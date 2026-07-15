@@ -1,0 +1,323 @@
+use super::*;
+
+/// Fail closed only for a managed principal AND compromised policy; every other combination proceeds.
+#[test]
+fn gate_blocks_only_managed_principal_with_compromised_policy() {
+    // The one blocking case.
+    assert!(
+        managed_policy_gate_decision(true, true).is_err(),
+        "managed principal + compromised policy must fail closed"
+    );
+    // Policy intact / opted-out → proceed even for a managed principal.
+    assert!(managed_policy_gate_decision(true, false).is_ok());
+    // No managed principal → nothing to enforce.
+    assert!(managed_policy_gate_decision(false, true).is_ok());
+    assert!(managed_policy_gate_decision(false, false).is_ok());
+}
+
+/// Writes both artifacts and overwrites in place on re-fetch.
+#[test]
+fn apply_writes_and_overwrites_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(home.join("managed_config.toml"), "[cli]\nold = true\n").unwrap();
+
+    let body = ManagedConfigResponse {
+        deployment_id: None,
+        team_id: None,
+        managed_config: Some("[cli]\ntheme = \"dark\"\n".into()),
+        requirements: Some("[features]\nweb_fetch = false\n".into()),
+        ..Default::default()
+    };
+    assert!(apply_managed_config(home, &body).unwrap());
+
+    assert_eq!(
+        std::fs::read_to_string(home.join("managed_config.toml")).unwrap(),
+        "[cli]\ntheme = \"dark\"\n",
+        "managed_config is overwritten with the served content"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("requirements.toml")).unwrap(),
+        "[features]\nweb_fetch = false\n"
+    );
+}
+
+/// An artifact the response no longer serves (absent or empty) is REMOVED — a withdrawn
+/// policy must stop enforcing, and a leftover would trip the signed absence check.
+#[test]
+fn apply_removes_artifact_the_server_no_longer_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(home.join("requirements.toml"), "[features]\n").unwrap();
+
+    // Response carries managed_config but NOT requirements.
+    let body = ManagedConfigResponse {
+        deployment_id: None,
+        team_id: None,
+        managed_config: Some("[cli]\ntheme = \"dark\"\n".into()),
+        requirements: None,
+        ..Default::default()
+    };
+    assert!(apply_managed_config(home, &body).unwrap());
+
+    assert!(home.join("managed_config.toml").exists());
+    assert!(
+        !home.join("requirements.toml").exists(),
+        "an artifact the server no longer serves is removed"
+    );
+
+    // EMPTY served content means the same thing as absent: remove.
+    let withdrawn = ManagedConfigResponse {
+        deployment_id: None,
+        team_id: None,
+        managed_config: Some(String::new()),
+        requirements: None,
+        ..Default::default()
+    };
+    assert!(apply_managed_config(home, &withdrawn).unwrap());
+    assert!(
+        !home.join("managed_config.toml").exists(),
+        "empty served content converges to absence"
+    );
+
+    // Converged state: another empty apply changes nothing.
+    assert!(!apply_managed_config(home, &withdrawn).unwrap());
+}
+
+/// Partial-write robustness: if one artifact lands and the other write
+/// fails, the error surfaces but the artifact that succeeded is kept.
+#[cfg(unix)]
+#[test]
+fn apply_partial_write_failure_keeps_written_artifact() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Force the requirements write to fail: a squatting dir whose child can't be
+    // unlinked (no write bit on the dir), so even the dir-squat clearing fails
+    // and the rename onto the dir fails after it.
+    let req = home.join("requirements.toml");
+    std::fs::create_dir(&req).unwrap();
+    std::fs::write(req.join("pin"), "x").unwrap();
+    std::fs::set_permissions(&req, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::remove_dir_all(&req).is_ok() {
+        eprintln!("skipping: permissions not enforced (running as root?)");
+        return;
+    }
+
+    let body = ManagedConfigResponse {
+        deployment_id: None,
+        team_id: None,
+        managed_config: Some("[cli]\ninstaller = \"internal\"\n".into()),
+        requirements: Some("[features]\nweb_fetch = false\n".into()),
+        ..Default::default()
+    };
+    let result = apply_managed_config(home, &body);
+
+    assert!(result.is_err(), "requirements write must fail");
+    assert!(
+        home.join("managed_config.toml").exists(),
+        "the artifact that wrote successfully must be kept"
+    );
+    // Tidy so the tempdir can be cleaned up.
+    let _ = std::fs::set_permissions(&req, std::fs::Permissions::from_mode(0o700));
+}
+
+/// The apply clears a squatting directory on both the overwrite and removal branches,
+/// so a dir-squat can't permanently block convergence.
+#[test]
+fn apply_converges_over_a_squatting_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::create_dir(home.join("requirements.toml")).unwrap();
+    std::fs::write(home.join("requirements.toml").join("junk"), "x").unwrap();
+    std::fs::create_dir(home.join("managed_config.toml")).unwrap();
+
+    // Overwrite branch clears the dir and writes; removal branch clears the dir.
+    let body = ManagedConfigResponse {
+        deployment_id: None,
+        team_id: None,
+        managed_config: Some("[cli]\ntheme = \"dark\"\n".into()),
+        requirements: None,
+        ..Default::default()
+    };
+    assert!(apply_managed_config(home, &body).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(home.join("managed_config.toml")).unwrap(),
+        "[cli]\ntheme = \"dark\"\n",
+        "the squatting directory is replaced by the served file"
+    );
+    assert!(
+        !home.join("requirements.toml").exists(),
+        "the squatting directory in a served-absent slot is removed"
+    );
+}
+
+/// The purge primitive (shared by logout and the identity-change purge) is best-effort over a
+/// PARTIAL install: present artifacts are removed, absent ones are tolerated (no panic, no
+/// error), and a directory squatting an artifact path is removed too.
+#[test]
+fn remove_managed_config_files_tolerates_partial_existence() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Only two of the four artifacts exist; one of them is a squatting DIRECTORY.
+    std::fs::write(home.join("requirements.toml"), "[features]\n").unwrap();
+    std::fs::create_dir(home.join("managed_config.toml")).unwrap();
+    std::fs::write(home.join("managed_config.toml").join("junk"), "x").unwrap();
+
+    remove_managed_config_files(home);
+
+    for f in [
+        "requirements.toml",
+        "managed_config.toml",
+        "managed_config_cache.json",
+        "managed_config.sig.json",
+    ] {
+        assert!(
+            !home.join(f).exists(),
+            "{f} must be gone after the purge (absent ones tolerated, dir squat removed)"
+        );
+    }
+}
+
+/// The transport-interruption variant must be retryable (so the loop escapes a
+/// poisoned connection) and must not be mistaken for an auth rejection.
+#[test]
+fn connection_interrupted_is_retryable_not_auth() {
+    let e = ManagedConfigError::ConnectionInterrupted("closed".into());
+    assert!(e.is_retryable(), "a transient interruption must be retried");
+    assert!(
+        !e.is_auth_rejection(),
+        "a transport error is not an auth rejection"
+    );
+}
+
+/// Each `TransportFailureKind` maps to the right `ManagedConfigError` with the right retryability:
+/// a `Permanent` (builder/redirect) failure is a client-side defect, so it maps to the terminal
+/// `RequestFailed`, not the server-blaming `InvalidResponse`, and must never be retried.
+#[test]
+fn transport_failure_maps_to_managed_config_error() {
+    use crate::http::{TransportFailure, TransportFailureKind};
+
+    let unreachable = map_transport_failure(TransportFailure {
+        kind: TransportFailureKind::Unreachable,
+        detail: "connection refused".into(),
+    });
+    assert!(matches!(unreachable, ManagedConfigError::Network(_)));
+    assert!(
+        unreachable.is_retryable(),
+        "an unreachable server is retried"
+    );
+    assert!(!unreachable.is_auth_rejection());
+
+    let interrupted = map_transport_failure(TransportFailure {
+        kind: TransportFailureKind::Interrupted,
+        detail: "connection closed before message completed".into(),
+    });
+    assert!(matches!(
+        interrupted,
+        ManagedConfigError::ConnectionInterrupted(_)
+    ));
+    assert!(
+        interrupted.is_retryable(),
+        "an in-flight interruption is retried"
+    );
+
+    let permanent = map_transport_failure(TransportFailure {
+        kind: TransportFailureKind::Permanent,
+        detail: "too many redirects".into(),
+    });
+    assert!(
+        matches!(permanent, ManagedConfigError::RequestFailed(_)),
+        "a client-side defect maps to RequestFailed, not InvalidResponse"
+    );
+    assert!(
+        !permanent.is_retryable(),
+        "a client-side defect is terminal and must not be retried"
+    );
+    assert!(!permanent.is_auth_rejection());
+}
+
+/// `send_with_retry_escaping_pool` combinator behavior with a counting op (no network):
+/// retryable errors retry up to `max_attempts`, non-retryable fails fast, success
+/// short-circuits, backoff awaited once per retry. The fresh-client swap on the final
+/// attempt needs a real degraded upstream and stays covered by the headless/e2e pass.
+#[tokio::test]
+async fn send_with_retry_escaping_pool_combinator_behavior() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // (a) all-retryable: op runs max_attempts times, backoff awaited max_attempts-1 times, last Err returned.
+    let op_calls = AtomicU32::new(0);
+    let backoffs = AtomicU32::new(0);
+    let exhausted: Result<(), u32> = crate::http::send_with_retry_escaping_pool(
+        |_client| {
+            let n = op_calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err(n) }
+        },
+        3,
+        |_e: &u32| true,
+        |_attempt| {
+            backoffs.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(())
+        },
+    )
+    .await;
+    assert_eq!(exhausted, Err(2), "returns the last attempt's error");
+    assert_eq!(
+        op_calls.load(Ordering::SeqCst),
+        3,
+        "op runs max_attempts times"
+    );
+    assert_eq!(
+        backoffs.load(Ordering::SeqCst),
+        2,
+        "backoff awaited max_attempts-1 times"
+    );
+
+    // (b) non-retryable: fail fast after one op call, no backoff.
+    let op_calls = AtomicU32::new(0);
+    let backoffs = AtomicU32::new(0);
+    let fast: Result<(), u32> = crate::http::send_with_retry_escaping_pool(
+        |_client| {
+            op_calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(7) }
+        },
+        5,
+        |_e: &u32| false,
+        |_attempt| {
+            backoffs.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(())
+        },
+    )
+    .await;
+    assert_eq!(fast, Err(7));
+    assert_eq!(
+        op_calls.load(Ordering::SeqCst),
+        1,
+        "a non-retryable error fails fast"
+    );
+    assert_eq!(
+        backoffs.load(Ordering::SeqCst),
+        0,
+        "no backoff on a fast failure"
+    );
+
+    // (c) success short-circuits: fail once (retryable), then succeed on the 2nd attempt.
+    let op_calls = AtomicU32::new(0);
+    let ok: Result<u32, u32> = crate::http::send_with_retry_escaping_pool(
+        |_client| {
+            let n = op_calls.fetch_add(1, Ordering::SeqCst);
+            let outcome: Result<u32, u32> = if n == 0 { Err(1) } else { Ok(42) };
+            async move { outcome }
+        },
+        5,
+        |_e: &u32| true,
+        |_attempt| std::future::ready(()),
+    )
+    .await;
+    assert_eq!(ok, Ok(42));
+    assert_eq!(
+        op_calls.load(Ordering::SeqCst),
+        2,
+        "stops at the first success"
+    );
+}

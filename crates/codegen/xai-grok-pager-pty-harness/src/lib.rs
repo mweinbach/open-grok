@@ -1,0 +1,490 @@
+//! Unified PTY harness for xai-grok-pager.
+//!
+//! The same layered API serves three consumers:
+//!
+//! 1. **Regression scenarios** (e.g. `scenarios::plan_approval_resume`,
+//!    exercised via `tests/` in this crate and `pty-scenario` YAML under
+//!    `xai-grok-pager/tests/scenarios/`) — assert screen contents and
+//!    multi-process resume behavior.
+//! 2. **Benchmarks** (`benches/pty_bench.rs`) — run timing scenarios, collect
+//!    per-frame timings, emit JSON / compare against baselines.
+//! 3. **Ad-hoc scenario runs** — spin up the harness to reproduce issues locally.
+//!
+//! ## Layers
+//!
+//! - **`pty`** (L1)       — PTY management (spawn, inject keys, resize, drain).
+//! - **`screen`** (L2a)   — Virtual terminal state via `alacritty_terminal` ("what the user sees").
+//! - **`timing`** (L2b)   — Per-frame durations via `?2026 h/l` markers.
+//! - **`content`** (L3)   — Mock inference server driving real content into the pager.
+//! - **`scenarios`**      — Named, parameterised workloads returning `BenchResults`.
+//! - **`results`**        — Aggregated statistics, baseline compare.
+//! - **`scroll_matrix`**  — `GROK_SCROLL_LOG` JSONL ingestion for the scroll validation matrix.
+//! - **`env`**            — Binary resolution and workspace path helpers.
+//! - **`flows`**          — Cross-suite drive/seed helpers shared by the pager's e2e targets.
+
+pub mod content;
+pub mod env;
+pub mod flows;
+pub mod host_clipboard;
+pub mod leader;
+pub mod pty;
+pub mod results;
+pub mod scenarios;
+pub mod screen;
+pub mod scripted;
+pub mod scroll_matrix;
+pub mod timing;
+
+pub use content::{ContentController, MockModel, ScriptedResponse, SseEvent, sse};
+pub use env::pager_binary;
+pub use flows::{
+    inference_request_count, oauth_env_for_pager, seed_fake_oauth, submit_turn,
+    wait_for_labels_absent, wait_for_model_via_new_sessions,
+};
+pub use host_clipboard::HostClipboardTextGuard;
+pub use leader::LeaderCluster;
+pub use pty::{PtyController, keys};
+pub use results::{BenchResults, compare_baseline};
+pub use scenarios::Scenario;
+pub use screen::ScreenTracker;
+pub use scripted::{
+    BugFinding, BugSeverity, DimensionAssertion, EnvVar, EnvironmentConfig, ImageFixture,
+    ImageFixtureKind, MockConfig, MouseButton, MousePoint, SGR_SCROLL_DOWN, SGR_SCROLL_UP,
+    ScenarioStep, ScriptedRunConfig, ScriptedRunReport, ScriptedRunStatus, ScriptedScenario,
+    ScriptedScenarioRunner, ScrollDirection, StepOutcome, StepStatus, TerminalConfig,
+    VisualArtifact,
+};
+pub use timing::{FrameTiming, FrameTimingParser};
+
+// Re-export ptyctl types for richer terminal emulation, vim key notation,
+// and styled output support.
+pub use ptyctl::keys::parse_keys;
+pub use ptyctl::styled::{StyledLine, StyledRun};
+pub use ptyctl::term::{ScreenOutput, Terminal as AlacrittyTerminal};
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use portable_pty::PtySize;
+
+/// High-level harness that composes PTY control, screen state, and frame timing.
+///
+/// The key method is [`update`](PtyHarness::update), which receives PTY output
+/// chunks inline and feeds each to **both** the [`ScreenTracker`] and
+/// [`FrameTimingParser`] as it arrives. This preserves inter-chunk timing for
+/// accurate frame measurement.
+pub struct PtyHarness {
+    pty: PtyController,
+    screen: ScreenTracker,
+    timing: FrameTimingParser,
+    raw_output: Vec<u8>,
+    /// Spawn instant — the time origin for asciinema cast event timestamps.
+    spawned_at: Instant,
+    /// Per-chunk cast events as `(elapsed_secs, end_offset_into_raw_output)`.
+    /// Each event's bytes are `raw_output[prev_end..end]`, so the chunks are
+    /// not duplicated in memory.
+    cast_events: Vec<(f64, usize)>,
+    /// Terminal size at spawn as `(cols, rows)` for the cast header.
+    cast_size: (u16, u16),
+    /// When true, [`update`](Self::update) forwards terminal-generated replies
+    /// (cursor-position reports, device attributes, …) back to the child.
+    /// Off by default so tests that script their own probe replies (e.g.
+    /// `pty_xtversion`) keep full control; minimal-mode tests turn it on so the
+    /// inline viewport's startup cursor query completes instead of timing out.
+    respond_to_queries: bool,
+}
+
+impl PtyHarness {
+    /// Spawn the pager in a PTY and create a new harness.
+    ///
+    /// Both `rows` and `cols` follow terminal convention: `(rows, cols)`.
+    pub fn new(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<Self> {
+        Self::new_in_dir(binary, rows, cols, args, env, None)
+    }
+
+    /// Like [`new`](Self::new), with an explicit working directory (`None` inherits).
+    pub fn new_in_dir(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        args: &[&str],
+        env: &[(&str, &str)],
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pty = PtyController::spawn_in_dir(binary, size, args, env, cwd)
+            .context("failed to spawn pager in PTY")?;
+
+        Ok(Self {
+            pty,
+            screen: ScreenTracker::new(rows, cols),
+            timing: FrameTimingParser::new(),
+            raw_output: Vec::new(),
+            spawned_at: Instant::now(),
+            cast_events: Vec::new(),
+            cast_size: (cols, rows),
+            respond_to_queries: false,
+        })
+    }
+
+    /// Enable (or disable) forwarding terminal-generated replies back to the
+    /// child during [`update`](Self::update). Real terminals answer device
+    /// queries automatically; the harness leaves this off by default so probe
+    /// tests can script their own replies. Minimal-mode tests enable it so the
+    /// inline viewport's startup cursor-position query (`ESC[6n`) is answered
+    /// and `--minimal` is not silently downgraded to full-screen inline.
+    pub fn set_respond_to_queries(&mut self, enabled: bool) {
+        self.respond_to_queries = enabled;
+    }
+
+    /// Spawn the pager with env vars from a [`ContentController`] attached.
+    ///
+    /// This is the common pattern for both e2e tests and benchmarks:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use xai_grok_pager_pty_harness::{PtyHarness, ContentController, pager_binary};
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let content = ContentController::start().await?;
+    /// content.set_response("# Hello\n\nAgent said hi.");
+    ///
+    /// let mut harness = PtyHarness::spawn_with_content(
+    ///     &pager_binary()?, 50, 120, &content, &[],
+    /// )?;
+    /// harness.wait_for_text("Hello", Duration::from_secs(10))?;
+    /// harness.quit()?;
+    /// # Ok(()) }
+    /// ```
+    pub fn spawn_with_content(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        content: &ContentController,
+        extra_args: &[&str],
+    ) -> Result<Self> {
+        Self::spawn_with_content_in_dir(binary, rows, cols, content, extra_args, None)
+    }
+
+    /// Like [`spawn_with_content`](Self::spawn_with_content), with an explicit working directory.
+    pub fn spawn_with_content_in_dir(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        content: &ContentController,
+        extra_args: &[&str],
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
+        let env = content.env_for_pager();
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        Self::new_in_dir(binary, rows, cols, extra_args, &env_refs, cwd)
+    }
+
+    // ── PTY control ──────────────────────────────────────────────────
+
+    /// Inject raw key bytes into the PTY.
+    pub fn inject_keys(&mut self, keys: &[u8]) -> Result<()> {
+        self.pty.inject_keys(keys)
+    }
+
+    /// Resize the PTY and virtual screen. Arguments are `(rows, cols)`.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        self.pty.resize(rows, cols)?;
+        self.screen.resize(rows, cols);
+        Ok(())
+    }
+
+    // ── Update: receive PTY output inline → feed both parsers ────────
+
+    /// Receive PTY output for up to `timeout`, feeding each chunk to both
+    /// the screen state tracker and the frame timing parser as it arrives.
+    ///
+    /// Processing inline (rather than buffering all chunks first) preserves
+    /// inter-chunk timing so that `FrameTimingParser` records accurate
+    /// wall-clock frame durations.
+    pub fn update(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.pty.recv_chunk(remaining) {
+                Some(chunk) => {
+                    self.raw_output.extend_from_slice(&chunk);
+                    self.cast_events.push((
+                        self.spawned_at.elapsed().as_secs_f64(),
+                        self.raw_output.len(),
+                    ));
+                    self.screen.feed(&chunk);
+                    self.timing.feed(&chunk);
+                    // Answer terminal probes (cursor-position reports, …) the
+                    // emulator queued while parsing this chunk, mirroring a real
+                    // terminal. Opt-in so probe-scripting tests keep control.
+                    if self.respond_to_queries {
+                        let responses = self.screen.drain_responses();
+                        if !responses.is_empty() {
+                            let _ = self.pty.inject_keys(&responses);
+                        }
+                    }
+                }
+                None => break, // timeout or child exited
+            }
+        }
+    }
+
+    /// Feed bytes **directly into the virtual screen only**, bypassing the
+    /// child (grok).
+    ///
+    /// Simulates an out-of-band repaint/reflow by an outer layer (tmux, or an
+    /// nvim/vim `:terminal`) that changes what's on screen without going
+    /// through grok's stdout. Used to reproduce the doubled-line class of bugs
+    /// where grok's diff renderer never re-asserts a region it didn't write
+    /// itself (since the harness is a single faithful emulator and cannot nest
+    /// a real tmux/nvim).
+    pub fn feed_screen(&mut self, bytes: &[u8]) {
+        self.screen.feed(bytes);
+    }
+
+    /// Check whether the child process is still running.
+    pub fn is_running(&mut self) -> bool {
+        self.pty.is_running()
+    }
+
+    // ── Screen state queries ─────────────────────────────────────────
+
+    /// Return structured plain-text screen contents.
+    pub fn screen_output(&self) -> ScreenOutput {
+        self.screen.output()
+    }
+
+    /// Return the full text contents of the virtual screen.
+    pub fn screen_contents(&self) -> String {
+        self.screen.contents()
+    }
+
+    /// Return the full screen with style information.
+    pub fn screen_styled(&self) -> Vec<StyledLine> {
+        self.screen.styled()
+    }
+
+    /// Render the current screen as HTML.
+    pub fn screen_html(&self) -> String {
+        self.screen.html()
+    }
+
+    /// Check whether the screen contains the given text.
+    pub fn contains_text(&self, text: &str) -> bool {
+        self.screen.contains(text)
+    }
+
+    /// Block until the screen contains `text` or `timeout` expires.
+    ///
+    /// Checks the current screen state first to avoid unnecessary blocking.
+    pub fn wait_for_text(&mut self, text: &str, timeout: Duration) -> Result<()> {
+        // Fast path: text may already be on screen from a prior update().
+        if self.screen.contains(text) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!(
+                    "timed out after {timeout:?} waiting for text: {text:?}\nscreen contents:\n{}",
+                    self.screen.contents()
+                );
+            }
+            self.update(Duration::from_millis(50).min(remaining));
+            if self.screen.contains(text) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Return all raw bytes emitted by the child PTY so far.
+    pub fn raw_output(&self) -> &[u8] {
+        &self.raw_output
+    }
+
+    /// Write everything the child PTY emitted so far as an asciinema v2 cast
+    /// (`.cast`), one output event per received chunk with its original
+    /// arrival timestamp. Replayable locally with `asciinema play`. Bytes are
+    /// decoded lossily so binary escapes cannot poison the JSON encoding.
+    ///
+    /// Limitation: the header is pinned to the spawn-time size and no `"r"`
+    /// resize events are emitted, so a cast from a test that calls
+    /// [`resize`](Self::resize) plays back at the original geometry.
+    pub fn write_cast(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create cast dir {}", parent.display()))?;
+        }
+        let (cols, rows) = self.cast_size;
+        let mut out = String::new();
+        out.push_str(&serde_json::json!({"version": 2, "width": cols, "height": rows}).to_string());
+        out.push('\n');
+        let mut start = 0usize;
+        for (elapsed, end) in &self.cast_events {
+            let mut end = *end;
+            // A multi-byte codepoint split across two PTY reads must not be
+            // lossy-decoded in halves: back off to the char boundary and let
+            // the partial bytes ride in the next event (a dangling tail at
+            // end-of-capture still decodes lossily — nothing to carry into).
+            while end > start
+                && end < self.raw_output.len()
+                && (self.raw_output[end] & 0xC0) == 0x80
+            {
+                end -= 1;
+            }
+            if end == start {
+                continue;
+            }
+            let data = String::from_utf8_lossy(&self.raw_output[start..end]);
+            out.push_str(&serde_json::json!([elapsed, "o", data]).to_string());
+            out.push('\n');
+            start = end;
+        }
+        std::fs::write(path, out).with_context(|| format!("write cast {}", path.display()))
+    }
+
+    // ── Scrollback queries (minimal mode commits blocks into native history) ──
+
+    /// The terminal's scrollback history as text (oldest line first).
+    pub fn scrollback_text(&self) -> String {
+        self.screen.scrollback_text()
+    }
+
+    /// Scrollback history + the visible screen, joined oldest→newest. Use for
+    /// minimal-mode assertions: a committed block may be on-screen or scrolled
+    /// above the pinned viewport depending on how much has accumulated.
+    pub fn full_text(&self) -> String {
+        self.screen.full_text()
+    }
+
+    /// Whether scrollback + visible screen contains `text`.
+    pub fn contains_full_text(&self, text: &str) -> bool {
+        self.screen.full_contains(text)
+    }
+
+    /// Block until scrollback + visible screen contains `text`, or `timeout`
+    /// expires. The scrollback-aware companion to [`Self::wait_for_text`] for
+    /// content that may have scrolled above the viewport (minimal mode).
+    pub fn wait_for_full_text(&mut self, text: &str, timeout: Duration) -> Result<()> {
+        if self.screen.full_contains(text) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!(
+                    "timed out after {timeout:?} waiting for text in scrollback+screen: \
+                     {text:?}\nfull contents:\n{}",
+                    self.screen.full_text()
+                );
+            }
+            self.update(Duration::from_millis(50).min(remaining));
+            if self.screen.full_contains(text) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Count Kitty graphics APC sequences that carry image data or placement in
+    /// the raw PTY output so far (delete / capability-query escapes excluded).
+    ///
+    /// These escapes are written into the synchronized-update frame buffer
+    /// (outside the vt100 cell grid), so they aren't visible to `wait_for_text`;
+    /// scanning the raw bytes is the only way to observe them.
+    pub fn count_kitty_graphics(&self) -> usize {
+        scripted::count_kitty_graphics(&self.raw_output)
+    }
+
+    /// Block until at least `min` Kitty graphics APC sequences (`ESC _ G`) have
+    /// appeared in the raw PTY output, or `timeout` expires.
+    ///
+    /// Polling the raw bytes avoids a fixed sleep (flake under load) and returns
+    /// as soon as the image is transmitted/placed.
+    pub fn wait_for_kitty_graphics(&mut self, min: usize, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.count_kitty_graphics() >= min {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!(
+                    "timed out after {timeout:?} waiting for {min} Kitty graphics escape(s); \
+                     found {}",
+                    self.count_kitty_graphics()
+                );
+            }
+            self.update(Duration::from_millis(50).min(remaining));
+        }
+    }
+
+    /// Return the current cursor position as `(row, col)`.
+    pub fn cursor_position(&self) -> (u16, u16) {
+        self.screen.cursor_position()
+    }
+
+    // ── Frame timing queries ─────────────────────────────────────────
+
+    /// Return all recorded frame timings.
+    pub fn frame_timings(&self) -> &[FrameTiming] {
+        self.timing.timings()
+    }
+
+    /// Compute aggregated benchmark results from collected frame timings.
+    pub fn bench_results(&self, scenario: &str, wall_time: Duration) -> BenchResults {
+        BenchResults::from_timings(scenario, self.timing.timings(), wall_time)
+    }
+
+    /// Return the total number of completed frames.
+    pub fn frame_count(&self) -> u64 {
+        self.timing.frame_count()
+    }
+
+    /// Reset all frame timing data.
+    pub fn reset_timing(&mut self) {
+        self.timing.reset();
+    }
+
+    // ── Lifecycle ────────────────────────────────────────────────────
+
+    /// Send 'q' and wait for the child process to exit (5s timeout, then kill).
+    pub fn quit(&mut self) -> Result<()> {
+        self.pty.quit()
+    }
+
+    /// Wait up to `timeout` for the child to exit, returning its exit code
+    /// (`None` if it's still running at the deadline). Call once and cache the
+    /// result — the underlying `try_wait` reaps the child.
+    pub fn wait_exit_code(&mut self, timeout: Duration) -> Option<u32> {
+        self.pty.wait_exit_code(timeout)
+    }
+
+    /// Child PID (see [`PtyController::child_pid`]).
+    pub fn child_pid(&self) -> Option<u32> {
+        self.pty.child_pid()
+    }
+
+    /// Deliver a signal to the child (unix). See [`PtyController::send_signal`].
+    #[cfg(unix)]
+    pub fn send_signal(&self, signal: i32) -> Result<()> {
+        self.pty.send_signal(signal)
+    }
+}

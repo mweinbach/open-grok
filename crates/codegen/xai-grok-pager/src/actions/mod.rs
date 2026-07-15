@@ -1,0 +1,705 @@
+//! Action registry — single source of truth for all actions, key bindings, and hints.
+//!
+//! Three consumers:
+//! - **Shortcuts bar**: `registry.hints(contexts)` → filtered, prioritized hints
+//! - **Command palette**: `registry.all()` → fuzzy searchable list
+//! - **Key dispatch**: `registry.lookup(key, context)` → action to execute
+//!
+//! ## Input bubbling
+//!
+//! Each layer in the input chain does an **exact context match**:
+//! 1. Pane level: `lookup(key, ScrollbackFocused)` or `lookup(key, PromptFocused)`
+//! 2. Agent level: `lookup(key, AgentScreen)`
+//! 3. Global level: `lookup(key, Always)`
+//!
+//! The bubbling is explicit in code, not hidden in `context_matches`.
+
+mod defaults;
+
+use crossterm::event::KeyEvent;
+
+use crate::input::key::KeyShortcut;
+use crate::views::shortcuts_bar::HintItem;
+
+pub use defaults::{ctrl_dot_unreliable, default_actions};
+
+/// Unique action identifier. Compile-time checked, no strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActionId {
+    // Prompt
+    SendPrompt,
+    InterjectPrompt,
+    /// Enable voice mode and start recording (`/voice`). Not a toggle — it
+    /// never turns voice mode off; capture is controlled by [`Self::VoiceToggle`].
+    EnableVoiceMode,
+    /// Start/stop mic capture (Ctrl+Space / Esc). Starting also enables voice
+    /// mode and spawns the pipeline if needed — no `/voice` prerequisite.
+    VoiceToggle,
+
+    // Navigation
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    HalfPageUp,
+    HalfPageDown,
+    GotoTop,
+    GotoBottom,
+    SelectNext,
+    SelectPrev,
+    NextTurn,
+    PrevTurn,
+    NextResponse,
+    PrevResponse,
+
+    // View
+    Collapse,
+    Expand,
+    ToggleFold,
+    ToggleExpandAll,
+    ExpandAllThinking,
+    ToggleRaw,
+    ToggleMouseCapture,
+
+    // Agent
+    NextModel,
+    CancelTurn,
+    ToggleYolo,
+    ToggleMultiline,
+
+    // Focus
+    FocusPrompt,
+    FocusScrollback,
+
+    // Block content
+    CopyBlockContent,
+    CopyBlockMeta,
+    OpenBlockViewer,
+
+    // Link navigation
+    OpenNextLink,
+    OpenPrevLink,
+
+    // Panes
+    ToggleTodos,
+    ToggleTasks,
+    ToggleQueue,
+    OpenSessions,
+    OpenExtensions,
+    SendToBackground,
+
+    // Prompt
+    CycleMode,
+    BashMode,
+
+    // Scrollback (contextual)
+    Rewind,
+    KillBgTask,
+
+    // Debug
+    DumpInputLog,
+
+    // App
+    Quit,
+    NewSession,
+    NewSessionInWorktree,
+    ExitSession,
+    CommandPalette,
+    ModelPicker,
+    ShortcutsHelp,
+
+    // Settings
+    OpenSettings,
+
+    // Agent Dashboard
+    OpenDashboard,
+    DashboardSelectNext,
+    DashboardSelectPrev,
+    DashboardTogglePin,
+    DashboardBeginRename,
+    DashboardStop,
+    DashboardCycleMode,
+    DashboardToggleGrouping,
+    DashboardReorderUp,
+    DashboardReorderDown,
+    DashboardShortcutsHelp,
+    DashboardExit,
+    DashboardOverlayExit,
+    DashboardOverlayPrev,
+    DashboardOverlayNext,
+    DashboardOverlayStop,
+    DashboardToggleAutoApprove,
+    DashboardOpenLocationPicker,
+    DashboardToggleWorktree,
+}
+/// When an action is available / visible.
+///
+/// Used for **exact** matching in `registry.lookup()`.
+/// Each layer in the input chain queries its own context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    /// Global — checked at the app level after all views.
+    Always,
+    /// Only when prompt pane is focused.
+    PromptFocused,
+    /// Only when scrollback pane is focused.
+    ScrollbackFocused,
+    /// Agent-level — checked after pane routing, before global.
+    AgentScreen,
+    /// Only on the welcome screen.
+    WelcomeScreen,
+    /// Only when the Agent Dashboard view is focused.
+    DashboardFocused,
+    /// Only inside the dashboard's session overlay (a dashboard-spawned agent
+    /// rendered fullscreen). Distinguishes the detail-view shortcuts (back to
+    /// dashboard, prev/next session) from the dashboard LIST shortcuts so the
+    /// cheatsheet can dim whichever set isn't applicable to the current view.
+    DashboardOverlay,
+}
+
+/// Action category (for grouping in command palette).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    GettingStarted,
+    Input,
+    ConversationNav,
+    ConversationAction,
+    Panels,
+    Session,
+    /// Agent Dashboard shortcuts.
+    Dashboard,
+}
+
+/// A registered action definition.
+#[derive(Debug, Clone)]
+pub struct ActionDef {
+    pub id: ActionId,
+    /// Short label for shortcuts bar: "Send", "Quit", "nav"
+    pub label: &'static str,
+    /// Longer description for command palette
+    pub description: &'static str,
+    /// Optional man-style help for the shortcuts cheatsheet detail/expand UI.
+    /// Consumers should fall back to `description` when this is `None`.
+    pub long_help: Option<&'static str>,
+    /// Default key binding
+    pub default_key: KeyShortcut,
+    /// Optional second key binding (e.g., j/k both shown as "j/k:nav")
+    pub alt_keys: Vec<KeyShortcut>,
+    /// Category for grouping
+    pub category: Category,
+    /// When this action is available
+    pub context: When,
+    /// Priority for shortcuts bar. None = don't show. Some(0) = highest priority.
+    pub hint_priority: Option<u8>,
+    /// Combined display for shortcuts bar (e.g., "j/k" for SelectNext+SelectPrev pair).
+    /// If set, overrides default_key.display().
+    pub hint_key_display: Option<&'static str>,
+    /// If true, requires double-press (1000ms TTL) to execute.
+    /// The first press sets a `PendingAction`; the second press confirms.
+    pub requires_confirmation: bool,
+}
+
+impl ActionDef {
+    /// Convert this action def into a [`HintItem`] for the shortcuts bar.
+    ///
+    /// Uses `default_key` only. For paired hints (j/k, h/l), the view should
+    /// use [`HintItem::paired`] with keys from two related action defs.
+    pub fn hint(&self) -> HintItem {
+        let mut item = HintItem::new(self.default_key, self.label);
+        item.custom_display = self.hint_key_display;
+        item.description = Some(std::borrow::Cow::Borrowed(self.description));
+        item
+    }
+}
+
+/// Registry of all actions. Single source of truth.
+pub struct ActionRegistry {
+    actions: Vec<ActionDef>,
+}
+
+impl ActionRegistry {
+    /// Create a registry with the given action definitions.
+    pub fn new(actions: Vec<ActionDef>) -> Self {
+        Self { actions }
+    }
+
+    /// Create the default registry with all standard actions.
+    pub fn defaults() -> Self {
+        Self::new(default_actions(false))
+    }
+
+    /// Create the default registry, optionally including config-gated actions.
+    pub fn defaults_with_config(mouse_reporting_toggle_enabled: bool) -> Self {
+        Self::new(default_actions(mouse_reporting_toggle_enabled))
+    }
+
+    /// Look up an action by key event and current context.
+    ///
+    /// Uses **exact** context matching — each layer in the input chain
+    /// calls this with its own context level.
+    pub fn lookup(&self, event: &KeyEvent, context: When) -> Option<ActionId> {
+        for def in &self.actions {
+            if def.context != context {
+                continue;
+            }
+            if def.default_key.matches(event) {
+                return Some(def.id);
+            }
+            if def.alt_keys.iter().any(|alt| alt.matches(event)) {
+                return Some(def.id);
+            }
+        }
+        None
+    }
+
+    /// Whether `event` matches `id`'s default or any alt, ignoring `When`.
+    /// Used for cross-pane chords that share an action's key set (e.g. queue
+    /// force-interject uses the same keys as `InterjectPrompt`).
+    pub fn matches_id(&self, id: ActionId, event: &KeyEvent) -> bool {
+        let Some(def) = self.find(id) else {
+            return false;
+        };
+        def.default_key.matches(event) || def.alt_keys.iter().any(|k| k.matches(event))
+    }
+
+    /// True when the send-now (interject) chord should act or be advertised:
+    /// turn running and there is something to send. `has_payload` is true for
+    /// non-empty composer text, editing a queued row, or a visible queued
+    /// follow-up (empty-composer force-send from the prompt). Idle or no
+    /// payload remains a no-op (not send-like-Enter).
+    pub fn interjection_possible(turn_running: bool, has_payload: bool) -> bool {
+        turn_running && has_payload
+    }
+
+    /// Registry pinned to non–VS Code family bindings (host-independent tests).
+    #[cfg(test)]
+    pub fn non_vscode_for_test() -> Self {
+        use crate::key;
+        let mut actions = default_actions(false);
+        for def in actions.iter_mut() {
+            if def.id == ActionId::Quit {
+                def.default_key = key!('q', CONTROL);
+                def.alt_keys = vec![key!('d', CONTROL)];
+            }
+            if def.id == ActionId::HalfPageDown {
+                def.default_key = key!('d', CONTROL);
+            }
+            if def.id == ActionId::InterjectPrompt {
+                def.default_key = key!(Enter, CONTROL);
+                def.alt_keys = vec![key!('i', CONTROL)];
+            }
+            if def.id == ActionId::OpenExtensions {
+                def.default_key = key!('l', CONTROL);
+                def.alt_keys = vec![];
+            }
+        }
+        Self::new(actions)
+    }
+
+    /// Registry pinned to Apple Terminal's interject binding (Ctrl+O is the
+    /// interject chord; kitty keyboard protocol unavailable → Ctrl+Enter does
+    /// not arrive). Host-independent stand-in for `default_actions` run under
+    /// an Apple Terminal context.
+    #[cfg(test)]
+    pub fn apple_terminal_for_test() -> Self {
+        use crate::key;
+        let mut actions = default_actions(false);
+        for def in actions.iter_mut() {
+            if def.id == ActionId::InterjectPrompt {
+                def.default_key = key!('o', CONTROL);
+                def.alt_keys = vec![key!(Enter, CONTROL), key!('i', CONTROL)];
+            }
+        }
+        Self::new(actions)
+    }
+
+    /// Registry pinned to VS Code family interject / extensions bindings.
+    #[cfg(test)]
+    pub fn vscode_family_for_test() -> Self {
+        use crate::key;
+        let mut actions = default_actions(false);
+        for def in actions.iter_mut() {
+            if def.id == ActionId::InterjectPrompt {
+                def.default_key = key!('l', CONTROL);
+                def.alt_keys = vec![];
+            }
+            if def.id == ActionId::OpenExtensions {
+                def.default_key = key!(Null);
+                def.alt_keys = vec![];
+            }
+        }
+        Self::new(actions)
+    }
+
+    /// Look up an action like [`Self::lookup`] but optionally suppress
+    /// bare-letter (or `Shift+letter`) bindings when `vim_mode == false`,
+    /// for contexts where those letters double as text-input keys.
+    ///
+    /// Applies to [`When::ScrollbackFocused`] and [`When::DashboardFocused`]:
+    /// the scrollback `j`/`k` scroll and the dashboard `j`/`k` row-nav
+    /// only resolve when vim-mode is on. With vim-mode off the letters
+    /// fall through so the caller can type them into its prompt — the
+    /// dashboard dispatch input and the agent prompt both rely on this.
+    ///
+    /// Arrow / Tab / Esc / Space / PgUp / PgDn / `?` and all `Ctrl+letter`
+    /// shortcuts always resolve — they come in as either the action's
+    /// `default_key` (e.g. `PageUp`, `Esc`) or `alt_keys` (arrows on
+    /// `SelectNext` / `Collapse` / etc.). Only the bare-letter primary
+    /// or alt is gated; arrow `alt_keys` on the same `ActionDef` still match.
+    pub fn lookup_with_mode(
+        &self,
+        event: &KeyEvent,
+        context: When,
+        vim_mode: bool,
+    ) -> Option<ActionId> {
+        // Contexts where a bare letter is also a typeable input key, so
+        // the vim-off suppression applies. Both surfaces own a text
+        // prompt that `j`/`k` must reach when vim-mode is off.
+        let letter_gated = matches!(context, When::ScrollbackFocused | When::DashboardFocused);
+        for def in &self.actions {
+            if def.context != context {
+                continue;
+            }
+            let suppress_default =
+                !vim_mode && letter_gated && def.default_key.is_letter_or_shift_letter();
+            if !suppress_default && def.default_key.matches(event) {
+                return Some(def.id);
+            }
+            // Alt keys: when vim_mode is off, also suppress any alt key
+            // that is itself a bare letter (e.g. the `j`/`k` alts on the
+            // dashboard's SelectNext / SelectPrev). Non-letter alts
+            // (arrows, Tab, Space) always match.
+            for alt in &def.alt_keys {
+                if !vim_mode && letter_gated && alt.is_letter_or_shift_letter() {
+                    continue;
+                }
+                if alt.matches(event) {
+                    return Some(def.id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find an action definition by ID.
+    pub fn find(&self, id: ActionId) -> Option<&ActionDef> {
+        self.actions.iter().find(|d| d.id == id)
+    }
+
+    /// Get hints for the shortcuts bar, filtered by contexts and sorted by priority.
+    ///
+    /// Pass multiple contexts to collect hints from all applicable levels.
+    /// E.g., for scrollback mode: `&[ScrollbackFocused, AgentScreen, Always]`.
+    pub fn hints(&self, contexts: &[When]) -> Vec<&ActionDef> {
+        let mut hints: Vec<&ActionDef> = self
+            .actions
+            .iter()
+            .filter(|def| def.hint_priority.is_some() && contexts.contains(&def.context))
+            .collect();
+        hints.sort_by_key(|def| def.hint_priority.unwrap_or(255));
+        hints
+    }
+
+    /// Get hint items for the shortcuts bar, filtered by contexts and sorted by priority.
+    ///
+    /// Convenience method that converts `ActionDef`s to `HintItem`s.
+    pub fn hint_items(&self, contexts: &[When]) -> Vec<HintItem> {
+        self.hints(contexts).iter().map(|def| def.hint()).collect()
+    }
+
+    /// Get the current key binding for an action.
+    pub fn key_for(&self, id: ActionId) -> Option<KeyShortcut> {
+        self.find(id).map(|def| def.default_key)
+    }
+
+    /// Get the effective hint key for an action, accounting for vim mode.
+    ///
+    /// In non-vim mode, bare-letter scrollback bindings are suppressed.
+    /// This returns the first non-letter alt key instead (e.g. arrow keys),
+    /// so hints show a key that actually works.
+    pub fn key_for_mode(&self, id: ActionId, vim_mode: bool) -> Option<KeyShortcut> {
+        let def = self.find(id)?;
+        if !vim_mode
+            && def.context == When::ScrollbackFocused
+            && def.default_key.is_letter_or_shift_letter()
+        {
+            def.alt_keys
+                .iter()
+                .find(|k| !k.is_letter_or_shift_letter())
+                .copied()
+        } else {
+            Some(def.default_key)
+        }
+    }
+
+    /// Get all actions (for command palette).
+    pub fn all(&self) -> &[ActionDef] {
+        &self.actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::key;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn non_vscode_registry() -> ActionRegistry {
+        ActionRegistry::non_vscode_for_test()
+    }
+
+    fn vscode_family_interject_registry() -> ActionRegistry {
+        ActionRegistry::vscode_family_for_test()
+    }
+
+    #[test]
+    fn shortcut_display() {
+        assert_eq!(key!('q').display(), "q");
+        assert_eq!(key!(Enter).display(), "Enter");
+        assert_eq!(key!('c', CONTROL).display(), "Ctrl+c");
+        assert_eq!(key!('l', CONTROL).display(), "Ctrl+l");
+    }
+
+    #[test]
+    fn shortcut_matches() {
+        let ctrl_c = key!('c', CONTROL);
+        let ctrl_event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(ctrl_c.matches(&ctrl_event));
+
+        let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(!ctrl_c.matches(&plain_c));
+    }
+
+    #[test]
+    fn ctrl_l_matches_interject_chord() {
+        let chord = key!('l', CONTROL);
+        let event = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(chord.matches(&event));
+        assert!(!chord.matches(&KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)));
+        assert!(!chord.matches(&KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)));
+        assert!(!chord.matches(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn vscode_family_interject_lookup_uses_ctrl_l_without_alts() {
+        let registry = vscode_family_interject_registry();
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(
+            registry.lookup(&ctrl_l, When::PromptFocused),
+            Some(ActionId::InterjectPrompt)
+        );
+        assert!(registry.matches_id(ActionId::InterjectPrompt, &ctrl_l));
+        // No alt chords on VS family.
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_ne!(
+            registry.lookup(&ctrl_enter, When::PromptFocused),
+            Some(ActionId::InterjectPrompt)
+        );
+        assert!(!registry.matches_id(ActionId::InterjectPrompt, &ctrl_enter));
+        let ctrl_i = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL);
+        assert_ne!(
+            registry.lookup(&ctrl_i, When::PromptFocused),
+            Some(ActionId::InterjectPrompt)
+        );
+        // OpenExtensions must not claim Ctrl+L on VS family (plugins via /plugins).
+        assert_ne!(
+            registry.lookup(&ctrl_l, When::AgentScreen),
+            Some(ActionId::OpenExtensions)
+        );
+        let def = registry
+            .find(ActionId::InterjectPrompt)
+            .expect("InterjectPrompt");
+        assert!(def.alt_keys.is_empty());
+    }
+
+    #[test]
+    fn interjection_possible_gate() {
+        assert!(!ActionRegistry::interjection_possible(false, true));
+        assert!(!ActionRegistry::interjection_possible(true, false));
+        assert!(ActionRegistry::interjection_possible(true, true));
+    }
+
+    #[test]
+    fn exact_context_matching() {
+        let registry = non_vscode_registry();
+
+        // Quit is When::Always — only found via Always lookup
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert_eq!(registry.lookup(&ctrl_q, When::Always), Some(ActionId::Quit));
+        // NOT found via scrollback or agent lookup (exact match)
+        assert_eq!(registry.lookup(&ctrl_q, When::ScrollbackFocused), None);
+        assert_eq!(registry.lookup(&ctrl_q, When::AgentScreen), None);
+
+        // Ctrl-D is HalfPageDown at scrollback level, Quit at global level
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(
+            registry.lookup(&ctrl_d, When::ScrollbackFocused),
+            Some(ActionId::HalfPageDown)
+        );
+        assert_eq!(registry.lookup(&ctrl_d, When::Always), Some(ActionId::Quit));
+    }
+
+    #[test]
+    fn cancel_at_agent_level() {
+        let registry = ActionRegistry::defaults();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            registry.lookup(&ctrl_c, When::AgentScreen),
+            Some(ActionId::CancelTurn)
+        );
+        // Not at scrollback or global level
+        assert_eq!(registry.lookup(&ctrl_c, When::ScrollbackFocused), None);
+        assert_eq!(registry.lookup(&ctrl_c, When::Always), None);
+    }
+
+    #[test]
+    fn scrollback_actions_only_at_scrollback_level() {
+        let registry = ActionRegistry::defaults();
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(
+            registry.lookup(&j, When::ScrollbackFocused),
+            Some(ActionId::SelectNext)
+        );
+        assert_eq!(registry.lookup(&j, When::AgentScreen), None);
+        assert_eq!(registry.lookup(&j, When::Always), None);
+    }
+
+    #[test]
+    fn find_action_def() {
+        let registry = ActionRegistry::defaults();
+        let def = registry.find(ActionId::Quit).unwrap();
+        assert_eq!(def.label, "quit");
+        assert!(def.requires_confirmation);
+    }
+
+    #[test]
+    fn multi_context_hints() {
+        let registry = ActionRegistry::defaults();
+        // Collect hints from multiple levels (as the shortcuts bar would)
+        let hints = registry.hints(&[When::ScrollbackFocused, When::AgentScreen, When::Always]);
+        assert!(!hints.is_empty());
+        // Should include quit (Always) and scrollback actions
+        let ids: Vec<_> = hints.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&ActionId::Quit));
+        assert!(ids.contains(&ActionId::SelectNext));
+        // Sorted by priority
+        for window in hints.windows(2) {
+            assert!(window[0].hint_priority <= window[1].hint_priority);
+        }
+    }
+
+    #[test]
+    fn quit_requires_confirmation() {
+        let registry = ActionRegistry::defaults();
+        let def = registry.find(ActionId::Quit).unwrap();
+        assert!(def.requires_confirmation);
+    }
+
+    #[test]
+    fn cancel_does_not_require_confirmation() {
+        let registry = ActionRegistry::defaults();
+        let def = registry.find(ActionId::CancelTurn).unwrap();
+        assert!(!def.requires_confirmation);
+    }
+
+    #[test]
+    fn toggle_mouse_capture_disabled_by_default() {
+        // Opt-in via config.toml; default registry must not register it.
+        let registry = ActionRegistry::defaults();
+        assert!(registry.find(ActionId::ToggleMouseCapture).is_none());
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(registry.lookup(&ctrl_r, When::ScrollbackFocused), None);
+    }
+
+    #[test]
+    fn toggle_mouse_capture_bound_on_scrollback_when_enabled() {
+        let registry = ActionRegistry::defaults_with_config(true);
+        // Registered and discoverable (command palette / cheatsheet) only
+        // when config enables the feature.
+        let def = registry
+            .find(ActionId::ToggleMouseCapture)
+            .expect("ToggleMouseCapture must be registered when config-enabled");
+        assert_eq!(def.category, Category::Panels);
+        assert_eq!(def.context, When::ScrollbackFocused);
+
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
+        let f9 = KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE);
+        let ctrl_shift_m = KeyEvent::new(
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let ctrl_space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
+
+        // Single binding: Ctrl+R while scrollback is focused.
+        assert_eq!(
+            registry.lookup(&ctrl_r, When::ScrollbackFocused),
+            Some(ActionId::ToggleMouseCapture)
+        );
+        // Not on agent/prompt contexts (Ctrl+R is deliberately unbound there;
+        // agent keeps the model picker on Ctrl+M).
+        assert_eq!(registry.lookup(&ctrl_r, When::AgentScreen), None);
+        assert_eq!(registry.lookup(&ctrl_r, When::PromptFocused), None);
+        assert_eq!(
+            registry.lookup(&ctrl_m, When::AgentScreen),
+            Some(ActionId::ModelPicker)
+        );
+        assert_eq!(
+            registry.lookup(&ctrl_m, When::PromptFocused),
+            Some(ActionId::ToggleMultiline)
+        );
+        // Former mouse-toggle dual bindings removed from scrollback.
+        assert_eq!(registry.lookup(&f9, When::ScrollbackFocused), None);
+        assert_eq!(registry.lookup(&f9, When::AgentScreen), None);
+        // Ctrl+Shift+M is no longer the voice chord — it resolves to nothing.
+        assert_eq!(
+            registry.lookup(&ctrl_shift_m, When::ScrollbackFocused),
+            None
+        );
+        assert_eq!(registry.lookup(&ctrl_shift_m, When::Always), None);
+        // Voice capture is bound to BOTH Ctrl+Space and F8, and is global
+        // (`When::Always`) so it resolves on the agent screen and the dashboard
+        // alike (distinct from Ctrl+M model picker / multiline). It is not
+        // agent-scoped, so an exact AgentScreen lookup misses.
+        assert_eq!(
+            registry.lookup(&ctrl_space, When::Always),
+            Some(ActionId::VoiceToggle)
+        );
+        assert_eq!(registry.lookup(&ctrl_space, When::AgentScreen), None);
+        let f8 = KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE);
+        assert_eq!(
+            registry.lookup(&f8, When::Always),
+            Some(ActionId::VoiceToggle)
+        );
+    }
+
+    #[test]
+    fn exit_session_is_command_only() {
+        let registry = ActionRegistry::defaults();
+        assert!(registry.find(ActionId::ExitSession).is_none());
+    }
+
+    #[test]
+    fn shortcuts_help_registered_with_ctrl_dot_and_ctrl_x() {
+        let registry = ActionRegistry::defaults();
+        let def = registry
+            .find(ActionId::ShortcutsHelp)
+            .expect("ShortcutsHelp action should be registered");
+        assert_eq!(def.label, "shortcuts");
+        assert!(!def.requires_confirmation);
+
+        // Both Ctrl+. and Ctrl+X should resolve to ShortcutsHelp
+        // (one is default_key, the other is alt_key — which is which
+        // depends on the terminal brand at runtime).
+        let ctrl_dot = KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL);
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(
+            registry.lookup(&ctrl_dot, When::AgentScreen),
+            Some(ActionId::ShortcutsHelp)
+        );
+        assert_eq!(
+            registry.lookup(&ctrl_x, When::AgentScreen),
+            Some(ActionId::ShortcutsHelp)
+        );
+    }
+}

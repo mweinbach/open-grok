@@ -1,0 +1,100 @@
+name: inline-edit-resubmit
+description: >-
+  Inline edit-and-resubmit happy path: select a previous user prompt in the
+  scrollback (Tab, k), Enter opens the in-place editor, append text, Enter
+  raises the inline rewind popup ("Resubmit from here", files-only row
+  hidden), `b` (conversation only) + `y` (last-prompt confirm) rewinds the
+  conversation and resubmits the EDITED text as a fresh turn. Distinct
+  per-turn mock sentinels prove the old tail was truncated and a new turn
+  streamed; no "Reverted conversation" note is shown.
+terminal:
+  rows: 40
+  cols: 110
+mock:
+  response: "FALLBACK_MOCK_RESPONSE"
+  turns:
+    - "FIRST_TURN_ANSWER from the mock server before any edit."
+    - "SECOND_TURN_ANSWER streamed after the inline resubmit."
+steps:
+  - action: wait_for_text
+    text: Quit
+    timeout_ms: 20000
+  - action: type_text
+    text: "fix the bug INLINE_BASE"
+  - action: keys
+    keys: "<Enter>"
+  - action: wait_for_text
+    text: FIRST_TURN_ANSWER
+    timeout_ms: 30000
+  # Let the turn-end chrome (completion marker) settle before navigating.
+  - action: wait
+    millis: 500
+  # Tab focuses the scrollback; k clamps the selection upward onto the
+  # first selectable entry — the user prompt.
+  # Tab focuses the scrollback (raw byte: ptyctl's <Tab> notation is not
+  # encodable by the Xterm key encoder and would be silently skipped).
+  - action: type_text
+    text: "\t"
+  # Footer swaps to the scrollback hint set once the pane owns keys.
+  - action: wait_for_text
+    text: "Space:prompt"
+    timeout_ms: 10000
+  # Up-arrow clamps the selection onto the first selectable entry — the
+  # user prompt (bare `k` needs vim mode; in the default mode a letter
+  # bounces focus back to the composer and types itself).
+  - action: keys
+    keys: "<Up><Up><Up><Up><Up><Up>"
+  - action: keys
+    keys: "<Enter>"
+  # The in-place editor is live: typed text mutates the entry on screen.
+  - action: type_text
+    text: " EDITED_RESUBMIT"
+  - action: wait_for_text
+    text: "INLINE_BASE EDITED_RESUBMIT"
+    timeout_ms: 10000
+  - action: keys
+    keys: "<Enter>"
+  # Inline variant of the rewind mode-select: retitled, files-only hidden.
+  - action: wait_for_text
+    text: "Resubmit from here"
+    timeout_ms: 15000
+  - action: assert_not_contains
+    text: "File changes only"
+  - action: screenshot
+    name: inline-mode-select
+    note: Inline resubmit popup with a/b rows and no files-only option.
+  # b = Conversation only; target is the first prompt, so the classic
+  # last-prompt confirm popup follows.
+  - action: keys
+    keys: "b"
+  - action: wait_for_text
+    text: "Confirm rewind"
+    timeout_ms: 15000
+  - action: keys
+    keys: "y"
+  # The rewind lands and the EDITED prompt is resubmitted: the second
+  # scripted turn streams its own sentinel.
+  - action: wait_for_text
+    text: SECOND_TURN_ANSWER
+    timeout_ms: 30000
+  # Old tail is gone (truncated at the edited prompt) ...
+  - action: assert_not_contains
+    text: FIRST_TURN_ANSWER
+  # ... without the classic rewind's system note ...
+  - action: assert_not_contains
+    text: "Reverted conversation"
+  # ... and the popup is gone while the edited text stands as the prompt.
+  - action: assert_not_contains
+    text: "Resubmit from here"
+  - action: assert_contains
+    text: "INLINE_BASE EDITED_RESUBMIT"
+  # The resubmitted request carried the edited text to the model.
+  - action: assert_request_contains
+    text: EDITED_RESUBMIT
+  - action: assert_chat_completion
+  - action: assert_not_contains
+    text: panicked
+  - action: assert_running
+  - action: screenshot
+    name: resubmitted
+    note: Transcript truncated at the prompt and regenerated from the edit.

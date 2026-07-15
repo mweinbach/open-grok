@@ -1,0 +1,31 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-update"
+version = "0.1.220-alpha.4"
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+futures = { workspace = true }
+indicatif = { workspace = true }
+reqwest = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["fs", "process", "io-util", "macros", "time"] }
+tracing = { workspace = true }
+xai-grok-shell = { workspace = true }
+xai-grok-tools = { workspace = true }
+xai-grok-version = { workspace = true }
+
+[dev-dependencies]
+semver = { workspace = true }
+serde_json = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+time = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "test-util"] }
+wiremock = { workspace = true }
+dunce = { workspace = true }

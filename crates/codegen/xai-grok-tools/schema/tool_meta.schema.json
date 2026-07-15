@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CanonicalToolMeta",
+  "description": "The canonical tool-identity envelope, attached to a tool-call event `_meta`\nas one nested object under [`TOOL_META_KEY`].\n\n```json\n\"x.ai/tool\": {\n  \"version\": 1,\n  \"name\": \"read_file\",\n  \"kind\": \"read\",\n  \"namespace\": \"grok_build\",\n  \"label\": \"Read\",\n  \"read_only\": true,\n  \"input\": { \"path\": \"...\" }\n}\n```\n\nConsumer contract:\n- **`label`** is the cross-harness grouping/display key: equivalent tools\n  share it (grok `read_file` → `\"Read\"`).\n- **`kind`** is a finer discriminator (`metadata.kind()`), *not* guaranteed\n  equal for equivalent ops across harnesses (listing is `list` in one\n  toolset, `list_dir` in another); prefer `label` to join, tolerate unknowns.\n- **`name`** is the harness-specific model-facing name; for diagnostics.\n  For harness-initiated events (e.g. the `bash_mode` marker), `raw_input`\n  is not guaranteed to match `name`'s schema.\n- **`input`** is a canonical *projection*, not a mirror: cross-harness keys\n  only, so some raw fields are intentionally dropped (e.g. grep flags,\n  `replace_all`), and bulky payload\n  fields (edit `old_string`/`new_string`, full write contents) are never\n  projected — read them from `raw_input`. It is omitted entirely\n  when no stable shape exists (MCP / dynamic / out-of-scope). When a field or\n  the whole dict is absent, fall back to `raw_input` on this or an earlier\n  update for the same `tool_call_id` (some updates, e.g. a parse failure,\n  carry neither and rely on the merge below).\n- **Lifecycle:** updates for one call share a `tool_call_id` — merge across\n  them (last write wins); `input` may arrive on a later update.\n- **Versioning:** additive changes (new object fields, new `kind` / `label`\n  values) don't bump `version`. Unknown `kind` degrades to `\"other\"`;\n  `namespace` is a closed enum (no `other` sink), so a new toolset fails\n  strict typed deserialization of the whole envelope — intentional, to force\n  typed consumers with exhaustive matches to update. Out-of-tree consumers\n  should read `namespace` loosely (as a string) and, on any `x.ai/tool`\n  parse failure, treat it as absent and fall back to `raw_input` + the ACP\n  `kind`. `version` bumps only on removal or meaning change.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "name": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/definitions/ToolKind"
+    },
+    "namespace": {
+      "$ref": "#/definitions/ToolNamespace"
+    },
+    "label": {
+      "type": "string"
+    },
+    "read_only": {
+      "type": "boolean"
+    },
+    "input": true
+  },
+  "required": [
+    "version",
+    "name",
+    "kind",
+    "namespace",
+    "label",
+    "read_only"
+  ],
+  "definitions": {
+    "ToolKind": {
+      "description": "Categorizes what a tool does at a high level. Open set — consumers must tolerate unknown values (Rust deserializes them to `other` via `#[serde(other)]`). Known values: `read`, `edit`, `delete`, `list_dir`, `write`, `move`, `search`, `lsp`, `execute`, `plan`, `web_search`, `web_fetch`, `background_task_action`, `wait_tasks_action`, `kill_task_action`, `list`, `skill`, `memory_search`, `memory_get`, `task`, `enter_plan`, `exit_plan`, `ask_user`, `image_gen`, `video_gen`, `image_to_video`, `reference_to_video`, `deploy_app`, `search_tool`, `use_tool`, `monitor`, `goal_update`, `other`.",
+      "type": "string"
+    },
+    "ToolNamespace": {
+      "description": "The toolset a tool belongs to.\n\nSerializes to snake_case (`grok_build`, `mcp`, …) for the\ncanonical tool `_meta` wire contract. PascalCase aliases are accepted on\ndeserialize so legacy persisted/manifest values still parse. The\n`Display` impl remains PascalCase for existing qualified id strings\n(e.g. `\"GrokBuild:read_file\"`); only the serde form goes on the wire.",
+      "type": "string",
+      "enum": [
+        "grok_build",
+        "grok_build_concise",
+        "grok_build_hashline",
+        "codex",
+        "opencode",
+        "mcp"
+      ]
+    }
+  }
+}

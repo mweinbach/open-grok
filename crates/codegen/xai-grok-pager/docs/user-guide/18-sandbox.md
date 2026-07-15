@@ -1,0 +1,244 @@
+# Sandbox Mode
+
+Sandbox mode restricts what the agent process and its spawned commands can access on your filesystem and network using OS-level kernel primitives (Landlock on Linux, Seatbelt on macOS). The kernel enforces these limits for the process lifetime.
+
+Sandbox mode is off by default.
+
+---
+
+## Quick Start
+
+```bash
+# Run with workspace sandbox (read everywhere, write to CWD + temp dirs + ~/.grok/)
+grok --sandbox workspace
+
+# Read-only mode (read everywhere, write only to ~/.grok/ + temp dirs)
+grok --sandbox read-only
+
+# Most restrictive profile (read CWD + system paths, write CWD + temp dirs + ~/.grok/, no child network)
+grok --sandbox strict
+```
+
+---
+
+## Built-in Profiles
+
+| Profile               | FS Read            | FS Write                                       | Child Network | Use Case                          |
+| --------------------- | ------------------ | ---------------------------------------------- | ------------- | --------------------------------- |
+| `off` (default)       | Unrestricted       | Unrestricted                                   | Unrestricted  | No sandbox                        |
+| `workspace`           | Everywhere         | CWD + `~/.grok/` + `/tmp` + `/var/tmp`         | Allowed       | Normal development                |
+| `devbox`              | Everywhere         | All top-level dirs except `/data`              | Allowed       | Disposable dev VMs                |
+| `read-only`           | Everywhere         | `~/.grok/` + `/tmp` + `/var/tmp`               | Blocked¹      | Exploration, code review          |
+| `strict`              | CWD + system paths | CWD + `~/.grok/` + `/tmp` + `/var/tmp`         | Blocked¹      | Untrusted code                    |
+
+¹ Child-network blocking is enforced on **Linux only** (via seccomp). On macOS it is a no-op — these profiles do not restrict child-process network there.
+
+To block specific files (e.g. `.env` or credential paths) on top of a profile, define a [custom profile](#custom-profiles) with a `deny` list — it is kernel-enforced (read + write/rename) and supports glob patterns like `**/*.pem`.
+
+### Profile Details
+
+**workspace** -- The recommended profile for everyday development. The agent can read any file on the system (for understanding dependencies, system libraries, etc.) but can only write to the current working directory, `~/.grok/`, and temp directories (`/tmp`, `/var/tmp`, plus the macOS temp dirs). Network access is allowed for tools like `web_search` and MCP servers.
+
+**devbox** -- A reserved built-in profile for disposable development VMs. The agent can read everywhere and write to every top-level directory except `/data` and the virtual filesystems (`/proc`, `/sys`, `/dev`), including the home directory. Network access is allowed. `--sandbox devbox` runs the built-in profile, which shadows any `[profiles.devbox]` you define in `sandbox.toml`.
+
+**read-only** -- Use when you want the agent to analyze code without modifying your project files. The agent can read everything but can only write to `~/.grok/` (needed for session persistence) and temp directories. Child-process network access is blocked on Linux (no-op on macOS).
+
+**strict** -- The most restrictive profile, for reviewing untrusted code. The agent can only read files within the current working directory and essential system paths. Writes are limited to CWD, `~/.grok/`, and temp directories. Child-process network access is blocked on Linux (no-op on macOS).
+
+---
+
+## Custom Profiles
+
+Create custom sandbox profiles in `~/.grok/sandbox.toml` (global) or `.grok/sandbox.toml` (per-project):
+
+```toml
+[profiles.project]
+# Start from a built-in profile, then add overrides
+extends = "workspace"
+restrict_network = true
+
+# Paths the agent can read but NOT write/delete
+read_only = ["/data"]
+
+# Additional writable paths
+read_write = ["/tmp/scratch"]
+
+# Paths or globs to kernel-deny (read + write/rename, enforced; see notes below)
+deny = ["/data/shared-secrets", "**/.env", "**/*.pem"]
+```
+
+Use the custom profile:
+
+```bash
+grok --sandbox project
+```
+
+A custom profile can't reuse a built-in name. `--sandbox devbox` always runs the built-in `devbox` profile, shadowing any `[profiles.devbox]` you define.
+
+When the global and per-project files define the same custom profile name, the user-level definition takes precedence and the project definition is ignored. Grok warns at startup if those two definitions differ. Identical duplicate definitions do not produce a warning.
+
+### Custom Profile Fields
+
+| Field              | Type     | Description                                          |
+| ------------------ | -------- | ---------------------------------------------------- |
+| `extends`          | String   | Base built-in profile to inherit from (`workspace`, `devbox`, `read-only`, `strict`). Defaults to `workspace` when omitted |
+| `restrict_network` | Boolean  | Block network access for child processes             |
+| `read_only`        | String[] | Additional read-only paths                           |
+| `read_write`       | String[] | Additional read-write paths                          |
+| `deny`             | String[] | Paths or globs to kernel-deny (read + write/rename; see notes). An entry with `*`, `?`, or `[` is a glob |
+
+> **Note on `deny`:** A non-empty `deny` list is **kernel-enforced**. Denied paths
+> are **read-denied and write/rename-denied** via Seatbelt on macOS and a bwrap
+> bind-over on Linux, so a denied path can neither be read (via `bash`, `grep`, or
+> subagents) nor relocated out of the deny set and read elsewhere (the
+> `mv secret x && cat x` bypass is closed). On **Linux**, read-deny requires
+> `bubblewrap`: if it is missing (or any single deny path can't be bound), Grok
+> refuses to start rather than run with denied paths exposed (`devbox`, which only
+> write-denies `/data`, still falls back to Landlock). Writes to paths **not** in
+> `deny` are controlled by what you grant in `read_write`.
+
+> **Globs in `deny`:** An entry is a **glob** if it contains `*`, `?`, or `[`.
+> Those characters **always** mean glob — to deny a literal file whose name
+> contains them, name a parent directory instead. The supported, gitignore-style
+> subset is:
+>
+> - `*` — any run of characters within one path segment (stops at `/`)
+> - `?` — exactly one character within a segment
+> - `**` — spans directories (as a whole path segment, e.g. `**/`, `a/**`); `**/`
+>   also matches zero directories, so `**/.env` matches `.env` and `sub/.env`
+> - `[abc]` / `[a-z]` — character classes; a leading `!` **or** `^` negates
+>   (`[!a]` and `[^a]` both mean "not `a`")
+>
+> Brace alternation (`{a,b}`), backslash-escapes, and the unusual class forms
+> `[]…]` (literal `]` first) and POSIX `[[:…:]]` are **not** supported, so the two
+> platforms can never interpret a glob differently. A glob using an unsupported
+> metacharacter, or one that is malformed, makes Grok **refuse to start** (fail
+> closed) on **both** platforms — write `*.pem` and `*.key` as separate entries
+> rather than `*.{pem,key}`.
+>
+> Relative globs are anchored at the workspace; absolute globs (e.g.
+> `/home/**/.ssh`) at their literal prefix. Non-glob entries keep exact-path
+> matching. Enforcement otherwise differs by platform:
+>
+> - **macOS is airtight:** each glob becomes a Seatbelt regex applied at runtime,
+>   so matching files are denied **even if created after Grok starts**.
+> - **Linux is best-effort:** a mount namespace can't glob at runtime, so each
+>   glob is expanded to the files that **exist at launch** and those are bound
+>   over. Files created **later** that match a glob are **not** covered — name
+>   exact paths for anything that must be airtight on Linux. A glob that matches
+>   too many files, or whose tree is too deep/broad to walk, makes Grok **refuse
+>   to start** rather than under-enforce.
+
+---
+
+## How It Works
+
+The sandbox is applied to the **entire grok process** at startup using kernel primitives -- not per-command wrapping. This means all tool operations are covered:
+
+- `read_file`, `search_replace`, `list_dir` -- restricted by Landlock/Seatbelt in-process
+- `bash` commands, `grep` (rg) -- child processes inherit FS restrictions automatically
+- Network -- on Linux, child processes can be blocked via seccomp; on macOS this is a no-op
+
+The sandbox is **irreversible** once applied. The agent cannot relax restrictions at runtime.
+
+---
+
+## Resuming Sessions
+
+The profile a session was started with is saved with the session and is **fixed
+for the life of the session**. When you resume it (`grok --resume <id>`,
+`grok --continue`, or `grok -r`), Grok restores that same profile automatically —
+so a session started with `--sandbox workspace` won't silently come back under a
+stricter default and break commands that previously worked.
+
+Resuming will **not** change a session's sandbox:
+
+- Omitting `--sandbox` on resume uses the session's saved profile.
+- Passing `--sandbox <profile>` that **matches** the saved profile is allowed.
+- Passing `--sandbox <profile>` that **differs** from the saved profile is
+  **refused with an error** — changing a resumed session's sandbox is a safety
+  footgun (it could widen access the session was meant to be confined to, or
+  break a session that relied on broader access). Start a new session to use a
+  different profile.
+
+Profile resolution order for a **new** session:
+
+1. An explicit `--sandbox <profile>` flag or `GROK_SANDBOX` environment variable
+2. The `[sandbox] profile` in your config
+3. `off` (no sandbox)
+
+---
+
+## Platform Support
+
+| Platform | Mechanism | Minimum Version        |
+| -------- | --------- | ---------------------- |
+| Linux    | Landlock  | Kernel 5.13 or later   |
+| macOS    | Seatbelt  | macOS (all versions)   |
+
+If the sandbox cannot be applied (e.g., unsupported kernel, missing entitlements), Grok logs a warning and continues without enforcement. The exception is an explicitly-requested **custom profile**: on **both macOS and Linux**, if it cannot be applied (unknown profile, malformed `sandbox.toml`, or — on Linux — `bubblewrap` unavailable for a non-empty `deny`), Grok refuses to start rather than run with its denied paths exposed.
+
+---
+
+## Network Restrictions
+
+On Linux, profiles with `restrict_network` block network access in **child processes** (bash commands, scripts) via seccomp. On macOS, network blocking is a no-op. Built-in tools that make HTTP requests in-process (web search, LLM API calls) are never affected -- the agent needs network access to function.
+
+In practice, on Linux this means:
+
+- `web_search`, `web_fetch`, and the LLM API always have network access
+- `bash` commands like `curl`, `wget`, and `npm install` are blocked when `restrict_network` is enabled
+
+---
+
+## Event Logging
+
+Sandbox events are logged to `~/.grok/sandbox-events.jsonl` for debugging. Events include:
+
+- Profile applied (which profile, timestamp)
+- Violations (attempted access to denied paths)
+
+---
+
+## When to Use Sandbox Mode
+
+**Use `workspace` when:**
+
+- Working on your own projects and you want basic write protection
+- Running in shared environments where you want to limit the scope of changes
+
+**Define a custom profile with a `deny` list when:**
+
+- You need to block specific files (e.g. `.env` or credential paths) on top of a base profile
+- You need kernel enforcement that covers `bash`, `grep`, and subagents — not just the `read_file` tool
+
+**Use `read-only` when:**
+
+- Reviewing code you do not trust
+- Exploring a codebase without risk of accidental modification
+- Running code analysis or audits
+
+**Use `strict` when:**
+
+- Analyzing untrusted or third-party code
+- Running in security-sensitive environments
+- You want maximum isolation
+
+**Skip sandbox when:**
+
+- The agent needs to install dependencies (`npm install`, `pip install`)
+- The agent needs to modify files outside the working directory
+- You are working in a trusted environment and want maximum flexibility
+
+---
+
+## Trade-offs
+
+| Aspect      | Without Sandbox            | With Sandbox                    |
+| ----------- | -------------------------- | ------------------------------- |
+| Safety      | Agent has full system access | Agent restricted to profile rules |
+| Capability  | Can do anything            | Limited by profile              |
+| Performance | No overhead                | Negligible overhead             |
+| Recovery    | Must trust the agent       | Kernel enforces boundaries      |
+
+The sandbox enforces limits at the OS level -- through Landlock or a mount namespace on Linux, and Seatbelt on macOS -- not a separate VM.

@@ -1,0 +1,86 @@
+name: inline-edit-dismiss-returns-to-editor
+description: >-
+  Esc from the inline resubmit popup returns to the still-open editor with
+  the edit intact (proven live by typing another char), and a second Esc
+  discards the edit entirely: the entry re-renders its original text and the
+  transcript is untouched.
+terminal:
+  rows: 40
+  cols: 110
+mock:
+  response: "DISMISS_MOCK_ANSWER from the scripted server."
+steps:
+  - action: wait_for_text
+    text: Quit
+    timeout_ms: 20000
+  - action: type_text
+    text: "polish the docs DISMISS_BASE"
+  - action: keys
+    keys: "<Enter>"
+  - action: wait_for_text
+    text: DISMISS_MOCK_ANSWER
+    timeout_ms: 30000
+  - action: wait
+    millis: 500
+  # Tab focuses the scrollback (raw byte: ptyctl's <Tab> notation is not
+  # encodable by the Xterm key encoder and would be silently skipped).
+  - action: type_text
+    text: "\t"
+  # Footer swaps to the scrollback hint set once the pane owns keys.
+  - action: wait_for_text
+    text: "Space:prompt"
+    timeout_ms: 10000
+  # Up-arrow clamps the selection onto the first selectable entry — the
+  # user prompt (bare `k` needs vim mode; in the default mode a letter
+  # bounces focus back to the composer and types itself).
+  - action: keys
+    keys: "<Up><Up><Up><Up><Up><Up>"
+  - action: keys
+    keys: "<Enter>"
+  - action: type_text
+    text: " DISMISS_EDIT"
+  - action: wait_for_text
+    text: "DISMISS_BASE DISMISS_EDIT"
+    timeout_ms: 10000
+  - action: keys
+    keys: "<Enter>"
+  - action: wait_for_text
+    text: "Resubmit from here"
+    timeout_ms: 15000
+  - action: screenshot
+    name: popup-over-editor
+    note: Inline resubmit popup raised over the open editor.
+  # Esc dismisses the popup and drops back into the editor, edit intact ...
+  - action: keys
+    keys: "<Esc>"
+  - action: wait
+    millis: 500
+  - action: assert_not_contains
+    text: "Resubmit from here"
+  - action: assert_contains
+    text: "DISMISS_BASE DISMISS_EDIT"
+  # ... and the editor is still LIVE: another typed char lands in it.
+  - action: keys
+    keys: "X"
+  - action: wait_for_text
+    text: "DISMISS_EDITX"
+    timeout_ms: 10000
+  - action: keys
+    keys: "<BS>"
+  # Second Esc discards the edit: the entry re-renders the original text.
+  - action: keys
+    keys: "<Esc>"
+  - action: wait
+    millis: 500
+  - action: assert_not_contains
+    text: "DISMISS_EDIT"
+  - action: assert_contains
+    text: "DISMISS_BASE"
+  - action: assert_contains
+    text: DISMISS_MOCK_ANSWER
+  - action: assert_not_contains
+    text: panicked
+  - action: assert_running
+  - action: screenshot
+    name: edit-discarded
+    note: Edit discarded by Esc; original prompt text restored in place.

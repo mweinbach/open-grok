@@ -1,0 +1,20 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-http"
+version = "0.1.0"
+edition.workspace = true
+description = "Shared reqwest HTTP clients and User-Agent construction for the grok CLI."
+
+[dependencies]
+reqwest = { workspace = true, features = ["blocking"] }
+reqwest-middleware = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+xai-grok-auth = { workspace = true, features = ["middleware"] }
+xai-grok-sampler = { path = "../xai-grok-sampler" }
+xai-grok-telemetry = { workspace = true }
+xai-grok-version = { workspace = true }
+xai-grok-workspace = { workspace = true }
+
+[lints]
+workspace = true

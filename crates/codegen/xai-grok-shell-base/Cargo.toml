@@ -1,0 +1,47 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-shell-base"
+version = "0.1.0"
+edition.workspace = true
+description = "Foundation modules for the grok shell crate family: environment presets, CPU profiling, and process/filesystem utilities."
+
+[features]
+# CI default set: builds a single shared rlib per crate, so downstream test
+# targets need the test-only helper surface compiled in.
+default-bazel = []
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+url = { workspace = true }
+xai-grok-config = { workspace = true }
+xai-grok-env = { workspace = true }
+xai-grok-shared = { workspace = true }
+xai-grok-version = { workspace = true }
+xai-tty-utils = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true }
+# No `flamegraph` feature: that pulls in inferno (CDDL-1.0), which we keep out
+# of shipped binaries. stop() emits folded stacks via pprof's public Report
+# API instead; render externally with speedscope or inferno-flamegraph.
+pprof = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `cfg(test)` in this crate does not enable features on dependencies, so the
+# tests' `EnvVarGuard` re-export needs the feature turned on explicitly.
+xai-grok-env = { workspace = true, features = [] }
+
+[lints]
+workspace = true

@@ -1,0 +1,343 @@
+//! Finalizing a turn from a terminal turn signal.
+//!
+//! The pager learns a turn reached its terminal outcome from two rails: the
+//! fire-and-forget `x.ai/session/prompt_complete` broadcast (the one-release
+//! compat path for not-yet-upgraded leaders) and the durable, persisted+replayed
+//! `XaiSessionUpdate::TurnCompleted`. Both converge on
+//! [`finalize_turn_from_terminal`] so the turn-finalize behavior lives in one
+//! place — and so a viewer that re-attaches mid-turn can finalize the turn from
+//! replay instead of staying stuck on "Waiting…".
+
+use crate::scrollback::blocks::SessionEvent;
+
+use super::agent::AgentId;
+use super::agent_view::AgentView;
+use super::app_view::AppView;
+
+/// Push a turn-terminal marker ("Turn completed/cancelled/failed"), folding
+/// any pending stop/stop_failure hook runs into it so they render inline
+/// (right-justified) on the marker line instead of as a standalone block.
+///
+/// All four marker rails route through here: the driver's `PromptResponse`,
+/// the lost-RPC reconcile, the viewer finalize, and wake turns'
+/// `push_wake_end_marker` (acp_handler). `event == None` (bash turns,
+/// rate-limit / re-auth UX that replaces the marker) flushes the held hooks
+/// as the legacy standalone lifecycle block so failures stay visible.
+///
+/// A stamped stash folds only on an exact ending-id match. On a mismatch the
+/// real-turn rails flush it standalone (the ending turn is THE turn — an
+/// older stash has no marker coming); the wake rail instead passes
+/// `preserve_mismatched_stash` so a REAL turn's leftover stash stays pending
+/// for its own marker rail rather than flushing on an unrelated wake. An
+/// unstamped stash keeps the legacy stashed-during-this-turn heuristic.
+///
+/// The marker carries a snapshot of the background work still running
+/// ("Worked for X. N commands still running") when any exists — a
+/// workless marker renders the legacy text unchanged. Announcing work opens
+/// the between-turns status window: completions landing before the next
+/// turn re-emit a fresh work-only status line after their chip.
+pub(super) fn push_turn_terminal_marker(
+    agent: &mut AgentView,
+    event: Option<SessionEvent>,
+    ending_prompt_id: Option<&str>,
+    preserve_mismatched_stash: bool,
+) {
+    let pending = agent.pending_stop_hooks.take();
+    let groups = match pending {
+        None => Vec::new(),
+        Some(pending) => {
+            let stale = match (pending.prompt_id.as_deref(), ending_prompt_id) {
+                (Some(stashed), Some(ending)) => stashed != ending,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if stale {
+                if preserve_mismatched_stash {
+                    // Wake rail: the stash belongs to a real turn whose own
+                    // marker rail will fold it — leave it pending.
+                    agent.pending_stop_hooks = Some(pending);
+                } else {
+                    for (name, runs) in pending.groups {
+                        agent.scrollback.push_lifecycle_hooks(name, runs);
+                    }
+                }
+                Vec::new()
+            } else {
+                pending.groups
+            }
+        }
+    };
+
+    match event {
+        Some(event) => {
+            agent.push_end_marker_block(event, groups, ending_prompt_id.map(str::to_string));
+        }
+        None => {
+            for (name, runs) in groups {
+                agent.scrollback.push_lifecycle_hooks(name, runs);
+            }
+        }
+    }
+}
+
+/// What applying a terminal turn signal did to one agent.
+pub(super) enum TerminalApply {
+    /// No change: a driver turn the signal does not provably match, or a
+    /// duplicate/stale terminal for an already-finished viewer turn.
+    Ignored,
+    /// Driver: the lost-RPC reconcile was armed. The turn is NOT finished — the
+    /// `PromptResponse` RPC owns the driver's lifecycle. Reported as a state
+    /// change so the reconcile sweep's animation tick stays scheduled.
+    ReconcileArmed,
+    /// Viewer: the turn was finished and (for non-rate-limit reasons) a terminal
+    /// marker pushed. The caller drops any stale running-prompt adoption.
+    ViewerFinalized,
+}
+
+/// Arm lost-`PromptResponse` reconcile for the driver turn we own.
+///
+/// - **Exact** `prompt_id` match → arm (canonical).
+/// - **Missing** wire `promptId` (`None` or empty) → arm on `current_prompt_id`
+///   only when the turn is not mid-tool/thinking/compact/retry (legacy /
+///   broken `TurnCompleted` payloads).
+/// - **Non-empty mismatch** → ignore (stale/peer terminal must not kill a
+///   newer live turn after grace).
+///
+/// Never clobber an existing arm for a different pid; keep earliest
+/// `received_at` when re-arming the same pid.
+fn arm_driver_turn_end_reconcile(
+    agent: &mut AgentView,
+    session_id: &str,
+    prompt_id: Option<&str>,
+    stop_reason: Option<&str>,
+    agent_result: Option<&str>,
+    cancel_trigger: Option<&str>,
+) -> bool {
+    if agent.session.loading_replay {
+        return false;
+    }
+    if !(agent.session.state.is_turn_running() || agent.session.state.is_cancelling()) {
+        return false;
+    }
+    let Some(current) = agent.session.current_prompt_id.clone() else {
+        return false;
+    };
+
+    let (arm_pid, arm_via) = match prompt_id {
+        Some(pid) if pid == current.as_str() => (current, "exact"),
+        Some("") => {
+            if driver_mid_active_work(agent) {
+                return false;
+            }
+            (current, "empty_wire_pid")
+        }
+        Some(_) => return false,
+        None => {
+            if driver_mid_active_work(agent) {
+                return false;
+            }
+            (current, "missing_wire_pid")
+        }
+    };
+
+    if let Some(pending) = agent.pending_turn_end_reconcile.as_ref() {
+        if pending.prompt_id != arm_pid {
+            return false;
+        }
+        // Same pid already armed — keep earliest received_at; refresh outcome.
+        let received_at = pending.received_at;
+        agent.pending_turn_end_reconcile = Some(super::agent_view::PendingTurnEnd {
+            prompt_id: arm_pid.clone(),
+            stop_reason: stop_reason.map(str::to_string),
+            agent_result: agent_result.map(str::to_string),
+            cancel_trigger: cancel_trigger.map(str::to_string),
+            received_at,
+        });
+        crate::unified_log::info(
+            "turn.end_reconcile.armed",
+            Some(session_id),
+            Some(serde_json::json!({
+                "prompt_id": arm_pid,
+                "wire_prompt_id": prompt_id,
+                "arm_via": arm_via,
+                "stop_reason": stop_reason,
+                "refreshed": true,
+            })),
+        );
+        return true;
+    }
+
+    crate::unified_log::info(
+        "turn.end_reconcile.armed",
+        Some(session_id),
+        Some(serde_json::json!({
+            "prompt_id": arm_pid,
+            "wire_prompt_id": prompt_id,
+            "arm_via": arm_via,
+            "stop_reason": stop_reason,
+        })),
+    );
+    agent.pending_turn_end_reconcile = Some(super::agent_view::PendingTurnEnd {
+        prompt_id: arm_pid,
+        stop_reason: stop_reason.map(str::to_string),
+        agent_result: agent_result.map(str::to_string),
+        cancel_trigger: cancel_trigger.map(str::to_string),
+        received_at: std::time::Instant::now(),
+    });
+    true
+}
+
+fn driver_mid_active_work(agent: &AgentView) -> bool {
+    matches!(
+        agent.session.tracker.activity(),
+        Some(crate::acp::tracker::TurnActivity::ToolRunning { .. })
+            | Some(crate::acp::tracker::TurnActivity::Thinking)
+            | Some(crate::acp::tracker::TurnActivity::AutoCompacting)
+            | Some(crate::acp::tracker::TurnActivity::Retrying { .. })
+    )
+}
+
+/// Finalize a turn from a terminal signal, shared by the `prompt_complete`
+/// broadcast and the durable `TurnCompleted` update so both behave identically.
+///
+/// DRIVER (`!attached_as_viewer`): the `PromptResponse` RPC owns the turn
+/// lifecycle (it carries context this signal lacks: error classes, rewind
+/// bookkeeping, adoption hand-off), so do NOT finish the turn here — that would
+/// race/double-finish on every normal turn end (the signal is emitted BEFORE the
+/// RPC response is written). But the RPC response can be LOST in transit (leader
+/// response routing / reconnect races), and
+/// it is the ONLY exit from `TurnRunning`/`TurnCancelling`. So when the signal
+/// refers to the turn this client is driving (exact pid, or missing/empty pid
+/// while not mid-tool), arm a deferred reconcile: if the RPC lands within the
+/// grace window it disarms this (see `TaskResult::PromptResponse`); otherwise
+/// the event loop finishes the turn from it (`reconcile_overdue_turn_ends`).
+///
+/// VIEWER (`attached_as_viewer`): a viewer adopts the driver's turn and never
+/// receives its `PromptResponse`, so this is its only non-interactive exit from
+/// `TurnRunning`. Finish the turn and push the "Turn completed/cancelled/failed"
+/// marker mapped from `stop_reason`. Idempotent: a duplicate/stale terminal for
+/// an already-finished turn pushes nothing and returns [`TerminalApply::Ignored`].
+///
+/// `cancel_trigger` is the signal's `_meta.cancelTrigger`, when stamped:
+/// `"send_now"` marks the cancel as the silent half of a cancel-and-send, so
+/// the `TurnCancelled` marker is suppressed (the sender's new prompt renders
+/// as the next turn). Absent meta means a normal cancel — except when this
+/// client just dispatched the send-now (`AgentView::expect_send_now_cancel`,
+/// the older-shell fallback, consumed here on the viewer finalize).
+pub(super) fn finalize_turn_from_terminal(
+    agent: &mut AgentView,
+    session_id: &str,
+    prompt_id: Option<&str>,
+    stop_reason: Option<&str>,
+    agent_result: Option<&str>,
+    cancel_trigger: Option<&str>,
+) -> TerminalApply {
+    if !agent.attached_as_viewer {
+        if arm_driver_turn_end_reconcile(
+            agent,
+            session_id,
+            prompt_id,
+            stop_reason,
+            agent_result,
+            cancel_trigger,
+        ) {
+            return TerminalApply::ReconcileArmed;
+        }
+        return TerminalApply::Ignored;
+    }
+
+    // Viewer: the driver's turn ended — exit TurnRunning. Only act when a turn
+    // is actually in progress so a stray/duplicate signal is harmless (a
+    // duplicate finds the turn already finished here and pushes no marker).
+    if !agent.session.state.is_busy() && agent.session.current_prompt_id.is_none() {
+        return TerminalApply::Ignored;
+    }
+
+    // Capture elapsed BEFORE `mark_turn_finished()` clears `turn_started_at`. The
+    // anchor was back-dated from the authoritative `turnStartMs` on adoption, so
+    // this reads the same wall-clock duration the driver shows.
+    let elapsed = agent.turn_elapsed().unwrap_or_default();
+    // Read before `finish_turn()` clears it; keys the pending stop-hook stash.
+    let ending_prompt_id = agent
+        .session
+        .current_prompt_id
+        .clone()
+        .or_else(|| prompt_id.map(str::to_string));
+
+    agent.session.finish_turn(&mut agent.scrollback);
+
+    // Wire meta wins; else the client-side expectation (older-shell fallback).
+    // Taken at every viewer finalize so it can't go stale.
+    let expected_send_now = agent.expect_send_now_cancel.take();
+    let send_now_cancel = match cancel_trigger {
+        Some(trigger) => trigger == "send_now",
+        None => expected_send_now.is_some(),
+    };
+
+    // A viewer never receives the driver's `PromptResponse` RPC — the source of
+    // the driver's "Worked for X" marker. Surface the equivalent here.
+    // The signal only carries a coarse `stop_reason` (no doom-loop category, no
+    // driver-local rate-limit / re-auth context), so map it to the closest event:
+    let event = match stop_reason {
+        // Send-now cancel: no marker (the sender's new prompt renders as the
+        // next turn; neither cancelled nor a substitute completed).
+        Some("cancelled") if send_now_cancel => None,
+        Some("cancelled") => Some(SessionEvent::TurnCancelled { elapsed }),
+        // Rate limits drive a dedicated UX on the driver and are not actionable
+        // from a viewer — don't surface a stray "Turn failed" line.
+        Some("rate_limit") => None,
+        Some("error") => Some(SessionEvent::TurnFailed {
+            error: agent_result
+                .map(str::to_string)
+                .unwrap_or_else(|| "unknown error".to_string()),
+            elapsed: Some(elapsed),
+        }),
+        // end_turn / max_tokens / max_turn_requests / refusal / unknown → done.
+        _ => Some(SessionEvent::TurnCompleted {
+            elapsed: Some(elapsed),
+        }),
+    };
+    push_turn_terminal_marker(agent, event, ending_prompt_id.as_deref(), false);
+
+    agent.mark_turn_finished();
+
+    TerminalApply::ViewerFinalized
+}
+
+/// Map a [`finalize_turn_from_terminal`] outcome to the redraw/tick bool that
+/// BOTH terminal rails (`prompt_complete` and the live `TurnCompleted`) RETURN
+/// DIRECTLY, applying the viewer-finalize side effect. Keeping this mapping in
+/// one place is load-bearing: the live `TurnCompleted` arm must return this
+/// instead of routing through `changed && is_active` (see below).
+///
+/// - `Ignored` -> `false`.
+/// - `ReconcileArmed` -> `true` UNCONDITIONALLY (not gated on visibility). The
+///   lost-RPC reconcile sweep rides the animation tick, and the event loop only
+///   re-arms the tick when a batch reports a change. A background-tab driver
+///   (`is_active == false`) that armed the reconcile must still report the change
+///   or `reconcile_overdue_turn_ends` never fires and the turn strands on
+///   "Waiting…" — the exact bug this rail fixes.
+/// - `ViewerFinalized` -> `true` only when `is_active` (drop pending adoption).
+pub(super) fn apply_terminal_outcome(
+    outcome: TerminalApply,
+    app: &mut AppView,
+    agent_id: AgentId,
+    is_active: bool,
+) -> bool {
+    match outcome {
+        TerminalApply::Ignored => false,
+        TerminalApply::ReconcileArmed => true,
+        TerminalApply::ViewerFinalized => {
+            if let Some(p) = app.pending_running_adoptions.remove(&agent_id)
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+            {
+                agent.discard_pending_adoption_updates(&p.prompt_id);
+            }
+            is_active
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "turn_completion/tests.rs"]
+mod tests;

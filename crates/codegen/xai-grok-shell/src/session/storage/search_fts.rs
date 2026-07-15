@@ -1,0 +1,1157 @@
+//! SQLite-backed FTS5 index for session search.
+//!
+//! Modelled after the memory system's `MemoryIndex` / `schema.rs`, but
+//! purpose-built for searching across *sessions* (titles + user prompts).
+//!
+//! ## Schema
+//!
+//! - `meta`              — key-value metadata (schema version)
+//! - `session_docs`      — one row per session (title, content, content_hash)
+//! - `session_docs_fts`  — content-synced FTS5 over title + content (not cwd)
+//!
+//! FTS is kept in sync with `session_docs` via `AFTER INSERT/UPDATE/DELETE`
+//! triggers so callers never need to touch the FTS table directly.
+//! The `cwd` column is intentionally excluded from the FTS table — it is a
+//! filter dimension only, applied via JOIN on `session_docs`.
+
+use rusqlite::{Connection, OptionalExtension, params};
+use xai_sqlite_journal::JournalMode;
+
+/// Bump when making breaking schema changes that require dropping and
+/// recreating tables, or to force a rebuild of stale index content
+/// (v3 → v4: messages with JSON escapes were silently dropped at indexing).
+const SCHEMA_VERSION: &str = "4";
+
+/// A document to be indexed for session search.
+#[derive(Debug, Clone)]
+pub struct SessionDoc {
+    pub session_id: String,
+    pub cwd: String,
+    pub updated_at_unix: i64,
+    pub title: String,
+    /// Concatenated user prompts (the searchable body).
+    pub content: String,
+    /// blake3 hash of `content` — used to skip redundant upserts.
+    pub content_hash: String,
+    /// Byte offset in `updates.jsonl` up to which content has been indexed.
+    /// Used for delta indexing: on subsequent updates, only bytes after this
+    /// offset are parsed and merged with existing content.
+    pub last_indexed_offset: u64,
+}
+
+/// State of a previously indexed session, returned by
+/// [`SessionSearchIndex::get_session_index_state`].
+#[derive(Debug, Clone)]
+pub struct SessionIndexState {
+    pub content: String,
+    pub content_hash: String,
+    pub last_indexed_offset: u64,
+}
+
+/// A single search result row.
+#[derive(Debug, Clone)]
+pub struct SessionSearchRow {
+    pub session_id: String,
+    pub cwd: String,
+    pub title: String,
+    pub updated_at_unix: i64,
+    pub score: f32,
+    pub matched_fields: Vec<String>,
+    pub snippet: Option<String>,
+}
+
+/// Result of a `SessionSearchIndex::query()` call.
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    pub results: Vec<SessionSearchRow>,
+    pub next_offset: Option<usize>,
+    pub total_estimate: Option<usize>,
+}
+
+/// Wraps a `rusqlite::Connection` pointing at `session_search.sqlite`.
+pub struct SessionSearchIndex {
+    db: Connection,
+}
+
+impl SessionSearchIndex {
+    /// Open (or create) the FTS index at `db_path`.
+    ///
+    /// Creates the schema and triggers on first use. When the stored schema
+    /// version is OLDER than [`SCHEMA_VERSION`], drops and recreates all
+    /// tables (simple migration strategy for an index that can be rebuilt)
+    /// and deletes the `last_bootstrap_at` completed-bootstrap marker so the
+    /// wipe is observable to bootstrap/staleness checks.
+    /// A NEWER stored version is tolerated read/write without dropping.
+    pub fn open_or_create(db_path: &std::path::Path) -> Result<Self, rusqlite::Error> {
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // The mode decision statfs's the parent dir created above.
+        Self::open_with_journal_mode(db_path, JournalMode::for_db_path(db_path))
+    }
+
+    /// Open with an explicit journal mode — the seam tests use to exercise
+    /// the network-filesystem decision on a local disk.
+    fn open_with_journal_mode(
+        db_path: &std::path::Path,
+        journal_mode: JournalMode,
+    ) -> Result<Self, rusqlite::Error> {
+        // busy_timeout + journal pragma live in the helper (see JournalMode::open).
+        let db = journal_mode.open(db_path)?;
+
+        // Check existing schema version
+        let stored_version: Option<String> = db
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'session_search_schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+
+        // One-way ratchet: drop only on UPGRADE (stored < current). Multiple
+        // grok generations share this DB (stable vs alpha); an equality check
+        // made each binary wipe the other's index in a ping-pong that left
+        // search empty mid-rebootstrap. A newer index is safe to read: bumps
+        // regenerate content only (table schema is column-identical), and the
+        // newer binary re-upserts any rows we write via content-hash mismatch.
+        // `None` = fresh DB; a non-integer stored value = legacy/corrupt → 0.
+        let current: u64 = SCHEMA_VERSION
+            .parse()
+            .expect("SCHEMA_VERSION is an integer");
+        let stored: Option<u64> = stored_version.as_deref().map(|v| v.parse().unwrap_or(0));
+        let owned_by_newer = stored.is_some_and(|s| s > current);
+        if stored.is_some_and(|s| s < current) {
+            // Discard the stale index AND its completed-bootstrap marker in
+            // one transaction. Binaries that predate the one-way ratchet
+            // (schema ≤ 3) still wipe a newer index on open, re-stamp their
+            // own version, and rewrite `last_bootstrap_at` when their
+            // bootstrap finishes. If that marker survived this upgrade drop,
+            // a "did a bootstrap complete?" check would trust it and never
+            // repopulate the now-empty tables — leaving content search
+            // permanently empty (the query path itself performs this drop).
+            // Deleting the marker makes the wipe observable: the search
+            // manager re-runs a full bootstrap and remote sync correctly
+            // treats the local index as stale. All other `meta` keys are
+            // preserved.
+            db.execute_batch(
+                "
+                BEGIN;
+                DROP TRIGGER IF EXISTS session_docs_ai;
+                DROP TRIGGER IF EXISTS session_docs_ad;
+                DROP TRIGGER IF EXISTS session_docs_au;
+                DROP TABLE IF EXISTS session_docs_fts;
+                DROP TABLE IF EXISTS session_docs;
+                DELETE FROM meta WHERE key = 'last_bootstrap_at';
+                COMMIT;
+                ",
+            )?;
+        } else if owned_by_newer {
+            tracing::debug!(
+                stored = stored.unwrap_or_default(),
+                current,
+                "session search index owned by a newer schema version; keeping tables"
+            );
+        }
+
+        // Create tables + content-synced FTS5 with auto-sync triggers
+        db.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS session_docs (
+                session_id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL
+            );
+
+            -- FTS only indexes title + content (searchable columns).
+            -- cwd is NOT in the FTS table — it is a filter dimension only,
+            -- applied via JOIN on session_docs.
+            CREATE VIRTUAL TABLE IF NOT EXISTS session_docs_fts USING fts5(
+                title,
+                content,
+                content='session_docs',
+                content_rowid='rowid'
+            );
+
+            -- Keep FTS in sync via triggers so callers only touch session_docs.
+            CREATE TRIGGER IF NOT EXISTS session_docs_ai AFTER INSERT ON session_docs BEGIN
+                INSERT INTO session_docs_fts(rowid, title, content)
+                VALUES (new.rowid, new.title, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS session_docs_ad AFTER DELETE ON session_docs BEGIN
+                INSERT INTO session_docs_fts(session_docs_fts, rowid, title, content)
+                VALUES ('delete', old.rowid, old.title, old.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS session_docs_au AFTER UPDATE ON session_docs BEGIN
+                INSERT INTO session_docs_fts(session_docs_fts, rowid, title, content)
+                VALUES ('delete', old.rowid, old.title, old.content);
+                INSERT INTO session_docs_fts(rowid, title, content)
+                VALUES (new.rowid, new.title, new.content);
+            END;
+            ",
+        )?;
+
+        // Add last_indexed_offset column (idempotent migration).
+        match db.execute(
+            "ALTER TABLE session_docs ADD COLUMN last_indexed_offset INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column") {
+                    return Err(e);
+                }
+            }
+        }
+
+        // Persist schema version — but never regress the row a newer
+        // generation owns (it would re-trigger that binary's upgrade drop).
+        if stored != Some(current) && !owned_by_newer {
+            db.execute(
+                "INSERT OR REPLACE INTO meta(key, value) \
+                 VALUES ('session_search_schema_version', ?1)",
+                params![SCHEMA_VERSION],
+            )?;
+        }
+
+        Ok(Self { db })
+    }
+
+    /// Insert or update a session document in the index.
+    ///
+    /// The content-synced FTS triggers handle updating `session_docs_fts`
+    /// automatically.
+    pub fn upsert_doc(&self, doc: &SessionDoc) -> Result<(), rusqlite::Error> {
+        self.db.execute(
+            "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash, last_indexed_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 cwd = excluded.cwd,
+                 updated_at = excluded.updated_at,
+                 title = excluded.title,
+                 content = excluded.content,
+                 content_hash = excluded.content_hash,
+                 last_indexed_offset = excluded.last_indexed_offset",
+            params![
+                doc.session_id,
+                doc.cwd,
+                doc.updated_at_unix,
+                doc.title,
+                doc.content,
+                doc.content_hash,
+                doc.last_indexed_offset as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a session document only if no row exists for its `session_id`.
+    ///
+    /// Atomic alternative to a check-then-insert: the index DB is shared
+    /// across processes, so a two-step gate could clobber a full-content row
+    /// written between the check and the insert.
+    pub fn insert_doc_if_absent(&self, doc: &SessionDoc) -> Result<(), rusqlite::Error> {
+        self.db.execute(
+            "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash, last_indexed_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(session_id) DO NOTHING",
+            params![
+                doc.session_id,
+                doc.cwd,
+                doc.updated_at_unix,
+                doc.title,
+                doc.content,
+                doc.content_hash,
+                doc.last_indexed_offset as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a session document from the index.
+    pub fn delete_doc(&self, session_id: &str) -> Result<(), rusqlite::Error> {
+        self.db.execute(
+            "DELETE FROM session_docs WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Return the stored content_hash for a session, if any.
+    ///
+    /// Used to skip redundant upserts when content hasn't changed.
+    pub fn get_content_hash(&self, session_id: &str) -> Result<Option<String>, rusqlite::Error> {
+        self.db
+            .query_row(
+                "SELECT content_hash FROM session_docs WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Return the full index state for a session: content, content_hash,
+    /// and last_indexed_offset. Used by the delta indexing path.
+    pub fn get_session_index_state(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionIndexState>, rusqlite::Error> {
+        self.db
+            .query_row(
+                "SELECT content, content_hash, last_indexed_offset FROM session_docs WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    let content: String = row.get(0)?;
+                    let content_hash: String = row.get(1)?;
+                    let offset: i64 = row.get(2)?;
+                    Ok(SessionIndexState {
+                        content,
+                        content_hash,
+                        last_indexed_offset: offset as u64,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Update only the `last_indexed_offset` for a session without touching
+    /// content or hash (avoids firing FTS triggers when content is unchanged).
+    pub fn update_indexed_offset(
+        &self,
+        session_id: &str,
+        offset: u64,
+    ) -> Result<(), rusqlite::Error> {
+        self.db.execute(
+            "UPDATE session_docs SET last_indexed_offset = ?2 WHERE session_id = ?1",
+            params![session_id, offset as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Read a value from the `meta` key-value table.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, rusqlite::Error> {
+        self.db
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Write a value to the `meta` key-value table (insert or replace).
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Return all session IDs currently in the index.
+    ///
+    /// Used during reindex to detect and prune orphaned entries.
+    pub fn all_indexed_session_ids(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.db.prepare("SELECT session_id FROM session_docs")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Run a BM25-ranked FTS5 query over indexed sessions.
+    ///
+    /// Multi-token queries require every token (AND) first; when that
+    /// intersection matches nothing the query reruns as an OR so partial
+    /// matches still surface. Returns `(results, next_offset, total_estimate)`.
+    pub fn query(
+        &self,
+        query: &str,
+        cwd: Option<&str>,
+        limit: usize,
+        offset: usize,
+        include_content: bool,
+    ) -> Result<QueryResult, rusqlite::Error> {
+        let Some((and_query, or_query)) = Self::build_match_queries(query) else {
+            return Ok(QueryResult {
+                results: Vec::new(),
+                next_offset: None,
+                total_estimate: Some(0),
+            });
+        };
+
+        let result = self.run_match_query(&and_query, cwd, limit, offset, include_content)?;
+        // Gate the fallback on the total (not the page) so every offset of one
+        // logical query is served by the same match string.
+        if result.total_estimate == Some(0) && and_query != or_query {
+            return self.run_match_query(&or_query, cwd, limit, offset, include_content);
+        }
+        Ok(result)
+    }
+
+    /// Execute one FTS5 MATCH string; `total_estimate` is computed with the
+    /// same match string that produced the rows.
+    fn run_match_query(
+        &self,
+        match_query: &str,
+        cwd: Option<&str>,
+        limit: usize,
+        offset: usize,
+        include_content: bool,
+    ) -> Result<QueryResult, rusqlite::Error> {
+        let total: i64 = self.db.query_row(
+            "SELECT COUNT(*)
+             FROM session_docs_fts
+             JOIN session_docs d ON d.rowid = session_docs_fts.rowid
+             WHERE session_docs_fts MATCH ?1
+               AND (?2 IS NULL OR d.cwd = ?2)",
+            params![match_query, cwd],
+            |row| row.get(0),
+        )?;
+
+        let snippet_expr = if include_content {
+            "snippet(session_docs_fts, 1, '[', ']', ' … ', 18)"
+        } else {
+            "NULL"
+        };
+
+        // BM25 weights: title=10.0, content=1.0
+        let sql = format!(
+            "SELECT
+               d.session_id,
+               d.cwd,
+               d.title,
+               d.updated_at,
+               bm25(session_docs_fts, 10.0, 1.0) AS rank,
+               {snippet_expr} AS snippet,
+               highlight(session_docs_fts, 0, '\x01', '\x02') AS hl_title,
+               highlight(session_docs_fts, 1, '\x01', '\x02') AS hl_content
+             FROM session_docs_fts
+             JOIN session_docs d ON d.rowid = session_docs_fts.rowid
+             WHERE session_docs_fts MATCH ?1
+               AND (?2 IS NULL OR d.cwd = ?2)
+             ORDER BY rank ASC, d.updated_at DESC, d.session_id ASC
+             LIMIT ?3 OFFSET ?4"
+        );
+
+        let mut stmt = self.db.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![match_query, cwd, limit as i64, offset as i64],
+            |row| {
+                let session_id: String = row.get("session_id")?;
+                let row_cwd: String = row.get("cwd")?;
+                let title: String = row.get("title")?;
+                let updated_at_unix: i64 = row.get("updated_at")?;
+                let rank: f64 = row.get("rank")?;
+                let snippet: Option<String> = row.get("snippet")?;
+                let hl_title: String = row.get("hl_title")?;
+                let hl_content: String = row.get("hl_content")?;
+
+                let score = if rank.is_finite() {
+                    -(rank as f32)
+                } else {
+                    0.0
+                };
+
+                let mut matched_fields = Vec::new();
+                if hl_title.contains('\x01') {
+                    matched_fields.push("title".to_string());
+                }
+                if hl_content.contains('\x01') {
+                    matched_fields.push("content".to_string());
+                }
+                if matched_fields.is_empty() {
+                    matched_fields.push("content".to_string());
+                }
+
+                Ok(SessionSearchRow {
+                    session_id,
+                    cwd: row_cwd,
+                    title,
+                    updated_at_unix,
+                    score,
+                    matched_fields,
+                    snippet,
+                })
+            },
+        )?;
+
+        let results: Vec<SessionSearchRow> = rows.collect::<Result<_, _>>()?;
+        let total_usize = usize::try_from(total).unwrap_or(0);
+        let next_offset = (offset + results.len() < total_usize).then_some(offset + results.len());
+
+        Ok(QueryResult {
+            results,
+            next_offset,
+            total_estimate: Some(total_usize),
+        })
+    }
+
+    /// Build the AND-joined and OR-joined FTS5 MATCH strings for a query.
+    ///
+    /// The strings are identical for single-token queries, which lets the
+    /// caller skip the fallback rerun.
+    fn build_match_queries(query: &str) -> Option<(String, String)> {
+        let prefixes: Vec<String> = query
+            .split_whitespace()
+            .flat_map(Self::sanitize_token)
+            .map(Self::token_prefix)
+            .collect();
+
+        if prefixes.is_empty() {
+            let fallback = query.trim();
+            if fallback.is_empty() {
+                return None;
+            }
+            let cleaned = fallback.replace('"', "");
+            let phrase = format!("\"{cleaned}\" *");
+            return Some((phrase.clone(), phrase));
+        }
+
+        Some((prefixes.join(" AND "), prefixes.join(" OR ")))
+    }
+
+    /// Split a query word on every stripped character instead of gluing the
+    /// fragments: `session_picker.rs` must search as `session_picker` + `rs`,
+    /// not as the never-indexed `session_pickerrs`. Fragments without any
+    /// alphanumeric (`-`, `->`, `_`) are dropped — they tokenize to empty
+    /// phrases, and an empty phrase inside an AND silently matches nothing.
+    fn sanitize_token(token: &str) -> impl Iterator<Item = &str> {
+        token
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .filter(|part| part.chars().any(|c| c.is_ascii_alphanumeric()))
+    }
+
+    /// One quoted FTS5 prefix per token, stemmed on the query side only.
+    ///
+    /// Plural queries reach singular docs by searching the shorter stem
+    /// (`sessions` → `session*`, `caches` → `cach*`); the trailing `*` covers
+    /// the reverse direction and typed stems like `ing`/`ed`, so no OR-group
+    /// is needed — a `(base OR stem)` group double-counts bm25 and ranks
+    /// inflected docs above exact matches. Short (< 4) words, identifiers
+    /// with digits/`_`/`-`, and `ss`-tail words (`pass`, `class`) stay exact.
+    fn token_prefix(token: &str) -> String {
+        let stem = if token.len() < 4 || !token.chars().all(|c| c.is_ascii_alphabetic()) {
+            token
+        } else {
+            let lower = token.to_ascii_lowercase();
+            if lower.ends_with("es") {
+                // The stem's prefix `*` also covers `e`-singulars (caches → cach*).
+                &token[..token.len() - 2]
+            } else if lower.ends_with('s') && !lower.ends_with("ss") {
+                &token[..token.len() - 1]
+            } else {
+                token
+            }
+        };
+        format!("\"{stem}\" *")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_doc(id: &str, title: &str, content: &str) -> SessionDoc {
+        SessionDoc {
+            session_id: id.to_string(),
+            cwd: "/test/workspace".to_string(),
+            updated_at_unix: 1700000000,
+            title: title.to_string(),
+            content: content.to_string(),
+            content_hash: blake3::hash(content.as_bytes()).to_hex().to_string(),
+            last_indexed_offset: 0,
+        }
+    }
+
+    fn open(tmp: &TempDir) -> SessionSearchIndex {
+        SessionSearchIndex::open_or_create(&tmp.path().join("session_search.sqlite")).unwrap()
+    }
+
+    #[test]
+    fn test_open_or_create_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let _i1 = open(&tmp);
+        let _i2 = open(&tmp);
+    }
+
+    fn journal_mode(index: &SessionSearchIndex) -> String {
+        index
+            .db
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_open_or_create_uses_wal_on_local_fs() {
+        // Ambient kill-switch would override the decision; skip if set.
+        if std::env::var("GROK_SQLITE_JOURNAL_MODE").is_ok() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(journal_mode(&open(&tmp)), "wal");
+    }
+
+    #[test]
+    fn test_network_mode_uses_fresh_per_host_truncate_db() {
+        // Network mode opens a per-host sibling of the given path (the
+        // legacy shared file is left untouched — a live old binary can flip
+        // it back to WAL at any time) in rollback-journal mode, and the
+        // index is fully usable there.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session_search.sqlite");
+
+        let index =
+            SessionSearchIndex::open_with_journal_mode(&path, JournalMode::Truncate).unwrap();
+        assert_eq!(journal_mode(&index), "truncate");
+        index
+            .upsert_doc(&test_doc("s1", "NFS crash", "sigbus walIndexTryHdr"))
+            .unwrap();
+        let hits = index.query("sigbus", None, 10, 0, false).unwrap();
+        assert_eq!(hits.results.len(), 1);
+        drop(index);
+
+        let eff = JournalMode::Truncate.effective_db_path(&path);
+        assert_ne!(eff, path);
+        let base = eff.display().to_string();
+        assert!(!std::fs::exists(format!("{base}-wal")).unwrap());
+        assert!(!std::fs::exists(format!("{base}-shm")).unwrap());
+    }
+
+    #[test]
+    fn test_version_mismatch_drops_docs_and_preserves_unrelated_meta() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let index = open(&tmp);
+            index
+                .upsert_doc(&test_doc("s1", "Rust debugging", "borrow checker"))
+                .unwrap();
+            index.set_meta("last_bootstrap_at", "1700000000").unwrap();
+            index.set_meta("last_upload_at", "1700000001").unwrap();
+        }
+
+        {
+            // Guard against the drop branch firing on every open: a reopen at
+            // the current version must keep the docs.
+            let same_version = open(&tmp);
+            assert_eq!(
+                same_version.all_indexed_session_ids().unwrap(),
+                vec!["s1".to_string()],
+                "docs must survive a same-version reopen"
+            );
+            // Simulate a database written by an older schema version.
+            same_version
+                .set_meta("session_search_schema_version", "3")
+                .unwrap();
+            assert_eq!(
+                same_version
+                    .get_meta("session_search_schema_version")
+                    .unwrap()
+                    .as_deref(),
+                Some("3"),
+                "version downgrade must take effect for the migration to fire"
+            );
+        }
+
+        let reopened = open(&tmp);
+        assert!(
+            reopened.all_indexed_session_ids().unwrap().is_empty(),
+            "stale docs must be dropped on version mismatch"
+        );
+        assert_eq!(
+            reopened
+                .get_meta("session_search_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some(SCHEMA_VERSION),
+            "schema version must be rewritten to current"
+        );
+        // The drop batch invalidates the completed-bootstrap marker (the
+        // dropped tables no longer reflect a completed bootstrap) but leaves
+        // every other `meta` key alone.
+        assert_eq!(
+            reopened.get_meta("last_bootstrap_at").unwrap(),
+            None,
+            "the completed-bootstrap marker must be invalidated by the drop"
+        );
+        assert_eq!(
+            reopened.get_meta("last_upload_at").unwrap().as_deref(),
+            Some("1700000001"),
+            "unrelated meta keys must survive the drop"
+        );
+        // Recreated tables + FTS triggers must be functional end-to-end.
+        reopened
+            .upsert_doc(&test_doc("s2", "Python profiling", "flamegraph"))
+            .unwrap();
+        let qr = reopened.query("python", None, 10, 0, false).unwrap();
+        assert_eq!(qr.total_estimate, Some(1));
+        assert_eq!(qr.results[0].session_id, "s2");
+    }
+
+    #[test]
+    fn test_newer_version_index_is_tolerated_not_dropped() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let index = open(&tmp);
+            index
+                .upsert_doc(&test_doc("s1", "Rust debugging", "borrow checker"))
+                .unwrap();
+            // Simulate an index owned by a newer grok generation that has
+            // completed a bootstrap.
+            index
+                .set_meta("session_search_schema_version", "5")
+                .unwrap();
+            index.set_meta("last_bootstrap_at", "1700000000").unwrap();
+        }
+
+        let reopened = open(&tmp);
+        assert_eq!(
+            reopened.all_indexed_session_ids().unwrap(),
+            vec!["s1".to_string()],
+            "docs must survive an older binary opening a newer index"
+        );
+        assert_eq!(
+            reopened
+                .get_meta("session_search_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some("5"),
+            "the newer generation keeps ownership of the version row"
+        );
+        assert_eq!(
+            reopened.get_meta("last_bootstrap_at").unwrap().as_deref(),
+            Some("1700000000"),
+            "no drop happened, so the newer index's bootstrap marker must survive"
+        );
+        // The tolerated index must stay fully usable for the older binary.
+        let qr = reopened.query("borrow", None, 10, 0, false).unwrap();
+        assert_eq!(qr.results[0].session_id, "s1");
+    }
+
+    #[test]
+    fn test_corrupt_version_row_drops_index() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let index = open(&tmp);
+            index
+                .upsert_doc(&test_doc("s1", "Rust debugging", "borrow checker"))
+                .unwrap();
+            index
+                .set_meta("session_search_schema_version", "garbage")
+                .unwrap();
+        }
+
+        let reopened = open(&tmp);
+        assert!(
+            reopened.all_indexed_session_ids().unwrap().is_empty(),
+            "a corrupt version row must drop and rebuild"
+        );
+        assert_eq!(
+            reopened
+                .get_meta("session_search_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some(SCHEMA_VERSION),
+            "rebuild rewrites the current version"
+        );
+    }
+
+    /// Repro: the on-disk state left behind by a pre-ratchet binary that
+    /// wiped the shared DB and ran its own bootstrap — a v3-stamped index
+    /// with a *recent* bootstrap marker. Pins that the current binary's open
+    /// drops the tables AND deletes the marker together (see the drop batch
+    /// in `open_or_create`); a surviving marker would suppress re-bootstrap
+    /// over empty tables.
+    #[test]
+    fn test_upgrade_drop_invalidates_completed_bootstrap_marker() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let index = open(&tmp);
+            index
+                .upsert_doc(&test_doc("s1", "old-binary doc", "indexed by v3"))
+                .unwrap();
+            index
+                .set_meta("session_search_schema_version", "3")
+                .unwrap();
+            index.set_meta("last_bootstrap_at", "1783393389").unwrap();
+        }
+
+        let reopened = open(&tmp);
+        assert!(
+            reopened.all_indexed_session_ids().unwrap().is_empty(),
+            "v3 docs must be dropped on upgrade"
+        );
+        assert_eq!(
+            reopened
+                .get_meta("session_search_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some(SCHEMA_VERSION),
+            "upgrade must stamp the current version"
+        );
+        assert_eq!(
+            reopened.get_meta("last_bootstrap_at").unwrap(),
+            None,
+            "the stale bootstrap marker must not survive the upgrade drop, \
+             or the wiped index would be treated as fully bootstrapped"
+        );
+
+        // A subsequent bootstrap can repopulate and re-stamp the marker.
+        reopened
+            .upsert_doc(&test_doc("s2", "fresh doc", "indexed by v4"))
+            .unwrap();
+        reopened
+            .set_meta("last_bootstrap_at", "1783393999")
+            .unwrap();
+        let qr = reopened.query("fresh", None, 10, 0, false).unwrap();
+        assert_eq!(qr.results[0].session_id, "s2");
+    }
+
+    #[test]
+    fn test_upsert_and_query() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index
+            .upsert_doc(&test_doc(
+                "s1",
+                "Rust debugging",
+                "fix the borrow checker issue",
+            ))
+            .unwrap();
+
+        let qr = index.query("rust", None, 10, 0, false).unwrap();
+        assert_eq!(qr.total_estimate, Some(1));
+        assert_eq!(qr.results[0].session_id, "s1");
+        assert!(qr.results[0].score > 0.0);
+        assert!(qr.results[0].matched_fields.contains(&"title".to_string()));
+    }
+
+    #[test]
+    fn test_upsert_updates_existing() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index
+            .upsert_doc(&test_doc("s1", "Old title", "old content"))
+            .unwrap();
+        index
+            .upsert_doc(&test_doc("s1", "New title about kubernetes", "new content"))
+            .unwrap();
+
+        let old = index.query("old", None, 10, 0, false).unwrap();
+        assert!(
+            old.results.is_empty(),
+            "old content should not be searchable"
+        );
+
+        let new = index.query("kubernetes", None, 10, 0, false).unwrap();
+        assert_eq!(new.results.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_doc() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index
+            .upsert_doc(&test_doc("s1", "Delete me", "some content about python"))
+            .unwrap();
+        assert_eq!(index.all_indexed_session_ids().unwrap().len(), 1);
+
+        index.delete_doc("s1").unwrap();
+        assert!(index.all_indexed_session_ids().unwrap().is_empty());
+
+        assert!(
+            index
+                .query("python", None, 10, 0, false)
+                .unwrap()
+                .results
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_content_hash_dedup() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        let doc = test_doc("s1", "Title", "body");
+        index.upsert_doc(&doc).unwrap();
+
+        assert_eq!(
+            index.get_content_hash("s1").unwrap().as_deref(),
+            Some(doc.content_hash.as_str())
+        );
+        assert_eq!(index.get_content_hash("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_insert_doc_if_absent_never_overwrites() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        let full = test_doc("s1", "Rust debugging", "borrow checker");
+        index.upsert_doc(&full).unwrap();
+
+        // Conflict arm: an existing (fuller) row must be left untouched.
+        index
+            .insert_doc_if_absent(&test_doc("s1", "placeholder", ""))
+            .unwrap();
+        assert_eq!(
+            index.get_content_hash("s1").unwrap().as_deref(),
+            Some(full.content_hash.as_str()),
+            "existing row must not be downgraded to the placeholder"
+        );
+        let qr = index.query("borrow", None, 10, 0, false).unwrap();
+        assert_eq!(
+            qr.results[0].session_id, "s1",
+            "full content must remain FTS-queryable after the no-op insert"
+        );
+
+        // Insert arm: a new id must land and fire the FTS trigger.
+        index
+            .insert_doc_if_absent(&test_doc("s2", "Python profiling", ""))
+            .unwrap();
+        let qr = index.query("python", None, 10, 0, false).unwrap();
+        assert_eq!(qr.total_estimate, Some(1));
+        assert_eq!(qr.results[0].session_id, "s2");
+    }
+
+    #[test]
+    fn test_query_cwd_filter() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+
+        let mut doc_a = test_doc("s1", "Rust project", "cargo build");
+        doc_a.cwd = "/workspace/a".to_string();
+        let mut doc_b = test_doc("s2", "Rust library", "cargo test");
+        doc_b.cwd = "/workspace/b".to_string();
+        index.upsert_doc(&doc_a).unwrap();
+        index.upsert_doc(&doc_b).unwrap();
+
+        let all = index.query("rust", None, 10, 0, false).unwrap();
+        assert_eq!(all.results.len(), 2);
+
+        let filtered = index
+            .query("rust", Some("/workspace/a"), 10, 0, false)
+            .unwrap();
+        assert_eq!(filtered.results.len(), 1);
+        assert_eq!(filtered.results[0].session_id, "s1");
+    }
+
+    #[test]
+    fn test_query_pagination() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        for i in 0..5 {
+            index
+                .upsert_doc(&test_doc(
+                    &format!("s{i}"),
+                    &format!("Session {i}"),
+                    &format!("rust content {i}"),
+                ))
+                .unwrap();
+        }
+
+        let page1 = index.query("rust", None, 2, 0, false).unwrap();
+        assert_eq!(page1.results.len(), 2);
+        assert_eq!(page1.total_estimate, Some(5));
+        assert_eq!(page1.next_offset, Some(2));
+
+        let page2 = index.query("rust", None, 2, 2, false).unwrap();
+        assert_eq!(page2.results.len(), 2);
+    }
+
+    #[test]
+    fn test_query_with_snippets() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index
+            .upsert_doc(&test_doc(
+                "s1",
+                "Debugging session",
+                "the rust borrow checker was causing lifetime errors in the parser",
+            ))
+            .unwrap();
+
+        let qr = index.query("borrow checker", None, 10, 0, true).unwrap();
+        assert_eq!(qr.results.len(), 1);
+        assert!(qr.results[0].snippet.is_some());
+    }
+
+    #[test]
+    fn test_query_empty_string() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index.upsert_doc(&test_doc("s1", "Title", "body")).unwrap();
+
+        let qr = index.query("", None, 10, 0, false).unwrap();
+        assert!(qr.results.is_empty());
+        assert_eq!(qr.total_estimate, Some(0));
+    }
+
+    #[test]
+    fn test_query_special_chars_sanitized() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index
+            .upsert_doc(&test_doc("s1", "Title", "hello world"))
+            .unwrap();
+
+        // Special chars should be stripped, leaving "hello"
+        let qr = index.query("hello!!!", None, 10, 0, false).unwrap();
+        assert_eq!(qr.results.len(), 1);
+    }
+
+    #[test]
+    fn test_matched_fields_title_vs_content() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index
+            .upsert_doc(&test_doc(
+                "s1",
+                "kubernetes deployment",
+                "unrelated body text",
+            ))
+            .unwrap();
+
+        let qr = index.query("kubernetes", None, 10, 0, false).unwrap();
+        assert_eq!(qr.results.len(), 1);
+        assert!(qr.results[0].matched_fields.contains(&"title".to_string()));
+    }
+
+    /// cwd is a filter dimension, not a search dimension. A term that only
+    /// appears in the cwd must never cause a session to match.
+    #[test]
+    fn test_cwd_not_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        let mut doc = test_doc("s1", "unrelated title", "unrelated content");
+        doc.cwd = "/Users/alice/workspace/supercalifragilistic".to_string();
+        index.upsert_doc(&doc).unwrap();
+
+        let qr = index
+            .query("supercalifragilistic", None, 10, 0, false)
+            .unwrap();
+        assert!(
+            qr.results.is_empty(),
+            "cwd-only term must not match, got {} results",
+            qr.results.len()
+        );
+    }
+
+    #[test]
+    fn test_query_filename_tokens_split() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index
+            .upsert_doc(&test_doc(
+                "s1",
+                "Fix list rendering",
+                "the bug lives in session_picker.rs near the filter",
+            ))
+            .unwrap();
+
+        // Pins splitting on stripped chars: gluing the fragments produced the
+        // never-indexed token `session_pickerrs`, so this query found nothing.
+        let qr = index
+            .query("session_picker.rs", None, 10, 0, false)
+            .unwrap();
+        assert_eq!(qr.total_estimate, Some(1));
+        assert_eq!(qr.results[0].session_id, "s1");
+    }
+
+    #[test]
+    fn test_query_and_first_with_or_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index
+            .upsert_doc(&test_doc(
+                "s1",
+                "Borrow both",
+                "fix the borrow checker issue",
+            ))
+            .unwrap();
+        index
+            .upsert_doc(&test_doc("s2", "Borrow only", "borrow money from the bank"))
+            .unwrap();
+        index
+            .upsert_doc(&test_doc("s3", "Tokio doc", "tokio runtime setup"))
+            .unwrap();
+        index
+            .upsert_doc(&test_doc("s4", "Sqlite doc", "sqlite index tuning"))
+            .unwrap();
+
+        // AND has hits: only the doc matching every token is returned, so
+        // partial matches cannot dilute the result set.
+        let qr = index.query("borrow checker", None, 10, 0, false).unwrap();
+        assert_eq!(qr.total_estimate, Some(1));
+        assert_eq!(qr.results[0].session_id, "s1");
+
+        // A separator-only word (`->`) must be dropped, not become an empty
+        // phrase that silently makes the whole AND match nothing.
+        let qr = index.query("fix -> borrow", None, 10, 0, false).unwrap();
+        assert_eq!(qr.total_estimate, Some(1));
+        assert_eq!(qr.results[0].session_id, "s1");
+
+        // No doc has both tokens: the OR rerun surfaces the partial matches.
+        let qr = index.query("tokio sqlite", None, 10, 0, false).unwrap();
+        assert_eq!(qr.total_estimate, Some(2));
+        let ids: Vec<&str> = qr.results.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"s3") && ids.contains(&"s4"),
+            "OR fallback must return both partial matches: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_query_plural_variants() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index
+            .upsert_doc(&test_doc("s1", "Plural doc", "resumed sessions list"))
+            .unwrap();
+        index
+            .upsert_doc(&test_doc("s2", "Singular doc", "resume the session flow"))
+            .unwrap();
+
+        // Plural query, singular doc: pins the query-side stem — without it
+        // `sessions*` cannot prefix-match `session`.
+        let qr = index.query("sessions", None, 10, 0, false).unwrap();
+        let ids: Vec<&str> = qr.results.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"s2"),
+            "singular doc must match a plural query: {ids:?}"
+        );
+
+        // Singular query, plural doc: pins the prefix-`*` coverage that makes
+        // an added plural variant unnecessary.
+        let qr = index.query("session", None, 10, 0, false).unwrap();
+        let ids: Vec<&str> = qr.results.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"s1"),
+            "plural doc must match a singular query: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_query_pure_symbol_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        index.upsert_doc(&test_doc("s1", "Title", "body")).unwrap();
+
+        // No indexable characters: the raw-phrase fallback must not error.
+        let qr = index.query("…", None, 10, 0, false).unwrap();
+        assert!(qr.results.is_empty());
+        assert_eq!(qr.total_estimate, Some(0));
+    }
+}

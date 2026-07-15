@@ -1,0 +1,157 @@
+//! Standalone voice debug harness: mic → streaming STT → transcript.
+//!
+//! ```bash
+//! export XAI_API_KEY=...
+//! cargo run -p xai-grok-voice --bin voice-probe -- --seconds 5
+//! ```
+
+use std::path::PathBuf;
+
+use xai_grok_voice::{
+    StaticVoiceAuth, VoiceConfig, VoiceProbeOptions, format_probe_report, run_streaming_probe,
+};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Standalone binary: install the process-level rustls provider (the pager
+    // does this in its own main), or the first TLS/WSS connect panics with
+    // "Could not automatically determine the process-level CryptoProvider".
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,xai_grok_voice=debug".into()),
+        )
+        .init();
+
+    let args = parse_args(std::env::args().skip(1).collect());
+
+    let auth = std::env::var("XAI_API_KEY")
+        .ok()
+        .and_then(StaticVoiceAuth::shared)
+        .ok_or_else(|| {
+            anyhow::anyhow!("set XAI_API_KEY (standalone probe has no login session)")
+        })?;
+
+    let config = load_config(args.config_path.as_deref());
+
+    eprintln!(
+        "Voice probe: listening {}s (sample_rate={})",
+        args.seconds, config.sample_rate
+    );
+    eprintln!("Speak now...\n");
+
+    if args.mic_only {
+        #[cfg(feature = "audio")]
+        {
+            let (bytes, chunks) =
+                xai_grok_voice::run_mic_only_probe(config.sample_rate, args.seconds)?;
+            println!("Mic-only OK: {bytes} bytes in {chunks} chunks");
+            if bytes == 0 {
+                println!("WARNING: no audio — grant mic access to the terminal");
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "audio"))]
+        anyhow::bail!("built without `audio` feature");
+    }
+
+    let report = run_streaming_probe(VoiceProbeOptions {
+        config,
+        auth,
+        capture_secs: args.seconds,
+    })
+    .await?;
+
+    print!("{}", format_probe_report(&report));
+    if report
+        .transcript
+        .as_ref()
+        .is_none_or(|t| t.trim().is_empty())
+    {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+struct Args {
+    seconds: u32,
+    config_path: Option<PathBuf>,
+    mic_only: bool,
+}
+
+fn parse_args(argv: Vec<String>) -> Args {
+    let mut out = Args {
+        seconds: 5,
+        config_path: None,
+        mic_only: false,
+    };
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--seconds" | "-s" => {
+                i += 1;
+                if i < argv.len() {
+                    out.seconds = argv[i].parse().unwrap_or(5);
+                }
+            }
+            "--config" => {
+                i += 1;
+                if i < argv.len() {
+                    out.config_path = Some(PathBuf::from(&argv[i]));
+                }
+            }
+            "--mic-only" => out.mic_only = true,
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other if !other.starts_with('-') => {}
+            _ => eprintln!("unknown arg: {}", argv[i]),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn load_config(path: Option<&std::path::Path>) -> VoiceConfig {
+    if let Some(path) = path
+        && let Ok(raw) = std::fs::read_to_string(path)
+        && let Ok(table) = toml::from_str::<toml::Table>(&raw)
+    {
+        return VoiceConfig::from_config_table(&table);
+    }
+    if let Ok(home) = std::env::var("GROK_HOME")
+        && let Ok(raw) = std::fs::read_to_string(PathBuf::from(home).join("config.toml"))
+        && let Ok(table) = toml::from_str::<toml::Table>(&raw)
+    {
+        return VoiceConfig::from_config_table(&table);
+    }
+    if let Ok(raw) = std::fs::read_to_string(
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".grok/config.toml"),
+    ) && let Ok(table) = toml::from_str::<toml::Table>(&raw)
+    {
+        return VoiceConfig::from_config_table(&table);
+    }
+    VoiceConfig::default()
+}
+
+fn print_help() {
+    eprintln!(
+        r#"voice-probe — debug mic + STT outside the pager
+
+Usage:
+  voice-probe [--seconds 5] [--mic-only]
+
+Environment:
+  XAI_API_KEY     required
+  RUST_LOG        optional (default info,xai_grok_voice=debug)
+
+Reads [voice] from ~/.grok/config.toml unless --config PATH is set.
+"#
+    );
+}

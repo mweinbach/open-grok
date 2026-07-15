@@ -1,0 +1,77 @@
+name: inline-edit-unchanged-exit
+description: >-
+  Enter on an inline prompt editor whose text is unchanged just closes the
+  editor: no rewind popup, no resubmit, transcript untouched. The editor
+  being live is proven by a typed char mutating the entry on screen (then
+  backspaced away); the editor being closed afterwards is proven by a
+  follow-up `j` NOT appearing in the entry text (it moves the scrollback
+  selection instead).
+terminal:
+  rows: 40
+  cols: 110
+mock:
+  response: "UNCHANGED_MOCK_ANSWER from the scripted server."
+steps:
+  - action: wait_for_text
+    text: Quit
+    timeout_ms: 20000
+  - action: type_text
+    text: "leave me alone UNCHANGED_BASE"
+  - action: keys
+    keys: "<Enter>"
+  - action: wait_for_text
+    text: UNCHANGED_MOCK_ANSWER
+    timeout_ms: 30000
+  - action: wait
+    millis: 500
+  # Tab focuses the scrollback (raw byte: ptyctl's <Tab> notation is not
+  # encodable by the Xterm key encoder and would be silently skipped).
+  - action: type_text
+    text: "\t"
+  # Footer swaps to the scrollback hint set once the pane owns keys.
+  - action: wait_for_text
+    text: "Space:prompt"
+    timeout_ms: 10000
+  # Up-arrow clamps the selection onto the first selectable entry — the
+  # user prompt (bare `k` needs vim mode; in the default mode a letter
+  # bounces focus back to the composer and types itself).
+  - action: keys
+    keys: "<Up><Up><Up><Up><Up><Up>"
+  - action: keys
+    keys: "<Enter>"
+  # Editor is live: a typed char shows up inside the entry ...
+  - action: keys
+    keys: "Z"
+  - action: wait_for_text
+    text: "UNCHANGED_BASEZ"
+    timeout_ms: 10000
+  # ... then restore the original text so the submit is a no-op.
+  - action: keys
+    keys: "<BS>"
+  - action: keys
+    keys: "<Enter>"
+  - action: wait
+    millis: 800
+  # No rewind popup of either flavor ever appears.
+  - action: assert_not_contains
+    text: "Resubmit from here"
+  - action: assert_not_contains
+    text: "What do you want to rewind"
+  # Editor closed: j navigates the scrollback instead of inserting.
+  - action: keys
+    keys: "j"
+  - action: wait
+    millis: 300
+  - action: assert_not_contains
+    text: "UNCHANGED_BASEj"
+  # Transcript intact.
+  - action: assert_contains
+    text: "UNCHANGED_BASE"
+  - action: assert_contains
+    text: UNCHANGED_MOCK_ANSWER
+  - action: assert_not_contains
+    text: panicked
+  - action: assert_running
+  - action: screenshot
+    name: unchanged-exit
+    note: Unchanged Enter closed the editor silently; transcript untouched.

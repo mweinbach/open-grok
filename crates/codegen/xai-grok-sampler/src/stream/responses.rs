@@ -1,0 +1,1025 @@
+//! Layer-2 stream transform for the OpenAI Responses API.
+//!
+//! Consumes a raw `rs::ResponseStreamEvent` stream and produces
+//! [`SamplingEvent`]s. Pure: no I/O, no shell coupling.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use futures_util::StreamExt;
+use futures_util::stream::{BoxStream, Stream};
+
+use xai_grok_sampling_types::{
+    ConversationItem, ConversationResponse, ResponseModelMetadata, SamplingError, StopReason,
+    TokenUsage, rs,
+};
+
+use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
+use crate::metrics::InferenceLatencyStats;
+use crate::types::RequestId;
+
+/// Returns whether a Responses API event reflects real model progress
+/// rather than a liveness-only heartbeat / status transition.
+pub(crate) fn responses_event_has_meaningful_content(event: &rs::ResponseStreamEvent) -> bool {
+    use rs::ResponseStreamEvent;
+
+    match event {
+        ResponseStreamEvent::ResponseCreated(_)
+        | ResponseStreamEvent::ResponseInProgress(_)
+        | ResponseStreamEvent::ResponseQueued(_) => false,
+        ResponseStreamEvent::ResponseOutputTextDelta(event) => !event.delta.is_empty(),
+        ResponseStreamEvent::ResponseOutputTextDone(event) => !event.text.is_empty(),
+        ResponseStreamEvent::ResponseRefusalDelta(event) => !event.delta.is_empty(),
+        ResponseStreamEvent::ResponseRefusalDone(event) => !event.refusal.is_empty(),
+        ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(event) => !event.delta.is_empty(),
+        ResponseStreamEvent::ResponseFunctionCallArgumentsDone(event) => {
+            !event.arguments.is_empty() || event.name.as_ref().is_some_and(|name| !name.is_empty())
+        }
+        ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => !event.delta.is_empty(),
+        ResponseStreamEvent::ResponseReasoningSummaryTextDone(event) => !event.text.is_empty(),
+        ResponseStreamEvent::ResponseReasoningTextDelta(event) => !event.delta.is_empty(),
+        ResponseStreamEvent::ResponseReasoningTextDone(event) => !event.text.is_empty(),
+        ResponseStreamEvent::ResponseMCPCallArgumentsDelta(event) => !event.delta.is_empty(),
+        ResponseStreamEvent::ResponseMCPCallArgumentsDone(event) => !event.arguments.is_empty(),
+        ResponseStreamEvent::ResponseCodeInterpreterCallCodeDelta(event) => !event.delta.is_empty(),
+        ResponseStreamEvent::ResponseCodeInterpreterCallCodeDone(event) => !event.code.is_empty(),
+        ResponseStreamEvent::ResponseCustomToolCallInputDelta(event) => !event.delta.is_empty(),
+        ResponseStreamEvent::ResponseCustomToolCallInputDone(event) => !event.input.is_empty(),
+        ResponseStreamEvent::ResponseCompleted(_)
+        | ResponseStreamEvent::ResponseFailed(_)
+        | ResponseStreamEvent::ResponseIncomplete(_)
+        | ResponseStreamEvent::ResponseOutputItemAdded(_)
+        | ResponseStreamEvent::ResponseOutputItemDone(_)
+        | ResponseStreamEvent::ResponseContentPartAdded(_)
+        | ResponseStreamEvent::ResponseContentPartDone(_)
+        | ResponseStreamEvent::ResponseFileSearchCallInProgress(_)
+        | ResponseStreamEvent::ResponseFileSearchCallSearching(_)
+        | ResponseStreamEvent::ResponseFileSearchCallCompleted(_)
+        | ResponseStreamEvent::ResponseWebSearchCallInProgress(_)
+        | ResponseStreamEvent::ResponseWebSearchCallSearching(_)
+        | ResponseStreamEvent::ResponseWebSearchCallCompleted(_)
+        | ResponseStreamEvent::ResponseReasoningSummaryPartAdded(_)
+        | ResponseStreamEvent::ResponseReasoningSummaryPartDone(_)
+        | ResponseStreamEvent::ResponseImageGenerationCallCompleted(_)
+        | ResponseStreamEvent::ResponseImageGenerationCallGenerating(_)
+        | ResponseStreamEvent::ResponseImageGenerationCallInProgress(_)
+        | ResponseStreamEvent::ResponseImageGenerationCallPartialImage(_)
+        | ResponseStreamEvent::ResponseMCPCallCompleted(_)
+        | ResponseStreamEvent::ResponseMCPCallFailed(_)
+        | ResponseStreamEvent::ResponseMCPCallInProgress(_)
+        | ResponseStreamEvent::ResponseMCPListToolsCompleted(_)
+        | ResponseStreamEvent::ResponseMCPListToolsFailed(_)
+        | ResponseStreamEvent::ResponseMCPListToolsInProgress(_)
+        | ResponseStreamEvent::ResponseCodeInterpreterCallInProgress(_)
+        | ResponseStreamEvent::ResponseCodeInterpreterCallInterpreting(_)
+        | ResponseStreamEvent::ResponseCodeInterpreterCallCompleted(_)
+        | ResponseStreamEvent::ResponseOutputTextAnnotationAdded(_)
+        | ResponseStreamEvent::ResponseError(_) => true,
+    }
+}
+
+/// Transform a raw Responses API event stream into a stream of
+/// [`SamplingEvent`]s.
+///
+/// Yields exactly one terminal event ([`SamplingEvent::Completed`] or
+/// [`SamplingEvent::Failed`]) per request. Server-side `ResponseFailed`
+/// and `ResponseError` events are translated to
+/// `SamplingError::Api { status: 500, .. }` so the actor's retry loop
+/// treats them as retryable.
+///
+/// `doom_loop` is the collector returned alongside `raw_stream` by
+/// `SamplingClient::conversation_stream_responses`; any signals the SSE
+/// decoder recorded are drained onto the final `ConversationResponse`.
+/// `None` (check disabled) leaves the response untouched.
+pub fn stream_responses<'a>(
+    raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
+    model_metadata: Option<ResponseModelMetadata>,
+    request_id: RequestId,
+    idle_timeout: Duration,
+    doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
+) -> impl Stream<Item = SamplingEvent> + Send + 'a {
+    async_stream::stream! {
+        use rs::{ResponseStreamEvent, Status};
+
+        let stream_start = Instant::now();
+        let mut chunk_timestamps: Vec<Instant> = Vec::new();
+
+        yield SamplingEvent::StreamStarted {
+            request_id: request_id.clone(),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        if let Some(metadata) = model_metadata {
+            yield SamplingEvent::ModelMetadata {
+                request_id: request_id.clone(),
+                metadata,
+            };
+        }
+
+        let mut final_response: Option<rs::Response> = None;
+        let mut chunk_index: u64 = 0;
+        let mut message_chunk_count: u64 = 0;
+        let mut first_token_emitted = false;
+        let mut reasoning_acc = String::new();
+        let mut last_content_chunk_at = Instant::now();
+
+        // Maps Responses API `output_index` to our tool-only `tool_index`.
+        // Populated when `ResponseOutputItemAdded` carries a `FunctionCall`;
+        // later `ResponseFunctionCallArgumentsDelta` events
+        // look up `output_index` here to find the matching `tool_index`.
+        let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut next_tool_index: u32 = 0;
+
+        let mut stream = raw_stream;
+        loop {
+            let event_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
+                Ok(Some(event_result)) => event_result,
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    let err = SamplingError::IdleTimeout {
+                        elapsed_secs: idle_timeout.as_secs(),
+                    };
+                    yield SamplingEvent::Failed {
+                        request_id: request_id.clone(),
+                        error: SamplingErrorInfo::from(&err),
+                    };
+                    return;
+                }
+            };
+
+            let event = match event_result {
+                Ok(event) => event,
+                Err(err) => {
+                    yield SamplingEvent::Failed {
+                        request_id: request_id.clone(),
+                        error: SamplingErrorInfo::from(&err),
+                    };
+                    return;
+                }
+            };
+
+            // A confident server-detected loop aborts the attempt (dropping
+            // the SSE connection) so the retry loop can resample instead of
+            // streaming the burning tail. Checked before the event is
+            // processed so a terminal frame carrying the signal never
+            // becomes the accepted response while the abort is armed.
+            if let Some(triggers) = doom_loop.as_ref().and_then(|c| c.abort_triggers()) {
+                let err = SamplingError::DoomLoopDetected {
+                    triggers,
+                    aborted_at_chunk: Some(chunk_index),
+                };
+                yield SamplingEvent::Failed {
+                    request_id: request_id.clone(),
+                    error: SamplingErrorInfo::from(&err),
+                };
+                return;
+            }
+
+            let event_has_content = responses_event_has_meaningful_content(&event);
+
+            // Track whether ResponseIncomplete should break the loop
+            // after the content-aware idle check below.
+            let mut should_break = false;
+
+            match event {
+                ResponseStreamEvent::ResponseOutputTextDelta(text_delta_event) => {
+                    let delta = text_delta_event.delta;
+                    if !delta.is_empty() {
+                        if !first_token_emitted {
+                            first_token_emitted = true;
+                            yield SamplingEvent::FirstToken {
+                                request_id: request_id.clone(),
+                            };
+                        }
+                        chunk_timestamps.push(Instant::now());
+                        chunk_index += 1;
+                        message_chunk_count += 1;
+                        yield SamplingEvent::ChannelToken {
+                            request_id: request_id.clone(),
+                            channel: SamplingChannel::Text,
+                            text: delta,
+                            chunk_index,
+                        };
+                    }
+                }
+
+                ResponseStreamEvent::ResponseReasoningSummaryTextDelta(summary_event) => {
+                    let delta = summary_event.delta;
+                    if !delta.is_empty() {
+                        if !first_token_emitted {
+                            first_token_emitted = true;
+                            yield SamplingEvent::FirstToken {
+                                request_id: request_id.clone(),
+                            };
+                        }
+                        chunk_index += 1;
+                        yield SamplingEvent::ChannelToken {
+                            request_id: request_id.clone(),
+                            channel: SamplingChannel::Reasoning,
+                            text: delta,
+                            chunk_index,
+                        };
+                    }
+                }
+
+                ResponseStreamEvent::ResponseReasoningTextDelta(reasoning_event) => {
+                    let delta = reasoning_event.delta;
+                    if !delta.is_empty() {
+                        if !first_token_emitted {
+                            first_token_emitted = true;
+                            yield SamplingEvent::FirstToken {
+                                request_id: request_id.clone(),
+                            };
+                        }
+                        chunk_index += 1;
+                        reasoning_acc.push_str(&delta);
+                        yield SamplingEvent::ChannelToken {
+                            request_id: request_id.clone(),
+                            channel: SamplingChannel::Reasoning,
+                            text: delta,
+                            chunk_index,
+                        };
+                    }
+                }
+
+                // Start of a Responses FunctionCall — emit initial id+name
+                // and remember the output_index → tool_index mapping.
+                ResponseStreamEvent::ResponseOutputItemAdded(added_event) => {
+                    if let rs::OutputItem::FunctionCall(fc) = added_event.item {
+                        let tool_index = next_tool_index;
+                        next_tool_index += 1;
+                        output_to_tool_index.insert(added_event.output_index, tool_index);
+
+                        yield SamplingEvent::ToolCallDelta {
+                            request_id: request_id.clone(),
+                            tool_index,
+                            id: Some(fc.call_id),
+                            name: Some(fc.name),
+                            arguments_delta: None,
+                        };
+                    }
+                }
+
+                // Continuation chunk for a streaming FunctionCall's args.
+                // Drop silently if no preceding OutputItemAdded mapped.
+                ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(args_event) => {
+                    let delta = args_event.delta;
+                    if !delta.is_empty()
+                        && let Some(&tool_index) =
+                            output_to_tool_index.get(&args_event.output_index)
+                    {
+                        yield SamplingEvent::ToolCallDelta {
+                            request_id: request_id.clone(),
+                            tool_index,
+                            id: None,
+                            name: None,
+                            arguments_delta: Some(delta),
+                        };
+                    }
+                }
+
+                ResponseStreamEvent::ResponseCompleted(completed_event) => {
+                    final_response = Some(completed_event.response);
+                }
+
+                ResponseStreamEvent::ResponseIncomplete(incomplete_event) => {
+                    final_response = Some(incomplete_event.response);
+                    should_break = true;
+                }
+
+                ResponseStreamEvent::ResponseFailed(failed_event) => {
+                    let response = failed_event.response;
+                    let error_message = response
+                        .error
+                        .as_ref()
+                        .map(|e| format!("{}: {}", e.code, e.message))
+                        .unwrap_or_else(|| "Response failed with unknown error".to_string());
+                    let err = SamplingError::Api {
+                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                        message: error_message,
+                        model_metadata: None,
+                        retry_after_secs: None,
+                        should_retry: None,
+                    };
+                    yield SamplingEvent::Failed {
+                        request_id: request_id.clone(),
+                        error: SamplingErrorInfo::from(&err),
+                    };
+                    return;
+                }
+
+                ResponseStreamEvent::ResponseError(error_event) => {
+                    let code = error_event.code.unwrap_or_else(|| "error".to_string());
+                    let error_message = format!("{}: {}", code, error_event.message);
+                    let err = SamplingError::Api {
+                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                        message: error_message,
+                        model_metadata: None,
+                        retry_after_secs: None,
+                        should_retry: None,
+                    };
+                    yield SamplingEvent::Failed {
+                        request_id: request_id.clone(),
+                        error: SamplingErrorInfo::from(&err),
+                    };
+                    return;
+                }
+
+                // ── Backend-hosted tool lifecycle events ────────────
+                // These tools are executed server-side by the agentic
+                // sampler. We emit progress events so the shell/pager
+                // can show status to the user.
+
+                // Web search
+                ResponseStreamEvent::ResponseWebSearchCallInProgress(ev) => {
+                    yield SamplingEvent::BackendToolCallStarted {
+                        request_id: request_id.clone(),
+                        call_id: ev.item_id.clone(),
+                        name: "web_search".to_string(),
+                    };
+                }
+                // Completed/Searching carry no data — the real payload
+                // arrives via ResponseOutputItemDone(WebSearchCall) below.
+                ResponseStreamEvent::ResponseWebSearchCallCompleted(_)
+                | ResponseStreamEvent::ResponseWebSearchCallSearching(_) => {}
+
+                // OutputItemDone carries the full result for backend tools.
+                // For WebSearchCall this includes the query and source URLs.
+                // For CustomToolCall this includes x_search results.
+                ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
+                    match &done_event.item {
+                        rs::OutputItem::WebSearchCall(ws) => {
+                            let result = serde_json::to_value(ws).ok();
+                            yield SamplingEvent::BackendToolCallCompleted {
+                                request_id: request_id.clone(),
+                                call_id: ws.id.clone(),
+                                name: "web_search".to_string(),
+                                result,
+                            };
+                        }
+                        // X search results arrive as CustomToolCall with
+                        // names like x_keyword_search, x_semantic_search, etc.
+                        // Use "x_search" consistently (matching the Started event);
+                        // the specific sub-type is in the serialized result payload
+                        // and extracted by the pager from raw_output.name.
+                        rs::OutputItem::CustomToolCall(ct) => {
+                            let result = serde_json::to_value(ct).ok();
+                            yield SamplingEvent::BackendToolCallCompleted {
+                                request_id: request_id.clone(),
+                                call_id: ct.id.clone(),
+                                name: "x_search".to_string(),
+                                result,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+
+                // CustomToolCallInputDelta is x_search in-progress streaming.
+                // Emit a started event on first delta per item_id.
+                ResponseStreamEvent::ResponseCustomToolCallInputDone(ev) => {
+                    yield SamplingEvent::BackendToolCallStarted {
+                        request_id: request_id.clone(),
+                        call_id: ev.item_id.clone(),
+                        name: "x_search".to_string(),
+                    };
+                }
+
+                // All other events (intermediate progress, annotations,
+                // image gen, file search, etc.) — no action needed.
+                _ => {}
+            }
+
+            if event_has_content {
+                last_content_chunk_at = Instant::now();
+            } else if last_content_chunk_at.elapsed() > idle_timeout {
+                let err = SamplingError::IdleTimeout {
+                    elapsed_secs: idle_timeout.as_secs(),
+                };
+                yield SamplingEvent::Failed {
+                    request_id: request_id.clone(),
+                    error: SamplingErrorInfo::from(&err),
+                };
+                return;
+            }
+
+            if should_break {
+                break;
+            }
+        }
+
+        // ── Build the final response ─────────────────────────────────
+        let mut response = match final_response {
+            Some(r) => r,
+            None => {
+                let err = SamplingError::Api {
+                    status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "No ResponseCompleted or ResponseIncomplete event received from \
+                              Responses API"
+                        .to_string(),
+                    model_metadata: None,
+                    retry_after_secs: None,
+                    should_retry: None,
+                };
+                yield SamplingEvent::Failed {
+                    request_id: request_id.clone(),
+                    error: SamplingErrorInfo::from(&err),
+                };
+                return;
+            }
+        };
+
+        // Billing fields (`prompt_tokens`, `completion_tokens`,
+        // `cached_prompt_tokens`, `reasoning_tokens`) are the cumulative
+        // wire values — they sum across every server-side turn of the
+        // agent loop and are what we bill on / log to telemetry.
+        //
+        // `total_tokens` is the live context length used to drive the
+        // CLI `/context` bar, the auto-compact threshold, and
+        // `meta.totalTokens` on persisted sessions. The SSE decoder
+        // (`deserialize_response_event`) has already rewritten
+        // `u.total_tokens` to `context_details.input + output` when
+        // the backend emits it; on older deployments the wire
+        // value passes through unchanged.
+        let usage = response.usage.as_ref().map(|u| TokenUsage {
+            prompt_tokens: u.input_tokens,
+            completion_tokens: u.output_tokens,
+            total_tokens: u.total_tokens,
+            reasoning_tokens: u.output_tokens_details.reasoning_tokens,
+            cached_prompt_tokens: u.input_tokens_details.cached_tokens,
+        });
+
+        let cost_usd_ticks = response
+            .metadata
+            .as_mut()
+            .and_then(|m| m.remove(crate::client::COST_USD_TICKS_METADATA_KEY))
+            .and_then(|s| s.parse::<i64>().ok());
+
+        let status = response.status.clone();
+
+        // Convert to ConversationItem(s); patch in accumulated reasoning
+        // text as a fallback when the final response lacks `content` /
+        // `summary` (the streaming deltas may have arrived out of band).
+        // Splice policy lives in `inject_streaming_reasoning_fallback`.
+        let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
+        xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
+
+        let has_tool_calls = items.iter().any(|i| match i {
+            ConversationItem::Assistant(a) => !a.tool_calls.is_empty(),
+            _ => false,
+        });
+
+        let stop_reason = if has_tool_calls {
+            Some(StopReason::ToolCalls)
+        } else {
+            match status {
+                Status::Completed => Some(StopReason::Stop),
+                Status::Incomplete => Some(StopReason::Length),
+                _ => None,
+            }
+        };
+
+        let stream_end = Instant::now();
+        let metrics =
+            InferenceLatencyStats::from_timestamps(stream_start, &chunk_timestamps, stream_end);
+
+        // Warn-only for now: surface the server-reported triggers once per
+        // request (raw labels only — ZDR-safe) and attach them for callers.
+        let doom_loop_signals = doom_loop
+            .as_ref()
+            .map(|collector| collector.take())
+            .unwrap_or_default();
+        if !doom_loop_signals.is_empty() {
+            tracing::warn!(
+                request_id = %request_id,
+                triggers = ?doom_loop_signals.iter().map(|s| s.raw.as_str()).collect::<Vec<_>>(),
+                "server reported doom-loop triggers for this response"
+            );
+        }
+
+        let conversation_response = ConversationResponse {
+            items,
+            stop_reason,
+            usage,
+            cost_usd_ticks,
+            message_chunks_emitted: message_chunk_count,
+            doom_loop_signals,
+            stop_message: None, // not reported on the Responses API
+        };
+
+        yield SamplingEvent::Completed {
+            request_id: request_id.clone(),
+            response: Box::new(conversation_response),
+            metrics,
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::responses as rs_types;
+    use futures_util::stream;
+    use std::pin::pin;
+
+    fn rid() -> RequestId {
+        RequestId::from("resp-test")
+    }
+
+    /// Build a minimal `rs_types::Response` for use in `ResponseCompleted`
+    fn build_response(status: rs_types::Status) -> rs_types::Response {
+        rs_types::Response {
+            background: None,
+            billing: None,
+            conversation: None,
+            created_at: 0,
+            completed_at: None,
+            error: None,
+            id: "resp_1".into(),
+            incomplete_details: None,
+            instructions: None,
+            max_output_tokens: None,
+            metadata: None,
+            model: "test-model".into(),
+            object: "response".into(),
+            output: vec![],
+            parallel_tool_calls: None,
+            previous_response_id: None,
+            prompt: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None,
+            service_tier: None,
+            status,
+            temperature: None,
+            text: None,
+            tool_choice: None,
+            tools: None,
+            top_logprobs: None,
+            top_p: None,
+            truncation: None,
+            usage: None,
+        }
+    }
+
+    fn empty_completed_response() -> rs_types::Response {
+        build_response(rs_types::Status::Completed)
+    }
+
+    fn failed_response_with_error(message: &str) -> rs_types::Response {
+        let mut r = build_response(rs_types::Status::Failed);
+        r.error = Some(rs_types::ErrorObject {
+            code: "server_error".into(),
+            message: message.into(),
+        });
+        r
+    }
+
+    fn text_delta_event(delta: &str) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputTextDelta(rs_types::ResponseTextDeltaEvent {
+            sequence_number: 0,
+            item_id: "item-1".into(),
+            output_index: 0,
+            content_index: 0,
+            delta: delta.into(),
+            logprobs: None,
+        })
+    }
+
+    fn completed_event() -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+            response: empty_completed_response(),
+            sequence_number: 0,
+        })
+    }
+
+    async fn collect(s: impl Stream<Item = SamplingEvent>) -> Vec<SamplingEvent> {
+        let mut out = Vec::new();
+        let mut s = pin!(s);
+        while let Some(ev) = s.next().await {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn missing_completed_event_yields_failed() {
+        let raw =
+            stream::iter(Vec::<Result<rs::ResponseStreamEvent, SamplingError>>::new()).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
+                assert_eq!(error.status_code, Some(500));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_delta_then_completed_yields_completed_with_stop() {
+        let raw = stream::iter(vec![Ok(text_delta_event("hello")), Ok(completed_event())]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let text_tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Text,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_tokens, vec!["hello"]);
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_failed_yields_failed_500() {
+        let failed = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
+            response: failed_response_with_error("boom"),
+            sequence_number: 0,
+        });
+        let raw = stream::iter(vec![Ok(failed)]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
+                assert_eq!(error.status_code, Some(500));
+                assert!(error.message.contains("boom"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_stream_transport_error_yields_failed() {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("hi")),
+            Err(SamplingError::EventStreamError("conn reset".into())),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SamplingEvent::Failed { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SamplingEvent::Completed { .. }))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_when_stream_stalls() {
+        let raw = stream::iter(vec![Ok(text_delta_event("hi"))])
+            .chain(stream::pending())
+            .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_millis(100),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::IdleTimeout);
+            }
+            other => panic!("expected Failed(IdleTimeout), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn model_metadata_yielded_after_stream_started() {
+        let raw = stream::iter(vec![Ok(completed_event())]).boxed();
+        let metadata = ResponseModelMetadata {
+            context_window: Some(8192),
+            ..Default::default()
+        };
+        let events = collect(stream_responses(
+            raw,
+            Some(metadata),
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        assert!(matches!(events[0], SamplingEvent::StreamStarted { .. }));
+        assert!(matches!(events[1], SamplingEvent::ModelMetadata { .. }));
+    }
+
+    #[test]
+    fn meaningful_content_classifier_basics() {
+        // Text delta with content is meaningful.
+        let event = text_delta_event("foo");
+        assert!(responses_event_has_meaningful_content(&event));
+        // Empty text delta is not.
+        let empty = text_delta_event("");
+        assert!(!responses_event_has_meaningful_content(&empty));
+        // Completed is meaningful (terminal).
+        assert!(responses_event_has_meaningful_content(&completed_event()));
+    }
+
+    fn function_call_added_event(
+        output_index: u32,
+        call_id: &str,
+        name: &str,
+    ) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputItemAdded(rs_types::ResponseOutputItemAddedEvent {
+            sequence_number: 0,
+            output_index,
+            item: rs_types::OutputItem::FunctionCall(rs_types::FunctionToolCall {
+                arguments: String::new(),
+                call_id: call_id.into(),
+                name: name.into(),
+                id: None,
+                status: None,
+            }),
+        })
+    }
+
+    fn function_call_args_delta_event(output_index: u32, delta: &str) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
+            rs_types::ResponseFunctionCallArgumentsDeltaEvent {
+                sequence_number: 0,
+                item_id: format!("item-{output_index}"),
+                output_index,
+                delta: delta.into(),
+            },
+        )
+    }
+
+    type Delta = (u32, Option<String>, Option<String>, Option<String>);
+
+    /// Extract all ToolCallDelta events as (tool_index, id, name, arguments_delta).
+    fn tool_call_deltas(evs: &[SamplingEvent]) -> Vec<Delta> {
+        evs.iter()
+            .filter_map(|e| match e {
+                SamplingEvent::ToolCallDelta {
+                    tool_index,
+                    id,
+                    name,
+                    arguments_delta,
+                    ..
+                } => Some((
+                    *tool_index,
+                    id.clone(),
+                    name.clone(),
+                    arguments_delta.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn function_call_emits_initial_id_name_then_arg_deltas() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(function_call_added_event(0, "call_xyz", "do_thing")),
+            Ok(function_call_args_delta_event(0, "{\"x\":")),
+            Ok(function_call_args_delta_event(0, "1}")),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+        let deltas = tool_call_deltas(&evs);
+
+        assert_eq!(deltas.len(), 3);
+        assert_eq!(deltas[0].0, 0);
+        assert_eq!(deltas[0].1.as_deref(), Some("call_xyz"));
+        assert_eq!(deltas[0].2.as_deref(), Some("do_thing"));
+        assert_eq!(deltas[0].3, None);
+        assert_eq!(deltas[1].0, 0);
+        assert_eq!(deltas[1].1, None);
+        assert_eq!(deltas[1].2, None);
+        assert_eq!(deltas[1].3.as_deref(), Some("{\"x\":"));
+        assert_eq!(deltas[2].3.as_deref(), Some("1}"));
+    }
+
+    #[tokio::test]
+    async fn function_call_args_delta_without_added_event_is_dropped() {
+        // ArgumentsDelta with no preceding OutputItemAdded has no
+        // output_index → tool_index mapping; drop silently.
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(function_call_args_delta_event(7, "{\"oops\":1}")),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+        assert_eq!(tool_call_deltas(&evs).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn multiple_function_calls_get_distinct_tool_indices() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(function_call_added_event(0, "call_a", "tool_a")),
+            Ok(function_call_added_event(1, "call_b", "tool_b")),
+            Ok(function_call_args_delta_event(0, "a-args")),
+            Ok(function_call_args_delta_event(1, "b-args")),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+        let deltas = tool_call_deltas(&evs);
+
+        assert_eq!(deltas.len(), 4);
+        assert_eq!(deltas[0].0, 0);
+        assert_eq!(deltas[0].1.as_deref(), Some("call_a"));
+        assert_eq!(deltas[1].0, 1);
+        assert_eq!(deltas[1].1.as_deref(), Some("call_b"));
+        assert_eq!(deltas[2].0, 0);
+        assert_eq!(deltas[2].3.as_deref(), Some("a-args"));
+        assert_eq!(deltas[3].0, 1);
+        assert_eq!(deltas[3].3.as_deref(), Some("b-args"));
+    }
+
+    #[tokio::test]
+    async fn doom_loop_collector_signals_land_on_completed_response() {
+        use xai_grok_sampling_types::doom_loop::{
+            DOOM_LOOP_CHECK_EVENT_TYPE, SAMPLE_CHECK_EVENT_DATA,
+        };
+        let collector = crate::doom_loop::DoomLoopSignalCollector::default();
+        assert!(collector.absorb(DOOM_LOOP_CHECK_EVENT_TYPE, SAMPLE_CHECK_EVENT_DATA));
+        let raw = stream::iter(vec![Ok(text_delta_event("hello")), Ok(completed_event())]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            Some(collector),
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.doom_loop_signals.len(), 1);
+                assert_eq!(
+                    response.doom_loop_signals[0].raw,
+                    "tail_repetition:4@response"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// An armed collector holding a confident signal aborts the attempt with
+    /// a retryable doom-loop failure; disarmed, the same stream completes and
+    /// the signals ride the response instead.
+    #[tokio::test]
+    async fn confident_signal_aborts_stream_unless_disarmed() {
+        let confident = r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:8@thinking"]}}"#;
+
+        let collector = crate::doom_loop::DoomLoopSignalCollector::default();
+        assert!(collector.absorb("response.doom_loop_check", confident));
+        let raw = stream::iter(vec![Ok(text_delta_event("hi")), Ok(completed_event())]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            Some(collector),
+        ))
+        .await;
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(
+                    error.kind,
+                    crate::events::SamplingErrorKind::DoomLoopDetected
+                );
+                assert!(error.is_retryable);
+                assert_eq!(
+                    error.doom_loop_triggers.as_deref(),
+                    Some(&["tail_repetition:8@thinking".to_string()][..])
+                );
+            }
+            other => panic!("expected Failed(DoomLoopDetected), got {other:?}"),
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SamplingEvent::Completed { .. }))
+        );
+
+        let collector = crate::doom_loop::DoomLoopSignalCollector::default();
+        assert!(collector.absorb("response.doom_loop_check", confident));
+        collector.disarm_abort();
+        let raw = stream::iter(vec![Ok(text_delta_event("hi")), Ok(completed_event())]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            Some(collector),
+        ))
+        .await;
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.doom_loop_signals.len(), 1);
+            }
+            other => panic!("expected Completed after disarm, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn doom_loop_signals_empty_without_collector_or_triggers() {
+        let raw = stream::iter(vec![Ok(completed_event())]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert!(response.doom_loop_signals.is_empty());
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        // A collector that never saw a trigger also leaves the field empty.
+        let raw = stream::iter(vec![Ok(completed_event())]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            Some(crate::doom_loop::DoomLoopSignalCollector::default()),
+        ))
+        .await;
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert!(response.doom_loop_signals.is_empty());
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+}

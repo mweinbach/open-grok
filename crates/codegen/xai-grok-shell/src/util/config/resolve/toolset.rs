@@ -1,0 +1,439 @@
+use crate::util::config::RemoteSettings;
+use toml::Value as TomlValue;
+use xai_grok_tools::implementations::grok_build::ask_user_question;
+
+/// Resolve whether the bash-harness `find`→`bfs` / `grep`→`ugrep` shadows are
+/// enabled. Precedence (highest first): `requirements.toml` (org policy, wins
+/// outright) > a truthy `DISABLE_EMBEDDED_SEARCH_TOOLS` master (forces off) > env
+/// > `config.toml` `[toolset.bash]` > `managed_config.toml` > default-on. Env uses the shared
+/// [`xai_grok_config::env_bool`] parser (`GROK_TOOLS_FIND_BFS` /
+/// `GROK_TOOLS_GREP_UGREP`, plus the `GROK_FIND_BFS` / `GROK_GREP_UGREP` aliases).
+///
+/// Pass the **merged** requirements ([`crate::config::load_merged_requirements`])
+/// so an org policy in any requirements layer — not only
+/// `~/.grok/requirements.toml` — is honored. Returns `(find_bfs, grep_ugrep)`,
+/// which the caller bakes into a
+/// [`xai_grok_tools::computer::local::SearchShadowConfig`] on the local terminal
+/// backend.
+pub fn resolve_search_tools_enabled(
+    requirements: Option<&TomlValue>,
+    user: Option<&TomlValue>,
+    managed: Option<&TomlValue>,
+) -> (bool, bool) {
+    let disable = xai_grok_config::env_bool("DISABLE_EMBEDDED_SEARCH_TOOLS");
+    fn from_toml(v: Option<&TomlValue>, key: &str) -> Option<bool> {
+        v?.get("toolset")?.get("bash")?.get(key)?.as_bool()
+    }
+    let resolve = |primary: &str, alias: &str, key: &str| -> bool {
+        let env = xai_grok_config::env_bool(primary).or_else(|| xai_grok_config::env_bool(alias));
+        resolve_search_tool_enabled(
+            disable,
+            from_toml(requirements, key),
+            env,
+            from_toml(user, key),
+            from_toml(managed, key),
+        )
+    };
+    (
+        resolve("GROK_TOOLS_FIND_BFS", "GROK_FIND_BFS", "find_bfs"),
+        resolve("GROK_TOOLS_GREP_UGREP", "GROK_GREP_UGREP", "grep_ugrep"),
+    )
+}
+
+/// Pure precedence for [`resolve_search_tools_enabled`] (tiers injected so it is
+/// unit-testable without env/disk): requirement (org policy) wins outright — even
+/// over the user `DISABLE_*` master kill-switch — then the master forces off,
+/// then env > config > managed > default-on.
+fn resolve_search_tool_enabled(
+    disable: Option<bool>,
+    requirement: Option<bool>,
+    env: Option<bool>,
+    config: Option<bool>,
+    managed: Option<bool>,
+) -> bool {
+    // Org policy (requirements.toml) is authoritative, so a user env kill-switch
+    // can't override an admin-forced value.
+    if let Some(required) = requirement {
+        return required;
+    }
+    if disable == Some(true) {
+        return false;
+    }
+    env.or(config).or(managed).unwrap_or(true)
+}
+
+/// Env override for `[toolset.ask_user_question] timeout_enabled` (parsed by
+/// the shared [`xai_grok_config::env_bool`] via `BoolFlag`). The secs env var
+/// lives in the tools crate (`RESPONSE_TIMEOUT_ENV`), parsed once there.
+const ENV_ASK_USER_QUESTION_TIMEOUT_ENABLED: &str = "GROK_ASK_USER_QUESTION_TIMEOUT_ENABLED";
+
+/// Extract `[toolset.ask_user_question] timeout_enabled` from one TOML layer.
+fn ask_user_question_timeout_enabled_from_toml(v: Option<&TomlValue>) -> Option<bool> {
+    v?.get("toolset")?
+        .get("ask_user_question")?
+        .get("timeout_enabled")?
+        .as_bool()
+}
+
+/// Extract `[toolset.ask_user_question] timeout_secs` from one TOML layer.
+/// Non-positive values are warned and dropped so the layer falls through —
+/// `0` must never mean "wait forever"; that is `timeout_enabled = false`.
+fn ask_user_question_timeout_secs_from_toml(v: Option<&TomlValue>) -> Option<u64> {
+    let raw = v?
+        .get("toolset")?
+        .get("ask_user_question")?
+        .get("timeout_secs")?
+        .as_integer()?;
+    let valid = u64::try_from(raw).ok().filter(|secs| *secs > 0);
+    if valid.is_none() {
+        tracing::warn!(
+            value = raw,
+            "[toolset.ask_user_question] timeout_secs must be a positive integer; ignoring layer"
+        );
+    }
+    valid
+}
+
+/// Resolve `[toolset.ask_user_question] timeout_enabled`.
+///
+/// Precedence: requirements > env (`GROK_ASK_USER_QUESTION_TIMEOUT_ENABLED`)
+/// > user `config.toml` > managed (user-level `managed_config.toml` over the
+/// system-managed layer, matching `effective_config()`'s merge order) >
+/// remote settings > default `true`. Returns [`Resolved`] so callers can
+/// log the winning source.
+///
+/// [`Resolved`]: crate::agent::config::Resolved
+fn resolve_ask_user_question_timeout_enabled(
+    requirements: Option<&TomlValue>,
+    user: Option<&TomlValue>,
+    managed: Option<&TomlValue>,
+    system_managed: Option<&TomlValue>,
+    remote: Option<bool>,
+) -> crate::agent::config::Resolved<bool> {
+    use crate::agent::config::BoolFlag;
+    BoolFlag::env(ENV_ASK_USER_QUESTION_TIMEOUT_ENABLED)
+        .requirement(ask_user_question_timeout_enabled_from_toml(requirements))
+        .config(ask_user_question_timeout_enabled_from_toml(user))
+        .managed(
+            ask_user_question_timeout_enabled_from_toml(managed)
+                .or_else(|| ask_user_question_timeout_enabled_from_toml(system_managed)),
+        )
+        .feature_flag(remote)
+        .default(ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED)
+        .resolve()
+}
+
+/// Pure precedence for [`resolve_ask_user_question_timeout_secs`] (tiers
+/// injected so it is unit-testable without env/disk): requirements > env >
+/// config > managed > remote > default (the tool's 30-minute `RESPONSE_TIMEOUT`).
+fn resolve_ask_user_question_timeout_secs_from_tiers(
+    requirement: Option<u64>,
+    env: Option<u64>,
+    config: Option<u64>,
+    managed: Option<u64>,
+    remote: Option<u64>,
+) -> u64 {
+    requirement
+        .or(env)
+        .or(config)
+        .or(managed)
+        .or(remote)
+        .unwrap_or(
+            xai_grok_tools::implementations::grok_build::ask_user_question::RESPONSE_TIMEOUT
+                .as_secs(),
+        )
+}
+
+/// Resolve `[toolset.ask_user_question] timeout_secs` (positive seconds).
+///
+/// Precedence: requirements > env (`GROK_ASK_USER_QUESTION_TIMEOUT_SECS`,
+/// parsed by the tools crate's canonical parser) > user `config.toml` >
+/// managed (user-level over system-managed, matching `effective_config()`) >
+/// remote settings > default 1800 (30 minutes).
+fn resolve_ask_user_question_timeout_secs(
+    requirements: Option<&TomlValue>,
+    user: Option<&TomlValue>,
+    managed: Option<&TomlValue>,
+    system_managed: Option<&TomlValue>,
+    remote: Option<u64>,
+) -> u64 {
+    resolve_ask_user_question_timeout_secs_from_tiers(
+        ask_user_question_timeout_secs_from_toml(requirements),
+        xai_grok_tools::implementations::grok_build::ask_user_question::response_timeout_env_secs(),
+        ask_user_question_timeout_secs_from_toml(user),
+        ask_user_question_timeout_secs_from_toml(managed)
+            .or_else(|| ask_user_question_timeout_secs_from_toml(system_managed)),
+        // remote settings `0` is treated as unset, mirroring the TOML validation.
+        remote.filter(|secs| *secs > 0),
+    )
+}
+
+/// Resolve the full `[toolset.ask_user_question]` params injected into the
+/// tool as `Params<AskUserQuestionParams>` at agent build/rebuild.
+///
+/// Reads the raw requirements / user / managed / system-managed layers from
+/// disk (raw layers, not the effective merge, so a managed-only value stays
+/// below env in the precedence); `remote` is the live remote tier. Both
+/// fields resolve to concrete values, so the tool's legacy env fallback only
+/// runs for consumers that skip this resolver.
+pub(crate) fn resolve_ask_user_question_params_from_disk(
+    remote: Option<&RemoteSettings>,
+) -> xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionParams {
+    let requirements = crate::config::load_merged_requirements();
+    let layers = match crate::config::ConfigLayers::load() {
+        Ok(l) => Some(l),
+        Err(e) => {
+            tracing::warn!(error = %e, "ask_user_question: failed to load config layers");
+            None
+        }
+    };
+    let user = layers.as_ref().map(|l| &l.user);
+    let managed = layers.as_ref().map(|l| &l.managed);
+    let system_managed = layers.as_ref().map(|l| &l.system_managed);
+    xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionParams {
+        timeout_enabled: Some(
+            resolve_ask_user_question_timeout_enabled(
+                requirements.as_ref(),
+                user,
+                managed,
+                system_managed,
+                remote.and_then(|r| r.ask_user_question_timeout_enabled),
+            )
+            .value,
+        ),
+        timeout_secs: Some(resolve_ask_user_question_timeout_secs(
+            requirements.as_ref(),
+            user,
+            managed,
+            system_managed,
+            remote.and_then(|r| r.ask_user_question_timeout_secs),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod ask_user_question_timeout_tests {
+    use super::*;
+    use crate::agent::config::ConfigSource;
+    use xai_grok_tools::implementations::grok_build::ask_user_question::RESPONSE_TIMEOUT_ENV;
+
+    // Both env vars are process-global (a dev exports the secs var for TUI
+    // repro); serialize and force them unset so these tests can't go flaky.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(ENV_ASK_USER_QUESTION_TIMEOUT_ENABLED) };
+        unsafe { std::env::remove_var(RESPONSE_TIMEOUT_ENV) };
+        g
+    }
+
+    fn toml_ask(body: &str) -> TomlValue {
+        toml::from_str(&format!("[toolset.ask_user_question]\n{body}\n")).unwrap()
+    }
+
+    #[test]
+    fn timeout_enabled_tier_precedence() {
+        let _g = guard();
+        // Default ON when nothing is set.
+        let r = resolve_ask_user_question_timeout_enabled(None, None, None, None, None);
+        assert!(r.value);
+        assert_eq!(r.source, ConfigSource::Default);
+        // requirements(false) beat user(true) and remote(true).
+        let off = toml_ask("timeout_enabled = false");
+        let on = toml_ask("timeout_enabled = true");
+        let r = resolve_ask_user_question_timeout_enabled(
+            Some(&off),
+            Some(&on),
+            None,
+            None,
+            Some(true),
+        );
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Requirement);
+        // user(false) beats managed(true) and remote(true).
+        let r = resolve_ask_user_question_timeout_enabled(
+            None,
+            Some(&off),
+            Some(&on),
+            None,
+            Some(true),
+        );
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Config);
+        // managed(false) beats system-managed(true) and remote(true).
+        let r = resolve_ask_user_question_timeout_enabled(
+            None,
+            None,
+            Some(&off),
+            Some(&on),
+            Some(true),
+        );
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::ManagedConfig);
+        // A system-managed-only value lands: beats remote, loses to user.
+        let r = resolve_ask_user_question_timeout_enabled(None, None, None, Some(&off), Some(true));
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::ManagedConfig);
+        let r = resolve_ask_user_question_timeout_enabled(
+            None,
+            Some(&on),
+            None,
+            Some(&off),
+            Some(false),
+        );
+        assert!(r.value);
+        assert_eq!(r.source, ConfigSource::Config);
+        // remote alone is honored.
+        let r = resolve_ask_user_question_timeout_enabled(None, None, None, None, Some(false));
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Remote);
+    }
+
+    #[test]
+    fn timeout_secs_tier_precedence() {
+        let d = xai_grok_tools::implementations::grok_build::ask_user_question::RESPONSE_TIMEOUT
+            .as_secs();
+        let r = resolve_ask_user_question_timeout_secs_from_tiers;
+        assert_eq!(r(None, None, None, None, None), d);
+        assert_eq!(r(Some(1), Some(2), Some(3), Some(4), Some(5)), 1); // requirements highest
+        assert_eq!(r(None, Some(2), Some(3), Some(4), Some(5)), 2); // env
+        assert_eq!(r(None, None, Some(3), Some(4), Some(5)), 3); // user config
+        assert_eq!(r(None, None, None, Some(4), Some(5)), 4); // managed
+        assert_eq!(r(None, None, None, None, Some(5)), 5); // remote
+    }
+
+    #[test]
+    fn timeout_secs_rejects_non_positive_layers() {
+        let _g = guard();
+        let d = xai_grok_tools::implementations::grok_build::ask_user_question::RESPONSE_TIMEOUT
+            .as_secs();
+        // user 0 and managed negative are dropped; remote fills the gap.
+        let zero = toml_ask("timeout_secs = 0");
+        let negative = toml_ask("timeout_secs = -5");
+        assert_eq!(
+            resolve_ask_user_question_timeout_secs(
+                None,
+                Some(&zero),
+                Some(&negative),
+                None,
+                Some(45)
+            ),
+            45
+        );
+        // remote 0 is unset too → default.
+        assert_eq!(
+            resolve_ask_user_question_timeout_secs(None, Some(&zero), None, None, Some(0)),
+            d
+        );
+        // A valid user layer wins over remote.
+        let user = toml_ask("timeout_secs = 30");
+        assert_eq!(
+            resolve_ask_user_question_timeout_secs(None, Some(&user), None, None, Some(45)),
+            30
+        );
+        // A system-managed-only value lands: beats remote, loses to user.
+        let sys = toml_ask("timeout_secs = 90");
+        assert_eq!(
+            resolve_ask_user_question_timeout_secs(None, None, None, Some(&sys), Some(45)),
+            90
+        );
+        assert_eq!(
+            resolve_ask_user_question_timeout_secs(
+                None,
+                Some(&user),
+                Some(&zero),
+                Some(&sys),
+                None
+            ),
+            30
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Assumes GROK_TOOLS_* / DISABLE_EMBEDDED_SEARCH_TOOLS are unset in the test env.
+    #[test]
+    fn resolve_search_tools_enabled_layers_and_precedence() {
+        // Default-on when nothing is set.
+        assert_eq!(resolve_search_tools_enabled(None, None, None), (true, true));
+
+        // config.toml [toolset.bash] disables per tool.
+        let user: TomlValue =
+            toml::from_str("[toolset.bash]\nfind_bfs = false\ngrep_ugrep = true\n").unwrap();
+        assert_eq!(
+            resolve_search_tools_enabled(None, Some(&user), None),
+            (false, true)
+        );
+
+        // Precedence: requirements > config.toml > managed.
+        let req: TomlValue = toml::from_str("[toolset.bash]\nfind_bfs = true\n").unwrap();
+        let managed: TomlValue = toml::from_str("[toolset.bash]\ngrep_ugrep = false\n").unwrap();
+        let (find, grep) = resolve_search_tools_enabled(Some(&req), Some(&user), Some(&managed));
+        assert!(find); // requirements `true` beats user `false`
+        assert!(grep); // user `true` beats managed `false`
+    }
+
+    #[test]
+    fn resolve_search_tool_enabled_precedence() {
+        // args: disable, requirement, env, config, managed
+        assert!(resolve_search_tool_enabled(None, None, None, None, None)); // default on
+        // Org requirement wins outright — even over the user DISABLE kill-switch.
+        assert!(resolve_search_tool_enabled(
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false)
+        ));
+        // With no requirement, a truthy DISABLE master forces off over env/config.
+        assert!(!resolve_search_tool_enabled(
+            Some(true),
+            None,
+            Some(true),
+            Some(true),
+            Some(true)
+        ));
+        // falsey DISABLE is ignored.
+        assert!(resolve_search_tool_enabled(
+            Some(false),
+            None,
+            None,
+            None,
+            None
+        ));
+        // requirement(false) forces off even when lower tiers say on.
+        assert!(!resolve_search_tool_enabled(
+            None,
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true)
+        ));
+        // env beats config/managed.
+        assert!(!resolve_search_tool_enabled(
+            None,
+            None,
+            Some(false),
+            Some(true),
+            Some(true)
+        ));
+        // config beats managed; managed is last before default.
+        assert!(!resolve_search_tool_enabled(
+            None,
+            None,
+            None,
+            Some(false),
+            Some(true)
+        ));
+        assert!(!resolve_search_tool_enabled(
+            None,
+            None,
+            None,
+            None,
+            Some(false)
+        ));
+    }
+}

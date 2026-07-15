@@ -1,0 +1,449 @@
+//! Shared URL-opening and scheme validation utilities.
+//!
+//! Extracted from the `OpenSupergrokUrl` dispatch handler so that any
+//! code path (keyboard navigation, mouse click, action dispatch) can
+//! open a link safely without duplicating platform-specific logic.
+
+use crate::terminal::hyperlinks::SchemeFilter;
+
+/// Open a URL in the system's default browser/handler.
+///
+/// Spawns the platform-native opener (`open` on macOS, `xdg-open` on
+/// Linux, `cmd /c start` on Windows) with fully detached stdio so it
+/// cannot block the pager.
+///
+/// **Callers handling untrusted input** should call [`is_safe_to_open`]
+/// first, or use [`open_url_if_safe`] which combines both steps.
+pub fn open_url(url: &str) {
+    // Test seam: PTY e2e must observe the open without launching a real
+    // browser. When set, append the URL to the file and skip the OS opener.
+    if let Ok(path) = std::env::var("GROK_TEST_OPEN_URL_FILE") {
+        use std::io::Write;
+        // Surface misconfiguration: a swallowed write leaves the PTY test
+        // failing with a generic timeout and no clue why.
+        if let Err(e) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| writeln!(f, "{url}"))
+        {
+            tracing::warn!(error = %e, path, "GROK_TEST_OPEN_URL_FILE write failed");
+        }
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "cmd";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let cmd = "xdg-open";
+
+    let mut command = std::process::Command::new(cmd);
+    #[cfg(target_os = "windows")]
+    command.args(["/c", "start", ""]);
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    xai_grok_tools::util::detach_std_command(&mut command);
+    if let Err(e) = command.spawn() {
+        // Redact URL to avoid leaking sensitive query params to logs.
+        let redacted = url::Url::parse(url)
+            .map(|mut u| {
+                u.set_query(None);
+                u.set_fragment(None);
+                u.to_string()
+            })
+            .unwrap_or_else(|_| "<unparseable>".to_string());
+        tracing::warn!(url = %redacted, error = %e, "failed to open URL");
+    }
+}
+
+/// Build the `open`/`xdg-open` opener command (macOS / Linux / BSD).
+///
+/// The returned command is TTY-guarded via [`xai_tty_utils::detach_std_command`]
+/// (`setsid`/`setpgid`) so the spawned GUI helper and its children can't grab
+/// the TUI's `/dev/tty`, with stdio fully redirected to null. Split from
+/// [`open_path`] so it can be unit-tested without spawning. The path is a single
+/// argument, never interpolated into a shell string. Windows uses
+/// [`reveal_in_explorer`] instead.
+#[cfg(not(target_os = "windows"))]
+fn build_open_path_command(path: &std::path::Path) -> std::process::Command {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(not(target_os = "macos"))]
+    let mut command = std::process::Command::new("xdg-open");
+    command
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    xai_tty_utils::detach_std_command(&mut command);
+    command
+}
+
+/// Reveal/open a local file in the OS file manager or default application.
+///
+/// Returns `true` on success. Takes a trusted filesystem path (no scheme
+/// validation, unlike [`open_url`]).
+///
+/// - **Windows**: `explorer.exe /select,<path>` reveals + highlights the file
+///   in Explorer. We deliberately avoid `cmd /c start`, whose `%VAR%`
+///   expansion corrupts the percent-encoded session-directory segment in
+///   imagine media paths (e.g. `…\C%3A%5CUsers…`).
+/// - **macOS / Linux**: `open` / `xdg-open` open the file in its default app.
+pub fn open_path(path: &std::path::Path) -> bool {
+    // Never launch a real GUI app in tests.
+    #[cfg(test)]
+    {
+        !path.as_os_str().is_empty()
+    }
+    #[cfg(all(not(test), target_os = "windows"))]
+    {
+        reveal_in_explorer(path)
+    }
+    #[cfg(all(not(test), not(target_os = "windows")))]
+    {
+        match build_open_path_command(path).spawn() {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to open file natively");
+                false
+            }
+        }
+    }
+}
+
+/// Reveal `path` in a new Explorer window with the file selected.
+///
+/// Uses `raw_arg` so Explorer's required `/select,"<path>"` quoting is passed
+/// verbatim — the default arg quoting wraps the whole token and breaks the
+/// switch. Launched directly (not via `cmd`), so percent characters in the
+/// path are not expanded by the shell. Session dirs embed a urlencoded cwd
+/// segment (`C%3A%5CUsers…`); those `%` chars must reach Explorer intact.
+///
+/// Prefer the on-disk path as-is. When the file is missing, open the parent
+/// folder (no `/select`) so the user lands near the media instead of Home.
+#[cfg(all(not(test), target_os = "windows"))]
+fn reveal_in_explorer(path: &std::path::Path) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    // Prefer the real on-disk location (absolute). Fall back to parent when
+    // the file was deleted so Explorer does not dump the user in Home.
+    let target = if path.is_file() || path.is_dir() {
+        path.to_path_buf()
+    } else if let Some(parent) = path.parent().filter(|p| p.is_dir()) {
+        tracing::debug!(
+            path = %path.display(),
+            parent = %parent.display(),
+            "media path missing; opening parent folder in Explorer"
+        );
+        parent.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+
+    let select_file = target.is_file();
+    let mut command = std::process::Command::new("explorer");
+    // Escape embedded double-quotes in the path so the `/select,"<path>"`
+    // quoting does not break. Windows file-system paths cannot legally contain
+    // `"`, but percent-decoded display paths or future user-chosen filenames
+    // could, so be defensive.
+    let escaped = target.display().to_string().replace('"', "\"\"");
+    if select_file {
+        command.raw_arg(format!("/select,\"{}\"", escaped));
+    } else {
+        // Open the folder itself (no /select) — works for dirs and as a
+        // fallback when we only have a parent path.
+        command.raw_arg(format!("\"{}\"", escaped));
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    xai_tty_utils::detach_std_command(&mut command);
+    // explorer.exe returns exit code 1 even on success, so a successful spawn
+    // is the best signal we have.
+    match command.spawn() {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(path = %target.display(), error = %e, "failed to reveal file in Explorer");
+            false
+        }
+    }
+}
+
+/// Check if a URL's scheme is safe to open.
+///
+/// Uses the `url` crate for robust scheme extraction. Falls back to
+/// prefix matching for non-standard URLs that `url::Url::parse` rejects.
+pub fn is_safe_to_open(url: &str, filter: SchemeFilter) -> bool {
+    let url = url.trim();
+    if let Ok(parsed) = url::Url::parse(url) {
+        return filter.allows(parsed.scheme());
+    }
+    // Fallback: check for scheme via "://" prefix, lowercasing for
+    // case-insensitive comparison (SchemeFilter matches lowercase literals).
+    if let Some((scheme, _)) = url.split_once("://") {
+        return filter.allows(&scheme.to_ascii_lowercase());
+    }
+    // Defensive: url::Url::parse handles well-formed mailto, but guard
+    // against edge cases where the parser rejects a mailto-like string.
+    if let Some((scheme, _)) = url.split_once(':')
+        && scheme.eq_ignore_ascii_case("mailto")
+    {
+        return filter.allows(&scheme.to_ascii_lowercase());
+    }
+    false
+}
+
+/// Validate scheme and open a URL if permitted. Returns `true` if opened.
+pub fn open_url_if_safe(url: &str, filter: SchemeFilter) -> bool {
+    if is_safe_to_open(url, filter) {
+        open_url(url);
+        true
+    } else {
+        tracing::debug!(url, "URL scheme not permitted");
+        false
+    }
+}
+
+/// Ensure `url` carries the given query parameter, returning the rewritten URL.
+///
+/// If the URL already contains a parameter with that name, its value is left
+/// untouched (the caller upstream may have intentionally set one). On parse
+/// failure, the original string is returned unchanged so this is safe to apply
+/// to opener input from untrusted sources.
+///
+/// Used by the SuperGrok upsell flow to attribute clicks to `referrer=grok-build`,
+/// matching the OAuth consent screen and x.ai/cli marketing links regardless of
+/// what the remote settings `gate_url` value happens to be.
+pub fn ensure_query_param(url: &str, key: &str, value: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let already_present = parsed.query_pairs().any(|(k, _)| k == key);
+    if already_present {
+        return parsed.to_string();
+    }
+    parsed.query_pairs_mut().append_pair(key, value);
+    parsed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_path_command_passes_path_as_a_single_arg() {
+        // Path with spaces must be one argument, never shell-interpolated.
+        let path = std::path::Path::new("/tmp/grok session/image 1.jpg");
+        let command = build_open_path_command(path);
+        let args: Vec<_> = command.get_args().map(|a| a.to_os_string()).collect();
+        assert!(args.contains(&path.as_os_str().to_os_string()));
+    }
+
+    #[test]
+    fn standard_http_schemes_allowed() {
+        assert!(is_safe_to_open(
+            "http://example.com",
+            SchemeFilter::Standard
+        ));
+        assert!(is_safe_to_open(
+            "https://example.com/path?q=1",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn mailto_allowed() {
+        assert!(is_safe_to_open(
+            "mailto:user@example.com",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn file_scheme_blocked_by_standard() {
+        // file:// removed from Standard to prevent local file / SSRF attacks.
+        assert!(!is_safe_to_open(
+            "file:///home/user/doc.pdf",
+            SchemeFilter::Standard
+        ));
+        // But allowed under EditorExtended.
+        assert!(is_safe_to_open(
+            "file:///home/user/doc.pdf",
+            SchemeFilter::EditorExtended
+        ));
+    }
+
+    #[test]
+    fn javascript_scheme_blocked() {
+        assert!(!is_safe_to_open(
+            "javascript:alert(1)",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn data_scheme_blocked() {
+        assert!(!is_safe_to_open(
+            "data:text/html,<h1>hi</h1>",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn empty_and_garbage_rejected() {
+        assert!(!is_safe_to_open("", SchemeFilter::Standard));
+        assert!(!is_safe_to_open("not-a-url", SchemeFilter::Standard));
+        assert!(!is_safe_to_open(
+            "://missing-scheme",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn editor_schemes_with_extended_filter() {
+        assert!(is_safe_to_open(
+            "vscode://file/path",
+            SchemeFilter::EditorExtended
+        ));
+        assert!(is_safe_to_open(
+            "cursor://open",
+            SchemeFilter::EditorExtended
+        ));
+        assert!(is_safe_to_open("idea://open", SchemeFilter::EditorExtended));
+        assert!(is_safe_to_open("zed://open", SchemeFilter::EditorExtended));
+    }
+
+    #[test]
+    fn editor_schemes_blocked_by_standard_filter() {
+        assert!(!is_safe_to_open(
+            "vscode://file/path",
+            SchemeFilter::Standard
+        ));
+        assert!(!is_safe_to_open("cursor://open", SchemeFilter::Standard));
+    }
+
+    #[test]
+    fn scheme_case_sensitivity() {
+        // url::Url normalizes to lowercase
+        assert!(is_safe_to_open(
+            "HTTP://EXAMPLE.COM",
+            SchemeFilter::Standard
+        ));
+        assert!(is_safe_to_open(
+            "HTTPS://EXAMPLE.COM",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn url_with_fragment_and_query() {
+        assert!(is_safe_to_open(
+            "https://example.com/page?key=val#section",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn ftp_scheme_blocked() {
+        assert!(!is_safe_to_open(
+            "ftp://files.example.com/pub",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn fallback_colon_slash_slash_path() {
+        // A custom scheme that url::Url may reject but has ://
+        assert!(!is_safe_to_open(
+            "custom://something",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn non_mailto_colon_without_slashes_rejected() {
+        assert!(!is_safe_to_open("tel:+1234567890", SchemeFilter::Standard));
+    }
+
+    #[test]
+    fn whitespace_trimmed_before_parse() {
+        assert!(is_safe_to_open(
+            "  https://example.com  ",
+            SchemeFilter::Standard
+        ));
+        assert!(is_safe_to_open(
+            "\thttps://example.com\n",
+            SchemeFilter::Standard
+        ));
+    }
+
+    #[test]
+    fn ensure_query_param_appends_when_missing() {
+        let out = ensure_query_param("https://grok.com/supergrok", "referrer", "grok-build");
+        assert_eq!(out, "https://grok.com/supergrok?referrer=grok-build");
+    }
+
+    #[test]
+    fn ensure_query_param_preserves_existing_value() {
+        let out = ensure_query_param(
+            "https://grok.com/supergrok?referrer=other",
+            "referrer",
+            "grok-build",
+        );
+        assert_eq!(out, "https://grok.com/supergrok?referrer=other");
+    }
+
+    #[test]
+    fn ensure_query_param_keeps_other_query_pairs() {
+        let out = ensure_query_param(
+            "https://grok.com/supergrok?heavy=1",
+            "referrer",
+            "grok-build",
+        );
+        assert_eq!(
+            out,
+            "https://grok.com/supergrok?heavy=1&referrer=grok-build"
+        );
+    }
+
+    #[test]
+    fn ensure_query_param_preserves_fragment() {
+        // The current remote settings value uses a hash fragment for client-side
+        // routing (`grok.com/#supergrok`); we still want the referrer attached.
+        let out = ensure_query_param("https://grok.com/#supergrok", "referrer", "grok-build");
+        assert_eq!(out, "https://grok.com/?referrer=grok-build#supergrok");
+    }
+
+    #[test]
+    fn ensure_query_param_returns_unchanged_on_parse_failure() {
+        let out = ensure_query_param("not a url", "referrer", "grok-build");
+        assert_eq!(out, "not a url");
+    }
+
+    #[test]
+    fn ensure_query_param_url_encodes_value() {
+        let out = ensure_query_param("https://grok.com/supergrok", "referrer", "grok build");
+        assert_eq!(out, "https://grok.com/supergrok?referrer=grok+build");
+    }
+
+    #[test]
+    fn fallback_scheme_case_insensitive() {
+        // Uppercase scheme that url::Url::parse rejects triggers fallback path;
+        // the fallback must lowercase before matching SchemeFilter.
+        assert!(!is_safe_to_open(
+            "CUSTOM://something",
+            SchemeFilter::Standard
+        ));
+        // Ensure mailto fallback is case-insensitive too.
+        assert!(is_safe_to_open(
+            "MAILTO:user@example.com",
+            SchemeFilter::Standard
+        ));
+    }
+}

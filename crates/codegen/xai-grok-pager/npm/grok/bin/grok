@@ -1,0 +1,136 @@
+#!/usr/bin/env node
+// Thin trampoline: resolves the grok binary from the matching per-platform
+// optional dependency package and execs it.
+//
+// Falls back to bootstrapping the canonical ~/.grok/bin/grok-<version> symlink
+// layout if postinstall hasn't run (e.g. npx, or postinstall failure).
+//
+// Binary location strategy (in priority order):
+//   1. ~/.grok/bin/grok        — canonical versioned symlink (postinstall.js)
+//   2. @xai-official/grok-<platform>/bin/grok[.exe]      — decompressed sibling
+//   3. @xai-official/grok-<platform>/bin/grok[.exe].br   — brotli-compressed
+//
+// Per-platform binaries are shipped brotli-compressed to stay well under
+// npm's ~200 MB tarball ceiling. See sibling packages @xai-official/grok-*.
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const zlib = require('zlib');
+
+const pkgName = '@xai-official/grok';
+const IS_WINDOWS = process.platform === 'win32';
+const EXE = IS_WINDOWS ? '.exe' : '';
+const BIN_NAME = `grok${EXE}`;
+const CANONICAL_DIR = path.join(os.homedir(), '.grok', 'bin');
+const CANONICAL_PATH = path.join(CANONICAL_DIR, BIN_NAME);
+
+function readLocalVersion() {
+    try { return require('../package.json').version; } catch { return undefined; }
+}
+
+// Resolve the per-platform sibling package's directory. Returns null if the
+// matching optional dependency wasn't installed (unsupported platform, or
+// npm refused to install optionalDependencies).
+function resolvePlatformPackageDir() {
+    const platformPkg = `@xai-official/grok-${process.platform}-${process.arch}`;
+    try {
+        return path.dirname(require.resolve(`${platformPkg}/package.json`));
+    } catch {
+        return null;
+    }
+}
+
+// Decompress a brotli-compressed binary to a sibling path. Atomic via tmp+rename.
+function decompressBrotli(brPath, outPath) {
+    const compressed = fs.readFileSync(brPath);
+    const decompressed = zlib.brotliDecompressSync(compressed);
+    const tmp = outPath + `.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, decompressed);
+    if (!IS_WINDOWS) fs.chmodSync(tmp, 0o755);
+    try { fs.renameSync(tmp, outPath); } catch {}
+}
+
+// Bootstrap the canonical versioned-symlink layout from a source binary.
+// Returns the canonical path on success, or the source path on failure.
+function bootstrapCanonical(sourceBinPath, version) {
+    try {
+        fs.mkdirSync(CANONICAL_DIR, { recursive: true });
+        const versionedName = `grok-${version}${EXE}`;
+        const versionedPath = path.join(CANONICAL_DIR, versionedName);
+        if (!fs.existsSync(versionedPath)) {
+            const tmpPath = versionedPath + `.tmp.${process.pid}`;
+            fs.copyFileSync(sourceBinPath, tmpPath);
+            if (!IS_WINDOWS) fs.chmodSync(tmpPath, 0o755);
+            fs.renameSync(tmpPath, versionedPath);
+        }
+        if (IS_WINDOWS) {
+            const oldPath = CANONICAL_PATH + '.old';
+            try { fs.unlinkSync(oldPath); } catch {}
+            try {
+                try { fs.unlinkSync(CANONICAL_PATH); } catch {}
+                fs.copyFileSync(versionedPath, CANONICAL_PATH);
+            } catch {
+                fs.renameSync(CANONICAL_PATH, oldPath);
+                try {
+                    fs.copyFileSync(versionedPath, CANONICAL_PATH);
+                } catch {
+                    try { fs.renameSync(oldPath, CANONICAL_PATH); } catch {}
+                    throw new Error('locked');
+                }
+            }
+        } else {
+            const tmpLink = CANONICAL_PATH + `.link.${process.pid}`;
+            try { fs.unlinkSync(tmpLink); } catch {}
+            fs.symlinkSync(versionedName, tmpLink);
+            fs.renameSync(tmpLink, CANONICAL_PATH);
+        }
+        return CANONICAL_PATH;
+    } catch {
+        return sourceBinPath;
+    }
+}
+
+function resolveBinary() {
+    if (fs.existsSync(CANONICAL_PATH)) return CANONICAL_PATH;
+
+    const platformDir = resolvePlatformPackageDir();
+    if (!platformDir) {
+        console.error(`${pkgName}: no platform binary installed for ${process.platform}-${process.arch}.`);
+        console.error(`  Expected sibling package @xai-official/grok-${process.platform}-${process.arch}.`);
+        console.error(`  This usually means npm skipped optionalDependencies (e.g. --no-optional)`);
+        console.error(`  or the platform is not supported.`);
+        process.exit(1);
+    }
+
+    const rawPath = path.join(platformDir, 'bin', BIN_NAME);
+    const brPath = rawPath + '.br';
+
+    // Decompress on first use if needed (atomic via tmp+rename).
+    if (!fs.existsSync(rawPath)) {
+        if (fs.existsSync(brPath)) {
+            decompressBrotli(brPath, rawPath);
+        }
+    }
+    if (!fs.existsSync(rawPath)) {
+        console.error(`${pkgName}: missing binary at ${rawPath}`);
+        process.exit(1);
+    }
+
+    const version = readLocalVersion();
+    if (version) {
+        return bootstrapCanonical(rawPath, version);
+    }
+    return rawPath;
+}
+
+const execPath = resolveBinary();
+const childEnv = { ...process.env, GROK_MANAGED_BY_NPM: '1' };
+const child = spawn(execPath, process.argv.slice(2), { stdio: 'inherit', env: childEnv });
+child.on('exit', (code, signal) => {
+    if (signal) {
+        process.kill(process.pid, signal);
+    } else {
+        process.exit(code ?? 0);
+    }
+});
