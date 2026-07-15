@@ -34,6 +34,14 @@ pub enum ConversationItem {
     Assistant(AssistantItem),
     /// Tool/function result
     ToolResult(ToolResultItem),
+    /// Output from a native Responses custom-tool call.
+    ///
+    /// Unlike [`ToolResult`][ConversationItem::ToolResult], custom tools may
+    /// emit more than one output item for a single call (for example Code
+    /// Mode's `notify` updates followed by a final result). Each output keeps
+    /// its own optional item ID and ordered content blocks, so replay does not
+    /// collapse repeated outputs or reorder text around images.
+    CustomToolOutput(CustomToolOutputItem),
     /// A tool call executed server-side by the backend agentic sampler
     /// (e.g. web search, X search, code interpreter). These are NOT
     /// executed by the client — the server already ran them and fed
@@ -270,6 +278,68 @@ pub struct ToolResultItem {
     pub images: Vec<ContentPart>,
 }
 
+/// One native Responses custom-tool-call output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CustomToolOutputItem {
+    /// Provider call ID shared with the originating custom-tool call.
+    pub call_id: String,
+    /// Unique Responses item ID for this particular output, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    /// Tool name retained as conversation metadata for rendering/diagnostics.
+    /// The Responses input schema does not currently accept it on replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Ordered output blocks. Text/image interleaving is significant.
+    pub content: Vec<CustomToolOutputContent>,
+}
+
+impl CustomToolOutputItem {
+    /// Construct an output with no provider item ID or tool-name metadata.
+    pub fn new(
+        call_id: impl Into<String>,
+        content: impl IntoIterator<Item = CustomToolOutputContent>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            item_id: None,
+            name: None,
+            content: content.into_iter().collect(),
+        }
+    }
+
+    /// Construct a text-only output.
+    pub fn text(call_id: impl Into<String>, text: impl Into<Arc<str>>) -> Self {
+        Self::new(
+            call_id,
+            [CustomToolOutputContent::Text { text: text.into() }],
+        )
+    }
+
+    pub fn with_item_id(mut self, item_id: impl Into<String>) -> Self {
+        self.item_id = Some(item_id.into());
+        self
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Flatten text blocks for display/token-estimation without disturbing
+    /// the stored block order.
+    pub fn text_content(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                CustomToolOutputContent::Text { text } => Some(text.as_ref()),
+                CustomToolOutputContent::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 /// A server-side tool call from the backend agentic sampler.
 ///
 /// Wraps the typed Responses API output items so they can be round-tripped
@@ -358,6 +428,61 @@ pub enum ContentPart {
     Text { text: Arc<str> },
     /// Image content (URL or base64 data URI)
     Image { url: Arc<str> },
+}
+
+/// Ordered content carried by a native custom-tool output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CustomToolOutputContent {
+    Text {
+        text: Arc<str>,
+    },
+    Image {
+        url: Arc<str>,
+        /// Responses image fidelity. Defaults to `auto`, matching the API.
+        #[serde(default)]
+        detail: CustomToolOutputImageDetail,
+    },
+}
+
+/// Image fidelity for a custom-tool output.
+///
+/// `async-openai` 0.33.1 does not yet expose `original`, so the typed
+/// conversion temporarily maps it to `high`. Call
+/// [`ConversationRequest::original_detail_custom_output_images`] after
+/// serializing the typed request to locate the exact fields that must be
+/// patched back to `"original"`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CustomToolOutputImageDetail {
+    #[default]
+    Auto,
+    Low,
+    High,
+    Original,
+}
+
+impl CustomToolOutputImageDetail {
+    fn to_responses_api(self) -> rs::ImageDetail {
+        match self {
+            Self::Auto => rs::ImageDetail::Auto,
+            Self::Low => rs::ImageDetail::Low,
+            Self::High | Self::Original => rs::ImageDetail::High,
+        }
+    }
+}
+
+impl CustomToolOutputContent {
+    pub fn text(text: impl Into<Arc<str>>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    pub fn image(url: impl Into<Arc<str>>, detail: CustomToolOutputImageDetail) -> Self {
+        Self::Image {
+            url: url.into(),
+            detail,
+        }
+    }
 }
 
 // ============================================================================
@@ -698,6 +823,29 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
 }
 
+/// Location of a custom-output image whose requested detail is `original`.
+///
+/// The indexes address the serialized Responses request as
+/// `input[input_item_index].output[output_content_index]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginalDetailCustomOutputImageOccurrence {
+    pub input_item_index: usize,
+    pub output_content_index: usize,
+    pub image_url: Arc<str>,
+}
+
+/// Location and metadata for a named native custom-tool output.
+///
+/// `async-openai` 0.33.1 does not expose the optional `name` accepted by the
+/// Responses wire format, so the sampler uses this after typed serialization
+/// to restore the field without relying on call-ID or content matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedCustomToolOutputOccurrence {
+    pub input_item_index: usize,
+    pub call_id: String,
+    pub name: String,
+}
+
 impl ConversationRequest {
     /// Add a client-executed tool while preserving the existing function-tool
     /// storage and backend behavior.
@@ -746,6 +894,63 @@ impl ConversationRequest {
             .collect()
     }
 
+    /// Locate every native custom-output image that requests `original`
+    /// detail in the flattened Responses input.
+    ///
+    /// `async-openai` 0.33.1 serializes these as `high`; callers that support
+    /// original-detail images can use the returned indexes to patch the
+    /// serialized request body back to `"original"` without URL matching or
+    /// ambiguity when the same image appears more than once.
+    pub fn original_detail_custom_output_images(
+        &self,
+    ) -> Vec<OriginalDetailCustomOutputImageOccurrence> {
+        let mut occurrences = Vec::new();
+        let mut input_item_index = 0;
+
+        for item in &self.items {
+            if let ConversationItem::CustomToolOutput(output) = item {
+                for (output_content_index, part) in output.content.iter().enumerate() {
+                    if let CustomToolOutputContent::Image {
+                        url,
+                        detail: CustomToolOutputImageDetail::Original,
+                    } = part
+                    {
+                        occurrences.push(OriginalDetailCustomOutputImageOccurrence {
+                            input_item_index,
+                            output_content_index,
+                            image_url: url.clone(),
+                        });
+                    }
+                }
+            }
+            input_item_index += conversation_item_to_input_items(item).len();
+        }
+
+        occurrences
+    }
+
+    /// Locate named native custom-tool outputs in the flattened Responses
+    /// input so the sampler can restore the wire-only `name` field.
+    pub fn named_custom_tool_outputs(&self) -> Vec<NamedCustomToolOutputOccurrence> {
+        let mut occurrences = Vec::new();
+        let mut input_item_index = 0;
+
+        for item in &self.items {
+            if let ConversationItem::CustomToolOutput(output) = item
+                && let Some(name) = &output.name
+            {
+                occurrences.push(NamedCustomToolOutputOccurrence {
+                    input_item_index,
+                    call_id: output.call_id.clone(),
+                    name: name.clone(),
+                });
+            }
+            input_item_index += conversation_item_to_input_items(item).len();
+        }
+
+        occurrences
+    }
+
     /// Strip all inline image data from the conversation to reduce payload size.
     ///
     /// Replaces `ContentPart::Image` entries with a text placeholder so the
@@ -771,6 +976,16 @@ impl ConversationRequest {
                     // images/PDFs). On 413 retry these are the largest payloads.
                     stripped += t.images.len();
                     t.images.clear();
+                }
+                ConversationItem::CustomToolOutput(output) => {
+                    for part in &mut output.content {
+                        if matches!(part, CustomToolOutputContent::Image { .. }) {
+                            *part = CustomToolOutputContent::Text {
+                                text: Arc::<str>::from("[image removed — conversation too large]"),
+                            };
+                            stripped += 1;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1303,10 +1518,15 @@ impl ConversationItem {
         item_id: impl AsRef<str>,
         content: impl Into<String>,
     ) -> Self {
-        Self::tool_result(
-            encode_custom_tool_call_id(call_id.as_ref(), item_id.as_ref()).to_string(),
-            content,
+        Self::CustomToolOutput(
+            CustomToolOutputItem::text(call_id.as_ref(), content.into())
+                .with_item_id(item_id.as_ref()),
         )
+    }
+
+    /// Create a native custom-tool output with ordered content blocks.
+    pub fn custom_tool_output(output: CustomToolOutputItem) -> Self {
+        Self::CustomToolOutput(output)
     }
 
     /// Create a tool result message with inline images.
@@ -1332,6 +1552,7 @@ impl ConversationItem {
             Self::User(_) => Role::User,
             Self::Assistant(_) => Role::Assistant,
             Self::ToolResult(_) => Role::Tool,
+            Self::CustomToolOutput(_) => Role::Tool,
             Self::BackendToolCall(_) => Role::Assistant,
             // Reasoning is semantically part of the assistant's turn.
             Self::Reasoning(_) => Role::Assistant,
@@ -1362,6 +1583,7 @@ impl ConversationItem {
                 .join("\n"),
             Self::Assistant(a) => a.content.as_ref().to_owned(),
             Self::ToolResult(t) => t.content.as_ref().to_owned(),
+            Self::CustomToolOutput(output) => output.text_content(),
             Self::BackendToolCall(b) => b.text_summary(),
             Self::Reasoning(r) => reasoning_item_text(r),
         }
@@ -2001,6 +2223,48 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
                 }
             }
         }
+        ConversationItem::CustomToolOutput(output) => {
+            let has_non_text = output
+                .content
+                .iter()
+                .any(|part| matches!(part, CustomToolOutputContent::Image { .. }));
+            let content = if output.content.len() == 1 && !has_non_text {
+                match &output.content[0] {
+                    CustomToolOutputContent::Text { text } => {
+                        MessageContent::Text(text.as_ref().to_owned())
+                    }
+                    CustomToolOutputContent::Image { .. } => unreachable!(),
+                }
+            } else {
+                MessageContent::Blocks(
+                    output
+                        .content
+                        .iter()
+                        .map(|part| match part {
+                            CustomToolOutputContent::Text { text } => ChatContentBlock::Text {
+                                text: text.as_ref().to_owned(),
+                            },
+                            CustomToolOutputContent::Image { url, .. } => {
+                                ChatContentBlock::ImageUrl {
+                                    image_url: ImageUrl {
+                                        url: url.as_ref().to_owned(),
+                                    },
+                                }
+                            }
+                        })
+                        .collect(),
+                )
+            };
+            ChatRequestMessage {
+                role: Role::Tool,
+                content,
+                name: output.name,
+                tool_calls: Vec::new(),
+                tool_call_id: Some(output.call_id),
+                model_id: None,
+                reasoning_content: None,
+            }
+        }
         // Backend tool calls have no Chat Completions equivalent.
         // Emit a synthetic assistant message so the model sees context
         // about what was searched, without breaking the message sequence.
@@ -2584,6 +2848,40 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                 },
             ))]
         }
+        ConversationItem::CustomToolOutput(output) => {
+            let wire_output =
+                if let [CustomToolOutputContent::Text { text }] = output.content.as_slice() {
+                    rs::CustomToolCallOutputOutput::Text(text.as_ref().to_owned())
+                } else {
+                    rs::CustomToolCallOutputOutput::List(
+                        output
+                            .content
+                            .iter()
+                            .map(|part| match part {
+                                CustomToolOutputContent::Text { text } => {
+                                    rs::InputContent::InputText(rs::InputTextContent {
+                                        text: text.as_ref().to_owned(),
+                                    })
+                                }
+                                CustomToolOutputContent::Image { url, detail } => {
+                                    rs::InputContent::InputImage(rs::InputImageContent {
+                                        detail: detail.to_responses_api(),
+                                        file_id: None,
+                                        image_url: Some(url.as_ref().to_owned()),
+                                    })
+                                }
+                            })
+                            .collect(),
+                    )
+                };
+            vec![rs::InputItem::Item(rs::Item::CustomToolCallOutput(
+                rs::CustomToolCallOutput {
+                    call_id: output.call_id.clone(),
+                    output: wire_output,
+                    id: output.item_id.clone(),
+                },
+            ))]
+        }
         ConversationItem::BackendToolCall(b) => {
             // Round-trip backend tool calls back to the Responses API as
             // their native item types, preserving full context continuity.
@@ -2989,6 +3287,15 @@ pub fn transform_conversation_cwd(
                     t.content = Arc::<str>::from(t.content.replace(source_cwd, target_cwd));
                 }
             }
+            ConversationItem::CustomToolOutput(output) => {
+                for part in &mut output.content {
+                    if let CustomToolOutputContent::Text { text } = part
+                        && text.contains(source_cwd)
+                    {
+                        *text = Arc::<str>::from(text.replace(source_cwd, target_cwd));
+                    }
+                }
+            }
             // Backend tool calls don't contain workspace paths — no-op.
             ConversationItem::BackendToolCall(_) => {}
             // Reasoning items rarely reference CWD paths, but they can —
@@ -3049,6 +3356,22 @@ pub enum DanglingToolCallReason {
     HarnessHalted { class: &'static str },
 }
 
+fn tool_output_call_id(item: &ConversationItem) -> Option<&str> {
+    match item {
+        ConversationItem::ToolResult(result) => Some(
+            decode_custom_tool_call_id(&result.tool_call_id)
+                .map(|(call_id, _)| call_id)
+                .unwrap_or(result.tool_call_id.as_str()),
+        ),
+        ConversationItem::CustomToolOutput(output) => Some(output.call_id.as_str()),
+        _ => None,
+    }
+}
+
+fn is_tool_output(item: &ConversationItem) -> bool {
+    tool_output_call_id(item).is_some()
+}
+
 /// Insert synthetic `ToolResult` items for any tool calls that lack a result.
 ///
 /// When a turn is cancelled mid-tool-execution, the conversation can have an
@@ -3057,9 +3380,10 @@ pub enum DanglingToolCallReason {
 ///
 /// Scans the entire conversation front-to-back. For every assistant message
 /// that has `tool_calls`, it checks which calls are answered by the
-/// immediately following `ToolResult` items and inserts synthetic results
-/// for any that are missing, preserving the original call order. `reason`
-/// controls the wording of those synthetic results.
+/// immediately following run of generic results and native custom outputs,
+/// and inserts synthetic results for any calls that are missing, preserving
+/// the original call order. `reason` controls the wording of those synthetic
+/// results.
 ///
 /// A full scan is necessary because old sessions (or sessions that switched
 /// API providers) may have dangling tool calls anywhere in the history, not
@@ -3080,18 +3404,25 @@ pub fn repair_dangling_tool_calls(
             && !a.tool_calls.is_empty()
         {
             // Snapshot the call metadata we need (avoids borrowing `conversation`).
-            let tool_calls: Vec<(Arc<str>, String)> = a
+            let tool_calls: Vec<(Arc<str>, String, bool, String)> = a
                 .tool_calls
                 .iter()
-                .map(|tc| (tc.id.clone(), tc.name.clone()))
+                .map(|tc| {
+                    (
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        tc.is_custom(),
+                        tc.call_id().to_owned(),
+                    )
+                })
                 .collect();
 
             // Collect answered IDs from the immediately following ToolResult items.
             let mut answered = std::collections::HashSet::new();
             let mut j = i + 1;
             while j < conversation.len() {
-                if let ConversationItem::ToolResult(tr) = &conversation[j] {
-                    answered.insert(tr.tool_call_id.clone());
+                if let Some(call_id) = tool_output_call_id(&conversation[j]) {
+                    answered.insert(call_id.to_owned());
                     j += 1;
                 } else {
                     break;
@@ -3101,12 +3432,16 @@ pub fn repair_dangling_tool_calls(
             // Build synthetic results for unanswered calls, preserving call order.
             let synthetic: Vec<ConversationItem> = tool_calls
                 .iter()
-                .filter(|(id, _)| !answered.contains(id.as_ref()))
-                .map(|(id, name)| {
-                    ConversationItem::tool_result(
-                        id.as_ref(),
-                        synthetic_dangling_result_text(name, reason),
-                    )
+                .filter(|(_, _, _, call_id)| !answered.contains(call_id))
+                .map(|(id, name, is_custom, call_id)| {
+                    let text = synthetic_dangling_result_text(name, reason);
+                    if *is_custom {
+                        ConversationItem::custom_tool_output(
+                            CustomToolOutputItem::text(call_id, text).with_name(name),
+                        )
+                    } else {
+                        ConversationItem::tool_result(id.as_ref(), text)
+                    }
                 })
                 .collect();
 
@@ -3129,8 +3464,8 @@ pub fn repair_dangling_tool_calls(
 }
 
 /// Read-only counterpart to [`repair_dangling_tool_calls`]: returns `true` if
-/// any assistant message has a tool call that is not answered by a `ToolResult`
-/// in the immediately-following run of results.
+/// any assistant message has a tool call that is not answered by a generic
+/// result or native custom output in the immediately-following output run.
 ///
 /// Lets callers decide whether the repair *would* fire (and therefore already
 /// signal a cancellation to the model) without mutating the conversation. Uses
@@ -3146,8 +3481,8 @@ pub fn has_dangling_tool_calls(conversation: &[ConversationItem]) -> bool {
             let mut answered = std::collections::HashSet::new();
             let mut j = i + 1;
             while j < conversation.len() {
-                if let ConversationItem::ToolResult(tr) = &conversation[j] {
-                    answered.insert(tr.tool_call_id.clone());
+                if let Some(call_id) = tool_output_call_id(&conversation[j]) {
+                    answered.insert(call_id.to_owned());
                     j += 1;
                 } else {
                     break;
@@ -3155,7 +3490,7 @@ pub fn has_dangling_tool_calls(conversation: &[ConversationItem]) -> bool {
             }
             if a.tool_calls
                 .iter()
-                .any(|tc| !answered.contains(tc.id.as_ref()))
+                .any(|tc| !answered.contains(tc.call_id()))
             {
                 return true;
             }
@@ -3187,10 +3522,12 @@ fn synthetic_dangling_result_text(name: &str, reason: DanglingToolCallReason) ->
 /// entries sharing the same `tool_call_id`.  The LLM API rejects this with
 /// "each tool_use must have a single result".
 ///
-/// This function scans the `ToolResult` items immediately following each
-/// assistant message.  If a `tool_call_id` appears more than once, only the
-/// **last** occurrence is kept (the real result), and earlier duplicates are
-/// removed.
+/// This function scans the complete tool-output run immediately following
+/// each assistant message. If a generic `ToolResult.tool_call_id` appears more
+/// than once, only the **last** occurrence is kept (the real result), and
+/// earlier duplicates are removed. Native [`ConversationItem::CustomToolOutput`]
+/// entries are deliberately never deduplicated because one custom call may
+/// emit multiple ordered progress/final output items.
 ///
 /// Returns the number of duplicate entries removed.
 pub fn dedup_duplicate_tool_results(conversation: &mut Vec<ConversationItem>) -> usize {
@@ -3206,7 +3543,7 @@ pub fn dedup_duplicate_tool_results(conversation: &mut Vec<ConversationItem>) ->
             let start = i + 1;
             let mut end = start;
             while end < conversation.len() {
-                if matches!(&conversation[end], ConversationItem::ToolResult(_)) {
+                if is_tool_output(&conversation[end]) {
                     end += 1;
                 } else {
                     break;
@@ -3438,6 +3775,47 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                     cache_control: None,
                 });
             }
+            ConversationItem::CustomToolOutput(output) => {
+                flush_assistant(&mut pending_assistant, &mut messages);
+                let blocks: Vec<ContentBlock> = output
+                    .content
+                    .iter()
+                    .map(|part| match part {
+                        CustomToolOutputContent::Text { text } => ContentBlock::Text {
+                            text: text.as_ref().to_owned(),
+                            cache_control: None,
+                        },
+                        CustomToolOutputContent::Image { url, .. } => {
+                            let source = if let Some(rest) = url.strip_prefix("data:") {
+                                if let Some((media_type, data)) = rest.split_once(";base64,") {
+                                    ImageSource::Base64 {
+                                        media_type: media_type.to_string(),
+                                        data: data.to_string(),
+                                    }
+                                } else {
+                                    ImageSource::Url {
+                                        url: url.as_ref().to_owned(),
+                                    }
+                                }
+                            } else {
+                                ImageSource::Url {
+                                    url: url.as_ref().to_owned(),
+                                }
+                            };
+                            ContentBlock::Image { source }
+                        }
+                    })
+                    .collect();
+                let content = match blocks.as_slice() {
+                    [ContentBlock::Text { text, .. }] => ToolResultContent::Text(text.clone()),
+                    _ => ToolResultContent::Blocks(blocks),
+                };
+                pending_tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id: sanitize_tool_call_id(&output.call_id),
+                    content,
+                    cache_control: None,
+                });
+            }
             // Anthropic Messages API has no native backend-tool-call concept.
             // Emit a synthetic assistant text block so the model retains
             // context about what was searched.
@@ -3620,7 +3998,10 @@ impl From<crate::messages::MessagesResponse> for ConversationItem {
 #[cfg(test)]
 mod compaction_item_bridge_tests {
     use super::*;
-    use xai_grok_compaction::{CompactionItem, CompactionItemFactory, CompactionRole};
+    use xai_grok_compaction::{
+        CompactedHistoryParts, CompactionItem, CompactionItemFactory, CompactionRole,
+        assemble_compacted_history,
+    };
 
     #[test]
     fn role_maps_every_variant() {
@@ -3638,6 +4019,12 @@ mod compaction_item_bridge_tests {
         );
         assert_eq!(
             CompactionItem::role(&ConversationItem::tool_result("tc1", "r")),
+            CompactionRole::Tool
+        );
+        assert_eq!(
+            CompactionItem::role(&ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "progress")
+            )),
             CompactionRole::Tool
         );
         // BackendToolCall / Reasoning are semantically part of the assistant
@@ -3725,6 +4112,49 @@ mod compaction_item_bridge_tests {
 
         let reminder = <ConversationItem as CompactionItemFactory>::new_system_reminder("r".into());
         assert_matches_user_reason(&reminder, Some(SyntheticReason::SystemReminder));
+    }
+
+    #[test]
+    fn full_replace_compaction_preserves_repeated_custom_outputs_verbatim() {
+        let recent = vec![
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "notify one")
+                    .with_item_id("out-1")
+                    .with_name("code"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "notify two")
+                    .with_item_id("out-2")
+                    .with_name("code"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "final")
+                    .with_item_id("out-3")
+                    .with_name("code"),
+            ),
+        ];
+        let compacted = assemble_compacted_history(CompactedHistoryParts {
+            system_message: ConversationItem::system("system"),
+            user_message_prefix: "prefix".into(),
+            agents_md_reminder: None,
+            last_user_query: None,
+            recent_messages: recent,
+            compaction_summary: "summary".into(),
+            system_reminder: None,
+            transcript_hint: None,
+        });
+
+        let outputs: Vec<_> = compacted
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::CustomToolOutput(output) => Some(output),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].item_id.as_deref(), Some("out-1"));
+        assert_eq!(outputs[1].text_content(), "notify two");
+        assert_eq!(outputs[2].text_content(), "final");
     }
 
     fn assert_matches_user_reason(item: &ConversationItem, expected: Option<SyntheticReason>) {
@@ -3884,6 +4314,148 @@ mod tests {
             .expect("custom output replayed");
         assert_eq!(custom_output["call_id"], "call_code");
         assert_eq!(custom_output["output"], "42");
+    }
+
+    #[test]
+    fn repeated_notify_and_final_custom_outputs_survive_repair_dedup_and_replay() {
+        let call = ToolCall::custom("call-code", "ctc-code", "code", "do work");
+        let mut items = vec![
+            ConversationItem::assistant_tool_calls(vec![call]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "notify one")
+                    .with_item_id("out-1")
+                    .with_name("code"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "notify two")
+                    .with_item_id("out-2")
+                    .with_name("code"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "final")
+                    .with_item_id("out-3")
+                    .with_name("code"),
+            ),
+        ];
+
+        assert!(!has_dangling_tool_calls(&items));
+        assert_eq!(
+            repair_dangling_tool_calls(&mut items, DanglingToolCallReason::UserCancelled),
+            0
+        );
+        assert_eq!(dedup_duplicate_tool_results(&mut items), 0);
+        assert_eq!(items.len(), 4);
+
+        let persisted = serde_json::to_value(&items[1]).unwrap();
+        assert_eq!(persisted["type"], "custom_tool_output");
+        assert_eq!(persisted["call_id"], "call-code");
+        assert_eq!(persisted["item_id"], "out-1");
+        assert_eq!(persisted["name"], "code");
+
+        let request = ConversationRequest::from_items(items);
+        assert_eq!(
+            request.named_custom_tool_outputs(),
+            vec![
+                NamedCustomToolOutputOccurrence {
+                    input_item_index: 1,
+                    call_id: "call-code".into(),
+                    name: "code".into(),
+                },
+                NamedCustomToolOutputOccurrence {
+                    input_item_index: 2,
+                    call_id: "call-code".into(),
+                    name: "code".into(),
+                },
+                NamedCustomToolOutputOccurrence {
+                    input_item_index: 3,
+                    call_id: "call-code".into(),
+                    name: "code".into(),
+                },
+            ]
+        );
+        let wire = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+        let outputs: Vec<_> = wire["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "custom_tool_call_output")
+            .collect();
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0]["call_id"], "call-code");
+        assert_eq!(outputs[0]["id"], "out-1");
+        assert_eq!(outputs[0]["output"], "notify one");
+        assert_eq!(outputs[1]["id"], "out-2");
+        assert_eq!(outputs[1]["output"], "notify two");
+        assert_eq!(outputs[2]["id"], "out-3");
+        assert_eq!(outputs[2]["output"], "final");
+    }
+
+    #[test]
+    fn custom_output_replay_preserves_a_image_b_order_and_detail() {
+        let item = ConversationItem::custom_tool_output(
+            CustomToolOutputItem::new(
+                "call-code",
+                [
+                    CustomToolOutputContent::text("A"),
+                    CustomToolOutputContent::image(
+                        "data:image/png;base64,iVBOR",
+                        CustomToolOutputImageDetail::Original,
+                    ),
+                    CustomToolOutputContent::text("B"),
+                ],
+            )
+            .with_item_id("out-image")
+            .with_name("code"),
+        );
+
+        let persisted = serde_json::to_string(&item).unwrap();
+        assert!(persisted.contains("\"detail\":\"original\""));
+        let restored: ConversationItem = serde_json::from_str(&persisted).unwrap();
+        let request =
+            ConversationRequest::from_items(vec![ConversationItem::system("system"), restored]);
+        assert_eq!(
+            request.original_detail_custom_output_images(),
+            vec![OriginalDetailCustomOutputImageOccurrence {
+                input_item_index: 1,
+                output_content_index: 1,
+                image_url: Arc::<str>::from("data:image/png;base64,iVBOR"),
+            }]
+        );
+        let wire = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+        let output = &wire["input"][1];
+        assert_eq!(output["type"], "custom_tool_call_output");
+        assert_eq!(output["call_id"], "call-code");
+        assert_eq!(output["id"], "out-image");
+        assert_eq!(
+            output["output"],
+            serde_json::json!([
+                {"type": "input_text", "text": "A"},
+                {
+                    "type": "input_image",
+                    // async-openai 0.33.1 has no Original variant; the
+                    // occurrence helper tells the sampler to patch this.
+                    "detail": "high",
+                    "image_url": "data:image/png;base64,iVBOR"
+                },
+                {"type": "input_text", "text": "B"}
+            ])
+        );
+    }
+
+    #[test]
+    fn repair_missing_custom_call_uses_native_custom_output() {
+        let mut items = vec![ConversationItem::assistant_tool_calls(vec![
+            ToolCall::custom("call-code", "ctc-code", "code", "do work"),
+        ])];
+        assert_eq!(
+            repair_dangling_tool_calls(&mut items, DanglingToolCallReason::UserCancelled),
+            1
+        );
+        assert_matches!(&items[1], ConversationItem::CustomToolOutput(output) => {
+            assert_eq!(output.call_id, "call-code");
+            assert_eq!(output.name.as_deref(), Some("code"));
+            assert!(output.text_content().contains("cancelled"));
+        });
     }
 
     #[test]
