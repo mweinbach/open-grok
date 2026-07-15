@@ -18,8 +18,9 @@ ported explicitly rather than silently changing the runtime contract.
 
 When Code Mode Only is effective:
 
-1. The Responses API exposes only the native custom/freeform `exec` tool and
-   the JSON-schema `wait` function tool to the model.
+1. The Responses API exposes the native custom/freeform `exec` tool, the
+   JSON-schema `wait` function tool, and Codex-style direct-only exceptions for
+   human interaction and multi-agent lifecycle controls.
 2. `exec` accepts raw JavaScript, not a JSON object containing JavaScript.
 3. Ordinary Grok Build tools remain registered but are hidden from the model's
    top-level tool list. JavaScript reaches them through the generated `tools.*`
@@ -30,6 +31,8 @@ When Code Mode Only is effective:
    structured content.
 6. The JavaScript runtime is persistent for the agent session and is disposed when
    that session ends.
+7. Direct-only collaboration controls remain top-level and are excluded from the
+   generated `tools.*` namespace, matching Sol's multi-agent-v2 policy.
 
 An implementation that exposes `exec` as a normal JSON-schema function or starts a
 fresh JavaScript process for every call is not compatible with this contract.

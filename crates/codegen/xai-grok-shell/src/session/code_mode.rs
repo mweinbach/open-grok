@@ -32,9 +32,22 @@ pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 
 /// Human-interaction tools must remain model-visible in Code Mode Only: a
 /// JavaScript callback cannot safely own an ACP question whose answer pauses
-/// the model turn. This mirrors Codex's `DirectModelOnly` exposure.
+/// the model turn. Collaboration lifecycle tools also stay direct, matching
+/// GPT-5.6 Sol's Codex multi-agent-v2 `DirectModelOnly` exposure.
 pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
-    matches!(name, "ask_user_question" | "request_user_input")
+    matches!(
+        name,
+        "ask_user_question"
+            | "request_user_input"
+            | "task"
+            | "spawn_subagent"
+            | "get_task_output"
+            | "get_command_or_subagent_output"
+            | "wait_tasks"
+            | "wait_commands_or_subagents"
+            | "kill_task"
+            | "kill_command_or_subagent"
+    )
 }
 
 const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
@@ -101,7 +114,14 @@ impl CodeModeRuntime {
 
         tokio::task::spawn_local(async move {
             while let Some(message) = receiver.recv().await {
-                spawn_dispatch_message(session_actor.clone(), message);
+                match message {
+                    message @ DispatchMessage::InvokeTool { .. } => {
+                        spawn_dispatch_message(session_actor.clone(), message);
+                    }
+                    message @ DispatchMessage::Notify { .. } => {
+                        dispatch_message(session_actor.clone(), message).await;
+                    }
+                }
             }
         });
         Ok(())
@@ -279,57 +299,64 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
 
 fn spawn_dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMessage) {
     tokio::task::spawn_local(async move {
-        match message {
-            DispatchMessage::InvokeTool {
-                invocation,
-                cancellation_token,
-                response_tx,
-            } => {
-                let response = match wait_for_active_code_mode_turn(
-                    &session_actor,
-                    &cancellation_token,
-                    "nested tool call",
-                )
-                .await
-                {
-                    Ok(session_actor) => tokio::select! {
-                        response = session_actor.dispatch_code_mode_nested_tool(
-                            invocation,
-                            cancellation_token.clone(),
-                        ) => response,
-                        _ = cancellation_token.cancelled() => {
-                            Err("code mode nested tool call cancelled".to_string())
-                        }
-                    },
-                    Err(error) => Err(error),
-                };
-                let _ = response_tx.send(response);
-            }
-            DispatchMessage::Notify {
-                call_id,
-                text,
-                cancellation_token,
-                response_tx,
-            } => {
-                let response = match wait_for_active_code_mode_turn(
-                    &session_actor,
-                    &cancellation_token,
-                    "notification",
-                )
-                .await
-                {
-                    Ok(session_actor) => tokio::select! {
-                        _ = session_actor.record_code_mode_notification(call_id, text) => Ok(()),
-                        _ = cancellation_token.cancelled() => {
-                            Err("code mode notification cancelled".to_string())
-                        }
-                    },
-                    Err(error) => Err(error),
-                };
-                let _ = response_tx.send(response);
-            }
-        }
+        dispatch_message(session_actor, message).await;
     });
+}
+
+/// Dispatch one runtime callback. Notifications are awaited serially by the
+/// receiver loop so repeated `notify()` outputs retain FIFO order; nested tool
+/// invocations call this from their own local tasks and may run concurrently.
+async fn dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMessage) {
+    match message {
+        DispatchMessage::InvokeTool {
+            invocation,
+            cancellation_token,
+            response_tx,
+        } => {
+            let response = match wait_for_active_code_mode_turn(
+                &session_actor,
+                &cancellation_token,
+                "nested tool call",
+            )
+            .await
+            {
+                Ok(session_actor) => tokio::select! {
+                    response = session_actor.dispatch_code_mode_nested_tool(
+                        invocation,
+                        cancellation_token.clone(),
+                    ) => response,
+                    _ = cancellation_token.cancelled() => {
+                        Err("code mode nested tool call cancelled".to_string())
+                    }
+                },
+                Err(error) => Err(error),
+            };
+            let _ = response_tx.send(response);
+        }
+        DispatchMessage::Notify {
+            call_id,
+            text,
+            cancellation_token,
+            response_tx,
+        } => {
+            let response = match wait_for_active_code_mode_turn(
+                &session_actor,
+                &cancellation_token,
+                "notification",
+            )
+            .await
+            {
+                Ok(session_actor) => tokio::select! {
+                    _ = session_actor.record_code_mode_notification(call_id, text) => Ok(()),
+                    _ = cancellation_token.cancelled() => {
+                        Err("code mode notification cancelled".to_string())
+                    }
+                },
+                Err(error) => Err(error),
+            };
+            let _ = response_tx.send(response);
+        }
+    }
 }
 
 /// Wait for the next Code Mode turn instead of rejecting callbacks that arrive
@@ -810,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_model_only_question_tool_is_not_nested_in_exec() {
+    fn direct_model_only_question_and_collaboration_tools_are_not_nested_in_exec() {
         let tools = vec![
             GrokToolDefinition::function(
                 "ask_user_question",
@@ -822,6 +849,16 @@ mod tests {
                 Some("Read a file"),
                 json!({"type": "object"}),
             ),
+            GrokToolDefinition::function(
+                "spawn_subagent",
+                Some("Launch a subagent"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "get_command_or_subagent_output",
+                Some("Read subagent output"),
+                json!({"type": "object"}),
+            ),
         ];
         let nested = collect_code_mode_tool_definitions(&tools);
         assert_eq!(
@@ -831,7 +868,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["read_file"]
         );
-        assert!(is_code_mode_direct_only_tool("ask_user_question"));
+        for direct_only in [
+            "ask_user_question",
+            "request_user_input",
+            "task",
+            "spawn_subagent",
+            "get_task_output",
+            "get_command_or_subagent_output",
+            "wait_tasks",
+            "wait_commands_or_subagents",
+            "kill_task",
+            "kill_command_or_subagent",
+        ] {
+            assert!(
+                is_code_mode_direct_only_tool(direct_only),
+                "{direct_only} must remain model-visible"
+            );
+        }
         assert!(!is_code_mode_direct_only_tool("read_file"));
     }
 
