@@ -740,6 +740,24 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: true,
             hidden_in_minimal: false,
         },
+        // SHELL-owned `[ui].code_mode`. The running session keeps its mode;
+        // this user preference is resolved only when a new session starts.
+        SettingMeta {
+            key: "code_mode",
+            category: SettingCategory::Agent,
+            owner: SettingOwner::Shell,
+            label: "Code mode",
+            description: "When on, new sessions use Codex-style code mode when the model does not specify a tool mode. Model metadata stays authoritative. Restart required.",
+            keywords: &[
+                "code", "mode", "codex", "coding", "agent", "session", "fallback", "model",
+                "metadata", "default",
+            ],
+            kind: SettingKind::Bool {
+                default: ui_default.code_mode.unwrap_or(false),
+            },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
         // PAGER-owned; default pinned by `defaults_match_pager_state`.
         SettingMeta {
             key: "multiline_mode",

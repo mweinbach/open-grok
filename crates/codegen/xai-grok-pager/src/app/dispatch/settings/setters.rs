@@ -291,6 +291,33 @@ pub(in crate::app::dispatch) fn set_remember_tool_approvals(
     }]
 }
 
+/// Mirror the user-config override in `current_ui`. Runtime mode resolution is
+/// intentionally left untouched; new sessions consume this preference.
+pub(super) fn set_code_mode_inner(app: &mut AppView, new: bool) {
+    app.current_ui.code_mode = Some(new);
+}
+
+/// SHELL-owned setter for the restart-required `[ui].code_mode` switch.
+pub(in crate::app::dispatch) fn set_code_mode(app: &mut AppView, new: bool) -> Vec<Effect> {
+    let prev_state = app.current_ui.code_mode;
+    let prev_effective = prev_state.unwrap_or(false);
+    if prev_effective == new && prev_state.is_some() {
+        return vec![];
+    }
+    set_code_mode_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "code_mode", value = new, "setting changed");
+    app.show_toast(&format!(
+        "{} (restart to apply)",
+        save_success_toast("Code mode", new),
+    ));
+    vec![Effect::PersistSetting {
+        key: "code_mode",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev_effective),
+    }]
+}
+
 /// Mirror the just-written TOML value in `app` so the modal reflects it (the
 /// effective timeout is re-resolved shell-side at agent build).
 pub(super) fn set_ask_user_question_timeout_enabled_inner(app: &mut AppView, new: bool) {

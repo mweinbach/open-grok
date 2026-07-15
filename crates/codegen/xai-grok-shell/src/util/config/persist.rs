@@ -1441,6 +1441,12 @@ auto_update = true
         let cfg = apply(|cfg| cfg.ui.simple_mode = Some(false));
         assert_eq!(cfg.ui.simple_mode, Some(false));
 
+        // set_code_mode wraps `cfg.ui.code_mode = Some(value)`.
+        let cfg = apply(|cfg| cfg.ui.code_mode = Some(true));
+        assert_eq!(cfg.ui.code_mode, Some(true));
+        let cfg = apply(|cfg| cfg.ui.code_mode = Some(false));
+        assert_eq!(cfg.ui.code_mode, Some(false));
+
         // set_theme wraps `cfg.ui.theme = Some(value)` (canonical name).
         let cfg = apply(|cfg| cfg.ui.theme = Some("tokyonight".to_string()));
         assert_eq!(cfg.ui.theme, Some("tokyonight".to_string()));
@@ -1588,6 +1594,36 @@ custom_user_key = "preserve-me"
             Some("preserve-me"),
             "unmodeled (unknown to the UiConfig schema) field must survive — \
              this is the merge_section invariant the new helpers depend on"
+        );
+    }
+
+    #[test]
+    fn set_code_mode_round_trips_through_merge() {
+        let original = r#"
+[ui]
+code_mode = false
+show_timestamps = true
+custom_user_key = "preserve-me"
+"#;
+        let root: TomlValue = toml::from_str(original).unwrap();
+        let mut cfg = load_config_from_toml(&root);
+
+        cfg.ui.code_mode = Some(true);
+
+        let mut table = root.as_table().unwrap().clone();
+        merge_section(&mut table, "ui", &cfg.ui);
+
+        let ui = table.get("ui").unwrap().as_table().unwrap();
+        assert_eq!(ui.get("code_mode").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            ui.get("show_timestamps").and_then(|v| v.as_bool()),
+            Some(true),
+            "unrelated modeled field must survive"
+        );
+        assert_eq!(
+            ui.get("custom_user_key").and_then(|v| v.as_str()),
+            Some("preserve-me"),
+            "unmodeled field must survive"
         );
     }
 

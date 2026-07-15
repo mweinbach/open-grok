@@ -653,6 +653,7 @@ fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "multiline_mode" => Some(Action::SetMultilineMode(new)),
         "vim_mode" => Some(Action::SetVimMode(new)),
         "remember_tool_approvals" => Some(Action::SetRememberToolApprovals(new)),
+        "code_mode" => Some(Action::SetCodeMode(new)),
         "toolset.ask_user_question.timeout_enabled" => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(new))
         }
@@ -5710,6 +5711,8 @@ mod tests {
                 // SHELL-owned remember_tool_approvals (Agent category,
                 // registered right after permission_mode).
                 "remember_tool_approvals",
+                // SHELL-owned code_mode (Agent category, restart-required).
+                "code_mode",
                 // SHELL-owned default_selected_permission (Agent category,
                 // colocated with permission_mode / plan_mode).
                 "default_selected_permission",

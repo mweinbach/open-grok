@@ -171,6 +171,11 @@ pub async fn set_remember_tool_approvals(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.remember_tool_approvals = Some(value)).await
 }
 
+/// Persist the restart-required `[ui].code_mode` override.
+pub async fn set_code_mode(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.code_mode = Some(value)).await
+}
+
 /// Persist `[ui].show_thinking_blocks` via `update_config`.
 pub async fn set_show_thinking_blocks(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.show_thinking_blocks = Some(value)).await

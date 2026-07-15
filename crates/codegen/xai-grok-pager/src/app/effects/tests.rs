@@ -684,6 +684,19 @@ async fn persist_setting_type_mismatch_errors_simple_mode() {
         "error message must mention key + expected kind, got: {err}",
     );
 }
+
+/// Type-mismatch for the restart-required Code mode switch.
+#[tokio::test]
+async fn persist_setting_type_mismatch_errors_code_mode() {
+    use crate::settings::SettingValue;
+    let r = persist_setting("code_mode", SettingValue::String("on".into())).await;
+    let err = r.expect_err("code_mode with String payload must return Err");
+    assert!(
+        err.contains("persist_setting(code_mode) expected Bool"),
+        "error message must mention key + expected kind, got: {err}",
+    );
+}
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 /// Spawn a fake ACP agent that counts `x.ai/yolo_mode_changed`

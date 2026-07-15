@@ -103,6 +103,12 @@ pub struct UiConfig {
     /// effective gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remember_tool_approvals: Option<bool>,
+    /// Use Codex-style code mode for new sessions whose model metadata does not
+    /// declare a tool mode. Explicit model metadata remains authoritative;
+    /// unset or false keeps the built-in fallback. Written by the settings
+    /// modal and applied at session startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<bool>,
     /// In-app drag selection highlight: `flash` | `hold` (legacy bool accepted).
     #[serde(
         default,
@@ -252,6 +258,7 @@ impl Default for UiConfig {
             voice_stt_language: None,
             mouse_reporting_toggle: None,
             remember_tool_approvals: None,
+            code_mode: None,
             cancel_subagents_on_turn_cancel: None,
             keep_text_selection: None,
             selection_highlight_duration_ms: None,
@@ -282,6 +289,19 @@ impl UiConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_mode_defaults_off_and_round_trips_explicit_values() {
+        assert_eq!(UiConfig::default().code_mode, None);
+
+        let enabled: UiConfig = serde_json::from_str(r#"{"code_mode":true}"#).unwrap();
+        assert_eq!(enabled.code_mode, Some(true));
+        let disabled: UiConfig = serde_json::from_str(r#"{"code_mode":false}"#).unwrap();
+        assert_eq!(disabled.code_mode, Some(false));
+
+        let value = serde_json::to_value(enabled).unwrap();
+        assert_eq!(value.get("code_mode").and_then(|v| v.as_bool()), Some(true));
+    }
 
     #[test]
     fn keep_text_selection_enabled_precedence() {

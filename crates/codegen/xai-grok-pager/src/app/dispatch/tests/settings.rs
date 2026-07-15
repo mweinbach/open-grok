@@ -886,6 +886,40 @@ fn every_persisting_setting_has_rollback_arm() {
         }
     }
 }
+
+#[test]
+fn code_mode_setter_persists_and_rolls_back_with_restart_toast() {
+    let mut app = test_app_with_agent();
+    assert_eq!(app.current_ui.code_mode, None);
+
+    let effects = dispatch(Action::SetCodeMode(true), &mut app);
+    assert_eq!(app.current_ui.code_mode, Some(true));
+    assert_eq!(effects.len(), 1);
+    assert!(matches!(
+        &effects[0],
+        Effect::PersistSetting {
+            key: "code_mode",
+            value: crate::settings::SettingValue::Bool(true),
+            rollback_value: crate::settings::SettingValue::Bool(false),
+        }
+    ));
+    let toast = app
+        .agents
+        .get(&AgentId(0))
+        .and_then(|a| a.toast.as_ref())
+        .map(|(message, _)| message.as_str())
+        .expect("code_mode setter must show a toast");
+    assert!(toast.contains("restart to apply"));
+
+    let rollback_effects = apply_setting_rollback(
+        &mut app,
+        "code_mode",
+        &crate::settings::SettingValue::Bool(false),
+    );
+    assert!(rollback_effects.is_empty());
+    assert_eq!(app.current_ui.code_mode, Some(false));
+}
+
 /// Pin the
 /// asymmetric clear-default semantics. `Action::ClearDefaultModel`
 /// persists `cfg.models.default = None` AND emits the
@@ -1217,6 +1251,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "remember_tool_approvals" => {
             let _ = dispatch(Action::SetRememberToolApprovals(true), app);
+        }
+        "code_mode" => {
+            let _ = dispatch(Action::SetCodeMode(true), app);
         }
         "toolset.ask_user_question.timeout_enabled" => {
             let _ = dispatch(Action::SetAskUserQuestionTimeoutEnabled(false), app);

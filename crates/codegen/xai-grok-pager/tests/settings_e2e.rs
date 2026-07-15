@@ -33,6 +33,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "simple_mode",
     "vim_mode",
     "remember_tool_approvals",
+    "code_mode",
     "toolset.ask_user_question.timeout_enabled",
     "keep_text_selection",
     "theme",
@@ -216,6 +217,9 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
                 "SetRememberToolApprovals value differs from expected"
             )
         }
+        ("code_mode", Action::SetCodeMode(b)) => {
+            assert_eq!(b, expected, "SetCodeMode value differs from expected")
+        }
         (
             "toolset.ask_user_question.timeout_enabled",
             Action::SetAskUserQuestionTimeoutEnabled(b),
@@ -367,6 +371,25 @@ fn space_on_remember_tool_approvals_dispatches_typed_setter() {
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
     // Default is false, so toggling flips it on.
     assert_set_bool_action(outcome, "remember_tool_approvals", true);
+}
+
+#[test]
+fn space_on_code_mode_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "code_mode");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "code_mode", true);
+}
+
+#[test]
+fn code_mode_registry_contract_is_restart_required_and_off_by_default() {
+    let reg = SettingsRegistry::defaults();
+    let meta = reg.find("code_mode").expect("code_mode must be registered");
+    assert_eq!(meta.label, "Code mode");
+    assert_eq!(meta.category, SettingCategory::Agent);
+    assert_eq!(meta.owner, SettingOwner::Shell);
+    assert!(meta.restart_required);
+    assert!(matches!(meta.kind, SettingKind::Bool { default: false }));
 }
 
 /// The Ask-Question timeout row renders in Agent & Approval directly above
@@ -583,6 +606,20 @@ fn mouse_click_on_remember_tool_approvals_indicator_toggles_in_one_click() {
         row_y,
     );
     assert_set_bool_action(outcome, "remember_tool_approvals", true);
+}
+
+#[test]
+fn mouse_click_on_code_mode_indicator_toggles_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "code_mode") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert_set_bool_action(outcome, "code_mode", true);
 }
 
 /// Value-column click toggles the Ask-Question timeout in one click.
@@ -1557,6 +1594,7 @@ fn registry_kind_membership_through_pr_14() {
             "simple_mode",
             "vim_mode",
             "remember_tool_approvals",
+            "code_mode",
             "toolset.ask_user_question.timeout_enabled",
             "auto_update",
             "show_tips",
@@ -1697,6 +1735,7 @@ fn defaults_round_trip_through_registry() {
             "simple_mode" => SettingValue::Bool(true),
             "vim_mode" => SettingValue::Bool(false),
             "remember_tool_approvals" => SettingValue::Bool(false),
+            "code_mode" => SettingValue::Bool(false),
             "toolset.ask_user_question.timeout_enabled" => SettingValue::Bool(true),
             "keep_text_selection" => SettingValue::Enum("flash"),
             "theme" => SettingValue::Enum("groknight"),
@@ -1793,6 +1832,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetMultilineMode(_))
             | SettingsKeyOutcome::Action(Action::SetVimMode(_))
             | SettingsKeyOutcome::Action(Action::SetRememberToolApprovals(_))
+            | SettingsKeyOutcome::Action(Action::SetCodeMode(_))
             | SettingsKeyOutcome::Action(Action::SetAskUserQuestionTimeoutEnabled(_))
             | SettingsKeyOutcome::Action(Action::SetShowTips(_))
             | SettingsKeyOutcome::Action(Action::SetAutoUpdate(_))
