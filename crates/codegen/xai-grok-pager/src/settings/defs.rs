@@ -747,7 +747,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Agent,
             owner: SettingOwner::Shell,
             label: "Code mode",
-            description: "When on, new sessions use Codex-style code mode when the model does not specify a tool mode. Model metadata stays authoritative. Restart required.",
+            description: "When on, new Responses-backed sessions use Codex-style Code Mode Only when the model does not specify a tool mode. Model metadata stays authoritative. Restart required.",
             keywords: &[
                 "code", "mode", "codex", "coding", "agent", "session", "fallback", "model",
                 "metadata", "default",

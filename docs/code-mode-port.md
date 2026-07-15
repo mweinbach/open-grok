@@ -18,8 +18,8 @@ ported explicitly rather than silently changing the runtime contract.
 
 When Code Mode Only is effective:
 
-1. The Responses API exposes only the native custom/freeform `exec` and `wait`
-   tools to the model.
+1. The Responses API exposes only the native custom/freeform `exec` tool and
+   the JSON-schema `wait` function tool to the model.
 2. `exec` accepts raw JavaScript, not a JSON object containing JavaScript.
 3. Ordinary Grok Build tools remain registered but are hidden from the model's
    top-level tool list. JavaScript reaches them through the generated `tools.*`
@@ -40,11 +40,14 @@ Settings gains a restart-required **Code mode** switch:
 
 - Off (default): preserve the current direct-tool behavior unless the selected
   model's catalog metadata requires another tool mode.
-- On: force `code_mode_only` for newly started sessions.
+- On: use `code_mode_only` for newly started sessions when the selected model
+  does not declare an explicit tool mode.
 
 Model metadata takes precedence, matching Codex. A model such as GPT-5.6 Sol that
 declares `code_mode_only` cannot be made incompatible by turning the preference
 off. The active session keeps its original tool mode until a new session starts.
+Code Mode uses the Responses API's native custom-tool wire format; a session whose
+effective mode is Code Mode must therefore use a Responses-backed model.
 
 ## Implementation phases
 
@@ -60,6 +63,11 @@ off. The active session keeps its original tool mode until a new session starts.
    and end-to-end Settings coverage.
 6. Run focused protocol, runtime, sampler, tool-registry, configuration, and pager
    tests followed by formatting and lint checks for the affected crates.
+
+All six phases are implemented against the pinned revision. Grok Build uses the
+upstream embedded V8 provider; the optional out-of-process `code-mode-host` is not
+included. This keeps the execution and persistence contract while avoiding a
+second process-management path.
 
 ## Provenance and maintenance
 

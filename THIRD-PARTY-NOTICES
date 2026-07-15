@@ -16632,7 +16632,10 @@ openai/codex
 --------------------------------------------------------------------------------
 Source:  https://github.com/openai/codex
 License: Apache-2.0
-Upstream paths: codex-rs/core/src/tools/handlers/ (and apply-patch crate)
+Source revision: 2be648ba4a6c159a3d80b1c07e7323cbd5efef8f
+Upstream paths: codex-rs/code-mode, codex-rs/code-mode-protocol,
+  codex-rs/core/src/tools/code_mode/, codex-rs/core/src/tools/handlers/
+  (and apply-patch crate)
 
 Copyright notice:
   Copyright 2025 OpenAI
@@ -16643,10 +16646,17 @@ Additional requirements / notices:
   Tool implementations under:
     crates/codegen/xai-grok-tools/src/implementations/codex/
   Modules: apply_patch, grep_files, list_dir, read_file.
+  Code Mode protocol and embedded JavaScript runtime under:
+    crates/codegen/xai-grok-code-mode-protocol/
+    crates/codegen/xai-grok-code-mode/
+  Code Mode shell adapter under:
+    crates/codegen/xai-grok-shell/src/session/code_mode.rs
   These are derived/portions of openai/codex tool handlers, adapted to this
-  crate's Tool trait and runtime. Apache-2.0 §4 requires retention of
-  copyright, patent, trademark, and attribution notices, a copy of the
-  license, and a notice of changes (this entry).
+  repository's tool traits, sampling transport, and session runtime. The
+  out-of-process code-mode host was not ported; Grok Build uses the upstream
+  in-process V8 provider. Apache-2.0 §4 requires retention of copyright,
+  patent, trademark, and attribution notices, a copy of the license, and a
+  notice of changes (this entry).
 
 
 --------------------------------------------------------------------------------
