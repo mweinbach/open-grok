@@ -123,6 +123,19 @@ pub(crate) fn strip_images(conversation: Vec<ConversationItem>) -> Vec<Conversat
                         *part = CustomToolOutputContent::text("[image]");
                     }
                 }
+                if !result.ordered_content.is_empty() {
+                    result.content = std::sync::Arc::<str>::from(
+                        result
+                            .ordered_content
+                            .iter()
+                            .filter_map(|part| match part {
+                                CustomToolOutputContent::Text { text } => Some(text.as_ref()),
+                                CustomToolOutputContent::Image { .. } => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(""),
+                    );
+                }
                 ConversationItem::ToolResult(result)
             }
             ConversationItem::CustomToolOutput(mut output) => {
@@ -3432,6 +3445,32 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         ];
         let result = strip_images(input);
         assert_eq!(result[0].text_content(), "just text");
+    }
+    #[test]
+    fn test_strip_images_resyncs_ordered_tool_result_text_mirror() {
+        let input = vec![ConversationItem::tool_result_with_ordered_content(
+            "wait-1",
+            vec![
+                CustomToolOutputContent::text("A"),
+                CustomToolOutputContent::image(
+                    "data:image/png;base64,AA==",
+                    CustomToolOutputImageDetail::Original,
+                ),
+                CustomToolOutputContent::text("B"),
+            ],
+        )];
+
+        let result = strip_images(input);
+        let ConversationItem::ToolResult(output) = &result[0] else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(output.content.as_ref(), "A[image]B");
+        assert!(
+            output
+                .ordered_content
+                .iter()
+                .all(|part| matches!(part, CustomToolOutputContent::Text { .. }))
+        );
     }
     #[test]
     fn test_prepare_for_summarization_strips_images() {

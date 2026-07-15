@@ -6,10 +6,11 @@
 //! [`ConversationItem`]) — but headers, sections, detail levels, and INDEX
 //! columns match.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use regex::Regex;
-use xai_grok_sampling_types::ConversationItem;
+use xai_grok_sampling_types::{ConversationItem, CustomToolOutputContent};
 
 /// Layout of the per-session segment store — single source of the path
 /// convention (writer, index parser, and transcript-hint builder all use these).
@@ -70,6 +71,46 @@ fn role_label(item: &ConversationItem) -> &'static str {
         ConversationItem::CustomToolOutput(_) => "Function",
         ConversationItem::BackendToolCall(_) => "Assistant",
         ConversationItem::Reasoning(_) => "Assistant",
+    }
+}
+
+/// Model-visible text for either function or native custom-tool output.
+/// Ordered output is the source of truth when present; images are represented
+/// by a small marker so segment artifacts never embed base64 payloads.
+fn tool_output_text(item: &ConversationItem) -> Option<Cow<'_, str>> {
+    let ordered_text = |parts: &[CustomToolOutputContent]| {
+        let mut text = String::new();
+        for part in parts {
+            match part {
+                CustomToolOutputContent::Text { text: part_text } => text.push_str(part_text),
+                CustomToolOutputContent::Image { .. } => text.push_str("[image]"),
+            }
+        }
+        text
+    };
+
+    match item {
+        ConversationItem::ToolResult(result) if result.ordered_content.is_empty() => {
+            let mut text = result.content.as_ref().to_owned();
+            for _ in &result.images {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str("[image]");
+            }
+            if result.images.is_empty() {
+                Some(Cow::Borrowed(result.content.as_ref()))
+            } else {
+                Some(Cow::Owned(text))
+            }
+        }
+        ConversationItem::ToolResult(result) => {
+            Some(Cow::Owned(ordered_text(&result.ordered_content)))
+        }
+        ConversationItem::CustomToolOutput(output) => {
+            Some(Cow::Owned(ordered_text(&output.content)))
+        }
+        _ => None,
     }
 }
 
@@ -233,9 +274,10 @@ fn compute_turn_stats(items: &[ConversationItem]) -> TurnStats {
                         .sum::<usize>();
                 }
             }
-            ConversationItem::ToolResult(t) => {
-                verbose_byte_estimate += t.content.len();
-                if t.content.starts_with("Error") || t.content.contains("Failed tool validation") {
+            ConversationItem::ToolResult(_) | ConversationItem::CustomToolOutput(_) => {
+                let content = tool_output_text(item).unwrap_or_default();
+                verbose_byte_estimate += content.len();
+                if content.starts_with("Error") || content.contains("Failed tool validation") {
                     tool_error_count += 1;
                 }
             }
@@ -329,10 +371,12 @@ fn render_turn_verbose(item: &ConversationItem, index: usize) -> String {
                 }
             }
         }
-        ConversationItem::ToolResult(t) => {
+        ConversationItem::ToolResult(_) | ConversationItem::CustomToolOutput(_) => {
             parts.push("[tool_response]".to_string());
-            if !t.content.is_empty() {
-                parts.push(t.content.to_string());
+            if let Some(content) = tool_output_text(item)
+                && !content.is_empty()
+            {
+                parts.push(content.into_owned());
             }
         }
         other => {
@@ -369,11 +413,13 @@ fn render_turn_balanced(item: &ConversationItem, index: usize) -> String {
                 }
             }
         }
-        ConversationItem::ToolResult(t) => {
+        ConversationItem::ToolResult(_) | ConversationItem::CustomToolOutput(_) => {
             parts.push("[tool_response]".to_string());
-            if !t.content.is_empty() {
+            if let Some(content) = tool_output_text(item)
+                && !content.is_empty()
+            {
                 parts.push(truncate_chars(
-                    &t.content,
+                    &content,
                     BALANCED_RESPONSE_CHARS,
                     "... [truncated]",
                 ));
@@ -425,7 +471,9 @@ fn render_turn_signature(item: &ConversationItem, index: usize) -> String {
             };
             format!("### Turn {index} ({role})  {sig_str}\n")
         }
-        ConversationItem::ToolResult(_) => format!("### Turn {index} ({role})  [tool_response]\n"),
+        ConversationItem::ToolResult(_) | ConversationItem::CustomToolOutput(_) => {
+            format!("### Turn {index} ({role})  [tool_response]\n")
+        }
         _ => format!("### Turn {index} ({role})\n"),
     }
 }
@@ -818,5 +866,51 @@ mod tests {
                 .last_assistant_excerpt
                 .contains("the final answer is 42")
         );
+    }
+
+    #[test]
+    fn native_and_ordered_tool_outputs_render_as_function_results() {
+        use xai_grok_sampling_types::{
+            CustomToolOutputContent, CustomToolOutputImageDetail, CustomToolOutputItem,
+        };
+
+        let items = vec![
+            ConversationItem::tool_result_with_ordered_content(
+                "wait-1",
+                vec![
+                    CustomToolOutputContent::text("A"),
+                    CustomToolOutputContent::image(
+                        "data:image/png;base64,AA==",
+                        CustomToolOutputImageDetail::Original,
+                    ),
+                    CustomToolOutputContent::text("B"),
+                ],
+            ),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::new(
+                "exec-1",
+                [
+                    CustomToolOutputContent::text("Error: nested tool failed"),
+                    CustomToolOutputContent::image(
+                        "data:image/png;base64,BB==",
+                        CustomToolOutputImageDetail::High,
+                    ),
+                ],
+            )),
+        ];
+
+        let stats = compute_turn_stats(&items);
+        assert_eq!(stats.role_counts, vec![("Function", 2)]);
+        assert_eq!(stats.tool_error_count, 1);
+
+        let verbose = render_segment_md(&items, "s", 1, CompactionDetail::Verbose, "t");
+        assert!(verbose.contains("[tool_response]\nA[image]B"));
+        assert!(verbose.contains("[tool_response]\nError: nested tool failed[image]"));
+
+        let balanced = render_segment_md(&items, "s", 1, CompactionDetail::Balanced, "t");
+        assert!(balanced.contains("A[image]B"));
+        assert!(balanced.contains("Error: nested tool failed[image]"));
+
+        let minimal = render_segment_md(&items, "s", 1, CompactionDetail::Minimal, "t");
+        assert_eq!(minimal.matches("[tool_response]").count(), 2);
     }
 }

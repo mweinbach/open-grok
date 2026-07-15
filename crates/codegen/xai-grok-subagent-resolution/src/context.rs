@@ -98,7 +98,7 @@ pub fn normalize_forked_context(items: Vec<ConversationItem>) -> (Vec<Conversati
 ///
 /// Returns a vec of indices where each complete turn ends (exclusive).
 /// A turn is: one or more consecutive User messages, followed by an
-/// Assistant message, followed by zero or more ToolResult messages.
+/// Assistant message, followed by zero or more function or native tool outputs.
 /// Real histories interleave `Reasoning` (and `BackendToolCall`) siblings,
 /// so those are skipped both before the Assistant and within the
 /// post-assistant tool-result run — otherwise long forked histories would
@@ -136,12 +136,13 @@ fn count_complete_turns(items: &[&ConversationItem]) -> Vec<usize> {
             break;
         }
         i += 1; // skip past Assistant
-        // Consume the post-assistant run: ToolResults plus interleaved
+        // Consume the post-assistant run: tool outputs plus interleaved
         // Reasoning / BackendToolCall siblings, until the next User/Assistant.
         while i < items.len()
             && matches!(
                 items[i],
                 ConversationItem::ToolResult(_)
+                    | ConversationItem::CustomToolOutput(_)
                     | ConversationItem::Reasoning(_)
                     | ConversationItem::BackendToolCall(_)
             )
@@ -745,6 +746,23 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0], 4); // after 2 tool results
         assert_eq!(turns[1], 6);
+    }
+
+    #[test]
+    fn count_complete_turns_with_repeated_native_tool_outputs() {
+        use xai_grok_sampling_types::CustomToolOutputItem;
+
+        let items = [
+            user_item("U1"),
+            assistant_with_tool_calls("A1", &["exec"]),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text("tc-exec", "progress")),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text("tc-exec", "done")),
+            user_item("U2"),
+            assistant_item("A2"),
+        ];
+        let refs: Vec<&ConversationItem> = items.iter().collect();
+        let turns = count_complete_turns(&refs);
+        assert_eq!(turns, vec![4, 6]);
     }
 
     #[test]

@@ -157,7 +157,12 @@ pub(crate) fn generate_metadata_summary(
 
     let tool_count = conversation
         .iter()
-        .filter(|item| matches!(item, ConversationItem::ToolResult(_)))
+        .filter(|item| {
+            matches!(
+                item,
+                ConversationItem::ToolResult(_) | ConversationItem::CustomToolOutput(_)
+            )
+        })
         .count();
 
     // ── Assemble summary ─────────────────────────────────────────────────────
@@ -332,6 +337,7 @@ mod tests {
                 tool_call_id: "tc_1".to_string(),
                 content: "file written".into(),
                 images: Vec::new(),
+                ordered_content: Vec::new(),
             }),
         ];
 
@@ -372,6 +378,9 @@ mod tests {
         let conv = vec![
             make_user("first question"),
             make_assistant("answer"),
+            ConversationItem::custom_tool_output(
+                xai_grok_sampling_types::CustomToolOutputItem::text("exec-1", "done"),
+            ),
             make_user("second question"),
         ];
         let real_queries = vec!["first question".to_string(), "second question".to_string()];
@@ -379,6 +388,7 @@ mod tests {
         assert!(summary.contains("## Session Summary"));
         assert!(summary.contains("2 user"));
         assert!(summary.contains("1 assistant"));
+        assert!(summary.contains("1 tool results"));
         assert!(summary.contains("first question"));
     }
 
