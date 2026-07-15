@@ -4,7 +4,47 @@
 //! no I/O, no actor state. They live in `xai-chat-state` so that both
 //! this crate and `xai-grok-shell` can share them without duplication.
 use std::collections::BTreeSet;
-use xai_grok_sampling_types::{ContentPart, ConversationItem, ToolResultItem};
+use xai_grok_sampling_types::{
+    ContentPart, ConversationItem, CustomToolOutputContent, CustomToolOutputItem, ToolResultItem,
+    decode_custom_tool_call_id,
+};
+
+fn tool_output_call_id(item: &ConversationItem) -> Option<&str> {
+    match item {
+        ConversationItem::ToolResult(result) => Some(
+            decode_custom_tool_call_id(&result.tool_call_id)
+                .map(|(call_id, _)| call_id)
+                .unwrap_or(result.tool_call_id.as_str()),
+        ),
+        ConversationItem::CustomToolOutput(output) => Some(output.call_id.as_str()),
+        _ => None,
+    }
+}
+
+fn is_tool_output(item: &ConversationItem) -> bool {
+    tool_output_call_id(item).is_some()
+}
+
+fn placeholder_tool_output(item: &ConversationItem) -> Option<ConversationItem> {
+    match item {
+        ConversationItem::ToolResult(result) => {
+            Some(ConversationItem::ToolResult(ToolResultItem {
+                tool_call_id: result.tool_call_id.clone(),
+                content: std::sync::Arc::<str>::from("Tool call omitted..."),
+                images: Vec::new(),
+                ordered_content: Vec::new(),
+            }))
+        }
+        ConversationItem::CustomToolOutput(output) => {
+            let mut placeholder =
+                CustomToolOutputItem::text(&output.call_id, "Tool call omitted...");
+            placeholder.item_id.clone_from(&output.item_id);
+            placeholder.name.clone_from(&output.name);
+            Some(ConversationItem::custom_tool_output(placeholder))
+        }
+        _ => None,
+    }
+}
 /// Drops tool results and flattens assistant `tool_calls` into
 /// `[Called tools: ...]` text annotations.
 ///
@@ -18,7 +58,7 @@ pub(crate) fn strip_tool_messages_for_conversation_item(
     conversation
         .into_iter()
         .filter_map(|item| match item {
-            ConversationItem::ToolResult(_) => None,
+            item if is_tool_output(&item) => None,
             ConversationItem::Assistant(mut a) => {
                 if !a.tool_calls.is_empty() {
                     let tool_names: Vec<String> =
@@ -66,6 +106,32 @@ pub(crate) fn strip_images(conversation: Vec<ConversationItem>) -> Vec<Conversat
                     }
                 }
                 ConversationItem::User(u)
+            }
+            ConversationItem::ToolResult(mut result) => {
+                if !result.images.is_empty() {
+                    let mut text = result.content.as_ref().to_owned();
+                    for _ in result.images.drain(..) {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str("[image]");
+                    }
+                    result.content = std::sync::Arc::<str>::from(text);
+                }
+                for part in &mut result.ordered_content {
+                    if matches!(part, CustomToolOutputContent::Image { .. }) {
+                        *part = CustomToolOutputContent::text("[image]");
+                    }
+                }
+                ConversationItem::ToolResult(result)
+            }
+            ConversationItem::CustomToolOutput(mut output) => {
+                for part in &mut output.content {
+                    if matches!(part, CustomToolOutputContent::Image { .. }) {
+                        *part = CustomToolOutputContent::text("[image]");
+                    }
+                }
+                ConversationItem::CustomToolOutput(output)
             }
             other => other,
         })
@@ -149,7 +215,7 @@ pub fn fit_conversation_to_budget(
         remaining -= cost;
         start = i;
     }
-    while start < body.len() && matches!(body[start], ConversationItem::ToolResult(_)) {
+    while start < body.len() && is_tool_output(&body[start]) {
         start += 1;
     }
     if start < body.len() {
@@ -165,7 +231,7 @@ fn recover_truncated_tail_unit(
     budget: u64,
 ) -> Vec<ConversationItem> {
     let mut results: Vec<ConversationItem> = Vec::new();
-    while matches!(body.last(), Some(ConversationItem::ToolResult(_))) {
+    while body.last().is_some_and(is_tool_output) {
         results.push(body.pop().expect("last() was Some"));
     }
     results.reverse();
@@ -197,10 +263,28 @@ fn truncate_item_to_tokens(item: ConversationItem, max_tokens: u64) -> Conversat
     let max_bytes = (max_tokens as usize).saturating_mul(4);
     match item {
         ConversationItem::ToolResult(mut t) => {
-            if let Some(s) = truncate_text_to_bytes(&t.content, max_bytes) {
-                t.content = s;
+            if t.ordered_content.is_empty() {
+                if let Some(s) = truncate_text_to_bytes(&t.content, max_bytes) {
+                    t.content = s;
+                }
+            } else {
+                truncate_ordered_content_to_tokens(&mut t.ordered_content, max_tokens);
+                t.content = std::sync::Arc::<str>::from(
+                    t.ordered_content
+                        .iter()
+                        .filter_map(|part| match part {
+                            CustomToolOutputContent::Text { text } => Some(text.as_ref()),
+                            CustomToolOutputContent::Image { .. } => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                );
             }
             ConversationItem::ToolResult(t)
+        }
+        ConversationItem::CustomToolOutput(mut output) => {
+            truncate_ordered_content_to_tokens(&mut output.content, max_tokens);
+            ConversationItem::CustomToolOutput(output)
         }
         ConversationItem::Assistant(mut a) => {
             if let Some(s) = truncate_text_to_bytes(&a.content, max_bytes) {
@@ -221,6 +305,47 @@ fn truncate_item_to_tokens(item: ConversationItem, max_tokens: u64) -> Conversat
         other => other,
     }
 }
+/// Keep the longest ordered-content prefix whose aggregate text and image cost
+/// fits `max_tokens`. A partial final text block is retained with the same
+/// truncation marker used for ordinary text items; later blocks are dropped so
+/// text/image ordering is never rearranged.
+fn truncate_ordered_content_to_tokens(content: &mut Vec<CustomToolOutputContent>, max_tokens: u64) {
+    let bytes_per_token = xai_token_estimation::BYTES_PER_TOKEN;
+    let mut remaining_units = max_tokens.saturating_mul(bytes_per_token);
+    let image_units =
+        xai_token_estimation::estimate_image_tokens(1).saturating_mul(bytes_per_token);
+    let mut retained = Vec::with_capacity(content.len());
+
+    for part in content.drain(..) {
+        match part {
+            CustomToolOutputContent::Text { text } => {
+                let text_units = u64::try_from(text.len()).unwrap_or(u64::MAX);
+                if text_units <= remaining_units {
+                    remaining_units -= text_units;
+                    retained.push(CustomToolOutputContent::Text { text });
+                    continue;
+                }
+
+                let available_bytes = usize::try_from(remaining_units).unwrap_or(usize::MAX);
+                if available_bytes > 0 {
+                    let text = truncate_text_to_bytes(&text, available_bytes)
+                        .unwrap_or_else(|| text.clone());
+                    retained.push(CustomToolOutputContent::Text { text });
+                }
+                break;
+            }
+            image @ CustomToolOutputContent::Image { .. } => {
+                if image_units > remaining_units {
+                    break;
+                }
+                remaining_units -= image_units;
+                retained.push(image);
+            }
+        }
+    }
+
+    *content = retained;
+}
 /// Char-boundary-safe prefix of `s` (incl. truncation marker) within `max_bytes`; `None` if `s` already fits.
 fn truncate_text_to_bytes(s: &str, max_bytes: usize) -> Option<std::sync::Arc<str>> {
     if s.len() <= max_bytes {
@@ -233,10 +358,21 @@ fn truncate_text_to_bytes(s: &str, max_bytes: usize) -> Option<std::sync::Arc<st
         end -= 1;
     }
     let dropped = s.len() - end;
-    Some(std::sync::Arc::<str>::from(format!(
+    let with_marker = format!(
         "{}\n[... truncated {dropped} bytes to fit the compaction window ...]",
         &s[..end]
-    )))
+    );
+    if with_marker.len() <= max_bytes {
+        return Some(std::sync::Arc::<str>::from(with_marker));
+    }
+
+    // Extremely small budgets cannot fit even the marker. Preserve a valid
+    // UTF-8 prefix instead of exceeding the caller's hard byte ceiling.
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(std::sync::Arc::<str>::from(&s[..end]))
 }
 /// Tags injected by the runtime that should be stripped from user queries.
 const SYSTEM_TAGS: &[&str] = &[
@@ -415,12 +551,7 @@ pub fn extract_messages_since_last_user(
         .take_while(|item| !matches!(item, ConversationItem::User(_)))
         .filter_map(|item| match item {
             ConversationItem::Assistant(a) => Some(ConversationItem::Assistant(a.clone())),
-            ConversationItem::ToolResult(t) => Some(ConversationItem::ToolResult(ToolResultItem {
-                tool_call_id: t.tool_call_id.clone(),
-                content: std::sync::Arc::<str>::from("Tool call omitted..."),
-                images: Vec::new(),
-            })),
-            _ => None,
+            _ => placeholder_tool_output(item),
         })
         .collect();
     messages.reverse();
@@ -453,12 +584,7 @@ pub fn extract_messages_since_last_real_user(
         .iter()
         .filter_map(|item| match item {
             ConversationItem::Assistant(a) => Some(ConversationItem::Assistant(a.clone())),
-            ConversationItem::ToolResult(t) => Some(ConversationItem::ToolResult(ToolResultItem {
-                tool_call_id: t.tool_call_id.clone(),
-                content: std::sync::Arc::<str>::from("Tool call omitted..."),
-                images: Vec::new(),
-            })),
-            _ => None,
+            _ => placeholder_tool_output(item),
         })
         .collect()
 }
@@ -885,15 +1011,16 @@ pub fn validate_compacted_history(items: &[ConversationItem]) -> Vec<String> {
         match item {
             ConversationItem::Assistant(a) => {
                 for tc in &a.tool_calls {
-                    seen_ids.insert(&tc.id);
+                    seen_ids.insert(tc.call_id());
                 }
             }
-            ConversationItem::ToolResult(tr) => {
-                if !seen_ids.contains(tr.tool_call_id.as_str()) {
-                    invalid_ids.push(tr.tool_call_id.clone());
+            output => {
+                if let Some(call_id) = tool_output_call_id(output)
+                    && !seen_ids.contains(call_id)
+                {
+                    invalid_ids.push(call_id.to_owned());
                 }
             }
-            _ => {}
         }
     }
     invalid_ids
@@ -922,15 +1049,16 @@ pub fn sanitize_compacted_history(items: Vec<ConversationItem>) -> SanitizeResul
         .filter(|item| match item {
             ConversationItem::Assistant(a) => {
                 for tc in &a.tool_calls {
-                    seen_ids.insert(tc.id.as_ref().to_owned());
+                    seen_ids.insert(tc.call_id().to_owned());
                 }
                 true
             }
-            ConversationItem::ToolResult(tr) => {
-                if seen_ids.contains(&tr.tool_call_id) {
+            output if tool_output_call_id(output).is_some() => {
+                let call_id = tool_output_call_id(output).expect("guarded above");
+                if seen_ids.contains(call_id) {
                     true
                 } else {
-                    stripped_tool_call_ids.push(tr.tool_call_id.clone());
+                    stripped_tool_call_ids.push(call_id.to_owned());
                     false
                 }
             }
@@ -1001,15 +1129,16 @@ pub fn strip_displaced_tool_results(items: &mut Vec<ConversationItem>) -> Vec<St
             run_ids = a
                 .tool_calls
                 .iter()
-                .map(|tc| tc.id.as_ref().to_owned())
+                .map(|tc| tc.call_id().to_owned())
                 .collect();
             true
         }
-        ConversationItem::ToolResult(tr) => {
-            if run_ids.contains(&tr.tool_call_id) {
+        output if tool_output_call_id(output).is_some() => {
+            let call_id = tool_output_call_id(output).expect("guarded above");
+            if run_ids.contains(call_id) {
                 true
             } else {
-                stripped.push(tr.tool_call_id.clone());
+                stripped.push(call_id.to_owned());
                 false
             }
         }
@@ -1023,7 +1152,53 @@ pub fn strip_displaced_tool_results(items: &mut Vec<ConversationItem>) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xai_grok_sampling_types::SyntheticReason;
+    use xai_grok_sampling_types::{CustomToolOutputImageDetail, SyntheticReason};
+
+    #[test]
+    fn native_custom_outputs_survive_compaction_adjacency_and_sanitization() {
+        let call =
+            xai_grok_sampling_types::ToolCall::custom("call-code", "item-code", "exec", "run()");
+        let mut conversation = vec![
+            ConversationItem::user("request"),
+            ConversationItem::assistant_tool_calls(vec![call]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "notify one")
+                    .with_item_id("output-1")
+                    .with_name("exec"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "notify two")
+                    .with_item_id("output-2")
+                    .with_name("exec"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "final")
+                    .with_item_id("output-3")
+                    .with_name("exec"),
+            ),
+        ];
+
+        assert!(validate_compacted_history(&conversation).is_empty());
+        assert!(strip_displaced_tool_results(&mut conversation).is_empty());
+        let recent = extract_messages_since_last_user(&conversation);
+        assert_eq!(recent.len(), 4);
+        let outputs = recent
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::CustomToolOutput(output) => Some(output),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].item_id.as_deref(), Some("output-1"));
+        assert_eq!(outputs[1].name.as_deref(), Some("exec"));
+        assert_eq!(outputs[2].text_content(), "Tool call omitted...");
+
+        let sanitized = sanitize_compacted_history(recent);
+        assert!(sanitized.stripped_tool_call_ids.is_empty());
+        assert_eq!(sanitized.items.len(), 4);
+    }
+
     #[test]
     fn compaction_attempt_serde_roundtrip_and_skips_none() {
         let attempt = CompactionAttempt {
@@ -3574,6 +3749,126 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             }
             other => panic!("expected truncated trailing assistant, got {other:?}"),
         }
+    }
+    /// Ordered function-tool output shares one aggregate budget across text and
+    /// image blocks instead of granting every text block the full allowance.
+    #[test]
+    fn truncate_ordered_tool_result_obeys_aggregate_budget() {
+        let first = "a".repeat(200);
+        let last = "b".repeat(4_000);
+        let item = ConversationItem::tool_result_with_ordered_content(
+            "call-ordered",
+            vec![
+                CustomToolOutputContent::text(first.clone()),
+                CustomToolOutputContent::image(
+                    "data:image/png;base64,AAAA",
+                    CustomToolOutputImageDetail::Original,
+                ),
+                CustomToolOutputContent::text(last),
+                CustomToolOutputContent::image(
+                    "data:image/png;base64,BBBB",
+                    CustomToolOutputImageDetail::Low,
+                ),
+            ],
+        );
+
+        let truncated = truncate_item_to_tokens(item, 900);
+        let ConversationItem::ToolResult(result) = truncated else {
+            panic!("expected tool result");
+        };
+
+        assert_eq!(result.ordered_content.len(), 3);
+        assert!(matches!(
+            &result.ordered_content[0],
+            CustomToolOutputContent::Text { text } if text.as_ref() == first
+        ));
+        assert!(matches!(
+            &result.ordered_content[1],
+            CustomToolOutputContent::Image {
+                detail: CustomToolOutputImageDetail::Original,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &result.ordered_content[2],
+            CustomToolOutputContent::Text { text }
+                if text.starts_with('b') && text.contains("truncated")
+        ));
+        assert_eq!(
+            result.content.as_ref(),
+            result
+                .ordered_content
+                .iter()
+                .filter_map(|part| match part {
+                    CustomToolOutputContent::Text { text } => Some(text.as_ref()),
+                    CustomToolOutputContent::Image { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        );
+        assert!(
+            estimate_item_tokens(&ConversationItem::ToolResult(result)) <= 900,
+            "aggregate ordered output must respect the per-item token budget"
+        );
+    }
+    /// Native custom-tool output uses the same aggregate accounting and keeps
+    /// retained text/image blocks in their original order.
+    #[test]
+    fn truncate_custom_tool_output_obeys_aggregate_budget() {
+        let item = ConversationItem::custom_tool_output(CustomToolOutputItem::new(
+            "call-custom",
+            vec![
+                CustomToolOutputContent::text("a".repeat(100)),
+                CustomToolOutputContent::image(
+                    "data:image/png;base64,AAAA",
+                    CustomToolOutputImageDetail::High,
+                ),
+                CustomToolOutputContent::text("b".repeat(100)),
+                CustomToolOutputContent::image(
+                    "data:image/png;base64,BBBB",
+                    CustomToolOutputImageDetail::Auto,
+                ),
+                CustomToolOutputContent::text("c".repeat(2_000)),
+            ],
+        ));
+
+        let truncated = truncate_item_to_tokens(item, 1_600);
+        let ConversationItem::CustomToolOutput(output) = truncated else {
+            panic!("expected custom tool output");
+        };
+
+        assert_eq!(output.content.len(), 5);
+        assert!(matches!(
+            &output.content[0],
+            CustomToolOutputContent::Text { text } if text.starts_with('a')
+        ));
+        assert!(matches!(
+            &output.content[1],
+            CustomToolOutputContent::Image {
+                detail: CustomToolOutputImageDetail::High,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &output.content[2],
+            CustomToolOutputContent::Text { text } if text.starts_with('b')
+        ));
+        assert!(matches!(
+            &output.content[3],
+            CustomToolOutputContent::Image {
+                detail: CustomToolOutputImageDetail::Auto,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &output.content[4],
+            CustomToolOutputContent::Text { text }
+                if text.starts_with('c') && text.contains("truncated")
+        ));
+        assert!(
+            estimate_item_tokens(&ConversationItem::CustomToolOutput(output)) <= 1_600,
+            "aggregate native output must respect the per-item token budget"
+        );
     }
     /// Incompactable-state regression: `fit` must charge images (765 each), so an image-heavy old turn is trimmed.
     #[test]
