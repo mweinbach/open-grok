@@ -1097,6 +1097,16 @@ pub struct CreateResponseWrapper {
     /// `async_openai`'s `rs::Tool` enum (e.g., `x_search`). Injected
     /// as raw JSON into the serialized request body's `tools` array.
     pub extra_raw_tools: Vec<serde_json::Value>,
+
+    /// Named custom-output items whose optional `name` field is not modeled by
+    /// async-openai 0.33.1. The sampler patches these exact flattened input
+    /// positions after typed request serialization.
+    pub named_custom_tool_outputs: Vec<crate::NamedCustomToolOutputOccurrence>,
+
+    /// Custom-output images requesting Responses `detail: "original"`, which
+    /// async-openai 0.33.1 does not yet model. The sampler restores these exact
+    /// content positions after typed request serialization.
+    pub original_detail_custom_output_images: Vec<crate::OriginalDetailCustomOutputImageOccurrence>,
 }
 
 impl CreateResponseWrapper {
@@ -1113,6 +1123,8 @@ impl CreateResponseWrapper {
             x_grok_user_id: None,
             trace: None,
             extra_raw_tools: vec![],
+            named_custom_tool_outputs: vec![],
+            original_detail_custom_output_images: vec![],
         }
     }
 

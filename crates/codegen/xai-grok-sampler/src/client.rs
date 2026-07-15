@@ -24,6 +24,7 @@ use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
+    NamedCustomToolOutputOccurrence, OriginalDetailCustomOutputImageOccurrence,
     ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
     rs,
 };
@@ -193,6 +194,64 @@ fn fill_missing_custom_tool_call_id(item: &mut serde_json::Value) {
         return;
     };
     item.insert("id".to_owned(), serde_json::Value::String(call_id));
+}
+
+/// Restore native custom-output fields that async-openai 0.33.1 cannot
+/// represent in its typed request model. Locations are captured from the
+/// original [`ConversationRequest`] before conversion, so repeated call IDs,
+/// names, or image URLs remain unambiguous.
+fn patch_custom_tool_output_wire_fields(
+    request_body: &mut serde_json::Value,
+    named_outputs: &[NamedCustomToolOutputOccurrence],
+    original_images: &[OriginalDetailCustomOutputImageOccurrence],
+) {
+    let Some(input) = request_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for occurrence in named_outputs {
+        let Some(item) = input
+            .get_mut(occurrence.input_item_index)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("custom_tool_call_output")
+            || item.get("call_id").and_then(serde_json::Value::as_str)
+                != Some(occurrence.call_id.as_str())
+        {
+            continue;
+        }
+        item.insert(
+            "name".to_owned(),
+            serde_json::Value::String(occurrence.name.clone()),
+        );
+    }
+
+    for occurrence in original_images {
+        let Some(content) = input
+            .get_mut(occurrence.input_item_index)
+            .and_then(|item| item.get_mut("output"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|output| output.get_mut(occurrence.output_content_index))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if content.get("type").and_then(serde_json::Value::as_str) != Some("input_image")
+            || content.get("image_url").and_then(serde_json::Value::as_str)
+                != Some(occurrence.image_url.as_ref())
+        {
+            continue;
+        }
+        content.insert(
+            "detail".to_owned(),
+            serde_json::Value::String("original".to_owned()),
+        );
+    }
 }
 
 /// On terminal Responses API events (`response.completed` /
@@ -1208,6 +1267,11 @@ impl SamplingClient {
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        patch_custom_tool_output_wire_fields(
+            &mut request_body,
+            &request.named_custom_tool_outputs,
+            &request.original_detail_custom_output_images,
+        );
         let http_request = grok_headers
             .apply(self.post(self.endpoint("responses")))
             .json(&request_body);
@@ -1353,6 +1417,11 @@ impl SamplingClient {
             }
         }
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        patch_custom_tool_output_wire_fields(
+            &mut request_body,
+            &request.named_custom_tool_outputs,
+            &request.original_detail_custom_output_images,
+        );
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
         let doom_loop = self
@@ -1915,6 +1984,8 @@ impl SamplingClient {
         // Collect xAI-specific tools that can't be expressed via rs::Tool
         // (e.g., x_search). These are injected as raw JSON after serialization.
         let extra_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
+        let named_custom_tool_outputs = request.named_custom_tool_outputs();
+        let original_detail_custom_output_images = request.original_detail_custom_output_images();
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -1925,6 +1996,8 @@ impl SamplingClient {
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_raw_tools = extra_tools;
+        wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
+        wrapper.original_detail_custom_output_images = original_detail_custom_output_images;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -1948,6 +2021,8 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
+        let named_custom_tool_outputs = request.named_custom_tool_outputs();
+        let original_detail_custom_output_images = request.original_detail_custom_output_images();
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -1957,6 +2032,8 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
+        wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
+        wrapper.original_detail_custom_output_images = original_detail_custom_output_images;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2776,6 +2853,40 @@ mod tests {
         assert_eq!(value["item_id"], "call_custom_5");
         assert_eq!(value["status"], "in_progress");
         assert_eq!(value["provider_extension"]["retained"], true);
+    }
+
+    #[test]
+    fn custom_output_wire_patch_restores_name_and_original_image_detail() {
+        let request = ConversationRequest::from_items(vec![
+            xai_grok_sampling_types::ConversationItem::custom_tool_output(
+                xai_grok_sampling_types::CustomToolOutputItem::new(
+                    "call-code",
+                    [
+                        xai_grok_sampling_types::CustomToolOutputContent::text("A"),
+                        xai_grok_sampling_types::CustomToolOutputContent::image(
+                            "data:image/png;base64,iVBOR",
+                            xai_grok_sampling_types::CustomToolOutputImageDetail::Original,
+                        ),
+                        xai_grok_sampling_types::CustomToolOutputContent::text("B"),
+                    ],
+                )
+                .with_item_id("out-code")
+                .with_name("exec"),
+            ),
+        ]);
+        let named_outputs = request.named_custom_tool_outputs();
+        let original_images = request.original_detail_custom_output_images();
+        let mut body = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+
+        assert!(body["input"][0].get("name").is_none());
+        assert_eq!(body["input"][0]["output"][1]["detail"], "high");
+
+        patch_custom_tool_output_wire_fields(&mut body, &named_outputs, &original_images);
+
+        assert_eq!(body["input"][0]["name"], "exec");
+        assert_eq!(body["input"][0]["output"][1]["detail"], "original");
+        assert_eq!(body["input"][0]["output"][0]["text"], "A");
+        assert_eq!(body["input"][0]["output"][2]["text"], "B");
     }
 
     /// `response.completed` carrying
