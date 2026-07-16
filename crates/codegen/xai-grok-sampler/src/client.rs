@@ -979,6 +979,7 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     idle_timeout_secs: Option<u64>,
     codex_multi_agent_v2: bool,
+    reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
@@ -1095,7 +1096,6 @@ impl SamplingClient {
                 AuthScheme::XApiKey => {
                     let header_value = HeaderValue::from_str(api_key).map_err(|_| {
                         tracing::debug!(
-                            api_key = %api_key,
                             "Invalid api_key: cannot be converted to a valid HTTP header"
                         );
                         SamplingError::Auth(
@@ -1109,7 +1109,6 @@ impl SamplingClient {
                     let bearer = format!("Bearer {}", api_key);
                     let header_value = HeaderValue::from_str(&bearer).map_err(|_| {
                         tracing::debug!(
-                            api_key = %api_key,
                             "Invalid api_key: cannot be converted to a valid HTTP Authorization header"
                         );
                         SamplingError::Auth(
@@ -1191,6 +1190,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             idle_timeout_secs: config.idle_timeout_secs,
             codex_multi_agent_v2: config.codex_multi_agent_v2,
+            reasoning_effort: config.reasoning_effort,
             reasoning_summary: config.reasoning_summary,
             doom_loop_recovery: config.doom_loop_recovery,
         };
@@ -1520,6 +1520,8 @@ impl SamplingClient {
         if request.top_p.is_none() {
             request.top_p = self.defaults.top_p;
         }
+
+        self.provider_adapter.sanitize_chat_request(&mut request);
 
         Ok(request)
     }
@@ -2913,6 +2915,10 @@ impl SamplingClient {
             request.max_output_tokens = self.defaults.max_completion_tokens;
         }
 
+        if request.reasoning_effort.is_none() {
+            request.reasoning_effort = self.defaults.reasoning_effort;
+        }
+
         Ok(())
     }
 
@@ -3620,6 +3626,28 @@ mod tests {
     fn new_with_minimal_config_succeeds() {
         let client = SamplingClient::new(minimal_config()).expect("client should construct");
         assert_eq!(client.api_backend(), ApiBackend::ChatCompletions);
+    }
+
+    #[test]
+    fn conversation_defaults_apply_reasoning_effort_without_overriding_request() {
+        let mut config = minimal_config();
+        config.reasoning_effort = Some(ReasoningEffort::Max);
+        let client = SamplingClient::new(config).expect("client should construct");
+
+        let mut inherited = ConversationRequest::default();
+        client
+            .apply_conversation_defaults(&mut inherited)
+            .expect("defaults should apply");
+        assert_eq!(inherited.reasoning_effort, Some(ReasoningEffort::Max));
+
+        let mut explicit = ConversationRequest {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..ConversationRequest::default()
+        };
+        client
+            .apply_conversation_defaults(&mut explicit)
+            .expect("defaults should apply");
+        assert_eq!(explicit.reasoning_effort, Some(ReasoningEffort::Low));
     }
 
     #[test]

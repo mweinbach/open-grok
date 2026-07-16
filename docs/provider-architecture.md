@@ -26,13 +26,16 @@ Codex provider does not override an explicit model API key.
 | --- | --- | --- | --- | --- | --- | --- |
 | xAI | Chat, Responses, Messages | xAI | xAI | `x-grok-*` | xAI session | allowed |
 | OpenAI Codex | Responses | Codex | OpenAI | standard only | Codex OAuth | denied |
+| Kimi | Chat | none | client function tools | standard only | provider API key | denied |
 
 The sampler's built-in `ProviderAdapter` registry applies the transport policy
 for each profile. The xAI adapter owns xAI request metadata and doom-loop
 opt-in. The Codex adapter owns instruction projection, reasoning-summary and
 Max/Ultra request mapping, prompt-cache affinity, sticky turn state, and
 forward-compatible Responses event handling. Neither adapter resolves or
-refreshes credentials.
+refreshes credentials. The Kimi adapter uses ordinary Chat Completions and
+removes sampling fields owned by Kimi coding models; it does not advertise a
+hosted-tool dialect.
 
 `ConversationRequest` and `ConversationResponse` remain provider neutral.
 Provider-native opaque history is retained with a typed backend item and is

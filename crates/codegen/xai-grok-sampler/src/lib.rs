@@ -47,7 +47,7 @@ pub use events::{SamplingChannel, SamplingErrorInfo, SamplingErrorKind, Sampling
 pub use handle::SamplerHandle;
 pub use metrics::{InferenceLatencyStats, compute_percentiles};
 pub use provider::{
-    CodexProvider, PROVIDER_REGISTRY, ProviderAdapter, ProviderRegistration,
+    CodexProvider, KimiProvider, PROVIDER_REGISTRY, ProviderAdapter, ProviderRegistration,
     ResponsesRequestPolicy, XaiProvider, provider_adapter,
 };
 pub use retry::{

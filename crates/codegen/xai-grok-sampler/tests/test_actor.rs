@@ -231,6 +231,81 @@ async fn submit_emits_started_first_token_channel_completed() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kimi_chat_request_uses_provider_key_and_standard_function_tools() {
+    use std::sync::Mutex;
+
+    let captured: Arc<Mutex<Vec<(HeaderMap, serde_json::Value)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(
+            move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_handler);
+                async move {
+                    captured.lock().unwrap().push((headers, body));
+                    let events = sse::chat_completion_events("ok", "kimi-k3");
+                    Sse::new(stream::iter(
+                        events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                    ))
+                }
+            },
+        ),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let mut config = test_config(server.base_url(), "kimi-k3");
+    config.provider = ModelProvider::Kimi;
+    config.temperature = Some(0.7);
+    config.top_p = Some(0.95);
+    config.reasoning_effort = Some(xai_grok_sampling_types::ReasoningEffort::Max);
+    config.client_identifier = Some("must-not-become-x-grok-metadata".into());
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+
+    let mut request = user_request("inspect this repository");
+    request.x_grok_session_id = Some("must-not-leak".into());
+    request.tools.push(xai_grok_sampling_types::ToolSpec {
+        name: "read_file".into(),
+        description: Some("Read a repository file".into()),
+        parameters: json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+    });
+    handle
+        .submit_and_collect(RequestId::from("req-kimi-chat"), request)
+        .await
+        .expect("Kimi Chat Completions request should complete");
+    server.shutdown();
+
+    let captured = captured.lock().unwrap();
+    let (headers, body) = captured.first().expect("one Kimi request");
+    assert_eq!(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer test-key")
+    );
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.as_str().starts_with("x-grok-")),
+        "Kimi must not receive xAI-private request headers: {headers:?}"
+    );
+    assert_eq!(body["model"], "kimi-k3");
+    assert_eq!(body["reasoning_effort"], "max");
+    assert!(body.get("temperature").is_none());
+    assert!(body.get("top_p").is_none());
+    assert_eq!(body.pointer("/tools/0/type"), Some(&json!("function")));
+    assert_eq!(
+        body.pointer("/tools/0/function/name"),
+        Some(&json!("read_file"))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // submit_and_collect
 // ---------------------------------------------------------------------------

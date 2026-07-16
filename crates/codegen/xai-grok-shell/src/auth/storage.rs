@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::model::{API_KEY_SCOPE, AuthMode, AuthStore, GrokAuth, lookup_auth};
+use xai_grok_sampling_types::ModelProvider;
 
 /// RAII guard for an exclusive advisory lock on `auth.json.lock`.
 /// The lock is released when the inner `File` is dropped (closing the FD).
@@ -348,31 +349,227 @@ pub fn read_api_key(grok_home: &Path) -> Option<String> {
 /// Uses the corrupt-recovery reader so a malformed auth.json (e.g. from a
 /// previous crash) can be healed when the user sets an API key.
 pub fn store_api_key(grok_home: &Path, api_key: &str) -> std::io::Result<()> {
+    store_scoped_api_key(grok_home, API_KEY_SCOPE, api_key)
+}
+
+/// Remove the `xai::api_key` scope from auth.json.
+pub fn clear_api_key(grok_home: &Path) -> std::io::Result<()> {
+    clear_scoped_api_key(grok_home, API_KEY_SCOPE)
+}
+
+fn provider_api_key_scope(provider: ModelProvider) -> String {
+    format!("{}::api_key", provider.as_str())
+}
+
+fn lock_api_key_store(path: &Path) -> std::io::Result<AuthFileLock> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    super::manager::lock::try_lock_auth_file_nonblocking(path).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "auth.json is being updated by another process; try again",
+        )
+    })
+}
+
+fn store_scoped_api_key(grok_home: &Path, scope: &str, api_key: &str) -> std::io::Result<()> {
     let path = grok_home.join("auth.json");
+    let lock = lock_api_key_store(&path)?;
     let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
     map.insert(
-        API_KEY_SCOPE.to_owned(),
+        scope.to_owned(),
         GrokAuth {
             key: api_key.to_owned(),
             auth_mode: AuthMode::ApiKey,
             ..Default::default()
         },
     );
+    if !lock.still_live(&path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "auth.json lock was reclaimed; try again",
+        ));
+    }
     write_auth_json(&path, &map)
 }
 
-/// Remove the `xai::api_key` scope from auth.json.
-pub fn clear_api_key(grok_home: &Path) -> std::io::Result<()> {
+fn clear_scoped_api_key(grok_home: &Path, scope: &str) -> std::io::Result<()> {
+    clear_scoped_api_key_with_remove(grok_home, scope, |path| std::fs::remove_file(path))
+}
+
+fn clear_scoped_api_key_with_remove(
+    grok_home: &Path,
+    scope: &str,
+    remove_file: fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let path = grok_home.join("auth.json");
-    if let Ok(mut map) = read_auth_json(&path) {
-        map.remove(API_KEY_SCOPE);
-        if map.is_empty() {
-            let _ = std::fs::remove_file(&path);
-        } else {
-            write_auth_json(&path, &map)?;
+    let lock = lock_api_key_store(&path)?;
+    let mut map = match read_auth_json(&path) {
+        Ok(map) => map,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    map.remove(scope);
+    if !lock.still_live(&path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "auth.json lock was reclaimed; try again",
+        ));
+    }
+    if map.is_empty() {
+        match remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
+    } else {
+        write_auth_json(&path, &map)?;
     }
     Ok(())
+}
+
+/// Read a provider-owned API key without allowing it to satisfy another
+/// provider's authentication. xAI's historical scope remains compatible.
+pub fn read_provider_api_key(grok_home: &Path, provider: ModelProvider) -> Option<String> {
+    let path = grok_home.join("auth.json");
+    let map = read_auth_json(&path).ok()?;
+    map.get(&provider_api_key_scope(provider))
+        .map(|auth| auth.key.clone())
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// Return provider credential presence without cloning key material into the
+/// caller. Intended for status-only settings surfaces.
+pub fn provider_api_key_is_configured(grok_home: &Path, provider: ModelProvider) -> bool {
+    let path = grok_home.join("auth.json");
+    let Ok(map) = read_auth_json(&path) else {
+        return false;
+    };
+    map.get(&provider_api_key_scope(provider))
+        .is_some_and(|auth| !auth.key.trim().is_empty())
+}
+
+/// Store a provider-owned API key in owner-only `auth.json`.
+pub fn store_provider_api_key(
+    grok_home: &Path,
+    provider: ModelProvider,
+    api_key: &str,
+) -> std::io::Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return clear_provider_api_key(grok_home, provider);
+    }
+    store_scoped_api_key(grok_home, &provider_api_key_scope(provider), api_key)
+}
+
+/// Remove one provider's API-key scope while preserving every other login.
+pub fn clear_provider_api_key(grok_home: &Path, provider: ModelProvider) -> std::io::Result<()> {
+    clear_scoped_api_key(grok_home, &provider_api_key_scope(provider))
+}
+
+#[cfg(test)]
+mod provider_api_key_tests {
+    use super::*;
+
+    fn permission_denied_remove(_: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    #[test]
+    fn provider_key_round_trip_and_clear_preserve_sibling_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        store_api_key(dir.path(), "xai-secret").unwrap();
+        store_provider_api_key(dir.path(), ModelProvider::Kimi, "kimi-secret").unwrap();
+
+        assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
+        assert_eq!(
+            read_provider_api_key(dir.path(), ModelProvider::Kimi).as_deref(),
+            Some("kimi-secret")
+        );
+
+        clear_provider_api_key(dir.path(), ModelProvider::Kimi).unwrap();
+        assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
+        assert!(read_provider_api_key(dir.path(), ModelProvider::Kimi).is_none());
+    }
+
+    #[test]
+    fn provider_key_clear_propagates_corrupt_auth_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let corrupt = b"{not valid json";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let error = clear_provider_api_key(dir.path(), ModelProvider::Kimi)
+            .expect_err("a failed auth.json read must not look like a successful clear");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn provider_key_clear_propagates_final_file_delete_error() {
+        let dir = tempfile::tempdir().unwrap();
+        store_provider_api_key(dir.path(), ModelProvider::Kimi, "kimi-secret").unwrap();
+
+        let error = clear_scoped_api_key_with_remove(
+            dir.path(),
+            &provider_api_key_scope(ModelProvider::Kimi),
+            permission_denied_remove,
+        )
+        .expect_err("a failed final-scope delete must not look like a successful clear");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            read_provider_api_key(dir.path(), ModelProvider::Kimi).as_deref(),
+            Some("kimi-secret")
+        );
+    }
+
+    #[test]
+    fn provider_key_clear_is_idempotent_when_auth_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        clear_provider_api_key(dir.path(), ModelProvider::Kimi).unwrap();
+
+        assert!(!dir.path().join("auth.json").exists());
+    }
+
+    #[test]
+    fn provider_key_write_fails_instead_of_racing_a_sibling_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let lock = super::super::manager::lock::try_lock_auth_file_nonblocking(&path)
+            .expect("first writer owns lock");
+
+        let error = store_provider_api_key(dir.path(), ModelProvider::Kimi, "kimi-secret")
+            .expect_err("concurrent RMW must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        let xai_error = store_api_key(dir.path(), "xai-secret")
+            .expect_err("legacy xAI writes must share the same lock");
+        assert_eq!(xai_error.kind(), std::io::ErrorKind::WouldBlock);
+        let clear_error =
+            clear_api_key(dir.path()).expect_err("legacy xAI clears must share the same lock");
+        assert_eq!(clear_error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(read_provider_api_key(dir.path(), ModelProvider::Kimi).is_none());
+        drop(lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_key_store_remains_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        store_provider_api_key(dir.path(), ModelProvider::Kimi, "kimi-secret").unwrap();
+        let mode = std::fs::metadata(dir.path().join("auth.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }
 
 #[cfg(test)]

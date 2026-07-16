@@ -3136,13 +3136,102 @@ fn managed_settings_env_flag(key: &str) -> Option<bool> {
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     xai_grok_workspace::permission::resolution::json_env_flag(json.get("env"), key)
 }
+
+fn merge_remote_provider_partition(
+    resolved: &mut IndexMap<String, ModelEntry>,
+    defaults: &IndexMap<String, ModelEntry>,
+    mut remote: Option<IndexMap<String, ModelEntry>>,
+    provider: ModelProvider,
+    authoritative: bool,
+) {
+    let Some(remote) = remote.as_mut() else {
+        return;
+    };
+    tracing::debug!(
+        count = remote.len(),
+        provider = provider.as_str(),
+        authoritative,
+        "loaded remote provider models",
+    );
+
+    // Provider endpoints often return a deliberately small schema. Preserve
+    // local execution metadata only from a same-provider, same-key donor.
+    for (key, entry) in remote.iter_mut() {
+        if entry.info.provider != provider {
+            tracing::warn!(
+                model_key = %key,
+                expected_provider = provider.as_str(),
+                actual_provider = entry.info.provider.as_str(),
+                "ignoring entry from the wrong provider catalog",
+            );
+            continue;
+        }
+        let Some(donor) = defaults
+            .get(key)
+            .filter(|donor| donor.info.provider == provider)
+        else {
+            continue;
+        };
+        if entry.info.context_window.get() == DEFAULT_CONTEXT_WINDOW
+            && donor.info.context_window.get() != DEFAULT_CONTEXT_WINDOW
+        {
+            entry.info.context_window = donor.info.context_window;
+        }
+        if entry.info.agent_type == DEFAULT_AGENT_TYPE {
+            entry.info.agent_type.clone_from(&donor.info.agent_type);
+        }
+        if entry.info.api_backend == ApiBackend::default() {
+            entry.info.api_backend.clone_from(&donor.info.api_backend);
+        }
+        if entry.info.tool_mode.is_none() {
+            entry.info.tool_mode = donor.info.tool_mode;
+        }
+        if entry.info.reasoning_efforts.is_empty() && !donor.info.reasoning_efforts.is_empty() {
+            entry.info.reasoning_efforts = donor.info.reasoning_efforts.clone();
+            entry.info.supports_reasoning_effort = donor.info.supports_reasoning_effort;
+            entry.info.reasoning_effort = donor.info.reasoning_effort;
+        }
+    }
+    remote.retain(|_, entry| entry.info.provider == provider);
+
+    if authoritative && !remote.is_empty() {
+        resolved.retain(|_, entry| entry.info.provider != provider);
+    }
+
+    for (key, entry) in std::mem::take(remote) {
+        // The queried provider owns its official bare slug. Preserve a
+        // conflicting entry under a stable provider-qualified key.
+        if resolved
+            .get(&key)
+            .is_some_and(|existing| existing.info.provider != provider)
+            && let Some(existing) = resolved.shift_remove(&key)
+        {
+            let existing_provider = existing.info.provider.as_str();
+            let mut qualified = format!("{existing_provider}:{key}");
+            let mut suffix = 2usize;
+            while resolved.contains_key(&qualified) {
+                qualified = format!("{existing_provider}:{key}:{suffix}");
+                suffix += 1;
+            }
+            tracing::warn!(
+                model_key = %key,
+                qualified_key = %qualified,
+                provider = provider.as_str(),
+                "provider model-key collision; reserving bare key for queried provider",
+            );
+            resolved.insert(qualified, existing);
+        }
+        resolved.insert(key, entry);
+    }
+}
+
 /// Assemble the final model map. Priority (highest wins):
 /// config.toml `[model.*]` > prefetched (remote) > hardcoded defaults.
 pub fn resolve_model_list(
     cfg: &Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
-    resolve_model_list_with_codex(cfg, prefetched, None, false)
+    resolve_model_list_with_provider_catalogs(cfg, prefetched, None, false, None, false)
 }
 
 /// Assemble the combined provider catalog. The xAI and Codex remote catalogs
@@ -3159,6 +3248,27 @@ pub fn resolve_model_list_with_codex(
     codex_remote: Option<IndexMap<String, ModelEntry>>,
     codex_authoritative: bool,
 ) -> IndexMap<String, ModelEntry> {
+    resolve_model_list_with_provider_catalogs(
+        cfg,
+        prefetched,
+        codex_remote,
+        codex_authoritative,
+        None,
+        false,
+    )
+}
+
+/// Assemble independently queried provider partitions before applying shared
+/// user overrides and filters. Each remote catalog may replace only entries
+/// from its own provider.
+pub fn resolve_model_list_with_provider_catalogs(
+    cfg: &Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    codex_remote: Option<IndexMap<String, ModelEntry>>,
+    codex_authoritative: bool,
+    kimi_remote: Option<IndexMap<String, ModelEntry>>,
+    kimi_authoritative: bool,
+) -> IndexMap<String, ModelEntry> {
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
     let defaults = default_model_entries(&cfg.endpoints);
     if cfg.endpoints.has_custom_endpoint() {
@@ -3170,7 +3280,7 @@ pub fn resolve_model_list_with_codex(
         resolved.extend(
             defaults
                 .iter()
-                .filter(|(_, entry)| entry.info.provider == ModelProvider::Codex)
+                .filter(|(_, entry)| entry.info.provider != ModelProvider::Xai)
                 .map(|(key, entry)| (key.clone(), entry.clone())),
         );
     } else {
@@ -3179,6 +3289,17 @@ pub fn resolve_model_list_with_codex(
     }
     if let Some(mut prefetched) = prefetched {
         tracing::debug!(count = prefetched.len(), "loaded prefetched models");
+        prefetched.retain(|key, entry| {
+            let keep = entry.info.provider == ModelProvider::Xai;
+            if !keep {
+                tracing::warn!(
+                    model_key = %key,
+                    actual_provider = entry.info.provider.as_str(),
+                    "ignoring non-xAI entry returned by the xAI model catalog",
+                );
+            }
+            keep
+        });
         let default_cw = DEFAULT_CONTEXT_WINDOW;
         for (key, entry) in prefetched.iter_mut() {
             let donor = resolved
@@ -3212,17 +3333,16 @@ pub fn resolve_model_list_with_codex(
                 );
             }
         }
-        // A remote xAI catalog is authoritative for xAI entries, but it does
-        // not know about Open Grok's independent ChatGPT Codex account. Keep
-        // the built-in Codex family beside whatever the xAI endpoint returns.
+        // A remote xAI catalog is authoritative only for xAI entries. Keep all
+        // other provider partitions beside whatever the xAI endpoint returns.
         let mut merged: IndexMap<String, ModelEntry> = resolved
             .into_iter()
-            .filter(|(_, entry)| entry.info.provider == ModelProvider::Codex)
+            .filter(|(_, entry)| entry.info.provider != ModelProvider::Xai)
             .collect();
         for (key, entry) in prefetched {
             if merged
                 .get(&key)
-                .is_some_and(|existing| existing.info.provider == ModelProvider::Codex)
+                .is_some_and(|existing| existing.info.provider != ModelProvider::Xai)
             {
                 let mut qualified = format!("xai:{key}");
                 let mut suffix = 2usize;
@@ -3233,7 +3353,7 @@ pub fn resolve_model_list_with_codex(
                 tracing::warn!(
                     model_key = %key,
                     qualified_key = %qualified,
-                    "xAI model key collides with reserved Codex slug; qualifying xAI key"
+                    "xAI model key collides with another provider slug; qualifying xAI key"
                 );
                 merged.insert(qualified, entry);
             } else {
@@ -3242,73 +3362,20 @@ pub fn resolve_model_list_with_codex(
         }
         resolved = merged;
     }
-    if let Some(mut codex_remote) = codex_remote {
-        tracing::debug!(
-            count = codex_remote.len(),
-            authoritative = codex_authoritative,
-            "loaded remote Codex models"
-        );
-
-        // The remote schema can omit fields that are part of Open Grok's
-        // execution contract. Inherit only absent/default-valued fields from
-        // the matching embedded entry before applying the live overlay.
-        let default_cw = DEFAULT_CONTEXT_WINDOW;
-        for (key, entry) in codex_remote.iter_mut() {
-            if entry.info.provider != ModelProvider::Codex {
-                tracing::warn!(model_key = %key, "ignoring non-Codex entry in Codex catalog");
-                continue;
-            }
-            if let Some(donor) = defaults
-                .get(key)
-                .filter(|donor| donor.info.provider == entry.info.provider)
-            {
-                if entry.info.context_window.get() == default_cw
-                    && donor.info.context_window.get() != default_cw
-                {
-                    entry.info.context_window = donor.info.context_window;
-                }
-                if entry.info.agent_type == DEFAULT_AGENT_TYPE {
-                    entry.info.agent_type.clone_from(&donor.info.agent_type);
-                }
-                if entry.info.api_backend == ApiBackend::default() {
-                    entry.info.api_backend.clone_from(&donor.info.api_backend);
-                }
-                if entry.info.tool_mode.is_none() {
-                    entry.info.tool_mode = donor.info.tool_mode;
-                }
-            }
-        }
-        codex_remote.retain(|_, entry| entry.info.provider == ModelProvider::Codex);
-
-        if codex_authoritative && !codex_remote.is_empty() {
-            resolved.retain(|_, entry| entry.info.provider != ModelProvider::Codex);
-        }
-
-        for (key, entry) in codex_remote {
-            // Official Codex slugs retain their bare catalog keys so
-            // `/model gpt-…` remains stable. Preserve an unlikely conflicting
-            // xAI entry under an explicit provider-qualified key.
-            if resolved
-                .get(&key)
-                .is_some_and(|existing| existing.info.provider != ModelProvider::Codex)
-                && let Some(existing) = resolved.shift_remove(&key)
-            {
-                let mut qualified = format!("xai:{key}");
-                let mut suffix = 2usize;
-                while resolved.contains_key(&qualified) {
-                    qualified = format!("xai:{key}:{suffix}");
-                    suffix += 1;
-                }
-                tracing::warn!(
-                    model_key = %key,
-                    qualified_key = %qualified,
-                    "provider model-key collision; reserving bare key for Codex"
-                );
-                resolved.insert(qualified, existing);
-            }
-            resolved.insert(key, entry);
-        }
-    }
+    merge_remote_provider_partition(
+        &mut resolved,
+        &defaults,
+        codex_remote,
+        ModelProvider::Codex,
+        codex_authoritative,
+    );
+    merge_remote_provider_partition(
+        &mut resolved,
+        &defaults,
+        kimi_remote,
+        ModelProvider::Kimi,
+        kimi_authoritative,
+    );
     for (key, model_override) in &cfg.config_models {
         let had_base = resolved.contains_key(key);
         let base = resolved.shift_remove(key);
@@ -3336,19 +3403,15 @@ pub fn resolve_model_list_with_codex(
     {
         let default_cw = DEFAULT_CONTEXT_WINDOW;
         type DonorMetadata = (std::num::NonZeroU64, ApiBackend, Option<ToolMode>);
-        let mut xai_donors: std::collections::HashMap<String, DonorMetadata> =
-            std::collections::HashMap::new();
-        let mut codex_donors: std::collections::HashMap<String, DonorMetadata> =
-            std::collections::HashMap::new();
+        let mut donors: std::collections::HashMap<
+            ModelProvider,
+            std::collections::HashMap<String, DonorMetadata>,
+        > = std::collections::HashMap::new();
         for entry in resolved
             .values()
             .filter(|entry| entry.info.context_window.get() != default_cw)
         {
-            let provider_donors = match entry.info.provider {
-                ModelProvider::Xai => &mut xai_donors,
-                ModelProvider::Codex => &mut codex_donors,
-            };
-            provider_donors.insert(
+            donors.entry(entry.info.provider).or_default().insert(
                 entry.info.model.clone(),
                 (
                     entry.info.context_window,
@@ -3358,9 +3421,8 @@ pub fn resolve_model_list_with_codex(
             );
         }
         for entry in resolved.values_mut() {
-            let provider_donors = match entry.info.provider {
-                ModelProvider::Xai => &xai_donors,
-                ModelProvider::Codex => &codex_donors,
+            let Some(provider_donors) = donors.get(&entry.info.provider) else {
+                continue;
             };
             if let Some((donor_cw, donor_backend, donor_tool_mode)) =
                 provider_donors.get(&entry.info.model)
@@ -3508,6 +3570,9 @@ struct DefaultModelJson {
     api_backend: ApiBackend,
     #[serde(default)]
     provider: ModelProvider,
+    /// Optional provider key environment variable(s) for embedded API-key
+    /// models. Secrets themselves are never embedded.
+    env_key: Option<EnvKeys>,
     /// Model-selected tool presentation. `None` keeps the direct-tool default.
     tool_mode: Option<ToolMode>,
     /// Codex model-catalog execution contract. Unknown versions stay disabled.
@@ -3606,7 +3671,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 inference_idle_timeout_secs: m.inference_idle_timeout_secs,
                 max_retries: None,
                 api_key: None,
-                env_key: None,
+                env_key: m.env_key,
                 extra_headers: IndexMap::new(),
                 use_concise: false,
                 hidden: m.hidden,
@@ -3837,6 +3902,8 @@ impl ConfigModelOverride {
         base: Option<ModelEntry>,
         endpoints: &EndpointsConfig,
     ) -> ModelEntry {
+        let had_base = base.is_some();
+        let inherited_provider = base.as_ref().map(|entry| entry.info.provider);
         let mut entry = base.unwrap_or_else(|| ModelEntry::fallback(key, endpoints));
         if let Some(ref v) = self.model {
             entry.info.model = v.clone();
@@ -3867,6 +3934,21 @@ impl ConfigModelOverride {
         }
         if let Some(v) = self.provider {
             entry.info.provider = v;
+        }
+        if self.base_url.is_none()
+            && entry.info.provider.profile().session_auth.is_api_key_only()
+            && (!had_base || inherited_provider != Some(entry.info.provider))
+        {
+            // A new third-party model, or an override that changes an existing
+            // entry to a third-party provider, must never inherit the donor's
+            // endpoint: that could disclose its explicit env/API key across
+            // provider boundaries.
+            tracing::warn!(
+                model_key = %key,
+                provider = entry.info.provider.as_str(),
+                "API-key-only model is missing base_url; leaving endpoint empty",
+            );
+            entry.info.base_url.clear();
         }
         if let Some(v) = self.tool_mode {
             entry.info.tool_mode = Some(v);
@@ -4197,6 +4279,21 @@ impl ModelEntry {
     /// Probes `std::env::var` at call time — result is not stable across env changes.
     pub fn has_own_credentials(&self) -> bool {
         self.own_credential().is_some()
+    }
+
+    /// Whether this entry can resolve a credential owned by its selected
+    /// provider. Application-stored provider keys are accepted only for the
+    /// provider's trusted endpoint; explicit per-model BYOK remains valid for
+    /// custom endpoints.
+    pub fn has_usable_provider_credentials(&self) -> bool {
+        self.has_own_credentials()
+            || (trusted_built_in_session_endpoint(self.info.provider, &self.info.base_url)
+                && self.info.provider.profile().session_auth.is_api_key_only()
+                && crate::auth::read_provider_api_key(
+                    &crate::util::grok_home::grok_home(),
+                    self.info.provider,
+                )
+                .is_some())
     }
 }
 impl std::ops::Deref for ModelEntry {
@@ -4579,7 +4676,9 @@ pub fn effective_auth_scheme(provider: ModelProvider, configured: AuthScheme) ->
 /// Explicit model-owned API keys are handled before this gate.
 fn trusted_built_in_session_endpoint(provider: ModelProvider, base_url: &str) -> bool {
     match provider.profile().session_auth {
-        xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => false,
+        xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => {
+            provider.is_kimi() && crate::kimi_models::is_trusted_api_base_url(base_url)
+        }
         xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
             crate::util::is_first_party_xai_url(base_url)
         }
@@ -4615,7 +4714,16 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
     } else {
         match info.provider.profile().session_auth {
             xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => {
-                if let Some(ref env_keys) = model.env_key
+                let stored = trusted_built_in_session_endpoint(info.provider, &info.base_url)
+                    .then(|| {
+                        crate::auth::read_provider_api_key(
+                            &crate::util::grok_home::grok_home(),
+                            info.provider,
+                        )
+                    })
+                    .flatten();
+                if stored.is_none()
+                    && let Some(ref env_keys) = model.env_key
                     && !env_keys.is_empty()
                 {
                     tracing::warn!(
@@ -4624,7 +4732,7 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
                     );
                 }
                 (
-                    None,
+                    stored,
                     info.base_url.clone(),
                     xai_chat_state::AuthType::ApiKey,
                 )
@@ -4866,7 +4974,7 @@ pub fn resolve_aux_model_sampling_config(
         // session bearer to an arbitrary configured URL.
         let trusted_provider_endpoint =
             trusted_built_in_session_endpoint(entry.info().provider, &entry.info().base_url);
-        if !trusted_provider_endpoint && !entry.has_own_credentials() {
+        if !trusted_provider_endpoint && !entry.has_usable_provider_credentials() {
             tracing::warn!(
                 aux_model = %model_id,
                 provider = ?entry.info().provider,
@@ -4878,7 +4986,7 @@ pub fn resolve_aux_model_sampling_config(
         let credentials = resolve_credentials_enforced(entry, session_key, disable_api_key_auth);
         let resolved_endpoint_is_trusted =
             trusted_built_in_session_endpoint(entry.info().provider, &credentials.base_url);
-        if !resolved_endpoint_is_trusted && !entry.has_own_credentials() {
+        if !resolved_endpoint_is_trusted && !entry.has_usable_provider_credentials() {
             tracing::warn!(
                 aux_model = %model_id,
                 provider = ?entry.info().provider,
@@ -11540,6 +11648,15 @@ default = "grok-4.5"
         entry.info.tool_mode = Some(ToolMode::CodeModeOnly);
         entry
     }
+
+    fn kimi_model_entry(slug: &str, context_window: u64) -> ModelEntry {
+        let mut entry = prefetch_model_entry(slug, context_window, ApiBackend::ChatCompletions);
+        entry.info.provider = ModelProvider::Kimi;
+        entry.info.base_url = crate::kimi_models::KIMI_API_BASE_URL.to_string();
+        entry.info.tool_mode = Some(ToolMode::Direct);
+        entry.env_key = Some(EnvKeys::single(crate::kimi_models::KIMI_API_KEY_ENV));
+        entry
+    }
     #[test]
     fn global_extra_headers_apply_to_model_without_override() {
         let dm = crate::models::default_model();
@@ -11928,15 +12045,91 @@ default = "grok-4.5"
         assert!(!resolved.contains_key("grok-build"));
     }
     #[test]
-    fn resolve_model_list_empty_xai_prefetch_preserves_codex_fallback() {
+    fn resolve_model_list_empty_xai_prefetch_preserves_non_xai_fallbacks() {
         let cfg = Config::default();
         let resolved = resolve_model_list(&cfg, Some(IndexMap::new()));
         assert!(!resolved.contains_key("grok-build"));
         assert!(resolved.contains_key("gpt-5.6-sol"));
+        assert!(resolved.contains_key("kimi-k3"));
         assert!(
             resolved
                 .values()
-                .all(|entry| entry.info.provider == ModelProvider::Codex)
+                .all(|entry| entry.info.provider != ModelProvider::Xai)
+        );
+    }
+
+    #[test]
+    fn xai_prefetch_cannot_publish_or_replace_kimi_models() {
+        let cfg = Config::default();
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "kimi-k3".to_owned(),
+            kimi_model_entry("attacker-routed-kimi", 8_192),
+        );
+        prefetched.insert(
+            "spoofed-kimi".to_owned(),
+            kimi_model_entry("spoofed-kimi", 8_192),
+        );
+
+        let resolved = resolve_model_list(&cfg, Some(prefetched));
+        let kimi = resolved.get("kimi-k3").expect("embedded Kimi fallback");
+        assert_eq!(kimi.info.provider, ModelProvider::Kimi);
+        assert_eq!(kimi.info.model, "kimi-k3");
+        assert_eq!(kimi.info.context_window.get(), 1_048_576);
+        assert!(!resolved.contains_key("spoofed-kimi"));
+    }
+
+    #[test]
+    fn embedded_kimi_model_uses_chat_and_provider_owned_credentials() {
+        let defaults = default_model_entries(&EndpointsConfig::default());
+        let entry = defaults.get("kimi-k3").expect("embedded Kimi K3");
+
+        assert_eq!(entry.info.provider, ModelProvider::Kimi);
+        assert_eq!(entry.info.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(entry.info.base_url, crate::kimi_models::KIMI_API_BASE_URL);
+        assert_eq!(entry.info.context_window.get(), 1_048_576);
+        assert_eq!(entry.info.tool_mode, Some(ToolMode::Direct));
+        assert_eq!(entry.info.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(
+            entry.env_key.as_ref().and_then(EnvKeys::primary),
+            Some(crate::kimi_models::KIMI_API_KEY_ENV)
+        );
+    }
+
+    #[test]
+    fn new_api_key_provider_model_without_base_url_fails_closed() {
+        let (_, models) = resolve_models_from_toml(
+            r#"
+            [model.custom-kimi]
+            model = "kimi-k3"
+            provider = "kimi"
+            api_backend = "chat_completions"
+            env_key = "CUSTOM_KIMI_KEY"
+            "#,
+            None,
+        );
+        let entry = models.get("custom-kimi").expect("custom Kimi entry");
+        assert_eq!(entry.info.provider, ModelProvider::Kimi);
+        assert!(entry.info.base_url.is_empty());
+    }
+
+    #[test]
+    fn provider_changing_override_without_base_url_drops_inherited_endpoint() {
+        let (_, models) = resolve_models_from_toml(
+            r#"
+            [model.grok-build]
+            model = "kimi-k3"
+            provider = "kimi"
+            api_backend = "chat_completions"
+            env_key = "CUSTOM_KIMI_KEY"
+            "#,
+            None,
+        );
+        let entry = models.get("grok-build").expect("overridden built-in entry");
+        assert_eq!(entry.info.provider, ModelProvider::Kimi);
+        assert!(
+            entry.info.base_url.is_empty(),
+            "a Kimi credential must never inherit the built-in xAI endpoint"
         );
     }
     #[test]
@@ -12039,6 +12232,55 @@ default = "grok-4.5"
         assert!(resolved.contains_key("gpt-next"));
         assert!(!resolved.contains_key("gpt-5.6-sol"));
         assert_eq!(resolved["gpt-next"].info.context_window.get(), 353_400);
+    }
+
+    #[test]
+    fn authoritative_kimi_catalog_replaces_only_kimi_partition() {
+        let cfg = Config::default();
+        let mut xai = IndexMap::new();
+        xai.insert(
+            "grok-live".to_string(),
+            prefetch_model_entry("grok-live", 500_000, ApiBackend::Responses),
+        );
+        let mut kimi = IndexMap::new();
+        kimi.insert(
+            "kimi-next".to_string(),
+            kimi_model_entry("kimi-next", 512_000),
+        );
+
+        let resolved = resolve_model_list_with_provider_catalogs(
+            &cfg,
+            Some(xai),
+            None,
+            false,
+            Some(kimi),
+            true,
+        );
+        assert!(resolved.contains_key("grok-live"));
+        assert!(resolved.contains_key("gpt-5.6-sol"));
+        assert!(resolved.contains_key("kimi-next"));
+        assert!(!resolved.contains_key("kimi-k3"));
+        assert_eq!(resolved["kimi-next"].info.provider, ModelProvider::Kimi);
+    }
+
+    #[test]
+    fn live_kimi_k3_inherits_only_same_provider_execution_metadata() {
+        let cfg = Config::default();
+        let mut kimi = IndexMap::new();
+        let mut remote = kimi_model_entry("kimi-k3", DEFAULT_CONTEXT_WINDOW);
+        remote.info.reasoning_efforts.clear();
+        remote.info.reasoning_effort = None;
+        remote.info.supports_reasoning_effort = false;
+        kimi.insert("kimi-k3".to_string(), remote);
+
+        let resolved =
+            resolve_model_list_with_provider_catalogs(&cfg, None, None, false, Some(kimi), true);
+        let entry = &resolved["kimi-k3"];
+        assert_eq!(entry.info.context_window.get(), 1_048_576);
+        assert_eq!(entry.info.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(entry.info.reasoning_efforts.len(), 1);
+        assert_eq!(entry.info.reasoning_efforts[0].value, ReasoningEffort::Max);
+        assert_eq!(entry.info.provider, ModelProvider::Kimi);
     }
     #[test]
     fn non_authoritative_codex_catalog_merges_with_embedded_fallback() {

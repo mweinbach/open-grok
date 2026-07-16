@@ -1069,6 +1069,8 @@ pub enum ModelProvider {
     Xai,
     #[serde(alias = "openai", alias = "openai_codex")]
     Codex,
+    #[serde(alias = "moonshot", alias = "moonshot_ai")]
+    Kimi,
 }
 
 /// Provider-specific wire contract used by the Responses API.
@@ -1277,6 +1279,22 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
+    /// Moonshot AI's OpenAI-compatible API. Kimi uses ordinary client-side
+    /// function tools over Chat Completions; it does not claim xAI or OpenAI
+    /// hosted-tool schemas that the platform does not provide.
+    pub const KIMI: Self = Self {
+        provider: ModelProvider::Kimi,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: None,
+            messages: false,
+        },
+        hosted_tool_dialect: None,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
     pub const fn id(self) -> &'static str {
         self.provider.as_str()
     }
@@ -1291,6 +1309,10 @@ impl ProviderProfile {
 
     pub const fn is_codex(self) -> bool {
         self.provider.is_codex()
+    }
+
+    pub const fn is_kimi(self) -> bool {
+        self.provider.is_kimi()
     }
 
     pub const fn allows_xai_services(self) -> bool {
@@ -1312,6 +1334,7 @@ impl ModelProvider {
         match self {
             Self::Xai => "xai",
             Self::Codex => "codex",
+            Self::Kimi => "kimi",
         }
     }
 
@@ -1320,6 +1343,7 @@ impl ModelProvider {
         match self {
             Self::Xai => "xAI",
             Self::Codex => "OpenAI Codex",
+            Self::Kimi => "Kimi",
         }
     }
 
@@ -1331,11 +1355,16 @@ impl ModelProvider {
         matches!(self, Self::Codex)
     }
 
+    pub const fn is_kimi(self) -> bool {
+        matches!(self, Self::Kimi)
+    }
+
     /// Return the built-in provider's complete behavior policy.
     pub const fn profile(self) -> ProviderProfile {
         match self {
             Self::Xai => ProviderProfile::XAI,
             Self::Codex => ProviderProfile::CODEX,
+            Self::Kimi => ProviderProfile::KIMI,
         }
     }
 }
@@ -1602,6 +1631,20 @@ mod tests {
                 session_auth: BuiltInSessionAuthKind::CodexOAuth,
                 xai_services: XaiServicePolicy::Denied,
             },
+            Case {
+                provider: ModelProvider::Kimi,
+                id: "kimi",
+                name: "Kimi",
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: None,
+                    messages: false,
+                },
+                hosted_tools: None,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+                xai_services: XaiServicePolicy::Denied,
+            },
         ];
 
         for case in cases {
@@ -1617,6 +1660,7 @@ mod tests {
             assert_eq!(profile.xai_services, case.xai_services);
             assert_eq!(profile.is_xai(), case.provider.is_xai());
             assert_eq!(profile.is_codex(), case.provider.is_codex());
+            assert_eq!(profile.is_kimi(), case.provider.is_kimi());
             assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
             for backend in [
                 ApiBackend::ChatCompletions,

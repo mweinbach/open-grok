@@ -20,6 +20,19 @@ pub(super) fn codex_models_refresh_payload(
     }
 }
 
+pub(super) fn kimi_models_query_payload(
+    refreshed: Result<bool, String>,
+    models: acp::SessionModelState,
+) -> serde_json::Value {
+    match refreshed {
+        Ok(refreshed) => serde_json::json!({ "refreshed": refreshed, "models": models }),
+        Err(warning) => {
+            tracing::warn!(%warning, "Kimi model query failed; returning embedded models");
+            serde_json::json!({ "refreshed": false, "warning": warning, "models": models })
+        }
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
     /// In the meta, we provide
@@ -3356,6 +3369,26 @@ impl acp::Agent for MvpAgent {
             "open-grok/codex/models/clear" => crate::extensions::to_ext_response(Ok(
                 serde_json::json!({
                     "cleared": self.models_manager.clear_codex_models(),
+                }),
+            )),
+            "open-grok/kimi/models/query" => {
+                let refreshed = self
+                    .models_manager
+                    .refresh_kimi_models()
+                    .await
+                    .map_err(|error| error.to_string());
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(kimi_models_query_payload(
+                    refreshed, models,
+                )))
+            }
+            "open-grok/kimi/models/clear" => crate::extensions::to_ext_response(Ok(
+                serde_json::json!({
+                    "cleared": self.models_manager.clear_kimi_models(),
                 }),
             )),
             "x.ai/getApiKey" | "x.ai/setApiKey" => {

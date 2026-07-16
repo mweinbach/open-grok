@@ -10,8 +10,8 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 use xai_grok_sampling_types::{
-    ApiBackend, ModelProvider, ProviderProfile, ReasoningEffort, ReasoningSummary,
-    RequestMetadataPolicy, ResponsesDialect, SamplingError,
+    ApiBackend, ChatCompletionRequest, ModelProvider, ProviderProfile, ReasoningEffort,
+    ReasoningSummary, RequestMetadataPolicy, ResponsesDialect, SamplingError,
 };
 
 use crate::config::SamplerConfig;
@@ -142,6 +142,10 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
             builder
         }
     }
+
+    /// Apply provider-owned request constraints after shared defaults. Most
+    /// OpenAI-compatible providers need no rewrite.
+    fn sanitize_chat_request(&self, _request: &mut ChatCompletionRequest) {}
 
     fn patch_responses_request(&self, request_body: &mut Value, policy: ResponsesRequestPolicy) {
         match self.profile().responses_dialect() {
@@ -288,6 +292,26 @@ impl ProviderAdapter for CodexProvider {
     }
 }
 
+#[derive(Debug)]
+pub struct KimiProvider;
+
+impl ProviderAdapter for KimiProvider {
+    fn provider(&self) -> ModelProvider {
+        ModelProvider::Kimi
+    }
+
+    fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
+        // Kimi's coding models own their sampling policy. Moonshot documents
+        // temperature/top_p as fixed for this lane, so do not forward either
+        // user or global defaults. Penalty tuning is likewise provider-owned
+        // for the coding models.
+        request.temperature = None;
+        request.top_p = None;
+        request.frequency_penalty = None;
+        request.presence_penalty = None;
+    }
+}
+
 /// One entry in the built-in provider registry.
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderRegistration {
@@ -297,9 +321,10 @@ pub struct ProviderRegistration {
 
 static XAI_PROVIDER: XaiProvider = XaiProvider;
 static CODEX_PROVIDER: CodexProvider = CodexProvider;
+static KIMI_PROVIDER: KimiProvider = KimiProvider;
 
 /// Complete registry for the built-in providers.
-pub static PROVIDER_REGISTRY: [ProviderRegistration; 2] = [
+pub static PROVIDER_REGISTRY: [ProviderRegistration; 3] = [
     ProviderRegistration {
         provider: ModelProvider::Xai,
         adapter: &XAI_PROVIDER,
@@ -307,6 +332,10 @@ pub static PROVIDER_REGISTRY: [ProviderRegistration; 2] = [
     ProviderRegistration {
         provider: ModelProvider::Codex,
         adapter: &CODEX_PROVIDER,
+    },
+    ProviderRegistration {
+        provider: ModelProvider::Kimi,
+        adapter: &KIMI_PROVIDER,
     },
 ];
 
@@ -317,6 +346,7 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
     match provider {
         ModelProvider::Xai => PROVIDER_REGISTRY[0].adapter,
         ModelProvider::Codex => PROVIDER_REGISTRY[1].adapter,
+        ModelProvider::Kimi => PROVIDER_REGISTRY[2].adapter,
     }
 }
 
@@ -509,7 +539,11 @@ mod tests {
 
     #[test]
     fn registry_is_complete_and_profiles_match_keys() {
-        let expected = [ModelProvider::Xai, ModelProvider::Codex];
+        let expected = [
+            ModelProvider::Xai,
+            ModelProvider::Codex,
+            ModelProvider::Kimi,
+        ];
         assert_eq!(PROVIDER_REGISTRY.len(), expected.len());
         for provider in expected {
             let entries = PROVIDER_REGISTRY
@@ -526,7 +560,11 @@ mod tests {
 
     #[test]
     fn request_patching_is_selected_only_by_provider_adapter() {
-        for provider in [ModelProvider::Xai, ModelProvider::Codex] {
+        for provider in [
+            ModelProvider::Xai,
+            ModelProvider::Codex,
+            ModelProvider::Kimi,
+        ] {
             let mut request = base_request();
             let original = request.clone();
             provider_adapter(provider).patch_responses_request(
@@ -538,7 +576,7 @@ mod tests {
                 },
             );
 
-            if provider == ModelProvider::Xai {
+            if provider != ModelProvider::Codex {
                 assert_eq!(request, original);
             } else {
                 assert_eq!(request["instructions"], "base prompt");
@@ -553,6 +591,7 @@ mod tests {
     fn prompt_cache_and_event_policy_follow_provider_profile() {
         let xai = provider_adapter(ModelProvider::Xai);
         let codex = provider_adapter(ModelProvider::Codex);
+        let kimi = provider_adapter(ModelProvider::Kimi);
         assert_eq!(xai.prompt_cache_key(Some("session")), None);
         assert_eq!(
             codex.prompt_cache_key(Some("session")),
@@ -562,7 +601,25 @@ mod tests {
         assert!(codex.supports_turn_state(&ApiBackend::Responses));
         assert!(xai.sends_doom_loop_opt_in());
         assert!(!codex.sends_doom_loop_opt_in());
+        assert!(!kimi.sends_doom_loop_opt_in());
         assert!(xai.normalizes_response_events());
         assert!(codex.normalizes_response_events());
+        assert!(!kimi.normalizes_response_events());
+        assert!(kimi.validate_backend(&ApiBackend::ChatCompletions).is_ok());
+        assert!(kimi.validate_backend(&ApiBackend::Responses).is_err());
+    }
+
+    #[test]
+    fn kimi_omits_sampling_parameters_owned_by_the_model() {
+        let mut request = ChatCompletionRequest::new("kimi-k3", Vec::new());
+        request.temperature = Some(0.7);
+        request.top_p = Some(0.95);
+        request.frequency_penalty = Some(0.2);
+        request.presence_penalty = Some(0.3);
+        provider_adapter(ModelProvider::Kimi).sanitize_chat_request(&mut request);
+        assert_eq!(request.temperature, None);
+        assert_eq!(request.top_p, None);
+        assert_eq!(request.frequency_penalty, None);
+        assert_eq!(request.presence_penalty, None);
     }
 }

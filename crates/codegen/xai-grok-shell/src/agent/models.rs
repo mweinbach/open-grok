@@ -12,6 +12,7 @@ use indexmap::IndexMap;
 use crate::agent::config::{self, ModelEntry, resolve_credentials, sampling_config_for_model};
 use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
 use crate::codex_models::{CodexCompactionMetadata, CodexModelsCatalog, CodexModelsClient};
+use crate::kimi_models::{KimiModelsCatalog, KimiModelsClient};
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::sampling::SamplerConfig as SamplingConfig;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -113,6 +114,8 @@ struct Inner {
     /// Provider-isolated ChatGPT Codex catalog. This must never be stored in
     /// `prefetched`, which is owned by xAI's `/v1/models` transport.
     codex_catalog: RwLock<Option<CodexModelsCatalog>>,
+    /// Provider-isolated Kimi catalog queried with only the Kimi API key.
+    kimi_catalog: RwLock<Option<KimiModelsCatalog>>,
     models: RwLock<IndexMap<String, ModelEntry>>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
@@ -129,14 +132,18 @@ struct Inner {
     gateway: RwLock<Option<xai_acp_lib::AcpAgentGatewaySender>>,
     cache: ModelsCacheManager,
     codex_client: CodexModelsClient,
+    kimi_client: KimiModelsClient,
     /// Serialize Codex cache/network refreshes. Session startup waits for an
     /// already-running refresh so it resolves against the same catalog rather
     /// than racing past the initial `OnlineIfUncached` request.
     codex_refresh_lock: tokio::sync::Mutex<()>,
+    kimi_refresh_lock: tokio::sync::Mutex<()>,
     /// Invalidates a refresh result when Codex logout races an in-flight
     /// `/models` request. Logout increments this before clearing the cache;
     /// only a refresh that started in the current generation may publish.
     codex_catalog_generation: AtomicU64,
+    /// Invalidates a Kimi model query when a catalog clear races its response.
+    kimi_catalog_generation: AtomicU64,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// `allowed_models` matched nothing in the fetched catalog; the prompt path
@@ -187,26 +194,30 @@ impl ModelsManager {
         auth_manager: Arc<AuthManager>,
         cfg: config::Config,
     ) -> Self {
-        Self::new_with_codex(
+        Self::new_with_provider_catalogs(
             prefetched,
+            None,
             None,
             models,
             current_model_id,
             auth_manager,
             cfg,
             CodexModelsClient::new(),
+            KimiModelsClient::new(),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn new_with_codex(
+    fn new_with_provider_catalogs(
         prefetched: Option<IndexMap<String, ModelEntry>>,
         codex_catalog: Option<CodexModelsCatalog>,
+        kimi_catalog: Option<KimiModelsCatalog>,
         models: IndexMap<String, ModelEntry>,
         current_model_id: acp::ModelId,
         auth_manager: Arc<AuthManager>,
         cfg: config::Config,
         codex_client: CodexModelsClient,
+        kimi_client: KimiModelsClient,
     ) -> Self {
         let has_session = auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
@@ -215,6 +226,7 @@ impl ModelsManager {
             inner: Arc::new(Inner {
                 prefetched: RwLock::new(prefetched),
                 codex_catalog: RwLock::new(codex_catalog),
+                kimi_catalog: RwLock::new(kimi_catalog),
                 models: RwLock::new(models),
                 current_model_id: RwLock::new(current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
@@ -226,8 +238,11 @@ impl ModelsManager {
                 gateway: RwLock::new(None),
                 cache: ModelsCacheManager::new(),
                 codex_client,
+                kimi_client,
                 codex_refresh_lock: tokio::sync::Mutex::new(()),
+                kimi_refresh_lock: tokio::sync::Mutex::new(()),
                 codex_catalog_generation: AtomicU64::new(0),
+                kimi_catalog_generation: AtomicU64::new(0),
                 retry_in_flight: AtomicBool::new(false),
                 allowlist_excludes_all: AtomicBool::new(false),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
@@ -280,10 +295,13 @@ impl ModelsManager {
         let has_prefetched = prefetched_models.is_some();
         let codex_client = CodexModelsClient::new();
         let codex_catalog = codex_client.load_fresh_cache();
-        let catalog = resolve_model_catalog_with_codex(
+        let kimi_client = KimiModelsClient::new();
+        let kimi_catalog = None;
+        let catalog = resolve_model_catalog_with_provider_catalogs(
             cfg,
             prefetched_models.clone(),
             codex_catalog.as_ref(),
+            kimi_catalog.as_ref(),
         );
 
         // Validate only against a real catalog; a bundled-only first run defers
@@ -308,14 +326,16 @@ impl ModelsManager {
 
         let current_model_id = acp::ModelId::new(Arc::from(current_model_key));
 
-        let mgr = Self::new_with_codex(
+        let mgr = Self::new_with_provider_catalogs(
             prefetched_models,
             codex_catalog,
+            kimi_catalog,
             catalog,
             current_model_id,
             auth_manager,
             cfg.clone(),
             codex_client,
+            kimi_client,
         );
         if has_prefetched {
             *mgr.inner.has_fetched_real_catalog.write() = true;
@@ -326,6 +346,7 @@ impl ModelsManager {
     pub(crate) fn set_gateway(&self, gateway: xai_acp_lib::AcpAgentGatewaySender) {
         *self.inner.gateway.write() = Some(gateway);
         self.start_codex_models_refresh();
+        self.start_kimi_models_query();
     }
 
     /// Refresh the authenticated ChatGPT Codex catalog after the agent has a
@@ -417,6 +438,69 @@ impl ModelsManager {
         had_catalog || had_cache
     }
 
+    fn start_kimi_models_query(&self) {
+        if !self.inner.kimi_client.has_usable_api_key() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("Kimi model query deferred: no Tokio runtime");
+            return;
+        };
+        let manager = self.clone();
+        runtime.spawn(async move {
+            if let Err(error) = manager.refresh_kimi_models().await {
+                tracing::warn!(%error, "Kimi model query failed; keeping embedded models");
+            }
+        });
+    }
+
+    /// Query Kimi's provider-owned `/models` endpoint and publish only its
+    /// catalog partition. Failures preserve the last live/embedded catalog.
+    pub(crate) async fn refresh_kimi_models(&self) -> anyhow::Result<bool> {
+        let _refresh_guard = self.inner.kimi_refresh_lock.lock().await;
+        let generation = self.inner.kimi_catalog_generation.load(Ordering::Acquire);
+        let Some(refreshed) = self.inner.kimi_client.query().await? else {
+            tracing::debug!("Kimi model query skipped: no Kimi API key");
+            return Ok(false);
+        };
+        if generation != self.inner.kimi_catalog_generation.load(Ordering::Acquire)
+            || !self
+                .inner
+                .kimi_client
+                .catalog_matches_current_credential(&refreshed)
+        {
+            tracing::debug!(
+                "discarded Kimi model query completed after catalog clear or credential change"
+            );
+            return Ok(false);
+        }
+        let count = refreshed.entries().len();
+        let authoritative = refreshed.is_authoritative();
+        *self.inner.kimi_catalog.write() = Some(refreshed);
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.prefetched.read().clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        tracing::info!(count, authoritative, "Kimi model catalog refreshed");
+        Ok(true)
+    }
+
+    /// Drop queried Kimi entries after its key is cleared. The embedded K3
+    /// entry remains available so the UI can accept a replacement key.
+    pub(crate) fn clear_kimi_models(&self) -> bool {
+        self.inner
+            .kimi_catalog_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let had_catalog = self.inner.kimi_catalog.write().take().is_some();
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.prefetched.read().clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        had_catalog
+    }
+
     /// Swap config, rebuild catalog, and reselect the model.
     ///
     /// Calls `reselect_default_model` when the preferred model changed
@@ -431,7 +515,13 @@ impl ModelsManager {
         let prefetched = self.inner.prefetched.read().clone();
         let new_catalog = {
             let codex_catalog = self.inner.codex_catalog.read();
-            resolve_model_catalog_with_codex(&new_config, prefetched, codex_catalog.as_ref())
+            let kimi_catalog = self.inner.kimi_catalog.read();
+            resolve_model_catalog_with_provider_catalogs(
+                &new_config,
+                prefetched,
+                codex_catalog.as_ref(),
+                kimi_catalog.as_ref(),
+            )
         };
         let has_real_catalog = *self.inner.has_fetched_real_catalog.read();
         if has_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
@@ -782,7 +872,13 @@ impl ModelsManager {
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
         let catalog = {
             let codex_catalog = self.inner.codex_catalog.read();
-            resolve_model_catalog_with_codex(cfg, prefetched, codex_catalog.as_ref())
+            let kimi_catalog = self.inner.kimi_catalog.read();
+            resolve_model_catalog_with_provider_catalogs(
+                cfg,
+                prefetched,
+                codex_catalog.as_ref(),
+                kimi_catalog.as_ref(),
+            )
         };
         *self.inner.models.write() = catalog;
     }
@@ -2130,21 +2226,30 @@ pub fn resolve_model_catalog(
     cfg: &config::Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
-    resolve_model_catalog_with_codex(cfg, prefetched, None)
+    resolve_model_catalog_with_provider_catalogs(cfg, prefetched, None, None)
 }
 
-/// Resolve the combined provider catalog while preserving independent xAI and
-/// ChatGPT Codex remote state. The Codex snapshot replaces or overlays only
-/// the Codex partition before the shared allow/disable/hide filters run.
-fn resolve_model_catalog_with_codex(
+/// Resolve the combined catalog while preserving each provider's independently
+/// authenticated remote state before shared filters run.
+fn resolve_model_catalog_with_provider_catalogs(
     cfg: &config::Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
     codex_catalog: Option<&CodexModelsCatalog>,
+    kimi_catalog: Option<&KimiModelsCatalog>,
 ) -> IndexMap<String, ModelEntry> {
     let codex_entries = codex_catalog.map(CodexModelsCatalog::entries);
     let codex_authoritative = codex_catalog.is_some_and(CodexModelsCatalog::is_authoritative);
+    let kimi_entries = kimi_catalog.map(KimiModelsCatalog::entries);
+    let kimi_authoritative = kimi_catalog.is_some_and(KimiModelsCatalog::is_authoritative);
     let mut catalog: IndexMap<String, ModelEntry> =
-        config::resolve_model_list_with_codex(cfg, prefetched, codex_entries, codex_authoritative);
+        config::resolve_model_list_with_provider_catalogs(
+            cfg,
+            prefetched,
+            codex_entries,
+            codex_authoritative,
+            kimi_entries,
+            kimi_authoritative,
+        );
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {
         let before = catalog.len();
@@ -2512,6 +2617,17 @@ mod tests {
         // Another real change: another bump.
         mgr.set_current_model_id(acp::ModelId::new("grok-3"));
         assert_eq!(mgr.model_switch_generation(), start + 2);
+    }
+
+    #[test]
+    fn clearing_kimi_catalog_invalidates_in_flight_query_generation() {
+        let mgr = test_manager();
+        let start = mgr.inner.kimi_catalog_generation.load(Ordering::Acquire);
+        assert!(!mgr.clear_kimi_models());
+        assert_eq!(
+            mgr.inner.kimi_catalog_generation.load(Ordering::Acquire),
+            start + 1
+        );
     }
 
     #[test]

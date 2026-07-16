@@ -2239,6 +2239,12 @@ impl SessionActor {
                         crate::sampling::error::error_data_with_status(msg, Some(401)),
                     ));
                 }
+                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                    provider: xai_grok_sampling_types::ModelProvider::Kimi,
+                } => {
+                    return Err(acp::Error::internal_error()
+                        .data("Kimi API-key authentication cannot be refreshed automatically"));
+                }
             };
             auth_retry_schedule.reset();
             codex_auth_retry_attempted = false;

@@ -33,13 +33,15 @@ fn automatic_auxiliary_model(
 fn auxiliary_reasoning_effort(
     provider: xai_grok_sampling_types::ModelProvider,
     supported: bool,
+    model_default: Option<xai_grok_sampling_types::ReasoningEffort>,
 ) -> Option<xai_grok_sampling_types::ReasoningEffort> {
-    supported.then_some(match provider {
-        xai_grok_sampling_types::ModelProvider::Codex => {
+    supported.then(|| {
+        if provider.is_codex() {
             xai_grok_sampling_types::ReasoningEffort::Medium
-        }
-        xai_grok_sampling_types::ModelProvider::Xai => {
+        } else if provider.is_xai() {
             xai_grok_sampling_types::ReasoningEffort::Low
+        } else {
+            model_default.unwrap_or(xai_grok_sampling_types::ReasoningEffort::Low)
         }
     })
 }
@@ -648,8 +650,9 @@ impl SessionActor {
         // Resolve and refresh xAI auth independently of the active chat
         // provider. This keeps a long-lived Codex session's explicit xAI
         // recap/memory helper alive without ever borrowing the Codex bearer.
-        // A known Codex helper skips xAI refresh entirely.
-        let xai_auth = (target_provider != Some(xai_grok_sampling_types::ModelProvider::Codex))
+        // Only an xAI helper may consult xAI auth. Third-party API-key
+        // providers must never read or refresh an unrelated xAI credential.
+        let xai_auth = (target_provider == Some(xai_grok_sampling_types::ModelProvider::Xai))
             .then(|| self.auth_manager.as_ref())
             .flatten()
             .and_then(|manager| manager.current_or_expired().map(|auth| (manager, auth.key)));
@@ -761,13 +764,15 @@ impl SessionActor {
         let supports_reasoning_effort =
             crate::agent::config::find_model_by_id(&models, &config.model)
                 .is_some_and(|entry| entry.info().supports_reasoning_effort);
+        let model_default = self
+            .models_manager
+            .model_default_reasoning_effort(&config.model);
         let reasoning_effort =
-            auxiliary_reasoning_effort(config.provider, supports_reasoning_effort).filter(
-                |effort| {
+            auxiliary_reasoning_effort(config.provider, supports_reasoning_effort, model_default)
+                .filter(|effort| {
                     self.models_manager
                         .model_accepts_reasoning_effort(&config.model, *effort)
-                },
-            );
+                });
         config.reasoning_effort = reasoning_effort;
 
         let model = config.model.clone();
@@ -1033,6 +1038,13 @@ impl SessionActor {
                         );
                     }
                     eligible
+                }
+                xai_grok_sampling_types::ModelProvider::Kimi => {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        "Kimi API-key authentication cannot be refreshed; surfacing 401",
+                    );
+                    false
                 }
             };
         if !matches!(error.kind, SamplingErrorKind::Auth) && error.status_code == Some(401) {
@@ -1594,19 +1606,26 @@ mod auxiliary_model_policy_tests {
     }
 
     #[test]
-    fn auxiliary_reasoning_is_cheap_and_capability_gated() {
+    fn auxiliary_reasoning_is_provider_appropriate_and_capability_gated() {
         assert_eq!(
-            auxiliary_reasoning_effort(ModelProvider::Codex, true),
+            auxiliary_reasoning_effort(ModelProvider::Codex, true, Some(ReasoningEffort::High)),
             Some(ReasoningEffort::Medium)
         );
         assert_eq!(
-            auxiliary_reasoning_effort(ModelProvider::Xai, true),
+            auxiliary_reasoning_effort(ModelProvider::Xai, true, Some(ReasoningEffort::High)),
             Some(ReasoningEffort::Low)
         );
         assert_eq!(
-            auxiliary_reasoning_effort(ModelProvider::Codex, false),
+            auxiliary_reasoning_effort(ModelProvider::Kimi, true, Some(ReasoningEffort::Max)),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            auxiliary_reasoning_effort(ModelProvider::Codex, false, Some(ReasoningEffort::High),),
             None
         );
-        assert_eq!(auxiliary_reasoning_effort(ModelProvider::Xai, false), None);
+        assert_eq!(
+            auxiliary_reasoning_effort(ModelProvider::Kimi, false, Some(ReasoningEffort::Max)),
+            None
+        );
     }
 }

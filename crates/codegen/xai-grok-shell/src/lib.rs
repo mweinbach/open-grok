@@ -18,6 +18,7 @@ pub mod cli_models;
 pub mod codex_auth;
 pub(crate) mod codex_models;
 pub mod config;
+pub(crate) mod kimi_models;
 pub use xai_grok_shell_base::cpu_profile;
 pub use xai_grok_shell_base::env;
 pub mod extensions;

@@ -1086,8 +1086,9 @@ mod is_hidden_tests {
     fn provider_boundary_and_summary_marker_are_sticky() {
         let boundary = ProviderBoundary::default();
         assert!(boundary.allows_xai_export());
-        assert!(boundary.observe(ModelProvider::Codex));
+        assert!(boundary.observe(ModelProvider::Kimi));
         assert!(!boundary.allows_xai_export());
+        assert!(!boundary.observe(ModelProvider::Codex));
         assert!(!boundary.observe(ModelProvider::Xai));
         assert!(!boundary.allows_xai_export());
 
@@ -1456,9 +1457,9 @@ impl ProviderBoundary {
     /// Observe a provider and return true only when it first closes the xAI
     /// service boundary.
     ///
-    /// Today Codex is the only built-in provider whose profile denies xAI-only
-    /// exports. Keeping the decision on the profile avoids growing another
-    /// provider-specific boolean when more providers are added.
+    /// Any provider whose profile denies xAI-only exports closes the boundary.
+    /// Keeping the decision on the profile avoids growing another
+    /// provider-specific boolean as providers are added.
     pub(crate) fn observe(&self, provider: ModelProvider) -> bool {
         !provider.profile().allows_xai_services()
             && self

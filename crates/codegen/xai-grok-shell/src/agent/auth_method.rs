@@ -67,7 +67,11 @@ where
     if disable_api_key_auth {
         return false;
     }
-    has_xai_api_key_env() || models.into_iter().any(ModelEntry::has_own_credentials)
+    has_xai_api_key_env()
+        || models.into_iter().any(|model| {
+            model.info().provider == xai_grok_sampling_types::ModelProvider::Xai
+                && model.has_own_credentials()
+        })
 }
 
 /// Inputs to [`build_auth_methods`].
