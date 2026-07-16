@@ -204,6 +204,31 @@ fn response_metadata_header_value(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Return true only when serde rejected the top-level Responses event kind,
+/// not when a known event was malformed internally. codex-rs intentionally
+/// uses an open string discriminator and ignores future event kinds; this
+/// predicate lets the Codex HTTP stream preserve that forward compatibility
+/// without hiding schema errors in events we already understand.
+fn is_unknown_top_level_response_event(error: &SamplingError, data: &str) -> bool {
+    let SamplingError::Serialization(error) = error else {
+        return false;
+    };
+    let Some(event_type) = serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+    else {
+        return false;
+    };
+    error
+        .to_string()
+        .contains(&format!("unknown variant `{event_type}`"))
+}
+
 /// Normalize valid custom-tool stream shapes that async-openai 0.33.1 models
 /// more strictly than the wire protocol used by some Responses deployments.
 ///
@@ -2316,6 +2341,7 @@ impl SamplingClient {
 
         let doom_loop_for_stream = doom_loop.clone();
         let codex_turn_state_for_stream = self.codex_turn_state.clone();
+        let is_codex_stream = self.defaults.provider == ModelProvider::Codex;
 
         // The scan item is an `Option`: `Some(None)` skips an absorbed
         // doom-loop event without terminating the stream (`filter_map`
@@ -2360,7 +2386,22 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            Some(Some(deserialize_response_event(data)))
+                            let decoded = deserialize_response_event(data);
+                            if is_codex_stream
+                                && decoded.as_ref().is_err_and(|error| {
+                                    is_unknown_top_level_response_event(error, data)
+                                })
+                            {
+                                tracing::debug!(
+                                    event_type = ?serde_json::from_str::<serde_json::Value>(data)
+                                        .ok()
+                                        .and_then(|value| value.get("type").cloned()),
+                                    "ignoring an unmodeled Codex Responses event"
+                                );
+                                Some(None)
+                            } else {
+                                Some(Some(decoded))
+                            }
                         }
                     }
                     Err(e) => {
@@ -4394,6 +4435,43 @@ mod tests {
             assert_eq!(call.name, "code");
             assert_eq!(call.input, "println!(\"hello\");");
         }
+    }
+
+    #[test]
+    fn codex_unknown_event_filter_only_accepts_unknown_top_level_kinds() {
+        let future = r#"{
+            "type": "response.future_control",
+            "sequence_number": 1,
+            "payload": {"forward_compatible": true}
+        }"#;
+        let future_error = deserialize_response_event(future).unwrap_err();
+        assert!(is_unknown_top_level_response_event(&future_error, future));
+
+        let known_with_bad_nested_kind = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 2,
+            "response": {
+                "id": "resp-future-output",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-5.6-sol",
+                "status": "completed",
+                "output": [{"type": "future_output"}]
+            }
+        })
+        .to_string();
+        let nested_error = deserialize_response_event(&known_with_bad_nested_kind).unwrap_err();
+        assert!(
+            !is_unknown_top_level_response_event(&nested_error, &known_with_bad_nested_kind),
+            "a known event with a malformed nested payload must still fail"
+        );
+
+        let malformed = r#"{"type":"response.future_control""#;
+        let malformed_error = deserialize_response_event(malformed).unwrap_err();
+        assert!(!is_unknown_top_level_response_event(
+            &malformed_error,
+            malformed
+        ));
     }
 
     #[test]

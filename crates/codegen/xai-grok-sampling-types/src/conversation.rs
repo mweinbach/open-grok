@@ -2218,6 +2218,57 @@ pub fn inject_streaming_reasoning_fallback(items: &mut Vec<ConversationItem>, te
     );
 }
 
+/// Restore streamed reasoning summaries onto the exact reasoning output item
+/// that produced them when the terminal `Response` omits summary content.
+///
+/// Each tuple is `(output_index, item_id, summary_parts)`. `summary_index` has
+/// already been used by the caller to order `summary_parts`; it is scoped to
+/// one reasoning item and therefore must never be merged across item IDs.
+/// Terminal response content remains authoritative when it is present.
+pub fn inject_streaming_reasoning_summary_fallbacks(
+    items: &mut Vec<ConversationItem>,
+    summaries: Vec<(u32, String, Vec<String>)>,
+) {
+    for (_output_index, item_id, summary_parts) in summaries {
+        let summary_parts = summary_parts
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>();
+        if summary_parts.is_empty() {
+            continue;
+        }
+
+        if let Some(reasoning) = items.iter_mut().find_map(|item| match item {
+            ConversationItem::Reasoning(reasoning) if reasoning.id == item_id => Some(reasoning),
+            _ => None,
+        }) {
+            let has_terminal_text = reasoning.summary.iter().any(|part| match part {
+                rs::SummaryPart::SummaryText(text) => !text.text.is_empty(),
+            });
+            if !has_terminal_text {
+                reasoning.summary.extend(
+                    summary_parts
+                        .into_iter()
+                        .map(|text| rs::SummaryPart::SummaryText(rs::SummaryTextContent { text })),
+                );
+            }
+            continue;
+        }
+
+        let mut reasoning = synthesized_reasoning_item(String::new());
+        reasoning.id = item_id;
+        reasoning.summary = summary_parts
+            .into_iter()
+            .map(|text| rs::SummaryPart::SummaryText(rs::SummaryTextContent { text }))
+            .collect();
+        let pos = items
+            .iter()
+            .rposition(|item| matches!(item, ConversationItem::Assistant(_)))
+            .unwrap_or(items.len());
+        items.insert(pos, ConversationItem::Reasoning(reasoning));
+    }
+}
+
 /// Reconstruct sibling `Reasoning` + `BackendToolCall` items from a
 /// legacy chat-history row's raw JSON.
 ///

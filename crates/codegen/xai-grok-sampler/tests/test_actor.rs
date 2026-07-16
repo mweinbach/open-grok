@@ -1155,6 +1155,18 @@ async fn codex_response_metadata_is_forward_compatible_and_replays_turn_state() 
                         .to_string(),
                     ),
                 );
+                events.insert(
+                    2,
+                    SseEvent::data(
+                        json!({
+                            "type": "response.future_control",
+                            "sequence_number": 2,
+                            "response_id": format!("resp-metadata-{attempt}"),
+                            "payload": {"forward_compatible": true}
+                        })
+                        .to_string(),
+                    ),
+                );
                 Sse::new(stream::iter(
                     sse_events_to_axum(events)
                         .into_iter()

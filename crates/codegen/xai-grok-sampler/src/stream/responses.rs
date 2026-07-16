@@ -142,7 +142,7 @@ pub fn stream_responses_with_client_custom_tools<'a>(
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
         let mut reasoning_text_acc = String::new();
-        let mut reasoning_summary_parts: BTreeMap<u32, String> = BTreeMap::new();
+        let mut reasoning_summary_parts: BTreeMap<(u32, String, u32), String> = BTreeMap::new();
         let mut last_content_chunk_at = Instant::now();
 
         // Maps Responses API `output_index` to our tool-only `tool_index`.
@@ -239,7 +239,11 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                         }
                         chunk_index += 1;
                         reasoning_summary_parts
-                            .entry(summary_event.summary_index)
+                            .entry((
+                                summary_event.output_index,
+                                summary_event.item_id.clone(),
+                                summary_event.summary_index,
+                            ))
                             .or_default()
                             .push_str(&delta);
                         yield SamplingEvent::ChannelToken {
@@ -253,13 +257,31 @@ pub fn stream_responses_with_client_custom_tools<'a>(
 
                 ResponseStreamEvent::ResponseReasoningSummaryTextDone(summary_event) => {
                     let summary = reasoning_summary_parts
-                        .entry(summary_event.summary_index)
+                        .entry((
+                            summary_event.output_index,
+                            summary_event.item_id,
+                            summary_event.summary_index,
+                        ))
                         .or_default();
                     // Some Codex deployments send only the terminal text,
                     // while others send deltas followed by the same complete
-                    // text. Fill an empty part without duplicating the latter.
-                    if summary.is_empty() {
-                        *summary = summary_event.text;
+                    // text. Emit and fill an empty part without duplicating
+                    // the latter.
+                    if summary.is_empty() && !summary_event.text.is_empty() {
+                        if !first_token_emitted {
+                            first_token_emitted = true;
+                            yield SamplingEvent::FirstToken {
+                                request_id: request_id.clone(),
+                            };
+                        }
+                        chunk_index += 1;
+                        *summary = summary_event.text.clone();
+                        yield SamplingEvent::ChannelToken {
+                            request_id: request_id.clone(),
+                            channel: SamplingChannel::Reasoning,
+                            text: summary_event.text,
+                            chunk_index,
+                        };
                     }
                 }
 
@@ -627,19 +649,37 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                 response,
                 &client_custom_tool_names,
             );
-        let reasoning_fallback = if reasoning_summary_parts.is_empty() {
-            reasoning_text_acc
+        let mut summaries_by_item: BTreeMap<(u32, String), Vec<(u32, String)>> = BTreeMap::new();
+        for ((output_index, item_id, summary_index), text) in reasoning_summary_parts {
+            if !text.is_empty() {
+                summaries_by_item
+                    .entry((output_index, item_id))
+                    .or_default()
+                    .push((summary_index, text));
+            }
+        }
+        if summaries_by_item.is_empty() {
+            xai_grok_sampling_types::inject_streaming_reasoning_fallback(
+                &mut items,
+                reasoning_text_acc,
+            );
         } else {
-            reasoning_summary_parts
-                .into_values()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        xai_grok_sampling_types::inject_streaming_reasoning_fallback(
-            &mut items,
-            reasoning_fallback,
-        );
+            let summaries = summaries_by_item
+                .into_iter()
+                .map(|((output_index, item_id), mut parts)| {
+                    parts.sort_by_key(|(summary_index, _)| *summary_index);
+                    (
+                        output_index,
+                        item_id,
+                        parts.into_iter().map(|(_, text)| text).collect(),
+                    )
+                })
+                .collect();
+            xai_grok_sampling_types::inject_streaming_reasoning_summary_fallbacks(
+                &mut items,
+                summaries,
+            );
+        }
 
         let has_tool_calls = items.iter().any(|i| match i {
             ConversationItem::Assistant(a) => !a.tool_calls.is_empty(),
@@ -765,15 +805,51 @@ mod tests {
     }
 
     fn reasoning_summary_delta_event(summary_index: u32, delta: &str) -> rs::ResponseStreamEvent {
+        reasoning_summary_delta_event_for(0, "reasoning-1", summary_index, delta)
+    }
+
+    fn reasoning_summary_delta_event_for(
+        output_index: u32,
+        item_id: &str,
+        summary_index: u32,
+        delta: &str,
+    ) -> rs::ResponseStreamEvent {
         rs::ResponseStreamEvent::ResponseReasoningSummaryTextDelta(
             rs_types::ResponseReasoningSummaryTextDeltaEvent {
                 sequence_number: 0,
-                item_id: "reasoning-1".into(),
-                output_index: 0,
+                item_id: item_id.into(),
+                output_index,
                 summary_index,
                 delta: delta.into(),
             },
         )
+    }
+
+    fn reasoning_summary_done_event(
+        output_index: u32,
+        item_id: &str,
+        summary_index: u32,
+        text: &str,
+    ) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseReasoningSummaryTextDone(
+            rs_types::ResponseReasoningSummaryTextDoneEvent {
+                sequence_number: 0,
+                item_id: item_id.into(),
+                output_index,
+                summary_index,
+                text: text.into(),
+            },
+        )
+    }
+
+    fn empty_reasoning_output(item_id: &str) -> rs_types::OutputItem {
+        rs_types::OutputItem::Reasoning(rs_types::ReasoningItem {
+            id: item_id.into(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some(format!("encrypted-{item_id}")),
+            status: None,
+        })
     }
 
     fn completed_event() -> rs::ResponseStreamEvent {
@@ -880,14 +956,122 @@ mod tests {
         let SamplingEvent::Completed { response, .. } = events.last().unwrap() else {
             panic!("expected completed response, got {:?}", events.last());
         };
-        let summary = response.items.iter().find_map(|item| match item {
-            ConversationItem::Reasoning(reasoning) => reasoning.summary.first().map(|part| {
-                let rs::SummaryPart::SummaryText(text) = part;
-                text.text.as_str()
-            }),
+        let summary_parts = response.items.iter().find_map(|item| match item {
+            ConversationItem::Reasoning(reasoning) => Some(
+                reasoning
+                    .summary
+                    .iter()
+                    .map(|part| {
+                        let rs::SummaryPart::SummaryText(text) = part;
+                        text.text.as_str()
+                    })
+                    .collect::<Vec<_>>(),
+            ),
             _ => None,
         });
-        assert_eq!(summary, Some("First part.\nSecond part."));
+        assert_eq!(summary_parts, Some(vec!["First part.", "Second part."]));
+    }
+
+    #[tokio::test]
+    async fn reasoning_summaries_are_scoped_to_their_output_item_ids() {
+        let raw = stream::iter(vec![
+            Ok(reasoning_summary_delta_event_for(
+                0,
+                "reasoning-a",
+                0,
+                "Summary A",
+            )),
+            Ok(reasoning_summary_delta_event_for(
+                1,
+                "reasoning-b",
+                0,
+                "Summary B",
+            )),
+            Ok(completed_event_with_output(vec![
+                empty_reasoning_output("reasoning-a"),
+                empty_reasoning_output("reasoning-b"),
+            ])),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let SamplingEvent::Completed { response, .. } = events.last().unwrap() else {
+            panic!("expected completed response, got {:?}", events.last());
+        };
+        let summaries = response
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::Reasoning(reasoning) => Some((
+                    reasoning.id.as_str(),
+                    reasoning.summary.first().map(|part| {
+                        let rs::SummaryPart::SummaryText(text) = part;
+                        text.text.as_str()
+                    }),
+                )),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(summaries.get("reasoning-a"), Some(&Some("Summary A")));
+        assert_eq!(summaries.get("reasoning-b"), Some(&Some("Summary B")));
+    }
+
+    #[tokio::test]
+    async fn done_only_reasoning_summary_is_rendered_once_and_persisted() {
+        let raw = stream::iter(vec![
+            Ok(reasoning_summary_done_event(
+                0,
+                "reasoning-done",
+                0,
+                "Done-only summary",
+            )),
+            Ok(completed_event_with_output(vec![empty_reasoning_output(
+                "reasoning-done",
+            )])),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let tokens = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Reasoning,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tokens, vec!["Done-only summary"]);
+
+        let SamplingEvent::Completed { response, .. } = events.last().unwrap() else {
+            panic!("expected completed response, got {:?}", events.last());
+        };
+        let summary = response.items.iter().find_map(|item| match item {
+            ConversationItem::Reasoning(reasoning) if reasoning.id == "reasoning-done" => {
+                reasoning.summary.first().map(|part| {
+                    let rs::SummaryPart::SummaryText(text) = part;
+                    text.text.as_str()
+                })
+            }
+            _ => None,
+        });
+        assert_eq!(summary, Some("Done-only summary"));
     }
 
     #[tokio::test]
