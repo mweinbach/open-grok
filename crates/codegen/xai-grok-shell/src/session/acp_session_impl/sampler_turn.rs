@@ -264,6 +264,7 @@ impl SessionActor {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider: Default::default(),
                 extra_headers: Default::default(),
                 context_window: std::num::NonZeroU64::new(256_000).unwrap(),
                 reasoning_effort: None,
@@ -307,6 +308,12 @@ impl SessionActor {
                 extra_headers.insert("x-compaction-at".to_string(), value.to_string());
             }
         }
+        // Chat state carries the provider resolved from the live model entry.
+        // This is authoritative for prefetched remote-only models that the
+        // disk-backed model-facts resolver cannot see.
+        let provider = cfg.provider;
+        let use_codex_bearer_resolver = provider == xai_grok_sampling_types::ModelProvider::Codex
+            && creds.auth_type == xai_chat_state::AuthType::SessionToken;
         SamplingConfig {
             api_key: creds.api_key,
             base_url: cfg.base_url,
@@ -315,7 +322,7 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             api_backend: cfg.api_backend,
-            provider: model_facts.provider,
+            provider,
             auth_scheme,
             extra_headers,
             context_window: cfg.context_window.get(),
@@ -326,15 +333,14 @@ impl SessionActor {
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
             idle_timeout_secs: None,
             client_identifier: self.client_identifier.clone(),
-            deployment_id: (model_facts.provider
-                != xai_grok_sampling_types::ModelProvider::Codex)
+            deployment_id: (provider != xai_grok_sampling_types::ModelProvider::Codex)
                 .then(|| {
                     crate::managed_config::resolve_deployment_id(
                         crate::managed_config::resolve_deployment_key().as_deref(),
                     )
                 })
                 .flatten(),
-            user_id: (model_facts.provider != xai_grok_sampling_types::ModelProvider::Codex)
+            user_id: (provider != xai_grok_sampling_types::ModelProvider::Codex)
                 .then(|| {
                     self.auth_manager
                         .as_ref()
@@ -344,10 +350,12 @@ impl SessionActor {
                 })
                 .flatten(),
             origin_client: self.origin_client.clone(),
-            attribution_callback: self.attribution_callback.clone(),
-            bearer_resolver: if model_facts.provider
-                == xai_grok_sampling_types::ModelProvider::Codex
-            {
+            attribution_callback: if provider == xai_grok_sampling_types::ModelProvider::Codex {
+                None
+            } else {
+                self.attribution_callback.clone()
+            },
+            bearer_resolver: if use_codex_bearer_resolver {
                 Some(std::sync::Arc::new(crate::codex_auth::CodexBearerResolver))
             } else if use_bearer_resolver {
                 self.auth_manager

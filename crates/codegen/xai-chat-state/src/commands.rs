@@ -370,6 +370,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider: Default::default(),
                 extra_headers: Default::default(),
                 context_window: std::num::NonZeroU64::new(128_000).unwrap(),
                 reasoning_effort: None,

@@ -50,6 +50,48 @@ pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
     )
 }
 
+/// Apply Code Mode Only's provider-specific hosted-tool policy.
+///
+/// xAI retains the established behavior of exposing no top-level hosted tools
+/// in Code Mode Only. Codex keeps its native web search alongside the `exec`
+/// custom tool; `x_search` is intentionally excluded even before the sampler's
+/// provider boundary applies its defense-in-depth filter.
+pub(crate) fn hosted_tools_for_code_mode(
+    hosted_tools: &[xai_grok_sampling_types::HostedTool],
+    tool_mode: xai_grok_sampling_types::ToolMode,
+    provider: xai_grok_sampling_types::ModelProvider,
+) -> Vec<xai_grok_sampling_types::HostedTool> {
+    let provider_tools = xai_grok_sampling_types::hosted_tools_for_provider(hosted_tools, provider);
+    if tool_mode != xai_grok_sampling_types::ToolMode::CodeModeOnly {
+        return provider_tools;
+    }
+    if provider != xai_grok_sampling_types::ModelProvider::Codex {
+        return Vec::new();
+    }
+    provider_tools
+        .into_iter()
+        .filter(|tool| matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. }))
+        .collect()
+}
+
+/// Avoid advertising a provider-hosted web search a second time inside the
+/// Code Mode `exec` tool.
+pub(crate) fn nested_tool_definitions_for_provider(
+    definitions: &[GrokToolDefinition],
+    provider: xai_grok_sampling_types::ModelProvider,
+    hosted_tools: &[xai_grok_sampling_types::HostedTool],
+) -> Vec<GrokToolDefinition> {
+    let codex_has_hosted_web = provider == xai_grok_sampling_types::ModelProvider::Codex
+        && hosted_tools
+            .iter()
+            .any(|tool| matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. }));
+    definitions
+        .iter()
+        .filter(|definition| !codex_has_hosted_web || definition.function.name != "web_search")
+        .cloned()
+        .collect()
+}
+
 const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
 start: pragma_source | plain_source
 pragma_source: PRAGMA_LINE NEWLINE SOURCE
@@ -886,6 +928,65 @@ mod tests {
             );
         }
         assert!(!is_code_mode_direct_only_tool("read_file"));
+    }
+
+    #[test]
+    fn codex_code_mode_only_keeps_hosted_web_without_x_search_or_nested_duplicate() {
+        let hosted = vec![
+            xai_grok_sampling_types::HostedTool::web_search(None),
+            xai_grok_sampling_types::HostedTool::XSearch,
+        ];
+        let effective_hosted = hosted_tools_for_code_mode(
+            &hosted,
+            xai_grok_sampling_types::ToolMode::CodeModeOnly,
+            xai_grok_sampling_types::ModelProvider::Codex,
+        );
+        assert_eq!(effective_hosted.len(), 1);
+        assert!(matches!(
+            effective_hosted[0],
+            xai_grok_sampling_types::HostedTool::WebSearch { .. }
+        ));
+
+        let definitions = vec![
+            GrokToolDefinition::function(
+                "web_search",
+                Some("Local search"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "read_file",
+                Some("Read a file"),
+                json!({"type": "object"}),
+            ),
+        ];
+        let nested = nested_tool_definitions_for_provider(
+            &definitions,
+            xai_grok_sampling_types::ModelProvider::Codex,
+            &effective_hosted,
+        );
+        assert_eq!(
+            nested
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file"]
+        );
+    }
+
+    #[test]
+    fn xai_code_mode_only_preserves_no_hosted_tools_behavior() {
+        let hosted = vec![
+            xai_grok_sampling_types::HostedTool::web_search(None),
+            xai_grok_sampling_types::HostedTool::XSearch,
+        ];
+        assert!(
+            hosted_tools_for_code_mode(
+                &hosted,
+                xai_grok_sampling_types::ToolMode::CodeModeOnly,
+                xai_grok_sampling_types::ModelProvider::Xai,
+            )
+            .is_empty()
+        );
     }
 
     #[test]

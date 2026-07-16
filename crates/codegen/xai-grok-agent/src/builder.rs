@@ -1005,7 +1005,9 @@ impl AgentBuilder {
             }
         }
         let use_backend_search = self.backend_search;
-        let web_search_enabled = self.web_search_config.is_enabled();
+        // Backend-hosted web search uses the primary model provider and does
+        // not depend on credentials for the separate client-executed search
+        // implementation.
         let tool_bridge = ToolBridge::finalize_builder(
             tool_bridge_builder,
             tool_config,
@@ -1172,10 +1174,8 @@ impl AgentBuilder {
         }
         let mut hosted_tools = Vec::new();
         if use_backend_search {
-            if web_search_enabled && definition.hosted_tool_allowed("web_search") {
-                hosted_tools.push(xai_grok_sampling_types::HostedTool::WebSearch {
-                    allowed_domains: None,
-                });
+            if definition.hosted_tool_allowed("web_search") {
+                hosted_tools.push(xai_grok_sampling_types::HostedTool::web_search(None));
             }
             if definition.hosted_tool_allowed("x_search") {
                 hosted_tools.push(xai_grok_sampling_types::HostedTool::XSearch);
@@ -2366,17 +2366,17 @@ mod tests {
             "expected XSearch hosted tool, got: {hosted:?}"
         );
     }
-    /// XSearch is added unconditionally when backend search is on;
-    /// WebSearch requires the web-search config.
+    /// Hosted search uses the primary model provider, so it remains available
+    /// without credentials for the separate client-executed search tool.
     #[tokio::test]
-    async fn hosted_tools_only_xsearch_when_web_search_disabled() {
+    async fn hosted_tools_do_not_depend_on_local_web_search_credentials() {
         let agent = build_with_web_search(false, true, &[]).await;
         let hosted = agent.hosted_tools();
         assert!(
-            !hosted
+            hosted
                 .iter()
                 .any(|t| matches!(t, xai_grok_sampling_types::HostedTool::WebSearch { .. })),
-            "WebSearch must NOT appear when web_search is disabled, got: {hosted:?}"
+            "expected provider-hosted WebSearch, got: {hosted:?}"
         );
         assert!(
             hosted

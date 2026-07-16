@@ -1068,6 +1068,9 @@ pub struct SamplingConfig {
     /// Which API backend to use for this model
     #[serde(default)]
     pub api_backend: ApiBackend,
+    /// First-party provider contract used for hosted-tool filtering.
+    #[serde(default)]
+    pub provider: ModelProvider,
     /// Extra headers to send with requests (e.g., for BYOK scenarios).
     #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
     pub extra_headers: indexmap::IndexMap<String, String>,

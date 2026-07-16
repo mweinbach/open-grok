@@ -750,12 +750,61 @@ impl From<CustomToolSpec> for ClientTool {
 /// A tool that the backend executes server-side during inference.
 /// The client sends these as native Responses API tool types (not Function).
 /// The backend's agentic sampler handles execution and streams results back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WebSearchMode {
+    /// Do not expose the hosted web-search tool.
+    Disabled,
+    /// Use the provider's cached search index only.
+    Cached,
+    /// Allow external access and prefer the provider's indexed corpus.
+    Indexed,
+    /// Allow live external web access.
+    #[default]
+    Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSearchContextSize {
+    Low,
+    Medium,
+    High,
+}
+
+impl WebSearchContextSize {
+    fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Approximate location hints accepted by OpenAI's hosted web search tool.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebSearchUserLocation {
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub timezone: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum HostedTool {
     /// Web search executed server-side by the backend's agentic sampler.
     WebSearch {
+        /// OpenAI/Codex search access mode. `None` preserves xAI's legacy
+        /// `{"type":"web_search"}` wire shape; Codex requests normalize it
+        /// to [`WebSearchMode::Live`].
+        mode: Option<WebSearchMode>,
         /// Optional domain allowlist for search results.
         allowed_domains: Option<Vec<String>>,
+        /// Optional approximate user location.
+        user_location: Option<WebSearchUserLocation>,
+        /// Optional amount of response context devoted to search.
+        search_context_size: Option<WebSearchContextSize>,
+        /// Optional search result content types, such as `text` and `image`.
+        search_content_types: Option<Vec<String>>,
     },
     /// X (Twitter) search executed server-side by the backend's agentic sampler.
     /// This is xAI-specific — not part of the OpenAI Responses API, so it's
@@ -770,6 +819,18 @@ pub enum HostedTool {
 }
 
 impl HostedTool {
+    /// Construct the legacy hosted web-search tool. Provider normalization
+    /// fills in Codex-specific defaults at the sampler boundary.
+    pub fn web_search(allowed_domains: Option<Vec<String>>) -> Self {
+        Self::WebSearch {
+            mode: None,
+            allowed_domains,
+            user_location: None,
+            search_context_size: None,
+            search_content_types: None,
+        }
+    }
+
     /// The name the backend registers this tool under server-side.
     pub fn wire_name(&self) -> &str {
         match self {
@@ -778,6 +839,56 @@ impl HostedTool {
             HostedTool::ClientCustom(tool) => &tool.name,
         }
     }
+
+    fn requires_raw_responses_tool(&self) -> bool {
+        match self {
+            HostedTool::WebSearch {
+                mode,
+                user_location,
+                search_context_size,
+                search_content_types,
+                ..
+            } => {
+                mode.is_some()
+                    || user_location.is_some()
+                    || search_context_size.is_some()
+                    || search_content_types.is_some()
+            }
+            HostedTool::XSearch | HostedTool::ClientCustom(_) => false,
+        }
+    }
+}
+
+/// Apply the first-party provider's hosted-tool contract before serialization.
+///
+/// In particular, `x_search` is never valid on the OpenAI/Codex endpoint. A
+/// missing web-search mode becomes Codex's live-search default, matching the
+/// pinned `codex-rs` hosted-tool setup.
+pub fn hosted_tools_for_provider(
+    hosted_tools: &[HostedTool],
+    provider: crate::ModelProvider,
+) -> Vec<HostedTool> {
+    hosted_tools
+        .iter()
+        .filter_map(|tool| match (provider, tool) {
+            (crate::ModelProvider::Codex, HostedTool::XSearch) => None,
+            (
+                crate::ModelProvider::Codex,
+                HostedTool::WebSearch {
+                    mode: Some(WebSearchMode::Disabled),
+                    ..
+                },
+            ) => None,
+            (crate::ModelProvider::Codex, HostedTool::WebSearch { .. }) => {
+                let mut tool = tool.clone();
+                if let HostedTool::WebSearch { mode, .. } = &mut tool {
+                    mode.get_or_insert(WebSearchMode::Live);
+                }
+                Some(tool)
+            }
+            _ => Some(tool.clone()),
+        })
+        .collect()
 }
 
 impl From<ToolDefinition> for ToolSpec {
@@ -2728,7 +2839,11 @@ impl From<&ConversationRequest> for rs::CreateResponse {
         rs::CreateResponse {
             background: None,
             conversation: None,
-            include: None,
+            include: req
+                .hosted_tools
+                .iter()
+                .any(|tool| matches!(tool, HostedTool::WebSearch { .. }))
+                .then_some(vec![rs::IncludeEnum::WebSearchCallActionSources]),
             input,
             instructions: None,
             max_output_tokens: req.max_output_tokens,
@@ -3074,7 +3189,12 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
 
     for hosted in &req.hosted_tools {
         match hosted {
-            HostedTool::WebSearch { allowed_domains } => {
+            HostedTool::WebSearch {
+                allowed_domains,
+                user_location,
+                search_context_size,
+                ..
+            } if !hosted.requires_raw_responses_tool() => {
                 let filters = allowed_domains
                     .as_ref()
                     .map(|domains| rs::WebSearchToolFilters {
@@ -3082,9 +3202,23 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
                     });
                 tools.push(rs::Tool::WebSearch(rs::WebSearchTool {
                     filters,
-                    ..Default::default()
+                    user_location: user_location.as_ref().map(|location| {
+                        rs::WebSearchApproximateLocation {
+                            r#type: rs::WebSearchApproximateLocationType::Approximate,
+                            city: location.city.clone(),
+                            country: location.country.clone(),
+                            region: location.region.clone(),
+                            timezone: location.timezone.clone(),
+                        }
+                    }),
+                    search_context_size: search_context_size.map(|size| match size {
+                        WebSearchContextSize::Low => rs::WebSearchToolSearchContextSize::Low,
+                        WebSearchContextSize::Medium => rs::WebSearchToolSearchContextSize::Medium,
+                        WebSearchContextSize::High => rs::WebSearchToolSearchContextSize::High,
+                    }),
                 }));
             }
+            HostedTool::WebSearch { .. } => {}
             // XSearch is xAI-specific — not in async_openai's rs::Tool enum.
             // Injected as raw JSON by the sampler client after serialization.
             HostedTool::XSearch => {}
@@ -3101,8 +3235,8 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
     tools
 }
 
-/// Return raw JSON tool definitions for xAI-specific hosted tools that
-/// cannot be represented by `async_openai`'s `rs::Tool` enum.
+/// Return raw JSON tool definitions for provider extensions that cannot be
+/// represented by `async_openai`'s `rs::Tool` enum.
 ///
 /// The sampler client injects these into the serialized request body's
 /// `tools` array before sending to the API.
@@ -3110,8 +3244,64 @@ pub fn extra_raw_tools(hosted_tools: &[HostedTool]) -> Vec<serde_json::Value> {
     let mut raw = Vec::new();
     for tool in hosted_tools {
         match tool {
-            // WebSearch is handled natively via rs::Tool::WebSearch in
-            // build_responses_tools() — no raw JSON injection needed.
+            HostedTool::WebSearch {
+                mode,
+                allowed_domains,
+                user_location,
+                search_context_size,
+                search_content_types,
+            } if tool.requires_raw_responses_tool() => {
+                let mut value = serde_json::json!({"type": "web_search"});
+                let object = value
+                    .as_object_mut()
+                    .expect("web-search tool literal must be an object");
+                if let Some(mode) = mode {
+                    match mode {
+                        WebSearchMode::Disabled => continue,
+                        WebSearchMode::Cached => {
+                            object.insert("external_web_access".into(), false.into());
+                        }
+                        WebSearchMode::Indexed => {
+                            object.insert("external_web_access".into(), true.into());
+                            object.insert("indexed_web_access".into(), true.into());
+                        }
+                        WebSearchMode::Live => {
+                            object.insert("external_web_access".into(), true.into());
+                        }
+                    }
+                }
+                if let Some(domains) = allowed_domains {
+                    object.insert(
+                        "filters".into(),
+                        serde_json::json!({"allowed_domains": domains}),
+                    );
+                }
+                if let Some(location) = user_location {
+                    let mut location_value = serde_json::json!({"type": "approximate"});
+                    let location_object = location_value
+                        .as_object_mut()
+                        .expect("web-search location literal must be an object");
+                    for (key, value) in [
+                        ("country", location.country.as_ref()),
+                        ("region", location.region.as_ref()),
+                        ("city", location.city.as_ref()),
+                        ("timezone", location.timezone.as_ref()),
+                    ] {
+                        if let Some(value) = value {
+                            location_object.insert(key.into(), value.clone().into());
+                        }
+                    }
+                    object.insert("user_location".into(), location_value);
+                }
+                if let Some(size) = search_context_size {
+                    object.insert("search_context_size".into(), size.as_wire_value().into());
+                }
+                if let Some(types) = search_content_types {
+                    object.insert("search_content_types".into(), serde_json::json!(types));
+                }
+                raw.push(value);
+            }
+            // The legacy xAI shape is represented natively by async-openai.
             HostedTool::WebSearch { .. } => {}
             HostedTool::XSearch => {
                 raw.push(serde_json::json!({"type": "x_search"}));
@@ -4800,9 +4990,7 @@ mod tests {
                     parameters: serde_json::json!({"type": "object"}),
                 },
             ]);
-        req.hosted_tools = vec![HostedTool::WebSearch {
-            allowed_domains: None,
-        }];
+        req.hosted_tools = vec![HostedTool::web_search(None)];
 
         let responses_req: rs::CreateResponse = (&req).into();
         let tools = responses_req.tools.expect("tools should be set");
@@ -4827,6 +5015,10 @@ mod tests {
             vec!["read_file"],
             "colliding function tool must be dropped"
         );
+        assert_eq!(
+            responses_req.include,
+            Some(vec![rs::IncludeEnum::WebSearchCallActionSources])
+        );
     }
 
     #[test]
@@ -4844,6 +5036,110 @@ mod tests {
         assert!(tools.is_empty(), "expected no tools, got: {tools:?}");
         let raw = extra_raw_tools(&req.hosted_tools);
         assert_eq!(raw, vec![serde_json::json!({"type": "x_search"})]);
+    }
+
+    #[test]
+    fn codex_hosted_tools_drop_x_search_and_use_live_web_contract() {
+        let tools = hosted_tools_for_provider(
+            &[
+                HostedTool::web_search(Some(vec!["example.com".to_string()])),
+                HostedTool::XSearch,
+            ],
+            crate::ModelProvider::Codex,
+        );
+
+        assert_eq!(tools.len(), 1, "x_search must never reach Codex");
+        assert_eq!(
+            extra_raw_tools(&tools),
+            vec![serde_json::json!({
+                "type": "web_search",
+                "external_web_access": true,
+                "filters": {"allowed_domains": ["example.com"]}
+            })]
+        );
+    }
+
+    #[test]
+    fn codex_disabled_web_search_emits_no_hosted_search_tools() {
+        let tools = hosted_tools_for_provider(
+            &[
+                HostedTool::WebSearch {
+                    mode: Some(WebSearchMode::Disabled),
+                    allowed_domains: None,
+                    user_location: None,
+                    search_context_size: None,
+                    search_content_types: None,
+                },
+                HostedTool::XSearch,
+            ],
+            crate::ModelProvider::Codex,
+        );
+
+        assert!(tools.is_empty());
+        assert!(extra_raw_tools(&tools).is_empty());
+    }
+
+    #[test]
+    fn xai_hosted_tools_keep_legacy_web_and_x_search_contract() {
+        let tools = hosted_tools_for_provider(
+            &[HostedTool::web_search(None), HostedTool::XSearch],
+            crate::ModelProvider::Xai,
+        );
+        assert_eq!(tools.len(), 2);
+        assert_eq!(
+            extra_raw_tools(&tools),
+            vec![serde_json::json!({"type": "x_search"})]
+        );
+
+        let mut request = ConversationRequest::from_items(vec![ConversationItem::user("hi")]);
+        request.hosted_tools = tools;
+        let wire = rs::CreateResponse::from(&request);
+        assert!(wire.tools.as_ref().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| matches!(tool, rs::Tool::WebSearch(_)))
+        }));
+        assert_eq!(
+            wire.include,
+            Some(vec![rs::IncludeEnum::WebSearchCallActionSources])
+        );
+    }
+
+    #[test]
+    fn codex_web_search_preserves_full_hosted_options() {
+        let tools = hosted_tools_for_provider(
+            &[HostedTool::WebSearch {
+                mode: Some(WebSearchMode::Indexed),
+                allowed_domains: Some(vec!["example.com".to_string()]),
+                user_location: Some(WebSearchUserLocation {
+                    country: Some("US".to_string()),
+                    city: Some("New York".to_string()),
+                    timezone: Some("America/New_York".to_string()),
+                    ..Default::default()
+                }),
+                search_context_size: Some(WebSearchContextSize::High),
+                search_content_types: Some(vec!["text".to_string(), "image".to_string()]),
+            }],
+            crate::ModelProvider::Codex,
+        );
+
+        assert_eq!(
+            extra_raw_tools(&tools),
+            vec![serde_json::json!({
+                "type": "web_search",
+                "external_web_access": true,
+                "indexed_web_access": true,
+                "filters": {"allowed_domains": ["example.com"]},
+                "user_location": {
+                    "type": "approximate",
+                    "country": "US",
+                    "city": "New York",
+                    "timezone": "America/New_York"
+                },
+                "search_context_size": "high",
+                "search_content_types": ["text", "image"]
+            })]
+        );
     }
 
     #[test]

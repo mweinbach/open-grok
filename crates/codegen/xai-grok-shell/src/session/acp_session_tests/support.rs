@@ -179,6 +179,7 @@ pub(crate) async fn create_test_actor_ex(
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider: Default::default(),
             extra_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(context_window)
                 .expect("test context_window must be non-zero"),

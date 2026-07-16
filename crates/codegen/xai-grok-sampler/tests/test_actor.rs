@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use axum::Router;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
 use axum::routing::post;
 use futures_util::stream::{self, StreamExt};
@@ -22,10 +23,11 @@ use tokio::sync::{mpsc, oneshot};
 
 use xai_grok_sampler::{
     ApiBackend, RequestId, RetryPolicy, SamplerActor, SamplerConfig, SamplingChannel,
-    SamplingErrorKind, SamplingEvent,
+    SamplingClient, SamplingErrorKind, SamplingEvent,
 };
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, UserItem,
+    ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, HostedTool, ModelProvider,
+    UserItem,
 };
 use xai_grok_test_support::{SseEvent, sse};
 
@@ -77,6 +79,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         temperature: None,
         top_p: None,
         api_backend: ApiBackend::ChatCompletions,
+        provider: Default::default(),
         auth_scheme: Default::default(),
         extra_headers: IndexMap::new(),
         context_window: 128_000,
@@ -774,6 +777,139 @@ fn responses_config(base_url: String, doom_loop: Option<DoomLoopRecoveryPolicy>)
     cfg.api_backend = ApiBackend::Responses;
     cfg.doom_loop_recovery = doom_loop;
     cfg
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
+    use std::sync::Mutex;
+
+    let captured: Arc<Mutex<Vec<(bool, HeaderMap, serde_json::Value)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(
+            move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_handler);
+                async move {
+                    let streaming = body
+                        .get("stream")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    captured.lock().unwrap().push((streaming, headers, body));
+
+                    let events = sse::responses_api_reasoning_and_text_events(
+                        "searched",
+                        "answer",
+                        "test-model",
+                    );
+                    if streaming {
+                        Sse::new(stream::iter(
+                            sse_events_to_axum(events)
+                                .into_iter()
+                                .map(Ok::<_, std::convert::Infallible>),
+                        ))
+                        .into_response()
+                    } else {
+                        let response = events
+                            .into_iter()
+                            .find_map(|event| {
+                                let payload =
+                                    serde_json::from_str::<serde_json::Value>(&event.data).ok()?;
+                                (payload.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("response.completed"))
+                                .then(|| payload["response"].clone())
+                            })
+                            .expect("test fixture must include a completed response");
+                        axum::Json(response).into_response()
+                    }
+                }
+            },
+        ),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let mut config = responses_config(server.base_url(), None);
+    config.provider = ModelProvider::Codex;
+    config.client_identifier = Some("must-not-leak".into());
+    config.client_version = Some("must-not-leak".into());
+    config.deployment_id = Some("must-not-leak".into());
+    config.user_id = Some("must-not-leak".into());
+    config.doom_loop_recovery = Some(DoomLoopRecoveryPolicy::default());
+    config
+        .extra_headers
+        .insert("originator".into(), "codex_cli_rs".into());
+
+    let codex_request = || {
+        let mut request = user_request("search the web");
+        request.hosted_tools = vec![HostedTool::web_search(None), HostedTool::XSearch];
+        request.x_grok_conv_id = Some("must-not-leak".into());
+        request.x_grok_req_id = Some("must-not-leak".into());
+        request.x_grok_session_id = Some("must-not-leak".into());
+        request.x_grok_turn_idx = Some("must-not-leak".into());
+        request.x_grok_agent_id = Some("must-not-leak".into());
+        request
+    };
+
+    let handle = SamplerActor::spawn(config.clone(), RetryPolicy::default(), event_tx);
+
+    handle
+        .submit_and_collect(
+            RequestId::from("req-codex-web-search-stream"),
+            codex_request(),
+        )
+        .await
+        .expect("streaming Codex hosted search request should complete");
+
+    SamplingClient::new(config)
+        .expect("Codex sampling client should construct")
+        .conversation_responses(codex_request())
+        .await
+        .expect("non-streaming Codex hosted search request should complete");
+    server.shutdown();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2, "expected one request per Responses path");
+    assert_eq!(
+        captured
+            .iter()
+            .map(|(streaming, _, _)| *streaming)
+            .collect::<Vec<_>>(),
+        vec![true, false],
+        "must exercise both streaming and non-streaming Responses paths"
+    );
+    for (streaming, headers, body) in captured.iter() {
+        let x_grok_headers = headers
+            .keys()
+            .filter(|name| name.as_str().starts_with("x-grok-"))
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            x_grok_headers.is_empty(),
+            "Codex Responses request (streaming={streaming}) leaked x-grok headers: {x_grok_headers:?}"
+        );
+        assert_eq!(
+            headers
+                .get("originator")
+                .and_then(|value| value.to_str().ok()),
+            Some("codex_cli_rs"),
+            "Codex provider headers must survive filtering"
+        );
+        assert_eq!(
+            body["tools"],
+            json!([{"type": "web_search", "external_web_access": true}])
+        );
+        assert!(
+            body["include"].as_array().is_some_and(|includes| includes
+                .iter()
+                .any(|include| { include.as_str() == Some("web_search_call.action.sources") })),
+            "Codex web search must request source URLs: {body}"
+        );
+        assert!(
+            !body.to_string().contains("x_search"),
+            "x_search must never be sent to Codex: {body}"
+        );
+    }
 }
 
 /// Server-reported doom-loop triggers flow through the actor rung onto the

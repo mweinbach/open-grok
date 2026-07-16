@@ -714,6 +714,64 @@ async fn reconstruct_full_config_no_bearer_resolver_for_api_key_method() {
         .await;
 }
 
+/// Remote-only model entries live in chat state but may be absent from the
+/// disk-backed model-facts resolver. Provider routing must follow chat state
+/// so Codex hosted tools, headers, and OAuth stay selected.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_full_config_uses_chat_state_provider_for_remote_only_codex_model() {
+    use crate::agent::auth_method::ModelByok;
+    use crate::agent::config::ModelAuthFacts;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("xai-session-token");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "codex-access-token".to_string(),
+            )
+            .await;
+
+            let mut chat_config = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has sampling config");
+            chat_config.provider = xai_grok_sampling_types::ModelProvider::Codex;
+            let model = chat_config.model.clone();
+            actor.chat_state_handle.update_sampling_config(chat_config);
+            actor.model_auth_facts.replace(Some((
+                model,
+                ModelAuthFacts {
+                    byok: ModelByok::NotByok,
+                    auth_scheme: Default::default(),
+                    // Simulate a disk resolver that cannot see the remote
+                    // catalog entry and therefore falls back to xAI.
+                    provider: xai_grok_sampling_types::ModelProvider::Xai,
+                },
+            )));
+
+            let reconstructed = actor.reconstruct_full_config().await;
+            assert_eq!(
+                reconstructed.provider,
+                xai_grok_sampling_types::ModelProvider::Codex
+            );
+            assert!(
+                reconstructed.bearer_resolver.is_some(),
+                "Codex session-token auth must retain its live OAuth resolver"
+            );
+            assert!(reconstructed.deployment_id.is_none());
+            assert!(reconstructed.user_id.is_none());
+            assert!(
+                reconstructed.attribution_callback.is_none(),
+                "OpenAI tokens must not flow into xAI auth attribution"
+            );
+        })
+        .await;
+}
+
 /// The pre-flight refresh heals a transiently-`ApiKey` session by writing the
 /// fresh session token back into `creds.api_key`.
 #[tokio::test(flavor = "current_thread")]

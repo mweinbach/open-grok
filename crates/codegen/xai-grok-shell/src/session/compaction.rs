@@ -189,12 +189,17 @@ impl SessionActor {
             let agent = self.agent.borrow();
             let use_backend_search =
                 agent.backend_search_enabled() && self.supports_backend_search.get();
+            let hosted_tools = if use_backend_search {
+                agent.hosted_tools().to_vec()
+            } else {
+                Vec::new()
+            };
             (
-                if use_backend_search {
-                    agent.hosted_tools().to_vec()
-                } else {
-                    Vec::new()
-                },
+                crate::session::code_mode::hosted_tools_for_code_mode(
+                    &hosted_tools,
+                    agent.tool_mode(),
+                    sampling_config.provider,
+                ),
                 agent.compaction_policy().wall_clock_budget_secs,
             )
         };
@@ -945,12 +950,19 @@ impl SessionActor {
             .into_iter()
             .map(xai_grok_sampling_types::ToolSpec::from)
             .collect();
-        let compaction_hosted_tools: Vec<xai_grok_sampling_types::HostedTool> =
-            if use_backend_search {
-                self.agent.borrow().hosted_tools().to_vec()
+        let compaction_hosted_tools: Vec<xai_grok_sampling_types::HostedTool> = {
+            let agent = self.agent.borrow();
+            let hosted_tools = if use_backend_search {
+                agent.hosted_tools().to_vec()
             } else {
                 Vec::new()
             };
+            crate::session::code_mode::hosted_tools_for_code_mode(
+                &hosted_tools,
+                agent.tool_mode(),
+                sampling_config.provider,
+            )
+        };
         tracing::info!(
             num_tools = compaction_tools.len(),
             tool_tokens = compaction_tool_tokens,
@@ -2184,6 +2196,7 @@ mod inline_auto_compact_flow_tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider: Default::default(),
                 extra_headers: Default::default(),
                 context_window: std::num::NonZeroU64::new(context_window)
                     .expect("test context_window must be non-zero"),

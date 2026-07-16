@@ -3315,6 +3315,7 @@ fn test_sampling_config(model_slug: &str) -> xai_grok_sampling_types::SamplingCo
         temperature: None,
         top_p: None,
         api_backend: Default::default(),
+        provider: Default::default(),
         extra_headers: Default::default(),
         context_window: NonZeroU64::new(256_000).expect("non-zero context window"),
         reasoning_effort: None,

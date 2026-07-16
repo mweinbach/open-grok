@@ -1908,6 +1908,12 @@ impl SessionActor {
         let mut prompt_timing = Some(crate::session::prompt_timing::PromptTiming::start());
         let tool_prep_start = std::time::Instant::now();
         let (tool_definitions, mcp_wait_ms) = self.prepare_tool_definitions_timed().await;
+        let model_provider = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|config| config.provider)
+            .unwrap_or_default();
         let tool_mode = self.agent.borrow().tool_mode();
         let code_mode_enabled = matches!(
             tool_mode,
@@ -2096,12 +2102,23 @@ impl SessionActor {
             if use_backend_search {
                 request.hosted_tools = self.agent.borrow().hosted_tools().to_vec();
             }
-            if code_mode_only {
-                request.hosted_tools.clear();
-            }
+            request.hosted_tools = crate::session::code_mode::hosted_tools_for_code_mode(
+                &request.hosted_tools,
+                tool_mode,
+                model_provider,
+            );
             if code_mode_enabled {
+                // Codex keeps provider-hosted web search at the top level in
+                // Code Mode. Do not also advertise the local web_search
+                // function inside the nested `exec` tool.
+                let code_mode_tool_definitions =
+                    crate::session::code_mode::nested_tool_definitions_for_provider(
+                        &tool_definitions,
+                        model_provider,
+                        &request.hosted_tools,
+                    );
                 request.add_client_tool(crate::session::code_mode::create_exec_tool(
-                    &tool_definitions,
+                    &code_mode_tool_definitions,
                     code_mode_only,
                 ));
             }

@@ -72,6 +72,17 @@ impl GrokRequestHeaders<'_> {
         }
         b
     }
+
+    fn apply_for_provider(
+        &self,
+        builder: reqwest::RequestBuilder,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> reqwest::RequestBuilder {
+        match provider {
+            xai_grok_sampling_types::ModelProvider::Xai => self.apply(builder),
+            xai_grok_sampling_types::ModelProvider::Codex => builder,
+        }
+    }
 }
 
 /// Parse the `Retry-After` response header as delta-seconds.
@@ -438,6 +449,7 @@ struct ClientDefaults {
     temperature: Option<f32>,
     top_p: Option<f32>,
     api_backend: ApiBackend,
+    provider: xai_grok_sampling_types::ModelProvider,
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
@@ -569,32 +581,34 @@ impl SamplingClient {
             headers.insert(header_name, header_value);
         }
 
-        // Add x-grok-client-version header for version gating at the proxy.
-        if let Some(client_version) = config.client_version.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(client_version)
-        {
-            headers.insert(
-                HeaderName::from_static("x-grok-client-version"),
-                header_value,
-            );
-        }
+        // x-grok-* headers are private xAI proxy metadata and must never be
+        // synthesized for the Codex Responses endpoint. Explicit provider
+        // headers (for example `originator`) still flow through extra_headers.
+        if config.provider != xai_grok_sampling_types::ModelProvider::Codex {
+            if let Some(client_version) = config.client_version.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(client_version)
+            {
+                headers.insert(
+                    HeaderName::from_static("x-grok-client-version"),
+                    header_value,
+                );
+            }
 
-        if let Some(deployment_id) = config.deployment_id.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(deployment_id)
-        {
-            headers.insert(
-                HeaderName::from_static("x-grok-deployment-id"),
-                header_value,
-            );
-        }
+            if let Some(deployment_id) = config.deployment_id.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(deployment_id)
+            {
+                headers.insert(
+                    HeaderName::from_static("x-grok-deployment-id"),
+                    header_value,
+                );
+            }
 
-        if let Some(user_id) = config.user_id.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(user_id)
-        {
-            headers.insert(HeaderName::from_static("x-grok-user-id"), header_value);
-        }
+            if let Some(user_id) = config.user_id.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(user_id)
+            {
+                headers.insert(HeaderName::from_static("x-grok-user-id"), header_value);
+            }
 
-        {
             let client_id = config
                 .client_identifier
                 .clone()
@@ -650,6 +664,7 @@ impl SamplingClient {
             temperature: config.temperature,
             top_p: config.top_p,
             api_backend: config.api_backend,
+            provider: config.provider,
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
             doom_loop_recovery: config.doom_loop_recovery,
@@ -987,7 +1002,10 @@ impl SamplingClient {
             user_id: payload.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
+            .apply_for_provider(
+                self.post(self.endpoint("chat/completions")),
+                self.defaults.provider,
+            )
             .json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1045,7 +1063,10 @@ impl SamplingClient {
             user_id: payload.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
+            .apply_for_provider(
+                self.post(self.endpoint("chat/completions")),
+                self.defaults.provider,
+            )
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&streaming_request);
 
@@ -1262,6 +1283,14 @@ impl SamplingClient {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
+        let extra_raw_tools = std::mem::take(&mut request.extra_raw_tools);
+        if !extra_raw_tools.is_empty() {
+            if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                tools.extend(extra_raw_tools);
+            } else {
+                request_body["tools"] = serde_json::Value::Array(extra_raw_tools);
+            }
+        }
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
         // it in post-serialize. This is the last surviving piece of the
@@ -1273,7 +1302,10 @@ impl SamplingClient {
             &request.original_detail_custom_output_images,
         );
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
+            .apply_for_provider(
+                self.post(self.endpoint("responses")),
+                self.defaults.provider,
+            )
             .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1345,11 +1377,11 @@ impl SamplingClient {
     ///
     /// The third tuple element is a per-request doom-loop signal collector,
     /// `Some` only when `SamplerConfig::doom_loop_recovery` is set — the same
-    /// gate that adds the opt-in `x-grok-doom-loop-check` request header, so
-    /// header and parse protection cannot drift apart. It is filled by the
-    /// SSE decoder as the server reports triggers and is meant to be handed
-    /// to `stream_responses` so the signals land on the final
-    /// `ConversationResponse`.
+    /// gate that adds the xAI-only `x-grok-doom-loop-check` request header.
+    /// Codex still gets an isolated collector but never receives the xAI
+    /// header. The collector is filled by the SSE decoder as the server
+    /// reports triggers and is meant to be handed to `stream_responses` so
+    /// the signals land on the final `ConversationResponse`.
     #[tracing::instrument(
         name = "http.create_response_stream",
         skip_all,
@@ -1407,8 +1439,8 @@ impl SamplingClient {
         if self.defaults.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
-        // Inject xAI-specific tools (e.g., x_search) that can't be expressed
-        // via async_openai's rs::Tool enum.
+        // Inject provider extensions (e.g., x_search and Codex web-search
+        // access modes) that async-openai's rs::Tool enum cannot express.
         if !extra_raw_tools.is_empty() {
             if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
                 tools.extend(extra_raw_tools);
@@ -1423,15 +1455,20 @@ impl SamplingClient {
             &request.original_detail_custom_output_images,
         );
         // Fresh per attempt so signals never leak across retries; `None`
-        // (check disabled) sends no header and does no peek work per event.
+        // disables collection. The opt-in wire header is xAI-only below.
         let doom_loop = self
             .defaults
             .doom_loop_recovery
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
         let mut http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
+            .apply_for_provider(
+                self.post(self.endpoint("responses")),
+                self.defaults.provider,
+            )
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        if doom_loop.is_some() {
+        if doom_loop.is_some()
+            && self.defaults.provider != xai_grok_sampling_types::ModelProvider::Codex
+        {
             // Presence opts in; the server ignores the value.
             http_request = http_request.header(DOOM_LOOP_CHECK_HEADER, "true");
         }
@@ -1636,7 +1673,7 @@ impl SamplingClient {
             user_id: request.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
+            .apply_for_provider(self.post(self.endpoint("messages")), self.defaults.provider)
             .json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1752,7 +1789,7 @@ impl SamplingClient {
             user_id: request.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
+            .apply_for_provider(self.post(self.endpoint("messages")), self.defaults.provider)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&request.inner);
 
@@ -1973,6 +2010,10 @@ impl SamplingClient {
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+        request.hosted_tools = xai_grok_sampling_types::hosted_tools_for_provider(
+            &request.hosted_tools,
+            self.defaults.provider,
+        );
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -1981,8 +2022,8 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
-        // Collect xAI-specific tools that can't be expressed via rs::Tool
-        // (e.g., x_search). These are injected as raw JSON after serialization.
+        // Collect provider extensions that cannot be expressed via rs::Tool.
+        // They are injected as raw JSON after serialization.
         let extra_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
         let named_custom_tool_outputs = request.named_custom_tool_outputs();
         let mut original_detail_custom_output_images =
@@ -2017,6 +2058,10 @@ impl SamplingClient {
         mut request: ConversationRequest,
     ) -> Result<rs::Response> {
         self.apply_conversation_defaults(&mut request)?;
+        request.hosted_tools = xai_grok_sampling_types::hosted_tools_for_provider(
+            &request.hosted_tools,
+            self.defaults.provider,
+        );
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -2024,6 +2069,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
+        let extra_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
         let named_custom_tool_outputs = request.named_custom_tool_outputs();
         let mut original_detail_custom_output_images =
             request.original_detail_custom_output_images();
@@ -2038,6 +2084,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
+        wrapper.extra_raw_tools = extra_tools;
         wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
         wrapper.original_detail_custom_output_images = original_detail_custom_output_images;
 
@@ -2167,6 +2214,7 @@ impl SamplingClient {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+    use xai_grok_sampling_types::ModelProvider;
     use xai_grok_sampling_types::types::ChatRequestMessage;
 
     fn minimal_config() -> SamplerConfig {
@@ -2178,6 +2226,7 @@ mod tests {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::ChatCompletions,
+            provider: Default::default(),
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
             context_window: 8192,
@@ -2350,6 +2399,85 @@ mod tests {
         cfg.extra_headers
             .insert("x-XAI-token-auth".to_string(), "xai-grok-cli".to_string());
         let _client = SamplingClient::new(cfg).expect("client with extra headers should construct");
+    }
+
+    #[test]
+    fn codex_omits_synthesized_x_grok_headers_but_keeps_provider_headers() {
+        let mut cfg = minimal_config();
+        cfg.provider = xai_grok_sampling_types::ModelProvider::Codex;
+        cfg.client_identifier = Some("must-not-leak".to_string());
+        cfg.client_version = Some("must-not-leak".to_string());
+        cfg.deployment_id = Some("must-not-leak".to_string());
+        cfg.user_id = Some("must-not-leak".to_string());
+        cfg.extra_headers
+            .insert("originator".to_string(), "codex_cli_rs".to_string());
+
+        let client = SamplingClient::new(cfg).expect("Codex client should construct");
+        assert!(
+            client
+                .default_headers
+                .keys()
+                .all(|name| !name.as_str().starts_with("x-grok-")),
+            "Codex client must not synthesize x-grok headers: {:?}",
+            client.default_headers
+        );
+        assert_eq!(
+            client
+                .default_headers
+                .get("originator")
+                .and_then(|value| value.to_str().ok()),
+            Some("codex_cli_rs")
+        );
+    }
+
+    #[test]
+    fn grok_request_headers_are_xai_only() {
+        let headers = GrokRequestHeaders {
+            conv_id: "conv-1",
+            req_id: "req-1",
+            model_id: "model-1",
+            session_id: "session-1",
+            turn_idx: Some("7"),
+            agent_id: "agent-1",
+            deployment_id: Some("deployment-1"),
+            user_id: Some("user-1"),
+        };
+        let http = reqwest::Client::new();
+        let xai = headers
+            .apply_for_provider(http.post("https://example.test"), ModelProvider::Xai)
+            .build()
+            .expect("xAI request should build");
+        for (name, value) in [
+            ("x-grok-conv-id", "conv-1"),
+            ("x-grok-req-id", "req-1"),
+            ("x-grok-model-override", "model-1"),
+            ("x-grok-session-id", "session-1"),
+            ("x-grok-turn-idx", "7"),
+            ("x-grok-agent-id", "agent-1"),
+            ("x-grok-deployment-id", "deployment-1"),
+            ("x-grok-user-id", "user-1"),
+        ] {
+            assert_eq!(
+                xai.headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok()),
+                Some(value),
+                "missing xAI tracking header {name}"
+            );
+        }
+
+        let codex = headers
+            .apply_for_provider(http.post("https://example.test"), ModelProvider::Codex)
+            .build()
+            .expect("Codex request should build");
+        assert!(
+            codex
+                .headers()
+                .keys()
+                .all(|name| !name.as_str().starts_with("x-grok-")),
+            "Codex must not receive any x-grok tracking headers: {:?}",
+            codex.headers()
+        );
     }
 
     #[test]
