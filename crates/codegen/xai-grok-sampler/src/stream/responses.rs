@@ -143,6 +143,12 @@ pub fn stream_responses_with_client_custom_tools<'a>(
         let mut first_token_emitted = false;
         let mut reasoning_text_acc = String::new();
         let mut reasoning_summary_parts: BTreeMap<(u32, String, u32), String> = BTreeMap::new();
+        // Codex treats `response.output_item.done` as the durable output
+        // carrier. Its terminal `response.completed` frame can contain only
+        // response metadata and usage, with an empty `response.output`.
+        // Retain the finished items so encrypted reasoning, messages, and
+        // complete tool calls survive conversion below.
+        let mut completed_output_items: BTreeMap<u32, rs::OutputItem> = BTreeMap::new();
         let mut last_content_chunk_at = Instant::now();
 
         // Maps Responses API `output_index` to our tool-only `tool_index`.
@@ -485,6 +491,8 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                 // For WebSearchCall this includes the query and source URLs.
                 // For CustomToolCall this includes x_search results.
                 ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
+                    completed_output_items
+                        .insert(done_event.output_index, done_event.item.clone());
                     match &done_event.item {
                         rs::OutputItem::WebSearchCall(ws) => {
                             let was_started = backend_output_started.contains(&done_event.output_index)
@@ -611,6 +619,15 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                 return;
             }
         };
+
+        // Normal xAI/Responses streams include the full output on the
+        // terminal response. Keep that authoritative when present; otherwise
+        // reconstruct the Codex response from its ordered done items. Never
+        // merge both representations, which would duplicate messages and
+        // tool calls.
+        if response.output.is_empty() && !completed_output_items.is_empty() {
+            response.output = completed_output_items.into_values().collect();
+        }
 
         // Billing fields (`prompt_tokens`, `completion_tokens`,
         // `cached_prompt_tokens`, `reasoning_tokens`) are the cumulative
@@ -859,6 +876,32 @@ mod tests {
         })
     }
 
+    fn output_item_done_event(
+        output_index: u32,
+        item: rs_types::OutputItem,
+    ) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputItemDone(rs_types::ResponseOutputItemDoneEvent {
+            sequence_number: u64::from(output_index),
+            output_index,
+            item,
+        })
+    }
+
+    fn assistant_message_output(id: &str, text: &str) -> rs_types::OutputItem {
+        serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "id": id,
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": text,
+                "annotations": []
+            }]
+        }))
+        .expect("valid assistant message output")
+    }
+
     async fn collect(s: impl Stream<Item = SamplingEvent>) -> Vec<SamplingEvent> {
         let mut out = Vec::new();
         let mut s = pin!(s);
@@ -1072,6 +1115,105 @@ mod tests {
             _ => None,
         });
         assert_eq!(summary, Some("Done-only summary"));
+    }
+
+    #[tokio::test]
+    async fn output_item_done_reconstructs_metadata_only_codex_completion() {
+        let raw = stream::iter(vec![
+            Ok(reasoning_summary_delta_event_for(
+                0,
+                "reasoning-durable",
+                0,
+                "Visible summary",
+            )),
+            Ok(text_delta_event("Durable answer")),
+            Ok(output_item_done_event(
+                0,
+                empty_reasoning_output("reasoning-durable"),
+            )),
+            Ok(output_item_done_event(
+                1,
+                assistant_message_output("message-durable", "Durable answer"),
+            )),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let streamed = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ChannelToken { channel, text, .. } => {
+                    Some((channel.clone(), text.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            streamed,
+            vec![
+                (SamplingChannel::Reasoning, "Visible summary"),
+                (SamplingChannel::Text, "Durable answer"),
+            ],
+            "done items must not emit a second set of live tokens",
+        );
+
+        let SamplingEvent::Completed { response, .. } = events.last().unwrap() else {
+            panic!("expected completed response, got {:?}", events.last());
+        };
+        assert_eq!(response.items.len(), 2);
+        let ConversationItem::Reasoning(reasoning) = &response.items[0] else {
+            panic!("expected durable reasoning item");
+        };
+        assert_eq!(
+            reasoning.encrypted_content.as_deref(),
+            Some("encrypted-reasoning-durable")
+        );
+        let rs::SummaryPart::SummaryText(summary) = &reasoning.summary[0];
+        assert_eq!(summary.text, "Visible summary");
+        let ConversationItem::Assistant(assistant) = &response.items[1] else {
+            panic!("expected durable assistant message");
+        };
+        assert_eq!(assistant.content.as_ref(), "Durable answer");
+    }
+
+    #[tokio::test]
+    async fn terminal_output_remains_authoritative_over_done_items() {
+        let raw = stream::iter(vec![
+            Ok(output_item_done_event(
+                0,
+                assistant_message_output("message-done", "from done item"),
+            )),
+            Ok(completed_event_with_output(vec![assistant_message_output(
+                "message-terminal",
+                "from terminal response",
+            )])),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let SamplingEvent::Completed { response, .. } = events.last().unwrap() else {
+            panic!("expected completed response, got {:?}", events.last());
+        };
+        assert_eq!(response.items.len(), 1);
+        let ConversationItem::Assistant(assistant) = &response.items[0] else {
+            panic!("expected terminal assistant message");
+        };
+        assert_eq!(assistant.content.as_ref(), "from terminal response");
     }
 
     #[tokio::test]
@@ -1309,6 +1451,51 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn output_item_done_preserves_complete_codex_function_call() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(function_call_added_event(0, "call_complete", "do_thing")),
+            Ok(function_call_args_delta_event(0, "{\"x\":")),
+            Ok(function_call_args_delta_event(0, "1}")),
+            Ok(output_item_done_event(
+                0,
+                rs_types::OutputItem::FunctionCall(rs_types::FunctionToolCall {
+                    arguments: "{\"x\":1}".into(),
+                    call_id: "call_complete".into(),
+                    name: "do_thing".into(),
+                    id: Some("fc_complete".into()),
+                    status: Some(rs_types::OutputStatus::Completed),
+                }),
+            )),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        assert_eq!(tool_call_deltas(&evs).len(), 3);
+        let SamplingEvent::Completed { response, .. } = evs.last().unwrap() else {
+            panic!("expected completed response");
+        };
+        assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+        let ConversationItem::Assistant(assistant) = response.items.last().unwrap() else {
+            panic!("expected trailing assistant");
+        };
+        let call = assistant
+            .tool_calls
+            .first()
+            .expect("complete function call");
+        assert_eq!(call.call_id(), "call_complete");
+        assert_eq!(call.name, "do_thing");
+        assert_eq!(call.arguments.as_ref(), "{\"x\":1}");
     }
 
     #[tokio::test]
