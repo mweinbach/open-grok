@@ -60,10 +60,11 @@ if ! file "$rg_path" | grep -q 'arm64'; then
     echo "Error: the bundled ripgrep executable is not arm64: $rg_path" >&2
     exit 1
 fi
-rg_version="$("$rg_path" --version | sed -n '1p')"
+rg_version_line="$("$rg_path" --version | sed -n '1p')"
+rg_version="$(printf '%s\n' "$rg_version_line" | awk '{ print $1 " " $2 }')"
 if [[ "$rg_version" != "$expected_rg_version" ]]; then
     echo "Error: release builds require ${expected_rg_version}." >&2
-    echo "Found '${rg_version}' at $rg_path" >&2
+    echo "Found '${rg_version_line}' at $rg_path" >&2
     echo "Set GROK_TOOLS_BUNDLE_RG_PATH to a verified ripgrep 15.0.0 arm64 binary." >&2
     exit 1
 fi
