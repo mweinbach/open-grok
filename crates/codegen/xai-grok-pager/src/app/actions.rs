@@ -635,7 +635,11 @@ pub enum Action {
     LogoutCodex,
     /// Log out and immediately start a new login flow.
     SwitchAccount,
-    /// User pressed login on the welcome screen.
+    /// Open the provider picker for a bare `/login` command.
+    OpenLoginProviderPicker,
+    /// Open Settings directly in the secure Kimi API-key editor.
+    OpenKimiApiKeyEditor,
+    /// Start the concrete xAI login flow (welcome screen, picker, or re-auth).
     Login,
     /// Connect the independent OpenAI Codex OAuth account in the browser.
     LoginCodex,

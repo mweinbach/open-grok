@@ -463,18 +463,50 @@ mod tests {
         logout::LogoutCommand.run(&mut ctx, args)
     }
     #[test]
-    fn login_bare_preserves_xai_flow() {
+    fn login_bare_opens_provider_picker() {
         assert!(matches!(
             run_login(""),
-            CommandResult::Action(Action::Login)
+            CommandResult::Action(Action::OpenLoginProviderPicker)
         ));
     }
     #[test]
+    fn login_xai_selects_existing_oauth_flow() {
+        for provider in [" xai ", "grok"] {
+            assert!(matches!(
+                run_login(provider),
+                CommandResult::Action(Action::Login)
+            ));
+        }
+    }
+    #[test]
     fn login_codex_selects_independent_oauth_flow() {
-        assert!(matches!(
-            run_login(" codex "),
-            CommandResult::Action(Action::LoginCodex)
-        ));
+        for provider in [" codex ", "openai", "chatgpt"] {
+            assert!(matches!(
+                run_login(provider),
+                CommandResult::Action(Action::LoginCodex)
+            ));
+        }
+    }
+    #[test]
+    fn login_kimi_selects_secure_api_key_editor() {
+        for provider in [" kimi ", "moonshot"] {
+            assert!(matches!(
+                run_login(provider),
+                CommandResult::Action(Action::OpenKimiApiKeyEditor)
+            ));
+        }
+    }
+    #[test]
+    fn login_provider_picker_lists_xai_codex_and_kimi_with_status() {
+        let items = login::provider_items(Some(crate::settings::SecretStatus::Stored));
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.insert_text.as_str())
+                .collect::<Vec<_>>(),
+            ["xai", "codex", "kimi"]
+        );
+        assert_eq!(items[2].description, "API key · stored in UI");
     }
     #[test]
     fn logout_bare_preserves_xai_flow() {

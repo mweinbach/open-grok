@@ -588,6 +588,84 @@ fn dispatch_open_settings_opens_then_close_on_reentry() {
         );
     }
 }
+
+#[test]
+fn dispatch_open_kimi_api_key_editor_uses_secure_focused_settings_mode() {
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::{SettingsEntryPoint, SettingsModalMode};
+
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::OpenKimiApiKeyEditor, &mut app);
+
+    assert!(effects.is_empty());
+    let Some(ActiveModal::Settings { state }) = app.agents[&AgentId(0)].active_modal.as_ref()
+    else {
+        panic!("/login kimi should open the Settings credential editor");
+    };
+    assert_eq!(state.entry_point, SettingsEntryPoint::ProviderLogin);
+    assert!(matches!(
+        state.mode,
+        SettingsModalMode::EditingSecret {
+            key: "kimi_api_key",
+            ref buffer,
+            cursor_byte: 0,
+            validation_error: None,
+        } if buffer.is_empty()
+    ));
+}
+
+#[test]
+fn dashboard_kimi_login_uses_secure_focused_settings_mode() {
+    use crate::views::settings_modal::{SettingsEntryPoint, SettingsModalMode};
+
+    let mut app = test_app_with_agent();
+    app.dashboard = Some(crate::views::dashboard::DashboardState::new());
+    app.active_view = ActiveView::AgentDashboard;
+
+    let effects = dispatch(Action::OpenKimiApiKeyEditor, &mut app);
+
+    assert!(effects.is_empty());
+    assert_eq!(app.active_view, ActiveView::AgentDashboard);
+    let state = app
+        .dashboard
+        .as_ref()
+        .and_then(|dashboard| dashboard.settings_modal.as_deref())
+        .expect("dashboard /login kimi should open the Settings credential editor");
+    assert_eq!(state.entry_point, SettingsEntryPoint::ProviderLogin);
+    assert!(matches!(
+        state.mode,
+        SettingsModalMode::EditingSecret {
+            key: "kimi_api_key",
+            ref buffer,
+            cursor_byte: 0,
+            validation_error: None,
+        } if buffer.is_empty()
+    ));
+}
+
+#[test]
+fn attached_dashboard_kimi_login_opens_editor_on_visible_agent() {
+    use crate::views::modal::ActiveModal;
+
+    let mut app = test_app_with_agent();
+    let mut dashboard = crate::views::dashboard::DashboardState::new();
+    dashboard.attached_agent = Some(AgentId(0));
+    app.dashboard = Some(dashboard);
+    app.active_view = ActiveView::AgentDashboard;
+
+    let effects = dispatch(Action::OpenKimiApiKeyEditor, &mut app);
+
+    assert!(effects.is_empty());
+    assert!(matches!(
+        app.agents[&AgentId(0)].active_modal,
+        Some(ActiveModal::Settings { .. })
+    ));
+    assert!(
+        app.dashboard
+            .as_ref()
+            .is_some_and(|dashboard| dashboard.settings_modal.is_none())
+    );
+}
 /// `dispatch_open_reset_confirm` moves the Settings modal state
 /// into the new `ResetSettingsConfirm` variant, preserving it
 /// across the confirm dialog's lifecycle. The dispatch arm is

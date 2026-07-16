@@ -2313,6 +2313,20 @@ impl AppView {
         ev: &mut Event,
         paste_provenance: PasteProvenance,
     ) -> InputOutcome {
+        if let Event::Paste(text) = ev
+            && matches!(self.active_view, ActiveView::AgentDashboard)
+            && self
+                .dashboard
+                .as_ref()
+                .is_some_and(|dashboard| dashboard.settings_secret_editor_active())
+        {
+            let pasted = crate::settings::SecretInput::new(std::mem::take(text));
+            return self
+                .dashboard
+                .as_mut()
+                .expect("dashboard secret paste target disappeared during synchronous routing")
+                .handle_settings_secret_paste(pasted);
+        }
         let target_agent = match self.active_view {
             ActiveView::Agent(agent_id) => Some(agent_id),
             ActiveView::AgentDashboard => self
@@ -2496,7 +2510,12 @@ impl AppView {
                     .dashboard
                     .as_ref()
                     .is_some_and(|d| d.attached_agent == Some(id));
-                if !overlay_active
+                let login_or_secret_modal_active = self
+                    .agents
+                    .get(&id)
+                    .is_some_and(|agent| agent.login_or_secret_modal_active());
+                if !login_or_secret_modal_active
+                    && !overlay_active
                     && let Event::Key(key) = ev
                     && key.kind != KeyEventKind::Release
                 {
@@ -2513,7 +2532,7 @@ impl AppView {
                         _ => {}
                     }
                 }
-                if overlay_active {
+                if overlay_active && !login_or_secret_modal_active {
                     if let Event::Key(key) = ev
                         && key.kind != KeyEventKind::Release
                     {
@@ -2679,6 +2698,12 @@ impl AppView {
                             agent.record_input(key, &outcome);
                         }
                         self.pending_effects.append(&mut agent.pending_effects);
+                        if login_or_secret_modal_active {
+                            // Provider selection and credential entry consume
+                            // even unhandled keys. Do not let Ctrl+\, Ctrl+C,
+                            // or another global shortcut hide a secret draft.
+                            return outcome;
+                        }
                         outcome
                     }
                     None => InputOutcome::Unchanged,
@@ -2688,6 +2713,23 @@ impl AppView {
                 if let Some(outcome) = self.voice_esc_outcome(key_event) {
                     return outcome;
                 }
+                // A dashboard-hosted credential editor owns input before any
+                // legacy attached-agent overlay. This prevents typed key
+                // bytes from reaching the agent prompt or its input recorder.
+                if self
+                    .dashboard
+                    .as_ref()
+                    .is_some_and(|dashboard| dashboard.settings_modal.is_some())
+                    && let Some(dashboard) = self.dashboard.as_mut()
+                {
+                    let outcome = dashboard.handle_input_with_paste_provenance(
+                        ev,
+                        &self.registry,
+                        paste_provenance,
+                    );
+                    self.pending_effects.append(&mut dashboard.pending_effects);
+                    return outcome;
+                }
                 let attached_raw = self.dashboard.as_ref().and_then(|d| d.attached_agent);
                 let attached = attached_raw.filter(|id| self.agents.contains_key(id));
                 if attached_raw.is_some()
@@ -2695,6 +2737,24 @@ impl AppView {
                     && let Some(d) = self.dashboard.as_mut()
                 {
                     d.close_popup();
+                }
+                if let Some(agent_id) = attached
+                    && self
+                        .agents
+                        .get(&agent_id)
+                        .is_some_and(|agent| agent.login_or_secret_modal_active())
+                {
+                    let agent = self
+                        .agents
+                        .get_mut(&agent_id)
+                        .expect("attached provider modal target disappeared");
+                    let secret_input = agent.settings_secret_editor_active();
+                    let outcome = agent.handle_input(ev, &self.registry);
+                    if !secret_input && let Event::Key(key) = ev {
+                        agent.record_input(key, &outcome);
+                    }
+                    self.pending_effects.append(&mut agent.pending_effects);
+                    return outcome;
                 }
                 if let Some(agent_id) = attached {
                     if let Event::Key(key) = ev
@@ -4579,6 +4639,19 @@ impl AppView {
                                 } else {
                                     (None, None, None)
                                 };
+                            let dashboard_settings_open = dashboard.settings_modal.is_some();
+                            if let Some(settings) = dashboard.settings_modal.as_mut() {
+                                // Paint after the optional attached-agent popup
+                                // so a session-less provider credential editor
+                                // remains the topmost interactive surface.
+                                crate::views::settings_modal::render_settings_modal(
+                                    f.buffer_mut(),
+                                    view_area,
+                                    settings,
+                                    compact,
+                                    None,
+                                );
+                            }
                             let stale_clears =
                                 Self::dashboard_stale_image_clears(agents, drawn_popup_agent);
                             let popup_post_flush =
@@ -4589,7 +4662,9 @@ impl AppView {
                             if let Some(panel) = &scroll_debug_panel {
                                 panel.render(full_area, f.buffer_mut());
                             }
-                            let cursor = if dashboard.attached_agent.is_some() {
+                            let cursor = if dashboard_settings_open {
+                                None
+                            } else if dashboard.attached_agent.is_some() {
                                 popup_cursor
                             } else {
                                 dash_cursor
@@ -4723,7 +4798,13 @@ impl AppView {
             || self.welcome_doc_viewer.is_some()
             || matches!(
                 self.active_view, ActiveView::AgentDashboard if self.dashboard.as_ref()
-                .is_some_and(| d | d.shortcuts_modal.is_some())
+                .is_some_and(| d | {
+                    d.shortcuts_modal.is_some()
+                        || d.settings_modal.is_some()
+                        || d.attached_agent
+                            .and_then(|id| self.agents.get(&id))
+                            .is_some_and(|agent| agent.login_or_secret_modal_active())
+                })
             )
             || cloud_modal_open
     }
@@ -5736,6 +5817,51 @@ pub(crate) mod tests {
             crate::views::settings_modal::SettingsModalMode::EditingSecret { buffer, .. }
                 if buffer.expose() == "sk-owned-secret"
         ));
+    }
+    #[test]
+    fn dashboard_owned_secret_paste_moves_text_out_of_terminal_event() {
+        let mut app = test_app();
+        app.active_view = ActiveView::AgentDashboard;
+        let mut dashboard = crate::views::dashboard::DashboardState::new();
+        let mut settings = crate::views::settings_modal::SettingsModalState::new(
+            app.settings_registry.clone(),
+            app.current_ui.clone(),
+            crate::settings::PagerLocalSnapshot::default(),
+        );
+        settings.mode = crate::views::settings_modal::SettingsModalMode::EditingSecret {
+            key: "kimi_api_key",
+            buffer: crate::settings::SecretInput::default(),
+            cursor_byte: 0,
+            validation_error: None,
+        };
+        dashboard.settings_modal = Some(Box::new(settings));
+        app.dashboard = Some(dashboard);
+
+        let mut event = Event::Paste("sk-dashboard-secret".to_owned());
+        let outcome =
+            app.handle_owned_input_with_paste_provenance(&mut event, PasteProvenance::Terminal);
+
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(matches!(&event, Event::Paste(text) if text.is_empty()));
+        let state = app
+            .dashboard
+            .as_ref()
+            .and_then(|dashboard| dashboard.settings_modal.as_deref())
+            .expect("dashboard Settings modal should remain open");
+        assert!(matches!(
+            &state.mode,
+            crate::views::settings_modal::SettingsModalMode::EditingSecret { buffer, .. }
+                if buffer.expose() == "sk-dashboard-secret"
+        ));
+
+        let close = app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(close, InputOutcome::Changed));
+        assert!(
+            app.dashboard
+                .as_ref()
+                .is_some_and(|dashboard| dashboard.settings_modal.is_none()),
+            "Esc should drop and zeroize the dashboard credential draft"
+        );
     }
     #[test]
     fn dashboard_x11_primary_provenance_bypasses_unrelated_clipboard_image() {
@@ -9344,6 +9470,54 @@ pub(crate) mod tests {
             "wheel must not reach the background scroll path while the cheatsheet is open",
         );
     }
+    #[test]
+    fn dashboard_settings_modal_is_scroll_blocking() {
+        let mut app = test_app();
+        app.active_view = ActiveView::AgentDashboard;
+        let mut dashboard = crate::views::dashboard::DashboardState::new();
+        dashboard.settings_modal = Some(Box::new(
+            crate::views::settings_modal::SettingsModalState::new(
+                app.settings_registry.clone(),
+                app.current_ui.clone(),
+                crate::settings::PagerLocalSnapshot::default(),
+            ),
+        ));
+        app.dashboard = Some(dashboard);
+
+        assert!(app.is_scroll_blocking_modal_open());
+        let _ = app.handle_input(&scroll_event(MouseEventKind::ScrollDown, 42, 17));
+        assert!(
+            app.last_scroll_pos.is_none(),
+            "wheel must not reach dashboard background scroll while Settings is open",
+        );
+    }
+    #[test]
+    fn attached_dashboard_provider_secret_editor_is_scroll_blocking() {
+        let mut app = test_app_with_agent();
+        let id = super::super::agent::AgentId(0);
+        app.active_view = ActiveView::AgentDashboard;
+        let mut dashboard = crate::views::dashboard::DashboardState::new();
+        dashboard.attached_agent = Some(id);
+        app.dashboard = Some(dashboard);
+        let mut settings = crate::views::settings_modal::SettingsModalState::new(
+            app.settings_registry.clone(),
+            app.current_ui.clone(),
+            crate::settings::PagerLocalSnapshot::default(),
+        );
+        assert!(settings.try_open_provider_login_secret("kimi_api_key"));
+        app.agents.get_mut(&id).unwrap().active_modal =
+            Some(crate::views::modal::ActiveModal::Settings {
+                state: Box::new(settings),
+            });
+
+        assert!(app.is_scroll_blocking_modal_open());
+        let _ = app.handle_input(&scroll_event(MouseEventKind::ScrollDown, 42, 17));
+        assert!(
+            app.last_scroll_pos.is_none(),
+            "wheel must route to the attached credential modal, not background scroll",
+        );
+        assert!(app.agents[&id].login_or_secret_modal_active());
+    }
     /// Ctrl+C on the session-less dashboard arms the quit confirmation
     /// (like the agent view) and a second press confirms. Regression for
     /// "Ctrl+C/D/Q do nothing on the dashboard prompt".
@@ -9777,6 +9951,45 @@ pub(crate) mod tests {
             d.attached_agent = Some(id);
         }
         (app, id)
+    }
+    #[test]
+    fn overlay_provider_secret_editor_owns_cycle_and_exit_shortcuts() {
+        let (mut app, id) = neutral_overlay_app();
+        let mut settings = crate::views::settings_modal::SettingsModalState::new(
+            app.settings_registry.clone(),
+            app.current_ui.clone(),
+            crate::settings::PagerLocalSnapshot::default(),
+        );
+        assert!(settings.try_open_provider_login_secret("kimi_api_key"));
+        app.agents.get_mut(&id).unwrap().active_modal =
+            Some(crate::views::modal::ActiveModal::Settings {
+                state: Box::new(settings),
+            });
+
+        for key in [
+            key_event(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            key_event(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+        ] {
+            let outcome = app.handle_input(&key);
+            assert!(
+                matches!(outcome, InputOutcome::Unchanged),
+                "provider secret editor must consume overlay/global shortcut, got {outcome:?}",
+            );
+            assert!(app.agents[&id].login_or_secret_modal_active());
+        }
+
+        let typed = app.handle_input(&key_event(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(matches!(typed, InputOutcome::Changed));
+        let Some(crate::views::modal::ActiveModal::Settings { state }) =
+            app.agents[&id].active_modal.as_ref()
+        else {
+            panic!("provider Settings modal should remain open");
+        };
+        assert!(matches!(
+            &state.mode,
+            crate::views::settings_modal::SettingsModalMode::EditingSecret { buffer, .. }
+                if buffer.expose() == "s"
+        ));
     }
     /// With a pending input overlay, neither `q` nor `Esc` is consumed as a
     /// dashboard-overlay exit — both fall through to the agent (the scrollback

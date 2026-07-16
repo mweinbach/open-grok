@@ -81,6 +81,9 @@ pub enum SettingsKeyOutcome {
     Close,
     /// Forward to dispatch.
     Action(Action),
+    /// Close the modal, then forward the action to dispatch.
+    /// Used by focused settings entry points such as `/login` → Kimi.
+    ActionAndClose(Action),
     /// Forward two actions in order (first must resolve before second).
     /// Used by `d`-reset-in-picker to revert preview before opening
     /// the reset-confirm overlay.
@@ -89,6 +92,16 @@ pub enum SettingsKeyOutcome {
     Changed,
     /// No-op.
     Unchanged,
+}
+
+/// How the Settings modal was entered. A focused provider-login editor closes
+/// when its one task is saved or cancelled; the regular Settings surface
+/// returns from sub-panes to the browse list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SettingsEntryPoint {
+    #[default]
+    FullSettings,
+    ProviderLogin,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +173,7 @@ pub struct SettingsModalState {
     /// Vertical scroll offset (line-granular).
     pub scroll_offset: usize,
     pub mode: SettingsModalMode,
+    pub entry_point: SettingsEntryPoint,
     /// Filter query. Persists across FilterFocused→Browse on Enter; cleared by Esc.
     pub query: String,
     /// Byte offset of the editing cursor within `query`.
@@ -219,6 +233,7 @@ impl SettingsModalState {
             selected,
             scroll_offset: 0,
             mode: SettingsModalMode::Browse,
+            entry_point: SettingsEntryPoint::FullSettings,
             query: String::new(),
             query_cursor: 0,
             filtered_cache,
@@ -335,6 +350,29 @@ impl SettingsModalState {
         }
         self.selected = idx;
         true
+    }
+
+    /// Open a registered secret setting as a focused provider-login task.
+    /// The normal Settings constructor remains the only source of snapshots
+    /// and credential state; this changes only selection and sub-pane routing.
+    pub fn try_open_provider_login_secret(&mut self, key: SettingKey) -> bool {
+        let Some(row_idx) = self.rows.iter().position(
+            |row| matches!(row, RowEntry::Setting { key: row_key, .. } if *row_key == key),
+        ) else {
+            return false;
+        };
+        if !matches!(
+            self.registry.find(key).map(|meta| &meta.kind),
+            Some(SettingKind::Secret)
+        ) {
+            return false;
+        }
+        self.selected = row_idx;
+        self.query.clear();
+        self.query_cursor = 0;
+        self.invalidate_filter();
+        self.entry_point = SettingsEntryPoint::ProviderLogin;
+        self.try_enter_editing_value()
     }
 
     /// Reset hit-test geometry so mouse handlers degrade gracefully
@@ -4365,12 +4403,18 @@ fn handle_editing_secret(state: &mut SettingsModalState, key: &KeyEvent) -> Sett
 
     match key.code {
         KeyCode::Esc => {
+            if state.entry_point == SettingsEntryPoint::ProviderLogin {
+                return SettingsKeyOutcome::Close;
+            }
             state.transition_to_browse();
             SettingsKeyOutcome::Changed
         }
         KeyCode::Enter => {
             let error = match &state.mode {
                 SettingsModalMode::EditingSecret { buffer, .. } if buffer.is_empty() => {
+                    if state.entry_point == SettingsEntryPoint::ProviderLogin {
+                        return SettingsKeyOutcome::Close;
+                    }
                     state.transition_to_browse();
                     return SettingsKeyOutcome::Changed;
                 }
@@ -4385,10 +4429,16 @@ fn handle_editing_secret(state: &mut SettingsModalState, key: &KeyEvent) -> Sett
                 SettingsModalMode::EditingSecret { buffer, .. } => std::mem::take(buffer),
                 _ => return SettingsKeyOutcome::Unchanged,
             };
-            state.transition_to_browse();
             if setting_key == "kimi_api_key" {
-                SettingsKeyOutcome::Action(Action::SetKimiApiKey(secret))
+                let action = Action::SetKimiApiKey(secret);
+                if state.entry_point == SettingsEntryPoint::ProviderLogin {
+                    SettingsKeyOutcome::ActionAndClose(action)
+                } else {
+                    state.transition_to_browse();
+                    SettingsKeyOutcome::Action(action)
+                }
             } else {
+                state.transition_to_browse();
                 tracing::error!(
                     target: "settings",
                     key = setting_key,

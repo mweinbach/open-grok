@@ -577,6 +577,11 @@ pub struct DashboardState {
     /// list. Cleared on close (Esc, `[✗]`, or the chrome's
     /// CloseRequested).
     pub shortcuts_modal: Option<Box<ShortcutsModalState>>,
+    /// Focused Settings surface used by session-less provider login flows.
+    /// Kimi API-key entry lives here when `/login kimi` is launched from the
+    /// dashboard, preserving the same redacting and zeroizing editor used by
+    /// an agent-owned Settings modal.
+    pub(crate) settings_modal: Option<Box<crate::views::settings_modal::SettingsModalState>>,
     /// True when the header's `[+ New Agent]` button has focus.
     ///
     /// The button is the default selection target when no row is
@@ -1286,6 +1291,7 @@ impl DashboardState {
             viewport_offset: 0,
             manual_scroll_active: false,
             shortcuts_modal: None,
+            settings_modal: None,
             pending_model: None,
             pending_mode: DashboardDispatchMode::Normal,
             models: crate::acp::model_state::ModelState::default(),
@@ -1837,6 +1843,14 @@ impl DashboardState {
                 || paste_provenance == crate::app::app_view::PasteProvenance::Terminal,
             "non-paste dashboard events cannot carry paste provenance"
         );
+        // A session-less provider credential editor owns the entire surface.
+        // Secret paste is intentionally intercepted one layer higher by
+        // `AppView::handle_owned_input_with_paste_provenance`, where the
+        // crossterm allocation can be moved into `SecretInput` and zeroized.
+        if self.settings_modal.is_some() {
+            return self.handle_settings_modal_input(ev);
+        }
+
         // Cheatsheet modal owns the keyboard / mouse when open —
         // its own search input, picker scroll, and chrome buttons
         // would all be inconsistent if the dashboard's row nav got
@@ -1908,6 +1922,124 @@ impl DashboardState {
                 )
             }
             _ => InputOutcome::Unchanged,
+        }
+    }
+
+    /// True while dashboard input must be treated as credential material.
+    /// The app-level owned-paste boundary uses this to keep key bytes out of
+    /// the ordinary prompt paste pipeline.
+    pub(crate) fn settings_secret_editor_active(&self) -> bool {
+        self.settings_modal.as_ref().is_some_and(|state| {
+            matches!(
+                state.mode,
+                crate::views::settings_modal::SettingsModalMode::EditingSecret { .. }
+            )
+        })
+    }
+
+    /// Consume a terminal paste that has already been moved out of its
+    /// crossterm event into the redacting, zeroizing secret wrapper.
+    pub(crate) fn handle_settings_secret_paste(
+        &mut self,
+        pasted: crate::settings::SecretInput,
+    ) -> InputOutcome {
+        let Some(state) = self.settings_modal.as_mut() else {
+            return InputOutcome::Unchanged;
+        };
+        let outcome = crate::views::settings_modal::handle_settings_paste(state, pasted);
+        self.apply_settings_outcome(outcome)
+    }
+
+    /// Route keyboard and mouse input to the dashboard-hosted Settings modal.
+    fn handle_settings_modal_input(&mut self, ev: &Event) -> InputOutcome {
+        use crate::views::modal_window::{ModalSizing, ModalWindowConfig, ModalWindowOutcome};
+        use crate::views::settings_modal::{
+            SettingsKeyOutcome, SettingsModalMode, handle_settings_key, handle_settings_mouse,
+        };
+
+        let Some(state) = self.settings_modal.as_mut() else {
+            return InputOutcome::Unchanged;
+        };
+        let outcome = match ev {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                // Settings sub-modes own their Esc and editing semantics. The
+                // browse surface delegates unhandled keys through the shared
+                // window chrome, matching the agent-owned Settings host.
+                if matches!(
+                    state.mode,
+                    SettingsModalMode::FilterFocused
+                        | SettingsModalMode::PickingEnum { .. }
+                        | SettingsModalMode::PickingGroup { .. }
+                        | SettingsModalMode::EditingValue { .. }
+                        | SettingsModalMode::EditingSecret { .. }
+                ) {
+                    handle_settings_key(state, key)
+                } else {
+                    let config = ModalWindowConfig {
+                        title: "",
+                        tabs: None,
+                        shortcuts: &[],
+                        sizing: ModalSizing::default(),
+                        fold_info: None,
+                    };
+                    match crate::views::modal_window::handle_modal_key(
+                        &mut state.window,
+                        key,
+                        &config,
+                    ) {
+                        ModalWindowOutcome::CloseRequested => SettingsKeyOutcome::Close,
+                        ModalWindowOutcome::Unhandled => handle_settings_key(state, key),
+                        _ => SettingsKeyOutcome::Changed,
+                    }
+                }
+            }
+            Event::Mouse(mouse) => match crate::views::modal_window::handle_modal_mouse(
+                &mut state.window,
+                mouse.kind,
+                mouse.column,
+                mouse.row,
+            ) {
+                ModalWindowOutcome::CloseRequested => SettingsKeyOutcome::Close,
+                ModalWindowOutcome::Handled => {
+                    if matches!(mouse.kind, crossterm::event::MouseEventKind::Moved) {
+                        state.hover_row = None;
+                    }
+                    SettingsKeyOutcome::Changed
+                }
+                ModalWindowOutcome::Unhandled => {
+                    handle_settings_mouse(state, mouse.kind, mouse.column, mouse.row)
+                }
+                _ => SettingsKeyOutcome::Changed,
+            },
+            // Owned terminal pastes are intercepted by AppView. A borrowed
+            // paste reaching this boundary is swallowed so it cannot leak
+            // into the dashboard prompt or be copied into a plain String.
+            Event::Paste(_) => SettingsKeyOutcome::Unchanged,
+            _ => SettingsKeyOutcome::Unchanged,
+        };
+        self.apply_settings_outcome(outcome)
+    }
+
+    fn apply_settings_outcome(
+        &mut self,
+        outcome: crate::views::settings_modal::SettingsKeyOutcome,
+    ) -> InputOutcome {
+        use crate::views::settings_modal::SettingsKeyOutcome;
+        match outcome {
+            SettingsKeyOutcome::Close => {
+                self.settings_modal = None;
+                InputOutcome::Changed
+            }
+            SettingsKeyOutcome::Action(action) => InputOutcome::Action(action),
+            SettingsKeyOutcome::ActionAndClose(action) => {
+                self.settings_modal = None;
+                InputOutcome::Action(action)
+            }
+            SettingsKeyOutcome::ActionPair(first, second) => {
+                InputOutcome::ActionPair(first, second)
+            }
+            SettingsKeyOutcome::Changed => InputOutcome::Changed,
+            SettingsKeyOutcome::Unchanged => InputOutcome::Unchanged,
         }
     }
 

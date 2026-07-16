@@ -1,6 +1,6 @@
 //! Login, logout, account switching, and auth-code submission dispatchers.
 
-use super::ctx::{restore_auth_return_view, show_welcome};
+use super::ctx::{get_visible_agent_mut, restore_auth_return_view, show_welcome};
 use super::queue::maybe_drain_queue;
 use super::router::dispatch;
 use super::session::lifecycle::{clear_startup_actions, drain_startup_actions};
@@ -17,6 +17,39 @@ use crate::scrollback::blocks::SessionEvent;
 // ---------------------------------------------------------------------------
 // Auth dispatch
 // ---------------------------------------------------------------------------
+
+/// Open the provider chooser for a bare `/login` without starting any auth
+/// flow. Startup and re-auth callers continue to dispatch concrete `Login`
+/// directly. The session-less dashboard reopens the shared slash provider
+/// completion so the same xAI, Codex, and Kimi choices remain available before
+/// an agent exists.
+pub(super) fn dispatch_open_login_provider_picker(app: &mut AppView) -> Vec<Effect> {
+    let kimi_status = super::settings::ui::kimi_api_key_status();
+    let items = crate::slash::commands::login::provider_items(Some(kimi_status));
+    if let Some(agent) = get_visible_agent_mut(app) {
+        agent.active_modal = Some(crate::views::modal::ActiveModal::ArgPicker {
+            command: "login".to_owned(),
+            args_query: String::new(),
+            items: items.clone(),
+            original_items: items,
+            state: crate::views::picker::PickerState::input_active(),
+            previous_palette: None,
+            window: crate::views::modal_window::ModalWindowState::new(),
+        });
+        vec![]
+    } else if let Some(dashboard) = app.dashboard.as_mut()
+        && matches!(app.active_view, ActiveView::AgentDashboard)
+    {
+        dashboard.search_mode = false;
+        dashboard.list_focused = false;
+        dashboard.error_toast = None;
+        dashboard.dispatch.set_text("/login ");
+        dashboard.dispatch.refresh_slash(&dashboard.models);
+        vec![]
+    } else {
+        dispatch_login(app)
+    }
+}
 
 fn snapshot_provider_sessions(
     app: &AppView,

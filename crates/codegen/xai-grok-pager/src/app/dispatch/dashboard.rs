@@ -61,6 +61,7 @@ pub(super) fn ensure_dashboard_state(app: &mut AppView) {
 /// plugins, `default_yolo`) and reset per-session staging. Shared by
 /// `dispatch_open_dashboard` and the overlay-cycle path; no-op if unallocated.
 fn configure_dashboard_state(app: &mut AppView) {
+    clear_overlay_login_or_secret_modal(app);
     let bootstrap_commands = app.bootstrap_acp_commands.clone();
     let models = app.models.clone();
     let disable_plugins = app.appearance.disable_plugins;
@@ -70,6 +71,9 @@ fn configure_dashboard_state(app: &mut AppView) {
     let has_agents = !app.agents.is_empty();
     if let Some(d) = app.dashboard.as_mut() {
         d.close_popup();
+        // Provider credential drafts are ephemeral. Dropping the Settings
+        // state zeroizes any partially entered key before a dashboard reopen.
+        d.settings_modal = None;
         d.location_picker = None;
         d.cwd = cwd.clone();
         d.cwd_has_git_ancestor = cwd_has_git_ancestor;
@@ -233,12 +237,16 @@ fn dashboard_alive_fn(
 }
 
 pub(super) fn dispatch_exit_dashboard(app: &mut AppView) -> Vec<Effect> {
+    clear_overlay_login_or_secret_modal(app);
     // Also clear any popup attachment so a fresh
     // reopen lands on the row list, not on a stale popup
     // (`close_popup()` atomically clears the hit
     // rects too.)
     if let Some(d) = app.dashboard.as_mut() {
         d.close_popup();
+        // Do not retain a partially typed provider credential in the
+        // in-memory dashboard state after the user leaves the surface.
+        d.settings_modal = None;
     }
     log_dashboard_closed(app);
     // Return to either Welcome or the most recently active agent.
@@ -400,6 +408,7 @@ pub(super) fn dispatch_dashboard_attach(
 /// `[✗]` close from the older design but applied to the new
 /// fullscreen-with-frame layout.
 pub(super) fn dispatch_dashboard_overlay_exit(app: &mut AppView) -> Vec<Effect> {
+    clear_overlay_login_or_secret_modal(app);
     if let Some(d) = app.dashboard.as_mut() {
         d.close_popup();
     }
@@ -412,6 +421,25 @@ pub(super) fn dispatch_dashboard_overlay_exit(app: &mut AppView) -> Vec<Effect> 
     clear_pending_overlay_stop(app);
     app.active_view = ActiveView::AgentDashboard;
     vec![]
+}
+
+/// Drop provider-login UI before a dashboard transition can hide its owning
+/// agent. Secret buffers zeroize on drop; the picker is also cleared so it
+/// cannot reappear against a different overlay context.
+fn clear_overlay_login_or_secret_modal(app: &mut AppView) {
+    let agent_id = match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        ActiveView::AgentDashboard => app
+            .dashboard
+            .as_ref()
+            .and_then(|dashboard| dashboard.attached_agent),
+        ActiveView::Welcome => None,
+    };
+    if let Some(agent_id) = agent_id
+        && let Some(agent) = app.agents.get_mut(&agent_id)
+    {
+        while agent.close_login_or_secret_modal() {}
+    }
 }
 
 /// Disarm a pending overlay stop-confirm (see
@@ -1019,6 +1047,7 @@ pub(super) fn dispatch_dashboard_overlay_cycle(app: &mut AppView, delta: i32) ->
     if next_id == current {
         return vec![];
     }
+    clear_overlay_login_or_secret_modal(app);
     // Materialize + configure only on a real switch — otherwise a
     // cycle-created dashboard renders bare on back-out (default cwd, empty
     // `/model`, wrong auto-approve).

@@ -16,8 +16,8 @@ use xai_grok_pager::settings::{
     SettingValue, SettingsRegistry,
 };
 use xai_grok_pager::views::settings_modal::{
-    RowEntry, SettingsKeyOutcome, SettingsModalMode, SettingsModalState, handle_settings_key,
-    handle_settings_mouse,
+    RowEntry, SettingsEntryPoint, SettingsKeyOutcome, SettingsModalMode, SettingsModalState,
+    handle_settings_key, handle_settings_mouse,
 };
 use xai_grok_shell::agent::config::UiConfig;
 
@@ -412,6 +412,59 @@ fn enter_on_kimi_api_key_opens_empty_secret_editor() {
             validation_error: None,
         } if buffer.is_empty()
     ));
+}
+
+#[test]
+fn provider_login_kimi_editor_is_focused_empty_and_standalone_for_every_status() {
+    for status in [
+        xai_grok_pager::settings::SecretStatus::Missing,
+        xai_grok_pager::settings::SecretStatus::Stored,
+        xai_grok_pager::settings::SecretStatus::EnvironmentOverride,
+    ] {
+        let mut s = make_state();
+        s.pager_snapshot.kimi_api_key_status = status;
+        assert!(s.try_open_provider_login_secret("kimi_api_key"));
+        assert_eq!(s.entry_point, SettingsEntryPoint::ProviderLogin);
+        assert!(matches!(
+            s.mode,
+            SettingsModalMode::EditingSecret {
+                key: "kimi_api_key",
+                ref buffer,
+                cursor_byte: 0,
+                validation_error: None,
+            } if buffer.is_empty()
+        ));
+    }
+}
+
+#[test]
+fn provider_login_kimi_editor_cancel_or_empty_submit_closes() {
+    for key in [KeyCode::Esc, KeyCode::Enter] {
+        let mut s = make_state();
+        assert!(s.try_open_provider_login_secret("kimi_api_key"));
+        assert!(matches!(
+            handle_settings_key(&mut s, &press(key)),
+            SettingsKeyOutcome::Close
+        ));
+    }
+}
+
+#[test]
+fn provider_login_kimi_editor_save_closes_with_redacted_typed_action() {
+    let mut s = make_state();
+    assert!(s.try_open_provider_login_secret("kimi_api_key"));
+    for c in "sk-kimi-test".chars() {
+        assert!(matches!(
+            handle_settings_key(&mut s, &press(KeyCode::Char(c))),
+            SettingsKeyOutcome::Changed
+        ));
+    }
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    let SettingsKeyOutcome::ActionAndClose(Action::SetKimiApiKey(secret)) = outcome else {
+        panic!("expected focused Kimi editor to save and close, got {outcome:?}");
+    };
+    assert_eq!(secret.expose(), "sk-kimi-test");
+    assert_eq!(format!("{secret:?}"), "SecretInput([REDACTED])");
 }
 
 /// The Ask-Question timeout row renders in Agent & Approval directly above
@@ -828,6 +881,9 @@ fn slash_enters_filter_mode_and_chars_go_to_query_no_action_leak() {
             SettingsKeyOutcome::Changed | SettingsKeyOutcome::Unchanged => {}
             SettingsKeyOutcome::Action(a) => {
                 panic!("filter mode leaked Action({a:?}) for char {c:?}");
+            }
+            SettingsKeyOutcome::ActionAndClose(a) => {
+                panic!("filter mode leaked ActionAndClose({a:?}) for char {c:?}");
             }
             SettingsKeyOutcome::ActionPair(a, b) => {
                 panic!("filter mode leaked ActionPair({a:?}, {b:?}) for char {c:?}");

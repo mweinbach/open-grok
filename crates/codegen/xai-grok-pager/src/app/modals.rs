@@ -585,6 +585,20 @@ impl AgentView {
                 InputOutcome::Changed
             }
             ArgPickerStep::Selected(item) => {
+                if command_clone == "login" {
+                    self.active_modal = None;
+                    return match crate::slash::commands::login::provider_action(&item.insert_text) {
+                        Ok(action) => InputOutcome::Action(action),
+                        Err(message) => {
+                            tracing::error!(
+                                target: "auth",
+                                error = %message,
+                                "login provider picker emitted an invalid provider token",
+                            );
+                            InputOutcome::Changed
+                        }
+                    };
+                }
                 let chains_to_effort = matches!(command_clone.as_str(), "model" | "m")
                     && item.insert_text.ends_with(char::is_whitespace);
                 if chains_to_effort {
@@ -1706,6 +1720,7 @@ impl AgentView {
                     "model" | "m" if !args_query.is_empty() => "Pick reasoning effort",
                     "model" | "m" => "Pick model",
                     "theme" | "t" => "Pick theme",
+                    "login" => "Connect provider",
                     _ => "Pick option",
                 };
                 let picker_entries: Vec<PickerEntry> = items

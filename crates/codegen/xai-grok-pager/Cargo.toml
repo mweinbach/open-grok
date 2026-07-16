@@ -213,6 +213,10 @@ path = "tests/leader_pty_e2e/mod.rs"
 name = "settings_e2e"
 path = "tests/settings_e2e.rs"
 
+[[test]]
+name = "login_e2e"
+path = "tests/login_e2e.rs"
+
 # Declarative scripted TUI scenarios — opt-in because they spawn the real pager.
 [[test]]
 name = "scripted_scenarios"

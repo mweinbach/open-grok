@@ -43,6 +43,44 @@ impl AgentView {
         )
     }
 
+    /// True when dashboard overlay chrome must yield to provider selection or
+    /// credential entry. This includes secret editing reached through regular
+    /// Settings, not only the focused `/login kimi` entry point.
+    pub(crate) fn login_or_secret_modal_active(&self) -> bool {
+        if let Some(child_id) = self.active_subagent.as_ref()
+            && self
+                .subagent_views
+                .get(child_id)
+                .is_some_and(|child| child.login_or_secret_modal_active())
+        {
+            return true;
+        }
+        matches!(
+            self.active_modal,
+            Some(ActiveModal::ArgPicker { ref command, .. }) if command == "login"
+        ) || self.settings_secret_editor_active()
+    }
+
+    /// Drop an in-flight provider picker or secret editor before an external
+    /// dashboard overlay transition hides its agent. Dropping `SecretInput`
+    /// zeroizes any partially typed credential immediately.
+    pub(crate) fn close_login_or_secret_modal(&mut self) -> bool {
+        if let Some(child_id) = self.active_subagent.clone()
+            && self
+                .subagent_views
+                .get(&child_id)
+                .is_some_and(|child| child.login_or_secret_modal_active())
+            && let Some(child) = self.subagent_views.get_mut(&child_id)
+        {
+            return child.close_login_or_secret_modal();
+        }
+        if self.login_or_secret_modal_active() {
+            self.active_modal = None;
+            return true;
+        }
+        false
+    }
+
     /// Consume a terminal paste that has already been moved out of its
     /// crossterm event. The wrapper is zeroized after its validated contents
     /// are copied into the secret editor's own zeroizing buffer.

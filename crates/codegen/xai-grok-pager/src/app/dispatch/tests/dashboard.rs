@@ -2948,6 +2948,33 @@ fn dashboard_overlay_exit_returns_to_dashboard() {
     assert_eq!(app.dashboard.as_ref().unwrap().attached_agent, None);
 }
 
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_overlay_exit_drops_provider_secret_editor() {
+    let mut app = test_app_with_agent();
+    open_dashboard(&mut app);
+    let id = AgentId(0);
+    let _ = dispatch_dashboard_attach(
+        &mut app,
+        crate::views::dashboard::DashboardRowId::TopLevel(id),
+    );
+    let mut settings = crate::views::settings_modal::SettingsModalState::new(
+        app.settings_registry.clone(),
+        app.current_ui.clone(),
+        crate::settings::PagerLocalSnapshot::default(),
+    );
+    assert!(settings.try_open_provider_login_secret("kimi_api_key"));
+    app.agents.get_mut(&id).unwrap().active_modal =
+        Some(crate::views::modal::ActiveModal::Settings {
+            state: Box::new(settings),
+        });
+
+    let _ = dispatch_dashboard_overlay_exit(&mut app);
+
+    assert!(matches!(app.active_view, ActiveView::AgentDashboard));
+    assert!(app.agents[&id].active_modal.is_none());
+}
+
 /// Overlay Ctrl+X (confirmed second press) — `DashboardOverlayStop`
 /// closes the attached session and lands on the DASHBOARD, not on
 /// the fallback agent the generic close path would pick while the
@@ -3209,10 +3236,25 @@ fn dashboard_overlay_cycle_wraps_through_agents() {
     );
     assert_eq!(app.dashboard.as_ref().unwrap().attached_agent, Some(id1));
 
+    let mut settings = crate::views::settings_modal::SettingsModalState::new(
+        app.settings_registry.clone(),
+        app.current_ui.clone(),
+        crate::settings::PagerLocalSnapshot::default(),
+    );
+    assert!(settings.try_open_provider_login_secret("kimi_api_key"));
+    app.agents.get_mut(&id1).unwrap().active_modal =
+        Some(crate::views::modal::ActiveModal::Settings {
+            state: Box::new(settings),
+        });
+
     // Next → id2.
     let _ = dispatch_dashboard_overlay_cycle(&mut app, 1);
     assert!(matches!(app.active_view, ActiveView::Agent(a) if a == id2));
     assert_eq!(app.dashboard.as_ref().unwrap().attached_agent, Some(id2));
+    assert!(
+        app.agents[&id1].active_modal.is_none(),
+        "cycling must drop a hidden provider credential draft",
+    );
 
     // Next again wraps back to id1.
     let _ = dispatch_dashboard_overlay_cycle(&mut app, 1);

@@ -25,6 +25,169 @@ fn set_agent_provider(app: &mut AppView, agent_id: AgentId, model: &str, provide
 }
 
 #[test]
+fn bare_login_opens_provider_picker_without_starting_auth() {
+    use crate::views::modal::ActiveModal;
+
+    let mut app = test_app_with_agent();
+    let before_auth = format!("{:?}", app.auth_state);
+    let effects = dispatch(Action::OpenLoginProviderPicker, &mut app);
+
+    assert!(effects.is_empty());
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+    assert_eq!(format!("{:?}", app.auth_state), before_auth);
+    let Some(ActiveModal::ArgPicker {
+        command,
+        items,
+        original_items,
+        ..
+    }) = app.agents[&AgentId(0)].active_modal.as_ref()
+    else {
+        panic!("bare /login should open the provider ArgPicker");
+    };
+    assert_eq!(command, "login");
+    assert_eq!(items.len(), 3);
+    assert_eq!(original_items.len(), 3);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.insert_text.as_str())
+            .collect::<Vec<_>>(),
+        ["xai", "codex", "kimi"]
+    );
+}
+
+#[test]
+fn dashboard_bare_login_opens_inline_provider_picker_without_starting_auth() {
+    let mut app = test_app_with_agent();
+    app.dashboard = Some(crate::views::dashboard::DashboardState::new());
+    app.active_view = ActiveView::AgentDashboard;
+    let before_auth = format!("{:?}", app.auth_state);
+
+    let effects = dispatch(Action::OpenLoginProviderPicker, &mut app);
+
+    assert!(effects.is_empty());
+    assert_eq!(app.active_view, ActiveView::AgentDashboard);
+    assert_eq!(format!("{:?}", app.auth_state), before_auth);
+    let dashboard = app.dashboard.as_ref().unwrap();
+    assert_eq!(dashboard.dispatch.text(), "/login ");
+    let snapshot = dashboard.dispatch.slash_snapshot();
+    assert!(snapshot.open);
+    assert_eq!(
+        snapshot
+            .matches
+            .iter()
+            .map(|item| item.insert_text.as_str())
+            .collect::<Vec<_>>(),
+        ["xai", "codex", "kimi"]
+    );
+}
+
+#[test]
+fn attached_dashboard_login_opens_picker_on_visible_agent() {
+    use crate::app::app_view::InputOutcome;
+    use crate::views::modal::ActiveModal;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app_with_agent();
+    let mut dashboard = crate::views::dashboard::DashboardState::new();
+    dashboard.attached_agent = Some(AgentId(0));
+    app.dashboard = Some(dashboard);
+    app.active_view = ActiveView::AgentDashboard;
+
+    let effects = dispatch(Action::OpenLoginProviderPicker, &mut app);
+
+    assert!(effects.is_empty());
+    assert!(matches!(
+        app.agents[&AgentId(0)].active_modal,
+        Some(ActiveModal::ArgPicker { ref command, .. }) if command == "login"
+    ));
+    assert_eq!(app.dashboard.as_ref().unwrap().dispatch.text(), "");
+
+    if let Some(ActiveModal::ArgPicker { state, .. }) =
+        app.agents[&AgentId(0)].active_modal.as_mut()
+    {
+        state.selected = 2;
+    }
+    let outcome = app
+        .agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .handle_modal_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let InputOutcome::Action(action) = outcome else {
+        panic!("attached Kimi selection should emit an action, got {outcome:?}");
+    };
+    assert!(matches!(&action, Action::OpenKimiApiKeyEditor));
+
+    let effects = dispatch(action, &mut app);
+    assert!(effects.is_empty());
+    assert!(matches!(
+        app.agents[&AgentId(0)].active_modal,
+        Some(ActiveModal::Settings { .. })
+    ));
+}
+
+#[test]
+fn login_picker_kimi_selection_routes_through_secure_save_flow() {
+    use crate::app::app_view::InputOutcome;
+    use crate::views::modal::ActiveModal;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::OpenLoginProviderPicker, &mut app);
+    assert!(effects.is_empty());
+    {
+        let Some(ActiveModal::ArgPicker { state, .. }) =
+            app.agents[&AgentId(0)].active_modal.as_mut()
+        else {
+            panic!("expected provider picker");
+        };
+        state.selected = 2;
+    }
+
+    let picker_outcome = app
+        .agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .handle_modal_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let InputOutcome::Action(action) = picker_outcome else {
+        panic!("Kimi selection should emit a provider action, got {picker_outcome:?}");
+    };
+    assert!(matches!(&action, Action::OpenKimiApiKeyEditor));
+
+    let effects = dispatch(action, &mut app);
+    assert!(effects.is_empty());
+    assert!(matches!(
+        app.agents[&AgentId(0)].active_modal,
+        Some(ActiveModal::Settings { .. })
+    ));
+
+    for c in "sk-kimi-routed".chars() {
+        let outcome = app
+            .agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .handle_modal_key(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        assert!(matches!(outcome, InputOutcome::Changed));
+    }
+    let save_outcome = app
+        .agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .handle_modal_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let InputOutcome::Action(save_action) = save_outcome else {
+        panic!("Kimi save should emit a typed action, got {save_outcome:?}");
+    };
+    assert!(app.agents[&AgentId(0)].active_modal.is_none());
+
+    let effects = dispatch(save_action, &mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::UpdateKimiApiKey { key: Some(key) }]
+            if key.expose() == "sk-kimi-routed"
+    ));
+}
+
+#[test]
 fn codex_login_keeps_xai_session_active_and_emits_independent_effect() {
     let mut app = test_app_with_agent();
     let effects = dispatch(Action::LoginCodex, &mut app);

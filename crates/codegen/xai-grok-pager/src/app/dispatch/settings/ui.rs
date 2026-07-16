@@ -17,7 +17,7 @@ use super::setters::{
 };
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
-use crate::app::dispatch::ctx::with_active_agent;
+use crate::app::dispatch::ctx::{get_visible_agent_mut, with_active_agent};
 use crate::app::dispatch::modes::{set_yolo_mode_inner, sync_active_auto_flag};
 use crate::app::dispatch::router::dispatch;
 use crate::app::dispatch::turn::apply_cancel_subagents_preference_global;
@@ -51,16 +51,23 @@ pub(in crate::app::dispatch) fn save_success_toast(label: &str, on: bool) -> Str
 /// snapshots by value; without this, toggles would appear stuck.
 pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     use crate::views::modal::ActiveModal;
+    let dashboard_settings_open = app
+        .dashboard
+        .as_ref()
+        .is_some_and(|dashboard| dashboard.settings_modal.is_some());
     // Early exit when no settings modal is open (common case).
-    if !app.agents.values().any(|a| {
-        matches!(
-            a.active_modal,
-            Some(ActiveModal::Settings { .. } | ActiveModal::ResetSettingsConfirm { .. })
-        )
-    }) {
+    if !dashboard_settings_open
+        && !app.agents.values().any(|a| {
+            matches!(
+                a.active_modal,
+                Some(ActiveModal::Settings { .. } | ActiveModal::ResetSettingsConfirm { .. })
+            )
+        })
+    {
         return;
     }
     let ui_snapshot = app.current_ui.clone();
+    let dashboard_snapshot = dashboard_settings_open.then(|| build_pager_snapshot(app));
     // Capture app-level fields before the mut-borrow loop.
     let coding_data_sharing_opt_out_from_app = app.coding_data_retention_opt_out;
     let show_tips_from_app = app.show_tips;
@@ -113,6 +120,15 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 voice_stt_language: voice_stt_language_from_app.clone(),
             };
         }
+    }
+    if let Some(snapshot) = dashboard_snapshot
+        && let Some(state) = app
+            .dashboard
+            .as_mut()
+            .and_then(|dashboard| dashboard.settings_modal.as_mut())
+    {
+        state.ui_snapshot = ui_snapshot;
+        state.pager_snapshot = snapshot;
     }
 }
 
@@ -237,6 +253,40 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
         pager_snapshot,
     ));
     agent.active_modal = Some(ActiveModal::Settings { state });
+    vec![]
+}
+
+/// Open the existing zeroizing Settings credential editor as a focused Kimi
+/// login task. Agent views host it in `ActiveModal::Settings`; the session-less
+/// dashboard hosts the same `SettingsModalState` directly. Both surfaces keep
+/// paste ownership and input-log suppression at their secure modal boundary.
+pub(in crate::app::dispatch) fn dispatch_open_kimi_api_key_editor(
+    app: &mut AppView,
+) -> Vec<Effect> {
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsModalState;
+
+    let registry = app.settings_registry.clone();
+    let ui_snapshot = app.current_ui.clone();
+    let pager_snapshot = build_pager_snapshot(app);
+
+    let mut state = SettingsModalState::new(registry, ui_snapshot, pager_snapshot);
+    if !state.try_open_provider_login_secret("kimi_api_key") {
+        tracing::error!(
+            target: "settings",
+            "Kimi API-key setting is missing or is no longer a secret setting",
+        );
+        return vec![];
+    }
+    if let Some(agent) = get_visible_agent_mut(app) {
+        agent.active_modal = Some(ActiveModal::Settings {
+            state: Box::new(state),
+        });
+    } else if matches!(app.active_view, ActiveView::AgentDashboard)
+        && let Some(dashboard) = app.dashboard.as_mut()
+    {
+        dashboard.settings_modal = Some(Box::new(state));
+    }
     vec![]
 }
 

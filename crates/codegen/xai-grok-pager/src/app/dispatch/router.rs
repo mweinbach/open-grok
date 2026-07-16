@@ -2,7 +2,7 @@
 use super::auth::{
     dispatch_cancel_login, dispatch_choose_startup_codex, dispatch_choose_startup_xai,
     dispatch_login, dispatch_login_codex, dispatch_logout, dispatch_logout_codex,
-    dispatch_submit_auth_code, dispatch_switch_account,
+    dispatch_open_login_provider_picker, dispatch_submit_auth_code, dispatch_switch_account,
 };
 use super::billing::dispatch_open_supergrok_url;
 use super::ctx::{
@@ -89,9 +89,9 @@ use super::settings::setters::{
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette, dispatch_open_howto_guides,
-    dispatch_open_reset_confirm, dispatch_open_settings, dispatch_toggle_compact_mode,
-    dispatch_toggle_mouse_capture, dispatch_toggle_multiline, dispatch_toggle_timestamps,
-    dispatch_toggle_vim_mode,
+    dispatch_open_kimi_api_key_editor, dispatch_open_reset_confirm, dispatch_open_settings,
+    dispatch_toggle_compact_mode, dispatch_toggle_mouse_capture, dispatch_toggle_multiline,
+    dispatch_toggle_timestamps, dispatch_toggle_vim_mode,
 };
 use super::status::{
     dispatch_copy_session_id, dispatch_open_gboom, dispatch_share_session,
@@ -999,6 +999,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             with_active_agent(app, |agent| agent.cycle_highlighted_link(false));
             vec![]
         }
+        Action::OpenLoginProviderPicker => dispatch_open_login_provider_picker(app),
+        Action::OpenKimiApiKeyEditor => dispatch_open_kimi_api_key_editor(app),
         Action::Login => dispatch_login(app),
         Action::LoginCodex => dispatch_login_codex(app),
         Action::ChooseStartupCodex => dispatch_choose_startup_codex(app),

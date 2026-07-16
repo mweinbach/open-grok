@@ -64,6 +64,26 @@ pub(super) fn get_active_agent_mut(app: &mut AppView) -> Option<&mut AgentView> 
     None
 }
 
+/// Get the agent currently visible on an agent surface, including an agent
+/// attached inside the dashboard session overlay. This is intentionally
+/// separate from [`get_active_agent_mut`]: most dispatch actions remain scoped
+/// to `ActiveView::Agent`, while UI-only provider-login modals should open on
+/// whichever agent prompt actually emitted them.
+pub(super) fn get_visible_agent_mut(app: &mut AppView) -> Option<&mut AgentView> {
+    let id = match app.active_view {
+        ActiveView::Agent(id) => id,
+        ActiveView::AgentDashboard => app.dashboard.as_ref()?.attached_agent?,
+        ActiveView::Welcome => return None,
+    };
+    let agent = app.agents.get_mut(&id)?;
+    if let Some(child_sid) = agent.active_subagent.clone()
+        && agent.subagent_views.contains_key(&child_sid)
+    {
+        return agent.subagent_views.get_mut(&child_sid).map(|b| &mut **b);
+    }
+    Some(agent)
+}
+
 /// Apply a closure to the active agent's scrollback (if any).
 ///
 /// Resolves through `active_subagent` — see [`with_active_agent`].
