@@ -16632,10 +16632,15 @@ openai/codex
 --------------------------------------------------------------------------------
 Source:  https://github.com/openai/codex
 License: Apache-2.0
-Source revision: 2be648ba4a6c159a3d80b1c07e7323cbd5efef8f
+Source revisions:
+  2be648ba4a6c159a3d80b1c07e7323cbd5efef8f (Code Mode and OAuth baseline)
+  cbc83d961e8132bfff4d340ab8342d181b79e95e (live model catalog contract)
 Upstream paths: codex-rs/code-mode, codex-rs/code-mode-protocol,
   codex-rs/core/src/tools/code_mode/, codex-rs/core/src/tools/handlers/
-  (and apply-patch crate)
+  (and apply-patch crate), codex-rs/models-manager,
+  codex-rs/model-provider/src/models_endpoint.rs,
+  codex-rs/codex-api/src/endpoint/models.rs,
+  codex-rs/protocol/src/openai_models.rs
 
 Copyright notice:
   Copyright 2025 OpenAI
@@ -16651,6 +16656,8 @@ Additional requirements / notices:
     crates/codegen/xai-grok-code-mode/
   Code Mode shell adapter under:
     crates/codegen/xai-grok-shell/src/session/code_mode.rs
+  Codex live-model transport and provider-isolated cache under:
+    crates/codegen/xai-grok-shell/src/codex_models.rs
   These are derived/portions of openai/codex tool handlers, adapted to this
   repository's tool traits, sampling transport, and session runtime. The
   out-of-process code-mode host was not ported; Grok Build uses the upstream

@@ -8,6 +8,32 @@ revision as the Code Mode port:
 - Commit: `2be648ba4a6c159a3d80b1c07e7323cbd5efef8f`
 - License: Apache-2.0
 
+The live model-catalog compatibility pass was refreshed against Codex commit
+`cbc83d961e8132bfff4d340ab8342d181b79e95e`.
+
+## Live model catalog
+
+Open Grok embeds the current GPT-5.6 Sol, Terra, and Luna definitions so the
+picker and headless model resolution still work offline. With ChatGPT Codex
+credentials available, the shell follows codex-rs' live catalog contract:
+
+- GET `https://chatgpt.com/backend-api/codex/models?client_version=<version>`
+  with a five-second timeout.
+- Send the Codex bearer plus `ChatGPT-Account-ID` and `X-OpenAI-Fedramp` when
+  present, with one forced token refresh and retry after a 401.
+- Read the response `ETag` and cache the parsed catalog for five minutes.
+- Use a nonempty list-visible ChatGPT response as authoritative for the Codex
+  provider partition. Empty or hidden-only responses merge with the embedded
+  fallback, matching codex-rs behavior.
+- Apply user `[model.*]` entries last, so explicit operator configuration remains
+  the highest-priority layer.
+
+The cache is `$OPENGROK_HOME/codex_models_cache.json` and is matched against the
+client version, endpoint, and non-secret Codex account identity. It is separate
+from xAI's `models_cache.json`, just as Codex credentials are separate from xAI
+credentials. A Codex refresh can neither remove xAI models nor read or mutate
+xAI auth state.
+
 ## Authentication
 
 `open-grok login --codex` uses Codex's ChatGPT OAuth client, PKCE authorization

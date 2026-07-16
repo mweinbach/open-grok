@@ -16,6 +16,7 @@ pub mod claude_import;
 pub mod claude_import_state;
 pub mod cli_models;
 pub mod codex_auth;
+pub(crate) mod codex_models;
 pub mod config;
 pub use xai_grok_shell_base::cpu_profile;
 pub use xai_grok_shell_base::env;

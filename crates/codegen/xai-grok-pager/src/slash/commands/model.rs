@@ -113,6 +113,63 @@ fn supports_reasoning_effort(info: &acp::ModelInfo) -> bool {
     supports_reasoning_effort_meta(info.meta.as_ref())
 }
 
+fn model_provider_label(info: &acp::ModelInfo) -> Option<&'static str> {
+    match info
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("provider"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("codex" | "openai" | "openai_codex") => Some("OpenAI"),
+        Some("xai") => Some("xAI"),
+        _ => None,
+    }
+}
+
+fn model_context_window(info: &acp::ModelInfo) -> Option<u64> {
+    info.meta
+        .as_ref()
+        .and_then(|meta| meta.get("totalContextTokens"))
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn format_context_window(tokens: u64) -> String {
+    fn compact(tokens: u64, divisor: u64, suffix: &str) -> String {
+        let tenths = ((tokens as u128 * 10 + u128::from(divisor / 2)) / u128::from(divisor)) as u64;
+        if tenths.is_multiple_of(10) {
+            format!("{}{suffix} context", tenths / 10)
+        } else {
+            format!("{}.{:01}{suffix} context", tenths / 10, tenths % 10)
+        }
+    }
+
+    if tokens >= 1_000_000 {
+        compact(tokens, 1_000_000, "M")
+    } else if tokens >= 1_000 {
+        compact(tokens, 1_000, "K")
+    } else {
+        format!("{tokens} context")
+    }
+}
+
+fn model_picker_description(info: &acp::ModelInfo) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if let Some(provider) = model_provider_label(info) {
+        parts.push(provider.to_string());
+    }
+    if let Some(tokens) = model_context_window(info) {
+        parts.push(format_context_window(tokens));
+    }
+    if let Some(description) = info
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+    {
+        parts.push(description.trim().to_string());
+    }
+    parts.join(" · ")
+}
+
 /// Split `args` into `(prefix, last_token)` on the final whitespace run.
 /// Returns `None` when there is no interior whitespace to split on. The token is
 /// resolved to an effort against the picked model's options by the caller.
@@ -174,9 +231,14 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
 
         items.push(ArgItem {
             display,
-            match_text: info.name.clone(),
+            match_text: format!(
+                "{} {} {}",
+                info.name,
+                id.0,
+                model_provider_label(info).unwrap_or_default()
+            ),
             insert_text,
-            description: info.description.clone().unwrap_or_default(),
+            description: model_picker_description(info),
         });
     }
     items
@@ -221,6 +283,28 @@ mod tests {
     fn plain_model(id: &str, name: &str) -> (acp::ModelId, acp::ModelInfo) {
         let id = acp::ModelId::new(Arc::from(id));
         let info = acp::ModelInfo::new(id.clone(), name.to_string());
+        (id, info)
+    }
+
+    fn provider_model(
+        id: &str,
+        name: &str,
+        provider: &str,
+        context_window: u64,
+    ) -> (acp::ModelId, acp::ModelInfo) {
+        let id = acp::ModelId::new(Arc::from(id));
+        let info = acp::ModelInfo::new(id.clone(), name.to_string())
+            .description(Some("Model description".to_string()))
+            .meta(Some(serde_json::Map::from_iter([
+                (
+                    "provider".to_string(),
+                    serde_json::Value::String(provider.to_string()),
+                ),
+                (
+                    "totalContextTokens".to_string(),
+                    serde_json::Value::Number(context_window.into()),
+                ),
+            ])));
         (id, info)
     }
 
@@ -293,6 +377,35 @@ mod tests {
         // Plain model has no trailing space -- Enter commits immediately.
         let plain = items.iter().find(|i| i.match_text == "Grok 4.5").unwrap();
         assert_eq!(plain.insert_text, "Grok 4.5");
+    }
+
+    #[test]
+    fn model_rows_show_provider_and_context_window_and_match_model_id() {
+        let mut state = ModelState::default();
+        let (codex_id, codex) = provider_model("gpt-5.6-sol", "GPT-5.6 Sol", "codex", 353_000);
+        let (xai_id, xai) = provider_model("grok-build", "Grok Build", "xai", 500_000);
+        state.available.insert(codex_id, codex);
+        state.available.insert(xai_id, xai);
+
+        let items = build_model_items(&state);
+        let codex = items
+            .iter()
+            .find(|item| item.insert_text == "GPT-5.6 Sol")
+            .expect("Codex model row");
+        assert_eq!(
+            codex.description,
+            "OpenAI · 353K context · Model description"
+        );
+        assert!(codex.match_text.contains("gpt-5.6-sol"));
+        assert!(codex.match_text.contains("OpenAI"));
+
+        let xai = items
+            .iter()
+            .find(|item| item.insert_text == "Grok Build")
+            .expect("xAI model row");
+        assert_eq!(xai.description, "xAI · 500K context · Model description");
+
+        assert_eq!(format_context_window(353_400), "353.4K context");
     }
 
     #[test]

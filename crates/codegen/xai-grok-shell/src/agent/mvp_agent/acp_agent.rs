@@ -823,6 +823,9 @@ impl acp::Agent for MvpAgent {
                     .data("initialize must be called before new_session")
             })?;
         self.seed_client_config_auth_if_available();
+        if let Err(error) = self.models_manager.refresh_codex_models(false).await {
+            tracing::warn!(%error, "Codex model catalog refresh failed during new session; keeping cached/embedded models");
+        }
         if let Ok(auth) = self.auth_manager.auth().await {
             self.refresh_settings_and_reapply(&auth).await;
         }
@@ -1215,6 +1218,9 @@ impl acp::Agent for MvpAgent {
                     .data("initialize must be called before load_session")
             })?;
         self.seed_client_config_auth_if_available();
+        if let Err(error) = self.models_manager.refresh_codex_models(false).await {
+            tracing::warn!(%error, "Codex model catalog refresh failed while loading session; keeping cached/embedded models");
+        }
         let persist_data = arguments
             .meta
             .as_ref()
@@ -3238,6 +3244,22 @@ impl acp::Agent for MvpAgent {
         let mut backend_no_bridge_err: Option<acp::Error> = None;
         let method = args.method.clone();
         let result = match method.as_ref() {
+            "open-grok/codex/models/refresh" => {
+                let refreshed = self.models_manager.refresh_codex_models(true).await;
+                crate::extensions::to_ext_response(refreshed.map(|refreshed| {
+                    let available = self.models_manager.available();
+                    let models = acp::SessionModelState::new(
+                        self.models_manager.current_model_id(),
+                        available.values().cloned().collect(),
+                    );
+                    serde_json::json!({ "refreshed": refreshed, "models": models })
+                }))
+            }
+            "open-grok/codex/models/clear" => crate::extensions::to_ext_response(Ok(
+                serde_json::json!({
+                    "cleared": self.models_manager.clear_codex_models(),
+                }),
+            )),
             "x.ai/getApiKey" | "x.ai/setApiKey" => {
                 crate::extensions::auth::handle(self, &args).await
             }

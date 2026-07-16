@@ -1,7 +1,7 @@
 //! Model fetching, resolution, and management.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -11,6 +11,7 @@ use indexmap::IndexMap;
 
 use crate::agent::config::{self, ModelEntry, resolve_credentials, sampling_config_for_model};
 use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
+use crate::codex_models::{CodexModelsCatalog, CodexModelsClient};
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::sampling::SamplerConfig as SamplingConfig;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -69,8 +70,25 @@ pub(crate) fn task_model_error_for_catalog(
     available: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
 ) -> Option<String> {
+    task_model_error_for_catalog_with_provider_auth(
+        requested,
+        available,
+        is_session_auth,
+        is_session_auth,
+    )
+}
+
+fn task_model_error_for_catalog_with_provider_auth(
+    requested: &str,
+    available: &IndexMap<String, ModelEntry>,
+    has_xai_session: bool,
+    has_codex_session: bool,
+) -> Option<String> {
     let is_available = |entry: &ModelEntry| {
-        entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
+        entry.info.user_selectable
+            && entry
+                .info
+                .visible_for_provider_auth(has_xai_session, has_codex_session)
     };
     if config::find_model_by_id(available, requested).is_some_and(&is_available) {
         return None;
@@ -105,6 +123,9 @@ pub struct ModelsManager {
 
 struct Inner {
     prefetched: RwLock<Option<IndexMap<String, ModelEntry>>>,
+    /// Provider-isolated ChatGPT Codex catalog. This must never be stored in
+    /// `prefetched`, which is owned by xAI's `/v1/models` transport.
+    codex_catalog: RwLock<Option<CodexModelsCatalog>>,
     models: RwLock<IndexMap<String, ModelEntry>>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
@@ -120,6 +141,15 @@ struct Inner {
     fetch_auth: RwLock<ModelFetchAuth>,
     gateway: RwLock<Option<xai_acp_lib::AcpAgentGatewaySender>>,
     cache: ModelsCacheManager,
+    codex_client: CodexModelsClient,
+    /// Serialize Codex cache/network refreshes. Session startup waits for an
+    /// already-running refresh so it resolves against the same catalog rather
+    /// than racing past the initial `OnlineIfUncached` request.
+    codex_refresh_lock: tokio::sync::Mutex<()>,
+    /// Invalidates a refresh result when Codex logout races an in-flight
+    /// `/models` request. Logout increments this before clearing the cache;
+    /// only a refresh that started in the current generation may publish.
+    codex_catalog_generation: AtomicU64,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// `allowed_models` matched nothing in the fetched catalog; the prompt path
@@ -170,12 +200,34 @@ impl ModelsManager {
         auth_manager: Arc<AuthManager>,
         cfg: config::Config,
     ) -> Self {
+        Self::new_with_codex(
+            prefetched,
+            None,
+            models,
+            current_model_id,
+            auth_manager,
+            cfg,
+            CodexModelsClient::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_codex(
+        prefetched: Option<IndexMap<String, ModelEntry>>,
+        codex_catalog: Option<CodexModelsCatalog>,
+        models: IndexMap<String, ModelEntry>,
+        current_model_id: acp::ModelId,
+        auth_manager: Arc<AuthManager>,
+        cfg: config::Config,
+        codex_client: CodexModelsClient,
+    ) -> Self {
         let has_session = auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
         let current_reasoning_effort = cfg.models.default_reasoning_effort;
         Self {
             inner: Arc::new(Inner {
                 prefetched: RwLock::new(prefetched),
+                codex_catalog: RwLock::new(codex_catalog),
                 models: RwLock::new(models),
                 current_model_id: RwLock::new(current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
@@ -186,6 +238,9 @@ impl ModelsManager {
                 fetch_auth: RwLock::new(fetch_auth),
                 gateway: RwLock::new(None),
                 cache: ModelsCacheManager::new(),
+                codex_client,
+                codex_refresh_lock: tokio::sync::Mutex::new(()),
+                codex_catalog_generation: AtomicU64::new(0),
                 retry_in_flight: AtomicBool::new(false),
                 allowlist_excludes_all: AtomicBool::new(false),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
@@ -224,6 +279,7 @@ impl ModelsManager {
         let is_session_auth = auth_manager
             .auth_mode()
             .is_some_and(|m| m.is_session_auth());
+        let is_codex_session_auth = crate::codex_auth::is_logged_in();
         let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
         let prefetched_models = prefetched_models.or_else(|| {
             let cache = ModelsCacheManager::new();
@@ -235,7 +291,13 @@ impl ModelsManager {
                 .map(|c| c.models)
         });
         let has_prefetched = prefetched_models.is_some();
-        let catalog = resolve_model_catalog(cfg, prefetched_models.clone());
+        let codex_client = CodexModelsClient::new();
+        let codex_catalog = codex_client.load_fresh_cache();
+        let catalog = resolve_model_catalog_with_codex(
+            cfg,
+            prefetched_models.clone(),
+            codex_catalog.as_ref(),
+        );
 
         // Validate only against a real catalog; a bundled-only first run defers
         // to the async fetch (`apply_refresh_result`).
@@ -244,7 +306,12 @@ impl ModelsManager {
         }
 
         let (current_model_key, current_model, model_source) =
-            resolve_default_model(cfg, &catalog, is_session_auth);
+            resolve_default_model_with_provider_auth(
+                cfg,
+                &catalog,
+                is_session_auth,
+                is_codex_session_auth,
+            );
 
         tracing::info!(
             model_id = %current_model.model,
@@ -254,12 +321,14 @@ impl ModelsManager {
 
         let current_model_id = acp::ModelId::new(Arc::from(current_model_key));
 
-        let mgr = Self::new(
+        let mgr = Self::new_with_codex(
             prefetched_models,
+            codex_catalog,
             catalog,
             current_model_id,
             auth_manager,
             cfg.clone(),
+            codex_client,
         );
         if has_prefetched {
             *mgr.inner.has_fetched_real_catalog.write() = true;
@@ -269,6 +338,96 @@ impl ModelsManager {
 
     pub(crate) fn set_gateway(&self, gateway: xai_acp_lib::AcpAgentGatewaySender) {
         *self.inner.gateway.write() = Some(gateway);
+        self.start_codex_models_refresh();
+    }
+
+    /// Refresh the authenticated ChatGPT Codex catalog after the agent has a
+    /// runtime and gateway. Existing credentials use `OnlineIfUncached`, just
+    /// like codex-rs startup, while an explicit post-login extension can force
+    /// an online request through [`Self::refresh_codex_models`].
+    fn start_codex_models_refresh(&self) {
+        if !crate::codex_auth::is_logged_in() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("Codex model refresh deferred: no Tokio runtime");
+            return;
+        };
+        let manager = self.clone();
+        runtime.spawn(async move {
+            if let Err(error) = manager.refresh_codex_models(false).await {
+                tracing::warn!(%error, "Codex model catalog refresh failed; keeping cached/embedded models");
+            }
+        });
+    }
+
+    /// Load or fetch the provider-isolated ChatGPT Codex model catalog and
+    /// publish the resulting combined model state. A failed fetch leaves the
+    /// current live/cache/fallback catalog untouched.
+    pub(crate) async fn refresh_codex_models(&self, force_online: bool) -> anyhow::Result<bool> {
+        let _refresh_guard = self.inner.codex_refresh_lock.lock().await;
+        let generation = self.inner.codex_catalog_generation.load(Ordering::Acquire);
+
+        let refreshed = if force_online {
+            self.inner.codex_client.fetch_and_cache().await?
+        } else {
+            self.inner.codex_client.load_fresh_or_fetch().await?
+        };
+        let Some(refreshed) = refreshed else {
+            tracing::debug!("Codex model refresh skipped: no Codex credentials");
+            return Ok(false);
+        };
+        if generation != self.inner.codex_catalog_generation.load(Ordering::Acquire)
+            || !crate::codex_auth::is_logged_in()
+        {
+            // `fetch_and_cache` persists before returning. If logout won the
+            // race, remove that just-written account-scoped cache as well as
+            // refusing to republish its catalog in memory.
+            self.inner.codex_client.invalidate_cache();
+            tracing::debug!("discarded Codex model refresh completed after logout");
+            return Ok(false);
+        }
+        if !self
+            .inner
+            .codex_client
+            .catalog_matches_current_account(&refreshed)
+        {
+            // Login can remain continuously true while the selected ChatGPT
+            // workspace changes. The catalog carries a non-secret principal
+            // digest so account A's in-flight response cannot publish for B.
+            tracing::debug!("discarded Codex model refresh completed after account switch");
+            return Ok(false);
+        }
+
+        let count = refreshed.list_visible_entries().len();
+        let authoritative = refreshed.is_authoritative();
+        *self.inner.codex_catalog.write() = Some(refreshed);
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.prefetched.read().clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        tracing::info!(count, authoritative, "Codex model catalog refreshed");
+        Ok(true)
+    }
+
+    /// Clear only ChatGPT Codex's live catalog/cache after Codex logout.
+    /// The independently authenticated xAI catalog and cache remain intact;
+    /// embedded OpenAI metadata immediately becomes the offline fallback.
+    pub(crate) fn clear_codex_models(&self) -> bool {
+        self.inner
+            .codex_catalog_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let had_catalog = self.inner.codex_catalog.write().take().is_some();
+        let had_cache = self.inner.codex_client.cache_path().is_file();
+        self.inner.codex_client.invalidate_cache();
+
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.prefetched.read().clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        had_catalog || had_cache
     }
 
     /// Swap config, rebuild catalog, and reselect the model.
@@ -283,7 +442,10 @@ impl ModelsManager {
             return;
         }
         let prefetched = self.inner.prefetched.read().clone();
-        let new_catalog = resolve_model_catalog(&new_config, prefetched);
+        let new_catalog = {
+            let codex_catalog = self.inner.codex_catalog.read();
+            resolve_model_catalog_with_codex(&new_config, prefetched, codex_catalog.as_ref())
+        };
         let has_real_catalog = *self.inner.has_fetched_real_catalog.read();
         if has_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
@@ -369,6 +531,10 @@ impl ModelsManager {
             .is_some_and(|m| m.is_session_auth())
     }
 
+    fn is_codex_session_auth(&self) -> bool {
+        crate::codex_auth::is_logged_in()
+    }
+
     /// ACP-visible (non-hidden) projection of the catalog.
     /// The catalog coming from `resolve_model_catalog` already has
     /// allowed_models + disabled_models + hidden_models applied.
@@ -383,13 +549,22 @@ impl ModelsManager {
             .filter(|(_, e)| e.info.user_selectable)
             .collect();
 
-        available_models(&selectable, self.is_session_auth())
+        available_models_with_provider_auth(
+            &selectable,
+            self.is_session_auth(),
+            self.is_codex_session_auth(),
+        )
     }
 
     pub(crate) fn task_model_error(&self, requested: &str) -> Option<String> {
         let is_session_auth = self.is_session_auth();
         let models = self.inner.models.read();
-        task_model_error_for_catalog(requested, &models, is_session_auth)
+        task_model_error_for_catalog_with_provider_auth(
+            requested,
+            &models,
+            is_session_auth,
+            self.is_codex_session_auth(),
+        )
     }
 
     pub fn current_model_id(&self) -> acp::ModelId {
@@ -556,7 +731,11 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        *self.inner.models.write() = resolve_model_catalog(cfg, prefetched);
+        let catalog = {
+            let codex_catalog = self.inner.codex_catalog.read();
+            resolve_model_catalog_with_codex(cfg, prefetched, codex_catalog.as_ref())
+        };
+        *self.inner.models.write() = catalog;
     }
 
     /// Refresh models when the etag changes.
@@ -915,15 +1094,20 @@ impl ModelsManager {
         });
     }
 
-    /// Wipe in-memory state so a previous identity's catalog doesn't leak.
+    /// Wipe only xAI in-memory state so a previous xAI identity's catalog
+    /// cannot leak. The independent Codex cache/catalog and embedded Codex
+    /// fallback remain available for Codex-only sessions.
     fn clear(&self) {
         *self.inner.prefetched.write() = None;
-        *self.inner.models.write() = IndexMap::new();
         *self.inner.etag.write() = None;
         *self.inner.has_fetched_real_catalog.write() = false;
         self.inner
             .allowlist_excludes_all
             .store(false, Ordering::Relaxed);
+        let cfg = self.inner.cfg.read().clone();
+        self.rebuild(&cfg, None);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
     }
 
     /// Build a `SamplingConfig` from the current model + auth state.
@@ -1141,11 +1325,18 @@ impl ModelsManager {
     /// `allowed_models`), so UI and sampling don't disagree on the active model.
     fn reselect_current_model_if_missing(&self, config: &config::Config) {
         let current = self.inner.current_model_id.read().clone();
+        let has_xai_session = self.is_session_auth();
+        let has_codex_session = self.is_codex_session_auth();
         let needs_reselection = {
             let models = self.inner.models.read();
             match models.get(current.0.as_ref()) {
                 None => true,
-                Some(entry) => !entry.info.user_selectable,
+                Some(entry) => {
+                    !entry.info.user_selectable
+                        || !entry
+                            .info
+                            .visible_for_provider_auth(has_xai_session, has_codex_session)
+                }
             }
         };
         if !needs_reselection {
@@ -1153,7 +1344,12 @@ impl ModelsManager {
         }
         let (key, _, source) = {
             let models = self.inner.models.read();
-            resolve_default_model(config, &models, self.is_session_auth())
+            resolve_default_model_with_provider_auth(
+                config,
+                &models,
+                self.is_session_auth(),
+                self.is_codex_session_auth(),
+            )
         };
         let new_id = acp::ModelId::new(Arc::from(key));
         tracing::info!(
@@ -1170,7 +1366,12 @@ impl ModelsManager {
     fn reselect_default_model(&self, config: &config::Config) {
         let (key, _, source) = {
             let models = self.inner.models.read();
-            resolve_default_model(config, &models, self.is_session_auth())
+            resolve_default_model_with_provider_auth(
+                config,
+                &models,
+                self.is_session_auth(),
+                self.is_codex_session_auth(),
+            )
         };
         let new_id = acp::ModelId::new(Arc::from(key));
         let current = self.inner.current_model_id.read().clone();
@@ -1690,9 +1891,22 @@ pub(crate) fn resolve_default_model(
     catalog: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
 ) -> (String, ModelEntry, config::ConfigSource) {
+    resolve_default_model_with_provider_auth(cfg, catalog, is_session_auth, is_session_auth)
+}
+
+fn resolve_default_model_with_provider_auth(
+    cfg: &config::Config,
+    catalog: &IndexMap<String, ModelEntry>,
+    has_xai_session: bool,
+    has_codex_session: bool,
+) -> (String, ModelEntry, config::ConfigSource) {
     let visible: IndexMap<String, ModelEntry> = catalog
         .iter()
-        .filter(|(_, e)| e.info.visible_for_auth(is_session_auth) && e.info.user_selectable)
+        .filter(|(_, e)| {
+            e.info
+                .visible_for_provider_auth(has_xai_session, has_codex_session)
+                && e.info.user_selectable
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
@@ -1792,9 +2006,20 @@ pub fn available_models(
     catalog: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {
+    available_models_with_provider_auth(catalog, is_session_auth, is_session_auth)
+}
+
+fn available_models_with_provider_auth(
+    catalog: &IndexMap<String, ModelEntry>,
+    has_xai_session: bool,
+    has_codex_session: bool,
+) -> IndexMap<acp::ModelId, acp::ModelInfo> {
     let visible: IndexMap<String, ModelEntry> = catalog
         .iter()
-        .filter(|(_, e)| e.info.visible_for_auth(is_session_auth))
+        .filter(|(_, e)| {
+            e.info
+                .visible_for_provider_auth(has_xai_session, has_codex_session)
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     config::to_acp_model_info(&visible)
@@ -1847,7 +2072,21 @@ pub fn resolve_model_catalog(
     cfg: &config::Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
-    let mut catalog: IndexMap<String, ModelEntry> = config::resolve_model_list(cfg, prefetched);
+    resolve_model_catalog_with_codex(cfg, prefetched, None)
+}
+
+/// Resolve the combined provider catalog while preserving independent xAI and
+/// ChatGPT Codex remote state. The Codex snapshot replaces or overlays only
+/// the Codex partition before the shared allow/disable/hide filters run.
+fn resolve_model_catalog_with_codex(
+    cfg: &config::Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    codex_catalog: Option<&CodexModelsCatalog>,
+) -> IndexMap<String, ModelEntry> {
+    let codex_entries = codex_catalog.map(CodexModelsCatalog::entries);
+    let codex_authoritative = codex_catalog.is_some_and(CodexModelsCatalog::is_authoritative);
+    let mut catalog: IndexMap<String, ModelEntry> =
+        config::resolve_model_list_with_codex(cfg, prefetched, codex_entries, codex_authoritative);
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {
         let before = catalog.len();
@@ -2995,6 +3234,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clearing_xai_identity_preserves_independent_codex_fallback() {
+        let mgr = test_manager();
+        let cfg = config::Config::default();
+        mgr.apply_refresh_result(&cfg, Some(make_prefetched(&["grok-private"])), None);
+        assert!(mgr.models().contains_key("grok-private"));
+
+        mgr.clear();
+
+        let models = mgr.models();
+        assert!(!models.contains_key("grok-private"));
+        assert!(models.contains_key("gpt-5.6-sol"));
+        assert_eq!(
+            models["gpt-5.6-sol"].info.provider,
+            xai_grok_sampling_types::ModelProvider::Codex
+        );
+    }
+
     /// A flip is "campaign-only" iff the preferred changed and either side is an
     /// active campaign default.
     #[test]
@@ -3356,6 +3613,37 @@ mod tests {
         info.supported_in_api = false;
         assert!(info.visible_for_auth(true));
         assert!(!info.visible_for_auth(false));
+    }
+
+    #[test]
+    fn combined_catalog_visibility_uses_each_providers_own_oauth() {
+        let mut xai = ModelEntry {
+            info: config::ModelInfo::fallback("xai-private"),
+            api_key: None,
+            env_key: None,
+            api_base_url: None,
+        };
+        xai.info.supported_in_api = false;
+        let mut codex = ModelEntry {
+            info: config::ModelInfo::fallback("codex-private"),
+            api_key: None,
+            env_key: None,
+            api_base_url: None,
+        };
+        codex.info.provider = xai_grok_sampling_types::ModelProvider::Codex;
+        codex.info.supported_in_api = false;
+        let catalog = IndexMap::from([
+            ("xai-private".to_string(), xai),
+            ("codex-private".to_string(), codex),
+        ]);
+
+        let xai_only = available_models_with_provider_auth(&catalog, true, false);
+        assert!(xai_only.contains_key(&acp::ModelId::new("xai-private")));
+        assert!(!xai_only.contains_key(&acp::ModelId::new("codex-private")));
+
+        let codex_only = available_models_with_provider_auth(&catalog, false, true);
+        assert!(!codex_only.contains_key(&acp::ModelId::new("xai-private")));
+        assert!(codex_only.contains_key(&acp::ModelId::new("codex-private")));
     }
 
     // ── duplicate model slug re-keying (A/B experiment "auto" alias) ──

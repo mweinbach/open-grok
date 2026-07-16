@@ -3120,23 +3120,48 @@ pub fn resolve_model_list(
     cfg: &Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
+    resolve_model_list_with_codex(cfg, prefetched, None, false)
+}
+
+/// Assemble the combined provider catalog. The xAI and Codex remote catalogs
+/// are deliberately separate: each may replace only its own embedded
+/// partition, and user `[model.*]` entries are applied after both providers.
+///
+/// `codex_authoritative` matches codex-rs' ChatGPT-account behavior. A usable
+/// remote response containing list-visible models replaces the embedded Codex
+/// partition; an empty/hidden-only response is merged so the embedded fallback
+/// remains available.
+pub fn resolve_model_list_with_codex(
+    cfg: &Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    codex_remote: Option<IndexMap<String, ModelEntry>>,
+    codex_authoritative: bool,
+) -> IndexMap<String, ModelEntry> {
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
+    let defaults = default_model_entries(&cfg.endpoints);
     if cfg.endpoints.has_custom_endpoint() {
         tracing::info!(
             models_base_url = ? cfg.endpoints.models_base_url, models_list_url = ? cfg
             .endpoints.models_list_url,
-            "custom models endpoint active, skipping built-in defaults",
+            "custom models endpoint active, skipping built-in xAI defaults",
+        );
+        resolved.extend(
+            defaults
+                .iter()
+                .filter(|(_, entry)| entry.info.provider == ModelProvider::Codex)
+                .map(|(key, entry)| (key.clone(), entry.clone())),
         );
     } else {
-        let defaults = default_model_entries(&cfg.endpoints);
         tracing::debug!(count = defaults.len(), "loaded default models");
-        resolved.extend(defaults);
+        resolved.extend(defaults.clone());
     }
     if let Some(mut prefetched) = prefetched {
         tracing::debug!(count = prefetched.len(), "loaded prefetched models");
         let default_cw = DEFAULT_CONTEXT_WINDOW;
         for (key, entry) in prefetched.iter_mut() {
-            let donor = resolved.get(key);
+            let donor = resolved
+                .get(key)
+                .filter(|donor| donor.info.provider == entry.info.provider);
             if let Some(donor) = donor {
                 if entry.info.context_window.get() == default_cw
                     && donor.info.context_window.get() != default_cw
@@ -3165,7 +3190,102 @@ pub fn resolve_model_list(
                 );
             }
         }
-        resolved = prefetched;
+        // A remote xAI catalog is authoritative for xAI entries, but it does
+        // not know about Open Grok's independent ChatGPT Codex account. Keep
+        // the built-in Codex family beside whatever the xAI endpoint returns.
+        let mut merged: IndexMap<String, ModelEntry> = resolved
+            .into_iter()
+            .filter(|(_, entry)| entry.info.provider == ModelProvider::Codex)
+            .collect();
+        for (key, entry) in prefetched {
+            if merged
+                .get(&key)
+                .is_some_and(|existing| existing.info.provider == ModelProvider::Codex)
+            {
+                let mut qualified = format!("xai:{key}");
+                let mut suffix = 2usize;
+                while merged.contains_key(&qualified) {
+                    qualified = format!("xai:{key}:{suffix}");
+                    suffix += 1;
+                }
+                tracing::warn!(
+                    model_key = %key,
+                    qualified_key = %qualified,
+                    "xAI model key collides with reserved Codex slug; qualifying xAI key"
+                );
+                merged.insert(qualified, entry);
+            } else {
+                merged.insert(key, entry);
+            }
+        }
+        resolved = merged;
+    }
+    if let Some(mut codex_remote) = codex_remote {
+        tracing::debug!(
+            count = codex_remote.len(),
+            authoritative = codex_authoritative,
+            "loaded remote Codex models"
+        );
+
+        // The remote schema can omit fields that are part of Open Grok's
+        // execution contract. Inherit only absent/default-valued fields from
+        // the matching embedded entry before applying the live overlay.
+        let default_cw = DEFAULT_CONTEXT_WINDOW;
+        for (key, entry) in codex_remote.iter_mut() {
+            if entry.info.provider != ModelProvider::Codex {
+                tracing::warn!(model_key = %key, "ignoring non-Codex entry in Codex catalog");
+                continue;
+            }
+            if let Some(donor) = defaults
+                .get(key)
+                .filter(|donor| donor.info.provider == entry.info.provider)
+            {
+                if entry.info.context_window.get() == default_cw
+                    && donor.info.context_window.get() != default_cw
+                {
+                    entry.info.context_window = donor.info.context_window;
+                }
+                if entry.info.agent_type == DEFAULT_AGENT_TYPE {
+                    entry.info.agent_type.clone_from(&donor.info.agent_type);
+                }
+                if entry.info.api_backend == ApiBackend::default() {
+                    entry.info.api_backend.clone_from(&donor.info.api_backend);
+                }
+                if entry.info.tool_mode.is_none() {
+                    entry.info.tool_mode = donor.info.tool_mode;
+                }
+            }
+        }
+        codex_remote.retain(|_, entry| entry.info.provider == ModelProvider::Codex);
+
+        if codex_authoritative && !codex_remote.is_empty() {
+            resolved.retain(|_, entry| entry.info.provider != ModelProvider::Codex);
+        }
+
+        for (key, entry) in codex_remote {
+            // Official Codex slugs retain their bare catalog keys so
+            // `/model gpt-…` remains stable. Preserve an unlikely conflicting
+            // xAI entry under an explicit provider-qualified key.
+            if resolved
+                .get(&key)
+                .is_some_and(|existing| existing.info.provider != ModelProvider::Codex)
+                && let Some(existing) = resolved.shift_remove(&key)
+            {
+                let mut qualified = format!("xai:{key}");
+                let mut suffix = 2usize;
+                while resolved.contains_key(&qualified) {
+                    qualified = format!("xai:{key}:{suffix}");
+                    suffix += 1;
+                }
+                tracing::warn!(
+                    model_key = %key,
+                    qualified_key = %qualified,
+                    "provider model-key collision; reserving bare key for Codex"
+                );
+                resolved.insert(qualified, existing);
+            }
+            resolved.insert(key, entry);
+        }
     }
     for (key, model_override) in &cfg.config_models {
         let had_base = resolved.contains_key(key);
@@ -3193,25 +3313,35 @@ pub fn resolve_model_list(
     }
     {
         let default_cw = DEFAULT_CONTEXT_WINDOW;
-        let donors: std::collections::HashMap<
-            String,
-            (std::num::NonZeroU64, ApiBackend, Option<ToolMode>),
-        > = resolved
+        type DonorMetadata = (std::num::NonZeroU64, ApiBackend, Option<ToolMode>);
+        let mut xai_donors: std::collections::HashMap<String, DonorMetadata> =
+            std::collections::HashMap::new();
+        let mut codex_donors: std::collections::HashMap<String, DonorMetadata> =
+            std::collections::HashMap::new();
+        for entry in resolved
             .values()
-            .filter(|e| e.info.context_window.get() != default_cw)
-            .map(|e| {
+            .filter(|entry| entry.info.context_window.get() != default_cw)
+        {
+            let provider_donors = match entry.info.provider {
+                ModelProvider::Xai => &mut xai_donors,
+                ModelProvider::Codex => &mut codex_donors,
+            };
+            provider_donors.insert(
+                entry.info.model.clone(),
                 (
-                    e.info.model.clone(),
-                    (
-                        e.info.context_window,
-                        e.info.api_backend.clone(),
-                        e.info.tool_mode,
-                    ),
-                )
-            })
-            .collect();
+                    entry.info.context_window,
+                    entry.info.api_backend.clone(),
+                    entry.info.tool_mode,
+                ),
+            );
+        }
         for entry in resolved.values_mut() {
-            if let Some((donor_cw, donor_backend, donor_tool_mode)) = donors.get(&entry.info.model)
+            let provider_donors = match entry.info.provider {
+                ModelProvider::Xai => &xai_donors,
+                ModelProvider::Codex => &codex_donors,
+            };
+            if let Some((donor_cw, donor_backend, donor_tool_mode)) =
+                provider_donors.get(&entry.info.model)
             {
                 if entry.info.context_window.get() == default_cw {
                     tracing::debug!(
@@ -3400,11 +3530,19 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
             let context_window = m
                 .context_window
                 .unwrap_or_else(|| NonZeroU64::new(200_000).expect("200000 is non-zero"));
+            let (base_url, api_base_url) = if m.provider == ModelProvider::Codex {
+                (crate::codex_auth::CODEX_INFERENCE_BASE_URL.to_owned(), None)
+            } else {
+                (
+                    endpoints.resolve_inference_base_url(),
+                    Some(endpoints.xai_api_base_url.clone()),
+                )
+            };
             let config = ModelEntryConfig {
                 id: m.id,
                 model: m.model,
-                base_url: endpoints.resolve_inference_base_url(),
-                api_base_url: Some(endpoints.xai_api_base_url.clone()),
+                base_url,
+                api_base_url,
                 name: m.name,
                 description: m.description,
                 context_window,
@@ -3916,6 +4054,21 @@ impl ModelInfo {
     /// | false    | false              | visible    | **hidden**   |
     pub fn visible_for_auth(&self, is_session_auth: bool) -> bool {
         !self.hidden && (is_session_auth || self.supported_in_api)
+    }
+
+    /// Provider-aware picker visibility for the combined Open Grok catalog.
+    /// A ChatGPT Codex login is independent from xAI session auth, so one
+    /// provider's OAuth state must never unlock or hide the other's models.
+    pub fn visible_for_provider_auth(
+        &self,
+        has_xai_session: bool,
+        has_codex_session: bool,
+    ) -> bool {
+        let has_provider_session = match self.provider {
+            ModelProvider::Xai => has_xai_session,
+            ModelProvider::Codex => has_codex_session,
+        };
+        !self.hidden && (has_provider_session || self.supported_in_api)
     }
 }
 /// Flat struct so credential and endpoint fields coexist after deep-merge.
@@ -4779,7 +4932,7 @@ pub fn sampling_config_for_model(
             .or_insert_with(|| crate::codex_auth::CODEX_ORIGINATOR.to_owned());
         extra_headers
             .entry("version".to_owned())
-            .or_insert_with(|| xai_grok_version::VERSION.to_owned());
+            .or_insert_with(crate::codex_models::codex_client_version);
     }
     if uses_codex_oauth {
         crate::codex_auth::set_oauth_identity_anchor(
@@ -5005,6 +5158,16 @@ pub fn to_acp_model_info(
                 map.insert(
                     "agentType".to_string(),
                     serde_json::Value::String(info.agent_type.clone()),
+                );
+                map.insert(
+                    "provider".to_string(),
+                    serde_json::Value::String(
+                        match info.provider {
+                            ModelProvider::Codex => "codex",
+                            ModelProvider::Xai => "xai",
+                        }
+                        .to_string(),
+                    ),
                 );
                 if let Some(tool_mode) = info.tool_mode {
                     let value = match tool_mode {
@@ -6557,7 +6720,7 @@ reasoning_effort = "low"
         );
         assert_eq!(
             sampling.extra_headers.get("version").map(String::as_str),
-            Some(xai_grok_version::VERSION)
+            Some(crate::codex_models::codex_client_version().as_str())
         );
 
         let byok_sampling = sampling_config_for_model(
@@ -11039,6 +11202,15 @@ default = "grok-4.5"
             api_base_url: None,
         }
     }
+
+    fn codex_model_entry(slug: &str, context_window: u64) -> ModelEntry {
+        let mut entry = prefetch_model_entry(slug, context_window, ApiBackend::Responses);
+        entry.info.provider = ModelProvider::Codex;
+        entry.info.base_url = crate::codex_auth::CODEX_INFERENCE_BASE_URL.to_string();
+        entry.info.agent_type = "codex".to_string();
+        entry.info.tool_mode = Some(ToolMode::CodeModeOnly);
+        entry
+    }
     #[test]
     fn global_extra_headers_apply_to_model_without_override() {
         let dm = crate::models::default_model();
@@ -11395,10 +11567,12 @@ default = "grok-4.5"
         let resolved = resolve_model_list(&cfg, Some(p));
         let sess: Vec<_> = resolved
             .values()
+            .filter(|e| e.info.provider == ModelProvider::Xai)
             .filter(|e| e.visible_for_auth(true))
             .collect();
         let api: Vec<_> = resolved
             .values()
+            .filter(|e| e.info.provider == ModelProvider::Xai)
             .filter(|e| e.visible_for_auth(false))
             .collect();
         assert_eq!(sess.len(), 1);
@@ -11425,10 +11599,141 @@ default = "grok-4.5"
         assert!(!resolved.contains_key("grok-build"));
     }
     #[test]
-    fn resolve_model_list_empty_prefetch_yields_empty_base() {
+    fn resolve_model_list_empty_xai_prefetch_preserves_codex_fallback() {
         let cfg = Config::default();
         let resolved = resolve_model_list(&cfg, Some(IndexMap::new()));
-        assert!(resolved.is_empty());
+        assert!(!resolved.contains_key("grok-build"));
+        assert!(resolved.contains_key("gpt-5.6-sol"));
+        assert!(
+            resolved
+                .values()
+                .all(|entry| entry.info.provider == ModelProvider::Codex)
+        );
+    }
+    #[test]
+    fn embedded_codex_fallback_uses_codex_transport_and_harness() {
+        let defaults = default_model_entries(&EndpointsConfig::default());
+        for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let entry = defaults.get(slug).expect("embedded Codex fallback");
+            assert_eq!(entry.info.provider, ModelProvider::Codex);
+            assert_eq!(
+                entry.info.base_url,
+                crate::codex_auth::CODEX_INFERENCE_BASE_URL
+            );
+            assert!(entry.api_base_url.is_none());
+            assert_eq!(entry.info.context_window.get(), 353_000);
+            assert_eq!(entry.info.agent_type, "codex");
+            assert_eq!(entry.info.tool_mode, Some(ToolMode::CodeModeOnly));
+            assert_eq!(entry.info.api_backend, ApiBackend::Responses);
+            assert!(
+                !entry.info.supported_in_api,
+                "embedded Codex fallbacks require a Codex OAuth session"
+            );
+        }
+    }
+    #[test]
+    fn authoritative_codex_catalog_replaces_only_codex_partition() {
+        let cfg = Config::default();
+        let mut xai = IndexMap::new();
+        xai.insert(
+            "grok-live".to_string(),
+            prefetch_model_entry("grok-live", 500_000, ApiBackend::Responses),
+        );
+        let mut codex = IndexMap::new();
+        codex.insert(
+            "gpt-next".to_string(),
+            codex_model_entry("gpt-next", 353_400),
+        );
+
+        let resolved = resolve_model_list_with_codex(&cfg, Some(xai), Some(codex), true);
+        assert!(resolved.contains_key("grok-live"));
+        assert!(resolved.contains_key("gpt-next"));
+        assert!(!resolved.contains_key("gpt-5.6-sol"));
+        assert_eq!(resolved["gpt-next"].info.context_window.get(), 353_400);
+    }
+    #[test]
+    fn non_authoritative_codex_catalog_merges_with_embedded_fallback() {
+        let cfg = Config::default();
+        let mut codex = IndexMap::new();
+        codex.insert(
+            "gpt-next".to_string(),
+            codex_model_entry("gpt-next", 353_400),
+        );
+
+        let resolved = resolve_model_list_with_codex(&cfg, None, Some(codex), false);
+        assert!(resolved.contains_key("grok-build"));
+        assert!(resolved.contains_key("gpt-5.6-sol"));
+        assert!(resolved.contains_key("gpt-next"));
+    }
+    #[test]
+    fn config_model_override_beats_live_codex_catalog() {
+        let mut cfg = Config::default();
+        cfg.config_models.insert(
+            "gpt-5.6-sol".to_string(),
+            ConfigModelOverride {
+                context_window: Some(123_456),
+                description: Some("operator override".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut codex = IndexMap::new();
+        codex.insert(
+            "gpt-5.6-sol".to_string(),
+            codex_model_entry("gpt-5.6-sol", 353_400),
+        );
+
+        let resolved = resolve_model_list_with_codex(&cfg, None, Some(codex), true);
+        let sol = resolved.get("gpt-5.6-sol").expect("Sol model");
+        assert_eq!(sol.info.context_window.get(), 123_456);
+        assert_eq!(sol.info.description.as_deref(), Some("operator override"));
+    }
+    #[test]
+    fn codex_keeps_bare_slug_when_xai_catalog_key_collides() {
+        let cfg = Config::default();
+        let mut xai = IndexMap::new();
+        xai.insert(
+            "gpt-5.6-sol".to_string(),
+            prefetch_model_entry("xai-routed-sol", 200_000, ApiBackend::Responses),
+        );
+        let mut codex = IndexMap::new();
+        codex.insert(
+            "gpt-5.6-sol".to_string(),
+            codex_model_entry("gpt-5.6-sol", 353_400),
+        );
+
+        let resolved = resolve_model_list_with_codex(&cfg, Some(xai), Some(codex), true);
+        assert_eq!(resolved["gpt-5.6-sol"].info.provider, ModelProvider::Codex);
+        assert_eq!(
+            resolved["xai:gpt-5.6-sol"].info.provider,
+            ModelProvider::Xai
+        );
+    }
+    #[test]
+    fn matching_slug_metadata_does_not_cross_provider_boundary() {
+        let cfg = Config::default();
+        let default_cw = DEFAULT_CONTEXT_WINDOW;
+        let mut xai = IndexMap::new();
+        xai.insert(
+            "gpt-5.6-sol".to_string(),
+            prefetch_model_entry("gpt-5.6-sol", default_cw, ApiBackend::ChatCompletions),
+        );
+
+        let resolved = resolve_model_list(&cfg, Some(xai));
+        let xai = resolved
+            .get("xai:gpt-5.6-sol")
+            .expect("colliding xAI model is provider-qualified");
+        let codex = resolved
+            .get("gpt-5.6-sol")
+            .expect("embedded Codex fallback keeps the bare slug");
+
+        assert_eq!(xai.info.provider, ModelProvider::Xai);
+        assert_eq!(xai.info.context_window.get(), default_cw);
+        assert_eq!(xai.info.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(xai.info.tool_mode, None);
+        assert_eq!(codex.info.provider, ModelProvider::Codex);
+        assert_eq!(codex.info.context_window.get(), 353_000);
+        assert_eq!(codex.info.api_backend, ApiBackend::Responses);
+        assert_eq!(codex.info.tool_mode, Some(ToolMode::CodeModeOnly));
     }
     /// Regression: enterprise managed config aliases grok-build to their own
     /// endpoint with env_key. The bundled grok-build has supported_in_api=false.

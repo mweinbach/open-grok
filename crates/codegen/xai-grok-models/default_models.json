@@ -13,6 +13,60 @@
       "top_p": 0.95,
       "api_backend": "responses",
       "supported_in_api": false
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "name": "GPT-5.6 Sol",
+      "description": "Latest frontier agentic coding model",
+      "context_window": 353000,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "reasoning_efforts": [
+        { "value": "low", "default": true },
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "name": "GPT-5.6 Terra",
+      "description": "Balanced agentic coding model for everyday work",
+      "context_window": 353000,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "reasoning_efforts": [
+        "low",
+        { "value": "medium", "default": true },
+        "high",
+        "xhigh"
+      ]
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "name": "GPT-5.6 Luna",
+      "description": "Fast and affordable agentic coding model",
+      "context_window": 353000,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "reasoning_efforts": [
+        "low",
+        { "value": "medium", "default": true },
+        "high",
+        "xhigh"
+      ]
     }
   ]
 }
