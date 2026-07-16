@@ -1105,7 +1105,7 @@ impl MvpAgent {
             model,
             session.as_ref().map(|a| a.key.as_str()),
         );
-        if model.info().provider != xai_grok_sampling_types::ModelProvider::Codex
+        if model.info().provider.profile().session_auth.is_xai()
             && matches!(preferred, Some(crate ::auth::PreferredAuthMethod::Oidc))
             && !model.has_own_credentials()
             && credentials.auth_type == xai_chat_state::AuthType::ApiKey
@@ -1118,7 +1118,7 @@ impl MvpAgent {
             self.cfg.borrow().grok_com_config.api_key_auth_disabled(),
             session.as_ref().map(|a| a.key.as_str()),
         );
-        if model.info().provider != xai_grok_sampling_types::ModelProvider::Codex
+        if model.info().provider.profile().session_auth.is_xai()
             && !has_session_key && credentials.auth_type == xai_chat_state::AuthType::ApiKey
             && !model.has_own_credentials() && self.is_session_based_auth()
         {
@@ -1133,7 +1133,7 @@ impl MvpAgent {
             );
             credentials.auth_type = xai_chat_state::AuthType::SessionToken;
         }
-        if model.info().provider != xai_grok_sampling_types::ModelProvider::Codex
+        if model.info().provider.profile().session_auth.is_xai()
             && !has_session_key && !model.has_own_credentials()
         {
             tracing::warn!(
@@ -1256,7 +1256,7 @@ impl MvpAgent {
             let sampling_config = self.sampling_config.borrow();
             (sampling_config.provider, sampling_config.api_key.clone())
         };
-        if provider == xai_grok_sampling_types::ModelProvider::Xai {
+        if provider.profile().session_auth.is_xai() {
             return api_key;
         }
         self.auth_manager
@@ -2628,7 +2628,7 @@ impl MvpAgent {
                 .await
                 .map(|config| config.provider)
                 .unwrap_or_default();
-            if provider == xai_grok_sampling_types::ModelProvider::Xai {
+            if provider.profile().allows_xai_services() {
                 self.trace_upload_config_with_reason().await
             } else {
                 (
@@ -3283,17 +3283,28 @@ impl MvpAgent {
             );
         // Authenticate the effective model after agent-profile pinning. The
         // preliminary/default model may belong to the other provider.
-        if sampling_config.provider == xai_grok_sampling_types::ModelProvider::Codex {
-            if !crate::codex_auth::sampling_config_has_credentials(&sampling_config) {
-                return Err(crate::codex_auth::auth_required_error());
+        match sampling_config.provider.profile().session_auth {
+            xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => {
+                if sampling_config.api_key.is_none() || sampling_config.bearer_resolver.is_some() {
+                    return Err(acp::Error::auth_required()
+                        .data("the selected provider requires a model API key"));
+                }
             }
-            // Keep sharing the agent's live xAI auth cell even while it is
-            // empty. Codex provenance lives in the resolved sampler, and a
-            // later xAI login can update this same running session if the user
-            // switches providers. Existing xAI auth never satisfies this
-            // provider-local admission check.
-        } else if auth_method_id.load().is_none() {
-            return Err(acp::Error::auth_required().data("no auth method id provided"));
+            xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth => {
+                if !crate::codex_auth::sampling_config_has_credentials(&sampling_config) {
+                    return Err(crate::codex_auth::auth_required_error());
+                }
+                // Keep sharing the agent's live xAI auth cell even while it is
+                // empty. Codex provenance lives in the resolved sampler, and a
+                // later xAI login can update this same running session if the user
+                // switches providers. Existing xAI auth never satisfies this
+                // provider-local admission check.
+            }
+            xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
+                if auth_method_id.load().is_none() {
+                    return Err(acp::Error::auth_required().data("no auth method id provided"));
+                }
+            }
         }
         let max_turns = {
             let cfg = self.cfg.borrow();
@@ -3489,10 +3500,12 @@ impl MvpAgent {
                 alpha_test_key: self.alpha_test_key(),
                 client_version: sampling_config.client_version.clone(),
             };
-            let attribution_callback: Option<
-                xai_grok_sampler::SharedAttributionCallback,
-            > = (sampling_config.provider
-                != xai_grok_sampling_types::ModelProvider::Codex)
+            let attribution_callback: Option<xai_grok_sampler::SharedAttributionCallback> =
+                sampling_config
+                    .provider
+                    .profile()
+                    .session_auth
+                    .is_xai()
                 .then(|| {
                     crate::auth::attribution::ShellAttribution::new(
                         self.auth_manager.clone(),

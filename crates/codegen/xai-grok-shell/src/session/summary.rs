@@ -116,8 +116,13 @@ impl SummaryGenerator {
         bearer_resolver: xai_grok_sampler::SharedBearerResolver,
     ) {
         if !matches!(self.state, State::Idle)
-            || self.config.sampling_client.provider()
-                != xai_grok_sampling_types::ModelProvider::Codex
+            || !self
+                .config
+                .sampling_client
+                .provider()
+                .profile()
+                .session_auth
+                .is_codex()
         {
             return;
         }

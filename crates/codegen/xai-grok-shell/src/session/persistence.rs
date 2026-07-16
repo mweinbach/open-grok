@@ -1453,9 +1453,14 @@ impl ProviderBoundary {
         }
     }
 
-    /// Observe a provider and return true only for the first Codex transition.
+    /// Observe a provider and return true only when it first closes the xAI
+    /// service boundary.
+    ///
+    /// Today Codex is the only built-in provider whose profile denies xAI-only
+    /// exports. Keeping the decision on the profile avoids growing another
+    /// provider-specific boolean when more providers are added.
     pub(crate) fn observe(&self, provider: ModelProvider) -> bool {
-        provider == ModelProvider::Codex
+        !provider.profile().allows_xai_services()
             && self
                 .ever_used_codex
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1536,10 +1541,10 @@ impl SessionPersistence {
             self.relay_sync.take();
             self.registry_title_sync.take();
         }
-        if provider == ModelProvider::Codex
+        if !provider.profile().allows_xai_services()
             && let Err(e) = self.storage.mark_ever_used_codex(&self.info).await
         {
-            tracing::warn!(?e, "failed to persist Codex provider boundary");
+            tracing::warn!(?e, "failed to persist non-xAI provider boundary");
         }
     }
 
@@ -2247,7 +2252,7 @@ async fn initialize_provider_boundary(
 ) -> io::Result<ProviderBoundary> {
     let boundary = ProviderBoundary::new(summary.ever_used_codex);
     boundary.observe(provider);
-    if provider == ModelProvider::Codex && !summary.ever_used_codex {
+    if !provider.profile().allows_xai_services() && !summary.ever_used_codex {
         storage.mark_ever_used_codex(info).await?;
         summary.ever_used_codex = true;
     }

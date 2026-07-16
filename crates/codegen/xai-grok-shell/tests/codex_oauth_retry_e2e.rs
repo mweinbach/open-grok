@@ -273,6 +273,7 @@ default = "codex-test"
     command
         .env("OPENGROK_HOME", &grok_home)
         .env("GROK_CODEX_AUTH_BASE_URL", &oauth.base_url)
+        .env("GROK_CODEX_INFERENCE_BASE_URL", server.url())
         .env_remove("XAI_API_KEY")
         .env_remove("GROK_LEADER_SOCKET");
 

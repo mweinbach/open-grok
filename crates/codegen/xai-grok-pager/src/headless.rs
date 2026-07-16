@@ -519,37 +519,77 @@ fn auth_required_message(interactive: bool) -> String {
     }
 }
 
-/// Resolve a selected Codex model's provider-local authentication before the
-/// legacy ACP/xAI auth gate runs. Codex credentials intentionally stay out of
-/// ACP auth-method ordering, so a Codex-only headless session must bypass that
-/// gate after proving it has either an explicit model key or isolated OAuth.
-fn selected_codex_auth(
+/// Resolve non-xAI provider-local authentication before the legacy ACP/xAI
+/// auth gate runs. Provider-owned credentials intentionally stay out of ACP
+/// auth-method ordering.
+fn selected_provider_auth(
     config: &AgentConfig,
     requested_model: Option<&str>,
+    prefer_credentialed_slug: bool,
 ) -> Option<anyhow::Result<bool>> {
     let model_id = requested_model.or(config.models.default.as_deref())?;
     let models = xai_grok_shell::agent::config::resolve_model_list(config, None);
-    let model = models
-        .get(model_id)
-        .or_else(|| models.values().find(|entry| entry.info().model == model_id))?;
-    if model.info().provider != xai_grok_shell::sampling::types::ModelProvider::Codex {
-        return None;
+    let exact = models.get(model_id);
+    let credentialed_slug = models
+        .values()
+        .rev()
+        .find(|entry| entry.info().model == model_id && entry.has_own_credentials());
+    let named = models
+        .values()
+        .find(|entry| entry.info().name.as_deref() == Some(model_id));
+    let matching_slug = models.values().find(|entry| entry.info().model == model_id);
+    let exact_has_provider_auth = exact.is_some_and(|entry| {
+        if entry.has_own_credentials() {
+            return true;
+        }
+        match entry.info().provider.profile().session_auth {
+            // xAI still uses the legacy ACP auth gate below. Keep its exact
+            // row stable rather than trying to pre-authorize an alias here.
+            xai_grok_shell::sampling::types::BuiltInSessionAuthKind::XaiSession => true,
+            xai_grok_shell::sampling::types::BuiltInSessionAuthKind::ApiKeyOnly => false,
+            xai_grok_shell::sampling::types::BuiltInSessionAuthKind::CodexOAuth => {
+                xai_grok_shell::agent::config::resolve_credentials(entry, None)
+                    .api_key
+                    .is_some()
+            }
+        }
+    });
+    // A persisted session stores the routing slug, which may also be the key
+    // of an embedded OAuth row. If a configured BYOK alias carries that same
+    // slug, it is the selectable row when OAuth is absent and must win for
+    // resume. Explicit CLI/profile keys keep exact-key semantics.
+    let model = if prefer_credentialed_slug && !exact_has_provider_auth {
+        credentialed_slug.or(exact).or(named).or(matching_slug)
+    } else {
+        exact.or(named).or(matching_slug)
+    }?;
+    match model.info().provider.profile().session_auth {
+        xai_grok_shell::sampling::types::BuiltInSessionAuthKind::XaiSession => None,
+        xai_grok_shell::sampling::types::BuiltInSessionAuthKind::ApiKeyOnly => {
+            Some(if model.has_own_credentials() {
+                Ok(true)
+            } else {
+                Err(anyhow::anyhow!(
+                    "The selected provider requires an API key. Configure `api_key` or `env_key` \
+                     on this model."
+                ))
+            })
+        }
+        xai_grok_shell::sampling::types::BuiltInSessionAuthKind::CodexOAuth => {
+            if model.has_own_credentials() {
+                return Some(Ok(true));
+            }
+            let credentials = xai_grok_shell::agent::config::resolve_credentials(model, None);
+            Some(if credentials.api_key.is_some() {
+                Ok(false)
+            } else {
+                Err(anyhow::anyhow!(
+                    "Not signed in to Codex. Run `open-grok login --codex --device-auth` for a \
+                         headless login, or configure an API key on this model."
+                ))
+            })
+        }
     }
-    if model.has_own_credentials() {
-        return Some(Ok(true));
-    }
-    Some(match xai_grok_shell::codex_auth::load_credentials() {
-        Ok(Some(_)) => Ok(false),
-        Ok(None) => Err(anyhow::anyhow!(
-            "Not signed in to Codex. Run `open-grok login --codex --device-auth` for a headless \
-             login, or configure an API key on this model."
-        )),
-        Err(error) => Err(anyhow::anyhow!(
-            "Could not read Codex credentials: {}. Run `open-grok login --codex --device-auth` to \
-             reconnect.",
-            error
-        )),
-    })
 }
 
 /// Authenticate using the agent's `defaultAuthMethodId` (source of truth for
@@ -1035,7 +1075,12 @@ pub async fn run_single_turn(
             })
     });
     let auth_model = profile_model.or(explicit_initial_model).or(base_auth_model);
-    let codex_auth_override = selected_codex_auth(&agent_config, auth_model);
+    let prefer_persisted_credentials = options.model.is_none()
+        && profile_model.is_none()
+        && explicit_initial_model.is_none()
+        && persisted_model.is_some();
+    let provider_auth_override =
+        selected_provider_auth(&agent_config, auth_model, prefer_persisted_credentials);
 
     // No agent-level hub client URL (gateway-only cloud; workspace provider
     // hub_url lives on `open-grok workspace` / WorkspaceStartArgs only).
@@ -1101,7 +1146,7 @@ pub async fn run_single_turn(
     // Authenticate using agent defaultAuthMethodId (preferred_method pin).
     let t_auth = Instant::now();
     let default_auth_method_id = crate::acp::parse_default_auth_method_id(init_resp.meta.as_ref());
-    let auth_result = match codex_auth_override {
+    let auth_result = match provider_auth_override {
         Some(result) => result,
         None => {
             authenticate(

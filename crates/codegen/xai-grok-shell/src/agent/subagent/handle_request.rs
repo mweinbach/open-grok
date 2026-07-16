@@ -490,7 +490,10 @@ pub(crate) async fn handle_subagent_request(
     }
     ctx.provider_boundary
         .observe(effective_sampling_config.provider);
-    if effective_sampling_config.provider == xai_grok_sampling_types::ModelProvider::Codex
+    if !effective_sampling_config
+        .provider
+        .profile()
+        .allows_xai_services()
         && let Some(tx) = &ctx.parent_persistence_tx
     {
         let _ = tx.send(
@@ -602,8 +605,10 @@ pub(crate) async fn handle_subagent_request(
         snapshot_ref: None,
         effective_model_id: Some(effective_model_id.0.to_string()),
     };
-    let child_allows_xai_export = effective_sampling_config.provider
-        == xai_grok_sampling_types::ModelProvider::Xai
+    let child_allows_xai_export = effective_sampling_config
+        .provider
+        .profile()
+        .allows_xai_services()
         && ctx.provider_boundary.allows_xai_export();
     let child_gcs_bucket_url = child_allows_xai_export
         .then(|| ctx.gcs_bucket_url.clone())

@@ -63,7 +63,9 @@ The public command is `open-grok`. It can be installed beside the upstream
 
 The implementation and compatibility contract are documented in
 [`docs/code-mode-port.md`](docs/code-mode-port.md) and
-[`docs/codex-provider-port.md`](docs/codex-provider-port.md).
+[`docs/codex-provider-port.md`](docs/codex-provider-port.md). The extension
+contract for adding providers, wire formats, and API-key or OAuth credentials
+is in [`docs/provider-architecture.md`](docs/provider-architecture.md).
 
 ## Install
 

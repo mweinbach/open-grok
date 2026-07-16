@@ -9,6 +9,9 @@ impl xai_grok_sampler::BearerResolver for TestParentBearerResolver {
     fn current_bearer(&self) -> Option<String> {
         Some(self.0.to_string())
     }
+    fn fail_closed_on_missing(&self) -> bool {
+        false
+    }
 }
 #[test]
 fn normalize_forked_context_strips_project_layout() {

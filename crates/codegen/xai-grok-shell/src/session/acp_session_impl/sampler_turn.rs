@@ -56,6 +56,10 @@ impl xai_grok_sampler::BearerResolver for AuthManagerBearerResolver {
     fn current_bearer(&self) -> Option<String> {
         self.0.current_or_expired().map(|auth| auth.key)
     }
+
+    fn fail_closed_on_missing(&self) -> bool {
+        false
+    }
 }
 
 /// Provider-owned resolver for an xAI auxiliary route selected from a Codex
@@ -148,13 +152,19 @@ pub(super) fn turn_auth_refresh_route(
     provider: xai_grok_sampling_types::ModelProvider,
     auth_type: xai_chat_state::AuthType,
 ) -> TurnAuthRefreshRoute {
-    match (provider, auth_type) {
-        (xai_grok_sampling_types::ModelProvider::Codex, xai_chat_state::AuthType::SessionToken) => {
-            TurnAuthRefreshRoute::CodexOAuth
-        }
-        (xai_grok_sampling_types::ModelProvider::Xai, xai_chat_state::AuthType::SessionToken) => {
-            TurnAuthRefreshRoute::XaiSession
-        }
+    match (provider.profile().session_auth, auth_type) {
+        (
+            xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly,
+            xai_chat_state::AuthType::SessionToken,
+        ) => TurnAuthRefreshRoute::ConfigApiKey,
+        (
+            xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth,
+            xai_chat_state::AuthType::SessionToken,
+        ) => TurnAuthRefreshRoute::CodexOAuth,
+        (
+            xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession,
+            xai_chat_state::AuthType::SessionToken,
+        ) => TurnAuthRefreshRoute::XaiSession,
         (_, xai_chat_state::AuthType::ApiKey) => TurnAuthRefreshRoute::ConfigApiKey,
     }
 }
@@ -259,7 +269,7 @@ impl SessionActor {
         tool_name: &str,
         provider: xai_grok_sampling_types::ModelProvider,
     ) -> bool {
-        if provider != xai_grok_sampling_types::ModelProvider::Codex {
+        if provider.profile().allows_xai_services() {
             return true;
         }
         match tool_name {
@@ -429,7 +439,8 @@ impl SessionActor {
         // This is authoritative for prefetched remote-only models that the
         // disk-backed model-facts resolver cannot see.
         let provider = cfg.provider;
-        let use_codex_bearer_resolver = provider == xai_grok_sampling_types::ModelProvider::Codex
+        let profile = provider.profile();
+        let use_codex_bearer_resolver = profile.session_auth.is_codex()
             && creds.auth_type == xai_chat_state::AuthType::SessionToken;
         let codex_bearer_resolver = use_codex_bearer_resolver.then(|| {
             std::sync::Arc::new(crate::codex_auth::CodexBearerResolver::from_headers(
@@ -459,17 +470,23 @@ impl SessionActor {
             max_retries: Some(self.max_retries),
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
             idle_timeout_secs: None,
-            client_identifier: (provider == xai_grok_sampling_types::ModelProvider::Xai)
+            client_identifier: profile
+                .request_metadata
+                .sends_x_grok_headers()
                 .then(|| self.client_identifier.clone())
                 .flatten(),
-            deployment_id: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+            deployment_id: profile
+                .request_metadata
+                .sends_x_grok_headers()
                 .then(|| {
                     crate::managed_config::resolve_deployment_id(
                         crate::managed_config::resolve_deployment_key().as_deref(),
                     )
                 })
                 .flatten(),
-            user_id: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+            user_id: profile
+                .request_metadata
+                .sends_x_grok_headers()
                 .then(|| {
                     self.auth_manager
                         .as_ref()
@@ -479,15 +496,14 @@ impl SessionActor {
                 })
                 .flatten(),
             origin_client: self.origin_client.clone(),
-            attribution_callback: if provider == xai_grok_sampling_types::ModelProvider::Codex {
-                None
-            } else {
-                self.attribution_callback.clone()
-            },
+            attribution_callback: profile
+                .session_auth
+                .is_xai()
+                .then(|| self.attribution_callback.clone())
+                .flatten(),
             bearer_resolver: if use_codex_bearer_resolver {
                 codex_bearer_resolver
-            } else if provider == xai_grok_sampling_types::ModelProvider::Xai && use_bearer_resolver
-            {
+            } else if profile.session_auth.is_xai() && use_bearer_resolver {
                 self.auth_manager
                     .as_ref()
                     .map(|am| -> xai_grok_sampler::SharedBearerResolver {
@@ -859,7 +875,10 @@ impl SessionActor {
         message: &str,
         provider: xai_grok_sampling_types::ModelProvider,
     ) {
-        let auth = (provider == xai_grok_sampling_types::ModelProvider::Xai)
+        let auth = provider
+            .profile()
+            .session_auth
+            .is_xai()
             .then(|| {
                 self.auth_manager
                     .as_ref()

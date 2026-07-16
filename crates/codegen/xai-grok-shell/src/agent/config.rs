@@ -3495,6 +3495,10 @@ pub fn effective_classifier_supports_re(
 struct DefaultModelJson {
     id: Option<String>,
     model: String,
+    /// Required for embedded providers that do not use a built-in session
+    /// endpoint; optional for the first-party xAI and Codex profiles.
+    base_url: Option<String>,
+    api_base_url: Option<String>,
     name: Option<String>,
     description: Option<String>,
     context_window: Option<NonZeroU64>,
@@ -3554,13 +3558,30 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
             let context_window = m
                 .context_window
                 .unwrap_or_else(|| NonZeroU64::new(200_000).expect("200000 is non-zero"));
-            let (base_url, api_base_url) = if m.provider == ModelProvider::Codex {
-                (crate::codex_auth::CODEX_INFERENCE_BASE_URL.to_owned(), None)
-            } else {
-                (
-                    endpoints.resolve_inference_base_url(),
-                    Some(endpoints.xai_api_base_url.clone()),
-                )
+            let (base_url, api_base_url) = match m.provider.profile().session_auth {
+                xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => (
+                    m.base_url.clone().unwrap_or_else(|| {
+                        panic!(
+                            "default_models.json: API-key-only model `{}` requires `base_url`",
+                            m.model
+                        )
+                    }),
+                    m.api_base_url.clone(),
+                ),
+                xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => (
+                    m.base_url
+                        .clone()
+                        .unwrap_or_else(|| endpoints.resolve_inference_base_url()),
+                    m.api_base_url
+                        .clone()
+                        .or_else(|| Some(endpoints.xai_api_base_url.clone())),
+                ),
+                xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth => (
+                    m.base_url
+                        .clone()
+                        .unwrap_or_else(crate::codex_auth::inference_base_url),
+                    m.api_base_url.clone(),
+                ),
             };
             let config = ModelEntryConfig {
                 id: m.id,
@@ -4124,9 +4145,10 @@ impl ModelInfo {
         has_xai_session: bool,
         has_codex_session: bool,
     ) -> bool {
-        let has_provider_session = match self.provider {
-            ModelProvider::Xai => has_xai_session,
-            ModelProvider::Codex => has_codex_session,
+        let has_provider_session = match self.provider.profile().session_auth {
+            xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => false,
+            xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => has_xai_session,
+            xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth => has_codex_session,
         };
         !self.hidden && (has_provider_session || self.supported_in_api)
     }
@@ -4546,10 +4568,24 @@ pub struct ResolvedCredentials {
 /// identity is authoritative even when a remote-only model has no matching
 /// disk entry or collides with stale xAI model facts.
 pub fn effective_auth_scheme(provider: ModelProvider, configured: AuthScheme) -> AuthScheme {
-    if provider == ModelProvider::Codex {
+    if provider.profile().session_auth.is_codex() {
         AuthScheme::Bearer
     } else {
         configured
+    }
+}
+
+/// Whether a built-in session credential may be sent to this endpoint.
+/// Explicit model-owned API keys are handled before this gate.
+fn trusted_built_in_session_endpoint(provider: ModelProvider, base_url: &str) -> bool {
+    match provider.profile().session_auth {
+        xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => false,
+        xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
+            crate::util::is_first_party_xai_url(base_url)
+        }
+        xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth => {
+            crate::codex_auth::is_trusted_inference_base_url(base_url)
+        }
     }
 }
 /// First usable BYOK credential: a non-empty (trimmed) api_key, else the first
@@ -4576,50 +4612,103 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
-    } else if info.provider == ModelProvider::Codex {
-        let credential = crate::codex_auth::load_credentials()
-            .map_err(|error| {
-                tracing::warn!(%error, "could not read isolated Codex OAuth credentials");
-                error
-            })
-            .ok()
-            .flatten();
-        (
-            credential.map(|credential| credential.access_token),
-            if info.base_url.trim().is_empty() {
-                crate::codex_auth::CODEX_INFERENCE_BASE_URL.to_owned()
-            } else {
-                info.base_url.clone()
-            },
-            xai_chat_state::AuthType::SessionToken,
-        )
-    } else if let Some(key) = session_key {
-        (
-            Some(key.to_owned()),
-            info.base_url.clone(),
-            xai_chat_state::AuthType::SessionToken,
-        )
-    } else if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
-        let url = model
-            .api_base_url
-            .clone()
-            .unwrap_or_else(|| info.base_url.clone());
-        (Some(key), url, xai_chat_state::AuthType::ApiKey)
     } else {
-        if let Some(ref env_keys) = model.env_key
-            && !env_keys.is_empty()
-        {
-            tracing::warn!(
-                model = % info.model, env_key = % env_keys,
-                "model has env_key configured but none of the environment variables are set — \
-                 requests will have no API key",
-            );
+        match info.provider.profile().session_auth {
+            xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => {
+                if let Some(ref env_keys) = model.env_key
+                    && !env_keys.is_empty()
+                {
+                    tracing::warn!(
+                        model = % info.model, env_key = % env_keys,
+                        "API-key-only model has no usable configured credential",
+                    );
+                }
+                (
+                    None,
+                    info.base_url.clone(),
+                    xai_chat_state::AuthType::ApiKey,
+                )
+            }
+            xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth => {
+                if !trusted_built_in_session_endpoint(info.provider, &info.base_url) {
+                    tracing::warn!(
+                        model = %info.model,
+                        base_url = %info.base_url,
+                        "refusing to send Codex OAuth credentials to a non-Codex endpoint",
+                    );
+                    return ResolvedCredentials {
+                        api_key: None,
+                        base_url: info.base_url.clone(),
+                        auth_type: xai_chat_state::AuthType::ApiKey,
+                        auth_scheme: effective_auth_scheme(info.provider, info.auth_scheme),
+                    };
+                }
+                let credential = crate::codex_auth::load_credentials()
+                    .map_err(|error| {
+                        tracing::warn!(%error, "could not read isolated Codex OAuth credentials");
+                        error
+                    })
+                    .ok()
+                    .flatten();
+                (
+                    credential.map(|credential| credential.access_token),
+                    if info.base_url.trim().is_empty() {
+                        crate::codex_auth::inference_base_url()
+                    } else {
+                        info.base_url.clone()
+                    },
+                    xai_chat_state::AuthType::SessionToken,
+                )
+            }
+            xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
+                let session_endpoint_trusted =
+                    trusted_built_in_session_endpoint(info.provider, &info.base_url);
+                if let Some(key) = session_key.filter(|_| session_endpoint_trusted) {
+                    (
+                        Some(key.to_owned()),
+                        info.base_url.clone(),
+                        xai_chat_state::AuthType::SessionToken,
+                    )
+                } else if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
+                    let url = model
+                        .api_base_url
+                        .clone()
+                        .unwrap_or_else(|| info.base_url.clone());
+                    if trusted_built_in_session_endpoint(info.provider, &url) {
+                        (Some(key), url, xai_chat_state::AuthType::ApiKey)
+                    } else {
+                        tracing::warn!(
+                            model = %info.model,
+                            base_url = %url,
+                            "refusing to send global xAI credentials to a non-xAI endpoint",
+                        );
+                        (None, url, xai_chat_state::AuthType::ApiKey)
+                    }
+                } else {
+                    if session_key.is_some() && !session_endpoint_trusted {
+                        tracing::warn!(
+                            model = %info.model,
+                            base_url = %info.base_url,
+                            "refusing to send the xAI session credential to a non-xAI endpoint",
+                        );
+                    }
+                    if let Some(ref env_keys) = model.env_key
+                        && !env_keys.is_empty()
+                    {
+                        tracing::warn!(
+                            model = % info.model, env_key = % env_keys,
+                            "model has env_key configured but none of the environment variables are set — \
+                             requests will have no API key",
+                        );
+                    }
+                    (
+                        None,
+                        info.base_url.clone(),
+                        xai_chat_state::AuthType::ApiKey,
+                    )
+                }
+            }
         }
-        (
-            None,
-            info.base_url.clone(),
-            xai_chat_state::AuthType::ApiKey,
-        )
     };
     let auth_scheme = effective_auth_scheme(info.provider, info.auth_scheme);
     tracing::debug!(
@@ -4775,13 +4864,8 @@ pub fn resolve_aux_model_sampling_config(
         // A custom/BYOK auxiliary endpoint must declare its own api_key or
         // env_key; otherwise a cross-provider helper could disclose the xAI
         // session bearer to an arbitrary configured URL.
-        let trusted_provider_endpoint = match entry.info().provider {
-            ModelProvider::Xai => crate::util::is_first_party_xai_url(&entry.info().base_url),
-            ModelProvider::Codex => {
-                let base = entry.info().base_url.trim().trim_end_matches('/');
-                base.is_empty() || base == crate::codex_auth::CODEX_INFERENCE_BASE_URL
-            }
-        };
+        let trusted_provider_endpoint =
+            trusted_built_in_session_endpoint(entry.info().provider, &entry.info().base_url);
         if !trusted_provider_endpoint && !entry.has_own_credentials() {
             tracing::warn!(
                 aux_model = %model_id,
@@ -4792,13 +4876,8 @@ pub fn resolve_aux_model_sampling_config(
             return None;
         }
         let credentials = resolve_credentials_enforced(entry, session_key, disable_api_key_auth);
-        let resolved_endpoint_is_trusted = match entry.info().provider {
-            ModelProvider::Xai => crate::util::is_first_party_xai_url(&credentials.base_url),
-            ModelProvider::Codex => {
-                credentials.base_url.trim().trim_end_matches('/')
-                    == crate::codex_auth::CODEX_INFERENCE_BASE_URL
-            }
-        };
+        let resolved_endpoint_is_trusted =
+            trusted_built_in_session_endpoint(entry.info().provider, &credentials.base_url);
         if !resolved_endpoint_is_trusted && !entry.has_own_credentials() {
             tracing::warn!(
                 aux_model = %model_id,
@@ -4911,7 +4990,11 @@ pub fn stamp_session_local_sampler_fields(
 
     // `client_identifier` produces xAI-specific request metadata and must not
     // be stamped onto OpenAI Codex traffic.
-    cfg.client_identifier = (cfg.provider == ModelProvider::Xai)
+    cfg.client_identifier = cfg
+        .provider
+        .profile()
+        .request_metadata
+        .sends_x_grok_headers()
         .then_some(client_identifier)
         .flatten();
     if shares_session_credential {
@@ -4994,14 +5077,21 @@ pub fn resolve_chat_state_auth_type_for_sampling_config(
     session_key: Option<&str>,
     fallback: xai_chat_state::AuthType,
 ) -> xai_chat_state::AuthType {
-    if config.provider == ModelProvider::Codex {
-        return if config.bearer_resolver.is_some() {
-            xai_chat_state::AuthType::SessionToken
-        } else {
+    match config.provider.profile().session_auth {
+        xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => {
             xai_chat_state::AuthType::ApiKey
-        };
+        }
+        xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth => {
+            if config.bearer_resolver.is_some() {
+                xai_chat_state::AuthType::SessionToken
+            } else {
+                xai_chat_state::AuthType::ApiKey
+            }
+        }
+        xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
+            resolve_chat_state_auth_type(&config.model, session_key, fallback)
+        }
     }
-    resolve_chat_state_auth_type(&config.model, session_key, fallback)
 }
 pub fn sampling_config_for_model(
     model: &ModelEntry,
@@ -5025,7 +5115,7 @@ pub fn sampling_config_for_model(
     let api_backend = info.api_backend.clone();
     // An explicit per-model API key is authoritative even for a Codex model.
     // Only the OAuth-backed path may refresh and replace the bearer token.
-    let uses_codex_oauth = info.provider == ModelProvider::Codex
+    let uses_codex_oauth = info.provider.profile().session_auth.is_codex()
         && credentials.auth_type == xai_chat_state::AuthType::SessionToken;
     let codex_credentials = uses_codex_oauth
         .then(crate::codex_auth::load_credentials)
@@ -5059,7 +5149,11 @@ pub fn sampling_config_for_model(
         auth_scheme: effective_auth_scheme(info.provider, credentials.auth_scheme),
         extra_headers,
         context_window: info.context_window.get(),
-        client_version: (info.provider != ModelProvider::Codex)
+        client_version: info
+            .provider
+            .profile()
+            .request_metadata
+            .sends_x_grok_headers()
             .then_some(client_version)
             .flatten(),
         reasoning_effort: info.reasoning_effort,
@@ -5069,10 +5163,18 @@ pub fn sampling_config_for_model(
         stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
         idle_timeout_secs: None,
         client_identifier: None,
-        deployment_id: (info.provider != ModelProvider::Codex)
+        deployment_id: info
+            .provider
+            .profile()
+            .request_metadata
+            .sends_x_grok_headers()
             .then_some(deployment_id)
             .flatten(),
-        user_id: (info.provider != ModelProvider::Codex)
+        user_id: info
+            .provider
+            .profile()
+            .request_metadata
+            .sends_x_grok_headers()
             .then_some(user_id)
             .flatten(),
         origin_client: None,
@@ -5097,7 +5199,9 @@ pub fn sampling_config_for_model(
 /// `multi_agent_version` field (or its embedded fallback), independently from
 /// the model's reasoning-effort menu.
 pub fn supports_codex_multi_agent_v2(info: &ModelInfo) -> bool {
-    info.provider == ModelProvider::Codex && info.codex_multi_agent_v2
+    info.provider.profile().responses_dialect()
+        == Some(xai_grok_sampling_types::ResponsesDialect::Codex)
+        && info.codex_multi_agent_v2
 }
 
 /// Effective Responses reasoning-summary mode derived from model metadata.
@@ -5106,7 +5210,9 @@ pub fn supports_codex_multi_agent_v2(info: &ModelInfo) -> bool {
 /// catalog value when the selected model advertises parameter support; an
 /// explicit catalog `none` is represented by omission on the wire.
 pub fn model_reasoning_summary(info: &ModelInfo) -> Option<ReasoningSummary> {
-    (info.provider == ModelProvider::Codex && info.supports_reasoning_summary_parameter)
+    (info.provider.profile().responses_dialect()
+        == Some(xai_grok_sampling_types::ResponsesDialect::Codex)
+        && info.supports_reasoning_summary_parameter)
         .then_some(info.default_reasoning_summary)
         .filter(|summary| *summary != ReasoningSummary::None)
 }
@@ -5293,13 +5399,7 @@ pub fn to_acp_model_info(
                 );
                 map.insert(
                     "provider".to_string(),
-                    serde_json::Value::String(
-                        match info.provider {
-                            ModelProvider::Codex => "codex",
-                            ModelProvider::Xai => "xai",
-                        }
-                        .to_string(),
-                    ),
+                    serde_json::Value::String(info.provider.as_str().to_string()),
                 );
                 if let Some(tool_mode) = info.tool_mode {
                     let value = match tool_mode {
@@ -5980,6 +6080,43 @@ reasoning_effort = "low"
         assert_eq!(model.info.base_url, "https://api.example.com/v1");
         assert_eq!(model.api_key, Some("sk-test-key-12345".to_string()));
     }
+
+    #[test]
+    fn built_in_session_credentials_are_scoped_to_provider_endpoints() {
+        let xai_custom = test_model_entry(
+            "custom-xai-route",
+            "https://vendor.example/v1",
+            None,
+            None,
+            None,
+        );
+        let xai_credentials = resolve_credentials(&xai_custom, Some("xai-session-secret"));
+        assert_eq!(xai_credentials.auth_type, xai_chat_state::AuthType::ApiKey);
+        assert!(xai_credentials.api_key.is_none());
+
+        let mut codex_custom = test_model_entry(
+            "custom-codex-route",
+            "https://vendor.example/v1",
+            None,
+            None,
+            None,
+        );
+        codex_custom.info.provider = ModelProvider::Codex;
+        codex_custom.info.api_backend = ApiBackend::Responses;
+        let codex_credentials = resolve_credentials(&codex_custom, None);
+        assert_eq!(
+            codex_credentials.auth_type,
+            xai_chat_state::AuthType::ApiKey
+        );
+        assert!(codex_credentials.api_key.is_none());
+
+        codex_custom.api_key = Some("endpoint-owned-key".to_owned());
+        let explicit = resolve_credentials(&codex_custom, None);
+        assert_eq!(explicit.auth_type, xai_chat_state::AuthType::ApiKey);
+        assert_eq!(explicit.api_key.as_deref(), Some("endpoint-owned-key"));
+        assert_eq!(explicit.base_url, "https://vendor.example/v1");
+    }
+
     fn test_model_entry(
         model: &str,
         base_url: &str,

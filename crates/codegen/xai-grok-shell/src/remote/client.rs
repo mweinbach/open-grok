@@ -817,27 +817,19 @@ pub fn parse_remote_model_value(
         .or_else(|| meta.and_then(|m| get_string(m, "agentType")))
         .or_else(|| meta.and_then(|m| get_string(m, "agent_type")))
         .unwrap_or_else(crate::agent::config::default_agent_type);
-    let api_backend = get_string(obj, "apiBackend")
-        .or_else(|| get_string(obj, "api_backend"))
-        .and_then(|s| match s.as_str() {
-            "responses" => Some(crate::sampling::ApiBackend::Responses),
-            "chat_completions" => Some(crate::sampling::ApiBackend::ChatCompletions),
-            "messages" => Some(crate::sampling::ApiBackend::Messages),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let provider = get_string(obj, "provider")
+    let api_backend = match get_string(obj, "apiBackend").or_else(|| get_string(obj, "api_backend"))
+    {
+        Some(value) => serde_json::from_value(serde_json::Value::String(value)).ok()?,
+        None => crate::sampling::ApiBackend::default(),
+    };
+    let provider = match get_string(obj, "provider")
         .or_else(|| get_string(obj, "modelProvider"))
         .or_else(|| get_string(obj, "model_provider"))
         .or_else(|| meta.and_then(|m| get_string(m, "provider")))
-        .and_then(|value| match value.as_str() {
-            "xai" => Some(xai_grok_sampling_types::ModelProvider::Xai),
-            "codex" | "openai" | "openai_codex" => {
-                Some(xai_grok_sampling_types::ModelProvider::Codex)
-            }
-            _ => None,
-        })
-        .unwrap_or_default();
+    {
+        Some(value) => serde_json::from_value(serde_json::Value::String(value)).ok()?,
+        None => xai_grok_sampling_types::ModelProvider::default(),
+    };
     let tool_mode = get_string(obj, "toolMode")
         .or_else(|| get_string(obj, "tool_mode"))
         .or_else(|| meta.and_then(|m| get_string(m, "toolMode")))
@@ -1462,6 +1454,28 @@ mod tests {
             xai_grok_sampling_types::ModelProvider::Codex
         );
     }
+
+    #[test]
+    fn parse_rejects_explicit_unknown_provider_or_backend() {
+        let unknown_provider = serde_json::json!({
+            "model": "future-model",
+            "provider": "misspelled-provider"
+        });
+        assert!(
+            parse_remote_model_value(&unknown_provider, "https://default.url").is_none(),
+            "an explicit unknown provider must not inherit the xAI default"
+        );
+
+        let unknown_backend = serde_json::json!({
+            "model": "future-model",
+            "apiBackend": "misspelled-backend"
+        });
+        assert!(
+            parse_remote_model_value(&unknown_backend, "https://default.url").is_none(),
+            "an explicit unknown backend must not inherit Chat Completions"
+        );
+    }
+
     #[test]
     fn parse_reads_reasoning_effort_fields() {
         use xai_grok_sampling_types::ReasoningEffort;

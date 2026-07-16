@@ -1485,15 +1485,41 @@ impl acp::Agent for MvpAgent {
         let startup_model_id = requested_model_id
             .clone()
             .unwrap_or_else(|| summary.current_model_id.clone());
-        let startup_sampling =
-            self.resolve_sampling_config_for_model(&startup_model_id, origin_client.clone());
-        if startup_sampling.provider == xai_grok_sampling_types::ModelProvider::Codex
-            && !crate::codex_auth::sampling_config_has_credentials(&startup_sampling)
-        {
-            // Fail before replay or spawning a promptable session. The pager
-            // recognizes this provider-local error, runs Codex OAuth, and
-            // retries the same deferred load.
-            return Err(crate::codex_auth::auth_required_error());
+        // Session summaries persist the routing slug, not necessarily the
+        // catalog key. Resolve it through the selectable projection before
+        // checking credentials so a configured BYOK alias can win over an
+        // unavailable embedded OAuth row with the same slug.
+        let startup_auth_model_id = if requested_model_id.is_none() {
+            let models = self.models_manager.models();
+            let available = self.models_manager.available();
+            selectable_catalog_key_for_persisted(&models, &available, &startup_model_id)
+                .unwrap_or_else(|| startup_model_id.clone())
+        } else {
+            // An explicit request is a catalog identity, not an ambiguous
+            // persisted routing slug. Preserve exact-key semantics.
+            startup_model_id.clone()
+        };
+        let startup_sampling = self.resolve_sampling_config_for_model(
+            &startup_auth_model_id,
+            origin_client.clone(),
+        );
+        match startup_sampling.provider.profile().session_auth {
+            xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly
+                if startup_sampling.api_key.is_none()
+                    || startup_sampling.bearer_resolver.is_some() =>
+            {
+                return Err(acp::Error::auth_required()
+                    .data("the selected provider requires a model API key"));
+            }
+            xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth
+                if !crate::codex_auth::sampling_config_has_credentials(&startup_sampling) =>
+            {
+                // Fail before replay or spawning a promptable session. The
+                // pager recognizes this provider-local error, runs Codex
+                // OAuth, and retries the same deferred load.
+                return Err(crate::codex_auth::auth_required_error());
+            }
+            _ => {}
         }
         self.session_turn_numbers
             .borrow_mut()
@@ -1696,7 +1722,7 @@ impl acp::Agent for MvpAgent {
                 .clone()
                 .or_else(|| {
                     self
-                        .resolve_model_id(&startup_model_id)
+                        .resolve_model_id(&startup_auth_model_id)
                         .ok()
                         .map(|m| m.info().agent_type.clone())
                 });
@@ -1726,7 +1752,7 @@ impl acp::Agent for MvpAgent {
                         session_meta: request_meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
-                        session_model_id: startup_model_id.clone(),
+                        session_model_id: startup_auth_model_id.clone(),
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd,

@@ -34,6 +34,21 @@ pub const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_ISSUER: &str = "https://auth.openai.com";
 pub const CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub const CODEX_INFERENCE_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub const CODEX_INFERENCE_BASE_URL_ENV: &str = "GROK_CODEX_INFERENCE_BASE_URL";
+
+/// Canonical Codex inference endpoint, with an explicit process-level trust
+/// override for development proxies and hermetic tests.
+pub fn inference_base_url() -> String {
+    std::env::var(CODEX_INFERENCE_BASE_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| CODEX_INFERENCE_BASE_URL.to_owned())
+}
+
+pub fn is_trusted_inference_base_url(base_url: &str) -> bool {
+    let candidate = base_url.trim().trim_end_matches('/');
+    candidate.is_empty() || candidate == inference_base_url().trim().trim_end_matches('/')
+}
 /// Machine-readable ACP error kind used when a Codex-backed session cannot be
 /// started or resumed until the provider-local credential is restored.
 pub const CODEX_AUTH_REQUIRED_ERROR_KIND: &str = "open_grok_codex_auth_required";

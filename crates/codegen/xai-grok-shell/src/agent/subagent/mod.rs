@@ -913,6 +913,10 @@ async fn read_parent_sampling_config(
         fn current_bearer(&self) -> Option<String> {
             self.0.current_or_expired().map(|auth| auth.key)
         }
+
+        fn fail_closed_on_missing(&self) -> bool {
+            false
+        }
     }
 
     if let Some(ref chat_state) = ctx.parent_chat_state {
@@ -927,13 +931,14 @@ async fn read_parent_sampling_config(
                 &cfg.base_url,
             );
             let bearer_resolver: Option<xai_grok_sampler::SharedBearerResolver> =
-                match (provider, uses_session_token) {
-                    (xai_grok_sampling_types::ModelProvider::Codex, true) => {
+                match (provider.profile().session_auth, uses_session_token) {
+                    (xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly, true) => None,
+                    (xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth, true) => {
                         Some(std::sync::Arc::new(
                             crate::codex_auth::CodexBearerResolver::from_headers(&extra_headers),
                         ))
                     }
-                    (xai_grok_sampling_types::ModelProvider::Xai, true) => Some(
+                    (xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession, true) => Some(
                         std::sync::Arc::new(AuthManagerBearerResolver(ctx.auth_manager.clone())),
                     ),
                     (_, false) => None,
@@ -944,6 +949,7 @@ async fn read_parent_sampling_config(
                     .map(|r| r.auth_scheme)
                     .unwrap_or_default(),
             );
+            let profile = provider.profile();
             let inherited = xai_grok_sampler::SamplerConfig {
                 api_key: creds.api_key,
                 base_url: cfg.base_url,
@@ -965,17 +971,25 @@ async fn read_parent_sampling_config(
                 max_retries: None,
                 stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
                 idle_timeout_secs: None,
-                client_identifier: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+                client_identifier: profile
+                    .request_metadata
+                    .sends_x_grok_headers()
                     .then(|| ctx.sampling_config.client_identifier.clone())
                     .flatten(),
-                deployment_id: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+                deployment_id: profile
+                    .request_metadata
+                    .sends_x_grok_headers()
                     .then(|| ctx.sampling_config.deployment_id.clone())
                     .flatten(),
-                user_id: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+                user_id: profile
+                    .request_metadata
+                    .sends_x_grok_headers()
                     .then(|| ctx.sampling_config.user_id.clone())
                     .flatten(),
                 origin_client: ctx.sampling_config.origin_client.clone(),
-                attribution_callback: (provider != xai_grok_sampling_types::ModelProvider::Codex)
+                attribution_callback: profile
+                    .session_auth
+                    .is_xai()
                     .then(|| ctx.attribution_callback.clone())
                     .flatten(),
                 bearer_resolver,
@@ -1070,7 +1084,7 @@ fn resolve_model_override_to_config(
     let session_key = ctx.auth.as_ref().map(|a| a.key.as_str());
     let has_session_key = session_key.is_some();
     let mut credentials = resolve_credentials(&entry, session_key);
-    if entry.info().provider != xai_grok_sampling_types::ModelProvider::Codex {
+    if entry.info().provider.profile().session_auth.is_xai() {
         credentials.auth_type = subagent_auth_type(Some(&entry), &ctx.auth_method_id);
     }
     let resolved_auth_type = credentials.auth_type;
