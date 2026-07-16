@@ -1895,6 +1895,31 @@ impl SessionActor {
                 ],
                 Vec::new(),
             ),
+            ToolInput::CodexReadFile(read_file) => (
+                format!("Read `{}`", read_file.file_path),
+                acp::ToolKind::Read,
+                vec![
+                    acp::ToolCallLocation::new(read_file.file_path)
+                        .line(u32::try_from(read_file.offset).ok()),
+                ],
+                Vec::new(),
+            ),
+            ToolInput::CodexListDir(list_dir) => (
+                format!("List `{}`", list_dir.dir_path),
+                acp::ToolKind::Other,
+                vec![acp::ToolCallLocation::new(list_dir.dir_path)],
+                Vec::new(),
+            ),
+            ToolInput::CodexGrepFiles(grep_files) => (
+                grep_files.pattern,
+                acp::ToolKind::Search,
+                grep_files
+                    .path
+                    .into_iter()
+                    .map(acp::ToolCallLocation::new)
+                    .collect(),
+                Vec::new(),
+            ),
             ToolInput::TodoWrite(_) => (
                 "Updating plan".to_string(),
                 acp::ToolKind::Think,
@@ -1994,12 +2019,7 @@ impl SessionActor {
                 vec![],
                 vec![],
             ),
-            ToolInput::Dynamic(_) => (
-                "Dynamic tool call".to_string(),
-                acp::ToolKind::Other,
-                vec![],
-                vec![],
-            ),
+            ToolInput::Dynamic(_) => (wire_name.to_string(), acp::ToolKind::Other, vec![], vec![]),
             ToolInput::MemorySearch(ms) => {
                 let end = ms
                     .query
@@ -2114,12 +2134,7 @@ impl SessionActor {
                 vec![],
             ),
             #[allow(unreachable_patterns)]
-            _ => (
-                "Tool call".to_string(),
-                acp::ToolKind::Other,
-                vec![],
-                vec![],
-            ),
+            _ => (wire_name.to_string(), acp::ToolKind::Other, vec![], vec![]),
         };
         let tool_call_update = acp::ToolCallUpdate::new(
             tool_call_id.clone(),

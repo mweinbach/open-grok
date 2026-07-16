@@ -1634,6 +1634,17 @@ mod tool_meta_stamp_tests {
             },
         }
     }
+    fn codex_read_file_call() -> crate::sampling::types::ToolCallResponse {
+        crate::sampling::types::ToolCallResponse {
+            id: "call-codex-read-1".to_string(),
+            kind: "function".to_string(),
+            function: crate::sampling::types::ToolCallFunction {
+                name: "read_file".to_string(),
+                arguments: r#"{"file_path":"/tmp/code-mode.txt","offset":7,"limit":20}"#
+                    .to_string(),
+            },
+        }
+    }
     /// The `x.ai/tool` object from an event's `_meta`, if present.
     fn tool_meta(meta: Option<&acp::Meta>) -> Option<&serde_json::Value> {
         meta.and_then(|m| m.get(TOOL_META_KEY))
@@ -1679,6 +1690,43 @@ mod tool_meta_stamp_tests {
                 let refined = refined.expect("refinement ToolCallUpdate emitted");
                 let t = tool_meta(refined.as_ref()).expect("refinement carries x.ai/tool");
                 assert_eq!(t["input"]["path"], "/tmp/stamp.txt");
+            })
+            .await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_read_file_refinement_shows_mapped_call_instead_of_generic_title() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut fixture = make_replay_send_update_fixture().await;
+                fixture.actor.agent = std::cell::RefCell::new(
+                    test_agent_with_tools(vec![ToolConfig::from_id("Codex:read_file".to_string())])
+                        .await,
+                );
+                let prepared = fixture
+                    .actor
+                    .prepare_tool_call(codex_read_file_call(), &mut Vec::new())
+                    .await
+                    .expect("prepare_tool_call should not error");
+                assert!(prepared.is_ok(), "Codex read_file should prepare cleanly");
+
+                let mut refinement = None;
+                while let Ok(event) = fixture.event_rx.try_recv() {
+                    let SessionEvent::Notification(SessionNotification::Acp(n)) = event else {
+                        continue;
+                    };
+                    if let acp::SessionUpdate::ToolCallUpdate(update) = n.update {
+                        refinement = Some(update);
+                    }
+                }
+
+                let refinement = refinement.expect("refinement ToolCallUpdate emitted");
+                assert_eq!(
+                    refinement.fields.title.as_deref(),
+                    Some("Read `/tmp/code-mode.txt`")
+                );
+                assert_eq!(refinement.fields.kind, Some(acp::ToolKind::Read));
+                assert_eq!(refinement.fields.locations.as_ref().map(Vec::len), Some(1));
             })
             .await;
     }
