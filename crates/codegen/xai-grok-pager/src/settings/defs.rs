@@ -788,6 +788,47 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
+        // SHELL-owned auxiliary model pins. Empty-string default maps to
+        // provider-aware Automatic; explicit IDs may intentionally select a
+        // model from another authenticated provider.
+        SettingMeta {
+            key: "recap_model",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Recap model",
+            description: "Model used for conversation recaps. Automatic chooses an economical model for the active provider.",
+            keywords: &["recap", "summary", "model", "automatic", "openai", "grok"],
+            kind: SettingKind::DynamicEnum {
+                default: "",
+                source: DynamicEnumSource::AuxiliaryModelCatalog,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "memory_model",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Memory model",
+            description: "Model used for memory generation and consolidation. Automatic chooses an economical model for the active provider.",
+            keywords: &[
+                "memory",
+                "dream",
+                "flush",
+                "model",
+                "automatic",
+                "openai",
+                "grok",
+            ],
+            kind: SettingKind::DynamicEnum {
+                default: "",
+                source: DynamicEnumSource::AuxiliaryModelCatalog,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         // SHARED. `u16` in UiConfig, widened to `i64` for registry.
         // Width changes apply on the next render frame.
         SettingMeta {

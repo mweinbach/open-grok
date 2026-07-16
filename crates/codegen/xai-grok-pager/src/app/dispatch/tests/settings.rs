@@ -1228,6 +1228,23 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
                 agent.session.models.set_current(id, None);
             }
         }
+        "recap_model" | "memory_model" => {
+            use agent_client_protocol as acp;
+            use std::sync::Arc;
+            if let ActiveView::Agent(aid) = app.active_view
+                && let Some(agent) = app.agents.get_mut(&aid)
+            {
+                let id = acp::ModelId::new(Arc::from("test-auxiliary-move"));
+                let info = acp::ModelInfo::new(id.clone(), "Test Auxiliary Move".to_string());
+                agent.session.models.available.insert(id.clone(), info);
+                let action = if key == "recap_model" {
+                    Action::SetRecapModel(id)
+                } else {
+                    Action::SetMemoryModel(id)
+                };
+                let _ = dispatch(action, app);
+            }
+        }
         "max_thoughts_width" => {
             let _ = dispatch(Action::SetMaxThoughtsWidth(200), app);
         }

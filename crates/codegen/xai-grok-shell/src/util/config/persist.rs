@@ -40,6 +40,18 @@ pub async fn save_config(config: &Config) -> Result<()> {
 
     merge_section(table, "cli", &config.cli);
     merge_section(table, "models", &config.models);
+    // `merge_section` deliberately preserves absent serialized fields so
+    // unmodeled future keys survive a settings write. These two fields are
+    // modeled `Option`s with an explicit Settings clear action, so `None` is a
+    // tombstone rather than "leave the old value alone".
+    if let Some(TomlValue::Table(models)) = table.get_mut("models") {
+        if config.models.recap.is_none() {
+            models.remove("recap");
+        }
+        if config.models.memory.is_none() {
+            models.remove("memory");
+        }
+    }
     merge_section(table, "ui", &config.ui);
     merge_section(table, "harness", &config.harness);
     merge_section(table, "session", &config.session);

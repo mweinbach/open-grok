@@ -50,6 +50,10 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
         // by explicit model/session transitions.
         let effects = app.sync_primary_provider_from_active_agent();
         app.pending_effects.extend(effects);
+        // Dynamic model pickers snapshot the catalog by value. Refresh any
+        // open Settings sheet immediately so newly added/removed OpenAI or xAI
+        // models are reflected without closing and reopening the modal.
+        crate::app::dispatch::refresh_open_settings_modals(app);
         !matches!(
             app.active_view,
             ActiveView::Agent(id)

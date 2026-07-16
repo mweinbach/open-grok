@@ -630,6 +630,10 @@ pub struct AppView {
     /// startup; updated synchronously by `set_X_inner` so dispatch
     /// stays sans-IO.
     pub current_ui: xai_grok_shell::agent::config::UiConfig,
+    /// Explicit auxiliary-model pins loaded from `[models]` and mirrored
+    /// optimistically by Settings. `None` means provider-aware Automatic.
+    pub recap_model: Option<String>,
+    pub memory_model: Option<String>,
     /// Working directory.
     pub cwd: PathBuf,
     /// Whether the project picker question has already been shown this session.
@@ -1408,6 +1412,8 @@ impl AppView {
             registry: ActionRegistry::defaults(),
             settings_registry: Arc::new(crate::settings::SettingsRegistry::defaults()),
             current_ui: xai_grok_shell::agent::config::UiConfig::default(),
+            recap_model: None,
+            memory_model: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             project_picker_shown: false,
             project_picker_disabled: false,
@@ -5373,6 +5379,8 @@ pub(crate) mod tests {
             registry: ActionRegistry::defaults(),
             settings_registry: std::sync::Arc::new(crate::settings::SettingsRegistry::defaults()),
             current_ui: xai_grok_shell::agent::config::UiConfig::default(),
+            recap_model: None,
+            memory_model: None,
             cwd: std::path::PathBuf::from("/tmp"),
             project_picker_shown: true,
             project_picker_disabled: false,

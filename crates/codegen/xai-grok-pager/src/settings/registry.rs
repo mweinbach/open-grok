@@ -101,6 +101,11 @@ pub enum DynamicEnumSource {
     /// Models from the active session's catalog. Prepends a
     /// `"(no override)"` sentinel so the user can clear the setting.
     ActiveModelCatalog,
+    /// Models from the active session's catalog for an auxiliary workload
+    /// (recap, memory, and similar helpers). The canonical value is the
+    /// provider model id while the picker renders the friendly model name.
+    /// An empty `"Automatic"` sentinel clears the explicit pin.
+    AuxiliaryModelCatalog,
 }
 
 /// Build the owned choice list for a `DynamicEnum` at picker-open time.
@@ -123,6 +128,23 @@ pub fn dynamic_enum_choices(
                     canonical: name.clone(),
                     display: name.clone(),
                     description: String::new(),
+                });
+            }
+            out
+        }
+        DynamicEnumSource::AuxiliaryModelCatalog => {
+            let mut out = Vec::with_capacity(snapshot.available_models.len() + 1);
+            out.push(OwnedEnumChoice {
+                canonical: String::new(),
+                display: "Automatic".to_string(),
+                description: "Choose an economical model for the active provider.".to_string(),
+            });
+            for (name, id) in &snapshot.available_models {
+                let id = id.0.to_string();
+                out.push(OwnedEnumChoice {
+                    canonical: id.clone(),
+                    display: name.clone(),
+                    description: id,
                 });
             }
             out
@@ -247,6 +269,10 @@ pub struct PagerLocalSnapshot {
     /// Cloned into the snapshot so the modal's validator/resolver is
     /// self-contained (the modal outlives the borrow on `app.agents`).
     pub available_models: Vec<(String, acp::ModelId)>,
+    /// Explicit `[models].recap` pin. `None` means provider-aware Automatic.
+    pub recap_model: Option<String>,
+    /// Explicit `[models].memory` pin. `None` means provider-aware Automatic.
+    pub memory_model: Option<String>,
     /// Whether the user has opted OUT of coding data sharing.
     /// Lives in auth metadata (no `UiConfig` field). Inverted mapping:
     /// `opt_out == false` → canonical "opt-in".
@@ -289,6 +315,8 @@ impl Default for PagerLocalSnapshot {
             auto_mode: false,
             current_model_name: None,
             available_models: Vec::new(),
+            recap_model: None,
+            memory_model: None,
             coding_data_sharing_opt_out: false,
             plan_mode_active: false,
             show_tips: None,
@@ -353,6 +381,17 @@ impl PagerLocalSnapshot {
     pub fn resolve_model_name(&self, query: &str) -> Option<acp::ModelId> {
         self.available_models.iter().find_map(|(name, id)| {
             if name.eq_ignore_ascii_case(query) {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Resolve a catalog model id carried by an ID-backed dynamic picker.
+    pub fn resolve_model_id(&self, query: &str) -> Option<acp::ModelId> {
+        self.available_models.iter().find_map(|(_name, id)| {
+            if id.0.as_ref() == query {
                 Some(id.clone())
             } else {
                 None
@@ -627,6 +666,13 @@ pub fn current_value_for(
         "default_model" => Some(SettingValue::String(
             pager.current_model_name.clone().unwrap_or_default(),
         )),
+        // Auxiliary model pins persist IDs. Empty means provider-aware Automatic.
+        "recap_model" => Some(SettingValue::String(
+            pager.recap_model.clone().unwrap_or_default(),
+        )),
+        "memory_model" => Some(SettingValue::String(
+            pager.memory_model.clone().unwrap_or_default(),
+        )),
         // max_thoughts_width: `u16` widened to `i64`.
         "max_thoughts_width" => Some(SettingValue::Int(ui.max_thoughts_width as i64)),
         // coding_data_sharing: inverts the `_opt_out` bool.
@@ -678,6 +724,35 @@ pub fn default_value_for(meta: &SettingMeta) -> SettingValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auxiliary_model_choices_use_ids_and_automatic_sentinel() {
+        use std::sync::Arc;
+        let snapshot = PagerLocalSnapshot {
+            available_models: vec![
+                (
+                    "Shared Name".to_string(),
+                    acp::ModelId::new(Arc::from("gpt-5.6-terra")),
+                ),
+                (
+                    "Shared Name".to_string(),
+                    acp::ModelId::new(Arc::from("grok-4.5")),
+                ),
+            ],
+            ..PagerLocalSnapshot::default()
+        };
+        let choices = dynamic_enum_choices(DynamicEnumSource::AuxiliaryModelCatalog, &snapshot);
+        assert_eq!(choices[0].canonical, "");
+        assert_eq!(choices[0].display, "Automatic");
+        assert_eq!(choices[1].canonical, "gpt-5.6-terra");
+        assert_eq!(choices[1].display, "Shared Name");
+        assert_eq!(choices[2].canonical, "grok-4.5");
+        assert_eq!(choices[2].display, "Shared Name");
+        assert_eq!(
+            snapshot.resolve_model_id("grok-4.5").unwrap().0.as_ref(),
+            "grok-4.5"
+        );
+    }
 
     /// Every SHELL/SHARED setting's default must match `UiConfig::default()`.
     /// PAGER-owned settings are covered by `defaults_match_pager_state`.
@@ -825,6 +900,13 @@ mod tests {
                         "default_model registry default must be empty string — \
                          the live default is resolved dynamically from \
                          cfg.models.default at session start",
+                    );
+                }
+                ("recap_model" | "memory_model", SettingKind::DynamicEnum { default, .. }) => {
+                    assert_eq!(
+                        *default, "",
+                        "auxiliary model registry defaults must be empty so the runtime's \
+                         provider-aware Automatic policy owns selection",
                     );
                 }
                 // max_thoughts_width: `u16` widened to `i64`.

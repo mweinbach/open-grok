@@ -1659,13 +1659,155 @@ pub(in crate::app::dispatch) fn clear_default_model(app: &mut AppView) -> Vec<Ef
 }
 
 // ---------------------------------------------------------------------------
-// Model-family settings: fork_secondary_model (and formerly
-// web_search_model, session_summary_model, default_reasoning_effort).
+// Model-family settings: recap_model, memory_model, and fork_secondary_model.
 //
-// SHELL-OWNED. Unlike `default_model`, these do NOT mutate live
-// runtime state — they update `current_ui` mirrors and persist.
+// SHELL-OWNED. Unlike `default_model`, these do NOT switch the active chat
+// model — they update pager-side config mirrors and persist.
 // No live preview. Rollback is purely disk + mirror.
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum AuxiliaryModelKind {
+    Recap,
+    Memory,
+}
+
+impl AuxiliaryModelKind {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Recap => "recap_model",
+            Self::Memory => "memory_model",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recap => "Recap model",
+            Self::Memory => "Memory model",
+        }
+    }
+}
+
+pub(super) fn set_recap_model_inner(app: &mut AppView, value: Option<String>) {
+    app.recap_model = value;
+}
+
+pub(super) fn set_memory_model_inner(app: &mut AppView, value: Option<String>) {
+    app.memory_model = value;
+}
+
+fn auxiliary_model_value(app: &AppView, kind: AuxiliaryModelKind) -> Option<String> {
+    match kind {
+        AuxiliaryModelKind::Recap => app.recap_model.clone(),
+        AuxiliaryModelKind::Memory => app.memory_model.clone(),
+    }
+}
+
+fn set_auxiliary_model_inner(app: &mut AppView, kind: AuxiliaryModelKind, value: Option<String>) {
+    match kind {
+        AuxiliaryModelKind::Recap => set_recap_model_inner(app, value),
+        AuxiliaryModelKind::Memory => set_memory_model_inner(app, value),
+    }
+}
+
+fn set_auxiliary_model(
+    app: &mut AppView,
+    kind: AuxiliaryModelKind,
+    new_id: acp::ModelId,
+) -> Vec<Effect> {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        tracing::error!(
+            target: "settings",
+            key = kind.key(),
+            "auxiliary model action dispatched with no active agent — no-op",
+        );
+        return vec![];
+    };
+    let Some(agent) = app.agents.get(&agent_id) else {
+        tracing::error!(
+            target: "settings",
+            key = kind.key(),
+            "active agent is missing while setting auxiliary model — no-op",
+        );
+        return vec![];
+    };
+    if !agent.session.models.available.contains_key(&new_id) {
+        tracing::error!(
+            target: "settings",
+            key = kind.key(),
+            id = ?new_id,
+            "auxiliary model id is absent from the live catalog — no-op",
+        );
+        return vec![];
+    }
+
+    let display_name = agent.session.models.display_name_for(&new_id);
+    let new_value = new_id.0.to_string();
+    let previous = auxiliary_model_value(app, kind);
+    if previous.as_deref() == Some(new_value.as_str()) {
+        return vec![];
+    }
+    set_auxiliary_model_inner(app, kind, Some(new_value.clone()));
+    refresh_open_settings_modals(app);
+    tracing::info!(
+        target: "settings",
+        key = kind.key(),
+        new = %display_name,
+        new_id = %new_value,
+        previous = ?previous,
+        "setting changed",
+    );
+    app.show_toast(&format!("\u{2713} {}: {display_name}", kind.label()));
+    vec![Effect::PersistSetting {
+        key: kind.key(),
+        value: crate::settings::SettingValue::String(new_value),
+        rollback_value: crate::settings::SettingValue::String(previous.unwrap_or_default()),
+    }]
+}
+
+fn clear_auxiliary_model(app: &mut AppView, kind: AuxiliaryModelKind) -> Vec<Effect> {
+    let previous = auxiliary_model_value(app, kind);
+    if previous.is_none() {
+        app.show_toast(&format!("\u{2713} {}: Automatic", kind.label()));
+        return vec![];
+    }
+    set_auxiliary_model_inner(app, kind, None);
+    refresh_open_settings_modals(app);
+    tracing::info!(
+        target: "settings",
+        key = kind.key(),
+        previous = ?previous,
+        "setting cleared to Automatic",
+    );
+    app.show_toast(&format!("\u{2713} {}: Automatic", kind.label()));
+    vec![Effect::PersistSetting {
+        key: kind.key(),
+        value: crate::settings::SettingValue::String(String::new()),
+        rollback_value: crate::settings::SettingValue::String(previous.unwrap_or_default()),
+    }]
+}
+
+pub(in crate::app::dispatch) fn set_recap_model(
+    app: &mut AppView,
+    model: acp::ModelId,
+) -> Vec<Effect> {
+    set_auxiliary_model(app, AuxiliaryModelKind::Recap, model)
+}
+
+pub(in crate::app::dispatch) fn clear_recap_model(app: &mut AppView) -> Vec<Effect> {
+    clear_auxiliary_model(app, AuxiliaryModelKind::Recap)
+}
+
+pub(in crate::app::dispatch) fn set_memory_model(
+    app: &mut AppView,
+    model: acp::ModelId,
+) -> Vec<Effect> {
+    set_auxiliary_model(app, AuxiliaryModelKind::Memory, model)
+}
+
+pub(in crate::app::dispatch) fn clear_memory_model(app: &mut AppView) -> Vec<Effect> {
+    clear_auxiliary_model(app, AuxiliaryModelKind::Memory)
+}
 
 /// State-only mutation for `fork_secondary_model`. Updates the
 /// `app.current_ui.fork_secondary_model` mirror so the modal

@@ -697,6 +697,20 @@ async fn persist_setting_type_mismatch_errors_code_mode() {
     );
 }
 
+#[tokio::test]
+async fn persist_setting_type_mismatch_errors_auxiliary_models() {
+    use crate::settings::SettingValue;
+    for key in ["recap_model", "memory_model"] {
+        let err = persist_setting(key, SettingValue::Bool(true))
+            .await
+            .expect_err("auxiliary model settings require String IDs");
+        assert!(
+            err.contains(&format!("persist_setting({key}) expected String")),
+            "error message must mention key + expected kind, got: {err}",
+        );
+    }
+}
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 /// Spawn a fake ACP agent that counts `x.ai/yolo_mode_changed`

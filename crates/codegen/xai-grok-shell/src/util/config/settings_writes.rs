@@ -78,6 +78,17 @@ pub async fn set_auto_light_theme(value: String) -> Result<()> {
 /// Defense against callers bypassing catalog validation.
 pub const MAX_DEFAULT_MODEL_LEN: usize = 256;
 
+fn optional_model_pin(label: &str, value: String) -> Result<Option<String>> {
+    if value.len() > MAX_DEFAULT_MODEL_LEN {
+        anyhow::bail!(
+            "{label} model id too long ({} > {} bytes)",
+            value.len(),
+            MAX_DEFAULT_MODEL_LEN
+        );
+    }
+    Ok((!value.is_empty()).then_some(value))
+}
+
 /// Persist `[models].default` and dismiss any active campaign nudging it (an
 /// explicit user pick wins over the soft campaign default).
 ///
@@ -94,6 +105,26 @@ pub async fn set_default_model(value: String) -> Result<()> {
         if value.is_empty() { None } else { Some(value) },
         None,
     )
+    .await
+}
+
+/// Persist an explicit `[models].recap` model id. Empty clears the pin and
+/// restores provider-aware Automatic selection.
+pub async fn set_recap_model(value: String) -> Result<()> {
+    let value = optional_model_pin("recap", value)?;
+    update_config(|cfg| {
+        cfg.models.recap = value;
+    })
+    .await
+}
+
+/// Persist an explicit `[models].memory` model id. Empty clears the pin and
+/// restores provider-aware Automatic selection.
+pub async fn set_memory_model(value: String) -> Result<()> {
+    let value = optional_model_pin("memory", value)?;
+    update_config(|cfg| {
+        cfg.models.memory = value;
+    })
     .await
 }
 
@@ -278,4 +309,25 @@ pub async fn set_show_tips(value: bool) -> Result<()> {
 /// Restart-required: auto-update check fires once on startup.
 pub async fn set_auto_update(value: bool) -> Result<()> {
     update_config(|cfg| cfg.cli.auto_update = Some(value)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auxiliary_model_pin_empty_clears_and_id_is_preserved() {
+        assert_eq!(optional_model_pin("recap", String::new()).unwrap(), None);
+        assert_eq!(
+            optional_model_pin("memory", "gpt-5.6-terra".to_string()).unwrap(),
+            Some("gpt-5.6-terra".to_string())
+        );
+    }
+
+    #[test]
+    fn auxiliary_model_pin_rejects_oversized_ids() {
+        let err = optional_model_pin("recap", "x".repeat(MAX_DEFAULT_MODEL_LEN + 1))
+            .expect_err("oversized model IDs must be rejected");
+        assert!(err.to_string().contains("recap model id too long"));
+    }
 }

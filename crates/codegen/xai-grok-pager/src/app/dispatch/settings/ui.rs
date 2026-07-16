@@ -7,12 +7,13 @@ use super::setters::{
     set_contextual_hint_inner, set_default_model_inner, set_default_selected_permission_inner,
     set_display_refresh_auto_cadence_inner, set_fork_secondary_model_inner,
     set_group_tool_verbs_inner, set_hunk_tracker_mode_inner, set_invert_scroll_inner,
-    set_keep_text_selection_inner, set_max_thoughts_width_inner, set_multiline_mode,
-    set_prompt_suggestions_inner, set_remember_tool_approvals_inner, set_render_mermaid_inner,
-    set_respect_manual_folds_inner, set_scroll_lines_inner, set_scroll_mode_inner,
-    set_scroll_speed_inner, set_show_thinking_blocks_inner, set_show_tips_inner,
-    set_simple_mode_inner, set_theme_inner, set_timestamps, set_timestamps_inner,
-    set_vim_mode_inner, set_voice_capture_mode_inner, set_voice_stt_language_inner,
+    set_keep_text_selection_inner, set_max_thoughts_width_inner, set_memory_model_inner,
+    set_multiline_mode, set_prompt_suggestions_inner, set_recap_model_inner,
+    set_remember_tool_approvals_inner, set_render_mermaid_inner, set_respect_manual_folds_inner,
+    set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
+    set_show_thinking_blocks_inner, set_show_tips_inner, set_simple_mode_inner, set_theme_inner,
+    set_timestamps, set_timestamps_inner, set_vim_mode_inner, set_voice_capture_mode_inner,
+    set_voice_stt_language_inner,
 };
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
@@ -52,6 +53,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let recap_model_from_app = app.recap_model.clone();
+    let memory_model_from_app = app.memory_model.clone();
     for agent in app.agents.values_mut() {
         // Walk both `Settings` and `ResetSettingsConfirm` — the
         // confirm dialog embeds settings state that must stay fresh
@@ -77,6 +80,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                     .iter()
                     .map(|(id, info)| (info.name.clone(), id.clone()))
                     .collect(),
+                recap_model: recap_model_from_app.clone(),
+                memory_model: memory_model_from_app.clone(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 // Prefer optimistic pending over confirmed active.
                 plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
@@ -158,6 +163,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let recap_model_from_app = app.recap_model.clone();
+    let memory_model_from_app = app.memory_model.clone();
 
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
@@ -190,6 +197,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
             .iter()
             .map(|(id, info)| (info.name.clone(), id.clone()))
             .collect(),
+        recap_model: recap_model_from_app,
+        memory_model: memory_model_from_app,
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
         // Prefer optimistic pending over confirmed active.
         plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
@@ -661,6 +670,8 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         auto_mode: agent_auto_mode(app),
         current_model_name: agent_current_model_name(app),
         available_models: agent_available_models(app),
+        recap_model: app.recap_model.clone(),
+        memory_model: app.memory_model.clone(),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         plan_mode_active: agent_plan_mode(app),
         show_tips: app.show_tips,
@@ -840,6 +851,30 @@ pub(in crate::app::dispatch) fn action_for_reset(
                     value = %s,
                     "action_for_reset(fork_secondary_model) received non-empty default — \
                      registry/dispatch skew (default should be empty string)",
+                );
+                None
+            }
+        }
+        ("recap_model", SettingValue::String(s)) => {
+            if s.is_empty() {
+                Some(Action::ClearRecapModel)
+            } else {
+                tracing::error!(
+                    target: "settings",
+                    value = %s,
+                    "action_for_reset(recap_model) received non-empty default",
+                );
+                None
+            }
+        }
+        ("memory_model", SettingValue::String(s)) => {
+            if s.is_empty() {
+                Some(Action::ClearMemoryModel)
+            } else {
+                tracing::error!(
+                    target: "settings",
+                    value = %s,
+                    "action_for_reset(memory_model) received non-empty default",
                 );
                 None
             }
@@ -1110,6 +1145,12 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
                 s.clone()
             };
             set_fork_secondary_model_inner(app, restored);
+        }
+        ("recap_model", SettingValue::String(s)) => {
+            set_recap_model_inner(app, (!s.is_empty()).then(|| s.clone()));
+        }
+        ("memory_model", SettingValue::String(s)) => {
+            set_memory_model_inner(app, (!s.is_empty()).then(|| s.clone()));
         }
 
         _ => {

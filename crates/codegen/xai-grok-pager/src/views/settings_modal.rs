@@ -772,6 +772,22 @@ fn action_for_string(
                     .map(Action::SetForkSecondaryModel)
             }
         }
+        "recap_model" => {
+            if value.is_empty() {
+                Some(Action::ClearRecapModel)
+            } else {
+                snapshot.resolve_model_id(&value).map(Action::SetRecapModel)
+            }
+        }
+        "memory_model" => {
+            if value.is_empty() {
+                Some(Action::ClearMemoryModel)
+            } else {
+                snapshot
+                    .resolve_model_id(&value)
+                    .map(Action::SetMemoryModel)
+            }
+        }
 
         _ => {
             let _ = value;
@@ -1492,11 +1508,7 @@ fn render_rows(buf: &mut Buffer, area: Rect, state: &mut SettingsModalState, the
                         }
                     }
                     SettingValue::String(s) => {
-                        if s.is_empty() && matches!(meta.kind, SettingKind::DynamicEnum { .. }) {
-                            "(no override)".to_string()
-                        } else {
-                            s.clone()
-                        }
+                        display_for_dynamic_canonical(&meta.kind, s, &state.pager_snapshot)
                     }
                     SettingValue::Enum(e) => display_for_enum_canonical(&meta.kind, e).to_string(),
                     SettingValue::Int(i) => i.to_string(),
@@ -1526,11 +1538,21 @@ fn render_rows(buf: &mut Buffer, area: Rect, state: &mut SettingsModalState, the
                 state.row_rects[row_idx] = render_area;
 
                 let is_hovered = hover_row_snapshot == Some(row_idx);
+                // `DynamicEnum` values persist canonicals. Render the resolved
+                // display label while retaining the canonical in modal state.
+                let rendered_value = match value {
+                    SettingValue::String(_)
+                        if matches!(meta.kind, SettingKind::DynamicEnum { .. }) =>
+                    {
+                        SettingValue::String(value_display.clone())
+                    }
+                    _ => value.clone(),
+                };
                 let value_rect = render_setting_row(
                     buf,
                     render_area,
                     meta,
-                    value,
+                    &rendered_value,
                     max_label_w,
                     is_selected,
                     theme,
@@ -1657,11 +1679,7 @@ fn compute_filtered_row_heights(state: &SettingsModalState, area_width: u16) -> 
                         }
                     }
                     SettingValue::String(s) => {
-                        if s.is_empty() && matches!(meta.kind, SettingKind::DynamicEnum { .. }) {
-                            "(no override)".to_string()
-                        } else {
-                            s.clone()
-                        }
+                        display_for_dynamic_canonical(&meta.kind, s, &state.pager_snapshot)
                     }
                     SettingValue::Enum(e) => display_for_enum_canonical(&meta.kind, e).to_string(),
                     SettingValue::Int(i) => i.to_string(),
@@ -3069,6 +3087,45 @@ fn display_for_enum_canonical<'a>(kind: &'a SettingKind, canonical: &'a str) -> 
     // Fallback: render the canonical verbatim. Defensive — catches a
     // schema-vs-renderer drift without crashing the modal.
     canonical
+}
+
+/// Resolve a dynamic enum's persisted canonical to the label shown in the
+/// settings row. This keeps auxiliary model IDs stable on disk while showing
+/// friendly model names (and the source-specific clear sentinel) in the UI.
+fn display_for_dynamic_canonical(
+    kind: &SettingKind,
+    canonical: &str,
+    snapshot: &PagerLocalSnapshot,
+) -> String {
+    let SettingKind::DynamicEnum { source, .. } = kind else {
+        return canonical.to_string();
+    };
+    match source {
+        crate::settings::DynamicEnumSource::ActiveModelCatalog => {
+            if canonical.is_empty() {
+                "(no override)".to_string()
+            } else {
+                snapshot
+                    .available_models
+                    .iter()
+                    .find(|(name, _)| name == canonical)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| canonical.to_string())
+            }
+        }
+        crate::settings::DynamicEnumSource::AuxiliaryModelCatalog => {
+            if canonical.is_empty() {
+                "Automatic".to_string()
+            } else {
+                snapshot
+                    .available_models
+                    .iter()
+                    .find(|(_, id)| id.0.as_ref() == canonical)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| canonical.to_string())
+            }
+        }
+    }
 }
 
 /// Word-wrap a description string. Returns owned lines for re-styling.
@@ -5438,8 +5495,8 @@ mod tests {
     /// Every registered
     /// `SettingKind::DynamicEnum` setting must have a matching arm
     /// in `action_for_string` for the picker's Enter (commit) path,
-    /// including the empty-canonical sentinel (row 0 of the picker
-    /// is always "(no override)").
+    /// including the empty-canonical sentinel (row 0 is either
+    /// "(no override)" or "Automatic", depending on the source).
     #[test]
     fn every_dynamic_enum_setting_has_action_for_string_arm() {
         let reg = SettingsRegistry::defaults();
@@ -5465,7 +5522,15 @@ mod tests {
             // a generic `Action::DynamicSettingChanged(...)` would
             // pass `is_some()` while breaking the typed dispatch.
             let empty_action = action_for_string(meta.key, String::new(), &snapshot);
-            let nonempty_action = action_for_string(meta.key, "Test Model".to_string(), &snapshot);
+            let nonempty_canonical = match &meta.kind {
+                SettingKind::DynamicEnum {
+                    source: crate::settings::DynamicEnumSource::AuxiliaryModelCatalog,
+                    ..
+                } => "test-model",
+                _ => "Test Model",
+            };
+            let nonempty_action =
+                action_for_string(meta.key, nonempty_canonical.to_string(), &snapshot);
             match meta.key {
                 "default_model" => {
                     assert!(
@@ -5490,6 +5555,14 @@ mod tests {
                         "fork_secondary_model non-empty canonical must produce \
                          SetForkSecondaryModel(_), got {nonempty_action:?}",
                     );
+                }
+                "recap_model" => {
+                    assert!(matches!(empty_action, Some(Action::ClearRecapModel)));
+                    assert!(matches!(nonempty_action, Some(Action::SetRecapModel(_))));
+                }
+                "memory_model" => {
+                    assert!(matches!(empty_action, Some(Action::ClearMemoryModel)));
+                    assert!(matches!(nonempty_action, Some(Action::SetMemoryModel(_))));
                 }
                 other => panic!(
                     "Unknown DynamicEnum key `{other}` — add a discriminating arm in \
@@ -5725,6 +5798,9 @@ mod tests {
                 "coding_data_sharing",
                 // SHELL-owned default_model (Models category).
                 "default_model",
+                // Auxiliary model selectors persist IDs while rendering names.
+                "recap_model",
+                "memory_model",
                 // Models category. `default_reasoning_effort`,
                 // `web_search_model`, and `session_summary_model` are
                 // not exposed in the modal.

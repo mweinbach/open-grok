@@ -43,6 +43,8 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "multiline_mode",
     "permission_mode",
     "default_model",
+    "recap_model",
+    "memory_model",
     "max_thoughts_width",
     "scroll_speed",
     "scroll_mode",
@@ -1645,7 +1647,12 @@ fn registry_kind_membership_through_pr_14() {
     let dynamic_enum_keys = by_kind.remove("DynamicEnum").unwrap_or_default();
     assert_eq!(
         dynamic_enum_keys,
-        vec!["default_model", "fork_secondary_model",],
+        vec![
+            "default_model",
+            "fork_secondary_model",
+            "memory_model",
+            "recap_model",
+        ],
         "DynamicEnum kind membership drift",
     );
 
@@ -1745,6 +1752,8 @@ fn defaults_round_trip_through_registry() {
             "multiline_mode" => SettingValue::Bool(false),
             "permission_mode" => SettingValue::Enum("ask"),
             "default_model" => SettingValue::String(String::new()),
+            "recap_model" => SettingValue::String(String::new()),
+            "memory_model" => SettingValue::String(String::new()),
             "max_thoughts_width" => SettingValue::Int(120),
             "scroll_speed" => SettingValue::Int(50),
             "scroll_mode" => SettingValue::Enum("auto"),
@@ -3618,8 +3627,8 @@ fn docs_footer_renders_for_browse_and_picker() {
             all_text.push('\n');
         }
         assert!(
-            all_text.contains("Ask Grok"),
-            "[{fixture_label}] docs footer (`Ask Grok`) must appear in the rendered modal:\n\
+            all_text.contains("Ask Open Grok"),
+            "[{fixture_label}] docs footer (`Ask Open Grok`) must appear in the rendered modal:\n\
              {all_text}"
         );
         assert!(
@@ -4119,7 +4128,68 @@ fn pr14_default_model_picker_row_zero_commits_clear_action() {
     }
 }
 
-/// Mouse click on `default_model` opens picker (keyboard ↔ mouse parity).
+/// Auxiliary model pickers persist the catalog ID while rendering the model
+/// name, and their row-zero sentinel means provider-aware Automatic.
+#[test]
+fn auxiliary_model_pickers_commit_ids_and_clear_to_automatic() {
+    let snapshot = PagerLocalSnapshot {
+        available_models: vec![(
+            "GPT-5.6 Terra".to_string(),
+            agent_client_protocol::ModelId::new(std::sync::Arc::from("gpt-5.6-terra")),
+        )],
+        ..PagerLocalSnapshot::default()
+    };
+    type ActionMatcher = fn(&Action) -> bool;
+    let cases: [(&str, ActionMatcher, ActionMatcher); 2] = [
+        (
+            "recap_model",
+            |action: &Action| matches!(action, Action::SetRecapModel(id) if id.0.as_ref() == "gpt-5.6-terra"),
+            |action: &Action| matches!(action, Action::ClearRecapModel),
+        ),
+        (
+            "memory_model",
+            |action: &Action| matches!(action, Action::SetMemoryModel(id) if id.0.as_ref() == "gpt-5.6-terra"),
+            |action: &Action| matches!(action, Action::ClearMemoryModel),
+        ),
+    ];
+    for (key, set_matches, clear_matches) in cases {
+        let mut state = SettingsModalState::new(
+            Arc::new(SettingsRegistry::defaults()),
+            UiConfig::default(),
+            snapshot.clone(),
+        );
+        navigate_to(&mut state, key);
+        let _ = handle_settings_key(&mut state, &press(KeyCode::Enter));
+        let _ = handle_settings_key(&mut state, &press(KeyCode::Down));
+        let outcome = handle_settings_key(&mut state, &press(KeyCode::Enter));
+        let SettingsKeyOutcome::Action(action) = outcome else {
+            panic!("expected typed set action for {key}, got {outcome:?}");
+        };
+        assert!(
+            set_matches(&action),
+            "wrong set action for {key}: {action:?}"
+        );
+
+        let mut state = SettingsModalState::new(
+            Arc::new(SettingsRegistry::defaults()),
+            UiConfig::default(),
+            snapshot.clone(),
+        );
+        navigate_to(&mut state, key);
+        let _ = handle_settings_key(&mut state, &press(KeyCode::Enter));
+        let outcome = handle_settings_key(&mut state, &press(KeyCode::Enter));
+        let SettingsKeyOutcome::Action(action) = outcome else {
+            panic!("expected clear action for {key}, got {outcome:?}");
+        };
+        assert!(
+            clear_matches(&action),
+            "wrong clear action for {key}: {action:?}"
+        );
+    }
+}
+
+/// Mouse clicks open both name-backed and ID-backed model pickers
+/// (keyboard ↔ mouse parity).
 #[test]
 fn pr14_mouse_click_on_dynamic_enum_row_opens_picker() {
     let snapshot = PagerLocalSnapshot {
@@ -4129,49 +4199,46 @@ fn pr14_mouse_click_on_dynamic_enum_row_opens_picker() {
         )],
         ..PagerLocalSnapshot::default()
     };
-    let mut s = SettingsModalState::new(
-        Arc::new(SettingsRegistry::defaults()),
-        UiConfig::default(),
-        snapshot,
-    );
-    s.list_area = Rect {
-        x: 0,
-        y: 0,
-        width: 80,
-        height: 80,
-    };
-    s.row_rects.resize(s.rows.len(), Rect::default());
-    let row_idx = row_idx_for(&s, "default_model");
-    s.row_rects[row_idx] = Rect {
-        x: 0,
-        y: row_idx as u16,
-        width: 80,
-        height: 1,
-    };
-    // First click: select.
-    let outcome = handle_settings_mouse(
-        &mut s,
-        MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        20,
-        row_idx as u16,
-    );
-    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
-    // Second click on the same row: opens picker.
-    let outcome = handle_settings_mouse(
-        &mut s,
-        MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        20,
-        row_idx as u16,
-    );
-    assert!(
-        matches!(outcome, SettingsKeyOutcome::Changed),
-        "second click on DynamicEnum row must open picker, got {outcome:?}",
-    );
-    assert!(
-        matches!(s.mode, SettingsModalMode::PickingEnum { key, .. } if key == "default_model"),
-        "second click on DynamicEnum row must transition to PickingEnum, got {:?}",
-        s.mode,
-    );
+    for key in ["default_model", "recap_model", "memory_model"] {
+        let mut state = SettingsModalState::new(
+            Arc::new(SettingsRegistry::defaults()),
+            UiConfig::default(),
+            snapshot.clone(),
+        );
+        state.list_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 80,
+        };
+        state.row_rects.resize(state.rows.len(), Rect::default());
+        let row_idx = row_idx_for(&state, key);
+        state.row_rects[row_idx] = Rect {
+            x: 0,
+            y: row_idx as u16,
+            width: 80,
+            height: 1,
+        };
+        let outcome = handle_settings_mouse(
+            &mut state,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            20,
+            row_idx as u16,
+        );
+        assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+        let outcome = handle_settings_mouse(
+            &mut state,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            20,
+            row_idx as u16,
+        );
+        assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+        assert!(
+            matches!(state.mode, SettingsModalMode::PickingEnum { key: picked, .. } if picked == key),
+            "second click on {key} must open its DynamicEnum picker, got {:?}",
+            state.mode,
+        );
+    }
 }
 
 /// Mouse click on `max_thoughts_width` opens the inline editor.
@@ -6095,7 +6162,8 @@ fn pr14_restart_required_split() {
     );
 }
 
-/// Model settings use `DynamicEnum` with `ActiveModelCatalog`.
+/// Primary/fork model settings use their name-backed catalog, while recap and
+/// memory use ID-backed auxiliary choices with an Automatic sentinel.
 #[test]
 fn pr14_string_settings_use_known_model_validator() {
     use xai_grok_pager::settings::DynamicEnumSource;
@@ -6116,6 +6184,16 @@ fn pr14_string_settings_use_known_model_validator() {
             other => panic!("expected DynamicEnum kind for `{key}`, got {other:?}"),
         }
     }
+    for key in ["recap_model", "memory_model"] {
+        let meta = reg.find(key).unwrap();
+        assert!(matches!(
+            meta.kind,
+            SettingKind::DynamicEnum {
+                source: DynamicEnumSource::AuxiliaryModelCatalog,
+                ..
+            }
+        ));
+    }
 }
 
 /// Defaults round-trip through `current_value_for`.
@@ -6131,6 +6209,14 @@ fn pr14_model_family_defaults_roundtrip_via_current_value_for() {
         value,
         SettingValue::String(String::new()),
         "PR 14: `fork_secondary_model` defaults to empty string (no-opinion sentinel)",
+    );
+    assert_eq!(
+        current_value_for("recap_model", &ui, &pager),
+        Some(SettingValue::String(String::new()))
+    );
+    assert_eq!(
+        current_value_for("memory_model", &ui, &pager),
+        Some(SettingValue::String(String::new()))
     );
 }
 
@@ -6155,7 +6241,11 @@ fn pr14_fork_secondary_model_reads_ui_config_non_baseline() {
 #[test]
 fn pr14_model_family_settings_are_discoverable_via_search() {
     let reg = SettingsRegistry::defaults();
-    let cases = [("fork", "fork_secondary_model")];
+    let cases = [
+        ("fork", "fork_secondary_model"),
+        ("recap", "recap_model"),
+        ("memory", "memory_model"),
+    ];
     for (query, expected_key) in cases {
         let hits = reg.search(query);
         assert!(

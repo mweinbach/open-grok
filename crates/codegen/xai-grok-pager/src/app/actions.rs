@@ -556,6 +556,18 @@ pub enum Action {
     /// Active session's model is unchanged; next session resolves
     /// via the shell's default-resolution chain.
     ClearDefaultModel,
+    /// Pin the model used for conversation recaps. The typed ID is resolved
+    /// from the combined authenticated catalog and persisted to
+    /// `[models].recap`.
+    SetRecapModel(acp::ModelId),
+    /// Clear `[models].recap`; the runtime chooses a provider-aware economical
+    /// model automatically.
+    ClearRecapModel,
+    /// Pin the model used for memory generation and consolidation. Explicit
+    /// picks may intentionally cross provider boundaries.
+    SetMemoryModel(acp::ModelId),
+    /// Clear `[models].memory`; the runtime chooses automatically.
+    ClearMemoryModel,
     /// Commit the max-thoughts-width (column budget for the thoughts panel).
     /// Payload is `i64`; clamped to `u16` at the shell helper boundary.
     SetMaxThoughtsWidth(i64),

@@ -1127,6 +1127,9 @@ pub(crate) async fn run(
     // Seed app state from disk once at the I/O boundary so dispatch
     // stays sans-IO.
     app.current_ui = load_initial_ui_config();
+    let auxiliary_models = load_initial_auxiliary_models();
+    app.recap_model = auxiliary_models.recap;
+    app.memory_model = auxiliary_models.memory;
     // Disk load replaces `current_ui`. Assign one policy-clamped resolved
     // launch mode unconditionally (CLI > TOML > remote > Ask) so disk Auto
     // cannot win over `--permission-mode ask`, and a policy-clamped remote
@@ -2592,6 +2595,35 @@ pub(crate) fn load_initial_ui_config() -> xai_grok_shell::agent::config::UiConfi
         return UiConfig::default();
     };
     ui_value.try_into::<UiConfig>().unwrap_or_default()
+}
+
+/// Auxiliary-model pins seeded once from the effective config. Settings keeps
+/// these mirrors current after startup so modal rendering stays sans-IO.
+#[derive(Default)]
+struct InitialAuxiliaryModels {
+    recap: Option<String>,
+    memory: Option<String>,
+}
+
+fn load_initial_auxiliary_models() -> InitialAuxiliaryModels {
+    let Ok(root) = xai_grok_shell::config::load_effective_config() else {
+        return InitialAuxiliaryModels::default();
+    };
+    let Some(models) = root.get("models") else {
+        return InitialAuxiliaryModels::default();
+    };
+    let read_pin = |key: &str| {
+        models
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    InitialAuxiliaryModels {
+        recap: read_pin("recap"),
+        memory: read_pin("memory"),
+    }
 }
 
 /// Config `Option<bool>` mirrors seeded once at startup. `None` = no
