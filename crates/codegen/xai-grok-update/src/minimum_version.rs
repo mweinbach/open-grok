@@ -29,6 +29,13 @@ enum EnforcementOutcome {
     Upgraded,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenGrokTargetSelection {
+    Install(String),
+    NoRelease,
+    NoSatisfyingRelease { latest: String },
+}
+
 /// User-facing enforcement failures; `Display` is printed to stderr.
 /// `AutoUpdateDisabled` and `NoInstaller` share copy but stay separate so
 /// telemetry can distinguish them.
@@ -79,6 +86,11 @@ pub(crate) enum MinimumVersionError {
         minimum: String,
         latest: String,
     },
+    #[error(
+        "Open Grok version {minimum} or later is required, but the latest Open Grok release is \
+         {latest}. No satisfying fork release is available."
+    )]
+    NoSatisfyingForkRelease { minimum: String, latest: String },
     /// Couldn't probe the registry — likely transient.
     #[error(
         "This version of Grok ({current}) is no longer supported. \
@@ -92,6 +104,31 @@ pub(crate) enum MinimumVersionError {
          Run `open-grok update` to install the latest allowed version."
     )]
     TargetBelowFloor { target: String, minimum: String },
+}
+
+fn is_open_grok_version(version: &semver::Version) -> bool {
+    version
+        .pre
+        .as_str()
+        .split('.')
+        .next()
+        .is_some_and(|identifier| identifier == "open-grok")
+}
+
+/// Compare an Open Grok release against a configured floor.
+///
+/// Open Grok tags encode the fork revision in SemVer's prerelease component
+/// (`0.1.220-open-grok.4`). Plain SemVer therefore considers them lower than
+/// the bare upstream core `0.1.220`. For a bare floor, compare the core tuple
+/// so a fork build from that core satisfies it. Explicit prerelease floors —
+/// including `open-grok.N` floors — retain normal SemVer ordering.
+fn version_satisfies_floor(current: &semver::Version, minimum: &semver::Version) -> bool {
+    if is_open_grok_version(current) && minimum.pre.is_empty() {
+        (current.major, current.minor, current.patch)
+            >= (minimum.major, minimum.minor, minimum.patch)
+    } else {
+        current >= minimum
+    }
 }
 
 /// Pure check against the configured floor. Empty / whitespace-only
@@ -122,7 +159,7 @@ fn evaluate_minimum_version(
         }
     };
 
-    if parsed_cur >= parsed_min {
+    if version_satisfies_floor(&parsed_cur, &parsed_min) {
         Ok(MinimumVersionDecision::Allow)
     } else {
         Ok(MinimumVersionDecision::BelowMinimum {
@@ -170,8 +207,17 @@ fn apply_floor_inner(target: &str, floor: Option<&str>) -> Result<String, Minimu
     let Some(min) = floor else {
         return Ok(target.to_string());
     };
+    let parsed_target = semver::Version::parse(target).ok();
     match evaluate_minimum_version(target, Some(min))? {
         MinimumVersionDecision::Allow => Ok(target.to_string()),
+        MinimumVersionDecision::BelowMinimum { minimum, .. }
+            if parsed_target.as_ref().is_some_and(is_open_grok_version) =>
+        {
+            Err(MinimumVersionError::NoSatisfyingForkRelease {
+                minimum,
+                latest: target.to_string(),
+            })
+        }
         MinimumVersionDecision::BelowMinimum { minimum, .. } => Ok(minimum),
     }
 }
@@ -184,6 +230,37 @@ fn pick_target_version(latest: Option<&str>, minimum: &str) -> String {
             _ => minimum.to_string(),
         },
         None => minimum.to_string(),
+    }
+}
+
+/// Select only an actually-published Open Grok release. Unlike the legacy
+/// npm/GCS updater, this must never synthesize the bare configured floor as a
+/// GitHub tag: a floor such as `0.1.221` does not imply that
+/// `v0.1.221` exists in the fork.
+fn pick_open_grok_target(
+    latest: Option<&str>,
+    minimum: &str,
+) -> Result<OpenGrokTargetSelection, MinimumVersionError> {
+    let parsed_min =
+        semver::Version::parse(minimum).map_err(|source| MinimumVersionError::InvalidMinimum {
+            value: minimum.to_string(),
+            source,
+        })?;
+    let Some(latest) = latest else {
+        return Ok(OpenGrokTargetSelection::NoRelease);
+    };
+    let Ok(parsed_latest) = semver::Version::parse(latest) else {
+        return Ok(OpenGrokTargetSelection::NoRelease);
+    };
+    if !is_open_grok_version(&parsed_latest) {
+        return Ok(OpenGrokTargetSelection::NoRelease);
+    }
+    if version_satisfies_floor(&parsed_latest, &parsed_min) {
+        Ok(OpenGrokTargetSelection::Install(latest.to_string()))
+    } else {
+        Ok(OpenGrokTargetSelection::NoSatisfyingRelease {
+            latest: latest.to_string(),
+        })
     }
 }
 
@@ -215,7 +292,19 @@ async fn enforce_minimum_version(
     };
 
     let latest = fetch_latest_version(installer, update_config).await.ok();
-    let target = pick_target_version(latest.as_deref(), &minimum);
+    let target = if installer == "open-grok" {
+        match pick_open_grok_target(latest.as_deref(), &minimum)? {
+            OpenGrokTargetSelection::Install(target) => target,
+            OpenGrokTargetSelection::NoRelease => {
+                return Err(MinimumVersionError::NoReleaseFound { current, minimum });
+            }
+            OpenGrokTargetSelection::NoSatisfyingRelease { latest } => {
+                return Err(MinimumVersionError::NoSatisfyingForkRelease { minimum, latest });
+            }
+        }
+    } else {
+        pick_target_version(latest.as_deref(), &minimum)
+    };
 
     info!(%current, %target, installer, "minimum_version: installing upgrade");
     eprintln!(
@@ -295,6 +384,9 @@ pub async fn enforce_minimum_version_or_exit(update_config: &UpdateConfig) {
 mod tests {
     use super::*;
 
+    const OPEN_GROK_3: &str = "0.1.220-open-grok.3";
+    const OPEN_GROK_4: &str = "0.1.220-open-grok.4";
+
     #[test]
     fn evaluate_minimum_version_decisions() {
         use MinimumVersionDecision::{Allow, BelowMinimum};
@@ -332,12 +424,82 @@ mod tests {
     }
 
     #[test]
+    fn open_grok_release_satisfies_bare_floor_by_core_version() {
+        use MinimumVersionDecision::{Allow, BelowMinimum};
+
+        assert_eq!(
+            evaluate_minimum_version(OPEN_GROK_4, Some("0.1.220")).unwrap(),
+            Allow,
+            "same-core fork release must satisfy a bare upstream floor"
+        );
+        assert_eq!(
+            evaluate_minimum_version(OPEN_GROK_4, Some("0.1.219")).unwrap(),
+            Allow
+        );
+        assert!(matches!(
+            evaluate_minimum_version(OPEN_GROK_4, Some("0.1.221")).unwrap(),
+            BelowMinimum { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_open_grok_floor_retains_full_semver_ordering() {
+        use MinimumVersionDecision::{Allow, BelowMinimum};
+
+        assert_eq!(
+            evaluate_minimum_version(OPEN_GROK_4, Some(OPEN_GROK_3)).unwrap(),
+            Allow
+        );
+        assert_eq!(
+            evaluate_minimum_version(OPEN_GROK_4, Some(OPEN_GROK_4)).unwrap(),
+            Allow
+        );
+        assert!(matches!(
+            evaluate_minimum_version(OPEN_GROK_3, Some(OPEN_GROK_4)).unwrap(),
+            BelowMinimum { .. }
+        ));
+    }
+
+    #[test]
     fn pick_target_returns_max_of_latest_and_minimum() {
         // The `None` branch is only reachable here — apply_floor always
         // passes `Some(target)`. Production hits it on fetch failure.
         assert_eq!(pick_target_version(Some("0.1.200"), "0.1.150"), "0.1.200");
         assert_eq!(pick_target_version(Some("0.1.140"), "0.1.150"), "0.1.150");
         assert_eq!(pick_target_version(None, "0.1.150"), "0.1.150");
+    }
+
+    #[test]
+    fn open_grok_target_selection_never_synthesizes_a_bare_release_tag() {
+        assert_eq!(
+            pick_open_grok_target(Some(OPEN_GROK_4), "0.1.220").unwrap(),
+            OpenGrokTargetSelection::Install(OPEN_GROK_4.to_string())
+        );
+        assert_eq!(
+            pick_open_grok_target(Some(OPEN_GROK_4), "0.1.221").unwrap(),
+            OpenGrokTargetSelection::NoSatisfyingRelease {
+                latest: OPEN_GROK_4.to_string()
+            }
+        );
+        assert_eq!(
+            pick_open_grok_target(Some(OPEN_GROK_4), OPEN_GROK_3).unwrap(),
+            OpenGrokTargetSelection::Install(OPEN_GROK_4.to_string())
+        );
+        assert_eq!(
+            pick_open_grok_target(Some(OPEN_GROK_3), OPEN_GROK_4).unwrap(),
+            OpenGrokTargetSelection::NoSatisfyingRelease {
+                latest: OPEN_GROK_3.to_string()
+            }
+        );
+        assert_eq!(
+            pick_open_grok_target(None, "0.1.220").unwrap(),
+            OpenGrokTargetSelection::NoRelease
+        );
+        assert_eq!(
+            pick_open_grok_target(Some("0.1.221"), "0.1.220").unwrap(),
+            OpenGrokTargetSelection::NoRelease,
+            "a bare upstream version must never become a fork install target"
+        );
     }
 
     #[test]
@@ -360,6 +522,33 @@ mod tests {
             apply_floor_inner("0.1.50", Some("0.1.100")).unwrap(),
             "0.1.100"
         );
+
+        // Fork releases satisfy bare same-core floors without being rewritten
+        // to a nonexistent bare GitHub tag.
+        assert!(check_install_target_inner(OPEN_GROK_4, Some("0.1.220")).is_ok());
+        assert_eq!(
+            apply_floor_inner(OPEN_GROK_4, Some("0.1.220")).unwrap(),
+            OPEN_GROK_4
+        );
+        assert_eq!(
+            apply_floor_inner(OPEN_GROK_4, Some(OPEN_GROK_3)).unwrap(),
+            OPEN_GROK_4
+        );
+
+        assert!(matches!(
+            check_install_target_inner(OPEN_GROK_3, Some(OPEN_GROK_4)).unwrap_err(),
+            MinimumVersionError::TargetBelowFloor { .. }
+        ));
+        assert!(matches!(
+            apply_floor_inner(OPEN_GROK_4, Some("0.1.221")).unwrap_err(),
+            MinimumVersionError::NoSatisfyingForkRelease { minimum, latest }
+                if minimum == "0.1.221" && latest == OPEN_GROK_4
+        ));
+        assert!(matches!(
+            apply_floor_inner(OPEN_GROK_3, Some(OPEN_GROK_4)).unwrap_err(),
+            MinimumVersionError::NoSatisfyingForkRelease { minimum, latest }
+                if minimum == OPEN_GROK_4 && latest == OPEN_GROK_3
+        ));
     }
 
     #[test]

@@ -8,6 +8,8 @@ use std::os::unix::process::CommandExt;
 
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::version::{
@@ -37,11 +39,11 @@ fn manual_install_cmd() -> &'static str {
 
 /// Build a reinstall hint for a known installer type.
 fn reinstall_hint(installer: &str) -> String {
-    match installer {
-        "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
-        "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
-        _ => format!("Please reinstall via:\n  {}", manual_install_cmd()),
-    }
+    let _ = installer;
+    format!(
+        "Please reinstall Open Grok via:\n  {}",
+        manual_install_cmd()
+    )
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -66,7 +68,7 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
 
     if let Some(error) = status.error.as_deref() {
         println!(
-            "Grok Build - v{} [{}]",
+            "Open Grok - v{} [{}]",
             status.current_version, status.channel
         );
         println!("Update check failed: {error}");
@@ -78,24 +80,24 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
     if status.update_available {
         if let Some(latest_version) = status.latest_version.as_deref() {
             println!(
-                "A new version of Grok Build is available: {} -> {}{}",
+                "A new version of Open Grok is available: {} -> {}{}",
                 status.current_version, latest_version, channel_label
             );
         } else {
-            println!("A new version of Grok Build is available.");
+            println!("A new version of Open Grok is available.");
         }
         return Ok(());
     }
 
     if let Some(latest_version) = status.latest_version.as_deref() {
         println!(
-            "Grok Build - v{} (latest: {}){}",
+            "Open Grok - v{} (latest: {}){}",
             status.current_version, latest_version, channel_label
         );
         return Ok(());
     }
 
-    println!("Grok Build - v{}{}", status.current_version, channel_label);
+    println!("Open Grok - v{}{}", status.current_version, channel_label);
     Ok(())
 }
 
@@ -265,12 +267,17 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
 /// like npm (no trustworthy disk version).
 fn disk_version_for_installer(installer: &str) -> Option<String> {
     match installer {
-        "internal" | "gh-release" => crate::version::installed_on_disk_version(),
+        "open-grok" | "internal" | "gh-release" => crate::version::installed_on_disk_version(),
         _ => None,
     }
 }
 
 fn env_installer() -> Option<&'static str> {
+    // Legacy installer overrides exist solely for this crate's compatibility
+    // tests. Shipping Open Grok processes never honor an xAI/npm updater lane.
+    if !cfg!(test) && std::env::var_os(xai_grok_version::TEST_VERSION_ENV).is_none() {
+        return None;
+    }
     if let Ok(v) = std::env::var("GROK_INSTALLER") {
         return match v.to_ascii_lowercase().as_str() {
             "npm" => Some("npm"),
@@ -295,12 +302,7 @@ pub async fn get_installer() -> Option<&'static str> {
     if let Some(i) = env_installer() {
         return Some(i);
     }
-    let cfg = config::load_config().await;
-    match cfg.cli.installer.as_deref() {
-        Some("npm") => Some("npm"),
-        Some("gh-release") => Some("gh-release"),
-        _ => Some("internal"),
-    }
+    Some("open-grok")
 }
 
 fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: bool) -> Option<bool> {
@@ -311,7 +313,16 @@ fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: boo
         // semver (no pre-release suffix). The pre-release checks in this
         // match are dead code but kept as a safety net.
         "stable" | "enterprise" => {
-            if !target.pre.is_empty() {
+            let is_open_grok_prerelease = |version: &semver::Version| {
+                version
+                    .pre
+                    .as_str()
+                    .split('.')
+                    .next()
+                    .is_some_and(|id| id == "open-grok")
+            };
+            let is_open_grok_release = is_open_grok_prerelease(&target);
+            if !target.pre.is_empty() && !is_open_grok_release {
                 tracing::warn!(
                     %current, %target,
                     channel = %channel,
@@ -319,7 +330,7 @@ fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: boo
                 );
                 return Some(false);
             }
-            if !current.pre.is_empty() {
+            if !current.pre.is_empty() && !is_open_grok_prerelease(&current) {
                 return Some(true);
             }
         }
@@ -342,7 +353,7 @@ fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: boo
 /// `get_installer()`, so they also get rollback support.
 fn installer_allows_downgrade(installer: &str) -> bool {
     match installer {
-        "internal" | "gh-release" => true,
+        "open-grok" | "internal" | "gh-release" => true,
         "npm" => false,
         _ => false,
     }
@@ -523,7 +534,7 @@ pub async fn run_update_if_available(
     let channel_label = format!(" [{}]", update_config.channel);
     if auto_update {
         eprintln!(
-            "A new version of Grok Build is available: {} -> {}{}",
+            "A new version of Open Grok is available: {} -> {}{}",
             current_version, latest_version, channel_label
         );
         if interactive {
@@ -551,7 +562,7 @@ pub async fn run_update_if_available(
             return Ok(false);
         }
         eprintln!(
-            "A new version of Grok Build is available: {} -> {}{}",
+            "A new version of Open Grok is available: {} -> {}{}",
             current_version, latest_version, channel_label
         );
         if interactive {
@@ -656,7 +667,7 @@ pub fn restart_grok() -> Result<()> {
     }
     cmd.env_clear();
     cmd.envs(std::env::vars_os().filter(|(k, _)| k != "GROK_AUTO_UPDATE"));
-    eprintln!("Restarting Grok...");
+    eprintln!("Restarting Open Grok...");
 
     // Use exec on Unix to replace the current process, avoiding stdio issues
     // when the parent exits. On Windows, fall back to spawn + exit.
@@ -689,6 +700,7 @@ pub async fn run_install_script(
     update_config: &UpdateConfig,
 ) -> Result<()> {
     let result = match installer {
+        "open-grok" => install_open_grok_release(target, update_config).await,
         "npm" => install_npm(
             target,
             &update_config.channel,
@@ -707,6 +719,254 @@ pub async fn run_install_script(
             reinstall_hint(installer)
         )
     })
+}
+
+const OPEN_GROK_MACOS_AARCH64_ASSET: &str = "open-grok-macos-aarch64";
+
+fn open_grok_release_asset() -> Result<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Ok(OPEN_GROK_MACOS_AARCH64_ASSET)
+    } else {
+        anyhow::bail!("Open Grok currently publishes updates only for macOS on Apple Silicon")
+    }
+}
+
+fn normalize_release_version(version: &str) -> Result<String> {
+    let trimmed = version.trim();
+    let normalized = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    semver::Version::parse(normalized).map_err(|error| {
+        anyhow::anyhow!("invalid Open Grok release version '{version}': {error}")
+    })?;
+    Ok(normalized.to_string())
+}
+
+async fn sha256_file(path: &std::path::Path) -> Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn parse_published_checksum(contents: &str, expected_asset: &str) -> Result<String> {
+    let line = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("published SHA-256 file is empty"))?;
+    let mut parts = line.split_whitespace();
+    let digest = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("published SHA-256 file has no digest"))?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("published SHA-256 digest is malformed");
+    }
+    if let Some(name) = parts.next() {
+        let name = name.trim_start_matches('*');
+        if name != expected_asset {
+            anyhow::bail!(
+                "published SHA-256 names unexpected asset '{name}' (expected '{expected_asset}')"
+            );
+        }
+    }
+    Ok(digest.to_ascii_lowercase())
+}
+
+async fn smoke_test_open_grok_binary(
+    binary_path: &std::path::Path,
+    expected_version: &str,
+) -> Result<String> {
+    let mut cmd = tokio::process::Command::new(binary_path);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    xai_grok_tools::util::detach_command(&mut cmd);
+    let output = tokio::time::timeout(SMOKE_TEST_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("downloaded Open Grok binary timed out during --version"))??;
+    if !output.status.success() {
+        anyhow::bail!(
+            "downloaded Open Grok binary failed its --version smoke test ({})",
+            output.status
+        );
+    }
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported_version = rendered
+        .split_whitespace()
+        .find_map(|token| {
+            let token = token.trim_matches(|character: char| {
+                matches!(character, ',' | ';' | '(' | ')' | '[' | ']')
+            });
+            semver::Version::parse(token)
+                .ok()
+                .map(|_| token.to_string())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("downloaded Open Grok binary did not report a semver version")
+        })?;
+    if reported_version != expected_version {
+        anyhow::bail!(
+            "downloaded Open Grok binary reported version {reported_version} (expected {expected_version})"
+        );
+    }
+    Ok(reported_version)
+}
+
+async fn migrate_regular_open_grok_install(
+    binary_path: &std::path::Path,
+    bin_dir: &std::path::Path,
+    download_dir: &std::path::Path,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let metadata = match tokio::fs::symlink_metadata(binary_path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "managed Open Grok path is neither a file nor symlink: {}",
+                binary_path.display()
+            );
+        }
+
+        // The public install.sh used a regular file through open-grok. Before
+        // replacing it with a managed symlink, preserve the exact inode with a
+        // hard link. This is important on macOS: unlinking the last name of an
+        // executing signed image can terminate the still-running process.
+        let (os, arch) = detect_platform()?;
+        let current = normalize_release_version(&get_installed_grok_version())?;
+        let mut preserved = download_dir.join(format!("open-grok-{current}-{os}-{arch}"));
+        if tokio::fs::symlink_metadata(&preserved).await.is_ok() {
+            preserved = download_dir.join(format!(
+                "open-grok-{current}+migration.{}-{os}-{arch}",
+                std::process::id()
+            ));
+        }
+        tokio::fs::hard_link(binary_path, &preserved)
+            .await
+            .with_context(|| {
+                format!(
+                    "preserving the active Open Grok executable at {}",
+                    preserved.display()
+                )
+            })?;
+        let relative = relative_symlink_target(&preserved, binary_path);
+        atomic_symlink_swap(&relative, binary_path).await?;
+        tracing::info!(
+            previous = %preserved.display(),
+            "migrated regular-file Open Grok install to managed symlink layout"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (binary_path, bin_dir, download_dir);
+    }
+    let _ = bin_dir;
+    Ok(())
+}
+
+async fn install_open_grok_release(
+    target: Option<&str>,
+    update_config: &UpdateConfig,
+) -> Result<()> {
+    let version = match target {
+        Some(version) => normalize_release_version(version)?,
+        None => fetch_latest_version("open-grok", update_config).await?,
+    };
+    install_open_grok_release_from_base(&version, &update_config.release_download_base_url).await
+}
+
+/// Install a pinned Open Grok release from a GitHub-Releases-compatible base
+/// URL. Exposed for an isolated updater integration test; production callers
+/// use the fixed mweinbach/open-grok URL from [`UpdateConfig`].
+#[doc(hidden)]
+pub async fn install_open_grok_release_from_base(
+    target: &str,
+    release_base_url: &str,
+) -> Result<()> {
+    let version = normalize_release_version(target)?;
+    let asset = open_grok_release_asset()?;
+    let base = release_base_url.trim_end_matches('/');
+    let tag = format!("v{version}");
+    let asset_url = format!("{base}/download/{tag}/{asset}");
+    let checksum_url = format!("{asset_url}.sha256");
+
+    let home = grok_home();
+    let download_dir = home.join("downloads");
+    let bin_dir = home.join("bin");
+    tokio::fs::create_dir_all(&download_dir).await?;
+    tokio::fs::create_dir_all(&bin_dir).await?;
+    let versioned_name = format!("open-grok-{version}-macos-aarch64");
+    let canonical_binary_path = download_dir.join(&versioned_name);
+    // A forced same-version reinstall must not rename over the inode currently
+    // targeted by the running managed command. On macOS, unlinking that signed
+    // executable can terminate the live process. A unique suffix *after* the
+    // platform keeps disk-version parsing at `version` while preserving the
+    // previous inode for already-running processes.
+    let binary_path = if tokio::fs::symlink_metadata(&canonical_binary_path)
+        .await
+        .is_ok()
+    {
+        unique_temp_sibling(&canonical_binary_path, "reinstall")
+    } else {
+        canonical_binary_path
+    };
+    let checksum_path = unique_temp_sibling(&download_dir.join(&versioned_name), "sha256");
+
+    eprintln!("  Downloading Open Grok v{version} (macOS Apple Silicon)...");
+    download_with_progress(&asset_url, &binary_path).await?;
+    if let Err(error) = download_silent(&checksum_url, &checksum_path).await {
+        let _ = tokio::fs::remove_file(&binary_path).await;
+        return Err(error).context("downloading published Open Grok SHA-256");
+    }
+
+    let checksum_contents = tokio::fs::read_to_string(&checksum_path).await?;
+    let _ = tokio::fs::remove_file(&checksum_path).await;
+    let expected = parse_published_checksum(&checksum_contents, asset)?;
+    let actual = sha256_file(&binary_path).await?;
+    if actual != expected {
+        let _ = tokio::fs::remove_file(&binary_path).await;
+        anyhow::bail!(
+            "Open Grok SHA-256 verification failed (expected {expected}, got {actual}); current version was not changed"
+        );
+    }
+
+    let reported_version = match smoke_test_open_grok_binary(&binary_path, &version).await {
+        Ok(reported_version) => reported_version,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&binary_path).await;
+            return Err(error);
+        }
+    };
+    debug_assert_eq!(reported_version, version);
+
+    let managed = bin_dir.join("open-grok");
+    migrate_regular_open_grok_install(&managed, &bin_dir, &download_dir).await?;
+    let link_path = swap_managed_bin_links(&binary_path, &bin_dir).await?;
+    remove_stale_pager(&bin_dir).await;
+    cleanup_old_downloads(&download_dir, "open-grok", &version).await;
+    let _ = config::update_config(|state| {
+        state.cli.installer = Some("open-grok".to_string());
+    })
+    .await;
+    regenerate_completions(&link_path, &home).await;
+    Ok(())
 }
 
 /// Detect the current platform (os, arch) for binary downloads.
@@ -2174,7 +2434,7 @@ pub async fn run_update(
             anyhow::bail!("{e}");
         }
         eprintln!(
-            "Installing Grok {} (current: {})...",
+            "Installing Open Grok {} (current: {})...",
             version, current_version
         );
         eprintln!();
@@ -2187,8 +2447,8 @@ pub async fn run_update(
         {
             tracing::warn!("Failed to persist auto_update=false for pinned install: {e}");
         }
-        eprintln!("  ✓ grok v{} installed successfully!", version);
-        eprintln!("  Please restart Grok.");
+        eprintln!("  ✓ Open Grok v{} installed successfully!", version);
+        eprintln!("  Please restart Open Grok.");
         return Ok(Some(version.to_string()));
     }
 
@@ -2285,12 +2545,15 @@ pub async fn run_update(
         .unwrap_or(true)
     {
         eprintln!(
-            "Forcing reinstall of Grok {} (already up to date)",
+            "Forcing reinstall of Open Grok {} (already up to date)",
             effective_current
         );
         &effective_current
     } else {
-        eprintln!("Updating Grok {} → {}", effective_current, install_target);
+        eprintln!(
+            "Updating Open Grok {} → {}",
+            effective_current, install_target
+        );
         &install_target
     };
 
@@ -2302,10 +2565,10 @@ pub async fn run_update(
     let stable_ptr = try_fetch_stable_pointer().await;
     write_version_cache(target_version, stable_ptr.as_deref()).await;
     refresh_deployment_config().await;
-    eprintln!("  ✓ grok v{} installed successfully!", target_version);
+    eprintln!("  ✓ Open Grok v{} installed successfully!", target_version);
 
     if !force && std::env::var_os("GROK_AUTO_UPDATE").is_none() {
-        eprintln!("  Please restart Grok.");
+        eprintln!("  Please restart Open Grok.");
     }
     Ok(Some(target_version.to_string()))
 }
@@ -3198,26 +3461,20 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_reinstall_hint_npm_mentions_npm_command() {
+    fn test_reinstall_hint_never_redirects_to_npm() {
         let hint = reinstall_hint("npm");
-        assert!(hint.contains("npm i -g"), "should suggest npm i -g: {hint}");
+        assert!(hint.contains("open-grok"), "should name Open Grok: {hint}");
         assert!(
-            hint.contains("@xai-official/grok"),
-            "should name the package: {hint}"
+            !hint.contains("npm"),
+            "must not suggest the upstream npm lane: {hint}"
         );
     }
 
     #[test]
-    fn test_reinstall_hint_gh_release_mentions_gh_command() {
+    fn test_reinstall_hint_never_requires_gh_cli() {
         let hint = reinstall_hint("gh-release");
-        assert!(
-            hint.contains("gh release download"),
-            "should suggest gh release download: {hint}"
-        );
-        assert!(
-            hint.contains("xai-org-shared/grok-build"),
-            "should name the repo: {hint}"
-        );
+        assert!(hint.contains("open-grok"), "should name Open Grok: {hint}");
+        assert!(!hint.contains("gh release"), "must not require gh: {hint}");
     }
 
     #[test]

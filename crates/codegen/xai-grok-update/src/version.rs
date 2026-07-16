@@ -11,7 +11,11 @@ use xai_grok_shell::util::grok_home::grok_home;
 
 const TTL_SECONDS_BEFORE_AUTO_UPDATE: Duration = Duration::from_secs(60 * 30);
 const NPM_PACKAGE: &str = "@xai-official/grok";
-pub const GH_RELEASE_REPO: &str = "xai-org-shared/grok-build";
+pub const GH_RELEASE_REPO: &str = "mweinbach/open-grok";
+pub const OPEN_GROK_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/mweinbach/open-grok/releases/latest";
+pub const OPEN_GROK_RELEASE_DOWNLOAD_BASE_URL: &str =
+    "https://github.com/mweinbach/open-grok/releases";
 
 /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching
 /// for binaries and origin-respecting no-cache for channel pointers.
@@ -45,6 +49,18 @@ pub struct UpdateConfig {
     pub channel: String,
     /// Custom npm registry URL. When set, passed as `--registry=` to npm CLI.
     pub npm_registry: Option<String>,
+    /// GitHub's public latest-release API endpoint for Open Grok.
+    ///
+    /// Production construction always uses [`OPEN_GROK_RELEASE_API_URL`]. The
+    /// field makes the complete updater testable against an isolated server
+    /// without adding an environment variable that could redirect updates.
+    #[doc(hidden)]
+    pub release_api_url: String,
+    /// Base URL containing `download/v<version>/<asset>` release artifacts.
+    /// Production construction always uses
+    /// [`OPEN_GROK_RELEASE_DOWNLOAD_BASE_URL`].
+    #[doc(hidden)]
+    pub release_download_base_url: String,
 }
 
 impl UpdateConfig {
@@ -56,6 +72,8 @@ impl UpdateConfig {
             alpha_test_key: None,
             channel: "stable".to_string(),
             npm_registry: None,
+            release_api_url: OPEN_GROK_RELEASE_API_URL.to_string(),
+            release_download_base_url: OPEN_GROK_RELEASE_DOWNLOAD_BASE_URL.to_string(),
         }
     }
 }
@@ -224,6 +242,51 @@ async fn fetch_gh_release_latest(exclude_pre: bool) -> Result<String> {
     Ok(version)
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubLatestRelease {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+}
+
+/// Resolve the latest Open Grok version from GitHub's unauthenticated public
+/// Releases API. This intentionally uses HTTP directly: normal updates must
+/// not depend on an installed/authenticated `gh` CLI.
+#[doc(hidden)]
+pub async fn fetch_open_grok_release_version_from_api(api_url: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("open-grok-updater")
+        .build()?;
+    let response = client.get(api_url).send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Open Grok release check failed: HTTP {}: {}",
+            status,
+            body.chars().take(200).collect::<String>().trim()
+        );
+    }
+    let release: GitHubLatestRelease = response.json().await?;
+    if release.draft {
+        anyhow::bail!("GitHub latest-release response unexpectedly referenced a draft release");
+    }
+    let version = release
+        .tag_name
+        .trim()
+        .strip_prefix('v')
+        .unwrap_or(release.tag_name.trim())
+        .to_string();
+    semver::Version::parse(&version).map_err(|error| {
+        anyhow::anyhow!(
+            "Open Grok release tag '{}' is not valid semver: {error}",
+            release.tag_name
+        )
+    })?;
+    Ok(version)
+}
+
 /// Fetch the latest version from a public CLI channel pointer.
 ///
 /// Reads `{base}/{channel}` which contains a plain-text semver string
@@ -344,6 +407,7 @@ async fn fetch_gcs_channel_pointer(channel: &str, base_url: &str) -> Result<Stri
 /// when no update is needed).
 pub async fn fetch_latest_version(installer: &str, config: &UpdateConfig) -> Result<String> {
     match installer {
+        "open-grok" => fetch_open_grok_release_version_from_api(&config.release_api_url).await,
         "npm" => fetch_npm_version(&config.channel, config.npm_registry.as_deref()).await,
         "gh-release" => fetch_gh_release_version(&config.channel).await,
         _ => fetch_gcs_version(&config.channel).await,
@@ -445,7 +509,13 @@ pub fn installed_on_disk_version() -> Option<String> {
         // metadata() follows the symlink: Err means the target is gone
         // (dangling link) and the version it names is not actually on disk.
         std::fs::metadata(&app).ok()?;
-        version_from_versioned_binary_name(target.file_name()?.to_str()?, "grok")
+        let name = target.file_name()?.to_str()?;
+        version_from_versioned_binary_name(name, "open-grok").or_else(|| {
+            std::env::var_os(xai_grok_version::TEST_VERSION_ENV)
+                .is_some()
+                .then(|| version_from_versioned_binary_name(name, "grok"))
+                .flatten()
+        })
     }
     #[cfg(not(unix))]
     {
@@ -488,16 +558,9 @@ pub(crate) fn version_from_versioned_binary_name(name: &str, bin_prefix: &str) -
 /// for correctness; on slow or unreachable networks the timeout fires and we
 /// return `None`. This keeps legacy updater paths fast.
 pub(crate) async fn try_fetch_stable_pointer() -> Option<String> {
-    tokio::time::timeout(Duration::from_millis(500), async {
-        for base in CLI_BASE_URLS {
-            if let Ok(v) = fetch_gcs_channel_pointer("stable", base).await {
-                return Some(v);
-            }
-        }
-        None
-    })
-    .await
-    .unwrap_or(None)
+    // Open Grok has one authoritative GitHub Releases lane and intentionally
+    // never probes xAI's legacy channel-pointer CDN.
+    None
 }
 
 /// Machine-readable provenance for Open Grok releases.

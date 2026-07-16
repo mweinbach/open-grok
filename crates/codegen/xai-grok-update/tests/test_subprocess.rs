@@ -411,11 +411,7 @@ async fn fetch_gh_release_passes_repo_flag() {
     let _ = fetch_gh_release_version("stable").await.unwrap();
     let log = g.args_log();
     assert!(log[0].contains("--repo"), "args: {}", log[0]);
-    assert!(
-        log[0].contains("xai-org-shared/grok-build"),
-        "args: {}",
-        log[0]
-    );
+    assert!(log[0].contains("mweinbach/open-grok"), "args: {}", log[0]);
 }
 
 #[tokio::test]

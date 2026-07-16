@@ -13,7 +13,7 @@ Install the latest Open Grok release, or VERSION when supplied. VERSION may
 optionally start with "v".
 
 Environment:
-  OPEN_GROK_BIN_DIR           Installation directory override
+  OPEN_GROK_BIN_DIR           Optional PATH-facing symlink directory
   OPENGROK_HOME               Runtime home (default: $HOME/.opengrok)
   OPEN_GROK_RELEASE_BASE_URL  Direct URL containing the release assets
 EOF
@@ -68,31 +68,33 @@ else
     release_url="https://github.com/${REPOSITORY}/releases/latest/download"
 fi
 
-if [[ -n "${OPEN_GROK_BIN_DIR:-}" ]]; then
-    bin_dir="$OPEN_GROK_BIN_DIR"
-else
-    if [[ -z "${OPENGROK_HOME:-}" && -z "${HOME:-}" ]]; then
-        echo "Error: HOME or OPENGROK_HOME must be set when OPEN_GROK_BIN_DIR is unset." >&2
-        exit 1
-    fi
-    open_grok_home="${OPENGROK_HOME:-$HOME/.opengrok}"
-    bin_dir="${open_grok_home}/bin"
-fi
-
-case "$bin_dir" in
-    /*) ;;
-    *)
-        echo "Error: the Open Grok bin directory must be an absolute path: $bin_dir" >&2
-        exit 1
-        ;;
-esac
-if [[ "$bin_dir" == *:* || "$bin_dir" == *$'\n'* || "$bin_dir" == *$'\r'* ]]; then
-    echo "Error: the Open Grok bin directory contains unsupported characters." >&2
+if [[ -z "${OPENGROK_HOME:-}" && -z "${HOME:-}" ]]; then
+    echo "Error: HOME or OPENGROK_HOME must be set." >&2
     exit 1
 fi
+open_grok_home="${OPENGROK_HOME:-$HOME/.opengrok}"
+managed_bin_dir="${open_grok_home}/bin"
+bin_dir="${OPEN_GROK_BIN_DIR:-$managed_bin_dir}"
 
-mkdir -p "$bin_dir"
-stage_dir="$(mktemp -d "${bin_dir}/.open-grok-install.XXXXXX")"
+for checked_dir in "$managed_bin_dir" "$bin_dir"; do
+    case "$checked_dir" in
+        /*) ;;
+        *)
+            echo "Error: the Open Grok bin directory must be an absolute path: $checked_dir" >&2
+            exit 1
+            ;;
+    esac
+    if [[ "$checked_dir" == *:* || "$checked_dir" == *$'\n'* || "$checked_dir" == *$'\r'* ]]; then
+        echo "Error: the Open Grok bin directory contains unsupported characters." >&2
+        exit 1
+    fi
+done
+
+download_dir="${open_grok_home}/downloads"
+mkdir -p "$managed_bin_dir" "$download_dir" "$bin_dir"
+managed_bin_dir_resolved="$(cd "$managed_bin_dir" && pwd -P)"
+bin_dir_resolved="$(cd "$bin_dir" && pwd -P)"
+stage_dir="$(mktemp -d "${download_dir}/.open-grok-install.XXXXXX")"
 cleanup() {
     rm -rf "$stage_dir"
 }
@@ -132,8 +134,57 @@ if [[ "$actual_sha" != "$expected_sha" ]]; then
 fi
 
 chmod 0755 "$binary_tmp"
-mv -f "$binary_tmp" "${bin_dir}/open-grok"
-echo "Installed Open Grok at ${bin_dir}/open-grok" >&2
+if ! version_output="$("$binary_tmp" --version 2>&1)"; then
+    echo "Error: downloaded Open Grok binary failed its --version smoke test." >&2
+    exit 1
+fi
+reported_version="$(printf '%s\n' "$version_output" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$/) { print $i; exit } }')"
+if [[ ! "$reported_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+    echo "Error: downloaded Open Grok binary did not report a valid version." >&2
+    echo "Actual output: $version_output" >&2
+    exit 1
+fi
+if [[ -n "$version" && "$reported_version" != "$version" ]]; then
+    echo "Error: downloaded Open Grok binary reported an unexpected version." >&2
+    echo "Expected: $version" >&2
+    echo "Actual:   $reported_version" >&2
+    exit 1
+fi
+
+installed_version="$reported_version"
+
+versioned_name="open-grok-${installed_version}-macos-aarch64"
+versioned_binary="${download_dir}/${versioned_name}"
+if [[ -e "$versioned_binary" || -L "$versioned_binary" ]]; then
+    versioned_name="${versioned_name}-reinstall-$$"
+    versioned_binary="${download_dir}/${versioned_name}"
+fi
+mv -f "$binary_tmp" "$versioned_binary"
+
+managed_command="${managed_bin_dir}/open-grok"
+if [[ -f "$managed_command" && ! -L "$managed_command" ]]; then
+    # Keep the inode of a possibly-running pre-managed installation alive
+    # while converting the command into the updater's symlink layout.
+    ln "$managed_command" "${download_dir}/.open-grok-previous.$$" 2>/dev/null || {
+        echo "Error: could not preserve the currently installed Open Grok binary." >&2
+        exit 1
+    }
+fi
+managed_link_tmp="${managed_bin_dir}/.open-grok-link.$$"
+rm -f "$managed_link_tmp"
+ln -s "../downloads/${versioned_name}" "$managed_link_tmp"
+mv -f "$managed_link_tmp" "$managed_command"
+
+if [[ "$bin_dir_resolved" != "$managed_bin_dir_resolved" ]]; then
+    exposed_link_tmp="${bin_dir}/.open-grok-link.$$"
+    rm -f "$exposed_link_tmp"
+    ln -s "$managed_command" "$exposed_link_tmp"
+    mv -f "$exposed_link_tmp" "${bin_dir}/open-grok"
+fi
+echo "Installed Open Grok at ${managed_command}" >&2
+if [[ "$bin_dir_resolved" != "$managed_bin_dir_resolved" ]]; then
+    echo "Linked ${bin_dir}/open-grok to the managed command." >&2
+fi
 
 path_line=""
 printf -v quoted_bin_dir '%q' "$bin_dir"

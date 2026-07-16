@@ -76,15 +76,15 @@ fn assert_active_binary(home: &Path, version: &str, platform: &str, expected_con
 }
 
 /// Lay down a managed-install layout in the test OPENGROK_HOME:
-/// `bin/open-grok -> ../downloads/grok-<version>-<platform>` (what
-/// `install_internal_from_base` produces).
+/// `bin/open-grok -> ../downloads/open-grok-<version>-<platform>` (the
+/// production Open Grok release layout).
 fn fake_managed_install(version: &str) {
     let home = test_home();
     let downloads = home.join("downloads");
     let bin = home.join("bin");
     std::fs::create_dir_all(&downloads).unwrap();
     std::fs::create_dir_all(&bin).unwrap();
-    let name = format!("grok-{version}-{}", host_platform());
+    let name = format!("open-grok-{version}-{}", host_platform());
     std::fs::write(downloads.join(&name), small_good_artifact()).unwrap();
     std::fs::set_permissions(
         downloads.join(&name),
@@ -346,7 +346,7 @@ async fn disk_probe_rejects_dangling_symlink() {
 
     std::fs::remove_file(
         home.join("downloads")
-            .join(format!("grok-0.2.7-{platform}")),
+            .join(format!("open-grok-0.2.7-{platform}")),
     )
     .unwrap();
 
@@ -374,7 +374,7 @@ async fn ensure_latest_repairs_dangling_symlink_by_downloading() {
     fake_managed_install("0.2.7");
     std::fs::remove_file(
         home.join("downloads")
-            .join(format!("grok-0.2.7-{platform}")),
+            .join(format!("open-grok-0.2.7-{platform}")),
     )
     .unwrap();
     let cfg = make_update_config("stable");

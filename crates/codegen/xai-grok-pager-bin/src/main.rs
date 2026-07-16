@@ -1866,9 +1866,9 @@ async fn async_main() -> Result<()> {
         )
         .await;
     }
-    // Open Grok releases are installed from this fork's GitHub releases. Do
-    // not run xAI's minimum-version updater: it can replace this executable
-    // with an upstream `grok`/`agent` build before the TUI starts.
+    // Open Grok releases are checked and installed exclusively from this
+    // fork's GitHub Releases lane. The updater never enters xAI's legacy
+    // CDN/npm paths or creates upstream `grok`/`agent` commands.
     let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
     type UpdateWaitHandle = tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>;
     let bg_update_wait: std::sync::Arc<tokio::sync::Mutex<Option<UpdateWaitHandle>>> =
@@ -1922,13 +1922,15 @@ async fn finish_update_on_exit(
         if let Some(reason) = reason {
             eprintln!("{reason}");
         }
-        auto_update::run_update_if_available(
-            auto_update::UpdateRunMode::Blocking,
-            false,
-            update_config,
-        )
-        .await
-        .is_ok()
+        let mut update_config = update_config.clone();
+        match auto_update::run_update(false, None, None, &mut update_config).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("Update failed: {error:#}");
+                false
+            }
+        }
     };
     match adopted {
         Some(handle) => {
@@ -1978,10 +1980,27 @@ fn build_update_config() -> UpdateConfig {
     }
     config
 }
-/// Open Grok releases are published manually on GitHub. Never invoke the
-/// upstream xAI updater, which installs a different binary and command name.
-fn should_check_for_updates(_no_auto_update_flag: bool) -> bool {
-    false
+/// Gate automatic update checks without affecting an explicit
+/// `open-grok update`. Release builds default on; command-line/config/env
+/// opt-outs and debug binaries remain off.
+fn should_check_for_updates(no_auto_update_flag: bool) -> bool {
+    let disabled_by_env = ["OPENGROK_DISABLE_AUTOUPDATER", "GROK_DISABLE_AUTOUPDATER"]
+        .into_iter()
+        .any(|name| {
+            std::env::var(name)
+                .ok()
+                .as_deref()
+                .is_some_and(env_flag_enabled)
+        });
+    update_checks_allowed(no_auto_update_flag, cfg!(debug_assertions), disabled_by_env)
+}
+
+fn update_checks_allowed(
+    no_auto_update_flag: bool,
+    debug_build: bool,
+    disabled_by_env: bool,
+) -> bool {
+    !no_auto_update_flag && !debug_build && !disabled_by_env
 }
 /// Mode-gate for the direct stdio agent's background auto-update.
 ///
@@ -2011,10 +2030,10 @@ fn get_channel_switch(alpha: bool, stable: bool, enterprise: bool) -> Option<&'s
 async fn run_update_command(
     check: bool,
     json: bool,
-    _force_reinstall: bool,
+    force_reinstall: bool,
     version: Option<String>,
     channel_switch: Option<&str>,
-    _base_update_config: &UpdateConfig,
+    base_update_config: &UpdateConfig,
 ) -> Result<()> {
     if json && !check {
         anyhow::bail!("--json requires --check");
@@ -2031,37 +2050,28 @@ async fn run_update_command(
         );
     }
 
-    let (installer_url, version_arg) = match version.as_deref() {
-        Some(version) => (
-            format!(
-                "https://github.com/mweinbach/open-grok/releases/download/v{version}/install.sh"
-            ),
-            format!(" -s -- v{version}"),
-        ),
-        None => (
-            "https://github.com/mweinbach/open-grok/releases/latest/download/install.sh"
-                .to_string(),
-            String::new(),
-        ),
-    };
-    let install_command = format!("curl -fsSL {installer_url} | bash{version_arg}");
+    if check {
+        if force_reinstall || version.is_some() {
+            anyhow::bail!("--check cannot be combined with --force-reinstall or --version");
+        }
+        let status = auto_update::check_update_status(base_update_config).await;
+        auto_update::print_update_status(&status, json)?;
+        if status.error.is_some() {
+            anyhow::bail!("Open Grok update check failed");
+        }
+        return Ok(());
+    }
 
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "automatic": false,
-                "repository": "mweinbach/open-grok",
-                "installCommand": install_command,
-            })
-        );
-    } else if check {
-        println!("Open Grok uses manually published GitHub releases.");
-        println!("To install the latest release:");
-        println!("  {install_command}");
-    } else {
-        println!("Reinstall Open Grok from GitHub Releases:");
-        println!("  {install_command}");
+    let mut update_config = base_update_config.clone();
+    let installed = auto_update::run_update(
+        force_reinstall,
+        version.as_deref(),
+        None,
+        &mut update_config,
+    )
+    .await?;
+    if let Some(installed_version) = installed {
+        signal_leaders_to_relaunch(&installed_version).await;
     }
     Ok(())
 }
@@ -2305,6 +2315,14 @@ mod tests {
             !stdio_direct_update_eligible(false, true),
             "non-stdio leader path is not stdio-eligible",
         );
+    }
+
+    #[test]
+    fn automatic_update_gate_respects_flag_environment_and_debug_safeguards() {
+        assert!(update_checks_allowed(false, false, false));
+        assert!(!update_checks_allowed(true, false, false));
+        assert!(!update_checks_allowed(false, true, false));
+        assert!(!update_checks_allowed(false, false, true));
     }
     use clap::Parser as _;
     /// `open-grok dashboard` flags the startup hook without forcing leader mode —

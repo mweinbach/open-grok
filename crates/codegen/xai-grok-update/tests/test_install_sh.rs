@@ -11,17 +11,21 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const GOOD_SCRIPT: &str = "#!/bin/sh\nexit 0\n";
-const GOOD_SHA256: &str = "306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb";
+const GOOD_SCRIPT: &str = "#!/bin/sh\necho open-grok 0.1.220-open-grok.3\nexit 0\n";
+const GOOD_SHA256: &str = "8c7fa98272d8df5f93e938d7b7a6498cb4dd07f05f5ff78824895c3b21237364";
+const WRONG_VERSION_SCRIPT: &str = "#!/bin/sh\necho open-grok 0.1.220-open-grok.30\nexit 0\n";
+const WRONG_VERSION_SHA256: &str =
+    "ce1ef8cd4edbb40f831b28028f794bcffff0a649702eb2cb389508f088372529";
 const VERSION: &str = "0.1.220-open-grok.3";
 const INSTALLER_BLOCK_START: &str = "# >>> open-grok installer >>>";
 
 fn script_path(name: &str) -> Option<PathBuf> {
-    dunce::canonicalize(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../xai-grok-pager/scripts/{name}")),
-    )
-    .ok()
-    .filter(|path| path.exists())
+    let path = if name == "install.sh" {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../install.sh")
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../xai-grok-pager/scripts/{name}"))
+    };
+    dunce::canonicalize(path).ok().filter(|path| path.exists())
 }
 
 fn host_platform() -> String {
@@ -68,11 +72,16 @@ fi
 if [ -n "$out" ]; then
   case "$url" in
     *.sha256)
-      printf '%s  open-grok-macos-aarch64\n' '{sha256}' > "$out"
+      if [ "$mode" = wrong_version ]; then
+        printf '%s  open-grok-macos-aarch64\n' '{wrong_sha256}' > "$out"
+      else
+        printf '%s  open-grok-macos-aarch64\n' '{sha256}' > "$out"
+      fi
       ;;
     *)
       case "$mode" in
         full) printf '%s' '{good}' > "$out" ;;
+        wrong_version) printf '%s' '{wrong_version}' > "$out" ;;
         truncate) printf '\0\0\0\0' > "$out" ;;
         garbage) head -c "$fullsize" /dev/zero | tr '\0' 'X' > "$out" ;;
       esac
@@ -85,6 +94,8 @@ printf '%s' '{version}'
         fullsize = GOOD_SCRIPT.len(),
         sha256 = GOOD_SHA256,
         good = GOOD_SCRIPT,
+        wrong_version = WRONG_VERSION_SCRIPT,
+        wrong_sha256 = WRONG_VERSION_SHA256,
         version = VERSION,
     );
     let path = dir.join("curl");
@@ -142,6 +153,30 @@ fn run_standard_installer(script: &Path, home: &Path, fake_bin: &Path, mode: &st
         .success()
 }
 
+fn run_standard_installer_with_bin_override(
+    script: &Path,
+    home: &Path,
+    fake_bin: &Path,
+    exposed_bin: &Path,
+) -> bool {
+    Command::new("/bin/bash")
+        .arg(script)
+        .arg(VERSION)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", isolated_path(fake_bin))
+        .env("OPENGROK_HOME", home.join(".opengrok"))
+        .env("OPEN_GROK_BIN_DIR", exposed_bin)
+        .env(
+            "OPEN_GROK_RELEASE_BASE_URL",
+            "https://fixture.invalid/release",
+        )
+        .env("FAKE_MODE", "full")
+        .status()
+        .expect("spawn Open Grok install.sh with bin override")
+        .success()
+}
+
 fn run_enterprise_installer(script: &Path, home: &Path, fake_bin: &Path, shell: &str) -> bool {
     Command::new("/bin/bash")
         .arg(script)
@@ -177,7 +212,12 @@ fn release_installer_preserves_previous_binary_when_checksum_fails() {
     let fake_bin = tempfile::tempdir().unwrap();
     write_fake_curl(fake_bin.path());
 
-    for (mode, should_succeed) in [("full", true), ("truncate", false), ("garbage", false)] {
+    for (mode, should_succeed) in [
+        ("full", true),
+        ("truncate", false),
+        ("garbage", false),
+        ("wrong_version", false),
+    ] {
         let home = tempfile::tempdir().unwrap();
         let open_grok_home = home.path().join(".opengrok");
         seed_previous_good(&open_grok_home);
@@ -190,6 +230,90 @@ fn release_installer_preserves_previous_binary_when_checksum_fails() {
         assert_active_open_grok_runs(&open_grok_home);
         assert_no_upstream_aliases(&open_grok_home);
     }
+}
+
+#[test]
+fn release_installer_keeps_override_linked_to_canonical_managed_command() {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        eprintln!("skipping: prebuilt release installer currently targets Apple Silicon macOS");
+        return;
+    }
+    let Some(script) = script_path("install.sh") else {
+        eprintln!("skipping: install.sh not found");
+        return;
+    };
+    let fake_bin = tempfile::tempdir().unwrap();
+    write_fake_curl(fake_bin.path());
+    let home = tempfile::tempdir().unwrap();
+    let open_grok_home = home.path().join(".opengrok");
+    let exposed_bin = home.path().join(".local/bin");
+
+    assert!(run_standard_installer_with_bin_override(
+        &script,
+        home.path(),
+        fake_bin.path(),
+        &exposed_bin,
+    ));
+
+    let canonical = open_grok_home.join("bin/open-grok");
+    let exposed = exposed_bin.join("open-grok");
+    assert!(
+        std::fs::symlink_metadata(&canonical)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::symlink_metadata(&exposed)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_link(&exposed).unwrap(), canonical);
+    assert!(
+        Command::new(&exposed)
+            .arg("--version")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_no_upstream_aliases(&open_grok_home);
+}
+
+#[test]
+fn release_installer_treats_a_trailing_slash_canonical_override_as_the_same_directory() {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        eprintln!("skipping: prebuilt release installer currently targets Apple Silicon macOS");
+        return;
+    }
+    let Some(script) = script_path("install.sh") else {
+        eprintln!("skipping: install.sh not found");
+        return;
+    };
+    let fake_bin = tempfile::tempdir().unwrap();
+    write_fake_curl(fake_bin.path());
+    let home = tempfile::tempdir().unwrap();
+    let open_grok_home = home.path().join(".opengrok");
+    let trailing_slash_bin = PathBuf::from(format!("{}/", open_grok_home.join("bin").display()));
+
+    assert!(run_standard_installer_with_bin_override(
+        &script,
+        home.path(),
+        fake_bin.path(),
+        &trailing_slash_bin,
+    ));
+
+    let canonical = open_grok_home.join("bin/open-grok");
+    let target = std::fs::read_link(&canonical).unwrap();
+    assert_ne!(target, canonical, "managed command must not link to itself");
+    assert!(
+        Command::new(&canonical)
+            .arg("--version")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_no_upstream_aliases(&open_grok_home);
 }
 
 #[test]

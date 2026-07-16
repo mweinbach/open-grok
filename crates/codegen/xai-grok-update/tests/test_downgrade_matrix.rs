@@ -52,6 +52,9 @@ fn make_config(channel: &str) -> UpdateConfig {
         alpha_test_key: None,
         channel: channel.to_string(),
         npm_registry: None,
+        release_api_url: xai_grok_update::version::OPEN_GROK_RELEASE_API_URL.to_string(),
+        release_download_base_url: xai_grok_update::version::OPEN_GROK_RELEASE_DOWNLOAD_BASE_URL
+            .to_string(),
     }
 }
 
@@ -452,15 +455,15 @@ async fn auto_update_target_npm_rollback_returns_none() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Lay down a managed-install layout in the test OPENGROK_HOME:
-/// `bin/open-grok -> ../downloads/grok-<version>-<platform>` (what
-/// `install_internal_from_base` produces).
+/// `bin/open-grok -> ../downloads/open-grok-<version>-<platform>` (the
+/// production Open Grok release layout).
 fn fake_managed_install(version: &str) {
     let home = test_home();
     let downloads = home.join("downloads");
     let bin = home.join("bin");
     std::fs::create_dir_all(&downloads).unwrap();
     std::fs::create_dir_all(&bin).unwrap();
-    let name = format!("grok-{version}-{}", host_platform());
+    let name = format!("open-grok-{version}-{}", host_platform());
     std::fs::write(downloads.join(&name), b"#!/bin/sh\nexit 0\n").unwrap();
     std::os::unix::fs::symlink(
         std::path::Path::new("../downloads").join(&name),

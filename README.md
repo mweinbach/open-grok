@@ -65,13 +65,16 @@ open-grok --version
 ```
 
 The installer downloads the raw `open-grok-macos-aarch64` artifact and its
-`.sha256` file, verifies SHA-256 before replacing anything, and atomically
-installs only `open-grok`. It does not create `grok` or `agent` aliases.
+`.sha256` file, verifies SHA-256, runs a version smoke test, and atomically
+activates only `open-grok`. The managed command always lives at
+`${OPENGROK_HOME:-$HOME/.opengrok}/bin/open-grok`, which keeps manual installs
+and in-app updates on the same path. It does not create `grok` or `agent`
+aliases.
 
-By default, the destination is
-`${OPENGROK_HOME:-$HOME/.opengrok}/bin`. Override it with
-`OPEN_GROK_BIN_DIR`. When piping the installer, export the override first so it
-is available to `bash`:
+By default, that managed `bin` directory is also added to `PATH`. Set
+`OPEN_GROK_BIN_DIR` to expose a symlink from another absolute directory while
+keeping the canonical managed binary under `OPENGROK_HOME`. When piping the
+installer, export the override first so it is available to `bash`:
 
 ```sh
 export OPEN_GROK_BIN_DIR="$HOME/.local/bin"
@@ -196,8 +199,8 @@ dist/THIRD-PARTY-NOTICES
 
 Open Grok uses `~/.opengrok` for user-level runtime state and project-local
 `.opengrok` directories for repository configuration. Set `OPENGROK_HOME` to
-move all user-level Open Grok state, or `OPEN_GROK_BIN_DIR` to change only the
-installed command location. Codex OAuth is stored at
+move all user-level Open Grok state, or `OPEN_GROK_BIN_DIR` to add a
+PATH-facing symlink to the canonical managed command. Codex OAuth is stored at
 `~/.opengrok/codex-auth.json` by default.
 
 The fork does not fall back to upstream Grok Build state. Credentials, settings,

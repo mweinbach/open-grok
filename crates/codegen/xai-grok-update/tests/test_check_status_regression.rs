@@ -57,6 +57,9 @@ fn make_update_config() -> UpdateConfig {
         alpha_test_key: None,
         channel: "stable".to_string(),
         npm_registry: None,
+        release_api_url: xai_grok_update::version::OPEN_GROK_RELEASE_API_URL.to_string(),
+        release_download_base_url: xai_grok_update::version::OPEN_GROK_RELEASE_DOWNLOAD_BASE_URL
+            .to_string(),
     }
 }
 
