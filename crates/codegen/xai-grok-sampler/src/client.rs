@@ -139,6 +139,71 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     Ok(event)
 }
 
+/// Absorb Codex's forward-compatible `response.metadata` side channel.
+///
+/// `async-openai` 0.33.1 uses a closed enum for Responses stream events and
+/// therefore rejects this valid Codex event before the ordinary stream
+/// transformer can see it. codex-rs parses the event through an open string
+/// discriminator, captures `x-codex-turn-state`, and otherwise treats it as a
+/// side channel. Mirror that behavior here instead of manufacturing a typed
+/// event or failing the request.
+///
+/// `response_id` is deliberately observed only for diagnostics. Codex reuses
+/// it as `previous_response_id` exclusively for incremental WebSocket
+/// requests; the HTTP Responses transport sends the complete input on every
+/// request and uses `prompt_cache_key` for cache affinity.
+fn absorb_response_metadata_event(
+    event_name: &str,
+    data: &str,
+    codex_turn_state: Option<&Arc<OnceLock<String>>>,
+) -> bool {
+    let parsed = serde_json::from_str::<serde_json::Value>(data).ok();
+    let is_metadata = event_name == "response.metadata"
+        || parsed
+            .as_ref()
+            .and_then(|value| value.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("response.metadata");
+    if !is_metadata {
+        return false;
+    }
+
+    if let Some(response_id) = parsed
+        .as_ref()
+        .and_then(|value| value.get("response_id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        tracing::trace!(%response_id, "received Codex response metadata");
+    }
+
+    let turn_state = parsed
+        .as_ref()
+        .and_then(|value| value.get("headers"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|headers| {
+            headers.iter().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case(X_CODEX_TURN_STATE_HEADER)
+                    .then(|| response_metadata_header_value(value))
+                    .flatten()
+            })
+        });
+    if let (Some(state), Some(value)) = (codex_turn_state, turn_state) {
+        // Codex's routing state is immutable within one logical turn. The
+        // first successful Responses/compact value always wins.
+        let _ = state.set(value);
+    }
+
+    true
+}
+
+fn response_metadata_header_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Array(values) => values.first().and_then(response_metadata_header_value),
+        _ => None,
+    }
+}
+
 /// Normalize valid custom-tool stream shapes that async-openai 0.33.1 models
 /// more strictly than the wire protocol used by some Responses deployments.
 ///
@@ -393,6 +458,16 @@ fn patch_codex_request_compat(
     }
 
     patch_codex_instruction_roles(request_body);
+
+    // GPT-5.6 Codex models default to automatic reasoning summaries. The
+    // shared typed conversion uses `concise` for xAI, so project the Codex
+    // request to the same value codex-rs obtains from models.json.
+    if request_body
+        .get("reasoning")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        request_body["reasoning"]["summary"] = serde_json::Value::String("auto".to_owned());
+    }
 
     if matches!(
         local_effort,
@@ -1764,6 +1839,12 @@ impl SamplingClient {
         let mut inner: rs::CreateResponse = (&request).into();
         inner.instructions = (!instructions.is_empty()).then(|| instructions.to_owned());
         inner.parallel_tool_calls = Some(true);
+        if inner.prompt_cache_key.is_none() {
+            inner.prompt_cache_key = request
+                .x_grok_session_id
+                .clone()
+                .filter(|session_id| !session_id.is_empty());
+        }
         let mut request_body = serde_json::to_value(inner).map_err(|error| {
             tracing::error!(%error, "failed to serialize Codex compact request");
             SamplingError::Serialization(error)
@@ -1880,6 +1961,18 @@ impl SamplingClient {
         let includes = request.inner.include.get_or_insert_with(Vec::new);
         if !includes.contains(&rs::IncludeEnum::ReasoningEncryptedContent) {
             includes.push(rs::IncludeEnum::ReasoningEncryptedContent);
+        }
+
+        // codex-rs keys HTTP prompt caching by the stable session ID. Keep
+        // this provider-scoped so xAI's request body remains unchanged, and
+        // preserve an explicit cache key if a caller supplied one.
+        if self.defaults.provider == ModelProvider::Codex
+            && request.inner.prompt_cache_key.is_none()
+        {
+            request.inner.prompt_cache_key = request
+                .x_grok_session_id
+                .clone()
+                .filter(|session_id| !session_id.is_empty());
         }
 
         Ok(())
@@ -2222,6 +2315,7 @@ impl SamplingClient {
         let event_stream = byte_stream.eventsource();
 
         let doom_loop_for_stream = doom_loop.clone();
+        let codex_turn_state_for_stream = self.codex_turn_state.clone();
 
         // The scan item is an `Option`: `Some(None)` skips an absorbed
         // doom-loop event without terminating the stream (`filter_map`
@@ -2251,10 +2345,16 @@ impl SamplingClient {
                         // the check disabled, the shared name-or-payload-type
                         // predicate guards against a server emitting it
                         // despite no opt-in (rollout skew), named or not.
-                        let swallow = match &doom_loop_for_stream {
-                            Some(collector) => collector.absorb(&event.event, data),
-                            None => is_check_event(&event.event, data),
-                        };
+                        let swallow_metadata = absorb_response_metadata_event(
+                            &event.event,
+                            data,
+                            codex_turn_state_for_stream.as_ref(),
+                        );
+                        let swallow = swallow_metadata
+                            || match &doom_loop_for_stream {
+                                Some(collector) => collector.absorb(&event.event, data),
+                                None => is_check_event(&event.event, data),
+                            };
                         if swallow {
                             Some(None)
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
@@ -3839,6 +3939,29 @@ mod tests {
                 Some("ultra"),
             );
         }
+    }
+
+    #[test]
+    fn codex_uses_auto_reasoning_summaries_without_changing_xai() {
+        let mut codex = serde_json::json!({
+            "input": [],
+            "reasoning": {"effort": "high", "summary": "concise"}
+        });
+        patch_codex_request_compat(&mut codex, ModelProvider::Codex, false, None);
+        assert_eq!(
+            codex.pointer("/reasoning/summary"),
+            Some(&serde_json::json!("auto"))
+        );
+
+        let mut xai = serde_json::json!({
+            "input": [],
+            "reasoning": {"effort": "high", "summary": "concise"}
+        });
+        patch_codex_request_compat(&mut xai, ModelProvider::Xai, false, None);
+        assert_eq!(
+            xai.pointer("/reasoning/summary"),
+            Some(&serde_json::json!("concise"))
+        );
     }
 
     #[test]

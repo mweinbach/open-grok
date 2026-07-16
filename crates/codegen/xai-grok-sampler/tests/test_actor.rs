@@ -922,6 +922,29 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
             "Codex web search must request source URLs: {body}"
         );
         assert!(
+            body["include"].as_array().is_some_and(|includes| includes
+                .iter()
+                .any(|include| include.as_str() == Some("reasoning.encrypted_content"))),
+            "Codex must request encrypted reasoning for lossless replay: {body}"
+        );
+        assert_eq!(
+            body.pointer("/reasoning/summary")
+                .and_then(serde_json::Value::as_str),
+            Some("auto"),
+            "Codex reasoning summaries must match codex-rs model defaults: {body}"
+        );
+        assert_eq!(
+            body.get("prompt_cache_key")
+                .and_then(serde_json::Value::as_str),
+            Some("must-not-leak"),
+            "Codex HTTP prompt caching must use the stable session ID: {body}"
+        );
+        assert!(
+            body.get("previous_response_id")
+                .is_none_or(serde_json::Value::is_null),
+            "HTTP Responses sends full input; previous_response_id is WebSocket-only in codex-rs: {body}"
+        );
+        assert!(
             !body.to_string().contains("x_search"),
             "x_search must never be sent to Codex: {body}"
         );
@@ -1002,11 +1025,14 @@ async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
         .insert("x-openai-fedramp".into(), "false".into());
 
     let client = SamplingClient::new(config).expect("Codex sampling client should construct");
+    let mut compact_request = user_request("history to compact");
+    compact_request.x_grok_session_id = Some("session-cache-key".into());
     let replacement = client
-        .compact_codex_conversation(user_request("history to compact"), "base instructions")
+        .compact_codex_conversation(compact_request, "base instructions")
         .await
         .expect("Codex compact request should complete");
-    let replay_request = ConversationRequest::from_items(replacement);
+    let mut replay_request = ConversationRequest::from_items(replacement);
+    replay_request.x_grok_session_id = Some("session-cache-key".into());
     let replay = replay_request.raw_codex_input_replacements();
     client
         .conversation_responses(replay_request)
@@ -1044,6 +1070,8 @@ async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
     assert_eq!(body["model"], "gpt-5.6-sol");
     assert_eq!(body["instructions"], "base instructions");
     assert_eq!(body["parallel_tool_calls"], true);
+    assert_eq!(body["prompt_cache_key"], "session-cache-key");
+    assert_eq!(body.pointer("/reasoning/summary"), Some(&json!("auto")));
     assert!(body["input"].is_array());
     for forbidden in [
         "store",
@@ -1071,6 +1099,95 @@ async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
     assert_eq!(
         replayed[0]["input"], compact_output,
         "the normal Responses transport must splice the exact compact output, not typed placeholders"
+    );
+    assert_eq!(replayed[0]["prompt_cache_key"], "session-cache-key");
+    assert!(
+        replayed[0]
+            .get("previous_response_id")
+            .is_none_or(serde_json::Value::is_null),
+        "HTTP continuation must replay full compacted input instead of a WebSocket response ID"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_response_metadata_is_forward_compatible_and_replays_turn_state() {
+    use std::sync::Mutex;
+
+    const TURN_STATE: &str = "x-codex-turn-state";
+    let request_number = Arc::new(AtomicU32::new(0));
+    let request_number_handler = Arc::clone(&request_number);
+    let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+
+    let app = Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap| {
+            let request_number = Arc::clone(&request_number_handler);
+            let captured = Arc::clone(&captured_handler);
+            async move {
+                captured.lock().unwrap().push(
+                    headers
+                        .get(TURN_STATE)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned),
+                );
+                let attempt = request_number.fetch_add(1, Ordering::SeqCst);
+                let mut events =
+                    sse::responses_api_reasoning_and_text_events("routing", "ok", "gpt-5.6-sol");
+                events.insert(
+                    1,
+                    SseEvent::data(
+                        json!({
+                            "type": "response.metadata",
+                            "sequence_number": 1,
+                            "response_id": format!("resp-metadata-{attempt}"),
+                            "headers": {
+                                "X-CoDeX-TuRn-StAtE": [if attempt == 0 {
+                                    "metadata-state"
+                                } else {
+                                    "ignored-later-state"
+                                }]
+                            },
+                            "metadata": {
+                                "future_extension": {"accepted": true}
+                            }
+                        })
+                        .to_string(),
+                    ),
+                );
+                Sse::new(stream::iter(
+                    sse_events_to_axum(events)
+                        .into_iter()
+                        .map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let mut config = responses_config(server.base_url(), None);
+    config.provider = ModelProvider::Codex;
+    config.model = "gpt-5.6-sol".into();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+
+    handle.begin_codex_turn();
+    handle
+        .submit_and_collect(RequestId::from("metadata-1"), user_request("first"))
+        .await
+        .expect("response.metadata must not fail typed SSE decoding");
+    handle
+        .submit_and_collect(
+            RequestId::from("metadata-2"),
+            user_request("same turn continuation"),
+        )
+        .await
+        .expect("a continuation must replay metadata turn state");
+    server.shutdown();
+
+    assert_eq!(
+        captured.lock().unwrap().as_slice(),
+        &[None, Some("metadata-state".into())],
+        "the first metadata turn-state value must be replayed exactly once per request"
     );
 }
 
