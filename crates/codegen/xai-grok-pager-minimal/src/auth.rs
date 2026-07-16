@@ -213,6 +213,7 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
             let provider_name = match provider {
                 PrimaryProvider::Codex => "ChatGPT Codex",
                 PrimaryProvider::Xai => "xAI Grok",
+                PrimaryProvider::Kimi => "Kimi",
             };
             y = put_line(
                 buf,
