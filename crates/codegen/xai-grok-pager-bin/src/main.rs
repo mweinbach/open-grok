@@ -2008,7 +2008,8 @@ fn update_checks_allowed(
 /// already self-updates at the top of `run_agent_command`, and a leader-backed
 /// stdio process is a thin bridge whose updates are owned by the leader
 /// (`LeaderAutoUpdateConfig`). Update suppression (`--no-auto-update`,
-/// `GROK_DISABLE_AUTOUPDATER`, debug builds) is layered on separately via
+/// `OPENGROK_DISABLE_AUTOUPDATER` (with the legacy Grok alias), debug builds)
+/// is layered on separately via
 /// [`should_check_for_updates`].
 fn stdio_direct_update_eligible(is_stdio: bool, use_leader: bool) -> bool {
     is_stdio && !use_leader

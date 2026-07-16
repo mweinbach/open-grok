@@ -20,7 +20,7 @@ curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/insta
 Install a specific version:
 
 ```bash
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash -s 0.1.220-open-grok.3
+curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash -s 0.1.220-open-grok.4
 ```
 
 The installer writes only `open-grok` under
@@ -33,11 +33,18 @@ Verify the installation:
 open-grok --version
 ```
 
-Update to the latest version by running the installer again:
+Check for or install the latest verified release:
 
 ```bash
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+open-grok update --check
+open-grok update --check --json
+open-grok update
 ```
+
+Release builds also check at launch and download an available update in the
+background for the next restart. Disable that behavior in Settings, with
+`[cli] auto_update = false` in `$OPENGROK_HOME/config.toml`, with the one-launch
+`--no-auto-update` flag, or with `OPENGROK_DISABLE_AUTOUPDATER=1`.
 
 ---
 
@@ -68,9 +75,9 @@ See [Authentication](02-authentication.md) for the full set of auth options incl
 
 ## Basic Interaction
 
-Once authenticated, Grok presents a full-screen TUI with two main areas:
+Once authenticated, Open Grok presents a full-screen TUI with two main areas:
 
-- **Scrollback** -- the conversation history showing your prompts, Grok's responses, tool calls, file edits, and more.
+- **Scrollback** -- the conversation history showing your prompts, model responses, tool calls, file edits, and more.
 - **Prompt** -- the input area at the bottom where you type messages.
 
 Type a message and press `Enter` to send it. Grok reads files, runs commands, and edits code as needed. Each tool run streams into the scrollback in real time.

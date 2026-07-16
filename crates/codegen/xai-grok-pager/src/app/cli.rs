@@ -94,15 +94,15 @@ See ~/.opengrok/README.md for more information.
     Export(crate::export_cmd::ExportArgs),
     /// Export or upload session trace data
     Trace(crate::trace_cmd::TraceArgs),
-    /// Show GitHub release installation instructions
+    /// Check for or install verified Open Grok GitHub releases
     Update {
-        /// Print the GitHub release installation command.
+        /// Check for a newer release without installing it.
         #[arg(long)]
         check: bool,
         /// Emit machine-readable JSON output (for --check).
         #[arg(long)]
         json: bool,
-        /// Retained for compatibility; Open Grok releases are installed by install.sh.
+        /// Reinstall the selected or latest release even when it is current.
         #[arg(long)]
         force_reinstall: bool,
         /// Install a specific version (e.g. 0.1.150 or 0.1.151-alpha.2).

@@ -4,7 +4,7 @@
 
 **Grok Build with ChatGPT Codex optimizations**
 
-[Install](#install) · [Sign in](#sign-in-and-use-both-providers) ·
+[Install](#install) · [Updates](#updates) · [Sign in](#sign-in-and-use-both-providers) ·
 [Code Mode](#codex-code-mode) · [Build from source](#build-from-source) ·
 [Provenance](#upstream-provenance-and-license)
 
@@ -32,10 +32,19 @@ The public command is `open-grok`. It can be installed beside the upstream
   both use Codex's `max` wire effort. For models whose live catalog metadata
   declares multi-agent v2, Ultra also enables codex-rs's proactive request
   policy.
-- **Codex automatic compaction.** Codex conversations use OpenAI's
-  `/responses/compact` endpoint, replay its opaque replacement history exactly,
-  and follow the live model catalog's compaction limit and compatibility hash.
-  xAI conversations keep Grok Build's existing compaction path.
+- **Current Codex automatic compaction.** By default, Codex conversations use
+  Remote Compaction V2 over the normal streaming `/responses` endpoint, retain
+  the newest bounded real-user tail, and replay the opaque encrypted compaction
+  item exactly. The legacy unary `/responses/compact` protocol remains an
+  explicit compatibility option. Both paths follow the live model catalog's
+  compaction limit and compatibility hash; xAI keeps Grok Build's compaction.
+- **Codex response continuity.** A stable per-session prompt-cache key,
+  turn-scoped `x-codex-turn-state`, durable `response.output_item.done` items,
+  encrypted reasoning, and catalog-selected reasoning summaries are preserved
+  across normal turns, tool loops, retries, compaction, and client rebuilds.
+  Full-input HTTP turns deliberately do not send `previous_response_id`,
+  matching codex-rs; codex-rs reserves ID-based prefix reuse for its validated
+  WebSocket path.
 - **ChatGPT Codex OAuth.** `open-grok login --codex` uses the Codex OAuth flow and
   stores those credentials separately in `~/.opengrok/codex-auth.json`.
 - **xAI and Codex side by side.** xAI sign-in remains available, `/model` can
@@ -48,6 +57,9 @@ The public command is `open-grok`. It can be installed beside the upstream
 - **One harness across providers.** Codex keeps the same subagent, scheduler,
   monitor, goal, plan, and user-question features as Grok while using Codex's
   file tools, prompt, transport, and model metadata.
+- **Verified release updates.** Release builds check the public Open Grok
+  GitHub release feed, verify version and SHA-256 before activation, and keep a
+  canonical versioned binary under `OPENGROK_HOME`.
 
 The implementation and compatibility contract are documented in
 [`docs/code-mode-port.md`](docs/code-mode-port.md) and
@@ -86,7 +98,7 @@ leading `v`):
 
 ```sh
 curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh \
-  | bash -s -- v0.1.220-open-grok.3
+  | bash -s -- v0.1.220-open-grok.4
 ```
 
 For local installer testing, `OPEN_GROK_RELEASE_BASE_URL` may point directly to
@@ -97,6 +109,35 @@ Release binaries are stripped and ad-hoc signed, but they are not Apple
 Developer ID signed or notarized. macOS may show an unidentified-developer or
 Gatekeeper warning. If your security policy requires notarization, build from
 source and sign the result with your own identity.
+
+## Updates
+
+Release builds check for a newer full GitHub Release at launch. When automatic
+updates are enabled, the TUI downloads and verifies the release in the
+background, atomically advances `${OPENGROK_HOME:-$HOME/.opengrok}/bin/open-grok`,
+and offers to restart onto it. The running process is never overwritten in
+place.
+
+Check or update explicitly:
+
+```sh
+open-grok update --check
+open-grok update --check --json
+open-grok update
+```
+
+Automatic updates default on and are configurable in Settings or in
+`$OPENGROK_HOME/config.toml`:
+
+```toml
+[cli]
+auto_update = false
+```
+
+For one launch, pass `--no-auto-update`. For managed environments, set
+`OPENGROK_DISABLE_AUTOUPDATER=1`; the legacy `GROK_DISABLE_AUTOUPDATER` name is
+accepted only for compatibility. Explicit `open-grok update` remains available
+when background checks are disabled.
 
 ## Sign in and use both providers
 

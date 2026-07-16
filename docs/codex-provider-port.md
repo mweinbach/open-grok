@@ -8,10 +8,9 @@ revision as the Code Mode port:
 - Commit: `2be648ba4a6c159a3d80b1c07e7323cbd5efef8f`
 - License: Apache-2.0
 
-The live model-catalog compatibility pass was refreshed against Codex commit
-`cbc83d961e8132bfff4d340ab8342d181b79e95e`.
-Per-turn routing and compaction behavior were rechecked against Codex commit
-`03bb3b12367397e14a8facc2e018d645ff4d8e83`.
+The live model-catalog, per-turn routing, response-stream, and compaction
+compatibility passes were refreshed against Codex commit
+`0f44bca9154e056a32fde7a89026b4620599e6f2`.
 
 ## Live model catalog
 
@@ -27,10 +26,11 @@ credentials available, the shell follows codex-rs' live catalog contract:
 - Use a nonempty list-visible ChatGPT response as authoritative for the Codex
   provider partition. Empty or hidden-only responses merge with the embedded
   fallback, matching codex-rs behavior.
-- Project each model's live context window, reasoning menu, hosted-search flag,
-  tool mode, `multi_agent_version`, `auto_compact_token_limit`, and `comp_hash`
-  into the TUI/session catalog. The version field, independently from the
-  effort menu, gates codex-rs's v2 proactive multi-agent request policy.
+- Project each model's live context window, reasoning menu, reasoning-summary
+  support/default, hosted-search flag, tool mode, `multi_agent_version`,
+  `auto_compact_token_limit`, and `comp_hash` into the TUI/session catalog. The
+  version field, independently from the effort menu, gates codex-rs's v2
+  proactive multi-agent request policy.
 - Apply user `[model.*]` entries last, so explicit operator configuration remains
   the highest-priority layer.
 
@@ -71,7 +71,8 @@ Codex 401 receives one immediate forced refresh and retry; xAI keeps its existin
 auth-manager retry schedule. No Codex path may invoke or update xAI auth state.
 
 Each logical Codex prompt also follows codex-rs's sticky-routing contract. The
-first successful `/responses` or `/responses/compact` response may supply
+first successful `/responses` response (or a legacy `/responses/compact`
+operation) may supply
 `x-codex-turn-state`; Open Grok replays that exact first value across retries,
 tool-loop continuations, client rebuilds, and in-turn compaction. The value is
 bound when a request is enqueued and never crosses into the next prompt or an
@@ -90,6 +91,30 @@ context window, `code_mode_only`, and backend-hosted search. Max and Ultra stay
 distinct in local session state while both encode as Codex `max`; Ultra adds the
 same request-local proactive delegation policy used by codex-rs. Live catalog
 metadata replaces these fallback capabilities when OpenAI changes them.
+
+## Response continuity and reasoning summaries
+
+Open Grok sends a stable `prompt_cache_key` derived from the session identity on
+normal Codex Responses turns and both compaction protocols. Full-input HTTP
+requests continue to send the complete provider-visible history and do not send
+`previous_response_id`, matching codex-rs's HTTP contract. Response IDs are
+observed for diagnostics; codex-rs reserves ID-based prefix reuse for its
+WebSocket transport after validating the server prefix.
+
+The stream treats `response.output_item.done` as the durable Codex output
+carrier because `response.completed` may contain only response metadata and
+usage. Finished messages, complete tool arguments, reasoning IDs, and
+`encrypted_content` therefore survive persistence and byte-stable replay even
+when the terminal response has an empty output array. A nonempty terminal output
+remains authoritative so xAI and legacy streams are not duplicated.
+
+Reasoning-summary support and its default mode come from the authenticated
+model catalog. The request omits `reasoning.summary` for unsupported models or
+the catalog's `none` mode and passes `auto`, `concise`, or `detailed` otherwise.
+Summary deltas are scoped by output item and summary index, rendered once, and
+attached to the matching durable reasoning item without losing its encrypted
+payload. Unknown future top-level `response.*` side-channel events are ignored;
+malformed known or nested output events still fail loudly.
 
 Implicit auxiliary requests stay on the active Codex provider. In particular,
 the compiled xAI defaults for session titles and image descriptions fall back
@@ -113,11 +138,29 @@ carry enough provider provenance to enforce the same boundary safely.
 
 ## Compaction
 
-Codex sessions use OpenAI's unary `POST /responses/compact` endpoint for both
-manual and automatic compaction. The request carries the active model,
-instructions, input, tools, reasoning controls, and account-scoped Codex auth;
-the returned provider-native items are filtered with codex-rs's allowlist and
-then replayed byte-for-byte as opaque Responses input on the next turn.
+Codex sessions default to codex-rs's Remote Compaction V2 protocol for manual
+and automatic compaction. Open Grok sends a normal streaming `POST /responses`
+request with the active instructions, provider-visible input, tools, reasoning
+controls, service tier, prompt-cache key, account-scoped auth, encrypted
+reasoning include, and a final `{"type":"compaction_trigger"}` input item. The
+request advertises `x-codex-beta-features: remote_compaction_v2`.
+
+The dedicated collector requires `response.completed` and exactly one durable
+`response.output_item.done` item of type `compaction`; unrelated stream items do
+not become assistant history. On success, replacement history contains the
+newest real-user messages within the same 64,000 approximate-token text budget,
+followed by the opaque encrypted compaction carrier. User metadata wrappers are
+removed, images and prompt markers are preserved, and a concurrent human steer
+is retained only when the in-flight snapshot remains an exact prefix. Failed or
+partial attempts install nothing. Three total attempts and one Codex auth
+refresh are allowed, without retrying a partial V2 operation against a different
+endpoint.
+
+Setting `[features] remote_compaction_v2 = false` selects the retained legacy
+unary `POST /responses/compact` implementation. Its provider-native output is
+filtered with codex-rs's allowlist and replayed byte-for-byte. The two protocols
+are selected before the operation; a V2 failure never silently falls back to
+the unary endpoint.
 
 Automatic compaction uses the live model's absolute
 `auto_compact_token_limit`, clamped to 90% of the raw context window as in
