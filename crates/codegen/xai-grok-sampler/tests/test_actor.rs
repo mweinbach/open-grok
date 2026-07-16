@@ -1239,6 +1239,7 @@ async fn codex_remote_compaction_v2_uses_responses_stream_contract() {
     );
     assert_eq!(body["model"], "gpt-5.6-sol");
     assert_eq!(body["instructions"], "base instructions");
+    assert_eq!(body["tool_choice"], "auto");
     assert_eq!(body["parallel_tool_calls"], true);
     assert_eq!(body["prompt_cache_key"], "session-cache-key");
     assert_eq!(body["store"], false);

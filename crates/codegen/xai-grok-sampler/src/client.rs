@@ -807,6 +807,7 @@ fn retain_codex_remote_compaction_v2_request_fields(
                 | "input"
                 | "instructions"
                 | "tools"
+                | "tool_choice"
                 | "parallel_tool_calls"
                 | "reasoning"
                 | "service_tier"
@@ -2124,6 +2125,12 @@ impl SamplingClient {
             self.defaults.reasoning_summary,
         );
         if remote_v2 {
+            if request_body
+                .get("tool_choice")
+                .is_none_or(serde_json::Value::is_null)
+            {
+                request_body["tool_choice"] = serde_json::Value::String("auto".to_owned());
+            }
             retain_codex_remote_compaction_v2_request_fields(&mut request_body)?;
             request_body
                 .get_mut("input")
@@ -3520,6 +3527,7 @@ mod tests {
             "input": [{"type": "message", "role": "user", "content": "hello"}],
             "instructions": "system",
             "tools": [{"type": "function", "name": "exec"}],
+            "tool_choice": "auto",
             "parallel_tool_calls": true,
             "reasoning": {"effort": "high", "summary": "detailed"},
             "service_tier": "priority",
@@ -3534,6 +3542,7 @@ mod tests {
         retain_codex_remote_compaction_v2_request_fields(&mut body).unwrap();
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
+        assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["service_tier"], "priority");
         assert_eq!(body["prompt_cache_key"], "session-key");
         assert_eq!(

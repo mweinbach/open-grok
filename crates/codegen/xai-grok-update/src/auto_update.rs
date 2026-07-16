@@ -1517,19 +1517,36 @@ async fn activate_verified_download(download: &VerifiedDownload) -> Result<()> {
 /// supported shell and writes the output to the standard completion paths.
 /// Failures are silently ignored — completions are a nice-to-have, not a
 /// requirement for a successful update.
+fn completion_destinations(
+    binary: &std::path::Path,
+    grok_home: &std::path::Path,
+    user_home: &std::path::Path,
+) -> [(&'static str, std::path::PathBuf); 3] {
+    let is_open_grok = binary.file_stem().and_then(std::ffi::OsStr::to_str) == Some("open-grok");
+    let (bash_name, zsh_name, fish_name) = if is_open_grok {
+        ("open-grok.bash", "_open-grok", "open-grok.fish")
+    } else {
+        ("grok.bash", "_grok", "grok.fish")
+    };
+    [
+        ("bash", grok_home.join("completions/bash").join(bash_name)),
+        ("zsh", grok_home.join("completions/zsh").join(zsh_name)),
+        (
+            "fish",
+            user_home.join(".config/fish/completions").join(fish_name),
+        ),
+    ]
+}
+
 async fn regenerate_completions(binary: &std::path::Path, grok_home: &std::path::Path) {
     // Derive $HOME independently — grok_home may be overridden via OPENGROK_HOME
     // env var, so grok_home.parent() isn't necessarily the user's home dir.
     #[allow(deprecated)]
     let user_home = std::env::home_dir().unwrap_or_default();
 
-    let completions: &[(&str, std::path::PathBuf)] = &[
-        ("bash", grok_home.join("completions/bash/grok.bash")),
-        ("zsh", grok_home.join("completions/zsh/_grok")),
-        ("fish", user_home.join(".config/fish/completions/grok.fish")),
-    ];
+    let completions = completion_destinations(binary, grok_home, &user_home);
 
-    for (shell, dest) in completions {
+    for (shell, dest) in &completions {
         if let Some(parent) = dest.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -2605,6 +2622,39 @@ async fn refresh_deployment_config() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_destinations_keep_open_grok_and_grok_names_separate() {
+        let grok_home = std::path::Path::new("/tmp/opengrok-home");
+        let user_home = std::path::Path::new("/tmp/user-home");
+        let open_grok = completion_destinations(
+            std::path::Path::new("/tmp/opengrok-home/bin/open-grok"),
+            grok_home,
+            user_home,
+        );
+        assert_eq!(
+            open_grok.map(|(_, path)| path),
+            [
+                grok_home.join("completions/bash/open-grok.bash"),
+                grok_home.join("completions/zsh/_open-grok"),
+                user_home.join(".config/fish/completions/open-grok.fish"),
+            ]
+        );
+
+        let upstream = completion_destinations(
+            std::path::Path::new("/tmp/grok-home/bin/grok"),
+            grok_home,
+            user_home,
+        );
+        assert_eq!(
+            upstream.map(|(_, path)| path),
+            [
+                grok_home.join("completions/bash/grok.bash"),
+                grok_home.join("completions/zsh/_grok"),
+                user_home.join(".config/fish/completions/grok.fish"),
+            ]
+        );
+    }
 
     #[test]
     fn test_tmp_download_path_is_unique_per_version_and_per_attempt() {

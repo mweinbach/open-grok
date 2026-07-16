@@ -524,10 +524,12 @@ fn codex_remote_compaction_v2_user(item: &ConversationItem) -> Option<Conversati
     let ConversationItem::User(user) = item else {
         return None;
     };
-    if !matches!(
-        user.synthetic_reason,
-        None | Some(xai_grok_sampling_types::SyntheticReason::Interjection)
-    ) {
+    let retain = match user.synthetic_reason {
+        Some(xai_grok_sampling_types::SyntheticReason::Interjection) => true,
+        None => is_real_user_turn(item),
+        Some(_) => false,
+    };
+    if !retain {
         return None;
     }
 
@@ -1491,6 +1493,23 @@ mod tests {
             codex_remote_compaction_v2_interjections(&snapshot, &edited).is_none(),
             "an edited prefix must reject the stale compaction result"
         );
+    }
+
+    #[test]
+    fn remote_compaction_v2_rejects_legacy_plain_synthetic_user_prompts() {
+        let input = vec![
+            ConversationItem::user("real task"),
+            ConversationItem::user(AUTO_CONTINUE_PROMPT),
+            ConversationItem::user("<user_query>__auto_continue__</user_query>"),
+            ConversationItem::interjection("human steer"),
+        ];
+
+        let history =
+            build_codex_remote_compaction_v2_history(&input, raw_compaction_item("opaque"));
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].text_content(), "real task");
+        assert_eq!(history[1].text_content(), "human steer");
+        assert!(matches!(history[2], ConversationItem::BackendToolCall(_)));
     }
 
     #[test]
