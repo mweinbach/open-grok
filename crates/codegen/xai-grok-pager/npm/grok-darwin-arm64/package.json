@@ -1,6 +1,6 @@
 {
     "name": "@mweinbach/open-grok-darwin-arm64",
-    "version": "0.1.220-open-grok.6",
+    "version": "0.1.220-open-grok.7",
     "description": "darwin-arm64 binary package for @mweinbach/open-grok.",
     "license": "Apache-2.0",
     "files": [
