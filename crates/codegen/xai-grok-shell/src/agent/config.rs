@@ -2063,6 +2063,12 @@ impl Config {
     pub fn is_two_pass_compaction_enabled(&self) -> bool {
         self.resolve_two_pass_compaction().value
     }
+    /// Codex remote compaction v2 gate. Default ON to match current codex-rs;
+    /// `[features] remote_compaction_v2 = false` (or the environment override)
+    /// selects the legacy unary `/responses/compact` protocol.
+    pub fn is_remote_compaction_v2_enabled(&self) -> bool {
+        self.resolve_remote_compaction_v2().value
+    }
     pub(crate) fn resolve_telemetry_mode(&self) -> Resolved<TelemetryMode> {
         if let Some(mode) = self.requirements.telemetry.pinned() {
             return Resolved::new(mode, ConfigSource::Requirement);
@@ -2172,6 +2178,12 @@ impl Config {
             .config(self.features.two_pass_compaction)
             .feature_flag(ff)
             .default(false)
+            .resolve()
+    }
+    pub(crate) fn resolve_remote_compaction_v2(&self) -> Resolved<bool> {
+        BoolFlag::env("OPENGROK_REMOTE_COMPACTION_V2")
+            .config(self.features.remote_compaction_v2)
+            .default(true)
             .resolve()
     }
     /// Server-side doom-loop check policy (the `x-grok-doom-loop-check`
@@ -3572,11 +3584,10 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 supports_reasoning_effort: m.supports_reasoning_effort,
                 reasoning_efforts: m.reasoning_efforts,
                 supports_reasoning_summary_parameter: m.provider == ModelProvider::Codex,
-                default_reasoning_summary: if m.provider == ModelProvider::Codex {
-                    ReasoningSummary::Auto
-                } else {
-                    ReasoningSummary::None
-                },
+                // The embedded catalog is only an offline fallback. Current
+                // ChatGPT Codex catalogs select `none`; live models.json data
+                // remains authoritative and overwrites this value.
+                default_reasoning_summary: ReasoningSummary::None,
                 supports_backend_search: m.supports_backend_search,
                 compactions_remaining: m.compactions_remaining,
                 compaction_at_tokens: m.compaction_at_tokens,
@@ -3644,7 +3655,7 @@ pub struct ModelEntryConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
     /// Whether this model accepts the Responses `reasoning.summary` member.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub supports_reasoning_summary_parameter: bool,
     /// Catalog-selected reasoning-summary detail.
     #[serde(default)]
@@ -3958,7 +3969,7 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
     /// Whether this model accepts the Responses `reasoning.summary` member.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub supports_reasoning_summary_parameter: bool,
     /// Catalog-selected reasoning-summary detail.
     #[serde(default)]
@@ -4160,6 +4171,9 @@ impl std::ops::Deref for ModelEntry {
 }
 fn is_false(v: &bool) -> bool {
     !v
+}
+fn is_true(v: &bool) -> bool {
+    *v
 }
 fn is_default_model_provider(provider: &ModelProvider) -> bool {
     *provider == ModelProvider::default()
@@ -4379,6 +4393,11 @@ pub struct Features {
     /// compaction. `None` = defer to remote settings / env / default (`false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub two_pass_compaction: Option<bool>,
+    /// Codex remote compaction v2 over the normal streaming Responses API.
+    /// `None` = defer to env / default (`true`); `false` selects the legacy
+    /// unary `/responses/compact` endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_compaction_v2: Option<bool>,
     /// Video generation tool. `None` = defer to remote settings / env / default (false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_gen: Option<bool>,
@@ -6761,6 +6780,14 @@ reasoning_effort = "low"
         assert_eq!(model.info.api_backend, ApiBackend::Responses);
         assert_eq!(model.info.tool_mode, Some(ToolMode::CodeModeOnly));
         assert!(model.info.supports_backend_search);
+        assert!(
+            model.info.supports_reasoning_summary_parameter,
+            "legacy Codex model TOML that omits the support field defaults true"
+        );
+        assert_eq!(
+            model_reasoning_summary(model.info()),
+            Some(ReasoningSummary::Auto)
+        );
         let sampling = sampling_config_for_model(
             model,
             ResolvedCredentials {
@@ -8595,6 +8622,34 @@ reasoning_effort = "low"
         assert!(!r.value, "env wins over config + remote");
         assert_eq!(r.source, ConfigSource::Env);
         unsafe { std::env::remove_var("GROK_TWO_PASS_COMPACTION") };
+    }
+    #[test]
+    #[serial]
+    fn resolve_remote_compaction_v2_precedence() {
+        const ENV: &str = "OPENGROK_REMOTE_COMPACTION_V2";
+        unsafe { std::env::remove_var(ENV) };
+
+        let default_cfg = Config::default();
+        let resolved = default_cfg.resolve_remote_compaction_v2();
+        assert!(resolved.value, "current Codex compaction is default-on");
+        assert_eq!(resolved.source, ConfigSource::Default);
+
+        let config_off = Config {
+            features: Features {
+                remote_compaction_v2: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resolved = config_off.resolve_remote_compaction_v2();
+        assert!(!resolved.value);
+        assert_eq!(resolved.source, ConfigSource::Config);
+
+        unsafe { std::env::set_var(ENV, "1") };
+        let resolved = config_off.resolve_remote_compaction_v2();
+        assert!(resolved.value, "Open Grok env override wins over config");
+        assert_eq!(resolved.source, ConfigSource::Env);
+        unsafe { std::env::remove_var(ENV) };
     }
     /// Gate precedence: env > `[doom_loop_recovery]` > remote settings >
     /// default(off), with the remote layer merged PER-FIELD from the nested
@@ -11704,11 +11759,8 @@ default = "grok-4.5"
             assert_eq!(entry.info.tool_mode, Some(ToolMode::CodeModeOnly));
             assert_eq!(entry.info.api_backend, ApiBackend::Responses);
             assert!(entry.info.supports_reasoning_summary_parameter);
-            assert_eq!(entry.info.default_reasoning_summary, ReasoningSummary::Auto);
-            assert_eq!(
-                model_reasoning_summary(entry.info()),
-                Some(ReasoningSummary::Auto)
-            );
+            assert_eq!(entry.info.default_reasoning_summary, ReasoningSummary::None);
+            assert_eq!(model_reasoning_summary(entry.info()), None);
             assert!(
                 !entry.info.supported_in_api,
                 "embedded Codex fallbacks require a Codex OAuth session"

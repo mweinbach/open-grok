@@ -1113,6 +1113,174 @@ async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_remote_compaction_v2_uses_responses_stream_contract() {
+    use std::sync::{Mutex, OnceLock};
+
+    const TURN_STATE: &str = "x-codex-turn-state";
+    let captured: Arc<Mutex<Vec<(HeaderMap, serde_json::Value)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(
+            move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_handler);
+                async move {
+                    captured.lock().unwrap().push((headers, body));
+                    let events = vec![
+                        Event::default().event("response.metadata").data(
+                            json!({
+                                "type": "response.metadata",
+                                "response_id": "resp_metadata",
+                                "headers": {"X-CoDeX-TuRn-StAtE": "metadata-state"}
+                            })
+                            .to_string(),
+                        ),
+                        Event::default().event("response.output_item.done").data(
+                            json!({
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": {"type": "message", "id": "ignored-message"}
+                            })
+                            .to_string(),
+                        ),
+                        Event::default().event("response.output_item.done").data(
+                            json!({
+                                "type": "response.output_item.done",
+                                "output_index": 1,
+                                "item": {
+                                    "type": "compaction",
+                                    "encrypted_content": "opaque-v2-summary"
+                                }
+                            })
+                            .to_string(),
+                        ),
+                        Event::default().event("response.completed").data(
+                            json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_compact_v2",
+                                    "usage": {
+                                        "input_tokens": 321,
+                                        "output_tokens": 9,
+                                        "input_tokens_details": {"cached_tokens": 123},
+                                        "output_tokens_details": {"reasoning_tokens": 7}
+                                    }
+                                }
+                            })
+                            .to_string(),
+                        ),
+                    ];
+                    let mut response = Sse::new(stream::iter(
+                        events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                    ))
+                    .into_response();
+                    response
+                        .headers_mut()
+                        .insert(TURN_STATE, "header-state".parse().unwrap());
+                    response
+                }
+            },
+        ),
+    );
+    let server = MockServer::spawn(app).await;
+    let mut config = responses_config(server.base_url(), None);
+    config.provider = ModelProvider::Codex;
+    config.model = "gpt-5.6-sol".into();
+    config.reasoning_effort = Some(xai_grok_sampling_types::ReasoningEffort::High);
+    config.reasoning_summary = Some(ReasoningSummary::Detailed);
+    config
+        .extra_headers
+        .insert("x-codex-beta-features".into(), "existing_feature".into());
+
+    let turn_state = Arc::new(OnceLock::new());
+    let client = SamplingClient::new_with_codex_turn_state(config, Arc::clone(&turn_state))
+        .expect("Codex sampling client should construct");
+    let mut request = user_request("history to compact");
+    request.x_grok_session_id = Some("session-cache-key".into());
+    request.reasoning_effort = Some(xai_grok_sampling_types::ReasoningEffort::High);
+    request.hosted_tools = vec![HostedTool::web_search(None)];
+    request.json_schema = Some(json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    }));
+    let result = client
+        .compact_codex_conversation_v2(request, "base instructions")
+        .await
+        .expect("remote compaction v2 should complete over /responses SSE");
+    server.shutdown();
+
+    assert_eq!(result.response_id, "resp_compact_v2");
+    let usage = result.usage.expect("completion usage should be captured");
+    assert_eq!(usage.input_tokens, 321);
+    assert_eq!(usage.output_tokens, 9);
+    assert_eq!(usage.total_tokens, 330);
+    assert_eq!(usage.input_tokens_details.cached_tokens, 123);
+    assert_eq!(usage.output_tokens_details.reasoning_tokens, 7);
+    assert_eq!(turn_state.get().map(String::as_str), Some("header-state"));
+    let replay = ConversationRequest::from_items(vec![result.compaction_item])
+        .raw_codex_input_replacements();
+    assert_eq!(replay[0].value["encrypted_content"], "opaque-v2-summary");
+    assert!(
+        replay[0].value.get("id").is_none(),
+        "the typed empty-ID sentinel must never leak into replay input"
+    );
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1, "v2 compaction must make one request");
+    let (headers, body) = &captured[0];
+    assert_eq!(
+        headers
+            .get("x-codex-beta-features")
+            .and_then(|value| value.to_str().ok()),
+        Some("existing_feature,remote_compaction_v2")
+    );
+    assert_eq!(body["model"], "gpt-5.6-sol");
+    assert_eq!(body["instructions"], "base instructions");
+    assert_eq!(body["parallel_tool_calls"], true);
+    assert_eq!(body["prompt_cache_key"], "session-cache-key");
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("high")));
+    assert_eq!(body.pointer("/reasoning/summary"), Some(&json!("detailed")));
+    assert_eq!(
+        body.pointer("/text/format/type"),
+        Some(&json!("json_schema"))
+    );
+    assert!(body["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool.get("type") == Some(&json!("web_search")))
+    }));
+    assert!(body["include"].as_array().is_some_and(|includes| {
+        includes
+            .iter()
+            .any(|include| include == "reasoning.encrypted_content")
+    }));
+    let input = body["input"].as_array().expect("input must be an array");
+    assert_eq!(
+        input.last(),
+        Some(&json!({"type": "compaction_trigger"})),
+        "the compaction trigger must be the exact final input item"
+    );
+    assert_eq!(
+        input
+            .iter()
+            .filter(|item| item.get("type") == Some(&json!("compaction_trigger")))
+            .count(),
+        1,
+        "the request must contain exactly one compaction trigger"
+    );
+    assert!(
+        body.get("previous_response_id")
+            .is_none_or(serde_json::Value::is_null),
+        "HTTP compaction v2 replays full input and must not chain response IDs"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_response_metadata_is_forward_compatible_and_replays_turn_state() {
     use std::sync::Mutex;
 

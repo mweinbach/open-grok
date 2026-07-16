@@ -119,6 +119,7 @@ pub(crate) async fn spawn_session_actor(
     compaction_mode: xai_chat_state::CompactionMode,
     compaction_verbatim_input: bool,
     two_pass_enabled: bool,
+    remote_compaction_v2: bool,
     buffering_settings: Option<BufferingSettings>,
     origin_client: Option<crate::http::OriginClientInfo>,
     codebase_indexes: std::sync::Arc<parking_lot::Mutex<CodebaseIndexManager>>,
@@ -627,6 +628,7 @@ pub(crate) async fn spawn_session_actor(
                 .and_then(|r| r.compaction_wall_clock_budget_secs),
         ),
         two_pass_enabled,
+        remote_compaction_v2,
     };
     let reminder_policy = resolve_reminder_policy(remote_settings.as_ref(), todo_gate);
     let (user_question_tx, user_question_rx) = tokio::sync::mpsc::unbounded_channel::<
@@ -1742,6 +1744,7 @@ pub(crate) async fn spawn_session_on_thread(
     compaction_mode: xai_chat_state::CompactionMode,
     compaction_verbatim_input: bool,
     two_pass_enabled: bool,
+    remote_compaction_v2: bool,
     buffering_settings: Option<BufferingSettings>,
     origin_client: Option<crate::http::OriginClientInfo>,
     codebase_indexes: std::sync::Arc<parking_lot::Mutex<CodebaseIndexManager>>,
@@ -1905,6 +1908,7 @@ pub(crate) async fn spawn_session_on_thread(
                         compaction_mode,
                         compaction_verbatim_input,
                         two_pass_enabled,
+                        remote_compaction_v2,
                         buffering_settings,
                         origin_client,
                         codebase_indexes,

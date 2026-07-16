@@ -1133,6 +1133,9 @@ pub(crate) async fn handle_subagent_request(
             xai_chat_state::CompactionMode::Summary,
             ctx.resolve_compaction_verbatim_input(),
             false,
+            ctx.agent_config
+                .as_ref()
+                .is_none_or(|config| config.is_remote_compaction_v2_enabled()),
             None,
             None,
             std::sync::Arc::new(

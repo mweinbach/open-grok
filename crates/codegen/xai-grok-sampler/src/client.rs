@@ -42,6 +42,8 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const X_CODEX_BETA_FEATURES_HEADER: &str = "x-codex-beta-features";
+const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
 const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
 const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
 const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
@@ -407,6 +409,22 @@ fn insert_json_default(
 fn normalize_response_output_item(item: &mut serde_json::Value) {
     normalize_x_search_call(item);
     fill_missing_custom_tool_call_id(item);
+    fill_missing_compaction_output_id(item);
+}
+
+/// async-openai 0.33.1 requires `CompactionBody.id`, while the Responses
+/// wire contract permits a compaction item without one. Use an empty
+/// typed-boundary sentinel; the conversation converter deliberately omits
+/// that sentinel from raw provider replay.
+fn fill_missing_compaction_output_id(item: &mut serde_json::Value) {
+    let Some(item) = item.as_object_mut() else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+        && !item.contains_key("id")
+    {
+        item.insert("id".to_owned(), serde_json::Value::String(String::new()));
+    }
 }
 
 /// Project xAI's current hosted `x_search_call` output item into the legacy
@@ -774,6 +792,41 @@ fn retain_codex_compact_request_fields(request_body: &mut serde_json::Value) -> 
     Ok(())
 }
 
+fn retain_codex_remote_compaction_v2_request_fields(
+    request_body: &mut serde_json::Value,
+) -> Result<()> {
+    let body = request_body
+        .as_object_mut()
+        .ok_or(SamplingError::InvalidConfiguration(
+            "Codex remote compaction v2 request did not serialize to an object",
+        ))?;
+    body.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "model"
+                | "input"
+                | "instructions"
+                | "tools"
+                | "parallel_tool_calls"
+                | "reasoning"
+                | "service_tier"
+                | "prompt_cache_key"
+                | "text"
+                | "include"
+                | "store"
+                | "stream"
+        )
+    });
+    body.retain(|key, value| {
+        !value.is_null()
+            || matches!(
+                key.as_str(),
+                "model" | "input" | "parallel_tool_calls" | "store" | "stream"
+            )
+    });
+    Ok(())
+}
+
 /// On terminal Responses API events (`response.completed` /
 /// `response.incomplete`), rewrite `response.usage.total_tokens` to the
 /// live context length when the wire includes
@@ -920,6 +973,177 @@ struct StreamOptions {
 #[derive(Debug, Deserialize)]
 struct CodexCompactHistoryResponse {
     output: Vec<serde_json::Value>,
+}
+
+/// Successful Codex remote-compaction-v2 stream result.
+///
+/// The output item is stored in the unified conversation's opaque Codex
+/// carrier. `response_id` and `usage` come from the required terminal
+/// `response.completed` event and are exposed for lifecycle telemetry; HTTP
+/// callers must not send the ID back as `previous_response_id`.
+#[derive(Debug, Clone)]
+pub struct CodexRemoteCompactionV2Result {
+    pub compaction_item: xai_grok_sampling_types::ConversationItem,
+    pub response_id: String,
+    pub usage: Option<rs::ResponseUsage>,
+}
+
+#[derive(Default)]
+struct CodexRemoteCompactionV2Collector {
+    output_item_count: usize,
+    compaction_items: Vec<serde_json::Value>,
+    completed_response_id: Option<String>,
+    completed_usage: Option<rs::ResponseUsage>,
+    saw_completed: bool,
+}
+
+impl CodexRemoteCompactionV2Collector {
+    fn absorb(
+        &mut self,
+        event_name: &str,
+        data: &str,
+        codex_turn_state: Option<&Arc<OnceLock<String>>>,
+    ) -> Result<()> {
+        if absorb_response_metadata_event(event_name, data, codex_turn_state) {
+            return Ok(());
+        }
+        if let Some(error) = try_parse_stream_error(data) {
+            return Err(error);
+        }
+        let value = serde_json::from_str::<serde_json::Value>(data)
+            .map_err(SamplingError::Serialization)?;
+        let event_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(event_name);
+        match event_type {
+            "response.output_item.done" => {
+                self.output_item_count = self.output_item_count.saturating_add(1);
+                let item = value
+                    .get("item")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        SamplingError::serialization_message(
+                            "Codex remote compaction v2 output_item.done contained no item",
+                        )
+                    })?;
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
+                    self.compaction_items
+                        .push(serde_json::Value::Object(item.clone()));
+                }
+            }
+            "response.completed" => {
+                let response = value
+                    .get("response")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        SamplingError::serialization_message(
+                            "Codex remote compaction v2 response.completed contained no response",
+                        )
+                    })?;
+                let response_id = response
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        SamplingError::serialization_message(
+                            "Codex remote compaction v2 response.completed contained no response id",
+                        )
+                    })?;
+                self.completed_response_id = Some(response_id.to_owned());
+                self.completed_usage = response
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                    .cloned()
+                    .map(normalize_codex_remote_compaction_usage)
+                    .transpose()?;
+                self.saw_completed = true;
+            }
+            _ => {
+                // Compaction streams may include ordinary message, reasoning,
+                // progress, and future side-channel events. Only the durable
+                // output_item.done compaction and terminal completion matter.
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<CodexRemoteCompactionV2Result> {
+        if !self.saw_completed {
+            return Err(SamplingError::EventStreamError(
+                "Codex remote compaction v2 stream closed before response.completed".to_owned(),
+            ));
+        }
+        if self.compaction_items.len() != 1 {
+            return Err(SamplingError::serialization_message(format!(
+                "Codex remote compaction v2 expected exactly one compaction output item, got {} from {} output items",
+                self.compaction_items.len(),
+                self.output_item_count,
+            )));
+        }
+        let mut items = xai_grok_sampling_types::codex_compact_output_to_conversation_items(
+            self.compaction_items,
+        )
+        .map_err(SamplingError::serialization_message)?;
+        let compaction_item = items.pop().ok_or_else(|| {
+            SamplingError::serialization_message(
+                "Codex remote compaction v2 produced no replayable compaction item",
+            )
+        })?;
+        Ok(CodexRemoteCompactionV2Result {
+            compaction_item,
+            response_id: self.completed_response_id.ok_or_else(|| {
+                SamplingError::serialization_message(
+                    "Codex remote compaction v2 completed without a response id",
+                )
+            })?,
+            usage: self.completed_usage,
+        })
+    }
+}
+
+fn normalize_codex_remote_compaction_usage(usage: serde_json::Value) -> Result<rs::ResponseUsage> {
+    let mut usage = usage
+        .as_object()
+        .cloned()
+        .ok_or_else(|| SamplingError::serialization_message("Responses usage is not an object"))?;
+    insert_json_default(&mut usage, "input_tokens", serde_json::json!(0));
+    insert_json_default(&mut usage, "output_tokens", serde_json::json!(0));
+    let total_tokens = usage
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(
+            usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+        )
+        .min(u64::from(u32::MAX));
+    insert_json_default(&mut usage, "total_tokens", serde_json::json!(total_tokens));
+    insert_json_default(
+        &mut usage,
+        "input_tokens_details",
+        serde_json::json!({"cached_tokens": 0}),
+    );
+    insert_json_default(
+        &mut usage,
+        "output_tokens_details",
+        serde_json::json!({"reasoning_tokens": 0}),
+    );
+    if let Some(details) = usage
+        .get_mut("input_tokens_details")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        insert_json_default(details, "cached_tokens", serde_json::json!(0));
+    }
+    if let Some(details) = usage
+        .get_mut("output_tokens_details")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        insert_json_default(details, "reasoning_tokens", serde_json::json!(0));
+    }
+    serde_json::from_value(serde_json::Value::Object(usage)).map_err(SamplingError::Serialization)
 }
 
 /// HTTP client for sampling. Cheap to clone; carries an `Arc`-backed
@@ -1839,6 +2063,106 @@ impl SamplingClient {
     // Responses API
     // =========================================================================
 
+    fn codex_compaction_request_body(
+        &self,
+        request: &ConversationRequest,
+        instructions: &str,
+        remote_v2: bool,
+    ) -> Result<serde_json::Value> {
+        let extra_raw_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
+        let named_custom_tool_outputs = request.named_custom_tool_outputs();
+        let mut original_detail_custom_output_images =
+            request.original_detail_custom_output_images();
+        original_detail_custom_output_images
+            .extend(request.original_detail_function_output_images());
+        let raw_input_replacements = request.raw_codex_input_replacements();
+        let local_reasoning_effort = request.reasoning_effort;
+
+        let mut inner: rs::CreateResponse = request.into();
+        inner.instructions = (!instructions.is_empty()).then(|| instructions.to_owned());
+        inner.parallel_tool_calls = Some(true);
+        if inner.prompt_cache_key.is_none() {
+            inner.prompt_cache_key = request
+                .x_grok_session_id
+                .clone()
+                .filter(|session_id| !session_id.is_empty());
+        }
+        if remote_v2 {
+            inner.store = Some(false);
+            inner.stream = Some(true);
+            let include = inner.include.get_or_insert_with(Vec::new);
+            if !include.contains(&rs::IncludeEnum::ReasoningEncryptedContent) {
+                include.push(rs::IncludeEnum::ReasoningEncryptedContent);
+            }
+        }
+        let mut request_body = serde_json::to_value(inner).map_err(|error| {
+            tracing::error!(%error, remote_v2, "failed to serialize Codex compact request");
+            SamplingError::Serialization(error)
+        })?;
+        if !extra_raw_tools.is_empty() {
+            if let Some(tools) = request_body
+                .get_mut("tools")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.extend(extra_raw_tools);
+            } else {
+                request_body["tools"] = serde_json::Value::Array(extra_raw_tools);
+            }
+        }
+        xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        patch_custom_tool_output_wire_fields(
+            &mut request_body,
+            &named_custom_tool_outputs,
+            &original_detail_custom_output_images,
+        );
+        patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
+        patch_codex_request_compat(
+            &mut request_body,
+            self.defaults.provider,
+            self.defaults.codex_multi_agent_v2,
+            local_reasoning_effort,
+            self.defaults.reasoning_summary,
+        );
+        if remote_v2 {
+            retain_codex_remote_compaction_v2_request_fields(&mut request_body)?;
+            request_body
+                .get_mut("input")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or(SamplingError::InvalidConfiguration(
+                    "Codex remote compaction v2 request requires an input array",
+                ))?
+                .push(serde_json::json!({"type": "compaction_trigger"}));
+        } else {
+            retain_codex_compact_request_fields(&mut request_body)?;
+        }
+        Ok(request_body)
+    }
+
+    fn codex_remote_compaction_v2_beta_header(&self) -> Result<HeaderValue> {
+        let mut features = self
+            .default_headers
+            .get(X_CODEX_BETA_FEATURES_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|feature| !feature.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !features
+            .iter()
+            .any(|feature| feature == REMOTE_COMPACTION_V2_FEATURE)
+        {
+            features.push(REMOTE_COMPACTION_V2_FEATURE.to_owned());
+        }
+        HeaderValue::from_str(&features.join(",")).map_err(|_| {
+            SamplingError::InvalidConfiguration("invalid x-codex-beta-features header")
+        })
+    }
+
     /// Replace a Codex conversation history through OpenAI's unary
     /// `/responses/compact` endpoint.
     ///
@@ -1868,53 +2192,7 @@ impl SamplingClient {
             &request.hosted_tools,
             self.defaults.provider,
         );
-        let extra_raw_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
-        let named_custom_tool_outputs = request.named_custom_tool_outputs();
-        let mut original_detail_custom_output_images =
-            request.original_detail_custom_output_images();
-        original_detail_custom_output_images
-            .extend(request.original_detail_function_output_images());
-        let raw_input_replacements = request.raw_codex_input_replacements();
-        let local_reasoning_effort = request.reasoning_effort;
-
-        let mut inner: rs::CreateResponse = (&request).into();
-        inner.instructions = (!instructions.is_empty()).then(|| instructions.to_owned());
-        inner.parallel_tool_calls = Some(true);
-        if inner.prompt_cache_key.is_none() {
-            inner.prompt_cache_key = request
-                .x_grok_session_id
-                .clone()
-                .filter(|session_id| !session_id.is_empty());
-        }
-        let mut request_body = serde_json::to_value(inner).map_err(|error| {
-            tracing::error!(%error, "failed to serialize Codex compact request");
-            SamplingError::Serialization(error)
-        })?;
-        if !extra_raw_tools.is_empty() {
-            if let Some(tools) = request_body
-                .get_mut("tools")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                tools.extend(extra_raw_tools);
-            } else {
-                request_body["tools"] = serde_json::Value::Array(extra_raw_tools);
-            }
-        }
-        xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
-        patch_custom_tool_output_wire_fields(
-            &mut request_body,
-            &named_custom_tool_outputs,
-            &original_detail_custom_output_images,
-        );
-        patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
-        patch_codex_request_compat(
-            &mut request_body,
-            self.defaults.provider,
-            self.defaults.codex_multi_agent_v2,
-            local_reasoning_effort,
-            self.defaults.reasoning_summary,
-        );
-        retain_codex_compact_request_fields(&mut request_body)?;
+        let request_body = self.codex_compaction_request_body(&request, instructions, false)?;
 
         let endpoint = self.endpoint("responses/compact");
         let timeout_secs = self
@@ -1970,6 +2248,122 @@ impl SamplingClient {
         }
         xai_grok_sampling_types::codex_compact_output_to_conversation_items(response.output)
             .map_err(SamplingError::serialization_message)
+    }
+
+    /// Run Codex remote compaction v2 over the normal streaming Responses
+    /// endpoint.
+    ///
+    /// The request is a normal full-input Codex Responses call whose final
+    /// input item is `{"type":"compaction_trigger"}`. The collector accepts
+    /// exactly one durable `response.output_item.done` compaction item and a
+    /// required `response.completed`; unrelated output and progress events are
+    /// intentionally ignored. Installation remains the caller's responsibility
+    /// so a disconnected/retried stream cannot partially mutate conversation
+    /// state.
+    pub async fn compact_codex_conversation_v2(
+        &self,
+        mut request: ConversationRequest,
+        instructions: &str,
+    ) -> Result<CodexRemoteCompactionV2Result> {
+        if self.defaults.provider != ModelProvider::Codex
+            || self.defaults.api_backend != ApiBackend::Responses
+        {
+            return Err(SamplingError::InvalidConfiguration(
+                "remote compaction v2 is available only for the Codex Responses provider",
+            ));
+        }
+        if request.items.is_empty() {
+            return Err(SamplingError::InvalidConfiguration(
+                "remote compaction v2 requires non-empty conversation input",
+            ));
+        }
+
+        self.apply_conversation_defaults(&mut request)?;
+        request.hosted_tools = xai_grok_sampling_types::hosted_tools_for_provider(
+            &request.hosted_tools,
+            self.defaults.provider,
+        );
+        let request_body = self.codex_compaction_request_body(&request, instructions, true)?;
+        let endpoint = self.endpoint("responses");
+        let timeout_secs = self
+            .defaults
+            .idle_timeout_secs
+            .unwrap_or(300)
+            .saturating_mul(4)
+            .max(1);
+        let mut beta_headers = HeaderMap::new();
+        beta_headers.insert(
+            HeaderName::from_static(X_CODEX_BETA_FEATURES_HEADER),
+            self.codex_remote_compaction_v2_beta_header()?,
+        );
+        tracing::debug!(%endpoint, timeout_secs, "sending Codex remote compaction v2 request");
+        let response = self
+            .post(&endpoint)
+            .headers(beta_headers)
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(SamplingError::Http)?;
+        let status = response.status();
+        if status.is_success() {
+            self.capture_codex_turn_state(response.headers());
+        }
+        let model_metadata = extract_model_metadata(response.headers());
+        let retry_after_secs = extract_retry_after(response.headers());
+        let should_retry = extract_should_retry(response.headers());
+        if !status.is_success() {
+            let bytes = response.bytes().await.map_err(SamplingError::Http)?;
+            let server_message = parse_error_bytes(bytes.as_ref());
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                self.record_401_attribution(crate::attribution::SamplingConsumer::ResponsesStream);
+                return Err(SamplingError::Auth(format!(
+                    "Unauthorized (401) from {endpoint}: {server_message}"
+                )));
+            }
+            return Err(SamplingError::Api {
+                status,
+                message: self.build_api_error_message(
+                    status,
+                    &server_message,
+                    &endpoint,
+                    &[],
+                    None,
+                ),
+                model_metadata,
+                retry_after_secs,
+                should_retry,
+            });
+        }
+
+        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        let mut first = true;
+        let byte_stream = response.bytes_stream().map(move |result| {
+            result.map(|bytes| {
+                if first {
+                    first = false;
+                    if bytes.starts_with(UTF8_BOM) {
+                        return bytes.slice(UTF8_BOM.len()..);
+                    }
+                }
+                bytes
+            })
+        });
+        let mut event_stream = byte_stream.eventsource();
+        let mut collector = CodexRemoteCompactionV2Collector::default();
+        while let Some(event) = event_stream.next().await {
+            let event =
+                event.map_err(|error| SamplingError::EventStreamError(error.to_string()))?;
+            if event.data == "[DONE]" {
+                break;
+            }
+            collector.absorb(&event.event, &event.data, self.codex_turn_state.as_ref())?;
+            if collector.saw_completed {
+                break;
+            }
+        }
+        collector.finish()
     }
 
     /// Apply default configuration to a Responses API request.
@@ -3117,6 +3511,203 @@ mod tests {
         ] {
             assert!(body.get(forbidden).is_none(), "unexpected {forbidden}");
         }
+    }
+
+    #[test]
+    fn codex_remote_compaction_v2_body_keeps_stream_contract_fields() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": [{"type": "message", "role": "user", "content": "hello"}],
+            "instructions": "system",
+            "tools": [{"type": "function", "name": "exec"}],
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high", "summary": "detailed"},
+            "service_tier": "priority",
+            "prompt_cache_key": "session-key",
+            "text": {"format": {"type": "text"}},
+            "store": false,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"],
+            "temperature": 0.7,
+            "max_output_tokens": 1234
+        });
+        retain_codex_remote_compaction_v2_request_fields(&mut body).unwrap();
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["prompt_cache_key"], "session-key");
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn idless_compaction_output_uses_typed_sentinel_only() {
+        let mut raw = serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        });
+        normalize_response_output_item(&mut raw);
+        assert_eq!(raw["id"], "");
+        let typed: rs::OutputItem = serde_json::from_value(raw).unwrap();
+        let rs::OutputItem::Compaction(compaction) = typed else {
+            panic!("expected typed compaction");
+        };
+        assert!(compaction.id.is_empty());
+    }
+
+    #[test]
+    fn remote_compaction_v2_collector_requires_one_done_item_and_completion() {
+        let turn_state = Arc::new(OnceLock::new());
+        let mut collector = CodexRemoteCompactionV2Collector::default();
+        collector
+            .absorb(
+                "response.metadata",
+                &serde_json::json!({
+                    "type": "response.metadata",
+                    "response_id": "resp_meta",
+                    "headers": {"X-Codex-Turn-State": "sticky-state"}
+                })
+                .to_string(),
+                Some(&turn_state),
+            )
+            .unwrap();
+        collector
+            .absorb(
+                "response.output_item.done",
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {"type": "message", "id": "ignored"}
+                })
+                .to_string(),
+                Some(&turn_state),
+            )
+            .unwrap();
+        collector
+            .absorb(
+                "response.output_item.done",
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {"type": "compaction", "encrypted_content": "opaque"}
+                })
+                .to_string(),
+                Some(&turn_state),
+            )
+            .unwrap();
+        collector
+            .absorb(
+                "response.completed",
+                &serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_completed",
+                        "usage": {"input_tokens": 120, "output_tokens": 8}
+                    }
+                })
+                .to_string(),
+                Some(&turn_state),
+            )
+            .unwrap();
+
+        let result = collector.finish().unwrap();
+        assert_eq!(result.response_id, "resp_completed");
+        assert_eq!(result.usage.unwrap().total_tokens, 128);
+        assert_eq!(turn_state.get().map(String::as_str), Some("sticky-state"));
+        let request = ConversationRequest::from_items(vec![result.compaction_item]);
+        let replay = request.raw_codex_input_replacements();
+        assert_eq!(replay[0].value["encrypted_content"], "opaque");
+        assert!(replay[0].value.get("id").is_none());
+    }
+
+    #[test]
+    fn remote_compaction_v2_collector_rejects_missing_compaction_item() {
+        let mut collector = CodexRemoteCompactionV2Collector::default();
+        collector
+            .absorb(
+                "response.completed",
+                &serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_completed"}
+                })
+                .to_string(),
+                None,
+            )
+            .unwrap();
+
+        let error = collector.finish().unwrap_err().to_string();
+        assert!(error.contains("expected exactly one compaction output item, got 0"));
+    }
+
+    #[test]
+    fn remote_compaction_v2_collector_rejects_duplicate_compaction_items() {
+        let mut collector = CodexRemoteCompactionV2Collector::default();
+        let done = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {"type": "compaction", "encrypted_content": "opaque"}
+        })
+        .to_string();
+        collector
+            .absorb("response.output_item.done", &done, None)
+            .unwrap();
+        collector
+            .absorb("response.output_item.done", &done, None)
+            .unwrap();
+        collector
+            .absorb(
+                "response.completed",
+                &serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_completed"}
+                })
+                .to_string(),
+                None,
+            )
+            .unwrap();
+
+        let error = collector.finish().unwrap_err().to_string();
+        assert!(error.contains("expected exactly one compaction output item, got 2"));
+    }
+
+    #[test]
+    fn remote_compaction_v2_collector_rejects_eof_before_completion() {
+        let mut collector = CodexRemoteCompactionV2Collector::default();
+        collector
+            .absorb(
+                "response.output_item.done",
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": "compaction", "encrypted_content": "opaque"}
+                })
+                .to_string(),
+                None,
+            )
+            .unwrap();
+
+        let error = collector.finish().unwrap_err().to_string();
+        assert!(error.contains("closed before response.completed"));
+    }
+
+    #[test]
+    fn remote_compaction_v2_collector_rejects_completed_without_response_id() {
+        let mut collector = CodexRemoteCompactionV2Collector::default();
+        let error = collector
+            .absorb(
+                "response.completed",
+                &serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": ""}
+                })
+                .to_string(),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("contained no response id"));
     }
 
     #[test]

@@ -2997,6 +2997,42 @@ pub fn response_to_conversation_items_with_client_custom_tools(
                 // calls — is emitted as its own sibling, preserving order.
                 items.push(ConversationItem::Reasoning(r));
             }
+            rs::OutputItem::Compaction(compaction) => {
+                // Remote compaction v2 emits its encrypted replacement as a
+                // normal Responses output item. Keep the provider payload
+                // opaque and in-order so it can be replayed exactly on the
+                // next Codex turn. async-openai requires an `id` even though
+                // the wire permits it to be absent; an empty typed-boundary
+                // sentinel must never become a fabricated provider ID.
+                let rs::CompactionBody {
+                    id,
+                    encrypted_content,
+                    created_by,
+                } = compaction;
+                let local_id = if id.is_empty() {
+                    format!("codex_compaction_{}", items.len())
+                } else {
+                    id.clone()
+                };
+                let mut raw = serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": encrypted_content,
+                });
+                if !id.is_empty() {
+                    raw["id"] = serde_json::Value::String(id);
+                }
+                if let Some(created_by) = created_by {
+                    raw["created_by"] = serde_json::Value::String(created_by);
+                }
+                backend_tool_count += 1;
+                items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
+                    kind: BackendToolKind::CodexRawInput(CodexRawInputItem {
+                        id: local_id,
+                        raw,
+                        cross_provider_fallback: None,
+                    }),
+                }));
+            }
             // Backend-executed tools: the server already ran these and
             // fed results into the model's context. We capture them as
             // BackendToolCall siblings so they're persisted and sent back
@@ -11471,6 +11507,64 @@ mod tests {
             compaction.estimated_content_len() > compaction.text_summary().len(),
             "context accounting must include the hidden encrypted payload"
         );
+    }
+
+    #[test]
+    fn typed_compaction_output_replays_without_fabricated_provider_id() {
+        let response = rs::Response {
+            background: None,
+            billing: None,
+            conversation: None,
+            created_at: 0,
+            completed_at: None,
+            error: None,
+            id: "resp_compact".into(),
+            incomplete_details: None,
+            instructions: None,
+            max_output_tokens: None,
+            metadata: None,
+            model: "gpt-5.6-sol".into(),
+            object: "response".into(),
+            output: vec![rs::OutputItem::Compaction(rs::CompactionBody {
+                id: String::new(),
+                encrypted_content: "opaque-v2-summary".into(),
+                created_by: Some("server".into()),
+            })],
+            parallel_tool_calls: None,
+            previous_response_id: None,
+            prompt: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None,
+            service_tier: None,
+            status: rs::Status::Completed,
+            temperature: None,
+            text: None,
+            tool_choice: None,
+            tools: None,
+            top_logprobs: None,
+            top_p: None,
+            truncation: None,
+            usage: None,
+        };
+
+        let items = response_to_conversation_items(response);
+        let ConversationItem::BackendToolCall(compaction) = &items[0] else {
+            panic!("compaction output must remain a raw provider item");
+        };
+        let BackendToolKind::CodexRawInput(raw) = &compaction.kind else {
+            panic!("compaction output must remain a Codex raw input");
+        };
+        assert_eq!(raw.raw["type"], "compaction");
+        assert_eq!(raw.raw["encrypted_content"], "opaque-v2-summary");
+        assert_eq!(raw.raw["created_by"], "server");
+        assert!(raw.raw.get("id").is_none());
+
+        let request = ConversationRequest::from_items(items);
+        let replay = request.raw_codex_input_replacements();
+        assert_eq!(replay.len(), 1);
+        assert!(replay[0].value.get("id").is_none());
     }
 
     #[test]

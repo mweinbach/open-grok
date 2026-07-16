@@ -3198,6 +3198,7 @@ impl MvpAgent {
             .borrow()
             .resolve_compaction_verbatim_input();
         let two_pass_enabled = self.cfg.borrow().is_two_pass_compaction_enabled();
+        let remote_compaction_v2 = self.cfg.borrow().is_remote_compaction_v2_enabled();
         let auto_update = self.cfg.borrow().cli.auto_update;
         let client_type = *self.client_type.borrow();
         let buffering_settings = self.buffering_settings.borrow().clone();
@@ -3595,6 +3596,7 @@ impl MvpAgent {
                     compaction_mode,
                     compaction_verbatim_input,
                     two_pass_enabled,
+                    remote_compaction_v2,
                     buffering_settings,
                     origin_client.clone(),
                     self.codebase_indexes.clone(),

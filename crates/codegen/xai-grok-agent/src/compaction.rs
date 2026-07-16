@@ -31,6 +31,14 @@ pub struct CompactionPolicy {
     /// config (`two_pass_compaction` flag) at session build; `false` keeps the
     /// legacy single-pass path. Default `false` (real sessions set it from config).
     pub two_pass_enabled: bool,
+
+    /// Use Codex's current remote compaction protocol over the normal
+    /// streaming Responses endpoint. When disabled, Codex Responses sessions
+    /// use the legacy unary `/responses/compact` endpoint.
+    ///
+    /// This is provider-gated by the session layer; it has no effect on xAI
+    /// models or non-Responses backends.
+    pub remote_compaction_v2: bool,
 }
 
 impl Default for CompactionPolicy {
@@ -41,6 +49,7 @@ impl Default for CompactionPolicy {
             memory_flush_enabled: false,
             wall_clock_budget_secs: 300,
             two_pass_enabled: false,
+            remote_compaction_v2: true,
         }
     }
 }

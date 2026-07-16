@@ -515,6 +515,184 @@ pub fn is_real_user_turn(item: &ConversationItem) -> bool {
         _ => false,
     }
 }
+
+/// Maximum real-user history retained alongside a Codex remote-compaction-v2
+/// item. This mirrors codex-rs's current retained-message budget.
+pub const CODEX_REMOTE_COMPACTION_V2_RETAINED_USER_TOKENS: u64 = 64_000;
+
+fn codex_remote_compaction_v2_user(item: &ConversationItem) -> Option<ConversationItem> {
+    let ConversationItem::User(user) = item else {
+        return None;
+    };
+    if !matches!(
+        user.synthetic_reason,
+        None | Some(xai_grok_sampling_types::SyntheticReason::Interjection)
+    ) {
+        return None;
+    }
+
+    let mut user = user.clone();
+    user.content = user
+        .content
+        .into_iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => {
+                let text = extract_user_query(&text);
+                (!text.is_empty()).then(|| ContentPart::Text {
+                    text: std::sync::Arc::<str>::from(text),
+                })
+            }
+            image @ ContentPart::Image { .. } => Some(image),
+        })
+        .collect();
+    (!user.content.is_empty()).then_some(ConversationItem::User(user))
+}
+
+/// Truncate only the text blocks of one boundary user message while retaining
+/// all of its images and original content-block order. The upstream V2
+/// retained-message contract budgets message text only; images are preserved
+/// and do not consume this 64k allowance.
+fn truncate_codex_remote_compaction_v2_user(
+    item: ConversationItem,
+    max_tokens: u64,
+) -> Option<ConversationItem> {
+    let ConversationItem::User(mut user) = item else {
+        return None;
+    };
+    let mut remaining_text_tokens = max_tokens;
+    let mut retained = Vec::with_capacity(user.content.len());
+    for part in user.content {
+        match part {
+            ContentPart::Image { url } => retained.push(ContentPart::Image { url }),
+            ContentPart::Text { text } => {
+                if remaining_text_tokens == 0 {
+                    continue;
+                }
+                let text_tokens = codex_remote_compaction_v2_text_tokens(text.len());
+                if text_tokens <= remaining_text_tokens {
+                    remaining_text_tokens -= text_tokens;
+                    retained.push(ContentPart::Text { text });
+                    continue;
+                }
+
+                let available = usize::try_from(
+                    remaining_text_tokens.saturating_mul(xai_token_estimation::BYTES_PER_TOKEN),
+                )
+                .unwrap_or(usize::MAX);
+                let kept = truncate_text_to_bytes(&text, available)
+                    .unwrap_or_else(|| std::sync::Arc::clone(&text));
+                remaining_text_tokens = 0;
+                if !kept.is_empty() {
+                    retained.push(ContentPart::Text { text: kept });
+                }
+            }
+        }
+    }
+    user.content = retained;
+    if user.content.is_empty() {
+        return None;
+    }
+    let item = ConversationItem::User(user);
+    (codex_remote_compaction_v2_user_text_tokens(&item) <= max_tokens).then_some(item)
+}
+
+fn codex_remote_compaction_v2_text_tokens(bytes: usize) -> u64 {
+    u64::try_from(bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(xai_token_estimation::BYTES_PER_TOKEN.saturating_sub(1))
+        / xai_token_estimation::BYTES_PER_TOKEN
+}
+
+fn codex_remote_compaction_v2_user_text_tokens(item: &ConversationItem) -> u64 {
+    let ConversationItem::User(user) = item else {
+        return 0;
+    };
+    user.content
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => codex_remote_compaction_v2_text_tokens(text.len()),
+            ContentPart::Image { .. } => 0,
+        })
+        .sum::<u64>()
+        .max(1)
+}
+
+fn fit_codex_remote_compaction_v2_user_tail(
+    user_messages: Vec<ConversationItem>,
+    max_tokens: u64,
+) -> Vec<ConversationItem> {
+    let mut remaining = max_tokens;
+    let mut reversed = Vec::new();
+    for item in user_messages.into_iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let cost = codex_remote_compaction_v2_user_text_tokens(&item);
+        if cost <= remaining {
+            remaining -= cost;
+            reversed.push(item);
+            continue;
+        }
+        if let Some(item) = truncate_codex_remote_compaction_v2_user(item, remaining) {
+            reversed.push(item);
+        }
+        break;
+    }
+    reversed.reverse();
+    reversed
+}
+
+/// Build the provider replay history installed after a successful Codex
+/// remote-compaction-v2 request.
+///
+/// The server's encrypted `compaction` item remains the authoritative summary.
+/// A bounded tail of genuine user messages is retained ahead of it so the
+/// latest user intent and multimodal inputs remain explicit. Synthetic user
+/// messages, assistant output, and tool plumbing are intentionally excluded.
+pub fn build_codex_remote_compaction_v2_history(
+    prompt_input: &[ConversationItem],
+    compaction_item: ConversationItem,
+) -> Vec<ConversationItem> {
+    let user_messages = prompt_input
+        .iter()
+        .filter_map(codex_remote_compaction_v2_user)
+        .collect::<Vec<_>>();
+    let mut retained = fit_codex_remote_compaction_v2_user_tail(
+        user_messages,
+        CODEX_REMOTE_COMPACTION_V2_RETAINED_USER_TOKENS,
+    );
+    retained.push(compaction_item);
+    retained
+}
+
+/// Return genuine user messages appended while a compaction request was in
+/// flight, provided the original snapshot is still an exact prefix.
+///
+/// A prefix mismatch means the conversation was edited, rewound, or otherwise
+/// replaced while compaction ran; callers must not install a response derived
+/// from stale history in that case. Matching append-only updates are safe, and
+/// retaining their real user turns prevents a steer/interjection from being
+/// erased by the replacement-history swap.
+pub fn codex_remote_compaction_v2_interjections(
+    snapshot: &[ConversationItem],
+    current: &[ConversationItem],
+) -> Option<Vec<ConversationItem>> {
+    if current.len() < snapshot.len() {
+        return None;
+    }
+    let unchanged = snapshot.iter().zip(current).all(|(expected, actual)| {
+        serde_json::to_value(expected).ok() == serde_json::to_value(actual).ok()
+    });
+    if !unchanged {
+        return None;
+    }
+    Some(
+        current[snapshot.len()..]
+            .iter()
+            .filter_map(codex_remote_compaction_v2_user)
+            .collect(),
+    )
+}
 /// Extract all *real* user queries from a conversation, in order.
 ///
 /// "Real" means the item passes [`is_real_user_turn`] — it has no
@@ -1166,6 +1344,154 @@ pub fn strip_displaced_tool_results(items: &mut Vec<ConversationItem>) -> Vec<St
 mod tests {
     use super::*;
     use xai_grok_sampling_types::{CustomToolOutputImageDetail, SyntheticReason};
+
+    fn raw_compaction_item(encrypted_content: &str) -> ConversationItem {
+        xai_grok_sampling_types::codex_compact_output_to_conversation_items(vec![
+            serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": encrypted_content,
+            }),
+        ])
+        .expect("valid compaction item")
+        .pop()
+        .expect("one compaction item")
+    }
+
+    #[test]
+    fn remote_compaction_v2_keeps_newest_real_user_tail_and_raw_item() {
+        let old = format!("old:{}", "a".repeat(200_000));
+        let latest = format!("latest:{}", "b".repeat(200_000));
+        let input = vec![
+            ConversationItem::system("base"),
+            ConversationItem::user(old),
+            ConversationItem::assistant("assistant output is not retained"),
+            ConversationItem::system_reminder("synthetic reminder"),
+            ConversationItem::user(latest.clone()),
+        ];
+
+        let history =
+            build_codex_remote_compaction_v2_history(&input, raw_compaction_item("opaque-summary"));
+
+        assert_eq!(
+            history.len(),
+            3,
+            "the boundary turn is retained in truncated form"
+        );
+        assert!(history[0].text_content().starts_with("old:"));
+        assert!(history[0].text_content().contains("truncated"));
+        assert_eq!(history[1].text_content(), latest);
+        let ConversationItem::BackendToolCall(item) = &history[2] else {
+            panic!("the final item must remain provider-native");
+        };
+        let xai_grok_sampling_types::BackendToolKind::CodexRawInput(raw) = &item.kind else {
+            panic!("the final item must remain a Codex raw input");
+        };
+        assert_eq!(raw.raw["type"], "compaction");
+        assert_eq!(raw.raw["encrypted_content"], "opaque-summary");
+        assert!(raw.raw.get("id").is_none());
+    }
+
+    #[test]
+    fn remote_compaction_v2_fits_multipart_user_tail_and_strips_wrappers() {
+        let boundary = ConversationItem::User(xai_grok_sampling_types::UserItem {
+            content: vec![
+                ContentPart::Text {
+                    text: std::sync::Arc::<str>::from(format!(
+                        "<user_info>private metadata</user_info><user_query>{}</user_query>",
+                        "a".repeat(300_000)
+                    )),
+                },
+                ContentPart::Image {
+                    url: std::sync::Arc::<str>::from("data:image/png;base64,AAAA"),
+                },
+                ContentPart::Text {
+                    text: std::sync::Arc::<str>::from("b".repeat(300_000)),
+                },
+            ],
+            ..Default::default()
+        });
+        let input = vec![boundary, ConversationItem::user("latest intent")];
+
+        let history =
+            build_codex_remote_compaction_v2_history(&input, raw_compaction_item("opaque-summary"));
+        let retained = &history[..history.len() - 1];
+        assert!(
+            retained
+                .iter()
+                .map(codex_remote_compaction_v2_user_text_tokens)
+                .sum::<u64>()
+                <= CODEX_REMOTE_COMPACTION_V2_RETAINED_USER_TOKENS,
+            "the multipart retained tail must stay within the hard 64k budget"
+        );
+        assert_eq!(retained.last().unwrap().text_content(), "latest intent");
+        let ConversationItem::User(boundary) = &retained[0] else {
+            panic!("boundary item must stay a user message");
+        };
+        assert!(
+            boundary
+                .content
+                .iter()
+                .any(|part| matches!(part, ContentPart::Image { .. }))
+        );
+        let boundary_text = retained[0].text_content();
+        assert!(!boundary_text.contains("private metadata"));
+        assert!(!boundary_text.contains("<user_query>"));
+        assert!(boundary_text.contains("truncated"));
+    }
+
+    #[test]
+    fn remote_compaction_v2_rounds_each_text_part_independently() {
+        let item = ConversationItem::User(xai_grok_sampling_types::UserItem {
+            content: vec![
+                ContentPart::Text {
+                    text: std::sync::Arc::<str>::from("a"),
+                },
+                ContentPart::Image {
+                    url: std::sync::Arc::<str>::from("data:image/png;base64,AAAA"),
+                },
+                ContentPart::Text {
+                    text: std::sync::Arc::<str>::from("b"),
+                },
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            codex_remote_compaction_v2_user_text_tokens(&item),
+            2,
+            "each text content item uses ceil(bytes / 4), while images cost zero"
+        );
+    }
+
+    #[test]
+    fn remote_compaction_v2_preserves_append_only_user_interjections() {
+        let snapshot = vec![
+            ConversationItem::system("base"),
+            ConversationItem::user("initial task"),
+        ];
+        let mut current = snapshot.clone();
+        current.push(ConversationItem::system_reminder("internal update"));
+        current.push(ConversationItem::interjection("new user steer"));
+
+        let interjections = codex_remote_compaction_v2_interjections(&snapshot, &current)
+            .expect("append-only history should be safe");
+        assert_eq!(interjections.len(), 1);
+        assert_eq!(interjections[0].text_content(), "new user steer");
+        let ConversationItem::User(interjection) = &interjections[0] else {
+            panic!("interjection must stay a user item");
+        };
+        assert_eq!(
+            interjection.synthetic_reason,
+            Some(SyntheticReason::Interjection)
+        );
+
+        let mut edited = current;
+        edited[1] = ConversationItem::user("edited task");
+        assert!(
+            codex_remote_compaction_v2_interjections(&snapshot, &edited).is_none(),
+            "an edited prefix must reject the stale compaction result"
+        );
+    }
 
     #[test]
     fn native_custom_outputs_survive_compaction_adjacency_and_sanitization() {

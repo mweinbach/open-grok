@@ -26,7 +26,8 @@ use crate::session::two_pass::{
 use agent_client_protocol as acp;
 use std::sync::Arc;
 use xai_chat_state::compaction_utils::{
-    CompactedHistoryInput, CompactionAttempt, build_compacted_history, is_degenerate_summary,
+    CompactedHistoryInput, CompactionAttempt, build_codex_remote_compaction_v2_history,
+    build_compacted_history, codex_remote_compaction_v2_interjections, is_degenerate_summary,
     prepare_conversation_for_verbatim_summarization, sanitize_compacted_history,
     validate_compacted_history,
 };
@@ -81,6 +82,14 @@ fn prefire_lead_percent() -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_PREFIRE_LEAD_PERCENT)
+}
+
+fn codex_compaction_auth_refresh_allowed(
+    attempt: u32,
+    max_attempts: u32,
+    already_refreshed: bool,
+) -> bool {
+    !already_refreshed && attempt < max_attempts
 }
 /// Cheap fingerprint of a conversation prefix for prefire NOTE₁ validity. A
 /// mismatch means the prefix changed (edit / rewind / branch) since pass-1, so
@@ -156,8 +165,9 @@ impl From<PrefireOutcome> for PrefirePass1Run {
 #[cfg(test)]
 mod two_pass_prefire_helper_tests {
     use super::{
-        CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE, auto_compact_token_limit, comp_hash_changed,
-        fingerprint_prefix, prefire_lead_percent, rewrite_codex_tool_outputs_to_fit_context_window,
+        CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE, auto_compact_token_limit,
+        codex_compaction_auth_refresh_allowed, comp_hash_changed, fingerprint_prefix,
+        prefire_lead_percent, rewrite_codex_tool_outputs_to_fit_context_window,
     };
     use xai_grok_sampling_types::{ConversationItem, ModelProvider};
     #[test]
@@ -239,6 +249,14 @@ mod two_pass_prefire_helper_tests {
         assert!(!comp_hash_changed(Some("v1"), Some("v1")));
         assert!(!comp_hash_changed(None, Some("v2")));
         assert!(!comp_hash_changed(Some("v1"), None));
+    }
+
+    #[test]
+    fn codex_compaction_auth_refresh_never_escapes_attempt_budget() {
+        assert!(codex_compaction_auth_refresh_allowed(1, 3, false));
+        assert!(codex_compaction_auth_refresh_allowed(2, 3, false));
+        assert!(!codex_compaction_auth_refresh_allowed(3, 3, false));
+        assert!(!codex_compaction_auth_refresh_allowed(1, 3, true));
     }
 
     #[test]
@@ -754,17 +772,68 @@ impl SessionActor {
         auto_trigger: bool,
         estimated_tokens: u64,
         context_window: u64,
-    ) -> Result<(Vec<ConversationItem>, u32), acp::Error> {
+    ) -> Result<(Vec<ConversationItem>, u32, bool), acp::Error> {
         const MAX_ATTEMPTS: u32 = 3;
         let mut refreshed_auth = false;
+        let remote_v2 = self.agent.borrow().compaction_policy().remote_compaction_v2;
         for attempt in 1..=MAX_ATTEMPTS {
-            match client
-                .compact_codex_conversation(request.clone(), instructions)
-                .await
-            {
-                Ok(items) => return Ok((items, attempt)),
+            let attempt_started = std::time::Instant::now();
+            let result = if remote_v2 {
+                client
+                    .compact_codex_conversation_v2(request.clone(), instructions)
+                    .await
+                    .map(|result| {
+                        let usage = result.usage.as_ref();
+                        tracing::info!(
+                            session_id = %self.session_info.id.0,
+                            response_id = %result.response_id,
+                            input_tokens = usage.map(|usage| usage.input_tokens),
+                            output_tokens = usage.map(|usage| usage.output_tokens),
+                            cached_tokens = usage.map(|usage| usage.input_tokens_details.cached_tokens),
+                            "Codex remote compaction v2 stream completed"
+                        );
+                        if let Some(usage) = usage {
+                            let usage = xai_grok_sampling_types::TokenUsage {
+                                prompt_tokens: usage.input_tokens,
+                                completion_tokens: usage.output_tokens,
+                                total_tokens: usage.total_tokens,
+                                reasoning_tokens: usage.output_tokens_details.reasoning_tokens,
+                                cached_prompt_tokens: usage.input_tokens_details.cached_tokens,
+                            };
+                            let api_duration_ms =
+                                u64::try_from(attempt_started.elapsed().as_millis())
+                                    .unwrap_or(u64::MAX);
+                            self.chat_state_handle.record_model_call_usage(
+                                request.model.clone(),
+                                usage.clone(),
+                                Some(api_duration_ms),
+                                None,
+                            );
+                            self.signals_handle().record_token_usage(
+                                usage.completion_tokens,
+                                usage.reasoning_tokens,
+                            );
+                        }
+                        build_codex_remote_compaction_v2_history(
+                            &request.items,
+                            result.compaction_item,
+                        )
+                    })
+            } else {
+                client
+                    .compact_codex_conversation(request.clone(), instructions)
+                    .await
+            };
+            match result {
+                Ok(items) => return Ok((items, attempt, remote_v2)),
                 Err(error) => {
-                    if error.is_auth_error() && !refreshed_auth {
+                    if error.is_auth_error()
+                        && codex_compaction_auth_refresh_allowed(
+                            attempt,
+                            MAX_ATTEMPTS,
+                            refreshed_auth,
+                        )
+                    {
                         refreshed_auth = true;
                         match crate::codex_auth::force_refresh().await {
                             Ok(Some(credentials)) => {
@@ -807,7 +876,8 @@ impl SessionActor {
                             attempt,
                             delay,
                             error = %error,
-                            "retrying Codex responses/compact request"
+                            remote_v2,
+                            "retrying Codex remote compaction request"
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                         continue;
@@ -831,11 +901,13 @@ impl SessionActor {
         mut compacted_history: Vec<ConversationItem>,
         cross_provider_fallback: String,
         system_items: Vec<ConversationItem>,
+        conversation_snapshot: &[ConversationItem],
         segment_messages: &[ConversationItem],
         tokens_before: u64,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         compact_source: &'static str,
         attempts: u32,
+        remote_v2: bool,
         compaction: xai_grok_telemetry::events::CompactionScope,
     ) -> Result<(), acp::Error> {
         if compacted_history.is_empty() {
@@ -872,6 +944,26 @@ impl SessionActor {
         // every provider output item exact and ordered after that prefix.
         let mut replacement = system_items;
         replacement.append(&mut compacted_history);
+        if remote_v2 {
+            let current = self.chat_state_handle.get_conversation().await;
+            let interjections = codex_remote_compaction_v2_interjections(
+                conversation_snapshot,
+                &current,
+            )
+            .ok_or_else(|| {
+                acp::Error::internal_error().data(
+                    "conversation changed while Codex remote compaction v2 was in flight; refusing stale replacement history",
+                )
+            })?;
+            if !interjections.is_empty() {
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    interjection_count = interjections.len(),
+                    "preserving user interjections received during Codex remote compaction v2"
+                );
+                replacement.extend(interjections);
+            }
+        }
         self.persist_compaction_segment(segment_messages, "[OpenAI server-side compacted context]");
 
         let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
@@ -961,7 +1053,14 @@ impl SessionActor {
         span.record("compaction_input_overflow_rejections", 0i64);
         span.record("compaction_deterministic_rejections", 0i64);
         span.record("compaction_transient_rejections", 0i64);
-        span.record("compaction_stop_reason", "responses_compact");
+        span.record(
+            "compaction_stop_reason",
+            if remote_v2 {
+                "responses_compaction_v2"
+            } else {
+                "responses_compact"
+            },
+        );
         span.record("compaction_outcome", CompactionOutcome::Success.as_str());
         span.record("compaction_delta_count", 0i64);
         compaction.complete(tokens_after);
@@ -970,7 +1069,8 @@ impl SessionActor {
             tokens_before,
             tokens_after,
             attempts,
-            "installed OpenAI responses/compact replacement history"
+            remote_v2,
+            "installed OpenAI remote-compaction replacement history"
         );
         Ok(())
     }
@@ -1426,7 +1526,7 @@ impl SessionActor {
             request.hosted_tools = compaction_hosted_tools;
             request.reasoning_effort = sampling_config.reasoning_effort;
             request.x_grok_session_id = Some(self.session_info.id.0.to_string());
-            let (replacement, attempts) = self
+            let (replacement, attempts, remote_v2) = self
                 .run_codex_remote_compact_request(
                     sampling_client,
                     codex_turn_state,
@@ -1442,11 +1542,13 @@ impl SessionActor {
                     replacement,
                     cross_provider_fallback,
                     system_items,
+                    &provider_conversation,
                     &segment_messages,
                     tokens_before,
                     auto_continue,
                     compact_source,
                     attempts,
+                    remote_v2,
                     compaction,
                 )
                 .await;
