@@ -20,7 +20,7 @@ The installer exposes only the `open-grok` command and places runtime state in
 ## npm Packaging Status
 
 This directory contains the fork-owned `@mweinbach/open-grok` packaging for a
-future npm distribution. The `v0.1.220-open-grok.7` release does **not** publish
+future npm distribution. The `v0.1.220-open-grok.8` release does **not** publish
 npm packages; use the GitHub release installer above.
 
 ## Get Started
