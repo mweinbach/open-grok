@@ -1701,7 +1701,7 @@ mod tests {
         assert_eq!(
             first_5,
             vec![
-                "Grok Build with ChatGPT Codex optimizations",
+                "Open Grok with ChatGPT Codex optimizations",
                 "",
                 "Usage: open-grok [OPTIONS] [PROMPT] [COMMAND]",
                 "",

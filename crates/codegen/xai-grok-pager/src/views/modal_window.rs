@@ -1210,7 +1210,7 @@ mod tests {
         use ratatui::layout::Rect;
 
         let theme = Theme::current();
-        const TEXT: &str = "Tip · Ask Grok about the docs";
+        const TEXT: &str = "Tip · Ask Open Grok about the docs";
         let row_text = |width: u16| {
             let area = Rect {
                 x: 0,
@@ -1229,7 +1229,7 @@ mod tests {
         let start = wide.find("Tip").expect("Tip");
         let trailing = wide.chars().rev().take_while(|c| *c == ' ').count();
         assert!(start.abs_diff(trailing) <= 1, "not centered: {wide:?}");
-        assert!(wide.contains("Ask Grok about the docs"));
+        assert!(wide.contains("Ask Open Grok about the docs"));
 
         let tiny = row_text(10);
         assert!(tiny.contains("Tip"));

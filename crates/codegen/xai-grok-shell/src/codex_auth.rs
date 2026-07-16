@@ -622,7 +622,7 @@ async fn callback_handler(
     // finish the same OAuth attempt.
     if query.state.as_deref() != Some(state.expected_state.as_str()) {
         return Html(
-            "<!doctype html><title>Grok Build login failed</title><h1>OpenAI Codex login failed</h1><p>Return to Grok Build for details.</p>",
+            "<!doctype html><title>Open Grok login failed</title><h1>OpenAI Codex login failed</h1><p>Return to Open Grok for details.</p>",
         );
     }
 
@@ -643,11 +643,11 @@ async fn callback_handler(
     }
     if success {
         Html(
-            "<!doctype html><title>Grok Build connected</title><h1>OpenAI Codex connected</h1><p>You can close this window and return to Grok Build.</p>",
+            "<!doctype html><title>Open Grok connected</title><h1>OpenAI Codex connected</h1><p>You can close this window and return to Open Grok.</p>",
         )
     } else {
         Html(
-            "<!doctype html><title>Grok Build login failed</title><h1>OpenAI Codex login failed</h1><p>Return to Grok Build for details.</p>",
+            "<!doctype html><title>Open Grok login failed</title><h1>OpenAI Codex login failed</h1><p>Return to Open Grok for details.</p>",
         )
     }
 }
@@ -828,7 +828,7 @@ async fn run_device_login_at(path: &Path, endpoints: &CodexEndpoints) -> Result<
     eprintln!("  {verification_url}");
     eprintln!("Then enter this one-time code (expires in 15 minutes):");
     eprintln!("  {}", device.user_code);
-    eprintln!("Continue only if you started this login in Grok Build.");
+    eprintln!("Continue only if you started this login in Open Grok.");
     let open_url = verification_url.clone();
     tokio::task::spawn_blocking(move || webbrowser::open(&open_url));
 
@@ -1448,7 +1448,9 @@ mod tests {
             }),
         )
         .await;
-        assert!(rejected.0.contains("login failed"));
+        assert!(rejected.0.contains("Open Grok login failed"));
+        assert!(rejected.0.contains("Return to Open Grok for details"));
+        assert!(!rejected.0.contains("Grok Build"));
         assert!(
             state.result_tx.lock().await.is_some(),
             "wrong-state callback must leave the one-shot sender available"
@@ -1464,7 +1466,9 @@ mod tests {
             }),
         )
         .await;
-        assert!(accepted.0.contains("Codex connected"));
+        assert!(accepted.0.contains("Open Grok connected"));
+        assert!(accepted.0.contains("return to Open Grok"));
+        assert!(!accepted.0.contains("Grok Build"));
         assert_eq!(result_rx.await.unwrap().unwrap(), "valid-code");
     }
 

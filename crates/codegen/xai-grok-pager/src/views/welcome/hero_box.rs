@@ -28,7 +28,7 @@ const LOGO_H_PAD: u16 = 3;
 /// message never paints over the button.
 const UPGRADE_CTA_ROWS: u16 = 2;
 
-const HERO_SUBTITLE: &str = "Thanks for trying Grok Build, give feedback with /feedback!";
+const HERO_SUBTITLE: &str = "Thanks for trying Open Grok, give feedback with /feedback!";
 
 use super::{PROMPT_HEIGHT, VERSION_GAP};
 

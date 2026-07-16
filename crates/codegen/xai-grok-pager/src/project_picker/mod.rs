@@ -78,8 +78,8 @@ pub fn build_project_question(
 
     ProjectQuestion {
         question: Question {
-            question: "Run Grok Build in a project directory?\n\n\
-                 This gives Grok Build full context of your codebase for better results."
+            question: "Run Open Grok in a project directory?\n\n\
+                 This gives Open Grok full context of your codebase for better results."
                 .into(),
             id: None,
             options,
@@ -98,6 +98,11 @@ mod tests {
     #[test]
     fn no_recent_dirs_returns_only_cwd() {
         let pq = build_project_question(&[], Path::new("/home/user"));
+        assert_eq!(
+            pq.question.question,
+            "Run Open Grok in a project directory?\n\n\
+             This gives Open Grok full context of your codebase for better results."
+        );
         assert_eq!(pq.resolved_paths.len(), 1);
         assert_eq!(pq.resolved_paths[0], PathBuf::from("/home/user"));
     }

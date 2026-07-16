@@ -159,7 +159,7 @@ fn callback_response(result: &CallbackResult) -> (StatusCode, Html<String>) {
     let (title, message) = match result {
         Ok(_) => (
             "Signed in",
-            "You can close this window and return to Grok Build.",
+            "You can close this window and return to Open Grok.",
         ),
         Err(_) => ("Access denied", "Close this window and try again."),
     };
@@ -556,6 +556,18 @@ type CallbackResult = Result<Callback, String>;
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+
+    #[test]
+    fn successful_callback_returns_to_open_grok() {
+        let result = Ok(Callback {
+            code: "code".into(),
+            state: "state".into(),
+        });
+        let (_, Html(page)) = callback_response(&result);
+
+        assert!(page.contains("return to Open Grok"));
+        assert!(!page.contains("Grok Build"));
+    }
 
     /// End-to-end test: mock IdP + full login flow with code arriving via loopback.
     /// Exercises discovery → PKCE → race_callback_and_stdin → token exchange → user info → persist.

@@ -391,7 +391,7 @@ fn open_grok_version() -> &'static str {
 #[command(
     name = "open-grok",
     version = open_grok_version(),
-    about = "Grok Build with ChatGPT Codex optimizations",
+    about = "Open Grok with ChatGPT Codex optimizations",
     disable_version_flag = true,
     next_display_order = None,
     help_template = "\

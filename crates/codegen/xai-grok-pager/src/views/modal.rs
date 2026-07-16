@@ -986,11 +986,11 @@ fn fit_docs_ask_grok_tip(docs_path: &str, width: usize) -> String {
         return String::new();
     }
     let long =
-        format!("Tip · Ask Grok about the docs ({docs_path}) — e.g. \"how do I set up MCP?\"");
+        format!("Tip · Ask Open Grok about the docs ({docs_path}) — e.g. \"how do I set up MCP?\"");
     if long.width() <= width {
         return long;
     }
-    let short = format!("Tip · Ask Grok about the docs · {docs_path}");
+    let short = format!("Tip · Ask Open Grok about the docs · {docs_path}");
     if short.width() <= width {
         return short;
     }
@@ -1354,8 +1354,8 @@ mod doc_picker_tip_tests {
     fn fit_docs_tip_prefers_path_and_never_overflows() {
         let path = crate::util::display_user_grok_path(DOCS_USER_GUIDE_REL);
         let long =
-            format!("Tip · Ask Grok about the docs ({path}) — e.g. \"how do I set up MCP?\"");
-        let short = format!("Tip · Ask Grok about the docs · {path}");
+            format!("Tip · Ask Open Grok about the docs ({path}) — e.g. \"how do I set up MCP?\"");
+        let short = format!("Tip · Ask Open Grok about the docs · {path}");
         let path_only = format!("Tip · {path}");
         assert_eq!(fit_docs_ask_grok_tip(&path, long.width()), long);
         assert_eq!(fit_docs_ask_grok_tip(&path, short.width()), short);
@@ -1396,7 +1396,7 @@ mod doc_picker_tip_tests {
             all.push('\n');
         }
         assert!(
-            all.contains("Tip") && all.contains("Ask Grok"),
+            all.contains("Tip") && all.contains("Ask Open Grok"),
             "missing tip footer:\n{all}"
         );
         assert!(
