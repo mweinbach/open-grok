@@ -34,6 +34,23 @@ pub struct MemoryFileWatcher {
     _watcher: RecommendedWatcher,
 }
 
+fn record_event(dirty_files: &ArcSwap<HashSet<PathBuf>>, dirty: &AtomicBool, event: Event) {
+    match event.kind {
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {}
+        _ => return,
+    }
+    for path in event.paths {
+        if path.extension().is_some_and(|ext| ext == "md") {
+            dirty_files.rcu(move |old| {
+                let mut new = (**old).clone();
+                new.insert(path.clone());
+                new
+            });
+            dirty.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 impl MemoryFileWatcher {
     /// Start watching the given memory directory for `.md` file changes.
     ///
@@ -48,21 +65,7 @@ impl MemoryFileWatcher {
 
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             let Ok(event) = res else { return };
-            match event.kind {
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {}
-                _ => return,
-            }
-            for path in &event.paths {
-                if path.extension().is_some_and(|ext| ext == "md") {
-                    let path = path.clone();
-                    df.rcu(move |old| {
-                        let mut new = (**old).clone();
-                        new.insert(path.clone());
-                        new
-                    });
-                    d.store(true, Ordering::Relaxed);
-                }
-            }
+            record_event(&df, &d, event);
         })
         .map_err(|e| {
             tracing::warn!(error = %e, "failed to create memory file watcher");
@@ -111,6 +114,11 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn deliver_create_event(watcher: &MemoryFileWatcher, path: PathBuf) {
+        let event = Event::new(EventKind::Create(notify::event::CreateKind::File)).add_path(path);
+        record_event(&watcher.dirty_files, &watcher.dirty, event);
+    }
+
     #[test]
     fn test_watcher_starts_on_valid_dir() {
         let tmp = TempDir::new().unwrap();
@@ -138,16 +146,15 @@ mod tests {
             return;
         };
 
-        // Create a .md file — watcher should detect it
-        std::fs::write(tmp.path().join("test.md"), "hello").unwrap();
-
-        // Give the watcher time to process (debounce + OS event delivery)
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Feed the same event produced by the OS into the callback logic.
+        // Native delivery is intentionally not part of this assertion: sandboxed
+        // macOS test processes can start FSEvents successfully but receive no events.
+        let path = tmp.path().join("test.md");
+        deliver_create_event(&watcher, path.clone());
 
         assert!(watcher.is_dirty(), "should detect .md creation");
         let dirty = watcher.take_dirty();
-        assert!(!dirty.is_empty(), "should have dirty paths");
-        assert!(dirty[0].extension().unwrap() == "md");
+        assert_eq!(dirty, vec![path]);
     }
 
     #[test]
@@ -158,11 +165,8 @@ mod tests {
             return;
         };
 
-        // Create a non-.md file
-        std::fs::write(tmp.path().join("test.txt"), "hello").unwrap();
-        std::fs::write(tmp.path().join("index.sqlite"), "db").unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        deliver_create_event(&watcher, tmp.path().join("test.txt"));
+        deliver_create_event(&watcher, tmp.path().join("index.sqlite"));
 
         assert!(
             !watcher.is_dirty(),
@@ -178,8 +182,7 @@ mod tests {
             return;
         };
 
-        std::fs::write(tmp.path().join("a.md"), "content").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        deliver_create_event(&watcher, tmp.path().join("a.md"));
 
         let first = watcher.take_dirty();
         assert!(!first.is_empty());
