@@ -36,6 +36,10 @@ When Code Mode Only is effective:
    that session ends.
 7. Direct-only collaboration controls remain top-level and are excluded from the
    generated `tools.*` namespace, matching Sol's multi-agent-v2 policy.
+8. `exec` and `wait` remain in model history but are transport details, not TUI
+   tool cards. The UI shows only the decoded nested tools and their ordinary
+   structured results; raw JavaScript, wait arguments, and cell transport output
+   stay hidden during live streaming and session replay.
 
 An implementation that exposes `exec` as a normal JSON-schema function or starts a
 fresh JavaScript process for every call is not compatible with this contract.
@@ -74,6 +78,12 @@ All six phases are implemented against the pinned revision. Grok Build uses the
 upstream embedded V8 provider; the optional out-of-process `code-mode-host` is not
 included. This keeps the execution and persistence contract while avoiding a
 second process-management path.
+
+The user-visible event behavior was rechecked against Codex commit
+`cbc83d961e8132bfff4d340ab8342d181b79e95e`. That revision records outer custom
+calls as raw response history but does not map them to typed TUI turn items;
+nested Code Mode invocations re-enter the normal tool dispatcher. Open Grok
+mirrors that split and also removes transport wrappers from legacy replay data.
 
 ## Provenance and maintenance
 

@@ -10,6 +10,8 @@ revision as the Code Mode port:
 
 The live model-catalog compatibility pass was refreshed against Codex commit
 `cbc83d961e8132bfff4d340ab8342d181b79e95e`.
+Per-turn routing and compaction behavior were rechecked against Codex commit
+`03bb3b12367397e14a8facc2e018d645ff4d8e83`.
 
 ## Live model catalog
 
@@ -26,9 +28,9 @@ credentials available, the shell follows codex-rs' live catalog contract:
   provider partition. Empty or hidden-only responses merge with the embedded
   fallback, matching codex-rs behavior.
 - Project each model's live context window, reasoning menu, hosted-search flag,
-  tool mode, and `multi_agent_version` into the TUI/session catalog. The version
-  field, independently from the effort menu, gates codex-rs's v2 proactive
-  multi-agent request policy.
+  tool mode, `multi_agent_version`, `auto_compact_token_limit`, and `comp_hash`
+  into the TUI/session catalog. The version field, independently from the
+  effort menu, gates codex-rs's v2 proactive multi-agent request policy.
 - Apply user `[model.*]` entries last, so explicit operator configuration remains
   the highest-priority layer.
 
@@ -68,6 +70,14 @@ The per-turn preflight uses only the selected provider's credential source. A
 Codex 401 receives one immediate forced refresh and retry; xAI keeps its existing
 auth-manager retry schedule. No Codex path may invoke or update xAI auth state.
 
+Each logical Codex prompt also follows codex-rs's sticky-routing contract. The
+first successful `/responses` or `/responses/compact` response may supply
+`x-codex-turn-state`; Open Grok replays that exact first value across retries,
+tool-loop continuations, client rebuilds, and in-turn compaction. The value is
+bound when a request is enqueued and never crosses into the next prompt or an
+xAI request. Manual compaction owns a private operation-scoped value so a
+concurrent prompt cannot replace its routing generation.
+
 ## Model routing
 
 A model entry selects this contract explicitly with `provider = "codex"`.
@@ -101,6 +111,23 @@ memory store. Provider-less cumulative memory archives, full diagnostic-log
 uploads, and recovered upload-queue spills are disabled until those artifacts
 carry enough provider provenance to enforce the same boundary safely.
 
+## Compaction
+
+Codex sessions use OpenAI's unary `POST /responses/compact` endpoint for both
+manual and automatic compaction. The request carries the active model,
+instructions, input, tools, reasoning controls, and account-scoped Codex auth;
+the returned provider-native items are filtered with codex-rs's allowlist and
+then replayed byte-for-byte as opaque Responses input on the next turn.
+
+Automatic compaction uses the live model's absolute
+`auto_compact_token_limit`, clamped to 90% of the raw context window as in
+codex-rs. When the field is absent, Open Grok derives the same 90%-of-raw
+fallback from the catalog's effective context. A changed nonempty `comp_hash`
+forces compatibility compaction before sampling. Explicit non-default Open
+Grok threshold configuration remains an operator override. Switching a compacted
+session to xAI uses only a bounded provider-neutral plaintext fallback; opaque
+Codex payloads never cross the provider boundary.
+
 ## Usage and hosted search
 
 The combined `/usage` command fetches xAI billing and Codex `/wham/usage`
@@ -112,6 +139,9 @@ Hosted search is provider-aware. xAI keeps its native web and X search tools.
 Codex emits the OpenAI `web_search` tool, including supported filters and source
 items, and never receives xAI-only `x_search`. Code Mode Only keeps hosted web
 search top-level while local tools remain behind the JavaScript dispatcher.
+The Responses adapter accepts xAI's current `x_search_call` output and progress
+frames as a provider-executed X Search lifecycle, while retaining compatibility
+with the earlier custom-tool representation.
 If hosted search is unavailable, Codex does not silently fall back to the
 compiled local xAI search model. The local tool remains hidden across in-place
 model switches unless the user configured a non-default search model, which is

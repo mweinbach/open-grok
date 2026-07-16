@@ -24,18 +24,30 @@ The public command is `open-grok`. It can be installed beside the upstream
   JavaScript `exec`/`wait` runtime used by Codex. Ordinary tools remain available
   through the generated `tools.*` namespace; direct-only interaction and
   multi-agent controls stay top-level.
-- **GPT-5.6 Sol compatibility.** The built-in `gpt-5.6-sol` entry uses the Codex
-  Responses API, a 353,000-token context window, backend-hosted web search, and
-  mandatory `code_mode_only` behavior.
+- **Live Codex model catalog.** When ChatGPT Codex is connected, Open Grok calls
+  the same authenticated `/models?client_version=…` endpoint as codex-rs. Live
+  model names, context windows, reasoning levels, search support, and tool modes
+  override the embedded Sol/Terra/Luna fallback catalog when OpenAI changes it.
+- **Codex Max and Ultra parity.** Max and Ultra remain distinct in the TUI while
+  both use Codex's `max` wire effort. For models whose live catalog metadata
+  declares multi-agent v2, Ultra also enables codex-rs's proactive request
+  policy.
+- **Codex automatic compaction.** Codex conversations use OpenAI's
+  `/responses/compact` endpoint, replay its opaque replacement history exactly,
+  and follow the live model catalog's compaction limit and compatibility hash.
+  xAI conversations keep Grok Build's existing compaction path.
 - **ChatGPT Codex OAuth.** `open-grok login --codex` uses the Codex OAuth flow and
-  stores those credentials separately in `~/.opengrok/codex-auth.json`. A model
-  API key may still be configured explicitly.
+  stores those credentials separately in `~/.opengrok/codex-auth.json`.
 - **xAI and Codex side by side.** xAI sign-in remains available, `/model` can
-  switch between provider-backed models, and `/usage` reports xAI billing and
-  Codex quota windows independently.
+  switch an existing conversation between provider-backed models by rebuilding
+  the correct harness in place, and `/usage` reports xAI billing and Codex quota
+  windows independently.
 - **Provider-aware hosted search.** xAI models receive xAI web/X search tools;
   Codex models receive OpenAI `web_search`. Open Grok does not pass one
   provider's credentials or provider-only tools to the other.
+- **One harness across providers.** Codex keeps the same subagent, scheduler,
+  monitor, goal, plan, and user-question features as Grok while using Codex's
+  file tools, prompt, transport, and model metadata.
 
 The implementation and compatibility contract are documented in
 [`docs/code-mode-port.md`](docs/code-mode-port.md) and
@@ -71,7 +83,7 @@ leading `v`):
 
 ```sh
 curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh \
-  | bash -s -- v0.1.220-open-grok.1
+  | bash -s -- v0.1.220-open-grok.2
 ```
 
 For local installer testing, `OPEN_GROK_RELEASE_BASE_URL` may point directly to
@@ -99,14 +111,22 @@ Then launch the TUI and select a model:
 open-grok
 ```
 
-Inside the TUI, use `/model gpt-5.6-sol` for GPT-5.6 Sol, `/model` (or the model
-picker) to switch providers, and `/usage` to view both providers' available
-usage. Bare `login`/`logout` continue to operate on xAI credentials; use
+On first launch, the TUI offers ChatGPT Codex and xAI Grok as separate sign-in
+choices. Inside the TUI, use `/model gpt-5.6-sol` for GPT-5.6 Sol, `/model` (or
+the model picker) to switch providers, and `/usage` to view both providers'
+available usage. The picker labels each model with its provider and live context
+window. Bare `login`/`logout` continue to operate on xAI credentials; use
 `logout --codex` for Codex or `logout --all` for both.
 
 Codex credentials are isolated from the primary xAI credential store. A
 Codex-selected session can run without xAI authentication, and a provider
 failure in `/usage` does not hide the other provider's result.
+
+Codex catalog data is cached for five minutes in the separate
+`$OPENGROK_HOME/codex_models_cache.json`. The cache is scoped to the Open Grok
+version, endpoint, and Codex account identity; it never shares xAI's
+`models_cache.json`. Authenticated Codex sessions can use the embedded catalog as
+a fallback when the cache or network is unavailable.
 
 ## Codex Code Mode
 
@@ -120,8 +140,11 @@ There are two related behaviors:
 In Code Mode Only, the model calls the native freeform `exec` tool with raw
 JavaScript. Local tools are invoked through `tools.*`, and `wait` resumes or
 terminates a yielded JavaScript cell. The runtime persists for the session and
-is disposed when the session ends. Changing the setting requires starting a
-new session.
+is disposed when the session ends. The TUI and restored transcripts hide the
+outer `exec`/`wait` transport—including raw JavaScript and wrapper JSON—and show
+only the decoded inner tool calls and their normal structured results. Hosted
+search remains available directly through the selected provider. Changing the
+setting requires starting a new session.
 
 ## Build from source
 
