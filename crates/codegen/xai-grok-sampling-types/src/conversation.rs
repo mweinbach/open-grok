@@ -1050,36 +1050,53 @@ impl HostedTool {
     }
 }
 
+impl crate::HostedToolDialect {
+    /// Normalize hosted tools for this wire dialect before serialization.
+    ///
+    /// In particular, `x_search` is never valid in the OpenAI schema. A
+    /// missing web-search mode becomes live search, matching the pinned
+    /// Codex hosted-tool setup.
+    pub fn hosted_tools(self, hosted_tools: &[HostedTool]) -> Vec<HostedTool> {
+        hosted_tools
+            .iter()
+            .filter_map(|tool| match (self, tool) {
+                (Self::OpenAi, HostedTool::XSearch) => None,
+                (
+                    Self::OpenAi,
+                    HostedTool::WebSearch {
+                        mode: Some(WebSearchMode::Disabled),
+                        ..
+                    },
+                ) => None,
+                (Self::OpenAi, HostedTool::WebSearch { .. }) => {
+                    let mut tool = tool.clone();
+                    if let HostedTool::WebSearch { mode, .. } = &mut tool {
+                        mode.get_or_insert(WebSearchMode::Live);
+                    }
+                    Some(tool)
+                }
+                _ => Some(tool.clone()),
+            })
+            .collect()
+    }
+}
+
+impl crate::ProviderProfile {
+    /// Normalize hosted tools using this profile's provider-neutral dialect.
+    pub fn hosted_tools(self, hosted_tools: &[HostedTool]) -> Vec<HostedTool> {
+        self.hosted_tool_dialect.hosted_tools(hosted_tools)
+    }
+}
+
 /// Apply the first-party provider's hosted-tool contract before serialization.
 ///
-/// In particular, `x_search` is never valid on the OpenAI/Codex endpoint. A
-/// missing web-search mode becomes Codex's live-search default, matching the
-/// pinned `codex-rs` hosted-tool setup.
+/// This compatibility entry point delegates to [`crate::ProviderProfile`] so
+/// downstream code can use the profile or hosted-tool dialect directly.
 pub fn hosted_tools_for_provider(
     hosted_tools: &[HostedTool],
     provider: crate::ModelProvider,
 ) -> Vec<HostedTool> {
-    hosted_tools
-        .iter()
-        .filter_map(|tool| match (provider, tool) {
-            (crate::ModelProvider::Codex, HostedTool::XSearch) => None,
-            (
-                crate::ModelProvider::Codex,
-                HostedTool::WebSearch {
-                    mode: Some(WebSearchMode::Disabled),
-                    ..
-                },
-            ) => None,
-            (crate::ModelProvider::Codex, HostedTool::WebSearch { .. }) => {
-                let mut tool = tool.clone();
-                if let HostedTool::WebSearch { mode, .. } = &mut tool {
-                    mode.get_or_insert(WebSearchMode::Live);
-                }
-                Some(tool)
-            }
-            _ => Some(tool.clone()),
-        })
-        .collect()
+    provider.profile().hosted_tools(hosted_tools)
 }
 
 impl From<ToolDefinition> for ToolSpec {
@@ -1223,15 +1240,16 @@ impl ConversationRequest {
         &self,
         provider: crate::ModelProvider,
     ) -> Vec<RawInputItemReplacement> {
+        let dialect = provider.profile().responses_dialect;
         let mut replacements = Vec::new();
         let mut input_item_index = 0usize;
         for item in &self.items {
             if let ConversationItem::BackendToolCall(backend) = item {
-                let value = match (&provider, &backend.kind) {
-                    (crate::ModelProvider::Codex, BackendToolKind::CodexRawInput(raw)) => {
+                let value = match (dialect, &backend.kind) {
+                    (crate::ResponsesDialect::Codex, BackendToolKind::CodexRawInput(raw)) => {
                         Some(raw.raw.clone())
                     }
-                    (crate::ModelProvider::Xai, BackendToolKind::XSearch(call)) => {
+                    (crate::ResponsesDialect::Xai, BackendToolKind::XSearch(call)) => {
                         Some(x_search_call_wire_value(call))
                     }
                     _ => None,
@@ -5549,6 +5567,56 @@ mod tests {
             wire.include,
             Some(vec![rs::IncludeEnum::WebSearchCallActionSources])
         );
+    }
+
+    #[test]
+    fn provider_profiles_normalize_hosted_tools_by_dialect() {
+        struct Case {
+            provider: crate::ModelProvider,
+            expected_len: usize,
+            expected_web_mode: Option<WebSearchMode>,
+            keeps_x_search: bool,
+        }
+
+        let input = [HostedTool::web_search(None), HostedTool::XSearch];
+        let cases = [
+            Case {
+                provider: crate::ModelProvider::Xai,
+                expected_len: 2,
+                expected_web_mode: None,
+                keeps_x_search: true,
+            },
+            Case {
+                provider: crate::ModelProvider::Codex,
+                expected_len: 1,
+                expected_web_mode: Some(WebSearchMode::Live),
+                keeps_x_search: false,
+            },
+        ];
+
+        for case in cases {
+            let profile = case.provider.profile();
+            let via_profile = profile.hosted_tools(&input);
+            let via_compatibility_api = hosted_tools_for_provider(&input, case.provider);
+            assert_eq!(via_profile.len(), case.expected_len, "{profile:?}");
+            assert_eq!(
+                via_compatibility_api.len(),
+                via_profile.len(),
+                "compatibility API diverged for {profile:?}"
+            );
+            assert_eq!(
+                via_profile
+                    .iter()
+                    .any(|tool| matches!(tool, HostedTool::XSearch)),
+                case.keeps_x_search,
+                "{profile:?}"
+            );
+            let web_mode = via_profile.iter().find_map(|tool| match tool {
+                HostedTool::WebSearch { mode, .. } => Some(*mode),
+                HostedTool::XSearch | HostedTool::ClientCustom(_) => None,
+            });
+            assert_eq!(web_mode, Some(case.expected_web_mode), "{profile:?}");
+        }
     }
 
     #[test]
@@ -11590,6 +11658,58 @@ mod tests {
         // One assistant message + one function call precede the raw item.
         assert_eq!(replacements[0].input_item_index, 2);
         assert_eq!(replacements[0].value, raw);
+    }
+
+    #[test]
+    fn provider_profiles_select_only_native_responses_history() {
+        let x_search = serde_json::from_value::<rs::CustomToolCall>(serde_json::json!({
+            "call_id": "xs_profile",
+            "input": serde_json::json!({"type": "search", "query": "profiles"}).to_string(),
+            "name": "x_search",
+            "id": "xs_profile"
+        }))
+        .unwrap();
+        let codex_raw = serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque-profile-history"
+        });
+        let request = ConversationRequest::from_items(vec![
+            ConversationItem::BackendToolCall(BackendToolCallItem {
+                kind: BackendToolKind::XSearch(x_search),
+            }),
+            ConversationItem::BackendToolCall(BackendToolCallItem {
+                kind: BackendToolKind::CodexRawInput(CodexRawInputItem {
+                    id: "codex_profile".to_string(),
+                    raw: codex_raw,
+                    cross_provider_fallback: None,
+                }),
+            }),
+        ]);
+
+        struct Case {
+            provider: crate::ModelProvider,
+            expected_index: usize,
+            expected_type: &'static str,
+        }
+        let cases = [
+            Case {
+                provider: crate::ModelProvider::Xai,
+                expected_index: 0,
+                expected_type: "x_search_call",
+            },
+            Case {
+                provider: crate::ModelProvider::Codex,
+                expected_index: 1,
+                expected_type: "compaction",
+            },
+        ];
+
+        for case in cases {
+            let replacements = request.raw_responses_input_replacements(case.provider);
+            assert_eq!(replacements.len(), 1, "{:?}", case.provider.profile());
+            assert_eq!(replacements[0].input_item_index, case.expected_index);
+            assert_eq!(replacements[0].value["type"], case.expected_type);
+        }
     }
 
     #[test]

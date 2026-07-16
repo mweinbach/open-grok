@@ -1062,13 +1062,236 @@ pub enum ApiBackend {
 /// This is deliberately explicit rather than inferred from a model slug or
 /// URL: the provider controls both credential resolution and which hosted
 /// tools are valid on the wire.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelProvider {
     #[default]
     Xai,
     #[serde(alias = "openai", alias = "openai_codex")]
     Codex,
+}
+
+/// Provider-specific wire contract used by the Responses API.
+///
+/// This remains separate from [`ApiBackend`]: both built-in providers use the
+/// Responses endpoint, but they require different request and replay shapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesDialect {
+    Xai,
+    Codex,
+}
+
+impl ResponsesDialect {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Xai => "xai",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub const fn is_xai(self) -> bool {
+        matches!(self, Self::Xai)
+    }
+
+    pub const fn is_codex(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+}
+
+/// Hosted-tool schema accepted by the selected provider.
+///
+/// `OpenAi` is intentionally broader than the built-in Codex provider: a
+/// future provider may share OpenAI's hosted-tool wire contract without using
+/// the Codex Responses dialect or Codex session authentication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedToolDialect {
+    Xai,
+    OpenAi,
+}
+
+impl HostedToolDialect {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Xai => "xai",
+            Self::OpenAi => "open_ai",
+        }
+    }
+
+    pub const fn is_xai(self) -> bool {
+        matches!(self, Self::Xai)
+    }
+
+    pub const fn is_open_ai(self) -> bool {
+        matches!(self, Self::OpenAi)
+    }
+}
+
+/// Policy for provider-private request metadata and identity headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestMetadataPolicy {
+    /// Send the `x-grok-*` request metadata used by xAI services.
+    XGrokHeaders,
+    /// Send only provider-standard metadata; never forward `x-grok-*` fields.
+    StandardHeadersOnly,
+}
+
+impl RequestMetadataPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::XGrokHeaders => "x_grok_headers",
+            Self::StandardHeadersOnly => "standard_headers_only",
+        }
+    }
+
+    pub const fn sends_x_grok_headers(self) -> bool {
+        matches!(self, Self::XGrokHeaders)
+    }
+}
+
+/// Built-in session credential source associated with a provider.
+///
+/// API-key authentication remains independently configurable. This policy
+/// identifies which first-party login/session store may satisfy a model that
+/// uses session authentication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltInSessionAuthKind {
+    XaiSession,
+    CodexOAuth,
+}
+
+impl BuiltInSessionAuthKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::XaiSession => "xai_session",
+            Self::CodexOAuth => "codex_oauth",
+        }
+    }
+
+    pub const fn is_xai(self) -> bool {
+        matches!(self, Self::XaiSession)
+    }
+
+    pub const fn is_codex(self) -> bool {
+        matches!(self, Self::CodexOAuth)
+    }
+}
+
+/// Whether data from this provider may enter xAI-only export and service
+/// paths such as feedback, persistence relay, and trace upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum XaiServicePolicy {
+    Allowed,
+    Denied,
+}
+
+impl XaiServicePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+        }
+    }
+
+    pub const fn allows(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
+/// Complete behavior policy for one built-in model provider.
+///
+/// Keeping these axes explicit lets transports and session services select a
+/// capability without matching [`ModelProvider`] directly. Adding another
+/// provider later therefore does not imply that every policy needs a third
+/// wire format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    /// Stable provider identifier. Use [`ModelProvider::as_str`] for its wire
+    /// value and [`ModelProvider::name`] for its display name.
+    pub provider: ModelProvider,
+    pub responses_dialect: ResponsesDialect,
+    pub hosted_tool_dialect: HostedToolDialect,
+    pub request_metadata: RequestMetadataPolicy,
+    pub session_auth: BuiltInSessionAuthKind,
+    pub xai_services: XaiServicePolicy,
+}
+
+impl ProviderProfile {
+    pub const XAI: Self = Self {
+        provider: ModelProvider::Xai,
+        responses_dialect: ResponsesDialect::Xai,
+        hosted_tool_dialect: HostedToolDialect::Xai,
+        request_metadata: RequestMetadataPolicy::XGrokHeaders,
+        session_auth: BuiltInSessionAuthKind::XaiSession,
+        xai_services: XaiServicePolicy::Allowed,
+    };
+
+    pub const CODEX: Self = Self {
+        provider: ModelProvider::Codex,
+        responses_dialect: ResponsesDialect::Codex,
+        hosted_tool_dialect: HostedToolDialect::OpenAi,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::CodexOAuth,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
+    pub const fn id(self) -> &'static str {
+        self.provider.as_str()
+    }
+
+    pub const fn name(self) -> &'static str {
+        self.provider.name()
+    }
+
+    pub const fn is_xai(self) -> bool {
+        self.provider.is_xai()
+    }
+
+    pub const fn is_codex(self) -> bool {
+        self.provider.is_codex()
+    }
+
+    pub const fn allows_xai_services(self) -> bool {
+        self.xai_services.allows()
+    }
+}
+
+impl ModelProvider {
+    /// Stable provider identifier used in configuration and persistence.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Xai => "xai",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Human-readable provider name for UI and diagnostics.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Xai => "xAI",
+            Self::Codex => "OpenAI Codex",
+        }
+    }
+
+    pub const fn is_xai(self) -> bool {
+        matches!(self, Self::Xai)
+    }
+
+    pub const fn is_codex(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+
+    /// Return the built-in provider's complete behavior policy.
+    pub const fn profile(self) -> ProviderProfile {
+        match self {
+            Self::Xai => ProviderProfile::XAI,
+            Self::Codex => ProviderProfile::CODEX,
+        }
+    }
 }
 
 /// How client-executed tools are exposed to the model.
@@ -1290,6 +1513,62 @@ impl From<crate::messages::MessagesRequest> for MessagesRequestWrapper {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn built_in_provider_profiles_are_complete_and_serde_capable() {
+        struct Case {
+            provider: ModelProvider,
+            id: &'static str,
+            name: &'static str,
+            responses: ResponsesDialect,
+            hosted_tools: HostedToolDialect,
+            request_metadata: RequestMetadataPolicy,
+            session_auth: BuiltInSessionAuthKind,
+            xai_services: XaiServicePolicy,
+        }
+
+        let cases = [
+            Case {
+                provider: ModelProvider::Xai,
+                id: "xai",
+                name: "xAI",
+                responses: ResponsesDialect::Xai,
+                hosted_tools: HostedToolDialect::Xai,
+                request_metadata: RequestMetadataPolicy::XGrokHeaders,
+                session_auth: BuiltInSessionAuthKind::XaiSession,
+                xai_services: XaiServicePolicy::Allowed,
+            },
+            Case {
+                provider: ModelProvider::Codex,
+                id: "codex",
+                name: "OpenAI Codex",
+                responses: ResponsesDialect::Codex,
+                hosted_tools: HostedToolDialect::OpenAi,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::CodexOAuth,
+                xai_services: XaiServicePolicy::Denied,
+            },
+        ];
+
+        for case in cases {
+            let profile = case.provider.profile();
+            assert_eq!(profile.provider, case.provider);
+            assert_eq!(profile.id(), case.id);
+            assert_eq!(profile.name(), case.name);
+            assert_eq!(profile.responses_dialect, case.responses);
+            assert_eq!(profile.hosted_tool_dialect, case.hosted_tools);
+            assert_eq!(profile.request_metadata, case.request_metadata);
+            assert_eq!(profile.session_auth, case.session_auth);
+            assert_eq!(profile.xai_services, case.xai_services);
+            assert_eq!(profile.is_xai(), case.provider.is_xai());
+            assert_eq!(profile.is_codex(), case.provider.is_codex());
+            assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
+
+            let serialized = serde_json::to_value(profile).unwrap();
+            let round_trip: ProviderProfile = serde_json::from_value(serialized).unwrap();
+            assert_eq!(round_trip, profile);
+        }
+    }
 
     #[test]
     fn reasoning_effort_serde_lowercase_round_trip() {
