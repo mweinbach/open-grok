@@ -718,11 +718,11 @@ fn spawn_fake_acp_agent(
     });
     counter
 }
-/// Redirect `GROK_HOME` to a tempdir for test isolation.
+/// Redirect `OPENGROK_HOME` to a tempdir for test isolation.
 fn setup_grok_home_in_tempdir() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir creation");
     unsafe {
-        std::env::set_var("GROK_HOME", tmp.path());
+        std::env::set_var("OPENGROK_HOME", tmp.path());
     }
     tmp
 }

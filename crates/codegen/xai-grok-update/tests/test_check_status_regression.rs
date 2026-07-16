@@ -1,5 +1,5 @@
 //! End-to-end regression tests for `check_update_status` that lock in the
-//! exact JSON shape produced by `grok update --check --json` for the failure
+//! exact JSON shape produced by `open-grok update --check --json` for the failure
 //! modes that real users have hit in the wild.
 //!
 //! Seen when a user is behind a corporate npm registry mirror:

@@ -1,4 +1,4 @@
-//! Headless single-turn mode (`grok -p "prompt"`).
+//! Headless single-turn mode (`open-grok -p "prompt"`).
 //!
 //! Runs the agent in-process via
 //! `spawn_grok_shell`, sends the ACP lifecycle (init → auth → session → prompt),
@@ -507,14 +507,14 @@ fn auto_respond_to_permissions(
 /// "Not signed in" error message, tailored to the session type.
 fn auth_required_message(interactive: bool) -> String {
     if interactive {
-        "Not signed in. Run `grok login` to authenticate \
-         (or `grok login --device-code` if no browser is available)."
+        "Not signed in. Run `open-grok login` to authenticate \
+         (or `open-grok login --device-code` if no browser is available)."
             .to_string()
     } else {
         "Not signed in. To authenticate without a browser, run:\n  \
-         grok login --device-code\n\n\
+         open-grok login --device-code\n\n\
          Alternatively, set the XAI_API_KEY environment variable \
-         or run `grok login` on a machine with a browser."
+         or run `open-grok login` on a machine with a browser."
             .to_string()
     }
 }
@@ -541,11 +541,11 @@ fn selected_codex_auth(
     Some(match xai_grok_shell::codex_auth::load_credentials() {
         Ok(Some(_)) => Ok(false),
         Ok(None) => Err(anyhow::anyhow!(
-            "Not signed in to Codex. Run `grok login --codex --device-auth` for a headless \
+            "Not signed in to Codex. Run `open-grok login --codex --device-auth` for a headless \
              login, or configure an API key on this model."
         )),
         Err(error) => Err(anyhow::anyhow!(
-            "Could not read Codex credentials: {}. Run `grok login --codex --device-auth` to \
+            "Could not read Codex credentials: {}. Run `open-grok login --codex --device-auth` to \
              reconnect.",
             error
         )),
@@ -860,7 +860,7 @@ async fn apply_headless_model_and_effort(
     .map_err(|e| {
         if let Some(name) = model_name {
             anyhow::anyhow!(
-                "Couldn't set model '{}': {}. Run 'grok models' to see available models.",
+                "Couldn't set model '{}': {}. Run 'open-grok models' to see available models.",
                 name,
                 e
             )
@@ -1038,7 +1038,7 @@ pub async fn run_single_turn(
     let codex_auth_override = selected_codex_auth(&agent_config, auth_model);
 
     // No agent-level hub client URL (gateway-only cloud; workspace provider
-    // hub_url lives on `grok workspace` / WorkspaceStartArgs only).
+    // hub_url lives on `open-grok workspace` / WorkspaceStartArgs only).
 
     agent_config.cli_agent_overrides = xai_grok_shell::agent::config::CliAgentOverrides {
         tools: parse_comma_list(options.cli_tools.as_deref()),
@@ -1409,7 +1409,7 @@ pub async fn run_single_turn(
 
     // Handle result
     if track_active {
-        // Non-blocking flock so a slow/network ~/.grok can't hang exit.
+        // Non-blocking flock so a slow/network ~/.opengrok can't hang exit.
         let _ = xai_grok_shell::active_sessions::try_unregister(&session_id);
     }
     cancel.cancel();

@@ -11,7 +11,7 @@ pub struct AcpSessionFs {
     /// being sent to the extension.  This is the defense-in-depth guard for
     /// AB overlay isolation: if a tool accidentally passes the display path
     /// (e.g., `/testbed/project/foo.rs`) instead of the overlay path
-    /// (`~/.grok/worktrees/.../b-overlay/foo.rs`), the adapter rewrites it
+    /// (`~/.opengrok/worktrees/.../b-overlay/foo.rs`), the adapter rewrites it
     /// so the extension reads/writes to the correct overlay location.
     display_cwd: Option<PathBuf>,
 }
@@ -136,21 +136,21 @@ mod tests {
     #[test]
     fn resolve_path_rewrites_display_to_overlay() {
         let result = test_resolve(
-            "/root/.grok/worktrees/proj/ab-123-b-overlay",
+            "/root/.opengrok/worktrees/proj/ab-123-b-overlay",
             Some("/testbed/proj"),
             "/testbed/proj/src/main.rs",
         );
         assert_eq!(
             result,
-            PathBuf::from("/root/.grok/worktrees/proj/ab-123-b-overlay/src/main.rs")
+            PathBuf::from("/root/.opengrok/worktrees/proj/ab-123-b-overlay/src/main.rs")
         );
     }
 
     #[test]
     fn resolve_path_passes_through_overlay_path() {
-        let overlay_path = "/root/.grok/worktrees/proj/ab-123-b-overlay/src/main.rs";
+        let overlay_path = "/root/.opengrok/worktrees/proj/ab-123-b-overlay/src/main.rs";
         let result = test_resolve(
-            "/root/.grok/worktrees/proj/ab-123-b-overlay",
+            "/root/.opengrok/worktrees/proj/ab-123-b-overlay",
             Some("/testbed/proj"),
             overlay_path,
         );
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn resolve_path_no_display_cwd_passthrough() {
         let result = test_resolve(
-            "/root/.grok/worktrees/proj/ab-123-b-overlay",
+            "/root/.opengrok/worktrees/proj/ab-123-b-overlay",
             None,
             "/testbed/proj/src/main.rs",
         );
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn resolve_path_relative_path_passthrough() {
         let result = test_resolve(
-            "/root/.grok/worktrees/proj/ab-123-b-overlay",
+            "/root/.opengrok/worktrees/proj/ab-123-b-overlay",
             Some("/testbed/proj"),
             "src/main.rs",
         );

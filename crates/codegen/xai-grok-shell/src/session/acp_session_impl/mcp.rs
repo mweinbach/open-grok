@@ -689,7 +689,7 @@ impl SessionActor {
     /// (`util::config::disabled_mcp_server_names`). Used by the
     /// auto-restart task to gate on the live configuration each
     /// backoff iteration — the user may have toggled the server off
-    /// or removed it from `~/.grok/config.toml` while we were
+    /// or removed it from `~/.opengrok/config.toml` while we were
     /// sleeping.
     ///
     /// HTTP / HttpAuth entries always return `false` here, which is
@@ -700,8 +700,8 @@ impl SessionActor {
     ///
     /// Performs one synchronous read of the per-cwd disabled-MCP
     /// list (`crate::util::config::disabled_mcp_server_names`,
-    /// which parses `~/.grok/config.toml` + the project
-    /// `.grok/config.toml`) on every call. The auto-restart task
+    /// which parses `~/.opengrok/config.toml` + the project
+    /// `.opengrok/config.toml`) on every call. The auto-restart task
     /// calls this at most:
     ///   - once at schedule time (`maybe_schedule_restart`), and
     ///   - once per backoff iteration (≤3 per restart window).

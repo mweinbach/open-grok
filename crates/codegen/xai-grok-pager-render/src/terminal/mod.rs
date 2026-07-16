@@ -644,7 +644,7 @@ fn detect_terminal_context() -> TerminalContext {
     // per-pane vars don't survive) and over SSH (not forwarded), except
     // brands with SSH-surviving markers (the VS Code family, and iTerm2
     // via LC_TERMINAL). tmux -g global env is stale (reflects the server's
-    // first client, not the current one). Revisit when `grok ssh` can
+    // first client, not the current one). Revisit when `open-grok ssh` can
     // forward env vars.
     let mut ctx = build_terminal_context_from_env(&env);
     ctx.brand = refine_unknown_brand_for_host(ctx.brand, HostOs::current());
@@ -988,7 +988,7 @@ fn terminal_name_from_term_program(value: &str) -> Option<TerminalName> {
 
 /// User-configured alt-screen (fullscreen) mode.
 ///
-/// Parsed from `[terminal] alt_screen` in `~/.grok/pager.toml` and
+/// Parsed from `[terminal] alt_screen` in `~/.opengrok/pager.toml` and
 /// overridden by the `--no-alt-screen` CLI flag.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AltScreenMode {

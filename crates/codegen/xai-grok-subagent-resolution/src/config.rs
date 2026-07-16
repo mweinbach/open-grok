@@ -191,7 +191,7 @@ description = "Research agent"
 default_capability_mode = "read-only"
 model = "grok-3"
 reasoning_effort = "high"
-prompt_file = ".grok/prompts/researcher.md"
+prompt_file = ".opengrok/prompts/researcher.md"
 default_isolation = "worktree"
 "#;
         let role: SubagentRole = toml::from_str(toml_str).unwrap();
@@ -201,7 +201,7 @@ default_isolation = "worktree"
         assert_eq!(role.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(
             role.prompt_file.as_deref(),
-            Some(".grok/prompts/researcher.md")
+            Some(".opengrok/prompts/researcher.md")
         );
         assert_eq!(role.default_isolation.as_deref(), Some("worktree"));
     }
@@ -221,7 +221,7 @@ default_isolation = "worktree"
         let toml_str = r#"
 instructions = "You are a concise writer."
 description = "A concise writing persona."
-instructions_file = ".grok/personas/concise.md"
+instructions_file = ".opengrok/personas/concise.md"
 model = "grok-3-fast"
 reasoning_effort = "low"
 default_isolation = "none"
@@ -245,7 +245,7 @@ description = "Path to write the summary"
         );
         assert_eq!(
             persona.instructions_file.as_deref(),
-            Some(".grok/personas/concise.md")
+            Some(".opengrok/personas/concise.md")
         );
         assert_eq!(persona.model.as_deref(), Some("grok-3-fast"));
         assert_eq!(persona.reasoning_effort.as_deref(), Some("low"));

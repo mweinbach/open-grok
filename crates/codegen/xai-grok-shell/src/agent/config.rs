@@ -334,7 +334,7 @@ impl EndpointsConfig {
     pub fn resolve_trace_upload_url(&self) -> String {
         blank_as_unset(&self.trace_upload_url).unwrap_or_else(|| self.proxy_url())
     }
-    /// Managed deployment-config URL (`grok setup`): explicit `managed_config_url`,
+    /// Managed deployment-config URL (`open-grok setup`): explicit `managed_config_url`,
     /// else `proxy_url` + `/deployment/config`. Never `xai_api_base_url`, so the
     /// deployment key reaches the proxy, not the inference host.
     pub fn resolve_managed_config_url(&self) -> String {
@@ -900,7 +900,7 @@ impl PluginsConfig {
     /// read here: a malicious repo could pre-populate `enabledPlugins` to
     /// bypass the project-plugin auto-disable logic in `populate_plugin_lists`,
     /// enabling attacker-controlled hooks (e.g. SessionStart → RCE).
-    /// Native `.grok/config.toml` entries already present take precedence:
+    /// Native `.opengrok/config.toml` entries already present take precedence:
     /// a name is only added if it isn't already in the opposite list.
     pub fn merge_claude_enabled_plugins(&mut self, _cwd: Option<&std::path::Path>) {
         if crate::claude_import::is_claude_import_marked_with_log("merge_claude_enabled_plugins") {
@@ -1079,7 +1079,7 @@ pub struct RemoteConfig {
 /// `[hub]` section from config.toml.
 ///
 /// Optional default Computer Hub URL for **workspace provider** exposure
-/// (`grok workspace` / leader `with_default_hub_url`). Does **not** enable
+/// (`open-grok workspace` / leader `with_default_hub_url`). Does **not** enable
 /// agent-side harness/client connections or alter local session behavior.
 ///
 /// ```toml
@@ -1090,7 +1090,7 @@ pub struct RemoteConfig {
 #[serde(default)]
 pub struct HubConfig {
     /// Hub WebSocket URL (`ws://` or `wss://`) used as the leader default for
-    /// `grok workspace start` when the CLI does not pass `--hub-url`.
+    /// `open-grok workspace start` when the CLI does not pass `--hub-url`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
@@ -1239,8 +1239,8 @@ pub struct StorageConfig {
 }
 /// `[paths]` configuration: extra directories to scan for skills, rules, etc.
 ///
-/// These supplement the built-in scan locations (`.grok/skills/`,
-/// `.agents/skills/`, `~/.grok/skills/`). They're written by `/import-claude`
+/// These supplement the built-in scan locations (`.opengrok/skills/`,
+/// `.agents/skills/`, `~/.opengrok/skills/`). They're written by `/import-claude`
 /// to preserve previously-discovered Claude directories after the runtime
 /// `.claude/` cutoff (see `[claude_compat] imported`).
 ///
@@ -1287,7 +1287,7 @@ pub struct Config {
     /// `[model.*]` overrides from config.toml. Resolve via `resolve_model_list()`.
     #[serde(skip)]
     pub config_models: IndexMap<String, ConfigModelOverride>,
-    /// Warnings from `[model.*]` parsing; surfaced by `grok inspect`.
+    /// Warnings from `[model.*]` parsing; surfaced by `open-grok inspect`.
     #[serde(skip)]
     pub model_override_warnings: Vec<super::config_model_override_parse::ModelOverrideWarning>,
     pub grok_com_config: GrokComConfig,
@@ -1465,7 +1465,7 @@ pub struct Config {
     #[serde(skip)]
     pub subagent_toggle: std::collections::HashMap<String, bool>,
     /// Per-subagent role definitions from `[subagents.roles]` in config.toml
-    /// and `.grok/roles/*.toml` file discovery.
+    /// and `.opengrok/roles/*.toml` file discovery.
     #[serde(skip)]
     pub subagent_roles:
         std::collections::HashMap<String, xai_grok_subagent_resolution::config::SubagentRole>,
@@ -1621,7 +1621,7 @@ pub use xai_grok_shared::ui_config::{ContextualHints, UiConfig};
 ///
 /// ```toml
 /// [agent]
-/// # Use a named agent (looked up via discovery: .grok/agents/, ~/.grok/agents/, built-ins)
+/// # Use a named agent (looked up via discovery: .opengrok/agents/, ~/.opengrok/agents/, built-ins)
 /// name = "my-custom-agent"
 ///
 /// # OR: path to an agent definition file (.md with YAML frontmatter)
@@ -1644,7 +1644,7 @@ pub struct AgentSelectionConfig {
     pub name: Option<String>,
     /// Path to an agent definition file (.md with YAML frontmatter).
     /// When set, the agent is loaded from this file.
-    /// Supports environment variable expansion (e.g., `$HOME/.grok/agents/my-agent.md`).
+    /// Supports environment variable expansion (e.g., `$HOME/.opengrok/agents/my-agent.md`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition: Option<PathBuf>,
     /// Global system-prompt identity label. Per-model override wins.
@@ -2667,7 +2667,7 @@ impl Config {
         resolve_mcp_push_server_status(None, None, self.features.mcp_push_server_status, None, None)
     }
     /// Resolve whether the leader's `ConfigFileWatcher` adds the two
-    /// narrow non-recursive watches for `<cwd>/` and `<cwd>/.grok/`.
+    /// narrow non-recursive watches for `<cwd>/` and `<cwd>/.opengrok/`.
     ///
     /// Thin delegate to the canonical
     /// [`resolve_mcp_recursive_config_watch`] free function — mirrors
@@ -2949,7 +2949,7 @@ fn error_reporting_enabled_from_toml(root: &toml::Value) -> Option<bool> {
 fn grok_telemetry_env_enabled() -> Option<bool> {
     env_telemetry_mode("GROK_TELEMETRY_ENABLED").map(|m| !m.is_disabled())
 }
-/// Load `~/.grok/requirements.toml` standalone so the admin pin can beat
+/// Load `~/.opengrok/requirements.toml` standalone so the admin pin can beat
 /// env vars. The merged config layer can't express that — last-merge-wins
 /// loses provenance.
 pub(crate) fn read_requirements_toml() -> Option<toml::Value> {
@@ -2999,7 +2999,7 @@ pub(crate) fn external_otel_master_switch_from(
 /// Layering follows `resolve_telemetry_mode`: **requirement > env > config >
 /// remote > default**, where the `[telemetry]` `otel_*` keys from the
 /// effective config (which already includes managed-config layers distributed
-/// by `grok setup`) sit under the env vars, requirements pins are applied on
+/// by `open-grok setup`) sit under the env vars, requirements pins are applied on
 /// top, and the remote layer is restrictive-only + asynchronous
 /// ([`apply_external_otel_remote_policy`]).
 pub fn resolve_external_otel_config(
@@ -4279,17 +4279,17 @@ pub struct Features {
     ///
     /// Practical consequence: setting
     /// `[features] mcp_push_server_status = false` in
-    /// `~/.grok/config.toml` will NOT disable the pager's
+    /// `~/.opengrok/config.toml` will NOT disable the pager's
     /// subscription on a freshly-launched process. To disable the
     /// pager subscription, set `GROK_MCP_PUSH_SERVER_STATUS=0` in
     /// the env before launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_push_server_status: Option<bool>,
     /// Whether the leader's `ConfigFileWatcher` adds the two narrow
-    /// non-recursive watches for `<cwd>/` and `<cwd>/.grok/`.
+    /// non-recursive watches for `<cwd>/` and `<cwd>/.opengrok/`.
     ///
     /// When `true` (default), edits to `<cwd>/.mcp.json`,
-    /// `<cwd>/.grok/config.toml`, or `<cwd>/.claude.json` flow
+    /// `<cwd>/.opengrok/config.toml`, or `<cwd>/.claude.json` flow
     /// through the watcher → reloader → `ConfigUpdate::
     /// ProjectMcpServersChanged { cwd }` → `app.rs` ACP-injection
     /// pipeline and the affected sessions reload their MCP servers

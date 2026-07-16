@@ -236,7 +236,7 @@ pub struct PlanModeExited {
     /// `None` if the plan file did not exist or was empty.
     pub plan_content: Option<String>,
 
-    /// The path where the plan file lives (e.g., `.grok/plan.md`).
+    /// The path where the plan file lives (e.g., `.opengrok/plan.md`).
     pub plan_file_path: String,
 }
 

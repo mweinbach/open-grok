@@ -131,7 +131,7 @@ pub fn clear_orphan() {
 }
 
 /// Best-effort cross-process lock serializing apply/remove of the managed-config
-/// files (TUI tick vs `grok login` vs prefetch). `None` on contention — the
+/// files (TUI tick vs `open-grok login` vs prefetch). `None` on contention — the
 /// caller skips and retries next cycle.
 fn try_lock_managed_config(home: &std::path::Path) -> Option<std::fs::File> {
     use fs2::FileExt;
@@ -149,7 +149,7 @@ fn try_lock_managed_config(home: &std::path::Path) -> Option<std::fs::File> {
 /// Retry budget for a sync, pairing the attempt count with a wall-clock cap.
 #[derive(Clone, Copy)]
 enum SyncBudget {
-    /// Background loop and explicit `grok setup`; runs retries to completion.
+    /// Background loop and explicit `open-grok setup`; runs retries to completion.
     Standard,
     /// Post-login sync; capped because login latency is user-visible.
     Login,
@@ -424,7 +424,7 @@ pub fn is_fetch_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Fetch managed config + requirements and write to `~/.grok/`, trying the
+/// Fetch managed config + requirements and write to `~/.opengrok/`, trying the
 /// deployment key first, then a signed-in team. `Ok(false)` when neither applies.
 pub async fn sync() -> Result<bool, ManagedConfigError> {
     Ok(sync_with_budget(SyncBudget::Standard, None).await?.wrote)
@@ -434,7 +434,7 @@ struct SyncOutcome {
     wrote: bool,
     /// The server returned non-empty config for the consulted principal — true
     /// even when a concurrent writer held the lock and our write was skipped, so
-    /// `grok setup` doesn't misreport a lock skip as "no config".
+    /// `open-grok setup` doesn't misreport a lock skip as "no config".
     served: bool,
     /// Which credential was consulted, so callers word team-vs-deployment
     /// messages by what actually served, not just what's configured.
@@ -529,7 +529,7 @@ enum FetchedConfig {
 
 /// Fetches the configuration for the current principal without touching disk:
 /// the deployment key first, then a signed-in team. The installing sync and the
-/// read-only `grok setup --json` both build on this.
+/// read-only `open-grok setup --json` both build on this.
 async fn fetch_for_principal(
     budget: SyncBudget,
     team_override: Option<GrokAuth>,
@@ -739,7 +739,7 @@ pub enum ManagedConfigSync {
     Failed,
 }
 
-/// Post-login hook for `grok login` and the ACP/TUI authenticate flow: clear any
+/// Post-login hook for `open-grok login` and the ACP/TUI authenticate flow: clear any
 /// orphaned files, then fetch the new principal's config immediately rather than
 /// waiting for the background tick. `authenticated` pins the just-logged-in
 /// principal (`None` = on-disk team). Latency-bounded by [`SyncBudget::Login`];
@@ -789,7 +789,7 @@ pub async fn post_login_sync(authenticated: Option<GrokAuth>) -> ManagedConfigSy
     }
 }
 
-/// Whether a credential exists that `grok setup` could install config for.
+/// Whether a credential exists that `open-grok setup` could install config for.
 pub fn has_principal() -> bool {
     resolve_deployment_key().is_some() || read_active_team_auth().is_some()
 }
@@ -899,10 +899,10 @@ network access: reconnect and start again. If you can't reconnect, contact your 
 /// policy can't be established gets no unmanaged session. With no signing key it reads the user-writable
 /// marker (a local user can disarm it by editing one field); non-forgeable enforcement is the trust-rooted
 /// layers (root-owned path, MDM, signed cache). No client env disables it; recovery stays open (reconnect /
-/// `grok setup`); ceasing to serve `fail_closed` rolls back.
+/// `open-grok setup`); ceasing to serve `fail_closed` rolls back.
 pub fn managed_policy_gate() -> Result<(), String> {
     // Skip under the lib unit-test build only: `bootstrap` reaches this without a staged
-    // `GROK_HOME` and would flake on the dev machine's real marker/auth. The pure decision
+    // `OPENGROK_HOME` and would flake on the dev machine's real marker/auth. The pure decision
     // is unit-tested; the integration tests (no `cfg(test)`) exercise this real path.
     if cfg!(test) {
         return Ok(());
@@ -926,7 +926,7 @@ pub fn managed_policy_gate() -> Result<(), String> {
 /// Detector + delete run under the managed-config lock (no rebind to B between them);
 /// contention skips — the holder owns the transition, like [`clear_orphan`].
 /// Residual: forging A→B→A offline sheds A's policy until its next online fetch — the same
-/// self-healing class as deleting the user-writable files outright; /etc/grok and MDM are unaffected.
+/// self-healing class as deleting the user-writable files outright; /etc/opengrok and MDM are unaffected.
 fn purge_prior_tenant_on_identity_change() {
     let crate::config::ServingIdentity::Team(team_id) = current_serving_identity_any_expiry()
     else {
@@ -953,11 +953,11 @@ fn managed_policy_gate_decision(
     Ok(())
 }
 
-/// Outcome of the `grok setup` sync. The caller renders it — CLI presentation
+/// Outcome of the `open-grok setup` sync. The caller renders it — CLI presentation
 /// and exit codes stay out of the library.
 #[derive(Debug)]
 pub enum SetupOutcome {
-    /// Config was written to `~/.grok`.
+    /// Config was written to `~/.opengrok`.
     Installed,
     /// The principal is valid but the server has no config for it.
     NothingConfigured,
@@ -965,9 +965,9 @@ pub enum SetupOutcome {
     Failed(ManagedConfigError),
 }
 
-/// Result of `grok setup --json`: what the server serves for the current
+/// Result of `open-grok setup --json`: what the server serves for the current
 /// principal, verbatim. `managed_config` may embed the enforced deployment key,
-/// exactly as `grok setup` would write it to disk.
+/// exactly as `open-grok setup` would write it to disk.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupReport {
@@ -978,13 +978,13 @@ pub struct SetupReport {
     pub configured: bool,
     pub deployment_id: Option<String>,
     pub team_id: Option<String>,
-    /// TOML documents exactly as `grok setup` would install them.
+    /// TOML documents exactly as `open-grok setup` would install them.
     pub managed_config: Option<String>,
     pub requirements: Option<String>,
     pub fail_closed: bool,
 }
 
-/// Fetches the report behind `grok setup --json` without writing anything:
+/// Fetches the report behind `open-grok setup --json` without writing anything:
 /// no artifacts, no signature sidecar, no sync marker.
 pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
     let (source, body) = match fetch_for_principal(SyncBudget::Standard, None).await? {
@@ -992,7 +992,7 @@ pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
         FetchedConfig::Team { body, .. } => (Some("teamOauth"), body),
         FetchedConfig::NoPrincipal => (None, ManagedConfigResponse::default()),
     };
-    // Match the installer's trust decision: a payload `grok setup` would refuse
+    // Match the installer's trust decision: a payload `open-grok setup` would refuse
     // is reported as an error, not printed as installable config.
     if source.is_some()
         && xai_grok_config::signed_policy::verification_active()
@@ -1012,7 +1012,7 @@ pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
     })
 }
 
-/// Run the `grok setup` sync for the current principal. The caller must check
+/// Run the `open-grok setup` sync for the current principal. The caller must check
 /// [`has_principal`] first and render the no-principal guidance.
 pub async fn run_setup() -> SetupOutcome {
     match sync_with_budget(SyncBudget::Standard, None).await {

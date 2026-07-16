@@ -17,8 +17,8 @@ Ask the user the following questions **one at a time as regular conversation que
 
 1. **Skill name** - ask the user to type a name. Lowercase letters (a-z), digits (0-9), and hyphens (-) only. Must start and end with a letter or digit. Must be 2-64 characters long (e.g. `deploy-k8s`). Validate the name before proceeding.
 2. **Scope** - present the user with two options:
-   - **Project** (Recommended): `<repo-root>/.grok/skills/<name>/SKILL.md` - available only in this repo, shareable with teammates
-   - **User**: `~/.grok/skills/<name>/SKILL.md` - available in all projects
+   - **Project** (Recommended): `<repo-root>/.opengrok/skills/<name>/SKILL.md` - available only in this repo, shareable with teammates
+   - **User**: `~/.opengrok/skills/<name>/SKILL.md` - available in all projects
    - Default to **Project** if inside a git repo, otherwise **User**.
 3. **What it should do** - ask the user to describe the workflow, paste an example prompt they keep repeating, or explain the task the skill should automate.
 
@@ -40,8 +40,8 @@ mkdir -p <SKILL_DIR>
 ```
 
 Where `<SKILL_DIR>` is:
-- User scope: `~/.grok/skills/<name>`
-- Project scope: `<repo-root>/.grok/skills/<name>`
+- User scope: `~/.opengrok/skills/<name>`
+- Project scope: `<repo-root>/.opengrok/skills/<name>`
 
 If the skill needs helper scripts, also create `<SKILL_DIR>/scripts/`.
 If the skill needs reference docs, also create `<SKILL_DIR>/references/`.

@@ -39,10 +39,10 @@ async fn campaign_leader_mode_remote_dismiss_on_model_pick() {
     }));
 
     // Seed config.toml with the user's own default model; a fixed leader
-    // socket under the shared GROK_HOME so every spawn elects/attaches to the
+    // socket under the shared OPENGROK_HOME so every spawn elects/attaches to the
     // same leader (mirrors `LeaderCluster`).
-    let grok_home = content.home().join(".grok");
-    std::fs::create_dir_all(&grok_home).expect("create GROK_HOME");
+    let grok_home = content.home().join(".opengrok");
+    std::fs::create_dir_all(&grok_home).expect("create OPENGROK_HOME");
     std::fs::write(
         grok_home.join("config.toml"),
         format!("[models]\ndefault = \"{CONFIG_MODEL}\"\n"),

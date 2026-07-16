@@ -57,7 +57,7 @@ pub async fn spawn_grok_shell(
 
     // Run the full bootstrap sequence: config resolution, process-level
     // singletons (including `extract_bundled_files` which writes compiled-in
-    // skills to ~/.grok/skills/), and model catalog construction.
+    // skills to ~/.opengrok/skills/), and model catalog construction.
     let (agent_config, models_manager) =
         xai_grok_shell::agent::init::bootstrap(&agent_config, &auth_manager, None)
             .map_err(|e| anyhow::anyhow!(e))?;

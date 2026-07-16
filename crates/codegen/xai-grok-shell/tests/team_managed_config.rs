@@ -3,7 +3,7 @@
 //! the cli-chat-proxy deployment-config route.
 //!
 //! Every test here MUST be `#[serial]`: they share one process-global
-//! `GROK_HOME` (the `grok_home` `OnceLock` allows a single value per process)
+//! `OPENGROK_HOME` (the `grok_home` `OnceLock` allows a single value per process)
 //! and mutate that directory + process env, so concurrent tests would race.
 
 use std::io::{BufRead, BufReader, Write};
@@ -20,7 +20,7 @@ fn team_identity(id: &str) -> ServingIdentity {
     ServingIdentity::Team(id.to_owned())
 }
 
-/// Shared temp dir used as GROK_HOME for the whole test binary (the grok_home
+/// Shared temp dir used as OPENGROK_HOME for the whole test binary (the grok_home
 /// `OnceLock` only allows one value per process). Also scrubs/installs the env
 /// this suite depends on, before any test thread reads it.
 fn test_home() -> &'static PathBuf {
@@ -29,7 +29,7 @@ fn test_home() -> &'static PathBuf {
         let path = tempfile::TempDir::new().unwrap().keep();
         // SAFETY: set once at init before other threads read the vars.
         unsafe {
-            std::env::set_var("GROK_HOME", &path);
+            std::env::set_var("OPENGROK_HOME", &path);
             // Ambient env must not shadow the scenarios under test: a real
             // deployment key, a managed-config opt-out, or a proxy that would
             // intercept the 127.0.0.1 mocks.
@@ -1394,7 +1394,7 @@ async fn lock_contention_does_not_fall_through_to_team() {
     assert_eq!(*count.lock().unwrap(), 1);
 }
 
-/// `grok setup` with config served but the lock held by another writer reports
+/// `open-grok setup` with config served but the lock held by another writer reports
 /// Installed (the holder is persisting it), not NothingConfigured.
 #[tokio::test]
 #[serial]

@@ -1945,7 +1945,7 @@ pub(crate) async fn handle_subagent_request(
     let mut worktree_removed = false;
     if let Some(ref wt_path) = worktree_path {
         if snapshot_dispose_enabled {
-            let ref_name = format!("refs/grok/subagents/{}", request.id);
+            let ref_name = format!("refs/open-grok/subagents/{}", request.id);
             let source_repo = resolve_subagent_source_repo(&ctx);
             match crate::session::worktree::snapshot_subagent_worktree(
                     wt_path,

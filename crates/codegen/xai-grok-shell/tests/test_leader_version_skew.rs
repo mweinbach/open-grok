@@ -58,7 +58,7 @@ async fn wait_for_pid_death(pid: u32, timeout: Duration) -> bool {
 }
 
 fn sandbox_unified_log(home: &Path) -> String {
-    std::fs::read_to_string(home.join(".grok").join("logs").join("unified.jsonl"))
+    std::fs::read_to_string(home.join(".opengrok").join("logs").join("unified.jsonl"))
         .unwrap_or_default()
 }
 
@@ -76,7 +76,7 @@ async fn new_client_evicts_old_leader_and_sessions_reload() {
             let server = MockInferenceServer::start().await.unwrap();
             let workdir = git_workdir();
             let home = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+            std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
 
             // Old binary elects the leader and completes a turn.
             let old_client = LeaderStdioClient::spawn_with_binary(
@@ -163,7 +163,7 @@ async fn old_client_adopts_new_leader_and_still_functions() {
             let server = MockInferenceServer::start().await.unwrap();
             let workdir = git_workdir();
             let home = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+            std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
 
             // NEW binary elects the leader first.
             let new_client = LeaderStdioClient::spawn_with_binary(
@@ -221,7 +221,7 @@ async fn old_client_adopts_new_leader_and_still_functions() {
         .await;
 }
 
-/// `grok update`'s relaunch signal against a REAL old leader: connect,
+/// `open-grok update`'s relaunch signal against a REAL old leader: connect,
 /// require `relaunch_v1`, send `RelaunchForUpdate`, and the leader exits so
 /// the surviving client re-elects. Mirrors the private
 /// `signal_leaders_to_relaunch` in `xai-grok-pager-bin/src/main.rs` (which is
@@ -237,7 +237,7 @@ async fn relaunch_for_update_drives_real_old_leader_to_exit() {
             let server = MockInferenceServer::start().await.unwrap();
             let workdir = git_workdir();
             let home = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+            std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
 
             let old_client = LeaderStdioClient::spawn_with_binary(
                 &old_bin,
@@ -259,7 +259,7 @@ async fn relaunch_for_update_drives_real_old_leader_to_exit() {
 
             // The update-signal body, against the sandboxed socket.
             let control = LeaderClient::connect(
-                home.path().join(".grok").join("leader.sock"),
+                home.path().join(".opengrok").join("leader.sock"),
                 "grok-pager-update",
                 ClientMode::Stdio,
                 ClientCapabilities::default(),
@@ -331,7 +331,7 @@ async fn eviction_leaves_single_leader_and_single_auth_owner() {
             let server = MockInferenceServer::start().await.unwrap();
             let workdir = git_workdir();
             let home = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+            std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
 
             let old_client = LeaderStdioClient::spawn_with_binary(
                 &old_bin,
@@ -345,7 +345,7 @@ async fn eviction_leaves_single_leader_and_single_auth_owner() {
                 .await
                 .expect("no live old leader");
 
-            let auth_path = home.path().join(".grok").join("auth.json");
+            let auth_path = home.path().join(".opengrok").join("auth.json");
             let auth_before = std::fs::metadata(&auth_path)
                 .ok()
                 .and_then(|m| m.modified().ok());

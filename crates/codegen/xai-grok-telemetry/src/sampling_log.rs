@@ -1,4 +1,4 @@
-//! Tracing layer for `target: "sampling_log"` → `~/.grok/logs/sampling.jsonl`.
+//! Tracing layer for `target: "sampling_log"` → `~/.opengrok/logs/sampling.jsonl`.
 //! Enable with `--log-sampling` or `GROK_LOG_SAMPLING=1`.
 
 use std::sync::Mutex;

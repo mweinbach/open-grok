@@ -31,7 +31,7 @@ In addition to AGENTS.md files, Grok scans for `*.md` files in rules directories
 
 | Location | Notes |
 |----------|-------|
-| `<dir>/.grok/rules/` | Always scanned |
+| `<dir>/.opengrok/rules/` | Always scanned |
 | `<dir>/.claude/rules/` | Claude compatibility (configurable) |
 | `<dir>/.cursor/rules/` | Cursor compatibility (configurable) |
 
@@ -43,7 +43,7 @@ Grok scans the Claude and Cursor rules directories by default. To disable scanni
 
 Grok scans for project rules in this order:
 
-1. **Global rules**: `~/.grok/` (applies to all projects)
+1. **Global rules**: `~/.opengrok/` (applies to all projects)
 2. **Repo rules**: If inside a git repo, every directory from the repo root down to the current working directory (inclusive)
 3. **CWD-only**: If not inside a git repo, only the current working directory
 
@@ -155,7 +155,7 @@ my-monorepo/
 To add rules for a single session without editing files, pass `--rules` (alias `--append-system-prompt`):
 
 ```bash
-grok --rules "Always use TypeScript. Prefer functional components."
+open-grok --rules "Always use TypeScript. Prefer functional components."
 ```
 
 Grok appends this text to the session's system prompt. Use it for session-specific customization.
@@ -179,22 +179,22 @@ Files ignored by `.gitignore` are skipped during discovery. To keep personal ove
 CLAUDE.local.md
 ```
 
-As top-level instruction files, Grok discovers only the recognized filenames listed under [Supported File Names](#supported-file-names) — not custom names such as `AGENTS.local.md` or `notes.md`. (Inside a rules directory such as `.grok/rules/`, every `*.md` file is loaded regardless of name.)
+As top-level instruction files, Grok discovers only the recognized filenames listed under [Supported File Names](#supported-file-names) — not custom names such as `AGENTS.local.md` or `notes.md`. (Inside a rules directory such as `.opengrok/rules/`, every `*.md` file is loaded regardless of name.)
 
 ---
 
-## The .grok/ Project Directory
+## The .opengrok/ Project Directory
 
-Beyond AGENTS.md files, the `.grok/` directory in your project root can contain additional project-level configuration:
+Beyond AGENTS.md files, the `.opengrok/` directory in your project root can contain additional project-level configuration:
 
 | Path | Purpose |
 |------|---------|
-| `.grok/config.toml` | Project-scoped MCP servers, plugins, and permission rules (other settings load only from `~/.grok/config.toml`) |
-| `.grok/skills/` | Project-scoped skill definitions |
-| `.grok/plugins/` | Project-scoped plugins |
-| `.grok/agents/` | Project-scoped agent definitions |
-| `.grok/hooks/` | Project-scoped lifecycle hooks |
-| `.grok/lsp.json` | LSP server configuration |
+| `.opengrok/config.toml` | Project-scoped MCP servers, plugins, and permission rules (other settings load only from `~/.opengrok/config.toml`) |
+| `.opengrok/skills/` | Project-scoped skill definitions |
+| `.opengrok/plugins/` | Project-scoped plugins |
+| `.opengrok/agents/` | Project-scoped agent definitions |
+| `.opengrok/hooks/` | Project-scoped lifecycle hooks |
+| `.opengrok/lsp.json` | LSP server configuration |
 
 These are all optional. See the respective guides for details on each.
 
@@ -202,10 +202,10 @@ These are all optional. See the respective guides for details on each.
 
 ## Inspecting Loaded Rules
 
-Use `grok inspect` to see all loaded project instructions:
+Use `open-grok inspect` to see all loaded project instructions:
 
 ```bash
-grok inspect
+open-grok inspect
 ```
 
 This shows each project instruction file it finds, with its path and approximate token count. Use it to confirm Grok picks up your rules.
@@ -222,7 +222,7 @@ This shows each project instruction file it finds, with its path and approximate
 
 4. **Use subdirectory scoping for large repos.** Different parts of a monorepo may have different conventions. Use per-directory AGENTS.md to scope rules appropriately.
 
-5. **Version control your rules.** Commit AGENTS.md to the repository so the whole team benefits. User-specific overrides belong in `~/.grok/` (global rules).
+5. **Version control your rules.** Commit AGENTS.md to the repository so the whole team benefits. User-specific overrides belong in `~/.opengrok/` (global rules).
 
 6. **Do not duplicate documentation.** AGENTS.md should contain actionable instructions, not a copy of your project's README. Link to external docs if needed.
 

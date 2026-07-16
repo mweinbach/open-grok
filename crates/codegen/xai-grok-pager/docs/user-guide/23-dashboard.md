@@ -12,11 +12,11 @@ which already shows when work is in flight.
 
 Three entry points, all opening the same view:
 
-- **`grok dashboard`** — launches the TUI directly into the dashboard.
+- **`open-grok dashboard`** — launches the TUI directly into the dashboard.
 - **`/dashboard`** (aliases **`/agents-dashboard`**, **`/sessions`**) — open
   from inside an active session.
 - **Ctrl+\\** — same as the slash command, two keystrokes. Configurable
-  in `~/.grok/config.toml` under `[keybindings]` like every other shortcut.
+  in `~/.opengrok/config.toml` under `[keybindings]` like every other shortcut.
 
 ---
 
@@ -145,7 +145,7 @@ guide here is intentionally short and cross-references the plan as
 the source of truth.
 
 All shortcuts are registered under `When::DashboardFocused` and can be
-rebound via `~/.grok/config.toml`.
+rebound via `~/.opengrok/config.toml`.
 
 ---
 
@@ -323,7 +323,7 @@ The query supports the same prefixes as before (they are only honoured
 ## Persistence
 
 Per-user dashboard preferences live under `[dashboard]` in
-`~/.grok/config.toml`:
+`~/.opengrok/config.toml`:
 
 ```toml
 [dashboard]
@@ -346,6 +346,6 @@ friendly toast.
 ## Phase 4 (out of scope for v1)
 
 The current dashboard lists only agents owned by **this** pager
-process. The plan's Phase 4 ("supervisor / `grok --bg`") would list
+process. The plan's Phase 4 ("supervisor / `open-grok --bg`") would list
 sessions that survive pager exit — that's a separate roadmap and not
 shipped yet.

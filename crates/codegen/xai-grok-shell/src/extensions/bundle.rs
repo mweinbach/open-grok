@@ -730,15 +730,15 @@ mod tests {
         let root = bundle::bundled_root();
         bundle::write_bundle_to_cache(&root, &sample_bundle()).unwrap();
         let project_root = tmp.path().join("workspace");
-        std::fs::create_dir_all(project_root.join(".grok/personas")).unwrap();
-        std::fs::create_dir_all(project_root.join(".grok/roles")).unwrap();
+        std::fs::create_dir_all(project_root.join(".opengrok/personas")).unwrap();
+        std::fs::create_dir_all(project_root.join(".opengrok/roles")).unwrap();
         std::fs::write(
-            project_root.join(".grok/personas/researcher.toml"),
+            project_root.join(".opengrok/personas/researcher.toml"),
             "instructions = \"project persona\"\n",
         )
         .unwrap();
         std::fs::write(
-            project_root.join(".grok/roles/reviewer.toml"),
+            project_root.join(".opengrok/roles/reviewer.toml"),
             "description = \"project role\"\n",
         )
         .unwrap();

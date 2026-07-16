@@ -886,7 +886,7 @@ mod tests {
 
     /// CROSS-CRATE REGRESSION GUARD:
     ///
-    /// Enterprise/BYOK configs (e.g. an enterprise `~/.grok/config.toml` with a
+    /// Enterprise/BYOK configs (e.g. an enterprise `~/.opengrok/config.toml` with a
     /// `[model.*]` table containing `env_key = "ANTHROPIC_AUTH_TOKEN"`) MUST
     /// NOT send the user to the login screen at startup.
     ///

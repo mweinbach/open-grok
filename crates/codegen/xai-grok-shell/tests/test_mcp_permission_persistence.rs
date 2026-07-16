@@ -21,7 +21,7 @@ use xai_grok_workspace::permission::{
     spawn_permission_manager, spawn_permission_manager_with_hub,
 };
 
-/// Shared `GROK_HOME` for the entire test binary. The `OnceLock` in
+/// Shared `OPENGROK_HOME` for the entire test binary. The `OnceLock` in
 /// `xai-grok-config` only allows one value per process, so all tests share
 /// this temp directory and `#[serial]` keeps them from clobbering each
 /// other's state files.
@@ -31,7 +31,7 @@ fn test_home() -> &'static PathBuf {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.keep();
         // SAFETY: called once at init before other threads touch this var.
-        unsafe { std::env::set_var("GROK_HOME", &path) };
+        unsafe { std::env::set_var("OPENGROK_HOME", &path) };
         path
     })
 }

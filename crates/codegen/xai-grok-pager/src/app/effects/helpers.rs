@@ -1374,7 +1374,7 @@ pub(super) fn parse_auto_topup_response(
         Err(_) => AutoTopupFetch::Unchanged,
     }
 }
-/// A blocking flock on the shared, possibly-network `~/.grok` lock must never
+/// A blocking flock on the shared, possibly-network `~/.opengrok` lock must never
 /// stall the event-loop thread (and would hang exit on `/quit`); the registry
 /// is best-effort, so skip on contention.
 pub(super) fn unregister_active_session_best_effort(session_id: &acp::SessionId) {

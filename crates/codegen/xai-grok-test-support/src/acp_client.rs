@@ -20,7 +20,7 @@ use crate::headless::stderr_tail;
 use crate::mock_server::MockInferenceServer;
 use crate::process::spawn_piped_with_stderr_capture;
 
-/// Spawn `grok agent stdio` with the canonical hermetic test env: the sandbox
+/// Spawn `open-grok agent stdio` with the canonical hermetic test env: the sandbox
 /// from [`test_env_cmd_tokio`] plus the debug-logging kill-list, so the
 /// hermeticity setup exists exactly once for the typed ([`GrokStdioClient`])
 /// and raw ([`RawStdioClient`]) harnesses. `leading_args` go before the
@@ -107,7 +107,7 @@ impl acp::Client for TestAcpClient {
     }
 }
 
-/// Drives `grok agent stdio` via the ACP protocol over pipes.
+/// Drives `open-grok agent stdio` via the ACP protocol over pipes.
 ///
 /// Handles the full lifecycle: spawn → initialize → authenticate → session → prompt.
 /// Child process is killed on drop.
@@ -396,7 +396,7 @@ impl GrokStdioClient {
     }
 }
 
-/// Drives `grok agent stdio` with verbatim newline-delimited JSON-RPC lines.
+/// Drives `open-grok agent stdio` with verbatim newline-delimited JSON-RPC lines.
 ///
 /// Exists for wire shapes the typed [`GrokStdioClient`] (`ClientSideConnection`,
 /// integer ids) can never produce — e.g. Xcode's Swift/Foundation `JSONEncoder`

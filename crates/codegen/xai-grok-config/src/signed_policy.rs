@@ -362,7 +362,7 @@ pub enum SignedVerdict {
     /// marker path (a first keyed launch over a pre-signing cache also refuses until
     /// one online refetch writes it — deliberate). Residual: wiping the marker with
     /// the sidecar — inherent to user-writable state, covered by the root-owned
-    /// /etc/grok and MDM layers. Otherwise the marker decides.
+    /// /etc/opengrok and MDM layers. Otherwise the marker decides.
     NoAuthenticSidecar,
     /// The sidecar exists but a transient IO error (EACCES-style, never plain absence
     /// or a squatting non-file) blocked the read. Not tamper evidence: the gate falls

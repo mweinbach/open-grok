@@ -2,7 +2,7 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Raw-string route e2e — the original field regression (`grok wrap "mycli ssh
+/// Raw-string route e2e — the original field regression (`open-grok wrap "mycli ssh
 /// host"`): ONE argv element containing spaces must be handed to `$SHELL -i -c`
 /// for word-splitting instead of being spawned as a program literally named
 /// `echo wrap-e2e one two`. `SHELL` is pinned to `/bin/sh` for determinism.

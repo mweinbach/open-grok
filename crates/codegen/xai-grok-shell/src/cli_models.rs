@@ -1,4 +1,4 @@
-//! Data APIs for `grok models`. Clients own display.
+//! Data APIs for `open-grok models`. Clients own display.
 
 use agent_client_protocol as acp;
 use anyhow::Result;
@@ -6,7 +6,7 @@ use xai_acp_lib::{AcpAgentTx, acp_send};
 
 use crate::agent::config::Config as AgentConfig;
 
-/// Status for the `grok models` banner (display order ≠ sampling priority; see [`AuthStatus::resolve`]).
+/// Status for the `open-grok models` banner (display order ≠ sampling priority; see [`AuthStatus::resolve`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthStatus {
     ApiKey,
@@ -100,7 +100,7 @@ mod tests {
 
     /// Isolate process-global auth sources that `AuthStatus::resolve` consults.
     ///
-    /// Uses `GROK_AUTH_PATH` (not `GROK_HOME`) so a OnceLock-cached real home
+    /// Uses `OPENGROK_AUTH_PATH` (not `OPENGROK_HOME`) so a OnceLock-cached real home
     /// with `auth.json` cannot leak into these tests.
     fn isolate_auth_sources() -> (tempfile::TempDir, [EnvGuard; 7]) {
         let dir = tempfile::tempdir().unwrap();
@@ -108,8 +108,8 @@ mod tests {
         let guards = [
             EnvGuard::unset(XAI_API_KEY_ENV_VAR),
             EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR),
-            EnvGuard::unset("GROK_AUTH"),
-            EnvGuard::set("GROK_AUTH_PATH", auth_path.to_str().unwrap()),
+            EnvGuard::unset("OPENGROK_AUTH"),
+            EnvGuard::set("OPENGROK_AUTH_PATH", auth_path.to_str().unwrap()),
             EnvGuard::unset("GROK_DEPLOYMENT_KEY"),
             EnvGuard::unset("GROK_WS_ORIGIN"),
             EnvGuard::unset("GROK_DISABLE_API_KEY_AUTH"),
@@ -161,7 +161,7 @@ mod tests {
             ..GrokAuth::test_default()
         };
         let json = serde_json::to_string(&token).unwrap();
-        let _auth = EnvGuard::set("GROK_AUTH", &json);
+        let _auth = EnvGuard::set("OPENGROK_AUTH", &json);
 
         assert_eq!(
             AuthStatus::resolve(&Config::default()),
@@ -253,7 +253,7 @@ mod tests {
             ..GrokAuth::test_default()
         };
         let json = serde_json::to_string(&token).unwrap();
-        let _auth = EnvGuard::set("GROK_AUTH", &json);
+        let _auth = EnvGuard::set("OPENGROK_AUTH", &json);
 
         let dm = crate::models::default_model();
         let cfg = config_from_toml(&byok_and_deployment_toml(dm));

@@ -37,7 +37,7 @@ pub(crate) fn trusted_native(
 /// Normally this requires the detected terminal brand to natively apply OSC 52
 /// to the system pasteboard (fail closed). Two overrides widen the brand gate:
 ///
-/// - `osc52_sink`: when `grok wrap` is capturing this process's output (see
+/// - `osc52_sink`: when `open-grok wrap` is capturing this process's output (see
 ///   [`super::osc52_sink_active`]) the escape sequence is intercepted upstream
 ///   and copied to the *local* clipboard regardless of the (often misdetected,
 ///   e.g. over SSH) inner terminal brand, so the copy is trusted.
@@ -551,7 +551,7 @@ mod tests {
         );
     }
 
-    // `grok wrap` sink: a brand that does NOT natively support OSC 52 (the
+    // `open-grok wrap` sink: a brand that does NOT natively support OSC 52 (the
     // common SSH case where the inner terminal is misdetected as Vte/Unknown)
     // is still trusted when an upstream OSC 52 sink is capturing our output.
     #[test]
@@ -666,7 +666,7 @@ mod tests {
     }
 
     // Unknown brand over SSH (not container) keeps failing closed — the
-    // container override is deliberately narrow; `grok wrap` is the SSH path.
+    // container override is deliberately narrow; `open-grok wrap` is the SSH path.
     #[test]
     fn ssh_unknown_brand_osc_only_still_fails() {
         let l = legs(true, false, false, false, true, "");

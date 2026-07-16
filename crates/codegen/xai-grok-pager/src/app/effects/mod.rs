@@ -4237,9 +4237,7 @@ fn format_session_info(
         .filter(|id| !id.is_empty())
         .map(|id| format!("\n  Conversation ID: {id}"))
         .unwrap_or_default();
-    let version_display = xai_grok_version::display_version(
-        xai_grok_update::channel_label(),
-    );
+    let version_display = xai_grok_version::display_version("");
     format!(
         "{title_line}  Shell version: {version_display}\n  Session ID: {session_id}{conversation_line}\n  Working directory: {cwd}\n  Model: {model_display}{model_hash_line}{backend_line}{sandbox_line}{turn_line}\n  Context: {used} / {total} tokens ({pct}%)"
     )

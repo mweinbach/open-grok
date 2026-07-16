@@ -4,7 +4,7 @@ use crate::common::*;
 
 /// Sticky screen mode: an explicit `--minimal` persists
 /// `[ui] screen_mode = "minimal"` to the isolated `config.toml`, and a later
-/// plain launch (no flag) in the same GROK_HOME reopens in minimal mode. The
+/// plain launch (no flag) in the same OPENGROK_HOME reopens in minimal mode. The
 /// fullscreen direction of the sticky write is covered by
 /// `minimal_slash_switches_to_fullscreen`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23,7 +23,7 @@ async fn minimal_sticky_screen_mode_persists() {
 
     // The startup persist is fire-and-forget; poll the isolated config.toml
     // (pumping the PTY so the pager never blocks on a full buffer).
-    let config_path = content.home().join(".grok").join("config.toml");
+    let config_path = content.home().join(".opengrok").join("config.toml");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let body = std::fs::read_to_string(&config_path).unwrap_or_default();

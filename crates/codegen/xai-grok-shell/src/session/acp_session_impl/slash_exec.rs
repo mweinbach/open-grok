@@ -138,12 +138,12 @@ impl SessionActor {
             BuiltinAction::HooksAdd { path } => {
                 if path.is_empty() {
                     self.send_slash_command_output(
-                        "Usage: /hooks add <path>\nProvide a path to a hook JSON file or directory under ~/.grok/.",
+                        "Usage: /hooks add <path>\nProvide a path to a hook JSON file or directory under ~/.opengrok/.",
                     )
                     .await;
                 } else {
                     // CWE-427: Use shared add_hooks_path() which validates
-                    // paths are under ~/.grok/ to prevent hook path injection.
+                    // paths are under ~/.opengrok/ to prevent hook path injection.
                     match crate::config::add_hooks_path(&path) {
                         Ok(()) => {
                             xai_grok_telemetry::session_ctx::log_event(

@@ -13,7 +13,7 @@ const T2: &str = "CLUSTER_SENTINEL_T2";
 /// `leader_two_clients_shared_session` PTY case.
 #[test]
 #[ignore = "leader-cluster: needs single-process isolation (process-global env + grok_home OnceLock in the shared lib test binary); run: cargo test -p xai-grok-pager --lib -- app::leader_cluster --ignored --test-threads=1"]
-#[serial_test::serial(GROK_HOME)]
+#[serial_test::serial(OPENGROK_HOME)]
 fn two_clients_share_session_and_stream_both_ways() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -75,7 +75,7 @@ fn two_clients_share_session_and_stream_both_ways() {
 /// (it never duplicates into the already-attached clients).
 #[test]
 #[ignore = "leader-cluster: needs single-process isolation (process-global env + grok_home OnceLock in the shared lib test binary); run: cargo test -p xai-grok-pager --lib -- app::leader_cluster --ignored --test-threads=1"]
-#[serial_test::serial(GROK_HOME)]
+#[serial_test::serial(OPENGROK_HOME)]
 fn n_client_fan_out_without_replay_duplication() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -155,7 +155,7 @@ fn n_client_fan_out_without_replay_duplication() {
 /// `leader_reattach_completion_roundtrips_durable_log`.
 #[test]
 #[ignore = "leader-cluster: needs single-process isolation (process-global env + grok_home OnceLock in the shared lib test binary); run: cargo test -p xai-grok-pager --lib -- app::leader_cluster --ignored --test-threads=1"]
-#[serial_test::serial(GROK_HOME)]
+#[serial_test::serial(OPENGROK_HOME)]
 fn reattach_completion_roundtrips_durable_log() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -235,7 +235,7 @@ fn reattach_completion_roundtrips_durable_log() {
 /// derivation is replicated inline).
 #[test]
 #[ignore = "leader-cluster: needs single-process isolation (process-global env + grok_home OnceLock in the shared lib test binary); run: cargo test -p xai-grok-pager --lib -- app::leader_cluster --ignored --test-threads=1"]
-#[serial_test::serial(GROK_HOME)]
+#[serial_test::serial(OPENGROK_HOME)]
 fn leader_kill_reconnect_reloads_without_duplicating_history() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -3,7 +3,7 @@
 //! Shown when the user runs `/import-claude` (in-session) or presses `i` on
 //! the welcome screen with new Claude settings detected. Users review each
 //! discovered item, toggle which to import, and confirm. Only checked items
-//! are written to `.grok/config.toml`.
+//! are written to `.opengrok/config.toml`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -714,7 +714,7 @@ fn build_rows(
     if !plan.global_items.is_empty() {
         let scope_start = flat_index;
         let scope_key = format!("scope:{:?}", Scope::Global);
-        let label = "Global  ~/.grok/config.toml".to_string();
+        let label = "Global  ~/.opengrok/config.toml".to_string();
         // Placeholder header; flat_indices filled after children are pushed.
         let scope_header_pos = rows.len();
         rows.push(Row::ScopeHeader {
@@ -741,7 +741,7 @@ fn build_rows(
     if !plan.project_items.is_empty() {
         let scope_start = flat_index;
         let scope_key = format!("scope:{:?}", Scope::Project);
-        let project_config = find_project_root(cwd).join(".grok").join("config.toml");
+        let project_config = find_project_root(cwd).join(".opengrok").join("config.toml");
         let label = format!("Project  {}", project_config.display());
         let scope_header_pos = rows.len();
         rows.push(Row::ScopeHeader {

@@ -42,7 +42,7 @@ const BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Configuration for bootstrap resource limits.
 ///
 /// Phase 1-3 use hardcoded defaults via `BootstrapConfig::default()`.
-/// User-configurable overrides via `~/.grok/settings.json` are deferred
+/// User-configurable overrides via `~/.opengrok/settings.json` are deferred
 /// to a follow-up.
 struct BootstrapConfig {
     /// Max concurrent sessions being indexed (default: 4).

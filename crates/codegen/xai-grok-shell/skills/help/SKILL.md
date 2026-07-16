@@ -16,11 +16,11 @@ Answer the user's question about Grok setup, configuration, or features.
 ## Steps
 
 1. If the question is about **current config** (what MCP servers, models, or settings are active),
-   read `~/.grok/config.toml`. MCP servers are under `[mcp_servers.*]` sections.
+   read `~/.opengrok/config.toml`. MCP servers are under `[mcp_servers.*]` sections.
 
 2. If the question is about **how to do something** (setup, adding MCP servers, creating skills,
    authentication, keyboard shortcuts, troubleshooting), first check the user-guide docs at
-   `~/.grok/docs/user-guide/`. The available guides are:
+   `~/.opengrok/docs/user-guide/`. The available guides are:
    - `01-getting-started.md` -- Installation, first launch, basic interaction
    - `02-authentication.md` -- Browser login, API keys, OIDC, external auth
    - `03-keyboard-shortcuts.md` -- Complete key bindings reference
@@ -43,9 +43,9 @@ Answer the user's question about Grok setup, configuration, or features.
    - `20-background-tasks.md` -- Background tasks and monitoring
    - `21-terminal-support.md` -- tmux, SSH, truecolor, clipboard, /terminal-setup
    Read the relevant guide(s) for the user's question. If none match, fall back to
-   `~/.grok/README.md` for the comprehensive reference.
+   `~/.opengrok/README.md` for the comprehensive reference.
 
-3. To **modify config** for the user, edit `~/.grok/config.toml` with search_replace.
+3. To **modify config** for the user, edit `~/.opengrok/config.toml` with search_replace.
 
-4. To **create a skill** for the user, create `~/.grok/skills/<name>/SKILL.md`
-   (read `~/.grok/docs/user-guide/08-skills.md` for the SKILL.md format).
+4. To **create a skill** for the user, create `~/.opengrok/skills/<name>/SKILL.md`
+   (read `~/.opengrok/docs/user-guide/08-skills.md` for the SKILL.md format).

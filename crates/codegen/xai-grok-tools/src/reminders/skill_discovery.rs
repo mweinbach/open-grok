@@ -1,7 +1,7 @@
 //! Skill discovery reminder — discovers new skills near accessed paths.
 //!
 //! Contains `SkillDiscoveryReminder`, a cross-cutting `Reminder` that fires
-//! after every tool call to check for SKILL.md files in `.grok/skills/`,
+//! after every tool call to check for SKILL.md files in `.opengrok/skills/`,
 //! `.agents/skills/`, or `.claude/skills/` directories near the accessed path.
 //!
 //! The actual tracking logic lives in
@@ -9,10 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-/// Directories that contain skill definitions (`.grok/skills/`, `.agents/skills/`,
+/// Directories that contain skill definitions (`.opengrok/skills/`, `.agents/skills/`,
 /// `.claude/skills/`, `.cursor/skills/`). Shared between startup skill discovery
 /// and runtime `SkillDiscoveryReminder`.
-pub const SKILL_CONFIG_DIRS: &[&str] = &[".grok", ".agents", ".claude", ".cursor"];
+pub const SKILL_CONFIG_DIRS: &[&str] = &[".opengrok", ".agents", ".claude", ".cursor"];
 
 use crate::implementations::skills::discovery;
 use crate::implementations::skills::types::SkillScope;
@@ -79,7 +79,7 @@ impl SkillDiscoveryReminder {
     }
 
     /// Check whether a SKILL.md path is inside a supported skills directory
-    /// (`.grok/skills/`, `.agents/skills/`, or `.claude/skills/`).
+    /// (`.opengrok/skills/`, `.agents/skills/`, or `.claude/skills/`).
     fn is_in_supported_skills_dir(path: &Path) -> bool {
         for ancestor in path.ancestors().skip(1) {
             if ancestor.file_name().is_some_and(|n| n == "skills") {
@@ -129,9 +129,9 @@ impl Reminder for SkillDiscoveryReminder {
 
         // Direct SKILL.md detection: when a tool writes (or reads) a
         // SKILL.md file, register it immediately. The normal upward-walk
-        // discovery cannot find these because it looks for `.grok/skills/`
+        // discovery cannot find these because it looks for `.opengrok/skills/`
         // sub-directories in *ancestor* dirs, and user-scope skills
-        // (~/.grok/) are outside the git root so the walk breaks early.
+        // (~/.opengrok/) are outside the git root so the walk breaks early.
         if target_path.file_name().is_some_and(|n| n == "SKILL.md")
             && Self::is_in_supported_skills_dir(target_path)
         {

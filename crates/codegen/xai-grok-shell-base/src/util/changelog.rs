@@ -63,18 +63,18 @@ impl Default for ChangelogManager {
 
 impl ChangelogManager {
     pub fn new() -> Self {
-        // Prefer live `$GROK_HOME` so harness-injected homes (PTY e2e) always
+        // Prefer live `$OPENGROK_HOME` so harness-injected homes (PTY e2e) always
         // win over a OnceLock that may have been initialised earlier with a
         // different path in the same process graph.
         Self::from_env_home()
     }
 
     /// Resolve cache paths from the live process environment (not the
-    /// `grok_home()` OnceLock). A seeded `$GROK_HOME` set on the pager
+    /// `grok_home()` OnceLock). A seeded `$OPENGROK_HOME` set on the pager
     /// process is always honoured even if some earlier init path cached a
     /// different home.
     fn from_env_home() -> Self {
-        let home = std::env::var_os("GROK_HOME")
+        let home = std::env::var_os("OPENGROK_HOME")
             .map(std::path::PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(crate::util::grok_home::grok_home);
@@ -93,7 +93,7 @@ impl ChangelogManager {
     /// When `GROK_CHANGELOG_OFFLINE` is set (PTY / integration tests), skip
     /// the CDN entirely and read only the disk cache so seeded fixtures win
     /// deterministically without network races. Paths are re-resolved from
-    /// `$GROK_HOME` so harness-injected env always applies.
+    /// `$OPENGROK_HOME` so harness-injected env always applies.
     ///
     /// JSON is only cached after a successful parse to avoid poisoning the
     /// disk cache with malformed content (the markdown cache is write-through
@@ -108,7 +108,7 @@ impl ChangelogManager {
     /// offline flag, and an explicit CDN base.
     ///
     /// Split out of [`fetch`] so unit tests can drive it against a temp home
-    /// without mutating process-global env (`GROK_HOME` /
+    /// without mutating process-global env (`OPENGROK_HOME` /
     /// `GROK_CHANGELOG_OFFLINE`), which races across the parallel test
     /// harness. Passing an unreachable `base` lets a test force a
     /// deterministic CDN miss instead of depending on whether the sandbox
@@ -136,7 +136,7 @@ impl ChangelogManager {
         });
 
         // If CDN is unreachable (CI sandboxes, airplane mode), fall back to
-        // any on-disk seed under `$GROK_HOME` even when offline mode was not
+        // any on-disk seed under `$OPENGROK_HOME` even when offline mode was not
         // explicitly requested — keeps PTY/integration tests deterministic.
         if markdown.is_none() {
             markdown = read_cache(&self.md_cache);
@@ -247,7 +247,7 @@ mod tests {
     use super::*;
 
     /// Build a manager pointing at `home` directly, bypassing the global
-    /// `$GROK_HOME` env so tests never race the parallel harness.
+    /// `$OPENGROK_HOME` env so tests never race the parallel harness.
     fn manager_for(home: &std::path::Path) -> ChangelogManager {
         ChangelogManager {
             md_cache: home.join("CHANGELOG.md"),

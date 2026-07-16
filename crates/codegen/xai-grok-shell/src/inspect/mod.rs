@@ -1,4 +1,4 @@
-//! `grok inspect` — configuration introspection.
+//! `open-grok inspect` — configuration introspection.
 //!
 //! Shows everything Grok discovers in the current directory: project
 //! instructions, permissions, hooks, skills, agents, plugins, MCP servers,
@@ -55,7 +55,7 @@ impl std::fmt::Display for Scope {
 #[serde(rename_all = "camelCase")]
 pub struct InspectReport {
     pub grok_version: String,
-    pub channel: String,
+    pub release_source: String,
     pub cwd: String,
     pub project_root: Option<String>,
     /// Folder-trust verdict for `cwd`: when false, repo-local project hooks,
@@ -258,14 +258,14 @@ pub struct LspServerEntry {
 pub struct ConfigSources {
     /// Config layers (system + user managed, user + system requirements, user
     /// config.toml, the macOS MDM managed-preferences layer, and project
-    /// .grok/config.toml files). Driven from the same resolvers used at runtime
+    /// .opengrok/config.toml files). Driven from the same resolvers used at runtime
     /// (`ConfigLayers`, `requirements_layers`) so system + MDM layers and
     /// precedence are included, and emptiness reflects real contribution after
     /// stripping (version_overrides, fail_closed, etc).
     pub layers: Vec<ConfigLayer>,
 }
 
-/// A single config layer entry for `grok inspect`.
+/// A single config layer entry for `open-grok inspect`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigLayer {
@@ -387,9 +387,7 @@ async fn build_report(cwd: &Path) -> InspectReport {
 
     InspectReport {
         grok_version: xai_grok_version::VERSION.to_string(),
-        channel: crate::util::config::channel_name_from_cache()
-            .unwrap_or("unknown")
-            .to_string(),
+        release_source: "github".to_string(),
         cwd: cwd.display().to_string(),
         project_root: git_root.map(|p| p.display().to_string()),
         project_trusted,
@@ -446,7 +444,7 @@ fn instruction_file_type(
     extra_rule_prefixes: &[PathBuf],
 ) -> &'static str {
     let path = Path::new(file_path);
-    if has_rules_directory(file_path, ".grok")
+    if has_rules_directory(file_path, ".opengrok")
         || has_rules_directory(file_path, ".cursor")
         || (!claude_imported && has_rules_directory(file_path, ".claude"))
         || extra_rule_prefixes
@@ -958,7 +956,7 @@ fn list_lsp_servers(
     // Folder-trust gate (display-only): inspect never spawns servers, but mark the
     // repo-local (project-scoped) entries a session would skip in an untrusted
     // clone so the listing matches the live gate. `remote = None` mirrors
-    // `grok mcp doctor` (no loaded RemoteSettings in a standalone command).
+    // `open-grok mcp doctor` (no loaded RemoteSettings in a standalone command).
     crate::agent::folder_trust::resolve_and_record(cwd, None, false);
     let project_allowed = crate::agent::folder_trust::project_scope_allowed(cwd);
 
@@ -982,7 +980,7 @@ fn list_lsp_servers(
 /// probing the canonical locations used by `ConfigLayers::load` and
 /// `requirements_layers`: system + user `managed_config.toml`, user
 /// `config.toml`, user + system `requirements.toml`, and project
-/// `.grok/config.toml` files (via `find_project_configs`). The macOS MDM
+/// `.opengrok/config.toml` files (via `find_project_configs`). The macOS MDM
 /// managed-preferences layer has no file on disk, so it is sourced directly
 /// from `requirements_layers()` rather than a path probe.
 ///
@@ -1271,7 +1269,7 @@ fn render_harness_compatibility(report: &ExternalCompatReport) -> String {
 fn print_human(r: &InspectReport) {
     println!();
     println!("  Environment");
-    println!("  {TREE} Version: {} [{}]", r.grok_version, r.channel);
+    println!("  {TREE} Version: {} (GitHub release)", r.grok_version);
     println!("  {TREE} CWD: {}", r.cwd);
     if let Some(ref root) = r.project_root {
         println!("  {TREE} Git root: {}", root);
@@ -1424,7 +1422,7 @@ fn print_human(r: &InspectReport) {
     if r.mcp_servers.is_empty() {
         println!();
         println!("  MCP Servers (0)");
-        println!("  {TREE} (none) \u{2014} see `grok mcp add --help`");
+        println!("  {TREE} (none) \u{2014} see `open-grok mcp add --help`");
     } else {
         print_columns(
             "MCP Servers",
@@ -1612,7 +1610,10 @@ mod tests {
             );
         }
 
-        for path in ["/repo/.grok/rules/team.md", r"C:\repo\.grok\rules\team.md"] {
+        for path in [
+            "/repo/.opengrok/rules/team.md",
+            r"C:\repo\.opengrok\rules\team.md",
+        ] {
             assert_eq!(instruction_file_type(path, false, &[]), "rules");
         }
         for path in [
@@ -1687,7 +1688,7 @@ mod tests {
     fn requirements_layer_contributes_requires_non_empty_post_strip_table() {
         // A `fail_closed`-only file is kept by the loader but with an empty
         // post-strip table, so it must not count as contributing.
-        let path = "/home/u/.grok/requirements.toml";
+        let path = "/home/u/.opengrok/requirements.toml";
         let layer = |v| crate::config::RequirementsLayer {
             value: v,
             source: crate::config::RequirementsSource::File(std::path::PathBuf::from(path)),
@@ -1795,21 +1796,21 @@ mod tests {
 
     #[test]
     fn skill_entry_source_maps_scopes() {
-        let home = Path::new("/home/u/.grok");
+        let home = Path::new("/home/u/.opengrok");
 
-        let s = skill_fixture("a", "/repo/.grok/skills/a/SKILL.md", SkillScope::Local);
+        let s = skill_fixture("a", "/repo/.opengrok/skills/a/SKILL.md", SkillScope::Local);
         assert!(matches!(
             skill_entry_source(&s, home),
             ConfigSource::Project { .. }
         ));
 
-        let s = skill_fixture("b", "/repo/.grok/skills/b/SKILL.md", SkillScope::Repo);
+        let s = skill_fixture("b", "/repo/.opengrok/skills/b/SKILL.md", SkillScope::Repo);
         assert!(matches!(
             skill_entry_source(&s, home),
             ConfigSource::Project { .. }
         ));
 
-        let s = skill_fixture("c", "/home/u/.grok/skills/c/SKILL.md", SkillScope::User);
+        let s = skill_fixture("c", "/home/u/.opengrok/skills/c/SKILL.md", SkillScope::User);
         assert!(matches!(
             skill_entry_source(&s, home),
             ConfigSource::User { .. }
@@ -1817,7 +1818,7 @@ mod tests {
 
         let s = skill_fixture(
             "d",
-            "/home/u/.grok/server-skills/d/SKILL.md",
+            "/home/u/.opengrok/server-skills/d/SKILL.md",
             SkillScope::Server,
         );
         assert!(matches!(
@@ -1825,7 +1826,11 @@ mod tests {
             ConfigSource::Server { .. }
         ));
 
-        let s = skill_fixture("e", "/home/u/.grok/bundled/e/SKILL.md", SkillScope::Bundled);
+        let s = skill_fixture(
+            "e",
+            "/home/u/.opengrok/bundled/e/SKILL.md",
+            SkillScope::Bundled,
+        );
         assert!(matches!(
             skill_entry_source(&s, home),
             ConfigSource::Bundled { .. }
@@ -1837,11 +1842,11 @@ mod tests {
     /// else keeps its real source.
     #[test]
     fn skill_entry_source_relabels_extracted_bundled_skills() {
-        let home = Path::new("/home/u/.grok");
+        let home = Path::new("/home/u/.opengrok");
 
         let s = skill_fixture(
             "help",
-            "/home/u/.grok/skills/help/SKILL.md",
+            "/home/u/.opengrok/skills/help/SKILL.md",
             SkillScope::User,
         );
         assert!(matches!(
@@ -1850,7 +1855,11 @@ mod tests {
         ));
 
         // Bundled name in a project dir: stays project.
-        let s = skill_fixture("help", "/repo/.grok/skills/help/SKILL.md", SkillScope::Repo);
+        let s = skill_fixture(
+            "help",
+            "/repo/.opengrok/skills/help/SKILL.md",
+            SkillScope::Repo,
+        );
         assert!(matches!(
             skill_entry_source(&s, home),
             ConfigSource::Project { .. }
@@ -1871,7 +1880,7 @@ mod tests {
         // not the extracted copy — stays user.
         let s = skill_fixture(
             "help",
-            "/home/u/.grok/skills/my-tools/SKILL.md",
+            "/home/u/.opengrok/skills/my-tools/SKILL.md",
             SkillScope::User,
         );
         assert!(matches!(
@@ -1882,7 +1891,7 @@ mod tests {
         // Non-bundled name under <grok_home>/skills: stays user.
         let s = skill_fixture(
             "my-skill",
-            "/home/u/.grok/skills/my-skill/SKILL.md",
+            "/home/u/.opengrok/skills/my-skill/SKILL.md",
             SkillScope::User,
         );
         assert!(matches!(
@@ -1895,7 +1904,7 @@ mod tests {
     /// over the scope fallback.
     #[test]
     fn skill_entry_source_prefers_stamped_config_source() {
-        let home = Path::new("/home/u/.grok");
+        let home = Path::new("/home/u/.opengrok");
         let mut s = skill_fixture("cfg", "/team/skills/cfg/SKILL.md", SkillScope::User);
         s.config_source = Some(ConfigSource::ConfigToml {
             path: PathBuf::from("/team/skills/cfg/SKILL.md"),
@@ -1919,7 +1928,7 @@ mod tests {
             )
             .unwrap();
         };
-        // Test-unique names: discovery also reads this machine's real ~/.grok dirs.
+        // Test-unique names: discovery also reads this machine's real ~/.opengrok dirs.
         let extra = tempfile::tempdir().unwrap();
         write(&extra.path().join("inspect-cfg-extra"), "inspect-cfg-extra");
         write(

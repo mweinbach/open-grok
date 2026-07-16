@@ -1,11 +1,16 @@
 # Contributing
 
-This repository does **not** accept external pull requests or unsolicited
-patches.
+Open Grok accepts focused issues and pull requests. Before starting a large
+change, open an issue so the approach can be agreed on without duplicating
+work.
 
-SpaceXAI develops this software internally. The public tree is published for
-source transparency and local builds under the terms of the Apache License,
-Version 2.0 (see [`LICENSE`](LICENSE)).
+Keep changes scoped, explain user-visible behavior in the pull request, add or
+update tests, and run the relevant Rust checks before requesting review. Do not
+include credentials, generated release artifacts, or unrelated formatting.
+
+Open Grok is a community fork of `xai-org/grok-build`; it is not affiliated
+with or endorsed by xAI or OpenAI. Upstream-only bugs should be reported to the
+upstream project.
 
 ## Security reports
 
@@ -14,6 +19,6 @@ Please report security issues through the process described in
 
 ## Licensing of this source
 
-By downloading or using this source, you agree that your use is governed by
-the Apache License, Version 2.0. No contributor license agreement is offered
-because external contributions are not accepted.
+Contributions are provided under the Apache License, Version 2.0 (see
+[`LICENSE`](LICENSE)). By submitting a contribution, you confirm that you have
+the right to license it under those terms.

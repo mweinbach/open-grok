@@ -604,7 +604,7 @@ pub fn color_support_warning(
             None,
             None,
         );
-        warning.note = Some("Unset NO_COLOR and restart Grok.".to_string());
+        warning.note = Some("Unset NO_COLOR and restart open-grok.".to_string());
         return Some(warning);
     }
 
@@ -641,7 +641,7 @@ pub fn color_support_warning(
         Some("export COLORTERM=truecolor"),
         None,
     );
-    warning.note = Some("Persist in ~/.zshrc / ~/.bashrc and restart Grok.".to_string());
+    warning.note = Some("Persist in ~/.zshrc / ~/.bashrc and restart open-grok.".to_string());
     Some(warning)
 }
 
@@ -2097,7 +2097,10 @@ mod tests {
         .expect("warn");
         assert_eq!(w.category, WarningCategory::LimitedColorSupport);
         assert!(w.message.contains("NO_COLOR"));
-        assert!(w.note.as_deref().is_some_and(|n| n.contains("NO_COLOR")));
+        assert_eq!(
+            w.note.as_deref(),
+            Some("Unset NO_COLOR and restart open-grok.")
+        );
     }
 
     #[test]
@@ -2149,6 +2152,10 @@ mod tests {
         .expect("warn");
         assert_eq!(w.fix.as_deref(), Some("export COLORTERM=truecolor"));
         assert!(w.config_path.is_none());
+        assert_eq!(
+            w.note.as_deref(),
+            Some("Persist in ~/.zshrc / ~/.bashrc and restart open-grok.")
+        );
     }
 
     #[test]

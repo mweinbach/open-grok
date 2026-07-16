@@ -68,7 +68,7 @@ impl GrokAuthCredentials {
         if self.deployment_key.is_some() {
             "Your GROK_DEPLOYMENT_KEY is invalid or expired. Please contact a team admin."
         } else if self.user_token.is_some() {
-            "Your auth token is invalid or expired. Run `grok login` to re-authenticate."
+            "Your auth token is invalid or expired. Run `open-grok login` to re-authenticate."
         } else {
             "Not authenticated."
         }

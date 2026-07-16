@@ -110,8 +110,8 @@ pub fn load_config_from_toml(root: &TomlValue) -> Config {
 /// Resolve permission config with project override semantics.
 ///
 /// Priority (per approved plan):
-/// 1. Nearest project `.grok/config.toml` with `[permission]` section (from cwd upward)
-/// 2. Global `~/.grok/config.toml` `[permission]` section
+/// 1. Nearest project `.opengrok/config.toml` with `[permission]` section (from cwd upward)
+/// 2. Global `~/.opengrok/config.toml` `[permission]` section
 ///
 /// Project `[permission]` overrides global wholesale (no deep merge).
 ///

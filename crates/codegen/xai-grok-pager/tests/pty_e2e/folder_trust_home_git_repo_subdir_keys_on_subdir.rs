@@ -40,7 +40,7 @@ async fn folder_trust_home_git_repo_subdir_keys_on_subdir() {
     // `content.home()`, so its home guard wouldn't fire and it would resolve the
     // wrong key). `TrustStore::is_trusted` canonicalizes + ancestor-prefix matches
     // internally, so passing the raw path is HOME-independent.
-    let store_path = content.home().join(".grok").join(TRUST_FILE_NAME);
+    let store_path = content.home().join(".opengrok").join(TRUST_FILE_NAME);
 
     // The question renders (keyed on the subdir), and the store is empty first.
     harness

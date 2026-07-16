@@ -622,7 +622,7 @@ async fn full_session_load_e2e() {
     // SAFETY: single-threaded current-thread runtime; set before any agent code
     // reads these process-globals (grok_home()/instrumentation mode are OnceLock).
     unsafe {
-        std::env::set_var("GROK_HOME", grok_home.path());
+        std::env::set_var("OPENGROK_HOME", grok_home.path());
         std::env::set_var("GROK_INSTRUMENTATION", "log");
         std::env::set_var("GROK_INSTRUMENTATION_LOG", &instr_log);
         std::env::set_var("GROK_CLI_CHAT_PROXY_BASE_URL", server.url());

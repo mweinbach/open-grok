@@ -39,14 +39,14 @@ Grok discovers plugins from these locations, in priority order:
 | Location | Scope | Trust |
 |----------|-------|-------|
 | `_meta.pluginDirs` (`session/new` / `session/load`) | Session -- loaded for that session only | Trusted automatically |
-| `--plugin-dir` (CLI flag, `grok agent`) | Process -- loaded for that agent process only | Trusted automatically |
-| `.grok/plugins/` | Project -- shared with the team through version control | Requires trust |
-| `~/.grok/plugins/` | User -- personal plugins for every project | Trusted automatically |
+| `--plugin-dir` (CLI flag, `open-grok agent`) | Process -- loaded for that agent process only | Trusted automatically |
+| `.opengrok/plugins/` | Project -- shared with the team through version control | Requires trust |
+| `~/.opengrok/plugins/` | User -- personal plugins for every project | Trusted automatically |
 | `[plugins].paths` (config) | Custom directories you add in `config.toml` | Depends on location |
 
 Grok also reads the `.claude/plugins/` equivalents for compatibility. When two plugins share a name, the higher-priority location wins.
 
-The Agent SDKs load per-session plugins through `GrokOptions.plugins`, which arrives as `_meta.pluginDirs` on `session/new` and `session/load`; because the caller controls the directory, these plugins are always trusted -- their hooks and MCP servers activate without a prompt, and they never persist beyond the session. The `--plugin-dir` flag is the process-wide equivalent for direct CLI use (repeatable: `grok agent --no-leader --plugin-dir A --plugin-dir B stdio`); it applies to dedicated agent processes only and is ignored in leader mode (the shared leader discovers its own plugins).
+The Agent SDKs load per-session plugins through `GrokOptions.plugins`, which arrives as `_meta.pluginDirs` on `session/new` and `session/load`; because the caller controls the directory, these plugins are always trusted -- their hooks and MCP servers activate without a prompt, and they never persist beyond the session. The `--plugin-dir` flag is the process-wide equivalent for direct CLI use (repeatable: `open-grok agent --no-leader --plugin-dir A --plugin-dir B stdio`); it applies to dedicated agent processes only and is ignored in leader mode (the shared leader discovers its own plugins).
 
 ---
 
@@ -115,18 +115,18 @@ Manage plugins without starting an interactive session.
 ### Plugin commands
 
 ```bash
-grok plugin list [--json] [--available]   # List installed plugins (--available requires --json)
-grok plugin install <source> --trust      # Git URL, GitHub shorthand (user/repo), or local path
-grok plugin uninstall <name> [--confirm] [--keep-data]   # Aliases: rm, remove
-grok plugin update [<name>]               # Omit the name to update all plugins
-grok plugin enable <name>
-grok plugin disable <name>
-grok plugin details <name>                # Show the plugin's component inventory
-grok plugin validate [<path>]             # Validate plugin.json (default: current directory)
-grok plugin tag [<path>] [--push] [--force] [--dry-run]   # Tag a release from the manifest version
+open-grok plugin list [--json] [--available]   # List installed plugins (--available requires --json)
+open-grok plugin install <source> --trust      # Git URL, GitHub shorthand (user/repo), or local path
+open-grok plugin uninstall <name> [--confirm] [--keep-data]   # Aliases: rm, remove
+open-grok plugin update [<name>]               # Omit the name to update all plugins
+open-grok plugin enable <name>
+open-grok plugin disable <name>
+open-grok plugin details <name>                # Show the plugin's component inventory
+open-grok plugin validate [<path>]             # Validate plugin.json (default: current directory)
+open-grok plugin tag [<path>] [--push] [--force] [--dry-run]   # Tag a release from the manifest version
 ```
 
-Run `grok plugin install <source>` without `--trust` and Grok prints the source and warns that installing will activate the plugin's hooks, MCP servers, and skills, then stops without installing. Add `--trust` to install it.
+Run `open-grok plugin install <source>` without `--trust` and Grok prints the source and warns that installing will activate the plugin's hooks, MCP servers, and skills, then stops without installing. Add `--trust` to install it.
 
 The `<source>` argument accepts:
 
@@ -140,27 +140,27 @@ The `<source>` argument accepts:
 ### Marketplace commands
 
 ```bash
-grok plugin marketplace list [--json]
-grok plugin marketplace add <url>         # Git URL, GitHub shorthand (user/repo), or local path
-grok plugin marketplace remove <url>      # Git URL or local path of a configured source
-grok plugin marketplace update [<name>]   # Omit the name to refresh all sources
+open-grok plugin marketplace list [--json]
+open-grok plugin marketplace add <url>         # Git URL, GitHub shorthand (user/repo), or local path
+open-grok plugin marketplace remove <url>      # Git URL or local path of a configured source
+open-grok plugin marketplace update [<name>]   # Omit the name to refresh all sources
 ```
 
 ### Example: set up a team marketplace
 
 ```bash
-grok plugin marketplace add my-org/team-plugins
-grok plugin marketplace list
-grok plugin install my-org/team-plugins --trust
-grok plugin list
-grok plugin update
+open-grok plugin marketplace add my-org/team-plugins
+open-grok plugin marketplace list
+open-grok plugin install my-org/team-plugins --trust
+open-grok plugin list
+open-grok plugin update
 ```
 
 ---
 
 ## Slash commands
 
-In an interactive session, these commands open the modal on a specific tab. They take no arguments — manage plugins from the modal or with the `grok plugin` CLI.
+In an interactive session, these commands open the modal on a specific tab. They take no arguments — manage plugins from the modal or with the `open-grok plugin` CLI.
 
 | Command | Opens |
 |---------|-------|
@@ -174,7 +174,7 @@ In an interactive session, these commands open the modal on a specific tab. They
 
 ## Configuration
 
-Configure plugin directories and per-plugin state in `~/.grok/config.toml`:
+Configure plugin directories and per-plugin state in `~/.opengrok/config.toml`:
 
 ```toml
 [plugins]
@@ -183,11 +183,11 @@ disabled = ["user/a1b2c3d4/noisy-plugin"]    # Plugin IDs or names to skip
 enabled = ["project/9f8e7d6c/team-tools"]    # Plugin IDs or names to force on
 ```
 
-List a plugin in `disabled` to discover it but skip loading its components. List a plugin in `enabled` to activate it — plugins are disabled by default unless a CLI override or an explicit config path enables them, so add them here to turn them on. Each entry is either a plain plugin name (as shown by `grok plugin list`) or a full plugin ID in the form `<scope>/<hash>/<name>`.
+List a plugin in `disabled` to discover it but skip loading its components. List a plugin in `enabled` to activate it — plugins are disabled by default unless a CLI override or an explicit config path enables them, so add them here to turn them on. Each entry is either a plain plugin name (as shown by `open-grok plugin list`) or a full plugin ID in the form `<scope>/<hash>/<name>`.
 
 ### Hide the plugins UI
 
-To hide the hooks and plugins UI — the `/hooks` and `/plugins` commands and the scrollback annotations — set this in `~/.grok/pager.toml`:
+To hide the hooks and plugins UI — the `/hooks` and `/plugins` commands and the scrollback annotations — set this in `~/.opengrok/pager.toml`:
 
 ```toml
 disable_plugins = true
@@ -227,7 +227,7 @@ Add sources under `extraKnownMarketplaces`, keyed by name. Each entry's `source`
 }
 ```
 
-Place this file at `~/.grok/settings.json` or `~/.claude/settings.json`.
+Place this file at `~/.opengrok/settings.json` or `~/.claude/settings.json`.
 
 ---
 
@@ -235,21 +235,21 @@ Place this file at `~/.grok/settings.json` or `~/.claude/settings.json`.
 
 Enabling a plugin loads its skills, slash commands, and agents. Trust is separate and controls whether a plugin's code runs: even for an enabled plugin, its hooks, MCP servers, and LSP servers stay inactive until you trust it. This prevents an untrusted repository from running code on your machine.
 
-Grok trusts plugins from `~/.grok/plugins/` automatically. Project plugins in `.grok/plugins/` require explicit trust. To trust a plugin, install it with `--trust`:
+Grok trusts plugins from `~/.opengrok/plugins/` automatically. Project plugins in `.opengrok/plugins/` require explicit trust. To trust a plugin, install it with `--trust`:
 
 ```bash
-grok plugin install <source> --trust
+open-grok plugin install <source> --trust
 ```
 
 ---
 
 ## Inspect plugins
 
-Run `grok inspect` to see every discovered plugin and what it provides:
+Run `open-grok inspect` to see every discovered plugin and what it provides:
 
 ```bash
-grok inspect          # Show plugins with their skills, agents, hooks, and MCP servers
-grok inspect --json   # Emit machine-readable JSON
+open-grok inspect          # Show plugins with their skills, agents, hooks, and MCP servers
+open-grok inspect --json   # Emit machine-readable JSON
 ```
 
 Plugin-provided components appear in their sections (Skills, Agents, MCP Servers, and so on) with a `plugin: <name>` label, so you can see where each component originates.

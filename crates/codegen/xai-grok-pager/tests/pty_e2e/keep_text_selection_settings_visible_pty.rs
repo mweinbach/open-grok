@@ -64,7 +64,11 @@ async fn keep_text_selection_settings_visible_pty() {
     assert!(
         saw_label,
         "settings modal must show Text selection row (config_seeded={})\nscreen:\n{}",
-        content.home().join(".grok").join("config.toml").exists(),
+        content
+            .home()
+            .join(".opengrok")
+            .join("config.toml")
+            .exists(),
         harness.screen_contents()
     );
 

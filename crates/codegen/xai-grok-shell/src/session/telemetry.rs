@@ -91,7 +91,7 @@ pub(crate) fn format_hook_name(spec: &xai_grok_hooks::config::HookSpec) -> Strin
 /// Provenance from the namespace prefix each loader stamps on the spec name:
 /// `global/` → user, `project/` → project, `plugin/` → plugin, `agent:` →
 /// agent, else unknown. (Source-dir classification was wrong — both global and
-/// project dirs contain `/.grok/`.)
+/// project dirs contain `/.opengrok/`.)
 fn format_hook_source(spec: &xai_grok_hooks::config::HookSpec) -> &'static str {
     let name = spec.name.as_str();
     if name.starts_with("global/") {

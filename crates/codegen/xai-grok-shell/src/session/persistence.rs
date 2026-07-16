@@ -77,7 +77,7 @@ pub struct BtwEntry {
 
 // Local feedback persistence types
 
-/// A feedback entry persisted to `~/.grok/sessions/.../feedback.jsonl`.
+/// A feedback entry persisted to `~/.opengrok/sessions/.../feedback.jsonl`.
 ///
 /// Uses a tagged enum so different feedback types are self-describing in the
 /// JSONL file (currently only `UserFeedback`).
@@ -439,7 +439,7 @@ fn session_exists_for_cwd_in_root(session_id: &str, cwd: &str, sessions_root: &P
 ///
 /// When a remote session is restored, a new local child is created with
 /// `summary.parent_session_id == remote_session_id`.  On a second
-/// `grok -r <remote_id>` in the same cwd, this function returns the already-restored
+/// `open-grok -r <remote_id>` in the same cwd, this function returns the already-restored
 /// child so no duplicate restore is performed.
 ///
 /// If multiple children match (e.g., from pre-fix duplicate restores), the
@@ -549,7 +549,7 @@ fn find_local_child_for_remote_in_root(
     }
 
     // Collect all matching children.  Multiple can exist when a user ran
-    // `grok -r <remote_id>` before this fix was deployed.
+    // `open-grok -r <remote_id>` before this fix was deployed.
     // Tuple: (updated_at, dir_mtime_nanos, session_id) — all sorted descending.
     let mut candidates: Vec<(String, u128, String)> = Vec::new();
 
@@ -594,11 +594,11 @@ fn find_local_child_for_remote_in_root(
 }
 
 /// Check if a session exists locally by session ID.
-/// Searches across ALL cwd directories under `~/.grok/sessions/`.
+/// Searches across ALL cwd directories under `~/.opengrok/sessions/`.
 ///
 /// Use `session_exists_for_cwd` instead when the target cwd is known
 /// (e.g., the `-r` resume path) to avoid false-positive matches.
-/// Find a session by ID across **all** CWD directories under `~/.grok/sessions/`.
+/// Find a session by ID across **all** CWD directories under `~/.opengrok/sessions/`.
 ///
 /// Unlike [`resolve_local_session`] which only checks a single CWD,
 /// this scans every encoded-CWD subdirectory. Returns the decoded CWD path
@@ -873,7 +873,7 @@ pub struct Summary {
     pub head_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
-    /// Absolute path to the `.grok` directory, used by reconstruction.
+    /// Absolute path to the `.opengrok` directory, used by reconstruction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok_home: Option<String>,
     /// When the session last had content added (user or model messages).
@@ -1995,7 +1995,7 @@ impl SessionPersistence {
     }
 }
 
-/// Collect MCP server stderr logs from `~/.grok/logs/mcp/` for inclusion in the session archive.
+/// Collect MCP server stderr logs from `~/.opengrok/logs/mcp/` for inclusion in the session archive.
 fn collect_mcp_stderr_logs(files: &mut Vec<CopiedSessionFile>) {
     let mcp_log_dir = xai_grok_config::grok_home().join("logs").join("mcp");
     let Ok(entries) = std::fs::read_dir(&mcp_log_dir) else {
@@ -2068,7 +2068,7 @@ fn init_remote_sync(
             let auth_manager = auth_manager.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "Writeback storage mode requires authentication. Run 'grok login' first.",
+                    "Writeback storage mode requires authentication. Run 'open-grok login' first.",
                 )
             })?;
             if let Some(auth) = auth_manager.current_or_expired() {
@@ -2162,7 +2162,7 @@ pub(crate) fn io_error_to_acp(e: &io::Error) -> acp::Error {
 }
 
 /// Best-effort worktree liveness touch: stamp `last_accessed_at` on the
-/// worktree containing this session's cwd so `grok worktree gc` expires by
+/// worktree containing this session's cwd so `open-grok worktree gc` expires by
 /// last use, not creation time. Lives here — not in a `StorageAdapter` —
 /// so every session create/load path shares it regardless of backend.
 fn spawn_worktree_touch(info: &Info) -> tokio::task::JoinHandle<()> {
@@ -2833,7 +2833,7 @@ static CLEANUP_SESSIONS_ONCE: std::sync::Once = std::sync::Once::new();
 /// Default TTL for stale session files (30 days).
 const DEFAULT_CLEANUP_TTL_DAYS: u32 = 30;
 
-/// Walk `~/.grok/sessions/` and delete files with mtime older than `ttl_days`.
+/// Walk `~/.opengrok/sessions/` and delete files with mtime older than `ttl_days`.
 /// Removes empty session directories after file cleanup.
 /// Skips `skip_session_dir` if provided (current session).
 ///
@@ -3760,7 +3760,7 @@ mod find_local_child_tests {
         assert!(found.is_none());
     }
 
-    /// Regression: a second `grok -r <remote_id>` must return the existing child
+    /// Regression: a second `open-grok -r <remote_id>` must return the existing child
     /// without creating a new restore, not return `None`.
     #[test]
     fn repeated_resume_returns_existing_child() {

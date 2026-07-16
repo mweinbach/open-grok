@@ -388,9 +388,9 @@ pub fn session_token_auth_gate(
 }
 
 pub const AUTH_ERROR_SESSION_EXPIRED: &str =
-    "Session expired. Run `grok login` to re-authenticate.";
+    "Session expired. Run `open-grok login` to re-authenticate.";
 
-pub const AUTH_ERROR_API_KEY: &str = "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to ~/.grok/config.toml.";
+pub const AUTH_ERROR_API_KEY: &str = "Authentication failed. Run `open-grok login`, set XAI_API_KEY, or add api_key to ~/.opengrok/config.toml.";
 
 /// Next ACP method id when `cached_token` cannot proceed (missing / expired /
 /// legacy WebLogin), or `None` when fallthrough is forbidden.
@@ -420,7 +420,7 @@ pub const PREFERRED_API_KEY_UNAVAILABLE: &str = "preferred_method=api_key but no
 
 /// Error when `preferred_method=oidc` but the session path cannot proceed.
 pub const PREFERRED_OIDC_UNAVAILABLE: &str =
-    "preferred_method=oidc but no session is available. Run `grok login` to authenticate.";
+    "preferred_method=oidc but no session is available. Run `open-grok login` to authenticate.";
 
 pub const XAI_API_KEY_METHOD_ID: &str = "xai.api_key";
 pub fn xai_api_key_auth_method() -> acp::AuthMethod {
@@ -442,7 +442,7 @@ pub fn cached_token_auth_method() -> acp::AuthMethod {
             acp::AuthMethodId::new(CACHED_TOKEN_AUTH_METHOD_ID),
             "cached_token".to_string(),
         )
-        .description(Some("Cached token from ~/.grok/auth.json".to_string())),
+        .description(Some("Cached token from ~/.opengrok/auth.json".to_string())),
     )
 }
 
@@ -752,7 +752,7 @@ mod tests {
     // ── End-to-end: enterprise TOML -> resolved models -> build_auth_methods ─
 
     /// END-TO-END REGRESSION TEST: parses the literal enterprise-style
-    /// `~/.grok/config.toml` skeleton from the bug report, walks it through
+    /// `~/.opengrok/config.toml` skeleton from the bug report, walks it through
     /// the same predicate (`should_advertise_xai_api_key`) and the same
     /// list-builder (`build_auth_methods`) that `MvpAgent::initialize()` uses
     /// in production, and asserts that `auth_methods.first()` is `xai.api_key`
@@ -921,9 +921,9 @@ mod tests {
 
     // -- grok login --legacy regression coverage ------------------------
     //
-    // `grok login --legacy` produces a GrokAuth with `auth_mode: WebLogin`,
+    // `open-grok login --legacy` produces a GrokAuth with `auth_mode: WebLogin`,
     // `oidc_issuer: None`, and no `expires_at` (30-day hardcoded TTL).
-    // When this token is present via the `GROK_AUTH` env var (or via legacy
+    // When this token is present via the `OPENGROK_AUTH` env var (or via legacy
     // scope fallback in auth.json), `AuthManager::new` returns it from
     // `current()`, feeding `has_cached_token = true` into `build_auth_methods`.
     // This puts `cached_token` first so `startup_auth_metadata()` returns
@@ -931,11 +931,11 @@ mod tests {
     // screen.
     //
     // This test pins the env-var path (highest priority in AuthManager) end-
-    // to-end. A regression in GROK_AUTH JSON parsing or in auth method
+    // to-end. A regression in OPENGROK_AUTH JSON parsing or in auth method
     // ordering would send legacy-token users to the login screen.
 
     /// END-TO-END REGRESSION TEST: a legacy auth token (WebLogin, no
-    /// expires_at) present in the `GROK_AUTH` env var, with no other auth
+    /// expires_at) present in the `OPENGROK_AUTH` env var, with no other auth
     /// available, MUST be loaded by `AuthManager` and cause `build_auth_methods`
     /// to advertise `cached_token` first. The pager therefore skips the login
     /// screen (frictionless legacy auth). This behavior works; the test
@@ -946,10 +946,10 @@ mod tests {
         use crate::auth::{AuthManager, AuthMode, GrokAuth, GrokComConfig};
 
         // Ensure clean slate for "no other auth available".
-        let _g1 = EnvGuard::unset("GROK_AUTH_PATH");
+        let _g1 = EnvGuard::unset("OPENGROK_AUTH_PATH");
         let _g2 = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
 
-        // Construct a legacy-style token exactly as `grok login --legacy`
+        // Construct a legacy-style token exactly as `open-grok login --legacy`
         // produces: WebLogin mode, no OIDC fields, no refresh_token, no
         // expires_at (is_expired falls back to 30-day age check).
         let legacy_token = GrokAuth {
@@ -965,11 +965,11 @@ mod tests {
             ..GrokAuth::test_default()
         };
 
-        // Provide it via GROK_AUTH env var (highest priority code path in
+        // Provide it via OPENGROK_AUTH env var (highest priority code path in
         // AuthManager::new). This is the "legacy auth token exists in the env"
         // case with no other auth.
         let legacy_json = serde_json::to_string(&legacy_token).expect("serialize legacy token");
-        let _g = EnvGuard::set("GROK_AUTH", &legacy_json);
+        let _g = EnvGuard::set("OPENGROK_AUTH", &legacy_json);
 
         // AuthManager picks it up from the env var directly (no file needed).
         let dir = tempfile::tempdir().unwrap();
@@ -978,7 +978,7 @@ mod tests {
         let current = mgr.current();
         assert!(
             current.is_some(),
-            "legacy token in GROK_AUTH env MUST be loaded directly -- if this fails, \
+            "legacy token in OPENGROK_AUTH env MUST be loaded directly -- if this fails, \
              users with legacy auth in env would be sent to the login screen",
         );
         assert_eq!(
@@ -1029,8 +1029,8 @@ mod tests {
     fn no_legacy_token_means_no_cached_token_advertised() {
         use crate::auth::{AuthManager, GrokComConfig};
 
-        let _g1 = EnvGuard::unset("GROK_AUTH");
-        let _g2 = EnvGuard::unset("GROK_AUTH_PATH");
+        let _g1 = EnvGuard::unset("OPENGROK_AUTH");
+        let _g2 = EnvGuard::unset("OPENGROK_AUTH_PATH");
 
         let dir = tempfile::tempdir().unwrap();
         // No auth.json in the tempdir.

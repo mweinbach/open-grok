@@ -1188,7 +1188,7 @@ mod tests {
             "do X",
             ChangesRef::File("/tmp/goal-classifier-abc-1.patch"),
             &["js/main.js".to_string()],
-            Some(Path::new("/home/u/.grok/sessions/s1/goal/plan.md")),
+            Some(Path::new("/home/u/.opengrok/sessions/s1/goal/plan.md")),
             None,
             "I did it.",
         );
@@ -1197,7 +1197,7 @@ mod tests {
             "OBJECTIVE:\ndo X\n\n\
              CHANGES_FILE: /tmp/goal-classifier-abc-1.patch\n\n\
              CHANGED_FILES:\n- js/main.js\n\n\
-             PLAN_FILE: /home/u/.grok/sessions/s1/goal/plan.md\n\n\
+             PLAN_FILE: /home/u/.opengrok/sessions/s1/goal/plan.md\n\n\
              PLAN_CHANGES: (none)\n\n\
              FINAL_RESPONSE:\nI did it.\n",
         );

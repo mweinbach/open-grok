@@ -246,8 +246,8 @@ fn find_btrfs_mount_for_source(source: &str, mountinfo: &str) -> Result<Option<P
 /// path by adjusting for the mount's root offset.
 ///
 /// For example, with mount entry `root=/repo mount_point=/workspace/repo` and target
-/// root `/repo/.grok-snapshots/wt-123`, this returns
-/// `/workspace/repo/.grok-snapshots/wt-123`.
+/// root `/repo/.opengrok-snapshots/wt-123`, this returns
+/// `/workspace/repo/.opengrok-snapshots/wt-123`.
 fn resolve_via_subvol_mount(
     device: &str,
     target_root: &str,
@@ -386,7 +386,7 @@ pub fn is_btrfs_subvolume(path: &Path) -> Result<Option<BtrfsInfo>> {
     //
     // A path like `/workspace/repo` can be a bind mount FROM a btrfs subvolume
     // at `/mnt/btrfs/repo`. In that case, statfs reports btrfs (because the data
-    // IS on btrfs), but the snapshot destination (e.g. `~/.grok/worktrees/...`)
+    // IS on btrfs), but the snapshot destination (e.g. `~/.opengrok/worktrees/...`)
     // is NOT on btrfs. We need to detect the bind mount so we can create
     // snapshots inside the actual btrfs mount point and expose them at the
     // destination via a symlink.
@@ -678,16 +678,16 @@ mod tests {
 
     #[test]
     fn test_resolve_via_subvol_mount_nested_path() {
-        // Simulates: target root /repo/.grok-snapshots/wt-123 resolved via
+        // Simulates: target root /repo/.opengrok-snapshots/wt-123 resolved via
         // mount with root=/repo at /workspace/repo
         let mountinfo =
             "8267 8961 0:813 /repo /workspace/repo rw,relatime - btrfs /dev/loop0 rw,ssd";
         let result =
-            resolve_via_subvol_mount("/dev/loop0", "/repo/.grok-snapshots/wt-123", mountinfo)
+            resolve_via_subvol_mount("/dev/loop0", "/repo/.opengrok-snapshots/wt-123", mountinfo)
                 .unwrap();
         assert_eq!(
             result,
-            Some(PathBuf::from("/workspace/repo/.grok-snapshots/wt-123"))
+            Some(PathBuf::from("/workspace/repo/.opengrok-snapshots/wt-123"))
         );
     }
 

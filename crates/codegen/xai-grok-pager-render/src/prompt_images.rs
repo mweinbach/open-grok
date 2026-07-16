@@ -4096,13 +4096,13 @@ mod tests {
     fn build_blocks_uri_prefers_durable_session_path() {
         let mut img = make_real_image(100, 80);
         img.source_path = Some(PathBuf::from("/Users/test/original.png"));
-        img.session_image_path = Some(PathBuf::from("/Users/test/.grok/session/image.png"));
+        img.session_image_path = Some(PathBuf::from("/Users/test/.opengrok/session/image.png"));
         let blocks = build_blocks_no_workspace("text".into(), vec![img]);
         assert_eq!(blocks.len(), 2);
         if let agent_client_protocol::ContentBlock::Image(ic) = &blocks[1] {
             assert_eq!(
                 ic.uri.as_deref(),
-                Some("file:///Users/test/.grok/session/image.png"),
+                Some("file:///Users/test/.opengrok/session/image.png"),
                 "model URI must prefer the durable session path"
             );
         } else {

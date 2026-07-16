@@ -1,12 +1,12 @@
 //! I/O integration tests for the auto-update crate.
 //!
-//! These tests touch global process state — `GROK_HOME` (a `OnceLock` in
+//! These tests touch global process state — `OPENGROK_HOME` (a `OnceLock` in
 //! `xai-grok-config`), `GROK_TEST_VERSION`, and `NPM_TOKEN` — so they
-//! must run serially. Once `GROK_HOME` is initialized for a process, it can't
+//! must run serially. Once `OPENGROK_HOME` is initialized for a process, it can't
 //! be changed; we set it from a single shared `OnceLock` and reset the
 //! contents of the directory between tests.
 //!
-//! The patterns here mirror the GROK_HOME isolation used in other
+//! The patterns here mirror the OPENGROK_HOME isolation used in other
 //! integration tests.
 
 mod common;
@@ -156,7 +156,7 @@ fn write_cache_with_timestamp(version: &str, ts: time::OffsetDateTime) {
 /// its on-disk contract: file shape + freshness logic via the public
 /// `GrokVersion` JSON layout.
 async fn cache_is_fresh() -> bool {
-    // Mirror the implementation: look at version.json under GROK_HOME,
+    // Mirror the implementation: look at version.json under OPENGROK_HOME,
     // parse, and check the TTL.
     let path = version_cache_path();
     let Ok(body) = tokio::fs::read_to_string(&path).await else {

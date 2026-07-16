@@ -1,6 +1,6 @@
 //! Project plugin trust management.
 //!
-//! Plugins from project directories (`.grok/plugins/`, `.claude/plugins/`)
+//! Plugins from project directories (`.opengrok/plugins/`, `.claude/plugins/`)
 //! are an execution surface.  A cloned repository could contain plugins with
 //! hook scripts or MCP server commands that run arbitrary code.
 //!
@@ -10,7 +10,7 @@
 //! **Trust key**: canonical absolute path of the plugin root directory,
 //! resolved via `dunce::canonicalize()`.
 //!
-//! **Trust storage**: `~/.grok/trusted-plugins` (one canonical path per line).
+//! **Trust storage**: `~/.opengrok/trusted-plugins` (one canonical path per line).
 //!
 //! **Behavior for untrusted plugins**:
 //! - Skills and agents are **discovered and listed** (metadata-only).
@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-/// Name of the trust-store file under `~/.grok/`.
+/// Name of the trust-store file under `~/.opengrok/`.
 const TRUST_FILE_NAME: &str = "trusted-plugins";
 
 /// Manages the set of trusted plugin root directories.
@@ -35,11 +35,11 @@ pub struct TrustStore {
 impl TrustStore {
     /// Load the trust store from disk.
     ///
-    /// If `~/.grok/trusted-plugins` does not exist, returns an empty store.
+    /// If `~/.opengrok/trusted-plugins` does not exist, returns an empty store.
     /// If the file cannot be read, logs a warning and returns an empty store.
     pub fn load() -> Self {
-        // Gate on user_grok_home() so a project's `.grok/trusted-plugins` is never
-        // read as the user trust store when neither GROK_HOME nor a home dir resolves.
+        // Gate on user_grok_home() so a project's `.opengrok/trusted-plugins` is never
+        // read as the user trust store when neither OPENGROK_HOME nor a home dir resolves.
         let Some(grok) = xai_grok_config::user_grok_home() else {
             return Self {
                 trusted: HashSet::new(),
@@ -76,7 +76,7 @@ impl TrustStore {
 
     /// Grant trust to a plugin root directory.
     ///
-    /// Canonicalizes the path and appends it to `~/.grok/trusted-plugins`.
+    /// Canonicalizes the path and appends it to `~/.opengrok/trusted-plugins`.
     /// If the path is already trusted, this is a no-op and returns `Ok(())`.
     pub fn grant_trust(&mut self, plugin_root: &Path) -> Result<(), TrustError> {
         let canonical =
@@ -119,7 +119,7 @@ impl TrustStore {
     /// Revoke trust for a plugin root directory.
     ///
     /// Canonicalizes the path, removes it from the in-memory set, and
-    /// rewrites `~/.grok/trusted-plugins` without the revoked entry.
+    /// rewrites `~/.opengrok/trusted-plugins` without the revoked entry.
     /// If the path is not currently trusted, this is a no-op.
     pub fn revoke_trust(&mut self, plugin_root: &Path) -> Result<(), TrustError> {
         let canonical =
@@ -165,7 +165,7 @@ impl TrustStore {
     ///
     /// A `[plugins].paths` entry is auto-trusted if its canonicalized path
     /// is under the user's home directory.  Otherwise it requires explicit
-    /// trust via `~/.grok/trusted-plugins`.
+    /// trust via `~/.opengrok/trusted-plugins`.
     pub fn is_config_path_auto_trusted(plugin_root: &Path) -> bool {
         let Some(home) = dirs::home_dir() else {
             return false;

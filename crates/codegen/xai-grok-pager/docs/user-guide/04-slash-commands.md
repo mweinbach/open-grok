@@ -212,7 +212,7 @@ Reopen the current session in the other render mode. `/minimal` (offered in
 fullscreen) switches to the experimental scrollback-native mode; `/fullscreen`
 (offered in minimal; alias `/full`) switches back to the standard alt-screen
 TUI. Both relaunch the pager on the same conversation and are **sticky**: the
-choice persists to `[ui].screen_mode` in `config.toml`, so future plain `grok`
+choice persists to `[ui].screen_mode` in `config.toml`, so future plain `open-grok`
 launches open in whatever mode was last used. The `--minimal` / `--fullscreen`
 CLI flags do the same thing at launch time.
 
@@ -546,7 +546,7 @@ Toggle message timestamps on or off.
 
 ## Skills as Slash Commands
 
-Any enabled skill with `user-invocable: true` in its SKILL.md frontmatter appears as a slash command. (A skill turned off via `/skills` is not advertised.) For example, if you have a skill at `~/.grok/skills/commit/SKILL.md`, you can invoke it with:
+Any enabled skill with `user-invocable: true` in its SKILL.md frontmatter appears as a slash command. (A skill turned off via `/skills` is not advertised.) For example, if you have a skill at `~/.opengrok/skills/commit/SKILL.md`, you can invoke it with:
 
 ```
 /commit fix typo in README

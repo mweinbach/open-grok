@@ -2,7 +2,7 @@
 //! truncation / corruption / cancel at every point, and after every iteration
 //! assert the single invariant that makes the brick impossible:
 //!
-//! > `~/.grok/bin/grok` resolves to a binary that passes the smoke-test, OR it
+//! > `~/.opengrok/bin/open-grok` resolves to a binary that passes the smoke-test, OR it
 //! > is still the previous-good binary. It is never a broken/partial binary,
 //! > and a `.tmp` never masquerades as the active binary.
 //!
@@ -44,9 +44,8 @@ fn large_good_artifact() -> Vec<u8> {
     v
 }
 
-/// Seed a previous-good versioned binary + both managed symlinks
-/// (`grok` and `agent` — see `swap_managed_bin_links`). Returns the
-/// absolute path of the seeded binary.
+/// Seed a previous-good versioned binary and the managed `open-grok` symlink.
+/// Returns the absolute path of the seeded binary.
 fn seed_previous_good(home: &Path, version: &str, platform: &str) -> PathBuf {
     let downloads = home.join("downloads");
     let bin = home.join("bin");
@@ -58,15 +57,13 @@ fn seed_previous_good(home: &Path, version: &str, platform: &str) -> PathBuf {
     std::fs::set_permissions(&prev, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let rel = format!("../downloads/grok-{version}-{platform}");
-    for name in ["grok", "agent"] {
-        let link = bin.join(name);
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&rel, &link).unwrap();
-    }
+    let link = bin.join("open-grok");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&rel, &link).unwrap();
     dunce::canonicalize(&prev).unwrap()
 }
 
-/// What the active `grok` should resolve to after an install attempt.
+/// What the active `open-grok` should resolve to after an install attempt.
 #[derive(Clone, Copy, PartialEq)]
 enum Expect {
     /// The new version was installed and activated.
@@ -78,11 +75,9 @@ enum Expect {
 /// THE invariant. Re-resolves the on-disk symlink and RE-EXECUTES the resolved
 /// binary; never inspects a harness-held value. Guarantees the active managed
 /// link is always runnable and is never a `.tmp` or a partial file. Applied
-/// to both `grok` and `agent` — `swap_managed_bin_links` moves them together.
+/// to the namespaced `open-grok` entry point.
 fn assert_invariant(home: &Path, prev_good: &Path, new_binary: &Path, expect: Expect) {
-    for name in ["grok", "agent"] {
-        assert_link_invariant(home, name, prev_good, new_binary, expect);
-    }
+    assert_link_invariant(home, "open-grok", prev_good, new_binary, expect);
 }
 
 fn assert_link_invariant(

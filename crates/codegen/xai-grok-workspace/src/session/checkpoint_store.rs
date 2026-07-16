@@ -16,7 +16,7 @@
 //! **On-disk layout** (under the session `cwd`):
 //!
 //! ```text
-//! <cwd>/.grok/rewind-checkpoints/
+//! <cwd>/.opengrok/rewind-checkpoints/
 //!   .gitignore                          # "*" — blobs are never committed
 //!   <session_id>/
 //!     checkpoint-<prompt_index>.json    # one RewindCheckpoint per prompt
@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 
 use crate::session::checkpoint::RewindCheckpoint;
 
-/// Directory (under `<cwd>/.grok`) holding every session's checkpoint store.
+/// Directory (under `<cwd>/.opengrok`) holding every session's checkpoint store.
 const STORE_SUBDIR: &str = "rewind-checkpoints";
 
 /// Default cap on retained checkpoints per session. Bounds on-disk and in-memory
@@ -45,7 +45,7 @@ static TMP_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 ///
 /// See the [module docs](self) for the on-disk layout and durability rationale.
 pub(crate) struct CheckpointStore {
-    /// Per-session store directory: `<cwd>/.grok/rewind-checkpoints/<session_id>`.
+    /// Per-session store directory: `<cwd>/.opengrok/rewind-checkpoints/<session_id>`.
     dir: PathBuf,
     /// Max retained checkpoints; the oldest are evicted beyond this.
     cap: usize,
@@ -74,7 +74,7 @@ impl CheckpointStore {
         // `session_id` is RPC-controlled: never join it verbatim (a `../../etc`
         // would escape the store root). Map it to a safe, collision-free name first.
         let dir = cwd
-            .join(".grok")
+            .join(".opengrok")
             .join(STORE_SUBDIR)
             .join(session_store_dir_name(session_id));
         let cap = cap.max(1);
@@ -486,7 +486,7 @@ mod tests {
         // ...and a `.gitignore` ignores the whole store so blobs are never committed.
         let gitignore = tmp
             .path()
-            .join(".grok")
+            .join(".opengrok")
             .join(STORE_SUBDIR)
             .join(".gitignore");
         let body = std::fs::read_to_string(&gitignore).expect("gitignore written");

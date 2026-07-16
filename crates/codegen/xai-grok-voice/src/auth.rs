@@ -26,7 +26,7 @@ pub type SharedVoiceAuth = Arc<dyn VoiceAuthProvider>;
 #[cfg(feature = "audio")]
 pub(crate) async fn require_bearer(auth: &SharedVoiceAuth) -> Result<String, VoiceError> {
     auth.bearer().await.ok_or_else(|| {
-        VoiceError::Auth("not signed in — run `grok login` or set XAI_API_KEY".into())
+        VoiceError::Auth("not signed in — run `open-grok login` or set XAI_API_KEY".into())
     })
 }
 

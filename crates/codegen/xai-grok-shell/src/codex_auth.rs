@@ -140,7 +140,7 @@ impl Default for CodexEndpoints {
 }
 
 /// Grok-owned copy of Codex's plaintext auth schema, stored separately at
-/// `~/.grok/codex-auth.json` with owner-only permissions.
+/// `~/.opengrok/codex-auth.json` with owner-only permissions.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CodexAuthStore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -780,13 +780,13 @@ async fn run_browser_login_at(
             Ok(Err(error)) => {
                 server.abort();
                 return Err(anyhow!(
-                    "could not open a browser for Codex login: {error}. Run `grok login --codex` instead"
+                    "could not open a browser for Codex login: {error}. Run `open-grok login --codex` instead"
                 ));
             }
             Err(error) => {
                 server.abort();
                 return Err(anyhow!(
-                    "could not launch Codex browser login: {error}. Run `grok login --codex` instead"
+                    "could not launch Codex browser login: {error}. Run `open-grok login --codex` instead"
                 ));
             }
         }
@@ -918,7 +918,7 @@ async fn refresh_at(
         return Ok(None);
     };
     if tokens.refresh_token.trim().is_empty() {
-        bail!("Codex OAuth refresh token is missing; run `grok login --codex`");
+        bail!("Codex OAuth refresh token is missing; run `open-grok login --codex`");
     }
     let prior_account_id = tokens
         .account_id
@@ -954,7 +954,7 @@ async fn refresh_at(
                 )
             );
         let action = if permanent {
-            " Run `grok login --codex` to reconnect."
+            " Run `open-grok login --codex` to reconnect."
         } else {
             ""
         };
@@ -1074,14 +1074,14 @@ async fn logout_at(path: &Path, endpoints: &CodexEndpoints) -> Result<bool> {
 pub async fn fetch_usage() -> Result<CodexUsageSnapshot> {
     let endpoints = CodexEndpoints::default();
     let Some(mut credentials) = fresh_credentials().await? else {
-        bail!("Not connected; run `grok login --codex`");
+        bail!("Not connected; run `open-grok login --codex`");
     };
     match fetch_usage_with_credentials(&endpoints, &credentials).await {
         Ok(snapshot) => Ok(snapshot),
         Err(UsageRequestError::Unauthorized) => {
             credentials = force_refresh()
                 .await?
-                .ok_or_else(|| anyhow!("Not connected; run `grok login --codex`"))?;
+                .ok_or_else(|| anyhow!("Not connected; run `open-grok login --codex`"))?;
             fetch_usage_with_credentials(&endpoints, &credentials)
                 .await
                 .map_err(UsageRequestError::into_anyhow)

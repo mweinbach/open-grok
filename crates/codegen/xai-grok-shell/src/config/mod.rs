@@ -9,8 +9,8 @@ pub use xai_grok_config_types::{
 };
 /// Full configuration for the memory system.
 ///
-/// Parsed from the `[memory]` section of `~/.grok/config.toml` or
-/// `.grok/config.toml`. Disabled by default; enabled via
+/// Parsed from the `[memory]` section of `~/.opengrok/config.toml` or
+/// `.opengrok/config.toml`. Disabled by default; enabled via
 /// `--experimental-memory` CLI flag or `GROK_MEMORY=1` env var.
 /// Force-disabled via `GROK_MEMORY=0` (overrides TOML and remote settings).
 ///
@@ -50,7 +50,7 @@ pub struct MemoryConfig {
     /// not under `[memory]`. Pruning is a compaction behavior.
     #[serde(skip)]
     pub pruning: PruningConfig,
-    /// Per-agent memory root override (e.g. `~/.grok/agent-memory/<name>/`).
+    /// Per-agent memory root override (e.g. `~/.opengrok/agent-memory/<name>/`).
     #[serde(skip)]
     pub root_dir_override: Option<std::path::PathBuf>,
     /// When true, the root is already project-scoped so MemoryStorage should
@@ -215,8 +215,8 @@ impl MemoryConfig {
 }
 /// Configuration for subagent (task tool) support.
 ///
-/// Parsed from the `[subagents]` section of `~/.grok/config.toml` or
-/// `.grok/config.toml`. Enabled by default; can be disabled via
+/// Parsed from the `[subagents]` section of `~/.opengrok/config.toml` or
+/// `.opengrok/config.toml`. Enabled by default; can be disabled via
 /// `GROK_SUBAGENTS=0` env var or `[subagents] enabled = false`
 /// in config.toml.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -257,7 +257,7 @@ pub struct SubagentsConfig {
     /// [subagents.roles.implementer]
     /// description = "Implementation agent with full access"
     /// default_capability_mode = "all"
-    /// prompt_file = ".grok/prompts/implementer.md"
+    /// prompt_file = ".opengrok/prompts/implementer.md"
     /// ```
     #[serde(default)]
     pub roles: std::collections::HashMap<String, SubagentRole>,
@@ -269,7 +269,7 @@ pub struct SubagentsConfig {
     ///
     /// [subagents.personas.concise]
     /// instructions = "Be extremely concise. No filler words."
-    /// instructions_file = ".grok/personas/concise.md"
+    /// instructions_file = ".opengrok/personas/concise.md"
     /// ```
     #[serde(default)]
     pub personas: std::collections::HashMap<String, SubagentPersona>,
@@ -382,13 +382,13 @@ impl SubagentsConfig {
     pub fn get_persona(&self, name: &str) -> Option<&SubagentPersona> {
         self.personas.get(name)
     }
-    /// Discover personas from `.grok/personas/` directory.
+    /// Discover personas from `.opengrok/personas/` directory.
     ///
-    /// File-based personas are loaded from `{cwd}/.grok/personas/*.toml`.
+    /// File-based personas are loaded from `{cwd}/.opengrok/personas/*.toml`.
     /// Each file defines a single `SubagentPersona`. The file stem becomes
     /// the persona name. Inline config takes precedence.
     pub fn discover_personas(&mut self, cwd: &std::path::Path) {
-        let dir = cwd.join(".grok").join("personas");
+        let dir = cwd.join(".opengrok").join("personas");
         self.discover_personas_in_dir(&dir);
     }
     /// Validate all role definitions. Returns a list of (role_name, error_message)
@@ -423,15 +423,15 @@ impl SubagentsConfig {
         }
         errors
     }
-    /// Discover roles from `.grok/roles/` directory and merge with inline config.
+    /// Discover roles from `.opengrok/roles/` directory and merge with inline config.
     ///
-    /// File-based roles are loaded from `{cwd}/.grok/roles/*.toml`. Each file
+    /// File-based roles are loaded from `{cwd}/.opengrok/roles/*.toml`. Each file
     /// defines a single `SubagentRole` (same schema as inline `[subagents.roles.*]`).
     /// The file stem becomes the role name.
     ///
     /// Precedence: inline config roles override file-based roles with the same name.
     pub fn discover_roles(&mut self, cwd: &std::path::Path) {
-        let roles_dir = cwd.join(".grok").join("roles");
+        let roles_dir = cwd.join(".opengrok").join("roles");
         self.discover_roles_in_dir(&roles_dir);
     }
     /// Resolve the final subagents config from all sources (in priority order):
@@ -445,7 +445,7 @@ impl SubagentsConfig {
     /// the default.
     ///
     /// When `cwd` is provided, file-based roles are discovered from
-    /// `{cwd}/.grok/roles/*.toml` and merged (inline config takes precedence).
+    /// `{cwd}/.opengrok/roles/*.toml` and merged (inline config takes precedence).
     pub fn resolve(cli_flag: bool, config: &toml::Value, cwd: Option<&std::path::Path>) -> Self {
         let mut result: Self = config
             .get("subagents")
@@ -696,7 +696,7 @@ pub struct ToolsConfig {
     pub respect_gitignore: bool,
     /// Drop tools whose xAI API requires server-side artifact storage
     /// (currently just `video_gen`). Intended for ZDR-bound teams via
-    /// `~/.grok/managed_config.toml`. Defaults to `false`.
+    /// `~/.opengrok/managed_config.toml`. Defaults to `false`.
     pub disable_zdr_incompatible_tools: bool,
     /// Optional S3 bucket config for ZDR video output. When present (and
     /// valid), video tools presign an upload URL and pass it to the API so
@@ -874,7 +874,7 @@ fn walk_toml(
     }
 }
 /// The `[skills]` table from an effective config, shared by the reload
-/// dispatch and `grok inspect`.
+/// dispatch and `open-grok inspect`.
 pub(crate) use crate::config::reloader::parse_skills_config;
 /// Effective config: layers + campaign overlay (remote cache + `GROK_CAMPAIGNS_OVERRIDE`).
 pub use crate::util::config::load_effective_config;
@@ -1336,15 +1336,15 @@ pub fn apply_sandbox(
         sandbox.install();
     }
 }
-/// Load `<cwd>/.grok/config.toml` (with this layer's `[[version_overrides]]`
+/// Load `<cwd>/.opengrok/config.toml` (with this layer's `[[version_overrides]]`
 /// applied). Empty table if the file is missing.
 pub fn load_project_config(cwd: &std::path::Path) -> std::io::Result<toml::Value> {
-    load_config_file(&cwd.join(".grok").join("config.toml"))
+    load_config_file(&cwd.join(".opengrok").join("config.toml"))
 }
 pub use xai_grok_workspace::project_config::find_project_configs;
 /// Resolve the effective `[plugins]` config for a working directory the same
 /// way a session does at reload time: global/user config
-/// ([`load_effective_config`]) plus every ancestor project `.grok/config.toml`
+/// ([`load_effective_config`]) plus every ancestor project `.opengrok/config.toml`
 /// ([`find_project_configs`], extending `paths` and `disabled`) plus the
 /// imported `enabledPlugins` merge.
 ///
@@ -1379,7 +1379,7 @@ pub fn resolve_effective_plugins_config(
     plugins_cfg
 }
 pub use xai_grok_config::{deep_merge_toml, expand_env_vars_in_string, expand_env_vars_in_toml};
-/// Add a plugin path to `[plugins].paths` in `~/.grok/config.toml`.
+/// Add a plugin path to `[plugins].paths` in `~/.opengrok/config.toml`.
 ///
 /// Creates the `[plugins]` section and `paths` array if they don't exist.
 /// Deduplicates: if the path is already present, this is a no-op.
@@ -1421,7 +1421,7 @@ pub fn add_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
     Ok(())
 }
-/// Remove a plugin path from `[plugins].paths` in `~/.grok/config.toml`.
+/// Remove a plugin path from `[plugins].paths` in `~/.opengrok/config.toml`.
 ///
 /// If the path is not found, this is a no-op (returns Ok).
 pub fn remove_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1444,7 +1444,7 @@ pub fn remove_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> 
     std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
     Ok(())
 }
-/// Add a plugin to `[plugins].disabled` in `~/.grok/config.toml`.
+/// Add a plugin to `[plugins].disabled` in `~/.opengrok/config.toml`.
 ///
 /// Creates the `[plugins]` section and `disabled` array if they don't exist.
 /// Deduplicates: if already present, this is a no-op.
@@ -1488,7 +1488,7 @@ pub fn add_disabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::Er
     std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
     Ok(())
 }
-/// Remove a plugin from `[plugins].disabled` in `~/.grok/config.toml`.
+/// Remove a plugin from `[plugins].disabled` in `~/.opengrok/config.toml`.
 ///
 /// If the plugin is not in the disabled list, this is a no-op.
 pub fn remove_disabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1511,7 +1511,7 @@ pub fn remove_disabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error:
     std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
     Ok(())
 }
-/// Add a plugin to `[plugin_cta].dismissed` in `~/.grok/config.toml`.
+/// Add a plugin to `[plugin_cta].dismissed` in `~/.opengrok/config.toml`.
 ///
 /// Creates the `[plugin_cta]` section and `dismissed` array if they don't exist.
 /// Deduplicates: if already present, this is a no-op.
@@ -1563,7 +1563,7 @@ pub fn add_dismissed_plugin_cta_to_file(
     std::fs::write(config_path, toml::to_string_pretty(&config)?)?;
     Ok(())
 }
-/// All plugin ids listed in `[plugin_cta].dismissed` in `~/.grok/config.toml`.
+/// All plugin ids listed in `[plugin_cta].dismissed` in `~/.opengrok/config.toml`.
 ///
 /// Read once (e.g. on catalog load) and cached so the matched-debounce recompute
 /// doesn't parse the config from disk on the UI thread.
@@ -1595,9 +1595,9 @@ pub fn dismissed_plugin_ctas_in_file(
         })
         .unwrap_or_default()
 }
-/// Validate that a hook path is safe to add to `~/.grok/hooks-paths`.
+/// Validate that a hook path is safe to add to `~/.opengrok/hooks-paths`.
 ///
-/// CWE-427: Only paths under `~/.grok/` are allowed to prevent
+/// CWE-427: Only paths under `~/.opengrok/` are allowed to prevent
 /// arbitrary hook path injection that bypasses the project trust gate.
 /// Paths are canonicalized (resolving symlinks and `..`) before checking.
 pub fn validate_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1628,7 +1628,7 @@ pub fn validate_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>>
     let canonical_home = dunce::canonicalize(&grok_home).unwrap_or_else(|_| grok_home.clone());
     if !canonical.starts_with(&canonical_home) {
         return Err(format!(
-            "Hook path must be under ~/.grok/ ({}). Got: {}",
+            "Hook path must be under ~/.opengrok/ ({}). Got: {}",
             canonical_home.display(),
             canonical.display()
         )
@@ -1657,7 +1657,7 @@ pub fn post_install_plugin(repo_key: &str) -> (Vec<String>, Vec<String>) {
     }
     (names, warnings)
 }
-/// Add a plugin to `[plugins].enabled` in `~/.grok/config.toml`.
+/// Add a plugin to `[plugins].enabled` in `~/.opengrok/config.toml`.
 ///
 /// Used for project-scope plugins that are disabled by default.
 /// Deduplicates: if already present, this is a no-op.
@@ -1701,7 +1701,7 @@ pub fn add_enabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::Err
     std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
     Ok(())
 }
-/// Remove a plugin from `[plugins].enabled` in `~/.grok/config.toml`.
+/// Remove a plugin from `[plugins].enabled` in `~/.opengrok/config.toml`.
 pub fn remove_enabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::util::grok_home::grok_home().join("config.toml");
     let content = match std::fs::read_to_string(&config_path) {
@@ -1722,10 +1722,10 @@ pub fn remove_enabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::
     std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
     Ok(())
 }
-/// Add a hook path to `~/.grok/hooks-paths` (one path per line).
+/// Add a hook path to `~/.opengrok/hooks-paths` (one path per line).
 ///
 /// If the path is already present (exact string match), this is a no-op.
-/// CWE-427: The path is validated to be under `~/.grok/` before writing.
+/// CWE-427: The path is validated to be under `~/.opengrok/` before writing.
 pub fn add_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     validate_hooks_path(path)?;
     add_hooks_path_to_file(
@@ -1753,7 +1753,7 @@ pub fn add_hooks_path_to_file(
     writeln!(file, "{}", path)?;
     Ok(())
 }
-/// Remove a hook path from `~/.grok/hooks-paths`.
+/// Remove a hook path from `~/.opengrok/hooks-paths`.
 ///
 /// If the path is not found (exact string match), this is a no-op.
 /// Matches the same exact-string behavior as `add_hooks_path`.

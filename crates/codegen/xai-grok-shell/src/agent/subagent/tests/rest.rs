@@ -502,15 +502,15 @@ fn snapshot_ref_field_in_meta_roundtrips() {
         resumed_from: None,
         child_cwd: None,
         worktree_path: Some("/tmp/grok-wt/sa-snap".into()),
-        snapshot_ref: Some("refs/grok/subagent-snapshots/sa-snap".into()),
+        snapshot_ref: Some("refs/open-grok/subagent-snapshots/sa-snap".into()),
         effective_model_id: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("snapshot_ref"));
-    assert!(json.contains("refs/grok/subagent-snapshots/sa-snap"));
+    assert!(json.contains("refs/open-grok/subagent-snapshots/sa-snap"));
     let parsed: SubagentMeta = serde_json::from_str(&json).unwrap();
     assert_eq!(
-        parsed.snapshot_ref.as_deref(), Some("refs/grok/subagent-snapshots/sa-snap")
+        parsed.snapshot_ref.as_deref(), Some("refs/open-grok/subagent-snapshots/sa-snap")
     );
 }
 #[test]
@@ -562,12 +562,12 @@ fn update_subagent_meta_snapshot_ref_persists_to_disk() {
     let dir = tempfile::TempDir::new().unwrap();
     assert!(write_subagent_meta(dir.path(), & snapshot_test_meta("sa-write")));
     assert!(
-        update_subagent_meta_snapshot_ref(dir.path(), "refs/grok/subagents/sa-write",
+        update_subagent_meta_snapshot_ref(dir.path(), "refs/open-grok/subagents/sa-write",
         "completed"), "persisting the ref into an existing meta.json must report success"
     );
     let data = std::fs::read_to_string(dir.path().join("meta.json")).unwrap();
     let reread: SubagentMeta = serde_json::from_str(&data).unwrap();
-    assert_eq!(reread.snapshot_ref.as_deref(), Some("refs/grok/subagents/sa-write"));
+    assert_eq!(reread.snapshot_ref.as_deref(), Some("refs/open-grok/subagents/sa-write"));
     assert_eq!(reread.status, "completed");
     assert_eq!(reread.worktree_path.as_deref(), Some("/tmp/grok-wt/subagent-x"));
 }
@@ -577,7 +577,7 @@ fn update_subagent_meta_snapshot_ref_persists_to_disk() {
 fn update_subagent_meta_snapshot_ref_reports_failure_when_meta_missing() {
     let dir = tempfile::TempDir::new().unwrap();
     assert!(
-        ! update_subagent_meta_snapshot_ref(dir.path(), "refs/grok/subagents/sa-missing",
+        ! update_subagent_meta_snapshot_ref(dir.path(), "refs/open-grok/subagents/sa-missing",
         "completed")
     );
 }
@@ -591,12 +591,12 @@ fn snapshot_ref_write_promotes_nonterminal_status_to_terminal() {
     meta.status = "running".into();
     assert!(write_subagent_meta(dir.path(), & meta));
     assert!(
-        update_subagent_meta_snapshot_ref(dir.path(), "refs/grok/subagents/x",
+        update_subagent_meta_snapshot_ref(dir.path(), "refs/open-grok/subagents/x",
         "completed")
     );
     let data = std::fs::read_to_string(dir.path().join("meta.json")).unwrap();
     let reread: SubagentMeta = serde_json::from_str(&data).unwrap();
-    assert_eq!(Some("refs/grok/subagents/x"), reread.snapshot_ref.as_deref());
+    assert_eq!(Some("refs/open-grok/subagents/x"), reread.snapshot_ref.as_deref());
     assert_eq!("completed", reread.status);
 }
 /// The coordinator setter stamps the snapshot ref onto the in-memory
@@ -622,17 +622,17 @@ async fn set_completed_snapshot_ref_updates_in_memory_entry() {
         .unwrap();
     assert!(before.snapshot_ref.is_none());
     coordinator
-        .set_completed_snapshot_ref("sa-mem", "refs/grok/subagents/sa-mem".into());
+        .set_completed_snapshot_ref("sa-mem", "refs/open-grok/subagents/sa-mem".into());
     let after = coordinator
         .resumable_source_for("sa-mem", "session-A", Path::new("/tmp"))
         .unwrap();
-    assert_eq!(after.snapshot_ref.as_deref(), Some("refs/grok/subagents/sa-mem"));
+    assert_eq!(after.snapshot_ref.as_deref(), Some("refs/open-grok/subagents/sa-mem"));
 }
 /// Unknown id is a no-op (entry already TTL-evicted; meta.json still holds it).
 #[test]
 fn set_completed_snapshot_ref_unknown_id_is_noop() {
     let mut coordinator = SubagentCoordinator::new();
-    coordinator.set_completed_snapshot_ref("ghost", "refs/grok/subagents/ghost".into());
+    coordinator.set_completed_snapshot_ref("ghost", "refs/open-grok/subagents/ghost".into());
     assert!(
         coordinator.resumable_source_for("ghost", "session-A", Path::new("/tmp"))
         .is_none()
@@ -741,7 +741,7 @@ async fn completion_snapshot_sequence_persists_ref_then_removes_worktree() {
     let meta_dir = temp.path().join("meta");
     write_subagent_meta(&meta_dir, &snapshot_test_meta("glue-1"));
     let mut coordinator = coordinator_with_completed("glue-1");
-    let ref_name = "refs/grok/subagents/glue-1";
+    let ref_name = "refs/open-grok/subagents/glue-1";
     let snapshot_ref = crate::session::worktree::snapshot_subagent_worktree(
             &wt,
             &repo,
@@ -784,14 +784,14 @@ async fn gate_on_completion_clears_model_facing_worktree_path_but_resume_retains
     }
     coordinator.move_to_completed("disp-1", "task".into(), "explore".into(), result);
     coordinator
-        .set_completed_snapshot_ref("disp-1", "refs/grok/subagents/disp-1".into());
+        .set_completed_snapshot_ref("disp-1", "refs/open-grok/subagents/disp-1".into());
     let listed = coordinator.completed.get("disp-1").expect("completed entry");
     assert_eq!(None, listed.result.worktree_path);
     let src = coordinator
         .resumable_source_for("disp-1", "session-A", Path::new("/tmp"))
         .unwrap();
     assert_eq!(Some(wt), src.worktree_path);
-    assert_eq!(Some("refs/grok/subagents/disp-1"), src.snapshot_ref.as_deref());
+    assert_eq!(Some("refs/open-grok/subagents/disp-1"), src.snapshot_ref.as_deref());
 }
 /// Gate on but the worktree was NOT removed (snapshot/persist/remove failed):
 /// the model-facing `result.worktree_path` is RETAINED so the parent can still
@@ -839,7 +839,7 @@ async fn disposal_completes_before_subagent_is_observable() {
     write_subagent_meta(&meta_dir, &snapshot_test_meta("order-1"));
     let mut coordinator = SubagentCoordinator::new();
     coordinator.insert(dummy_tracker("order-1", "session-A", "explore", "task"));
-    let ref_name = "refs/grok/subagents/order-1";
+    let ref_name = "refs/open-grok/subagents/order-1";
     let snapshot_ref = crate::session::worktree::snapshot_subagent_worktree(
             &wt,
             &repo,
@@ -1232,7 +1232,7 @@ fn resume_source_worktree_reuse() {
         child_session_id: "child-wt".into(),
         child_cwd: "/tmp/worktree".into(),
         worktree_path: Some(
-            PathBuf::from("/home/user/.grok/worktrees/myrepo/subagent-sub-wt"),
+            PathBuf::from("/home/user/.opengrok/worktrees/myrepo/subagent-sub-wt"),
         ),
         snapshot_ref: None,
         subagent_type: "general-purpose".into(),
@@ -1242,7 +1242,7 @@ fn resume_source_worktree_reuse() {
     let worktree = source_with_worktree.worktree_path.clone();
     assert_eq!(
         worktree.as_deref(),
-        Some(Path::new("/home/user/.grok/worktrees/myrepo/subagent-sub-wt",)),
+        Some(Path::new("/home/user/.opengrok/worktrees/myrepo/subagent-sub-wt",)),
         "should reuse source worktree"
     );
     let source_without_worktree = ResumeSourceData {
@@ -1317,7 +1317,7 @@ fn select_override_cwd_resume_never_falls_through_to_request_cwd() {
         child_session_id: "child-wt".into(),
         child_cwd: "/tmp/whatever".into(),
         worktree_path: Some(
-            PathBuf::from("/home/user/.grok/worktrees/repo/subagent-sub-wt"),
+            PathBuf::from("/home/user/.opengrok/worktrees/repo/subagent-sub-wt"),
         ),
         snapshot_ref: None,
         subagent_type: "general-purpose".into(),

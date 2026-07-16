@@ -85,7 +85,7 @@ async fn empty_dk_response_marker_binds_the_verified_deployment_id() {
     assert!(xai_grok_shell::managed_config::managed_policy_gate().is_ok());
 }
 
-/// A signature-rejected sync surfaces as failure in BOTH `grok setup` and the
+/// A signature-rejected sync surfaces as failure in BOTH `open-grok setup` and the
 /// post-login sync — never as Installed/NoChange while nothing was persisted.
 #[tokio::test]
 #[serial]

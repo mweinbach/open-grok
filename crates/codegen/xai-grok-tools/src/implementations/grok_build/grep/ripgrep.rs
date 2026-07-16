@@ -38,7 +38,7 @@ fn resolve_bundled_rg() -> std::io::Result<PathBuf> {
 /// Get the path to the ripgrep executable.
 ///
 /// In release builds with bundling enabled, this extracts the bundled ripgrep
-/// binary to ~/.grok/vendor/ and returns that path.
+/// binary to ~/.opengrok/vendor/ and returns that path.
 /// Otherwise, assumes `rg` is in PATH.
 pub fn rg_path() -> PathBuf {
     static RG_EXEC: OnceLock<PathBuf> = OnceLock::new();

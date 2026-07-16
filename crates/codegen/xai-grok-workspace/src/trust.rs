@@ -1,6 +1,6 @@
 //! Folder-trust store ("do you trust this folder?").
 //!
-//! Persists per-folder trust decisions to `~/.grok/trusted_folders.toml`.
+//! Persists per-folder trust decisions to `~/.opengrok/trusted_folders.toml`.
 //! This is the durable backing store for the VS-Code-style folder-trust gate
 //! that decides whether repo-local MCP / LSP servers (which run arbitrary
 //! commands from repo-controlled config files) are allowed to spawn.
@@ -19,11 +19,11 @@
 //! is written atomically with owner-only (`0600`) permissions.
 //!
 //! The store is rooted at [`xai_grok_config::user_grok_home`] — the **Option**
-//! home that resolves to `None` (rather than a cwd-relative `./.grok`) when
-//! neither `$GROK_HOME` nor a home directory is set (e.g. a minimal container /
+//! home that resolves to `None` (rather than a cwd-relative `./.opengrok`) when
+//! neither `$OPENGROK_HOME` nor a home directory is set (e.g. a minimal container /
 //! CI). In that no-home environment [`TrustStore::load`] yields an **empty,
 //! trust-nothing** store that persists nothing, so a cloned repo can never ship
-//! a `./.grok/trusted_folders.toml` that self-trusts its own checkout (fail
+//! a `./.opengrok/trusted_folders.toml` that self-trusts its own checkout (fail
 //! closed).
 
 use std::collections::BTreeMap;
@@ -34,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// Filename of the folder-trust store under `~/.grok/`.
+/// Filename of the folder-trust store under `~/.opengrok/`.
 pub const TRUST_FILE_NAME: &str = "trusted_folders.toml";
 
 /// A single folder's trust record.
@@ -106,7 +106,7 @@ impl TrustStore {
     ///
     /// Resolves via [`xai_grok_config::user_grok_home`], never
     /// [`xai_grok_config::grok_home`], so it never falls back to a cwd-relative
-    /// `./.grok` — that fallback would let an untrusted cloned repo's `.grok`
+    /// `./.opengrok` — that fallback would let an untrusted cloned repo's `.opengrok`
     /// masquerade as the user-global store and self-trust the checkout.
     pub fn default_path() -> Option<PathBuf> {
         Self::default_path_in(xai_grok_config::user_grok_home())
@@ -352,14 +352,14 @@ impl TrustStore {
 /// repo (trust applies to the whole repo), otherwise the canonicalized `cwd`.
 ///
 /// A grok-managed worktree first collapses onto its recorded source repo's git
-/// ROOT (via the `~/.grok/worktrees.db` registry), so every `grok -w` worktree
+/// ROOT (via the `~/.opengrok/worktrees.db` registry), so every `open-grok -w` worktree
 /// shares one trust key regardless of creation mode — including standalone clones
 /// that git can't link back to their source — and regardless of the subdir
-/// `grok -w` was launched from (the recorded source repo may be a repo subdir).
+/// `open-grok -w` was launched from (the recorded source repo may be a repo subdir).
 /// Non-registry git worktrees fall through to the git-topology collapse below.
 ///
 /// A linked git worktree collapses onto its MAIN checkout's root so every
-/// `grok -w` worktree of a repo shares one trust key. The collapse fires ONLY
+/// `open-grok -w` worktree of a repo shares one trust key. The collapse fires ONLY
 /// for the conventional `<workdir>/.git` layout — i.e. the common gitdir
 /// resolves back to `<main_workdir>/.git`. For bare or `--separate-git-dir`
 /// repos (where the common gitdir's inferred workdir would be the gitdir's
@@ -455,7 +455,7 @@ fn now_unix() -> Option<i64> {
 /// RAII exclusive advisory lock on a sidecar lock file, released on drop.
 ///
 /// Serializes concurrent `TrustStore` writers (multiple processes / instances
-/// sharing `~/.grok/`) across the whole read-modify-write so updates merge
+/// sharing `~/.opengrok/`) across the whole read-modify-write so updates merge
 /// instead of clobbering each other. The lock is advisory; only writers that
 /// take it (i.e. this code) coordinate, which is sufficient since this store is
 /// the sole writer of its file.
@@ -486,7 +486,7 @@ impl Drop for ExclusiveLock {
 /// One-time migration of legacy project-hook trust grants into the unified
 /// folder-trust store. Idempotent and guarded to run at most once per process.
 ///
-/// The legacy `~/.grok/trusted-hook-projects` file listed one canonical project
+/// The legacy `~/.opengrok/trusted-hook-projects` file listed one canonical project
 /// path per line; each becomes a folder-trust grant so the unified gate honors
 /// prior decisions. The legacy file is then renamed to `*.migrated` so it is
 /// read only once. A no-op when the legacy file is absent/already migrated or no
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn default_path_in_maps_home_and_preserves_no_home() {
         // With a resolvable home the store sits at <home>/trusted_folders.toml.
-        let home = PathBuf::from("/home/alice/.grok");
+        let home = PathBuf::from("/home/alice/.opengrok");
         assert_eq!(
             TrustStore::default_path_in(Some(home.clone())),
             Some(home.join(TRUST_FILE_NAME))
@@ -724,8 +724,8 @@ mod tests {
 
         // With NO resolvable home the path is `None` — never a synthesized
         // fallback. This is the regression guard that keeps the store off the
-        // cwd-relative `./.grok` that grok_home() would invent, which is exactly
-        // how a cloned repo's own `<repo>/.grok/trusted_folders.toml` could
+        // cwd-relative `./.opengrok` that grok_home() would invent, which is exactly
+        // how a cloned repo's own `<repo>/.opengrok/trusted_folders.toml` could
         // masquerade as the user-global store and self-trust the checkout.
         assert_eq!(TrustStore::default_path_in(None), None);
     }
@@ -746,7 +746,7 @@ mod tests {
         // Simulate the no-home environment where `default_path()` is `None`:
         // `load()` yields `empty()`, a store with no backing path. It must
         // trust nothing and silently no-op on writes — never touching a
-        // cwd-relative `./.grok`.
+        // cwd-relative `./.opengrok`.
         let mut store = TrustStore::empty();
         assert!(store.is_empty());
 
@@ -1277,7 +1277,7 @@ mod tests {
 
     #[test]
     fn workspace_key_collapses_linked_worktrees_onto_main_checkout() {
-        // Every linked `grok -w` worktree of a repo must share ONE trust key:
+        // Every linked `open-grok -w` worktree of a repo must share ONE trust key:
         // its main checkout's root. Build a real repo + two linked worktrees and
         // assert each collapses onto the main checkout (so it is trusted once,
         // not re-prompted per worktree).
@@ -1423,11 +1423,11 @@ mod tests {
     // how the caller binds the fixture's return.
     use crate::LockedTestEnv;
 
-    /// Point `GROK_HOME` at an isolated tempdir and register one grok-managed
+    /// Point `OPENGROK_HOME` at an isolated tempdir and register one grok-managed
     /// worktree at `<home>/worktrees/repo/<name>` recording `source_repo` and
     /// `creation_mode`. The worktree dir is a PLAIN directory — NOT a git linked
     /// worktree — so only the registry can collapse it. Returns `(env, worktree
-    /// dir)`; the [`LockedTestEnv`] holds the lock and restores `GROK_HOME` on
+    /// dir)`; the [`LockedTestEnv`] holds the lock and restores `OPENGROK_HOME` on
     /// drop (before releasing the lock), so the caller may bind it any way.
     fn register_grok_worktree(
         temp: &tempfile::TempDir,
@@ -1446,7 +1446,7 @@ mod tests {
 
         // Acquire the lock, then set the env under it (LockedTestEnv restores the
         // env before releasing the lock on drop).
-        let env = LockedTestEnv::lock().set("GROK_HOME", &home);
+        let env = LockedTestEnv::lock().set("OPENGROK_HOME", &home);
 
         let db = WorktreeDb::open(&home).unwrap();
         let record = WorktreeRecord {

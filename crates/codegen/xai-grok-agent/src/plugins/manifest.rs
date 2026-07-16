@@ -2,7 +2,7 @@
 //!
 //! The canonical manifest location is `plugin.json` at the plugin root.
 //! Fallback locations (checked in order when the root manifest is absent):
-//! 1. `.grok-plugin/plugin.json`
+//! 1. `.opengrok-plugin/plugin.json`
 //! 2. `.claude-plugin/plugin.json`
 //!
 //! If no manifest is found at all, the plugin can still function via
@@ -292,7 +292,7 @@ fn resolve_dirs(
 /// Manifest search order within a plugin directory.
 const MANIFEST_PATHS: &[&str] = &[
     "plugin.json",
-    ".grok-plugin/plugin.json",
+    ".opengrok-plugin/plugin.json",
     ".claude-plugin/plugin.json",
 ];
 
@@ -567,11 +567,11 @@ mod tests {
     fn load_manifest_fallback_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let plugin_root = tmp.path().join("fallback-plugin");
-        std::fs::create_dir_all(plugin_root.join(".grok-plugin")).unwrap();
+        std::fs::create_dir_all(plugin_root.join(".opengrok-plugin")).unwrap();
 
-        // Write manifest in .grok-plugin/ fallback location
+        // Write manifest in .opengrok-plugin/ fallback location
         std::fs::write(
-            plugin_root.join(".grok-plugin/plugin.json"),
+            plugin_root.join(".opengrok-plugin/plugin.json"),
             r#"{"name": "fallback-plugin"}"#,
         )
         .unwrap();
@@ -586,12 +586,12 @@ mod tests {
     fn load_manifest_root_wins_over_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let plugin_root = tmp.path().join("priority-test");
-        std::fs::create_dir_all(plugin_root.join(".grok-plugin")).unwrap();
+        std::fs::create_dir_all(plugin_root.join(".opengrok-plugin")).unwrap();
 
         // Write both root and fallback
         std::fs::write(plugin_root.join("plugin.json"), r#"{"name": "root-wins"}"#).unwrap();
         std::fs::write(
-            plugin_root.join(".grok-plugin/plugin.json"),
+            plugin_root.join(".opengrok-plugin/plugin.json"),
             r#"{"name": "fallback-loses"}"#,
         )
         .unwrap();

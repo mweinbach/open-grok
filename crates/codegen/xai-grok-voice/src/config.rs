@@ -5,7 +5,7 @@ use crate::error::VoiceError;
 /// Voice settings for the STT transport.
 ///
 /// Carries the transport knobs parsed from optional `[voice]` in
-/// `~/.grok/config.toml` (STT URL pieces, language, sample rate, endpointing)
+/// `~/.opengrok/config.toml` (STT URL pieces, language, sample rate, endpointing)
 /// plus two `#[serde(skip)]` request-identity fields the pager stamps in after
 /// parsing (documented on the fields below). Whether voice is available is
 /// resolved by the pager (GA default on; remote kill switch /

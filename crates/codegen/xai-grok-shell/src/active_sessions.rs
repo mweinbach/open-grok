@@ -1,4 +1,4 @@
-//! Tracks open TUI sessions in `~/.grok/active_sessions.json` for crash
+//! Tracks open TUI sessions in `~/.opengrok/active_sessions.json` for crash
 //! recovery. Clean exit removes the entry; crash leaves it behind. On next
 //! launch, [`collect_crashed`] finds orphaned entries (dead PIDs).
 

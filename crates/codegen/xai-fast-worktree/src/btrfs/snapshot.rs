@@ -179,17 +179,17 @@ pub fn create_snapshot_with_symlink(btrfs_info: &BtrfsInfo, dest: &Path) -> Resu
     create_snapshot(snapshot_source, &snapshot_path)?;
 
     // When the snapshot is inside the source (subvol mount case), the snapshot
-    // contains an empty .grok-snapshots/ directory (btrfs excludes nested subvolumes
+    // contains an empty .opengrok-snapshots/ directory (btrfs excludes nested subvolumes
     // from snapshots, leaving only empty directory placeholders). Remove it to
     // keep the worktree clean.
-    let stale_snapshots_dir = snapshot_path.join(".grok-snapshots");
+    let stale_snapshots_dir = snapshot_path.join(".opengrok-snapshots");
     if stale_snapshots_dir.exists()
         && let Err(e) = std::fs::remove_dir(&stale_snapshots_dir)
     {
         tracing::debug!(
             path = %stale_snapshots_dir.display(),
             error = %e,
-            "failed to remove stale .grok-snapshots placeholder from snapshot"
+            "failed to remove stale .opengrok-snapshots placeholder from snapshot"
         );
     }
 
@@ -224,7 +224,7 @@ pub fn create_snapshot_with_symlink(btrfs_info: &BtrfsInfo, dest: &Path) -> Resu
 /// worktree `dest`.
 ///
 /// When the btrfs mount IS the source repo (subvol mount without a separate
-/// root mount), snapshots go under `.grok-snapshots/` to stay hidden from git;
+/// root mount), snapshots go under `.opengrok-snapshots/` to stay hidden from git;
 /// otherwise they go under `worktrees/`.
 ///
 /// Name is `<basename>-<hash of full dest>`: basename alone collides when two repos
@@ -234,7 +234,7 @@ pub fn create_snapshot_with_symlink(btrfs_info: &BtrfsInfo, dest: &Path) -> Resu
 /// the identical layout.
 pub fn snapshot_dest_path(btrfs_mount: &Path, subvolume_root: &Path, dest: &Path) -> PathBuf {
     let subdir = if btrfs_mount == subvolume_root {
-        BTRFS_SNAPSHOT_SUBDIRS[1] // ".grok-snapshots"
+        BTRFS_SNAPSHOT_SUBDIRS[1] // ".opengrok-snapshots"
     } else {
         BTRFS_SNAPSHOT_SUBDIRS[0] // "worktrees"
     };
@@ -349,7 +349,7 @@ pub fn delete_snapshot(path: &Path) -> Result<()> {
 ///   delete to a subvolume elsewhere),
 /// - lives directly inside a snapshot-storage directory — its real,
 ///   canonicalized parent's final component is one of [`BTRFS_SNAPSHOT_SUBDIRS`]
-///   (`worktrees` or `.grok-snapshots`),
+///   (`worktrees` or `.opengrok-snapshots`),
 /// - and that directory sits **directly under a real btrfs mount point** (from
 ///   the live mount table), anchoring the delete to grok-managed storage rather
 ///   than any directory that merely happens to be named `worktrees`.
@@ -394,7 +394,7 @@ fn is_safe_snapshot_delete_target_in(snapshot_path: &Path, btrfs_mounts: &[PathB
     let Ok(canonical_parent) = dunce::canonicalize(parent) else {
         return false;
     };
-    // Parent must be a snapshot-storage dir (`worktrees` / `.grok-snapshots`)...
+    // Parent must be a snapshot-storage dir (`worktrees` / `.opengrok-snapshots`)...
     let named_ok = canonical_parent
         .file_name()
         .and_then(|n| n.to_str())
@@ -431,9 +431,9 @@ pub const BTRFS_META_SUFFIX: &str = ".btrfs-meta.json";
 /// Subdirectory names used to store btrfs snapshots inside a btrfs mount point.
 ///
 /// `"worktrees"` is used when a separate btrfs root mount exists (common case).
-/// `".grok-snapshots"` is used when the btrfs mount IS the repo subvolume
+/// `".opengrok-snapshots"` is used when the btrfs mount IS the repo subvolume
 /// (dot-prefixed to stay hidden from git).
-pub const BTRFS_SNAPSHOT_SUBDIRS: &[&str] = &["worktrees", ".grok-snapshots"];
+pub const BTRFS_SNAPSHOT_SUBDIRS: &[&str] = &["worktrees", ".opengrok-snapshots"];
 
 /// Compute the sibling metadata file path for a snapshot directory.
 pub fn btrfs_meta_path(snapshot_path: &Path) -> Option<PathBuf> {
@@ -662,7 +662,7 @@ mod tests {
         let meta = BtrfsSnapshotMetadata {
             kind: Cow::Borrowed("btrfs"),
             snapshot_path: PathBuf::from("/mnt/btrfs/worktrees/wt-abc"),
-            mount_target: PathBuf::from("/home/user/.grok/worktrees/repo/session/wt-abc"),
+            mount_target: PathBuf::from("/home/user/.opengrok/worktrees/repo/session/wt-abc"),
             created_at: "1740000000s-since-epoch".to_string(),
         };
         let json = serde_json::to_string_pretty(&meta).unwrap();
@@ -679,7 +679,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let snapshot_path = tmp.path().join("wt-abc");
         std::fs::create_dir(&snapshot_path).unwrap();
-        let mount_target = Path::new("/home/user/.grok/worktrees/wt-abc");
+        let mount_target = Path::new("/home/user/.opengrok/worktrees/wt-abc");
 
         write_btrfs_metadata(&snapshot_path, mount_target).unwrap();
 
@@ -726,7 +726,7 @@ mod tests {
         // btrfs mount differs from subvolume root → snapshots under worktrees/.
         let btrfs_mount = Path::new("/mnt/btrfs");
         let subvolume_root = Path::new("/workspace/repo");
-        let dest = Path::new("/home/user/.grok/worktrees/repo/session/wt-abc");
+        let dest = Path::new("/home/user/.opengrok/worktrees/repo/session/wt-abc");
         let got = snapshot_dest_path(btrfs_mount, subvolume_root, dest);
         assert_eq!(got.parent().unwrap(), Path::new("/mnt/btrfs/worktrees"));
         assert_hashed_name(got.file_name().unwrap().to_str().unwrap(), "wt-abc");
@@ -736,13 +736,13 @@ mod tests {
 
     #[test]
     fn test_snapshot_dest_path_subvol_mount() {
-        // btrfs mount IS the subvolume root → snapshots under .grok-snapshots/.
+        // btrfs mount IS the subvolume root → snapshots under .opengrok-snapshots/.
         let mount = Path::new("/workspace/repo");
-        let dest = Path::new("/home/user/.grok/worktrees/repo/session/wt-xyz");
+        let dest = Path::new("/home/user/.opengrok/worktrees/repo/session/wt-xyz");
         let got = snapshot_dest_path(mount, mount, dest);
         assert_eq!(
             got.parent().unwrap(),
-            Path::new("/workspace/repo/.grok-snapshots")
+            Path::new("/workspace/repo/.opengrok-snapshots")
         );
         assert_hashed_name(got.file_name().unwrap().to_str().unwrap(), "wt-xyz");
     }
@@ -762,8 +762,8 @@ mod tests {
         // same on-disk snapshot (the cross-repo data-loss collision).
         let btrfs_mount = Path::new("/mnt/btrfs");
         let subvolume_root = Path::new("/workspace/repo");
-        let dest_a = Path::new("/home/user/.grok/worktrees/repo-a/session/wt-abc");
-        let dest_b = Path::new("/home/user/.grok/worktrees/repo-b/session/wt-abc");
+        let dest_a = Path::new("/home/user/.opengrok/worktrees/repo-a/session/wt-abc");
+        let dest_b = Path::new("/home/user/.opengrok/worktrees/repo-b/session/wt-abc");
         let a = snapshot_dest_path(btrfs_mount, subvolume_root, dest_a);
         let b = snapshot_dest_path(btrfs_mount, subvolume_root, dest_b);
         assert_ne!(
@@ -781,7 +781,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let snapshot_path = tmp.path().join("worktrees").join("wt-abc-deadbeef");
         std::fs::create_dir_all(&snapshot_path).unwrap();
-        let dest = Path::new("/home/user/.grok/worktrees/repo-a/session/wt-abc");
+        let dest = Path::new("/home/user/.opengrok/worktrees/repo-a/session/wt-abc");
 
         // No metadata yet → cannot prove ownership → refuse.
         assert!(!snapshot_meta_targets(&snapshot_path, dest));
@@ -791,7 +791,7 @@ mod tests {
         assert!(snapshot_meta_targets(&snapshot_path, dest));
 
         // Metadata for a DIFFERENT dest → must refuse (would clobber other session).
-        let other = Path::new("/home/user/.grok/worktrees/repo-b/session/wt-abc");
+        let other = Path::new("/home/user/.opengrok/worktrees/repo-b/session/wt-abc");
         assert!(!snapshot_meta_targets(&snapshot_path, other));
     }
 
@@ -800,7 +800,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let snapshot_path = tmp.path().join("worktrees").join("wt-abc-deadbeef");
         std::fs::create_dir_all(&snapshot_path).unwrap();
-        let dest = Path::new("/home/user/.grok/worktrees/repo-a/session/wt-abc");
+        let dest = Path::new("/home/user/.opengrok/worktrees/repo-a/session/wt-abc");
 
         // No sibling meta → crashed-creation orphan → reclaimable.
         assert_eq!(
@@ -816,7 +816,7 @@ mod tests {
         );
 
         // Meta records a different dest → another session → must refuse.
-        let other = Path::new("/home/user/.grok/worktrees/repo-b/session/wt-abc");
+        let other = Path::new("/home/user/.opengrok/worktrees/repo-b/session/wt-abc");
         assert_eq!(
             snapshot_meta_state(&snapshot_path, other),
             SnapshotMetaState::Mismatch

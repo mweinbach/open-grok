@@ -1432,7 +1432,7 @@ fn make_version_mismatch_notification(
             "clientVersion" : client_version, "leaderVersion" : leader_version, "message"
             :
             format!("Client version {client_version} differs from leader version \
-                     {leader_version}. Restart the grok binary to use the same version.")
+                     {leader_version}. Restart open-grok to use the same version.")
             } }
         )
         .to_string(),
@@ -2413,7 +2413,7 @@ mod tests {
     /// Relay demand gate (relay-on-demand): Stdio registrations must NOT
     /// signal relay demand — a leader serving only interactive clients (TUI
     /// dashboard, IDE) keeps the grok.com relay off. The first Headless
-    /// registration (devbox / `grok agent headless` flow) flips the watch so
+    /// registration (devbox / `open-grok agent headless` flow) flips the watch so
     /// `run_leader` starts the deferred relay connection.
     #[tokio::test]
     async fn relay_demand_signals_only_on_headless_registration() {
@@ -3815,6 +3815,13 @@ mod tests {
                 .unwrap_or("")
                 .contains("0.1.157"),
             "message should mention the client version"
+        );
+        assert!(
+            json["params"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Restart open-grok"),
+            "message should name the Open Grok executable"
         );
     }
     #[test]

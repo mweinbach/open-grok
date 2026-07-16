@@ -312,7 +312,7 @@ pub enum FilterValue {
 }
 
 /// Persisted dashboard configuration stored under `[dashboard]` in
-/// `~/.grok/config.toml`. Lenient — corrupted fields fall back to
+/// `~/.opengrok/config.toml`. Lenient — corrupted fields fall back to
 /// defaults (edge case 12).
 ///
 /// Pinned + reorder are keyed by stable session ids (see
@@ -4428,7 +4428,7 @@ pub fn load_persisted_enabled() -> Option<bool> {
         .and_then(|v| v.as_bool())
 }
 
-/// Load the full persisted dashboard from `~/.grok/config.toml`.
+/// Load the full persisted dashboard from `~/.opengrok/config.toml`.
 ///
 /// Returns `None` only when the file is missing or completely unreadable.
 /// Malformed individual fields fall back to defaults silently (edge case
@@ -4483,7 +4483,7 @@ pub fn load_persisted_from_path(path: &std::path::Path) -> Option<PersistedDashb
 /// non-empty AND unparseable, meaning we MUST NOT overwrite it (the
 /// file may contain user data we cannot interpret). Without this
 /// guard, a single dashboard pin would clobber every other table in
-/// `~/.grok/config.toml` (`[ui]`, `[hints]`, `[mcpServers]`, …).
+/// `~/.opengrok/config.toml` (`[ui]`, `[hints]`, `[mcpServers]`, …).
 ///
 /// Atomic write via `<path>.dashboard.tmp.<pid>`
 /// + rename, so concurrent readers never observe a half-truncated file.

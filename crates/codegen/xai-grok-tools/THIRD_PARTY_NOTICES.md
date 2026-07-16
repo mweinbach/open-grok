@@ -66,7 +66,7 @@ SOFTWARE.
 ## Bundled tool binaries
 
 Release builds of this crate embed unmodified, prebuilt binaries of the
-tools below (see `build.rs`); they are self-extracted to `~/.grok/vendor/`
+tools below (see `build.rs`); they are self-extracted to `~/.opengrok/vendor/`
 at runtime. Which tools are embedded in a given build depends on what the
 release pipeline supplies at build time:
 
@@ -75,7 +75,7 @@ release pipeline supplies at build time:
 - **ugrep** and **bfs** are embedded only when the release pipeline supplies
   static binaries via `GROK_TOOLS_BUNDLE_UGREP_PATH` /
   `GROK_TOOLS_BUNDLE_BFS_PATH`. When those are unset the tools are not
-  bundled, and the runtime instead resolves them from `~/.grok/vendor/` or
+  bundled, and the runtime instead resolves them from `~/.opengrok/vendor/` or
   `$PATH` if the user has installed them. Their license terms are included
   below so that any build that does bundle them is covered.
 

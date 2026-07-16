@@ -2540,7 +2540,7 @@ mod tests {
         // across rows. The whole path must be clickable (one overlay region
         // per row, all pointing at the full file:// URL) — not just the
         // leading path fragment on the first row.
-        let path = "/Users/alice/.grok/sessions/%2FUsers%2Falice%2Fcode%2Fxai/\
+        let path = "/Users/alice/.opengrok/sessions/%2FUsers%2Falice%2Fcode%2Fxai/\
                     019e0000-0000-7000-8000-000000000001/images/1.jpg";
         let entries = vec![make_markdown_entry(&format!(
             "Image generated and saved to {path}\n"

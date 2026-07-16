@@ -508,7 +508,7 @@ fn usage_fetched_renders_xai_and_explicit_codex_disconnected_state() {
                 subscription_tier: Some("supergrok".to_string()),
                 autotopup: crate::views::credit_bar::AutoTopupFetch::Cleared,
             }),
-            codex: Err("Not connected; run `grok login --codex`".to_string()),
+            codex: Err("Not connected; run `open-grok login --codex`".to_string()),
         }),
         &mut app,
     );

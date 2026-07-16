@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Runs once after npm install/update. Reads the grok binary from the
 // matching per-platform optional dependency (@xai-official/grok-<platform>)
-// and installs it to ~/.grok/bin/ using versioned filenames:
+// and installs it to ~/.opengrok/bin/ using versioned filenames:
 //
 //   Unix:    grok-<version>  +  grok  (symlink)
 //   Windows: grok-<version>.exe  +  grok.exe  (copy)
@@ -16,7 +16,7 @@ const zlib = require('zlib');
 const { execSync } = require('child_process');
 const TOML = require('@iarna/toml');
 
-const CANONICAL_DIR = path.join(os.homedir(), '.grok', 'bin');
+const CANONICAL_DIR = path.join(os.homedir(), '.opengrok', 'bin');
 
 const key = `${process.platform}-${process.arch}`;
 const SUPPORTED = new Set([
@@ -176,7 +176,7 @@ cleanupOldVersions('grok');
 cleanupOldVersions('grok-pager');
 
 // Write installer config
-const configDir = path.join(os.homedir(), '.grok');
+const configDir = path.join(os.homedir(), '.opengrok');
 const configPath = path.join(configDir, 'config.toml');
 let obj = {};
 try { obj = TOML.parse(fs.readFileSync(configPath, 'utf8')); } catch { }
@@ -203,12 +203,12 @@ if (npmRegistry) {
 fs.writeFileSync(configPath, TOML.stringify(obj), 'utf8');
 
 // Shell completions: print setup hints (no silent shell config mutation).
-// Set GROK_INSTALL_COMPLETIONS=1 to auto-generate to ~/.grok/completions.
+// Set GROK_INSTALL_COMPLETIONS=1 to auto-generate to ~/.opengrok/completions.
 const GROK_PATH = path.join(CANONICAL_DIR, `grok${EXE}`);
 if (process.env.GROK_INSTALL_COMPLETIONS === '1' && !IS_WINDOWS) {
     try {
         const { spawnSync } = require('child_process');
-        const completionsDir = path.join(os.homedir(), '.grok', 'completions');
+        const completionsDir = path.join(os.homedir(), '.opengrok', 'completions');
         const bashPath = path.join(completionsDir, 'bash', 'grok.bash');
         const zshPath = path.join(completionsDir, 'zsh', '_grok');
         fs.mkdirSync(path.dirname(bashPath), { recursive: true });
@@ -217,7 +217,7 @@ if (process.env.GROK_INSTALL_COMPLETIONS === '1' && !IS_WINDOWS) {
         if (bashRes.status === 0) fs.writeFileSync(bashPath, bashRes.stdout);
         const zshRes = spawnSync(GROK_PATH, ['completions', 'zsh'], { encoding: 'utf8' });
         if (zshRes.status === 0) fs.writeFileSync(zshPath, zshRes.stdout);
-        console.log('Completions generated to ~/.grok/completions (bash/zsh)');
+        console.log('Completions generated to ~/.opengrok/completions (bash/zsh)');
     } catch {}
 } else if (!IS_WINDOWS) {
     console.log('Tip: grok completions bash > ~/.local/share/bash-completion/completions/grok');

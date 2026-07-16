@@ -393,7 +393,7 @@ pub(in crate::app::dispatch) fn dispatch_exit_session(app: &mut AppView) -> Vec<
     effects
 }
 /// Handle the user accepting the folder-trust question: persist the grant for
-/// the workspace (writes `~/.grok/trusted_folders.toml`), mark trust resolved,
+/// the workspace (writes `~/.opengrok/trusted_folders.toml`), mark trust resolved,
 /// then replay any deferred session startup (only if auth is also done).
 pub(in crate::app::dispatch) fn dispatch_trust_folder(app: &mut AppView) -> Vec<Effect> {
     if let TrustState::Pending { workspace } = &app.trust_state {
@@ -424,7 +424,7 @@ pub(in crate::app::dispatch) fn clear_startup_actions(app: &mut AppView) {
     let _ = app.deferred_startup.take();
 }
 /// Replay the session-startup actions deferred until auth + trust both resolved
-/// (`--resume` / `--worktree` / initial-prompt / `grok dashboard`). Extracted
+/// (`--resume` / `--worktree` / initial-prompt / `open-grok dashboard`). Extracted
 /// from the `AuthComplete` handler so the folder-trust answer can run the SAME
 /// machinery; whichever gate resolves last drains it (each call site guards on
 /// the other gate being `Done`, so it runs exactly once).

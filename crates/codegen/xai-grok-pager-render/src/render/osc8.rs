@@ -90,9 +90,9 @@ fn link_finder() -> &'static LinkFinder {
     })
 }
 
-/// One path segment without spaces (`main.rs`, `.grok`, `@scope`). Leading `.`
+/// One path segment without spaces (`main.rs`, `.opengrok`, `@scope`). Leading `.`
 /// matches dot-directories and `%` matches percent-encoded segments — grok
-/// session media lives under `~/.grok/sessions/%2F…/images/1.jpg`.
+/// session media lives under `~/.opengrok/sessions/%2F…/images/1.jpg`.
 const PATH_SEGMENT: &str = r"[a-zA-Z0-9_@.%][a-zA-Z0-9._+@%\-]*";
 
 /// Final path segment may contain *internal* spaces for macOS app bundles and
@@ -101,7 +101,7 @@ const PATH_SEGMENT: &str = r"[a-zA-Z0-9_@.%][a-zA-Z0-9._+@%\-]*";
 const PATH_SEGMENT_SPACED: &str =
     r"[a-zA-Z0-9_@.%][a-zA-Z0-9._+@%\-]*(?: [a-zA-Z0-9._+@%\-]+)+\.[a-zA-Z0-9][a-zA-Z0-9._+@%\-]*";
 
-/// Relative file path (`images/1.png`, `.grok/x.txt`) — one or more `/`-joined
+/// Relative file path (`images/1.png`, `.opengrok/x.txt`) — one or more `/`-joined
 /// directory segments plus a filename that has an extension. No leading `/`
 /// or `~` (those are the absolute forms). The required extension keeps
 /// slashed prose ("and/or", "TCP/IP") out; the caller still gates on the file
@@ -255,7 +255,7 @@ struct RowSegment {
 /// break, `Some("")` = mid-word wrap, `Some(" ")` = word wrap. Consecutive
 /// rows connected by `Some(..)` joiners are re-joined into one logical line
 /// before matching, so a long path or URL soft-wrapped across rows (imagine
-/// media lives at `~/.grok/sessions/%2F…/images/1.jpg`, which wraps in
+/// media lives at `~/.opengrok/sessions/%2F…/images/1.jpg`, which wraps in
 /// narrow panes) is detected whole and each row's fragment gets its own
 /// clickable overlay region. Spans within a row are likewise concatenated so
 /// styling boundaries never truncate a match.
@@ -857,9 +857,10 @@ mod tests {
 
     #[test]
     fn scan_detects_grok_session_media_path() {
-        // Dot-directory (`.grok`), percent-encoded session segment, and a
+        // Dot-directory (`.opengrok`), percent-encoded session segment, and a
         // trailing sentence period — the shape of `image_gen` output prose.
-        let line = make_line("Saved to /Users/alice/.grok/sessions/%2Fabc/00000000/images/1.jpg.");
+        let line =
+            make_line("Saved to /Users/alice/.opengrok/sessions/%2Fabc/00000000/images/1.jpg.");
         let mut overlay = LinkOverlay::new();
         scan_unjoined(std::iter::once((0, &line)), 0, &[], &mut overlay);
 
@@ -867,7 +868,7 @@ mod tests {
         assert_eq!(
             &*overlay.links()[0].url,
             // `%` is itself percent-encoded (`%25`) when building the file URL.
-            "file:///Users/alice/.grok/sessions/%252Fabc/00000000/images/1.jpg",
+            "file:///Users/alice/.opengrok/sessions/%252Fabc/00000000/images/1.jpg",
         );
     }
 
@@ -877,8 +878,9 @@ mod tests {
         // across visual rows (`joiner: Some("")` mid-word break). Previously
         // each row was scanned in isolation, so only the `/Users/alice`
         // fragment on the first row matched and became clickable.
-        let row0 =
-            make_line("Image generated and saved to /Users/alice/.grok/sessions/%2FUsers%2Fali");
+        let row0 = make_line(
+            "Image generated and saved to /Users/alice/.opengrok/sessions/%2FUsers%2Fali",
+        );
         let row1 = make_line("ce%2Fcode%2Fxai/00000000-0000-0000-0000-000000000001/images/1.jpg");
         let rows: Vec<(u16, &Line<'static>, Option<&str>)> =
             vec![(3, &row0, None), (4, &row1, Some(""))];
@@ -886,7 +888,7 @@ mod tests {
         scan_lines_for_url_overlays(rows.into_iter(), 2, &[], &mut overlay);
 
         assert_eq!(overlay.links().len(), 2, "one overlay region per row");
-        let expected_url = "file:///Users/alice/.grok/sessions/%252FUsers%252Fali\
+        let expected_url = "file:///Users/alice/.opengrok/sessions/%252FUsers%252Fali\
                             ce%252Fcode%252Fxai/00000000-0000-0000-0000-000000000001/images/1.jpg";
         for link in overlay.links() {
             assert_eq!(&*link.url, expected_url);
@@ -899,7 +901,7 @@ mod tests {
         assert_eq!(
             l0.col_end,
             2 + UnicodeWidthStr::width(
-                "Image generated and saved to /Users/alice/.grok/sessions/%2FUsers%2Fali"
+                "Image generated and saved to /Users/alice/.opengrok/sessions/%2FUsers%2Fali"
             ) as u16
         );
         // Row 1: the continuation fragment covers the entire row.
@@ -918,7 +920,7 @@ mod tests {
     fn scan_wrapped_path_trailing_sentence_period_excluded() {
         // Wrapped path ending mid-sentence: trailing `.` on the last row is
         // trimmed from the clickable region.
-        let row0 = make_line("Saved to /Users/me/.grok/sessions/%2Fabc/019f3a86/ima");
+        let row0 = make_line("Saved to /Users/me/.opengrok/sessions/%2Fabc/019f3a86/ima");
         let row1 = make_line("ges/1.jpg. Enjoy!");
         let rows: Vec<(u16, &Line<'static>, Option<&str>)> =
             vec![(0, &row0, None), (1, &row1, Some(""))];
@@ -929,7 +931,7 @@ mod tests {
         for link in overlay.links() {
             assert_eq!(
                 &*link.url,
-                "file:///Users/me/.grok/sessions/%252Fabc/019f3a86/images/1.jpg"
+                "file:///Users/me/.opengrok/sessions/%252Fabc/019f3a86/images/1.jpg"
             );
         }
         assert_eq!(overlay.links()[1].col_start, 0);

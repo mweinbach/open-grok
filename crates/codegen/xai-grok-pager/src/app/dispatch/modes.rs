@@ -13,7 +13,7 @@ use xai_grok_telemetry::session_ctx::log_event;
 /// overlay popover. If no plan has been written yet, show a toast.
 ///
 /// Delegates to `AgentView::show_plan_preview()` which reads the plan file
-/// from `~/.grok/sessions/<urlencoded_cwd>/<session_id>/plan.md`.
+/// from `~/.opengrok/sessions/<urlencoded_cwd>/<session_id>/plan.md`.
 pub(super) fn dispatch_show_plan(app: &mut AppView) -> Vec<Effect> {
     with_active_agent(app, |agent| {
         if agent.plan_approval_view.is_some() {

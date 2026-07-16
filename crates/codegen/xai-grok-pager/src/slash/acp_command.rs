@@ -179,13 +179,13 @@ mod tests {
     fn valid_skill_meta_populates_fields() {
         let meta = serde_json::json!({
             "scope": "local",
-            "path": "/home/user/.grok/skills/commit/SKILL.md"
+            "path": "/home/user/.opengrok/skills/commit/SKILL.md"
         });
         let cmd = make_cmd("commit", Some(meta));
         let acp_cmd = AcpSlashCommand::from(&cmd);
         assert_eq!(
             acp_cmd.skill_path.as_deref(),
-            Some("/home/user/.grok/skills/commit/SKILL.md")
+            Some("/home/user/.opengrok/skills/commit/SKILL.md")
         );
         assert_eq!(acp_cmd.skill_scope, Some(SkillScope::Local));
         assert!(!acp_cmd.meta_malformed);

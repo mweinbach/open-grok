@@ -9,7 +9,7 @@ use super::common::*;
 ///
 /// A fake argv-echoing `$SHELL` makes the assertion deterministic: real alias
 /// expansion is the shell's own contract (and rc-file dependent), while the
-/// argv shape is the part `grok wrap` owns. The quoting round-trip against a
+/// argv shape is the part `open-grok wrap` owns. The quoting round-trip against a
 /// real shell is covered by `joined_line_roundtrips_words_through_real_sh` in
 /// `wrap_cmd_tests`.
 #[test]

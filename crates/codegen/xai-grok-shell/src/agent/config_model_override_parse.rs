@@ -10,7 +10,7 @@
 //! parsed again. Non-table values are dropped with a warning.
 //!
 //! Warnings are retained on `Config::model_override_warnings` and surfaced by
-//! `grok inspect`.
+//! `open-grok inspect`.
 
 use indexmap::IndexMap;
 use serde::Serialize;
@@ -125,7 +125,7 @@ pub(crate) fn log_model_override_warnings(warnings: &[ModelOverrideWarning]) {
     if !warnings.is_empty() {
         tracing::warn!(
             warnings = warnings.len(),
-            "model_override: parsed with warnings; run `grok inspect` for details"
+            "model_override: parsed with warnings; run `open-grok inspect` for details"
         );
     }
 }

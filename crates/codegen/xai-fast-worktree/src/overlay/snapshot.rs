@@ -622,7 +622,7 @@ mod tests {
             snapshot_root: PathBuf::from("/var/lib/repo-fuse/instance/worktrees/abc/root"),
             work_dir: PathBuf::from("/var/lib/repo-fuse/instance/worktrees/abc/work"),
             lower_dir: PathBuf::from("/var/lib/repo-fuse/instance/fuse-lower"),
-            mount_target: PathBuf::from("/home/user/.grok/worktrees/abc"),
+            mount_target: PathBuf::from("/home/user/.opengrok/worktrees/abc"),
             created_at: "2026-02-19T22:38:00Z".to_string(),
         };
 
@@ -649,7 +649,7 @@ mod tests {
             "snapshot_upper": "/var/lib/repo-fuse/instance/worktrees/abc123/upper",
             "work_dir": "/var/lib/repo-fuse/instance/worktrees/abc123/work",
             "lower_dir": "/var/lib/repo-fuse/instance/fuse-lower",
-            "mount_target": "/home/user/.grok/worktrees/abc123",
+            "mount_target": "/home/user/.opengrok/worktrees/abc123",
             "created_at": "2026-02-19T22:38:00Z"
         }"#;
 
@@ -751,14 +751,14 @@ mod tests {
             "snapshot_upper": "/var/lib/repo-fuse/instance/worktrees/wt1/upper",
             "work_dir": "/var/lib/repo-fuse/instance/worktrees/wt1/work",
             "lower_dir": "/var/lib/repo-fuse/instance/fuse-lower",
-            "mount_target": "/home/user/.grok/worktrees/wt1",
+            "mount_target": "/home/user/.opengrok/worktrees/wt1",
             "created_at": "1740000000s-since-epoch"
         }"#;
         let meta: OverlayMetadata = serde_json::from_str(json).unwrap();
         assert_eq!(meta.kind, "overlay");
         assert_eq!(
             meta.mount_target,
-            PathBuf::from("/home/user/.grok/worktrees/wt1")
+            PathBuf::from("/home/user/.opengrok/worktrees/wt1")
         );
         // "snapshot_upper" in JSON maps to snapshot_root via serde alias
         assert_eq!(

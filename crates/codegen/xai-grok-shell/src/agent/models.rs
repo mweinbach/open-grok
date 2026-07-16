@@ -663,12 +663,12 @@ impl ModelsManager {
         }
     }
 
-    /// Hot-reload the catalog from `~/.grok/models_cache.json` after an
+    /// Hot-reload the catalog from `~/.opengrok/models_cache.json` after an
     /// external write (detected by the config file watcher).
     ///
     /// A long-running leader otherwise only refreshes its catalog from its
     /// *own* fetch paths (startup prefetch, auth change, response-header etag).
-    /// When another grok process sharing `~/.grok` (a `--no-leader` run, a
+    /// When another grok process sharing `~/.opengrok` (a `--no-leader` run, a
     /// newer client, grok-desktop) fetches a fresher `/v1/models` catalog and
     /// persists it, this picks it up without a network round-trip.
     ///

@@ -15,7 +15,7 @@
 //!
 //! ## Plan File
 //!
-//! The plan file path defaults to `.grok/plan.md` relative to the session
+//! The plan file path defaults to `.opengrok/plan.md` relative to the session
 //! `Cwd`. The tool reads it via the `FileSystem` resource (the same async FS
 //! abstraction used by `ReadFile` and `SearchReplace`).
 
@@ -230,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn exit_with_plan_content() {
         let tmp = TempDir::new().unwrap();
-        let plan_dir = tmp.path().join(".grok");
+        let plan_dir = tmp.path().join(".opengrok");
         std::fs::create_dir_all(&plan_dir).unwrap();
         std::fs::write(
             plan_dir.join("plan.md"),
@@ -261,7 +261,7 @@ mod tests {
                 assert!(plan_content.contains("Do thing A"));
                 assert!(plan_content.contains("Do thing B"));
                 // Cwd fallback now displays the resolved absolute path (shared resolver).
-                assert!(plan_file_path.ends_with(".grok/plan.md"));
+                assert!(plan_file_path.ends_with(".opengrok/plan.md"));
             }
             other => panic!("Expected PlanReady, got {:?}", other),
         }
@@ -270,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn exit_with_empty_plan_file() {
         let tmp = TempDir::new().unwrap();
-        let plan_dir = tmp.path().join(".grok");
+        let plan_dir = tmp.path().join(".opengrok");
         std::fs::create_dir_all(&plan_dir).unwrap();
         std::fs::write(plan_dir.join("plan.md"), "   \n  \n").unwrap();
 
@@ -327,7 +327,7 @@ mod tests {
         use crate::notification::types::{ToolNotification, ToolNotificationHandle};
 
         let tmp = TempDir::new().unwrap();
-        let plan_dir = tmp.path().join(".grok");
+        let plan_dir = tmp.path().join(".opengrok");
         std::fs::create_dir_all(&plan_dir).unwrap();
         std::fs::write(plan_dir.join("plan.md"), "The plan").unwrap();
 
@@ -350,7 +350,7 @@ mod tests {
             ToolNotification::PlanModeExited(exited) => {
                 assert_eq!(exited.tool_call_id, "call-99");
                 assert_eq!(exited.plan_content, Some("The plan".to_string()));
-                assert!(exited.plan_file_path.ends_with(".grok/plan.md"));
+                assert!(exited.plan_file_path.ends_with(".opengrok/plan.md"));
             }
             other => panic!("Expected PlanModeExited, got {:?}", other),
         }
@@ -376,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_format_includes_plan_content() {
         let tmp = TempDir::new().unwrap();
-        let plan_dir = tmp.path().join(".grok");
+        let plan_dir = tmp.path().join(".opengrok");
         std::fs::create_dir_all(&plan_dir).unwrap();
         std::fs::write(plan_dir.join("plan.md"), "Step 1\nStep 2").unwrap();
 
@@ -398,7 +398,7 @@ mod tests {
         assert!(prompt.contains("saved at:"));
         assert!(prompt.contains("Step 1"));
         assert!(prompt.contains("Step 2"));
-        assert!(prompt.contains(".grok/plan.md"));
+        assert!(prompt.contains(".opengrok/plan.md"));
         assert!(prompt.contains("## Plan:"));
     }
 

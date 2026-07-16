@@ -7,9 +7,9 @@ use std::path::PathBuf;
 /// Top-level commands for the pager binary.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Run Grok without the interactive UI
+    /// Run Open Grok without the interactive UI
     Agent(Box<AgentArgs>),
-    /// Show the configuration Grok discovers for this directory
+    /// Show the configuration Open Grok discovers for this directory
     Inspect {
         /// Emit machine-readable JSON output.
         #[arg(long)]
@@ -24,7 +24,7 @@ pub enum Command {
         #[arg(long, conflicts_with = "codex")]
         all: bool,
     },
-    /// Sign in to Grok
+    /// Sign in to Open Grok
     Login {
         /// Ignored (kept for backwards compatibility). OAuth2 is now the only auth method.
         #[arg(long, hide = true)]
@@ -63,7 +63,7 @@ pub enum Command {
     /// Fetch and install managed configuration
     Setup {
         /// Print the fetched configuration as JSON instead of installing it;
-        /// writes nothing to ~/.grok.
+        /// writes nothing to ~/.opengrok.
         #[arg(long)]
         json: bool,
     },
@@ -84,34 +84,34 @@ clipboard (containers, SSH) and your terminal does not handle OSC 52 itself
 sync with your window size.
 
 Examples:
-  grok wrap docker exec -it my-container bash
-  grok wrap kubectl exec -it my-pod -- bash
+  open-grok wrap docker exec -it my-container bash
+  open-grok wrap kubectl exec -it my-pod -- bash
 
-See ~/.grok/README.md for more information.
+See ~/.opengrok/README.md for more information.
 ")]
     Wrap(WrapArgs),
     /// Export a session transcript as Markdown
     Export(crate::export_cmd::ExportArgs),
     /// Export or upload session trace data
     Trace(crate::trace_cmd::TraceArgs),
-    /// Check for updates or install a specific version
+    /// Show GitHub release installation instructions
     Update {
-        /// Check for updates without installing.
+        /// Print the GitHub release installation command.
         #[arg(long)]
         check: bool,
         /// Emit machine-readable JSON output (for --check).
         #[arg(long)]
         json: bool,
-        /// Force re-download and install even if already up to date.
+        /// Retained for compatibility; Open Grok releases are installed by install.sh.
         #[arg(long)]
         force_reinstall: bool,
         /// Install a specific version (e.g. 0.1.150 or 0.1.151-alpha.2).
         #[arg(long)]
         version: Option<String>,
-        /// Switch to the alpha release channel (faster updates, may have bugs).
+        /// Unsupported in Open Grok (retained for CLI compatibility).
         #[arg(long, conflicts_with_all = ["stable", "enterprise"])]
         alpha: bool,
-        /// Switch to the stable release channel (default, weekly releases).
+        /// Unsupported in Open Grok (retained for CLI compatibility).
         #[arg(long, conflicts_with_all = ["alpha", "enterprise"])]
         stable: bool,
         /// Switch to the enterprise release channel.
@@ -143,7 +143,7 @@ See ~/.grok/README.md for more information.
     ///
     /// Centralised, agent-native overview of every session (top-level and
     /// subagents). Disabled when `[dashboard].enabled = false` in
-    /// `~/.grok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env
+    /// `~/.opengrok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env
     /// var is set.
     Dashboard,
 }
@@ -161,7 +161,7 @@ pub struct WrapArgs {
     )]
     pub command: Vec<String>,
 }
-/// Targets a running leader process by PID (used by `grok workspace`).
+/// Targets a running leader process by PID (used by `open-grok workspace`).
 #[derive(Debug, clap::Args, Clone, Default)]
 pub struct LeaderTargetArgs {
     /// Leader process ID.
@@ -295,13 +295,13 @@ impl AgentArgs {
                 Ok(canonical) if canonical.is_dir() => Some(canonical),
                 Ok(_) => {
                     eprintln!(
-                        "grok: --plugin-dir {}: not a directory; skipping",
+                        "open-grok: --plugin-dir {}: not a directory; skipping",
                         p.display()
                     );
                     None
                 }
                 Err(e) => {
-                    eprintln!("grok: --plugin-dir {}: {e}; skipping", p.display());
+                    eprintln!("open-grok: --plugin-dir {}: {e}; skipping", p.display());
                     None
                 }
             })
@@ -378,23 +378,20 @@ pub struct LeaderArgs {
     #[command(flatten)]
     pub headless: HeadlessArgs,
 }
-/// Return the version string with channel label for `--version` / `-v` output.
+/// Return the Open Grok version string for `--version` / `-v` output.
 ///
 /// Uses a `OnceLock` so the formatting happens once and the result lives
 /// for `'static` (required by clap's `ArgAction::Version`).
-fn version_with_channel() -> &'static str {
+fn open_grok_version() -> &'static str {
     use std::sync::OnceLock;
     static V: OnceLock<String> = OnceLock::new();
-    V.get_or_init(|| {
-        let label = xai_grok_update::channel_label();
-        xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), label)
-    })
+    V.get_or_init(|| xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), ""))
 }
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "grok",
-    version = version_with_channel(),
-    about = "Grok Build TUI",
+    name = "open-grok",
+    version = open_grok_version(),
+    about = "Grok Build with ChatGPT Codex optimizations",
     disable_version_flag = true,
     next_display_order = None,
     help_template = "\
@@ -418,7 +415,7 @@ pub struct PagerArgs {
     /// Working directory.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
-    /// Use a custom leader socket path instead of the default `~/.grok/leader.sock`.
+    /// Use a custom leader socket path instead of the default `~/.opengrok/leader.sock`.
     #[arg(
         long = "leader-socket",
         value_name = "PATH",
@@ -630,7 +627,7 @@ pub struct PagerArgs {
     pub self_verify: bool,
     /// Exit as soon as the first agent turn ends, without waiting for pending
     /// background bash/monitor tasks or background subagents (headless only).
-    /// Default for all `grok -p` runs is to wait (up to `--background-wait-timeout`)
+    /// Default for all `open-grok -p` runs is to wait (up to `--background-wait-timeout`)
     /// so eval harnesses see full task completion. Use this for fast scripts that
     /// only need the first turn's text. Does not wait for server-side auto-wake
     /// output or persistent monitors (those hit the timeout).
@@ -695,19 +692,19 @@ pub struct PagerArgs {
     /// Experimental: scrollback-native rendering. Finalized blocks are printed
     /// into the terminal's native scrollback (use the terminal's own scroll /
     /// selection); a small pinned region holds the prompt + running turn.
-    /// Sticky: records `[ui] screen_mode = "minimal"` in ~/.grok/config.toml
-    /// so future plain `grok` invocations open in minimal mode too.
+    /// Sticky: records `[ui] screen_mode = "minimal"` in ~/.opengrok/config.toml
+    /// so future plain `open-grok` invocations open in minimal mode too.
     #[arg(long = "minimal")]
     pub minimal: bool,
     /// Open in the standard fullscreen TUI, overriding a sticky minimal
     /// preference. Sticky counterpart of --minimal: records
-    /// `[ui] screen_mode = "fullscreen"` in ~/.grok/config.toml so future
-    /// plain `grok` invocations open fullscreen again. Fullscreen-vs-inline
+    /// `[ui] screen_mode = "fullscreen"` in ~/.opengrok/config.toml so future
+    /// plain `open-grok` invocations open fullscreen again. Fullscreen-vs-inline
     /// still follows the alt-screen policy (--no-alt-screen, [terminal]
     /// alt_screen, terminal auto-detection).
     #[arg(long = "fullscreen", conflicts_with = "minimal")]
     pub fullscreen: bool,
-    /// Write sampling events to ~/.grok/logs/sampling.jsonl.
+    /// Write sampling events to ~/.opengrok/logs/sampling.jsonl.
     #[arg(long = "log-sampling", env = "GROK_LOG_SAMPLING", hide = true)]
     pub log_sampling: bool,
     /// Show the login screen even when credentials are already available.
@@ -722,7 +719,7 @@ pub struct PagerArgs {
     /// Run standalone even when leader mode is configured.
     #[arg(long, conflicts_with = "leader", hide = true)]
     pub no_leader: bool,
-    /// Initial prompt for the interactive session, e.g. `grok "fix the bug"` or `grok --worktree=feat "create this feature"`.
+    /// Initial prompt for the interactive session, e.g. `open-grok "fix the bug"` or `open-grok --worktree=feat "create this feature"`.
     #[arg(
         value_name = "PROMPT",
         conflicts_with_all = &["single",
@@ -764,8 +761,8 @@ impl PagerArgs {
             .map(std::path::Path::new)
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .filter(|n| *n == "grok" || *n == "agent")
-            .unwrap_or("grok")
+            .filter(|n| *n == "open-grok")
+            .unwrap_or("open-grok")
             .to_owned();
         let mut args = Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)));
         if let Some(socket) = args.leader_socket.take() {
@@ -878,7 +875,7 @@ impl PagerArgs {
     /// The initial interactive prompt from the positional argument, trimmed.
     ///
     /// Returns `None` when no positional prompt was given or it is only
-    /// whitespace. This is the `grok "<prompt>"` launch form; the headless
+    /// whitespace. This is the `open-grok "<prompt>"` launch form; the headless
     /// `-p`/`--single` path is handled separately.
     pub fn initial_prompt(&self) -> Option<&str> {
         self.prompt
@@ -890,6 +887,13 @@ impl PagerArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_omits_upstream_channel_badges() {
+        let version = open_grok_version();
+        assert!(!version.contains(" [stable]"), "{version}");
+        assert!(!version.contains(" [alpha]"), "{version}");
+    }
     #[test]
     fn version_flag_exits_zero() {
         let err = PagerArgs::try_parse_from(["grok", "--version"]).unwrap_err();

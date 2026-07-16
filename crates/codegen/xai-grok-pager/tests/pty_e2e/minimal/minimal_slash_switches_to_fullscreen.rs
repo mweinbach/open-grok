@@ -71,7 +71,7 @@ async fn minimal_slash_switches_to_fullscreen() {
     // relaunched process persists to `[ui] screen_mode` (fire-and-forget at
     // startup — poll while pumping the PTY). The minimal direction is covered
     // by `minimal_sticky_screen_mode_persists`.
-    let config_path = content.home().join(".grok").join("config.toml");
+    let config_path = content.home().join(".opengrok").join("config.toml");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let body = std::fs::read_to_string(&config_path).unwrap_or_default();

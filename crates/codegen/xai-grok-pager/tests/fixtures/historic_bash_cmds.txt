@@ -71,7 +71,7 @@ curl -LsSf "http://file-server.example.internal/cicd/example/install.sh?nocache"
 ! sudo du -shx /.Spotlight-V100 /.DocumentRevisions-V100 /private/var/vm /private/var/folders /cores /Library 2>/dev/null | sort -rh
 ### END
 ### CMD 21
-cat ~/.grok/config.toml | grep composer
+cat ~/.opengrok/config.toml | grep composer
 ### END
 ### CMD 22
 GROK_DEBUG_CONTEXT_WINDOW=100000 GROK_AUTO_COMPACT_THRESHOLD_PERCENT=5 /tmp/pager-under-test -r 019e0000-0000-7000-8000-000000000001 -p 'reply with exactly: again' --model example-model --always-approve --no-leader > /tmp/compaction-repro/headless5.log 2>&1; echo EXIT=$? >> /tmp/compaction-repro/headless5.log

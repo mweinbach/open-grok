@@ -712,9 +712,9 @@ fn print_exit_resume_hint(session_id: &str, minimal: bool, w: &mut impl Write) {
     let _ = writeln!(w);
     let _ = writeln!(w, "Resume this session with:");
     if minimal {
-        let _ = writeln!(w, "  grok --minimal --resume {session_id}");
+        let _ = writeln!(w, "  open-grok --minimal --resume {session_id}");
     } else {
-        let _ = writeln!(w, "  grok --resume {session_id}");
+        let _ = writeln!(w, "  open-grok --resume {session_id}");
     }
 }
 /// Screen-mode relaunch failure fallback (same quit tail as plain resume).
@@ -1271,10 +1271,10 @@ pub(crate) fn set_terminal_title(title: &str) {
 fn terminal_title_string(title: &str) -> String {
     let sanitized: String = title.chars().filter(|c| !c.is_control()).collect();
     if sanitized.is_empty() {
-        "grok".into()
+        "open-grok".into()
     } else {
-        let truncated: String = sanitized.chars().take(80 - 6).collect();
-        format!("{} - grok", truncated)
+        let truncated: String = sanitized.chars().take(80 - 11).collect();
+        format!("{} - open-grok", truncated)
     }
 }
 fn set_panic_hook(mode: ScreenMode) {
@@ -1317,11 +1317,11 @@ mod tests {
     fn terminal_title_strips_control_characters() {
         assert_eq!(
             terminal_title_string("evil\x07\x1b]52;c;payload\x07title"),
-            "evil]52;c;payloadtitle - grok"
+            "evil]52;c;payloadtitle - open-grok"
         );
-        assert_eq!(terminal_title_string("\x07\x1b\x00"), "grok");
-        assert_eq!(terminal_title_string(""), "grok");
-        assert_eq!(terminal_title_string("My chat"), "My chat - grok");
+        assert_eq!(terminal_title_string("\x07\x1b\x00"), "open-grok");
+        assert_eq!(terminal_title_string(""), "open-grok");
+        assert_eq!(terminal_title_string("My chat"), "My chat - open-grok");
     }
     #[test]
     fn hunk_tracker_mode_nothing_set_is_none() {
@@ -1689,9 +1689,9 @@ mod tests {
         assert!(!args.no_alt_screen);
     }
     #[test]
-    fn cli_command_name_is_grok() {
+    fn cli_command_name_is_open_grok() {
         use clap::CommandFactory;
-        assert_eq!(PagerArgs::command().get_name(), "grok");
+        assert_eq!(PagerArgs::command().get_name(), "open-grok");
     }
     #[test]
     fn cli_help_output_header() {
@@ -1701,9 +1701,9 @@ mod tests {
         assert_eq!(
             first_5,
             vec![
-                "Grok Build TUI",
+                "Grok Build with ChatGPT Codex optimizations",
                 "",
-                "Usage: grok [OPTIONS] [PROMPT] [COMMAND]",
+                "Usage: open-grok [OPTIONS] [PROMPT] [COMMAND]",
                 "",
                 "Arguments:",
             ]
@@ -1741,7 +1741,7 @@ mod tests {
         print_exit_resume_hint("sess-abc", false, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "\nResume this session with:\n  grok --resume sess-abc\n"
+            "\nResume this session with:\n  open-grok --resume sess-abc\n"
         );
     }
     #[test]
@@ -1750,7 +1750,7 @@ mod tests {
         print_exit_resume_hint("sess-abc", true, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "\nResume this session with:\n  grok --minimal --resume sess-abc\n"
+            "\nResume this session with:\n  open-grok --minimal --resume sess-abc\n"
         );
     }
     #[test]

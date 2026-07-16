@@ -68,7 +68,7 @@ pub struct McpServerStatusPayload {
     /// MCP server name (`grok_com_linear`, `github`, ...).
     pub name: String,
     /// `managed` (sourced from cli-chat-proxy / `grok_com_` prefix)
-    /// or `local` (user `.grok/config.toml`).
+    /// or `local` (user `.opengrok/config.toml`).
     pub source: McpServerSource,
     /// Current status — see [`McpServerStatus`].
     pub status: McpServerStatus,

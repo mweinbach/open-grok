@@ -14,7 +14,7 @@
 //! workspace-server reaches back to, e.g. `ws://localhost:10030/v1/tools`)
 //! using a bearer token. `servers.list` is scoped per-user on the server, so
 //! the bearer must resolve to the same user that owns the session — the
-//! access token from `~/.grok/auth.json` does (same identity).
+//! access token from `~/.opengrok/auth.json` does (same identity).
 
 use base64::Engine;
 use clap::Parser;

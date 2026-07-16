@@ -89,7 +89,7 @@ fn exhausted_quota_distinguishes_credits_from_rate_limit() {
 #[test]
 fn disconnected_codex_usage_is_explicit() {
     assert_eq!(
-        format_codex_usage_error("Not connected; run `grok login --codex`"),
-        "Not connected. Run `grok login --codex`."
+        format_codex_usage_error("Not connected; run `open-grok login --codex`"),
+        "Not connected. Run `open-grok login --codex`."
     );
 }

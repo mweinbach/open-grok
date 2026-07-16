@@ -1,7 +1,7 @@
 // claude_import_state.rs
 // Tracks what Claude settings have been imported/dismissed so we don't re-prompt.
 //
-// State is persisted to `~/.grok/claude_import_state.json`.
+// State is persisted to `~/.opengrok/claude_import_state.json`.
 // Hash is SHA-256 over sorted, concatenated contents of all Claude settings
 // files at a given scope (global or project).
 
@@ -16,7 +16,7 @@ use xai_grok_workspace::permission::claude_settings::find_claude_settings_paths;
 
 // Types
 
-/// Persistent import state, loaded from / saved to `~/.grok/claude_import_state.json`.
+/// Persistent import state, loaded from / saved to `~/.opengrok/claude_import_state.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportState {
     /// Schema version for forward compatibility.

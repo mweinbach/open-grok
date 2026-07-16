@@ -32,18 +32,18 @@ Install a specific version:
 $env:GROK_VERSION="0.1.42"; irm https://x.ai/cli/install.ps1 | iex
 ```
 
-The PowerShell installer automatically adds `%USERPROFILE%\.grok\bin` to your User PATH. Alternatively, install via [Git for Windows](https://gitforwindows.org/) (Git Bash) or MSYS2 using the bash script above. WSL users get the Linux binary automatically.
+The PowerShell installer automatically adds `%USERPROFILE%\.opengrok\bin` to your User PATH. Alternatively, install via [Git for Windows](https://gitforwindows.org/) (Git Bash) or MSYS2 using the bash script above. WSL users get the Linux binary automatically.
 
 Verify the installation:
 
 ```bash
-grok --version
+open-grok --version
 ```
 
 Update to the latest version at any time:
 
 ```bash
-grok update
+open-grok update
 ```
 
 ---
@@ -53,16 +53,16 @@ grok update
 Start Grok by running:
 
 ```bash
-grok
+open-grok
 ```
 
-On first launch, Grok opens your browser to authenticate with grok.com. After you sign in, Grok stores your credentials in `~/.grok/auth.json`, where they persist across sessions. Grok refreshes your credentials automatically and prompts you to sign in again when they can no longer be renewed.
+On first launch, Grok opens your browser to authenticate with grok.com. After you sign in, Grok stores your credentials in `~/.opengrok/auth.json`, where they persist across sessions. Grok refreshes your credentials automatically and prompts you to sign in again when they can no longer be renewed.
 
 If you prefer API key authentication (e.g., for CI/CD or environments without a browser), set the `XAI_API_KEY` environment variable instead:
 
 ```bash
 export XAI_API_KEY="xai-..."
-grok
+open-grok
 ```
 
 See [Authentication](02-authentication.md) for the full set of auth options including OIDC, external auth providers, and device code flow.
@@ -102,7 +102,7 @@ The `@` operator opens a fuzzy file picker. By default it respects `.gitignore` 
 By default, Grok asks for permission before executing shell commands or editing files. You can approve individually or toggle always-approve mode:
 
 - Press `Ctrl+O` to toggle always-approve mode
-- Use the `--yolo` flag at launch: `grok --yolo`
+- Use the `--yolo` flag at launch: `open-grok --yolo`
 - Type `/always-approve` in the prompt to toggle the mode
 
 ---
@@ -111,11 +111,11 @@ By default, Grok asks for permission before executing shell commands or editing 
 
 ### Sessions
 
-Every conversation is a **session**. Sessions are automatically saved to `~/.grok/sessions/` and can be resumed later. Each session tracks the full conversation history, tool calls, file edits, and task state.
+Every conversation is a **session**. Sessions are automatically saved to `~/.opengrok/sessions/` and can be resumed later. Each session tracks the full conversation history, tool calls, file edits, and task state.
 
 - Start a new session: `Ctrl+N` or `/new`
 - Resume a previous session: `/resume` in the TUI, or `--resume <ID>` from the CLI
-- Continue the most recent session: `grok -c`
+- Continue the most recent session: `open-grok -c`
 
 ### Scrollback
 
@@ -165,44 +165,44 @@ See [Slash Commands](04-slash-commands.md) for the complete reference.
 
 ```bash
 # Launch the interactive TUI and submit an initial prompt as the first turn
-grok "fix the failing auth test and run it"
+open-grok "fix the failing auth test and run it"
 
 # Initial prompt in a new git worktree. Use --worktree=<name> (with `=`) so the
-# prompt isn't swallowed as the worktree name — `grok -w "refactor module X"`
+# prompt isn't swallowed as the worktree name — `open-grok -w "refactor module X"`
 # would treat "refactor module X" as the worktree label, not the prompt.
-grok --worktree=feat "refactor module X"
+open-grok --worktree=feat "refactor module X"
 
 # Base the worktree on a specific branch (e.g. main) instead of the current HEAD:
-grok -w --ref main "implement feature from main"
+open-grok -w --ref main "implement feature from main"
 
 
 # Start in a specific project directory
-grok --cwd ~/projects/my-app
+open-grok --cwd ~/projects/my-app
 
 # Add project-specific rules
-grok --rules "Always use TypeScript. Prefer functional components."
+open-grok --rules "Always use TypeScript. Prefer functional components."
 
 # Auto-approve all tool executions
-grok --yolo
+open-grok --yolo
 
 # Use a specific model
-grok -m grok-build
+open-grok -m grok-build
 
 # Resume a previous session
-grok --resume <session-id>
+open-grok --resume <session-id>
 
 # Continue the most recent session
-grok -c
+open-grok -c
 
-# Experimental scrollback-native render mode. Sticky: plain `grok` reopens in
+# Experimental scrollback-native render mode. Sticky: plain `open-grok` reopens in
 # the mode last chosen via --minimal/--fullscreen (or /minimal//fullscreen).
-grok --minimal
+open-grok --minimal
 
 # Back to the standard fullscreen TUI (and make it sticky again)
-grok --fullscreen
+open-grok --fullscreen
 
 # Headless mode (for scripts)
-grok -p "Explain this codebase"
+open-grok -p "Explain this codebase"
 ```
 
 ---
@@ -212,7 +212,7 @@ grok -p "Explain this codebase"
 Run Grok non-interactively for scripting, CI/CD, and automation:
 
 ```bash
-grok -p "Your prompt here"
+open-grok -p "Your prompt here"
 ```
 
 Output formats:
@@ -226,7 +226,7 @@ Output formats:
 Example CI/CD usage:
 
 ```bash
-grok -p "Review changes for bugs" --output-format json --yolo | jq -r '.text'
+open-grok -p "Review changes for bugs" --output-format json --yolo | jq -r '.text'
 ```
 
 ---
@@ -236,7 +236,7 @@ grok -p "Review changes for bugs" --output-format json --yolo | jq -r '.text'
 Add per-project instructions by creating an `AGENTS.md` file in your repository. Grok reads these files and injects their contents as a project-instructions message at the start of the conversation:
 
 ```
-~/.grok/AGENTS.md           # Global rules (apply to all projects)
+~/.opengrok/AGENTS.md           # Global rules (apply to all projects)
 <repo-root>/AGENTS.md       # Repository-level rules
 <cwd>/AGENTS.md             # Directory-level rules (highest priority)
 ```

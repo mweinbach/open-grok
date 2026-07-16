@@ -40,7 +40,7 @@ Submitting `/theme` on its own -- without choosing from the picker -- cycles to 
 
 ### Via Config File
 
-Set the theme in `~/.grok/config.toml`:
+Set the theme in `~/.opengrok/config.toml`:
 
 ```toml
 [ui]
@@ -135,7 +135,7 @@ Toggle compact mode with the `/compact-mode` slash command. Compact mode:
 - Reduces horizontal padding to the minimum (1 column).
 - Reduces top padding in the prompt area and info blocks.
 
-The setting is persisted in `~/.grok/config.toml` under `[ui].compact_mode` and survives restarts.
+The setting is persisted in `~/.opengrok/config.toml` under `[ui].compact_mode` and survives restarts.
 
 Use compact mode on small screens to maximize content area.
 
@@ -155,7 +155,7 @@ Grok selects the matching file automatically when you switch themes. The `.tmThe
 
 ## Deep Customization with pager.toml
 
-For fine-grained control over the TUI appearance, create `~/.grok/pager.toml`. This file controls scrollback layout, block styling, animations, and more. All settings have defaults; specify only the values you override. (Dev builds generate this file as a template with every default commented out — uncomment a line to override it; commented values keep tracking future defaults.)
+For fine-grained control over the TUI appearance, create `~/.opengrok/pager.toml`. This file controls scrollback layout, block styling, animations, and more. All settings have defaults; specify only the values you override. (Dev builds generate this file as a template with every default commented out — uncomment a line to override it; commented values keep tracking future defaults.)
 
 ### Layout
 

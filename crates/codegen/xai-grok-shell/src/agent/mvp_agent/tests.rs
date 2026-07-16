@@ -845,7 +845,7 @@ fn resolve_agent_definition_agent_profile_with_model_override() {
         std::env::remove_var("GROK_AGENT");
     }
     let tmp = tempfile::tempdir().unwrap();
-    let agents_dir = tmp.path().join(".grok").join("agents");
+    let agents_dir = tmp.path().join(".opengrok").join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
     std::fs::write(
             agents_dir.join("test-architect.md"),
@@ -1639,7 +1639,7 @@ async fn ensure_plugin_registry_lazily_populates_snapshot() {
     use crate::auth::{AuthManager, GrokComConfig};
     use xai_grok_test_support::EnvGuard;
     let grok_home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", grok_home.path());
+    let _env = EnvGuard::set("OPENGROK_HOME", grok_home.path());
     let plugin_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         plugin_dir.path().join("plugin.json"),
@@ -3544,7 +3544,7 @@ fn interactive_trust_prompt_grant_reloads_project_mcp() {
     use xai_grok_test_support::EnvGuard;
     use xai_grok_workspace::trust::{TrustStore, workspace_key};
     let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _env = EnvGuard::set("OPENGROK_HOME", home.path());
     let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
     let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
     let repo = repo_with_project_mcp_server();
@@ -3623,7 +3623,7 @@ fn interactive_trust_prompt_reject_keeps_gated() {
     use xai_grok_test_support::EnvGuard;
     use xai_grok_workspace::trust::{TrustStore, workspace_key};
     let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _env = EnvGuard::set("OPENGROK_HOME", home.path());
     let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
     let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
     let repo = repo_with_project_mcp_server();
@@ -3660,7 +3660,7 @@ fn interactive_trust_prompt_reject_keeps_gated() {
 fn interactive_trust_prompt_dormant_when_feature_off() {
     use xai_grok_test_support::EnvGuard;
     let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _env = EnvGuard::set("OPENGROK_HOME", home.path());
     let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
     let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
     let repo = repo_with_project_mcp_server();
@@ -3690,7 +3690,7 @@ fn interactive_trust_prompt_dormant_when_feature_off() {
 fn interactive_trust_prompt_no_request_without_capability() {
     use xai_grok_test_support::EnvGuard;
     let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _env = EnvGuard::set("OPENGROK_HOME", home.path());
     let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
     let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
     let repo = repo_with_project_mcp_server();
@@ -3718,7 +3718,7 @@ fn interactive_trust_prompt_client_error_fails_closed() {
     use xai_grok_test_support::EnvGuard;
     use xai_grok_workspace::trust::{TrustStore, workspace_key};
     let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _env = EnvGuard::set("OPENGROK_HOME", home.path());
     let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
     let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
     let repo = repo_with_project_mcp_server();
@@ -3759,7 +3759,7 @@ fn interactive_trust_prompt_client_error_fails_closed() {
 fn interactive_trust_prompt_dedups_same_workspace() {
     use xai_grok_test_support::EnvGuard;
     let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _env = EnvGuard::set("OPENGROK_HOME", home.path());
     let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
     let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
     let repo = repo_with_project_mcp_server();
@@ -3834,7 +3834,7 @@ async fn drain_reload_commands(
 fn interactive_trust_prompt_reloads_all_same_workspace_sessions() {
     use xai_grok_test_support::EnvGuard;
     let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _env = EnvGuard::set("OPENGROK_HOME", home.path());
     let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
     let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
     let repo = repo_with_project_mcp_server();
@@ -3899,7 +3899,7 @@ fn interactive_trust_prompt_reprompts_after_untrust() {
     use xai_grok_test_support::EnvGuard;
     use xai_hooks_plugins_types::HooksAction;
     let home = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _env = EnvGuard::set("OPENGROK_HOME", home.path());
     let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
     let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
     let repo = repo_with_project_mcp_server();

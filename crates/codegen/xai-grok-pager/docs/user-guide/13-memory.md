@@ -22,20 +22,20 @@ Memory is experimental and disabled by default.
 ### Per-Session Flag
 
 ```bash
-grok --experimental-memory
+open-grok --experimental-memory
 ```
 
 ### Environment Variable
 
 ```bash
 export GROK_MEMORY=1
-grok
+open-grok
 ```
 
 ### Config File (Persistent)
 
 ```toml
-# ~/.grok/config.toml
+# ~/.opengrok/config.toml
 [memory]
 enabled = true
 ```
@@ -45,7 +45,7 @@ enabled = true
 To disable memory even when other settings enable it:
 
 ```bash
-grok --no-memory
+open-grok --no-memory
 ```
 
 Or:
@@ -81,13 +81,13 @@ You can also toggle from inside the `/memory` modal by pressing `t`.
 
 ## How Memory Is Stored
 
-Memory is stored as Markdown files under `~/.grok/memory/`:
+Memory is stored as Markdown files under `~/.opengrok/memory/`:
 
 | Location | Scope | Description |
 |----------|-------|-------------|
-| `~/.grok/memory/MEMORY.md` | Global | Facts that apply across all your projects |
-| `~/.grok/memory/<project-slug>-<hash8>/MEMORY.md` | Workspace | Project-specific conventions and context |
-| `~/.grok/memory/<project-slug>-<hash8>/sessions/` | Sessions | Per-session summaries and logs |
+| `~/.opengrok/memory/MEMORY.md` | Global | Facts that apply across all your projects |
+| `~/.opengrok/memory/<project-slug>-<hash8>/MEMORY.md` | Workspace | Project-specific conventions and context |
+| `~/.opengrok/memory/<project-slug>-<hash8>/sessions/` | Sessions | Per-session summaries and logs |
 
 Grok suffixes each workspace directory with a short hash of the repository's identity. The identity is the `origin` remote in `org/repo` form when the directory is a Git repository with an `origin` remote, or the directory path otherwise. Because clones and worktrees of the same repository share an `origin` remote, they also share one memory directory.
 
@@ -132,7 +132,7 @@ Use `/flush` when you want to preserve important context:
 
 ### Remember
 
-Ask Grok to remember something, and it appends the note to a `MEMORY.md` file -- the workspace file for project-specific items, or the global `~/.grok/memory/MEMORY.md` for cross-project preferences:
+Ask Grok to remember something, and it appends the note to a `MEMORY.md` file -- the workspace file for project-specific items, or the global `~/.opengrok/memory/MEMORY.md` for cross-project preferences:
 
 ```
 > remember to always open PR links after pushing
@@ -146,7 +146,7 @@ You can also save a note directly with the `/remember` command:
 /remember always open PR links after pushing
 ```
 
-Run `/remember` with no text to enter remember mode, where the next line you type becomes the note. Either way, Grok opens a review panel showing the note (with an optional rewritten version you can toggle with `Tab`); the note is written only after you confirm. On save, Grok shows `Memory saved to ~/.grok/memory/MEMORY.md`.
+Run `/remember` with no text to enter remember mode, where the next line you type becomes the note. Either way, Grok opens a review panel showing the note (with an optional rewritten version you can toggle with `Tab`); the note is written only after you confirm. On save, Grok shows `Memory saved to ~/.opengrok/memory/MEMORY.md`.
 
 ### Forget
 
@@ -156,7 +156,7 @@ Ask Grok to forget something, and it finds and removes the matching entry:
 > forget the snake_case convention
 ```
 
-Forget is best-effort: the model searches memory and removes entries that match. For guaranteed removal, edit the files under `~/.grok/memory/` directly and delete the entry yourself. To locate a file, open the `/memory` browser and press `y` to copy its path.
+Forget is best-effort: the model searches memory and removes entries that match. For guaranteed removal, edit the files under `~/.opengrok/memory/` directly and delete the entry yourself. To locate a file, open the `/memory` browser and press `y` to copy its path.
 
 ### Recall
 
@@ -170,7 +170,7 @@ Grok searches across all memory files and summarizes what it knows, grouped by s
 
 ### Direct Editing
 
-You can edit memory files directly under `~/.grok/memory/`. The file watcher reindexes your changes on the next memory search. Use `/flush` to save the current session now, and `/dream` to consolidate session logs into organized topics.
+You can edit memory files directly under `~/.opengrok/memory/`. The file watcher reindexes your changes on the next memory search. Use `/flush` to save the current session now, and `/dream` to consolidate session logs into organized topics.
 
 ---
 
@@ -215,7 +215,7 @@ You can also open `/memory` from the command palette.
 When you save a note with `/remember`, Grok confirms in the scrollback:
 
 ```
-Memory saved to ~/.grok/memory/MEMORY.md
+Memory saved to ~/.opengrok/memory/MEMORY.md
 ```
 
 Background saves — flush, dream, and session-end — run silently and do not post a scrollback message. Use `/memory` at any time to browse what Grok has stored.
@@ -324,26 +324,26 @@ lambda = 0.7             # 0.0 = max diversity, 1.0 = pure relevance
 
 ## CLI Commands
 
-The `grok memory` command manages memory from the shell. It has one subcommand, `clear`:
+The `open-grok memory` command manages memory from the shell. It has one subcommand, `clear`:
 
 ```bash
 # Clear workspace memory (MEMORY.md, sessions/, and index.sqlite). This is the default scope.
-grok memory clear
+open-grok memory clear
 
 # The same scope, stated explicitly
-grok memory clear --workspace
+open-grok memory clear --workspace
 
 # Clear the global MEMORY.md
-grok memory clear --global
+open-grok memory clear --global
 
 # Clear both workspace and global memory
-grok memory clear --all
+open-grok memory clear --all
 
 # Skip the confirmation prompt (-y is the short form)
-grok memory clear --yes
+open-grok memory clear --yes
 ```
 
-To edit memory from the shell, open the files in your editor directly -- for example, `$EDITOR ~/.grok/memory/MEMORY.md`.
+To edit memory from the shell, open the files in your editor directly -- for example, `$EDITOR ~/.opengrok/memory/MEMORY.md`.
 
 ---
 
@@ -355,7 +355,7 @@ To edit memory from the shell, open the files in your editor directly -- for exa
 |-----|---------|-------------|
 | `enabled` | `false` | Enable memory |
 | `session.save_on_end` | `true` | Write metadata summary on session end |
-| `watcher.enabled` | `true` | Watch `~/.grok/memory/` for external edits and reindex |
+| `watcher.enabled` | `true` | Watch `~/.opengrok/memory/` for external edits and reindex |
 
 ### Index Settings (`[memory.index]`)
 
@@ -434,7 +434,7 @@ When a session memory is old, Grok attaches a staleness note to it in search res
 
 ## File Watcher
 
-By default, Grok watches `~/.grok/memory/` for external file changes. If you edit memory files directly (e.g., in your editor), the changes are picked up automatically on the next memory search:
+By default, Grok watches `~/.opengrok/memory/` for external file changes. If you edit memory files directly (e.g., in your editor), the changes are picked up automatically on the next memory search:
 
 - Created or modified files are reindexed.
 - Deleted files have their stale chunks removed from the index.
@@ -450,8 +450,8 @@ enabled = true    # default
 
 ### Memory Not Working
 
-1. Verify memory is enabled: check `grok inspect` output.
-2. Check the flag: `grok --experimental-memory` or `GROK_MEMORY=1`.
+1. Verify memory is enabled: check `open-grok inspect` output.
+2. Check the flag: `open-grok --experimental-memory` or `GROK_MEMORY=1`.
 3. Check for `--no-memory` or `GROK_MEMORY=0` overriding your config.
 
 ### Memory Not Appearing in Sessions
@@ -463,9 +463,9 @@ Memory is injected on the first turn. If you started a session before enabling m
 Use `/memory` in the TUI to browse all memory files with a preview. You can also access them directly:
 
 ```bash
-ls ~/.grok/memory/
-cat ~/.grok/memory/MEMORY.md
-$EDITOR ~/.grok/memory/MEMORY.md
+ls ~/.opengrok/memory/
+cat ~/.opengrok/memory/MEMORY.md
+$EDITOR ~/.opengrok/memory/MEMORY.md
 ```
 
 ### Debug Logging

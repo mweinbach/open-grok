@@ -187,9 +187,9 @@ fn discover_auto_sources(cwd: &str, skills: &[SkillInfo]) -> Vec<(String, usize)
     // [paths] extra_skill_dirs in config.toml (written by /import-claude).
     let imported = crate::claude_import::is_claude_import_marked();
     let local_dir_names: &[&str] = if imported {
-        &[".grok", ".agents"]
+        &[".opengrok", ".agents"]
     } else {
-        &[".grok", ".agents", ".claude"]
+        &[".opengrok", ".agents", ".claude"]
     };
 
     let mut sources: Vec<(String, usize)> = Vec::new();

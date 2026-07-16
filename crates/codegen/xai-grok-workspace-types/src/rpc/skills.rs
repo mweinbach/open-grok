@@ -40,13 +40,13 @@ impl WorkspaceRpc for DiscoverPluginsReq {
 /// so round-tripping never rewrites a novel scope value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SkillScope {
-    /// cwd/.grok/skills
+    /// cwd/.opengrok/skills
     Local,
-    /// repo_root/.grok/skills
+    /// repo_root/.opengrok/skills
     Repo,
-    /// ~/.grok/skills
+    /// ~/.opengrok/skills
     User,
-    /// ~/.grok/server-skills (synced from the skill store)
+    /// ~/.opengrok/server-skills (synced from the skill store)
     Server,
     /// platform built-in skills
     Bundled,
@@ -160,7 +160,7 @@ mod tests {
         let raw = serde_json::json!({
             "name": "my-skill",
             "description": "A test skill",
-            "path": "/workspace/.grok/skills/my-skill/SKILL.md",
+            "path": "/workspace/.opengrok/skills/my-skill/SKILL.md",
             "scope": "local",
         });
         let info: SkillInfo = serde_json::from_value(raw).unwrap();
@@ -190,13 +190,13 @@ mod tests {
             "license": "Apache-2.0",
             "compatibility": "Requires kubectl",
             "metadata": {"team": "infra"},
-            "path": "/root/.grok/server-skills/deploy/SKILL.md",
+            "path": "/root/.opengrok/server-skills/deploy/SKILL.md",
             "scope": "server",
-            "config_source": {"type": "user", "path": "/root/.grok/skills"},
+            "config_source": {"type": "user", "path": "/root/.opengrok/skills"},
             "plugin_name": "infra-plugin",
             "plugin_version": "1.0.0",
-            "plugin_root": "/root/.grok/plugins/infra-plugin",
-            "plugin_data": "/root/.grok/plugin-data/infra-plugin",
+            "plugin_root": "/root/.opengrok/plugins/infra-plugin",
+            "plugin_data": "/root/.opengrok/plugin-data/infra-plugin",
             "allowed_tools": ["bash"],
             "model": "grok-4",
             "effort": "high",

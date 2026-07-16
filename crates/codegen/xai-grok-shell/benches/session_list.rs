@@ -545,7 +545,7 @@ fn bench_session_list(c: &mut Criterion) {
     let home = TempDir::new().expect("create fixture root");
     // SAFETY: no runtime or benchmark worker activity exists during setup.
     unsafe {
-        std::env::set_var("GROK_HOME", home.path());
+        std::env::set_var("OPENGROK_HOME", home.path());
     }
     assert_eq!(xai_grok_shell::util::grok_home::grok_home(), home.path());
     let fixture = Fixture::new(home);

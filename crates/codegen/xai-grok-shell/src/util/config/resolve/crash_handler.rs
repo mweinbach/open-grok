@@ -60,7 +60,7 @@ fn cached_remote_crash_handler_enabled() -> Option<bool> {
     REMOTE_CRASH_HANDLER_ENABLED.read().ok().and_then(|g| *g)
 }
 
-/// Merge system-managed policy (`/etc/grok`) under home `managed_config.toml`
+/// Merge system-managed policy (`/etc/opengrok`) under home `managed_config.toml`
 /// so MDM/system layers still reach the managed BoolFlag tier.
 fn load_managed_toml_layers() -> Option<TomlValue> {
     let system = crate::config::load_system_managed_config().ok();

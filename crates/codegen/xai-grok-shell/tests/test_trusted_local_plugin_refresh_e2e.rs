@@ -4,7 +4,7 @@
 //! 1. Install a local plugin (full copy into `installed-plugins/`).
 //! 2. Add a new agent only on the **live** source tree.
 //! 3. Start a headless session — startup must re-copy trusted/user-home locals.
-//! 4. Smoke-validate session JSON under `$GROK_HOME/sessions/` after exit.
+//! 4. Smoke-validate session JSON under `$OPENGROK_HOME/sessions/` after exit.
 //!
 //! Requires a built `grok` binary (`GROK_BINARY` or cargo-built pager) for the
 //! ignored headless test.
@@ -113,9 +113,9 @@ fn trusted_local_refresh_surfaces_new_agent_via_discovery() {
     // symlink (macOS `/var` -> `/private/var`).
     let home_tmp = TempDir::new().unwrap();
     let home = dunce::canonicalize(home_tmp.path()).unwrap();
-    let grok_home = home.join(".grok");
+    let grok_home = home.join(".opengrok");
     let _home_guard = EnvVarGuard::set("HOME", &home);
-    let _grok_guard = EnvVarGuard::set("GROK_HOME", &grok_home);
+    let _grok_guard = EnvVarGuard::set("OPENGROK_HOME", &grok_home);
 
     // Live source: a user-home local plugin (mirrors a `~/.claude` local tree).
     let source = home
@@ -167,7 +167,7 @@ fn trusted_local_refresh_surfaces_new_agent_via_discovery() {
     );
 
     // Session `_meta.pluginDirs` load. Lives in the same test because
-    // grok_home() caches the first GROK_HOME per process; a separate test
+    // grok_home() caches the first OPENGROK_HOME per process; a separate test
     // could seed the cache first and break the assertions above.
     let plugin_dir = home.join("session-plugin");
     write_minimal_plugin(&plugin_dir, "session-plugin");
@@ -213,7 +213,7 @@ async fn headless_session_refreshes_trusted_local_plugin_and_writes_session_json
     // symlink (macOS `/var` -> `/private/var`).
     let home_tmp = TempDir::new().unwrap();
     let home = dunce::canonicalize(home_tmp.path()).unwrap();
-    let grok_home = home.join(".grok");
+    let grok_home = home.join(".opengrok");
     std::fs::create_dir_all(&grok_home).unwrap();
 
     let source = home
@@ -223,11 +223,11 @@ async fn headless_session_refreshes_trusted_local_plugin_and_writes_session_json
     write_minimal_plugin(&source, "demo-plugin");
     write_agent(&source, "old", "old-agent", "exists at install");
 
-    // The spawned binary gets HOME/GROK_HOME via `cmd.env` below; this global env
+    // The spawned binary gets HOME/OPENGROK_HOME via `cmd.env` below; this global env
     // is only for the in-process post-run discovery assertion (which resolves the
     // registry via grok_home()). `#[serial]` keeps it from racing other tests.
     let _home_guard = EnvVarGuard::set("HOME", &home);
-    let _grok_guard = EnvVarGuard::set("GROK_HOME", &grok_home);
+    let _grok_guard = EnvVarGuard::set("OPENGROK_HOME", &grok_home);
 
     let mut registry = InstallRegistry::empty(grok_home.join("installed-plugins"));
     let installed = register_local_install(&mut registry, &source);
@@ -254,7 +254,7 @@ async fn headless_session_refreshes_trusted_local_plugin_and_writes_session_json
     .kill_on_drop(true);
     xai_grok_test_support::env::test_env_cmd_tokio(&mut cmd, &server.url(), &home);
     cmd.env("HOME", &home);
-    cmd.env("GROK_HOME", &grok_home);
+    cmd.env("OPENGROK_HOME", &grok_home);
 
     let result = run_headless_with_cmd(cmd).await;
     assert_headless_success(
@@ -292,7 +292,7 @@ async fn headless_session_refreshes_trusted_local_plugin_and_writes_session_json
         "new agent must surface in /agents after the binary's session-start refresh"
     );
 
-    // Smoke: session storage under GROK_HOME/sessions has JSON artifacts.
+    // Smoke: session storage under OPENGROK_HOME/sessions has JSON artifacts.
     let sessions_root = grok_home.join("sessions");
     assert!(
         sessions_root.is_dir(),

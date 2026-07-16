@@ -30,7 +30,7 @@ async fn undo_tip_seen_count_never_persisted() {
     // Old behavior wrote `[hints] undo_tip_shown_count`; the in-memory cap
     // writes nothing. A missing config.toml (read_to_string → "") also proves
     // no persist happened, since the old code would have created it.
-    let config = content.home().join(".grok").join("config.toml");
+    let config = content.home().join(".opengrok").join("config.toml");
     let body = std::fs::read_to_string(&config).unwrap_or_default();
     assert!(
         !body.contains("undo_tip_shown_count"),

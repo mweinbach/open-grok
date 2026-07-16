@@ -1,4 +1,4 @@
-//! Host clipboard image paste mediated by `grok wrap`.
+//! Host clipboard image paste mediated by `open-grok wrap`.
 //!
 //! On a full remote paste miss (no image/text/file URLs) with
 //! `osc52_sink_active()`, remote emits a private OSC on stderr; wrap injects a
@@ -9,7 +9,7 @@
 //! Answering the private request OSC is effectively an image clipboard *read*
 //! for the wrapped session: any process that can write to the PTY (not only
 //! the inner `grok`) can solicit the host pasteboard. That is intentional and
-//! acceptable for `grok wrap` because (1) the user opted into wrap on their
+//! acceptable for `open-grok wrap` because (1) the user opted into wrap on their
 //! own host, (2) the answer stays inside their session, and (3) the remote
 //! only requests when `osc52_sink_active()` (wrap already set
 //! `GROK_OSC52_SINK` / `LC_GROK_OSC52_SINK`). Do not generalize this pattern

@@ -3,7 +3,7 @@
 use super::common::*;
 
 /// Folder-trust Case 2 — cwd IS `$HOME` (a git repo) => no prompt, no re-prompt
-/// loop. `$HOME` (and its default `~/.grok`) can never be recorded by the trust
+/// loop. `$HOME` (and its default `~/.opengrok`) can never be recorded by the trust
 /// store, so `decide` resolves Trusted rather than prompting on a key that could
 /// never persist. The pager boots straight to the normal welcome; without the
 /// fix the trust question would render (and re-appear every session).

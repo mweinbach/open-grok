@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Default install directory name under `~/.grok/`.
+/// Default install directory name under `~/.opengrok/`.
 const DEFAULT_INSTALL_DIR_NAME: &str = "installed-plugins";
 
 /// Registry of installed repos and their plugins.
@@ -249,7 +249,7 @@ impl InstallRegistry {
     ///
     /// Resolution order:
     /// 1. `[plugins].install_dir` from effective config (requirements > config > managed)
-    /// 2. Default: `~/.grok/installed-plugins/`
+    /// 2. Default: `~/.opengrok/installed-plugins/`
     pub fn resolve_install_dir() -> PathBuf {
         if let Some(dir) = Self::read_install_dir_from_config() {
             return dir;

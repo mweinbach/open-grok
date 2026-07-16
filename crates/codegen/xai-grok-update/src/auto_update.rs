@@ -25,13 +25,13 @@ pub enum UpdateRunMode {
 
 const PROMPT_UPDATE_NOW: &str = "Update now? [Y/n/d]";
 const MSG_AUTO_UPDATE_BACKGROUND: &str = "Auto-update running in background.";
-const MSG_RUN_UPDATE_MANUAL: &str = "Run `grok update` to get the latest version.";
+const MSG_RUN_UPDATE_MANUAL: &str = "Run `open-grok update` to get the latest version.";
 /// Manual-install one-liner for this platform's bootstrap installer.
 fn manual_install_cmd() -> &'static str {
     if cfg!(windows) {
-        "irm https://x.ai/cli/install.ps1 | iex"
+        "Open Grok does not currently publish a Windows binary; build it from source"
     } else {
-        "curl -fsSL https://x.ai/cli/install.sh | bash"
+        "curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash"
     }
 }
 
@@ -203,7 +203,7 @@ pub struct EnsureLatestOutcome {
 ///
 /// Unlike [`run_update`] this never uses the compiled-in version for the
 /// download decision — a binary already installed by another process (TUI
-/// background download, explicit `grok update`) is reused as-is. This both
+/// background download, explicit `open-grok update`) is reused as-is. This both
 /// removes the duplicate download in leader mode and stops the pre-fix
 /// hourly re-download while a busy leader keeps deferring its relaunch.
 ///
@@ -254,7 +254,7 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
 }
 
 /// Disk-version probe gated on the installer actually maintaining the
-/// managed `~/.grok/bin/grok` symlink.
+/// managed `~/.opengrok/bin/open-grok` symlink.
 ///
 /// Only the internal (install.sh / CDN) and gh-release installers write that
 /// symlink. npm manages its own global install, so for npm a symlink left
@@ -360,7 +360,7 @@ pub struct BackgroundUpdateCheck {
     /// `Some` when the *running* binary is older than the channel pointer —
     /// drives the in-TUI restart hint regardless of who downloads the binary.
     pub update: Option<UpdateAvailable>,
-    /// Handle to the background `grok update` child, `Some` only when a
+    /// Handle to the background `open-grok update` child, `Some` only when a
     /// download was actually started (the on-disk install was behind the
     /// pointer). The TUI parks this and `wait()`s on it at quit-for-update
     /// time instead of spawning a second downloader.
@@ -381,7 +381,7 @@ impl BackgroundUpdateCheck {
 /// Sets [`BackgroundUpdateCheck::update`] when the running binary is older
 /// than the channel pointer. If `auto_update` is enabled **and the on-disk
 /// install is also behind the pointer**, kicks off a non-blocking download
-/// (spawns `grok update` as a detached child process) so the new binary is
+/// (spawns `open-grok update` as a detached child process) so the new binary is
 /// ready when the user quits and relaunches. When another process (an earlier
 /// TUI, the leader's hourly checker) already put the target version on disk,
 /// no download is started — only the restart hint is surfaced.
@@ -421,7 +421,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
 
     // Only download when the on-disk install is behind the pointer; the
     // running process being stale (checked above) just means "show the
-    // restart hint". The quit-for-update path's `grok update` child resolves
+    // restart hint". The quit-for-update path's `open-grok update` child resolves
     // to "Already up to date" against the same disk state. Gated on the
     // installer maintaining the managed symlink — for npm a leftover symlink
     // would wrongly suppress the download (see `disk_version_for_installer`).
@@ -586,7 +586,7 @@ pub async fn run_update_if_available(
     Ok(false)
 }
 
-/// Launch "grok update" in blocking or non-blocking mode.
+/// Launch "open-grok update" in blocking or non-blocking mode.
 ///
 /// In `NonBlocking` mode the spawned child's handle is returned so the caller
 /// can later `wait()` on the in-flight download (e.g. the TUI's
@@ -617,7 +617,7 @@ async fn run_update_subcommand(run_mode: UpdateRunMode) -> Result<Option<tokio::
             // No detach: the child must stay in the foreground process group so Ctrl+C cancels it with the parent; the atomic install protocol makes mid-download kills safe.
             let status = cmd.status().await?;
             if !status.success() {
-                anyhow::bail!("grok update failed with {}", status);
+                anyhow::bail!("open-grok update failed with {}", status);
             }
             Ok(None)
         }
@@ -638,7 +638,7 @@ async fn run_update_subcommand(run_mode: UpdateRunMode) -> Result<Option<tokio::
 ///
 /// `current_exe()` resolves symlinks via `/proc/self/exe` (see proc(5)),
 /// so it returns the old versioned target after a symlink swap.
-/// Prefer `~/.grok/bin/grok` which always points to the latest version.
+/// Prefer `~/.opengrok/bin/open-grok` which always points to the latest version.
 fn resolve_restart_exe() -> Result<std::path::PathBuf> {
     let canonical = grok_application();
     if canonical.exists() {
@@ -1029,7 +1029,7 @@ pub async fn download_silent(url: &str, dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Delete `~/.grok/models_cache.json` after a successful update.
+/// Delete `~/.opengrok/models_cache.json` after a successful update.
 ///
 /// The cache embeds the binary version and will be treated as a miss by the
 /// new binary anyway, but removing it eagerly avoids a wasted disk read +
@@ -1043,7 +1043,7 @@ async fn remove_stale_models_cache() {
     }
 }
 
-/// Remove the stale `grok-pager` symlink/binary from `~/.grok/bin/` left by
+/// Remove the stale `grok-pager` symlink/binary from `~/.opengrok/bin/` left by
 /// older installations that shipped a separate pager binary.
 async fn remove_stale_pager(bin_dir: &std::path::Path) {
     let name = if cfg!(windows) {
@@ -1145,8 +1145,8 @@ async fn smoke_test_binary(binary_path: &std::path::Path) -> bool {
 
 /// Test-only entry point: same as [`install_internal`] but reads from
 /// `gcs_base_url` instead of the hardcoded GCS bucket. Persists installer
-/// config and writes to `~/.grok/bin/`, so callers must isolate
-/// `GROK_HOME`.
+/// config and writes to `~/.opengrok/bin/`, so callers must isolate
+/// `OPENGROK_HOME`.
 #[doc(hidden)]
 pub async fn install_internal_from_base(
     target: Option<&str>,
@@ -1157,8 +1157,8 @@ pub async fn install_internal_from_base(
     activate_verified_download(&download).await
 }
 
-/// A downloaded and smoke-tested binary in `~/.grok/downloads/`, not yet
-/// activated as the managed `grok`/`agent`.
+/// A downloaded and smoke-tested binary in `~/.opengrok/downloads/`, not yet
+/// activated as the managed `open-grok` command.
 struct VerifiedDownload {
     version: String,
     binary_path: std::path::PathBuf,
@@ -1227,7 +1227,7 @@ async fn activate_verified_download(download: &VerifiedDownload) -> Result<()> {
     let bin_dir = grok_home.join("bin");
     tokio::fs::create_dir_all(&bin_dir).await?;
 
-    // Atomic swap of ~/.grok/bin/{grok,agent} -> downloaded binary.
+    // Atomic swap of ~/.opengrok/bin/open-grok -> downloaded binary.
     let link_path = swap_managed_bin_links(&download.binary_path, &bin_dir).await?;
 
     remove_stale_pager(&bin_dir).await;
@@ -1258,7 +1258,7 @@ async fn activate_verified_download(download: &VerifiedDownload) -> Result<()> {
 /// Failures are silently ignored — completions are a nice-to-have, not a
 /// requirement for a successful update.
 async fn regenerate_completions(binary: &std::path::Path, grok_home: &std::path::Path) {
-    // Derive $HOME independently — grok_home may be overridden via GROK_HOME
+    // Derive $HOME independently — grok_home may be overridden via OPENGROK_HOME
     // env var, so grok_home.parent() isn't necessarily the user's home dir.
     #[allow(deprecated)]
     let user_home = std::env::home_dir().unwrap_or_default();
@@ -1290,13 +1290,13 @@ async fn regenerate_completions(binary: &std::path::Path, grok_home: &std::path:
 
 /// Compute a relative symlink target from `link` to `target`.
 ///
-/// When both paths share a grandparent (e.g. `~/.grok/bin/grok` and
-/// `~/.grok/downloads/grok-0.1.203-linux-x86_64`), returns a relative path
+/// When both paths share a grandparent (e.g. `~/.opengrok/bin/grok` and
+/// `~/.opengrok/downloads/grok-0.1.203-linux-x86_64`), returns a relative path
 /// like `../downloads/grok-0.1.203-linux-x86_64`.  When they share the same
 /// parent directory, returns just the filename.  Falls back to the absolute
 /// `target` path for any other layout.
 ///
-/// Relative symlinks survive Docker bind-mounts where `~/.grok/` is mapped
+/// Relative symlinks survive Docker bind-mounts where `~/.opengrok/` is mapped
 /// into a container with a different `$HOME` (and thus a different absolute
 /// prefix).
 #[cfg(unix)]
@@ -1320,16 +1320,15 @@ fn relative_symlink_target(target: &std::path::Path, link: &std::path::Path) -> 
     target.to_path_buf()
 }
 
-/// Swap `~/.grok/bin/{grok,agent}` to point at `binary_path`. Returns the
-/// `grok` link path (for [`regenerate_completions`]).
+/// Swap `~/.opengrok/bin/open-grok` to point at `binary_path`. Returns the
+/// managed link path (for [`regenerate_completions`]).
 ///
-/// `grok` and `agent` are first-class entry points that the bootstrap
-/// installers (`install.sh`, `install.ps1`, `install-enterprise.sh`)
-/// maintain in lockstep, and so must the updater — otherwise `grok update`
-/// leaves `agent` pinned at the previous version.
+/// Open Grok intentionally maintains only its namespaced entry point. Creating
+/// legacy `grok` or `agent` aliases would collide with a separately-installed
+/// upstream Grok Build CLI.
 ///
 /// Unix: atomic symlink swap with relative target (survives Docker
-/// bind-mounts of `~/.grok/`). Windows: [`windows_replace_exe`].
+/// bind-mounts of `~/.opengrok/`). Windows: [`windows_replace_exe`].
 ///
 /// **All-or-nothing.** Each link's prior state is captured (Unix: prior
 /// symlink target; Windows: `.rollback.bak`; or `Absent` marker via
@@ -1342,11 +1341,13 @@ async fn swap_managed_bin_links(
     binary_path: &std::path::Path,
     bin_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
-    let grok_name = if cfg!(windows) { "grok.exe" } else { "grok" };
-    let agent_name = if cfg!(windows) { "agent.exe" } else { "agent" };
-    let grok_link = bin_dir.join(grok_name);
-    let agent_link = bin_dir.join(agent_name);
-    let link_paths: [std::path::PathBuf; 2] = [grok_link.clone(), agent_link];
+    let managed_name = if cfg!(windows) {
+        "open-grok.exe"
+    } else {
+        "open-grok"
+    };
+    let managed_link = bin_dir.join(managed_name);
+    let link_paths = [managed_link.clone()];
 
     // Capture every link up-front so a 2nd-link capture failure can't
     // strand the 1st mid-swap.
@@ -1415,7 +1416,7 @@ async fn swap_managed_bin_links(
     for cap in &captured {
         cap.cleanup().await;
     }
-    Ok(grok_link)
+    Ok(managed_link)
 }
 
 /// Snapshot of a managed-bin link's prior state for rollback in
@@ -1939,11 +1940,11 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
         tokio::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).await?;
     }
 
-    // Atomic swap of ~/.grok/bin/{grok,agent} -> downloaded binary.
+    // Atomic swap of ~/.opengrok/bin/open-grok -> downloaded binary.
     swap_managed_bin_links(&binary_path, &bin_dir).await?;
 
     // Update grok-latest -> versioned binary so any existing symlinks that route
-    // through it (e.g. /usr/local/bin/grok -> ~/.grok/downloads/grok-latest)
+    // through it (e.g. /usr/local/bin/grok -> ~/.opengrok/downloads/grok-latest)
     // resolve to the newly installed version.
     #[cfg(unix)]
     {
@@ -1951,21 +1952,6 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
         let rel_target = relative_symlink_target(&binary_path, &latest_path);
         if let Err(e) = atomic_symlink_swap(&rel_target, &latest_path).await {
             tracing::warn!("Failed to update grok-latest symlink: {e}");
-        }
-    }
-
-    // Also update /usr/local/bin/{grok,agent} if either points directly into
-    // ~/.grok/downloads/ (legacy layout — skips the grok-latest indirection).
-    // Permission errors ignored.
-    #[cfg(unix)]
-    for name in ["grok", "agent"] {
-        let system_link = std::path::PathBuf::from(format!("/usr/local/bin/{name}"));
-        if let Ok(existing_target) = tokio::fs::read_link(&system_link).await {
-            let target_str = existing_target.to_string_lossy();
-            if target_str.contains(".grok/downloads/") && !target_str.ends_with("grok-latest") {
-                // Try to update; ignore permission errors
-                let _ = atomic_symlink_swap(&binary_path, &system_link).await;
-            }
         }
     }
 
@@ -2023,7 +2009,7 @@ fn create_temp_npmrc(npm_registry: Option<&str>) -> Result<Option<std::path::Pat
 /// the code signature of the mmap'd executable pages once the backing file
 /// inode is unlinked.
 ///
-/// While our postinstall.js now uses versioned binaries under ~/.grok/bin/
+/// While our postinstall.js now uses versioned binaries under ~/.opengrok/bin/
 /// (so processes launched from there are safe), older installations or npx
 /// invocations may still be running the vendored binary directly.
 #[cfg(target_os = "macos")]
@@ -2148,7 +2134,7 @@ pub async fn apply_channel_switch(channel_switch: Option<&str>, update_config: &
     }
 }
 
-/// Run the `grok update` command. Returns `Ok(Some(version))` when the target
+/// Run the `open-grok update` command. Returns `Ok(Some(version))` when the target
 /// version is present on disk afterwards — either installed by this call or
 /// found already installed (e.g. by a concurrent background download); returns
 /// `Ok(None)` when there is no installer or no applicable target. Callers use
@@ -2343,11 +2329,11 @@ async fn refresh_deployment_config() {
     match xai_grok_shell::managed_config::sync().await {
         Ok(true) => eprintln!("  Applied managed configuration."),
         Ok(false) => tracing::debug!("no managed configuration to apply"),
-        // Auth issues aren't actionable mid-update: quiet here, loud on `grok setup`.
+        // Auth issues aren't actionable mid-update: quiet here, loud on `open-grok setup`.
         Err(e) if e.is_auth_rejection() => tracing::debug!("managed config not applied: {e}"),
         Err(e) if e.is_retryable() => {
             tracing::debug!("managed config refresh failed: {e}");
-            eprintln!("  Couldn't apply managed configuration. Run `grok setup` to retry.");
+            eprintln!("  Couldn't apply managed configuration. Run `open-grok setup` to retry.");
         }
         Err(e) => eprintln!("  Couldn't apply managed configuration. {e}"),
     }
@@ -2363,8 +2349,10 @@ mod tests {
         // name onto a single `grok-0.1.tmp`; the helper must keep distinct
         // versions distinct AND make repeated attempts (same process, e.g.
         // concurrent tokio tasks) unique.
-        let dest_181 = std::path::Path::new("/home/u/.grok/downloads/grok-0.1.181-linux-x86_64");
-        let dest_182 = std::path::Path::new("/home/u/.grok/downloads/grok-0.1.182-linux-x86_64");
+        let dest_181 =
+            std::path::Path::new("/home/u/.opengrok/downloads/grok-0.1.181-linux-x86_64");
+        let dest_182 =
+            std::path::Path::new("/home/u/.opengrok/downloads/grok-0.1.182-linux-x86_64");
 
         let a = tmp_download_path(dest_181);
         let b = tmp_download_path(dest_182);
@@ -2387,7 +2375,7 @@ mod tests {
         );
         assert_eq!(
             a.parent(),
-            std::path::Path::new("/home/u/.grok/downloads").into(),
+            std::path::Path::new("/home/u/.opengrok/downloads").into(),
             "temp file must stay in the destination directory for atomic rename"
         );
     }
@@ -2678,8 +2666,8 @@ mod tests {
     #[test]
     fn test_relative_symlink_target_sibling_dirs() {
         // bin/grok -> ../downloads/grok-0.1.203
-        let target = std::path::Path::new("/home/alice/.grok/downloads/grok-0.1.203");
-        let link = std::path::Path::new("/home/alice/.grok/bin/grok");
+        let target = std::path::Path::new("/home/alice/.opengrok/downloads/grok-0.1.203");
+        let link = std::path::Path::new("/home/alice/.opengrok/bin/grok");
         let result = relative_symlink_target(target, link);
         assert_eq!(
             result,
@@ -2691,8 +2679,8 @@ mod tests {
     #[test]
     fn test_relative_symlink_target_same_dir() {
         // downloads/grok-latest -> grok-0.1.203 (same directory)
-        let target = std::path::Path::new("/home/alice/.grok/downloads/grok-0.1.203");
-        let link = std::path::Path::new("/home/alice/.grok/downloads/grok-latest");
+        let target = std::path::Path::new("/home/alice/.opengrok/downloads/grok-0.1.203");
+        let link = std::path::Path::new("/home/alice/.opengrok/downloads/grok-latest");
         let result = relative_symlink_target(target, link);
         assert_eq!(result, std::path::PathBuf::from("grok-0.1.203"));
     }
@@ -2700,26 +2688,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_relative_symlink_target_cross_tree_stays_absolute() {
-        // /usr/local/bin/grok -> /home/alice/.grok/downloads/grok-0.1.203
+        // /usr/local/bin/grok -> /home/alice/.opengrok/downloads/grok-0.1.203
         // Different grandparents — should stay absolute.
-        let target = std::path::Path::new("/home/alice/.grok/downloads/grok-0.1.203");
+        let target = std::path::Path::new("/home/alice/.opengrok/downloads/grok-0.1.203");
         let link = std::path::Path::new("/usr/local/bin/grok");
         let result = relative_symlink_target(target, link);
         assert_eq!(
             result,
-            std::path::PathBuf::from("/home/alice/.grok/downloads/grok-0.1.203")
+            std::path::PathBuf::from("/home/alice/.opengrok/downloads/grok-0.1.203")
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn test_relative_symlink_survives_directory_move() {
-        // Simulates Docker bind-mount: create ~/.grok/ layout at path A,
+        // Simulates Docker bind-mount: create ~/.opengrok/ layout at path A,
         // then move it to path B and verify the symlink still resolves.
         let dir = tempfile::tempdir().unwrap();
 
         // Create alice's layout
-        let alice = dir.path().join("alice").join(".grok");
+        let alice = dir.path().join("alice").join(".opengrok");
         let alice_downloads = alice.join("downloads");
         let alice_bin = alice.join("bin");
         std::fs::create_dir_all(&alice_downloads).unwrap();
@@ -2734,10 +2722,10 @@ mod tests {
         // Verify it works at the original location
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "binary-content");
 
-        // "Bind-mount" to bob: copy the entire .grok tree
+        // "Bind-mount" to bob: copy the entire .opengrok tree
         let bob_home = dir.path().join("bob");
         std::fs::create_dir_all(&bob_home).unwrap();
-        let bob = bob_home.join(".grok");
+        let bob = bob_home.join(".opengrok");
         let copy_status = std::process::Command::new("cp")
             .args(["-a", alice.to_str().unwrap(), bob.to_str().unwrap()])
             .status()
@@ -3967,7 +3955,7 @@ mod tests {
         );
         assert_eq!(
             MSG_RUN_UPDATE_MANUAL,
-            "Run `grok update` to get the latest version."
+            "Run `open-grok update` to get the latest version."
         );
     }
 

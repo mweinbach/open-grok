@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use serial_test::serial;
 
 /// Shared temp directory that lives for the entire test binary.
-/// All tests share this as GROK_HOME (the `OnceLock` in xai-grok-config
+/// All tests share this as OPENGROK_HOME (the `OnceLock` in xai-grok-config
 /// only allows one value per process).
 fn test_home() -> &'static PathBuf {
     static HOME: OnceLock<PathBuf> = OnceLock::new();
@@ -23,7 +23,7 @@ fn test_home() -> &'static PathBuf {
         // Keep so the directory survives the entire test process.
         let path = dir.keep();
         // SAFETY: called once at init before other threads touch this var.
-        unsafe { std::env::set_var("GROK_HOME", &path) };
+        unsafe { std::env::set_var("OPENGROK_HOME", &path) };
         path
     })
 }

@@ -1,4 +1,4 @@
-//! Pure resolution logic for `grok plugin install <name>` marketplace refs.
+//! Pure resolution logic for `open-grok plugin install <name>` marketplace refs.
 
 use crate::types::{MarketplaceEntry, MarketplaceSource, SourceKind};
 use crate::{canonical_github_owner_repo, is_official_source_url};

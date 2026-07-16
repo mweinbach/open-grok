@@ -938,7 +938,7 @@ fn spawn_permission_manager_with_pin(
         // "Yes, allow all edits during this session".
         //
         // Prior to this change, that choice would set edit_policy=Allow and
-        // persist it to ~/.grok/sessions/<cwd>/permission.toml. This caused
+        // persist it to ~/.opengrok/sessions/<cwd>/permission.toml. This caused
         // the allow to survive full restarts (new grok process, new agent
         // session in the same directory), which did not match the label or
         // user expectation (and did not match upstream session-scoped

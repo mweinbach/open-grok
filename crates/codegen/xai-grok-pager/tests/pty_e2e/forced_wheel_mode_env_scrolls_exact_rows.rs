@@ -24,7 +24,7 @@ use super::scroll::*;
 // Remaining determinism notes: back-to-back PTY writes only compress arrival
 // gaps (no mid-burst >80ms split; see the driver contract in `scroll.rs`),
 // the per-flush cap floor (6) exceeds the 3-line total, the wheel path has
-// no acceleration, and the harness's hermetic GROK_HOME pins scroll_speed at
+// no acceleration, and the harness's hermetic OPENGROK_HOME pins scroll_speed at
 // its default (50 → 1.0x).
 
 /// 120 one-row markers ≫ the 50-row PTY: early markers sit off-screen-top.

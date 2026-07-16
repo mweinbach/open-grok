@@ -2,7 +2,7 @@
 //!
 //! Two install modes, chosen by env precedence (see `resolve_debug_target_inner`):
 //! - PerSession (`GROK_DEBUG_LOG=1`): a routing layer fans each session's
-//!   firehose to `~/.grok/debug/<session_id>.txt` (one file per session), with a
+//!   firehose to `~/.opengrok/debug/<session_id>.txt` (one file per session), with a
 //!   `<role>-<pid>.txt` catch-all for events fired outside any session span, and
 //!   a `latest.txt` symlink pointing at the most-recently-opened session file.
 //! - SingleFile (explicit path via `GROK_LOG_FILE` or `GROK_DEBUG_LOG=<path>`):
@@ -405,7 +405,7 @@ pub fn flush() {
 /// Where the firehose should go, if anywhere.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DebugTarget {
-    /// `GROK_DEBUG_LOG=1` → route per session into `<dir>` (`~/.grok/debug`).
+    /// `GROK_DEBUG_LOG=1` → route per session into `<dir>` (`~/.opengrok/debug`).
     PerSession { dir: PathBuf },
     /// An explicit path → one flat `fmt` file, routing bypassed.
     SingleFile { path: PathBuf, src: DebugSource },
@@ -413,7 +413,7 @@ pub(crate) enum DebugTarget {
 
 /// Resolve the debug target, honoring precedence: explicit GROK_LOG_FILE wins
 /// (single file, RUST_LOG filter); else GROK_DEBUG_LOG — a truthy bool routes
-/// per session into `~/.grok/debug`, an explicit path writes a single file.
+/// per session into `~/.opengrok/debug`, an explicit path writes a single file.
 ///
 /// Read via `var_os` (not `var`) so a non-UTF-8 path isn't silently dropped.
 pub(crate) fn resolve_debug_target() -> Option<DebugTarget> {
@@ -477,7 +477,7 @@ fn resolve_debug_target_inner(
 const LOG_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Prune `*.txt` firehose files (and orphaned `latest.txt` swap temps) under
-/// `~/.grok/debug` older than [`LOG_RETENTION`] so the dir doesn't grow
+/// `~/.opengrok/debug` older than [`LOG_RETENTION`] so the dir doesn't grow
 /// unbounded. Age-based (not count-based) so a still-open log from a concurrent
 /// process is never unlinked mid-write; best-effort, ignore errors.
 pub(crate) fn sweep_old_logs() {

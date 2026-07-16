@@ -1765,7 +1765,7 @@ mod tests {
     #[test]
     fn subtitle_worktree_shows_label_branch_and_marker() {
         let mut agent = make_idle_agent_with_model(None);
-        agent.session.cwd = PathBuf::from("/home/me/.grok/worktrees/x/location-picker");
+        agent.session.cwd = PathBuf::from("/home/me/.opengrok/worktrees/x/location-picker");
         agent.is_worktree = true;
         agent.worktree_label = Some("location-picker".to_string());
         agent.current_branch = Some("kevin/feature".to_string());

@@ -242,13 +242,13 @@ pub fn process_client_identifier() -> String {
 }
 
 /// Header telling cli-chat-proxy whether this process is a single-prompt
-/// (`grok -p`) run or an interactive session; feeds the `client_mode`
+/// (`open-grok -p`) run or an interactive session; feeds the `client_mode`
 /// metric label.
 pub const CLIENT_MODE_HEADER: &str = "x-grok-client-mode";
 
 /// One-way latch: set to `"headless"` at startup by the non-TUI entry points
-/// (`run_single_turn` for `grok -p`, `run_headless_inner` for
-/// `grok agent [headless]`), `"interactive"` otherwise.
+/// (`run_single_turn` for `open-grok -p`, `run_headless_inner` for
+/// `open-grok agent [headless]`), `"interactive"` otherwise.
 static CLIENT_MODE: OnceLock<&'static str> = OnceLock::new();
 
 /// Mark this process as headless (single-prompt). No-op if already set.

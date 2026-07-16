@@ -966,7 +966,7 @@ pub(crate) async fn run(
         );
     }
 
-    // Apply initial config (may come from existing ~/.grok/pager.toml).
+    // Apply initial config (may come from existing ~/.opengrok/pager.toml).
     let mut initial_config = config_watcher.current().clone();
     // The cache holds the USER compact value; the render value is derived
     // (auto-compact while the startup terminal is short).
@@ -1329,7 +1329,7 @@ pub(crate) async fn run(
         app.draw(terminal);
     }
 
-    // Initial prompt from the CLI positional (`grok "fix the bug"`). When
+    // Initial prompt from the CLI positional (`open-grok "fix the bug"`). When
     // already authenticated, hand it to the shared dispatcher helper (same
     // `NewSession`/`SendPrompt` path the welcome screen uses). ZDR-blocked
     // accounts cannot start a session, so drop the prompt — this mirrors the
@@ -1347,7 +1347,7 @@ pub(crate) async fn run(
         }
     }
 
-    // `grok dashboard` startup: open the dashboard view immediately. The
+    // `open-grok dashboard` startup: open the dashboard view immediately. The
     // CLI subcommand wrote a `GROK_OPEN_DASHBOARD_AT_STARTUP=1` env var
     // so we don't have to thread a flag through every arg struct.
     if std::env::var("GROK_OPEN_DASHBOARD_AT_STARTUP").as_deref() == Ok("1") {
@@ -1515,7 +1515,7 @@ pub(crate) async fn run(
             } else if app.voice_cmd_tx.is_none() {
                 app.voice_state = VoiceState::Idle;
                 app.voice_ui_active = false;
-                app.show_toast("Voice pipeline could not start — restart grok");
+                app.show_toast("Voice pipeline could not start — restart open-grok");
             } else {
                 // Defensive: a queued start with the pipeline already up (which
                 // shouldn't occur) — drop it so we don't re-enter every tick.
@@ -1997,8 +1997,8 @@ pub(crate) async fn run(
             // Hot-reload: config file changed (dev mode) or initial load.
             Ok(()) = config_watcher.changed() => {
                 let mut config = config_watcher.current().clone();
-                // Preserve fields persisted via `~/.grok/config.toml [ui]`
-                // rather than `~/.grok/pager.toml`. The watcher only knows
+                // Preserve fields persisted via `~/.opengrok/config.toml [ui]`
+                // rather than `~/.opengrok/pager.toml`. The watcher only knows
                 // about pager.toml, so a hot-reload would otherwise revert
                 // these to their hardcoded defaults. Compact carries the
                 // PRE-reload render value; the canonical re-derive below owns

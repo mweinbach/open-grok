@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn server_dir_is_joined_under_root() {
-        let root = Path::new("/home/u/.grok/projects/enc/mcps");
+        let root = Path::new("/home/u/.opengrok/projects/enc/mcps");
         assert_eq!(server_descriptor_dir(root, "vercel"), root.join("vercel"));
     }
 

@@ -360,8 +360,8 @@ mod tests {
 
     #[test]
     fn expanded_surface_uses_worktree_cwd() {
-        let cwd = Path::new("/Users/me/.grok/worktrees/foo");
-        let path = "/Users/me/.grok/worktrees/foo/crates/x/a.rs";
+        let cwd = Path::new("/Users/me/.opengrok/worktrees/foo");
+        let path = "/Users/me/.opengrok/worktrees/foo/crates/x/a.rs";
         assert_eq!(
             path_for_tool_surface(path, ToolPathSurface::Expanded, Some(cwd), None, 0),
             "crates/x/a.rs"

@@ -10,7 +10,7 @@ const ENABLED_PLUGIN: &str = "copy-enabled";
 const DISABLED_PLUGIN: &str = "copy-disabled";
 
 fn seed_plugins_for_copy_hints(content: &ContentController) {
-    let grok_home = content.home().join(".grok");
+    let grok_home = content.home().join(".opengrok");
     let plugins_dir = grok_home.join("plugins");
     for name in [ENABLED_PLUGIN, DISABLED_PLUGIN] {
         let dir = plugins_dir.join(name);
@@ -23,7 +23,7 @@ fn seed_plugins_for_copy_hints(content: &ContentController) {
         )
         .expect("write plugin.json");
     }
-    std::fs::create_dir_all(&grok_home).expect("create .grok");
+    std::fs::create_dir_all(&grok_home).expect("create .opengrok");
     // User plugins default to disabled unless listed under enabled.
     let config = format!(
         "[plugins]\nenabled = [\"{ENABLED_PLUGIN}\"]\ndisabled = [\"{DISABLED_PLUGIN}\"]\n"

@@ -1,7 +1,7 @@
 #
 # Grok CLI installer for PowerShell — https://x.ai/cli/install.ps1
 #
-# Auth: GROK_DEPLOYMENT_KEY env var (takes precedence) or ~/.grok/auth.json from `grok login`.
+# Auth: GROK_DEPLOYMENT_KEY env var (takes precedence) or ~/.opengrok/auth.json from `open-grok login`.
 # Env: GROK_CHANNEL (stable|alpha|enterprise, default: stable), GROK_BIN_DIR, GROK_PROXY_URL
 #
 # Usage:
@@ -35,7 +35,7 @@ if ($PSVersionTable.Platform -and $PSVersionTable.Platform -ne 'Win32NT') {
     exit 1
 }
 
-$GrokDir = Join-Path $env:USERPROFILE '.grok'
+$GrokDir = Join-Path $env:USERPROFILE '.opengrok'
 
 # --- Helpers ---
 
@@ -122,10 +122,10 @@ if ($env:GROK_DEPLOYMENT_KEY) {
     $legacyToken = Read-GrokToken $LegacyScope
     if ($oidcToken) {
         $AuthSource = 'auth.json (oidc)'
-        Write-Host 'Auth: using OIDC token from ~/.grok/auth.json.' -ForegroundColor DarkGray
+        Write-Host 'Auth: using OIDC token from ~/.opengrok/auth.json.' -ForegroundColor DarkGray
     } elseif ($legacyToken) {
         $AuthSource = 'auth.json (legacy)'
-        Write-Host 'Auth: using legacy token from ~/.grok/auth.json.' -ForegroundColor DarkGray
+        Write-Host 'Auth: using legacy token from ~/.opengrok/auth.json.' -ForegroundColor DarkGray
     }
 }
 

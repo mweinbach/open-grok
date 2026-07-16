@@ -72,10 +72,10 @@ pub fn init_metrics() {
     hub_server::init_metrics();
 }
 /// Crate-wide lock serializing every test that mutates the process-global
-/// environment (`GROK_HOME`, `HOME`, …). nextest isolates each test in its own
+/// environment (`OPENGROK_HOME`, `HOME`, …). nextest isolates each test in its own
 /// process, but `cargo test --lib` shares ONE process across threads, so
 /// per-module locks don't serialize cross-module — a peer test in another module
-/// can clobber `GROK_HOME` mid-test. A single shared lock (used by every
+/// can clobber `OPENGROK_HOME` mid-test. A single shared lock (used by every
 /// env-mutating test module) is required for that single-process run to be
 /// race-free.
 #[cfg(test)]

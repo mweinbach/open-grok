@@ -254,7 +254,7 @@ impl Theme {
 
     /// Get the current theme, quantized to the terminal's color level.
     ///
-    /// Reads the active theme kind (loaded from `~/.grok/config.toml` on
+    /// Reads the active theme kind (loaded from `~/.opengrok/config.toml` on
     /// first call, then cached in memory), builds the theme from its
     /// `const fn` constructor, and quantizes to the terminal's color level.
     ///

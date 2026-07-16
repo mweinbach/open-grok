@@ -95,7 +95,7 @@ impl std::fmt::Display for UninstallError {
                 write!(
                     f,
                     "Plugin \"{name}\" not found.\n\
-                     Run `grok plugin list` to see installed plugins."
+                     Run `open-grok plugin list` to see installed plugins."
                 )
             }
             Self::NeedsConfirm {
@@ -119,7 +119,7 @@ impl std::fmt::Display for UninstallError {
 }
 
 /// Find, remove, clean up, and deregister a plugin.
-/// When `keep_data` is true, `~/.grok/plugin-data/<id>/` is preserved.
+/// When `keep_data` is true, `~/.opengrok/plugin-data/<id>/` is preserved.
 pub fn uninstall_plugin(
     name: &str,
     confirm: bool,
@@ -217,7 +217,7 @@ impl std::fmt::Display for UpdateError {
                 write!(
                     f,
                     "Plugin \"{name}\" not found.\n\
-                     Run `grok plugin list` to see installed plugins."
+                     Run `open-grok plugin list` to see installed plugins."
                 )
             }
         }
@@ -607,7 +607,7 @@ impl std::fmt::Display for MarketplaceInstallError {
                     write!(
                         f,
                         "Unknown marketplace \"{qualifier}\". No marketplaces are registered; \
-                         add one with `grok plugin marketplace add`."
+                         add one with `open-grok plugin marketplace add`."
                     )
                 } else {
                     let list = bullet_list(registered);
@@ -644,8 +644,8 @@ impl std::fmt::Display for MarketplaceInstallError {
                 write!(
                     f,
                     "No marketplace plugin named \"{name}\" in any registered marketplace.\n\
-                     Install a local directory with `grok plugin install ./{name}`, or add a \
-                     source with `grok plugin marketplace add`."
+                     Install a local directory with `open-grok plugin install ./{name}`, or add a \
+                     source with `open-grok plugin marketplace add`."
                 )?;
                 if !skipped_sources.is_empty() {
                     write!(
@@ -662,7 +662,7 @@ impl std::fmt::Display for MarketplaceInstallError {
                 write!(
                     f,
                     "Multiple marketplaces provide a plugin named \"{name}\":\n{list}\n\
-                     Pin one with `grok plugin install {name}@<qualifier>`."
+                     Pin one with `open-grok plugin install {name}@<qualifier>`."
                 )
             }
             Self::PartialScan {
@@ -674,7 +674,7 @@ impl std::fmt::Display for MarketplaceInstallError {
                     f,
                     "Couldn't scan every marketplace while resolving \"{name}\", so it can't be \
                      resolved safely. Unscanned source(s):\n{list}\n\
-                     Retry, or pin the source explicitly with `grok plugin install {name}@<qualifier>`."
+                     Retry, or pin the source explicitly with `open-grok plugin install {name}@<qualifier>`."
                 )
             }
             Self::Sync {
@@ -1174,11 +1174,11 @@ pub fn remove_toml_marketplace_block(content: &str, source_identity: &str) -> Op
 }
 
 /// Try removing a source from `settings.json` / `known_marketplaces.json` under
-/// `~/.grok/` and `~/.claude/`. Returns `true` if removed from at least one file.
+/// `~/.opengrok/` and `~/.claude/`. Returns `true` if removed from at least one file.
 pub fn try_remove_source_from_json_files(source_url_or_path: &str) -> bool {
     // Resolve user grok via user_grok_home() (None when no home resolves) and
-    // home separately, so removal still runs from $GROK_HOME when no home dir
-    // exists, and never touches a cwd-relative .grok.
+    // home separately, so removal still runs from $OPENGROK_HOME when no home dir
+    // exists, and never touches a cwd-relative .opengrok.
     let home = dirs::home_dir();
     let grok = xai_grok_config::user_grok_home();
 

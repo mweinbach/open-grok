@@ -3,7 +3,7 @@ description: >
   A plain prompt referencing a skill mid-message
   ("great /test-skill do it") keeps the composer's teal token highlight in the
   scrollback echo after submit. The workspace seeds a repo-local
-  .grok/skills/test-skill/SKILL.md so the real shell advertises the skill; the
+  .opengrok/skills/test-skill/SKILL.md so the real shell advertises the skill; the
   screenshots capture the styled composer (pre-submit) and the styled echo
   (post-submit) — the styled JSON artifacts carry the per-run fg colors for
   visual verification and demo material.
@@ -15,7 +15,7 @@ environment:
 workspace:
   git_init: true
   files:
-    ".grok/skills/test-skill/SKILL.md": "---\nname: test-skill\ndescription: Test skill for echo styling.\n---\n\nDo the thing.\n"
+    ".opengrok/skills/test-skill/SKILL.md": "---\nname: test-skill\ndescription: Test skill for echo styling.\n---\n\nDo the thing.\n"
 mock:
   response: "MIDTEXT_SKILL_ECHO_DONE assistant reply after the mid-text skill prompt."
 steps:

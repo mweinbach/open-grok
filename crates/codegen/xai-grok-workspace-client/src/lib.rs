@@ -590,7 +590,7 @@ mod tests {
                 "workspace.git_status" => ok(serde_json::json!("On branch main")),
                 "workspace.discover_skills" => ok(serde_json::json!(
                     [{ "name" : "my-skill", "description" : "A test skill",
-                    "path" : "/workspace/.grok/skills/my-skill/SKILL.md", "scope"
+                    "path" : "/workspace/.opengrok/skills/my-skill/SKILL.md", "scope"
                     : "local", }]
                 )),
                 "workspace.discover_agents_md" => ok(serde_json::json!(

@@ -703,7 +703,7 @@ pub struct CleanupReport {
 /// Remove all worktrees under a directory.
 ///
 /// Scans the given directory for subdirectories (one or two levels deep to
-/// handle `~/.grok/worktrees/<repo>/<session>/`) and calls `remove_worktree()`
+/// handle `~/.opengrok/worktrees/<repo>/<session>/`) and calls `remove_worktree()`
 /// on each. Useful during session teardown to clean up all session worktrees.
 ///
 /// This is a **blocking** operation.
@@ -1571,7 +1571,7 @@ pub mod gc {
 
     /// True if any `live_cwds` entry sits inside `wt_path`. Kernel CWD links are
     /// physical paths, so also match the canonicalized worktree path — a
-    /// symlinked `$GROK_HOME` or custom worktree path would otherwise never match.
+    /// symlinked `$OPENGROK_HOME` or custom worktree path would otherwise never match.
     fn cwd_within(wt_path: &Path, live_cwds: &[PathBuf]) -> bool {
         let wt_canon = dunce::canonicalize(wt_path).unwrap_or_else(|_| wt_path.to_path_buf());
         live_cwds
@@ -2071,7 +2071,7 @@ mod tests {
         std::fs::write(repo_path.join("file.txt"), "content").unwrap();
         git_commit_all(&repo_path, "initial");
 
-        // Create ~/.grok/worktrees/<repo>/<session>/ structure.
+        // Create ~/.opengrok/worktrees/<repo>/<session>/ structure.
         let worktrees_dir = tmp.path().join("worktrees");
         let repo_group = worktrees_dir.join("myrepo");
         std::fs::create_dir_all(&repo_group).unwrap();
@@ -2116,7 +2116,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_cleanup_worktrees_in_removes_nested_dangling_symlink() {
-        // Dangling symlink one level deeper (~/.grok/worktrees/<repo>/<session>):
+        // Dangling symlink one level deeper (~/.opengrok/worktrees/<repo>/<session>):
         // the nested branch must also unlink it rather than skip it.
         let tmp = tempfile::TempDir::new().unwrap();
         let worktrees_dir = tmp.path().join("worktrees");
@@ -2184,7 +2184,7 @@ mod tests {
     fn remove_with_delegate_deregisters_plain_worktree_without_calling_delegate() {
         xai_test_utils::require_git!();
         use xai_test_utils::git::{git_commit_all, init_git_repo};
-        // Isolate GROK_HOME so the post-removal unregister writes to a private DB.
+        // Isolate OPENGROK_HOME so the post-removal unregister writes to a private DB.
         #[cfg(feature = "metadata")]
         let _fx = crate::db::GrokHomeFixture::new();
 
@@ -2242,7 +2242,7 @@ mod tests {
 
         let report = delete_snapshot_with_delegate_fallback(
             Path::new("/mnt/btrfs/worktrees/snap-1"),
-            Path::new("/home/u/.grok/worktrees/repo/wt"),
+            Path::new("/home/u/.opengrok/worktrees/repo/wt"),
             Some(&delegate),
             |_| anyhow::bail!("operation not permitted (os error 1)"),
         )
@@ -2449,7 +2449,7 @@ mod tests {
         let snapshot_path = worktrees_dir.join("wt-live");
         std::fs::create_dir(&snapshot_path).unwrap();
         let unrestored_home = tmp.path().join("unrestored-home");
-        let mount_target = unrestored_home.join(".grok/worktrees/x/wt-live");
+        let mount_target = unrestored_home.join(".opengrok/worktrees/x/wt-live");
         assert!(
             !mount_target.parent().unwrap().exists(),
             "precondition: mount_target parent must be absent"
@@ -2499,7 +2499,7 @@ mod tests {
         let worktrees_dir = tmp.path().join("worktrees");
         std::fs::create_dir(&worktrees_dir).unwrap();
 
-        let mount_target = std::path::PathBuf::from("/home/user/.grok/worktrees/active-wt");
+        let mount_target = std::path::PathBuf::from("/home/user/.opengrok/worktrees/active-wt");
 
         let meta = btrfs::BtrfsSnapshotMetadata {
             kind: std::borrow::Cow::Borrowed("btrfs"),
@@ -2835,12 +2835,12 @@ mod tests {
 
         #[test]
         fn register_worktree_writes_correct_fields() {
-            // Isolate GROK_HOME so register_worktree's open_default write lands
+            // Isolate OPENGROK_HOME so register_worktree's open_default write lands
             // in our own DB (lock + private tmp + restore via the fixture).
             let fx = crate::db::GrokHomeFixture::new();
 
             // Unique basename → unique id, so a concurrent open_default writer
-            // (GROK_HOME is process-global) can't INSERT-OR-REPLACE our row.
+            // (OPENGROK_HOME is process-global) can't INSERT-OR-REPLACE our row.
             let wt_path = fx.home.join("register-fields-wt");
             std::fs::create_dir(&wt_path).unwrap();
 
@@ -3502,7 +3502,7 @@ mod tests {
             // succeeds, so the mock's delete_snapshot is not called.)
             use std::sync::atomic::{AtomicUsize, Ordering};
 
-            // GROK_HOME == the gc DB dir so remove_worktree's open_default
+            // OPENGROK_HOME == the gc DB dir so remove_worktree's open_default
             // unregister hits the same DB the gc record lives in.
             let fx = crate::db::GrokHomeFixture::new();
             let db = WorktreeDb::open(&fx.home).unwrap();

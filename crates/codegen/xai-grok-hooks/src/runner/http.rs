@@ -175,7 +175,7 @@ pub async fn run_http_hook(
     let url: &str = &expanded_url;
     // For tracing/log purposes prefer the pre-expansion source so
     // resolved values from the user `env` map (which may contain
-    // secrets like API tokens) don't land in `~/.grok/logs`. Falls
+    // secrets like API tokens) don't land in `~/.opengrok/logs`. Falls
     // back to the expanded form if the spec was constructed by a
     // legacy path that didn't populate `url_raw`. The same `log_url`
     // is also threaded into `format!("HTTP request failed for {}:

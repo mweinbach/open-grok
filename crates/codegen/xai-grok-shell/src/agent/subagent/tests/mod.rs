@@ -119,11 +119,11 @@ fn subagent_max_turns_definition_wins_else_inherits_parent() {
 fn resume_worktree_action_covers_three_outcomes() {
     use super::{ResumeWorktreeAction, resume_worktree_action};
     assert_eq!(
-        resume_worktree_action(true, Some("refs/grok/subagents/x")),
+        resume_worktree_action(true, Some("refs/open-grok/subagents/x")),
         ResumeWorktreeAction::Rehydrate
     );
     assert_eq!(
-        resume_worktree_action(false, Some("refs/grok/subagents/x")),
+        resume_worktree_action(false, Some("refs/open-grok/subagents/x")),
         ResumeWorktreeAction::Rehydrate
     );
     assert_eq!(resume_worktree_action(true, None), ResumeWorktreeAction::Reuse);

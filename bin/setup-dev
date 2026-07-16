@@ -23,4 +23,4 @@ cargo check --locked -p xai-grok-pager-bin
 
 echo
 echo "Local development setup is ready."
-echo "Run this checkout with: ./bin/grok-dev --version"
+echo "Run this checkout with: ./bin/open-grok-dev --version"

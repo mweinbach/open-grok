@@ -1596,7 +1596,7 @@ fn is_binary_file(path: &Path) -> bool {
 /// Check if a path is under a hidden directory (component starting with `.`).
 ///
 /// Returns `true` for paths like `.claude/worktrees/x/src/main.rs` or
-/// `.grok/worktrees/repo/lib.rs`, which should not be indexed since they
+/// `.opengrok/worktrees/repo/lib.rs`, which should not be indexed since they
 /// are typically tool-managed worktrees or caches.
 fn is_under_hidden_dir(path: &Path) -> bool {
     path.components().any(|c| {
@@ -1790,7 +1790,7 @@ mod tests {
             ".claude/worktrees/abc/src/main.rs"
         )));
         assert!(is_under_hidden_dir(Path::new(
-            ".grok/worktrees/repo/lib.rs"
+            ".opengrok/worktrees/repo/lib.rs"
         )));
         assert!(is_under_hidden_dir(Path::new("src/.hidden/file.rs")));
     }

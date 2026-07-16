@@ -472,7 +472,7 @@ impl MemoryIndex {
     ///
     /// An empty string means no claim is active.  A non-empty claim means
     /// a session currently owns the reindex lock (or a crashed session left
-    /// a stale one).  Used by `grok memory doctor` to detect stuck states.
+    /// a stale one).  Used by `open-grok memory doctor` to detect stuck states.
     pub fn get_reindex_claim(&self) -> String {
         self.db
             .query_row(
@@ -485,7 +485,7 @@ impl MemoryIndex {
 
     /// Return all distinct file paths that have at least one indexed chunk.
     ///
-    /// Used by `grok memory doctor` to detect orphaned chunks (chunks whose
+    /// Used by `open-grok memory doctor` to detect orphaned chunks (chunks whose
     /// source file has since been deleted).
     pub fn all_indexed_paths(&self) -> Result<Vec<String>, rusqlite::Error> {
         let mut stmt = self
@@ -1179,13 +1179,13 @@ mod tests {
     ///
     /// 1. Index a file.
     /// 2. Delete the file from disk (simulates a user removing a session log).
-    /// 3. Run the same orphan-removal logic as `grok memory reindex`:
+    /// 3. Run the same orphan-removal logic as `open-grok memory reindex`:
     ///    compare `all_indexed_paths()` against current files and call
     ///    `delete_path()` for paths that no longer exist.
     /// 4. Verify the stale chunks are gone and are no longer searchable.
     ///
-    /// This proves that `grok memory reindex`'s Phase 1 actually fixes the
-    /// state that `grok memory doctor` warns about.
+    /// This proves that `open-grok memory reindex`'s Phase 1 actually fixes the
+    /// state that `open-grok memory doctor` warns about.
     #[test]
     fn test_reindex_maintenance_removes_orphaned_chunks() {
         let tmp = TempDir::new().unwrap();
@@ -1206,7 +1206,7 @@ mod tests {
         // Delete the file — now it is orphaned in the index.
         std::fs::remove_file(&file).unwrap();
 
-        // Simulate `grok memory reindex` Phase 1: compare indexed vs current.
+        // Simulate `open-grok memory reindex` Phase 1: compare indexed vs current.
         let current: std::collections::BTreeSet<String> = vec![].into_iter().collect(); // empty = no files
         let indexed = idx.all_indexed_paths().unwrap();
         for path in &indexed {
@@ -1225,7 +1225,7 @@ mod tests {
 
     /// A fresh (non-stale) reindex claim blocks `try_claim_reindex`.
     ///
-    /// Verifies that `grok memory reindex` Phase 0 correctly bails when a
+    /// Verifies that `open-grok memory reindex` Phase 0 correctly bails when a
     /// live session holds a fresh claim — i.e., the CLI cannot steal a live
     /// session's lock and then mutate the index concurrently.
     #[test]
@@ -1256,10 +1256,10 @@ mod tests {
         idx.release_claim();
     }
 
-    /// `grok memory reindex` Phase 3 resets the stale reindex claim.
+    /// `open-grok memory reindex` Phase 3 resets the stale reindex claim.
     ///
     /// Verifies that `release_claim()` clears `meta.reindex_claim` so that
-    /// `grok memory doctor` no longer reports a stale lock after reindex runs.
+    /// `open-grok memory doctor` no longer reports a stale lock after reindex runs.
     #[test]
     fn test_reindex_maintenance_resets_stale_claim() {
         let tmp = TempDir::new().unwrap();
@@ -1274,7 +1274,7 @@ mod tests {
             "claim must be set before Phase 3"
         );
 
-        // Simulate `grok memory reindex` Phase 3: release the claim.
+        // Simulate `open-grok memory reindex` Phase 3: release the claim.
         idx.release_claim();
 
         assert_eq!(

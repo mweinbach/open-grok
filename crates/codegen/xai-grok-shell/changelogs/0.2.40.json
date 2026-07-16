@@ -1,7 +1,7 @@
 [
   {
     "category": "features",
-    "description": "**`grok --debug`** now produces per-session log files under ~/.grok/debug/ even with a leader process.",
+    "description": "**`grok --debug`** now produces per-session log files under ~/.opengrok/debug/ even with a leader process.",
     "breaking_change": false
   },
   {

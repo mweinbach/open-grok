@@ -114,7 +114,7 @@ impl<'de> Deserialize<'de> for UserMessageTemplate {
         deserializer.deserialize_any(Visitor)
     }
 }
-/// One discovered rule file (AGENTS.md / Claude.md / .grok/rules/*.md).
+/// One discovered rule file (AGENTS.md / Claude.md / .opengrok/rules/*.md).
 ///
 /// Wire-compatible with `AgentConfigFile` -- this type exists so the
 /// `UserMessageContext` does not depend on the AGENTS-discovery internals
@@ -185,7 +185,7 @@ pub struct UserMessageContext {
     pub terminals_folder: Option<PathBuf>,
     /// Workspace-scoped rule files (cwd / repo root / optional workspace user dir).
     pub workspace_rules: Vec<RuleEntry>,
-    /// User-scoped rule files (~/.grok/, ~/.claude/).
+    /// User-scoped rule files (~/.opengrok/, ~/.claude/).
     pub user_rules: Vec<RuleEntry>,
     /// Skill registry snapshot (already deduped). Rendered through the
     /// shared budget-tier renderer.
@@ -196,7 +196,7 @@ pub struct UserMessageContext {
     /// Connected MCP servers (alphabetical).
     pub mcp_servers: Vec<McpServerEntry>,
     /// Absolute path to the per-workspace MCP descriptor root
-    /// (`~/.grok/projects/<encoded-cwd>/mcps`). Surfaced in
+    /// (`~/.opengrok/projects/<encoded-cwd>/mcps`). Surfaced in
     /// the `<mcp_file_system>` instructions so the model knows where
     /// to discover tool/resource schemas. Required when `mcp_servers` is
     /// non-empty; ignored otherwise.

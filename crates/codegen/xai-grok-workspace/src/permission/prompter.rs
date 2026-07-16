@@ -39,7 +39,7 @@ pub const ALLOW_EDITS_SESSION_OPTION_ID: &str = "allow-edits-session";
 ///     1. Flips local YOLO state on the active agent
 ///     2. Drains any queued permission requests with `AllowOnce` responses
 ///     3. Persists `[ui] permission_mode = "always-approve"` to
-///        `~/.grok/config.toml` via the `Effect::PersistPermissionMode` effect
+///        `~/.opengrok/config.toml` via the `Effect::PersistPermissionMode` effect
 ///     4. Sends the existing `x.ai/yolo_mode_changed` ACP notification so
 ///        the agent's permission manager flips its `yolo_mode` flag
 ///

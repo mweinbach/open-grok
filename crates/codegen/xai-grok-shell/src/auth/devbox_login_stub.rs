@@ -4,7 +4,7 @@
 //! off, so the remote devbox login helper is not reached. The API
 //! mirrors the real module: `is_devbox_environment()` is always `false`, which
 //! short-circuits every auto-recovery/migration call site, and the entry
-//! points that can still be reached directly (`grok login --devbox`) return a
+//! points that can still be reached directly (`open-grok login --devbox`) return a
 //! descriptive error.
 
 use super::manager::AuthManager;
@@ -31,7 +31,7 @@ pub(super) async fn mint_devbox_auth_raw() -> anyhow::Result<GrokAuth> {
     anyhow::bail!(UNAVAILABLE)
 }
 
-/// `grok login --devbox` entry point: always errors in this build.
+/// `open-grok login --devbox` entry point: always errors in this build.
 pub async fn run_devbox_login(_config: &crate::agent::config::Config) -> anyhow::Result<GrokAuth> {
     anyhow::bail!(UNAVAILABLE)
 }

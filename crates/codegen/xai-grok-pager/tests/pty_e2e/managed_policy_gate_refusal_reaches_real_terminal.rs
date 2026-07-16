@@ -47,7 +47,7 @@ async fn managed_policy_gate_refusal_reaches_real_terminal() {
         &["--no-auto-update"],
         // GROK_MANAGED_CONFIG=0 disables the background refetch so the gate decision is deterministic and offline.
         &[
-            ("GROK_HOME", home_str),
+            ("OPENGROK_HOME", home_str),
             ("GROK_MANAGED_CONFIG", "0"),
             ("NO_COLOR", "1"),
         ],

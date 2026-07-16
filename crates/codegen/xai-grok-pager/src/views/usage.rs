@@ -20,7 +20,7 @@ pub fn format_xai_usage_error(error: &str) -> String {
 /// message distinct from a transient service failure.
 pub fn format_codex_usage_error(error: &str) -> String {
     if error.to_ascii_lowercase().contains("not connected") {
-        "Not connected. Run `grok login --codex`.".to_string()
+        "Not connected. Run `open-grok login --codex`.".to_string()
     } else {
         format!("Usage unavailable: {error}")
     }
@@ -348,8 +348,8 @@ mod tests {
     #[test]
     fn disconnected_error_is_explicit_and_actionable() {
         assert_eq!(
-            format_codex_usage_error("Not connected; run `grok login --codex`"),
-            "Not connected. Run `grok login --codex`."
+            format_codex_usage_error("Not connected; run `open-grok login --codex`"),
+            "Not connected. Run `open-grok login --codex`."
         );
     }
 }

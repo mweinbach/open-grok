@@ -212,8 +212,8 @@ async fn run_case(unauthorized_responses: usize, byok: bool) -> CaseResult {
 
     let oauth = spawn_oauth_mock().await;
     let home = tempfile::tempdir().expect("temp home");
-    let grok_home = home.path().join(".grok");
-    std::fs::create_dir_all(&grok_home).expect("create GROK_HOME");
+    let grok_home = home.path().join(".opengrok");
+    std::fs::create_dir_all(&grok_home).expect("create OPENGROK_HOME");
     write_codex_auth(&grok_home);
     let byok_line = byok.then_some("api_key = \"codex-byok\"\n").unwrap_or("");
     std::fs::write(
@@ -271,7 +271,7 @@ default = "codex-test"
         .kill_on_drop(true);
     xai_grok_test_support::env::test_env_cmd_tokio(&mut command, &server.url(), home.path());
     command
-        .env("GROK_HOME", &grok_home)
+        .env("OPENGROK_HOME", &grok_home)
         .env("GROK_CODEX_AUTH_BASE_URL", &oauth.base_url)
         .env_remove("XAI_API_KEY")
         .env_remove("GROK_LEADER_SOCKET");
@@ -467,8 +467,8 @@ async fn codex_resume_uses_persisted_provider_instead_of_xai_default() {
     server.set_response("Codex resume succeeded");
 
     let home = tempfile::tempdir().expect("temp home");
-    let grok_home = home.path().join(".grok");
-    std::fs::create_dir_all(&grok_home).expect("create GROK_HOME");
+    let grok_home = home.path().join(".opengrok");
+    std::fs::create_dir_all(&grok_home).expect("create OPENGROK_HOME");
     let workdir = git_workdir();
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -522,7 +522,7 @@ default = "{default_model}"
             .kill_on_drop(true);
         xai_grok_test_support::env::test_env_cmd_tokio(&mut command, &server.url(), home.path());
         command
-            .env("GROK_HOME", &grok_home)
+            .env("OPENGROK_HOME", &grok_home)
             .env_remove("XAI_API_KEY")
             .env_remove("GROK_LEADER_SOCKET");
         command
@@ -702,8 +702,8 @@ async fn xai_codex_xai_resume_keeps_xai_exports_closed() {
 
     let export_mock = spawn_xai_export_mock().await;
     let home = tempfile::tempdir().expect("temp home");
-    let grok_home = home.path().join(".grok");
-    std::fs::create_dir_all(&grok_home).expect("create GROK_HOME");
+    let grok_home = home.path().join(".opengrok");
+    std::fs::create_dir_all(&grok_home).expect("create OPENGROK_HOME");
     write_xai_oauth(&grok_home);
 
     std::fs::write(
@@ -752,7 +752,7 @@ default = "xai-sticky"
             .kill_on_drop(true);
         xai_grok_test_support::env::test_env_cmd_tokio(&mut command, &server.url(), home.path());
         command
-            .env("GROK_HOME", &grok_home)
+            .env("OPENGROK_HOME", &grok_home)
             .env("GROK_FEEDBACK_ENABLED", "true")
             .env("GROK_FEEDBACK_BASE_URL", &export_mock.base_url)
             .env("GROK_TELEMETRY_TRACE_UPLOAD", "true")

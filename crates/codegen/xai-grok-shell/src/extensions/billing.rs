@@ -162,7 +162,7 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 
 /// Structured context for unified-log entries from a successful billing fetch.
 ///
-/// Keeps history to a count + the most recent period so `~/.grok/logs/unified.jsonl`
+/// Keeps history to a count + the most recent period so `~/.opengrok/logs/unified.jsonl`
 /// stays useful without dumping unbounded period arrays.
 fn billing_unified_log_ctx(billing: &BillingConfigResponse) -> serde_json::Value {
     let history_len = billing
@@ -201,7 +201,7 @@ async fn handle_get_billing(agent: &MvpAgent) -> ExtResult {
     let auth = super::auth_gate::require_xai_auth(
         &agent.auth_manager,
         "Authentication required to fetch billing data",
-        "Billing data requires auth with grok.com. Run `grok login` to authenticate.",
+        "Billing data requires auth with grok.com. Run `open-grok login` to authenticate.",
     )?;
 
     let proxy_base = agent.cli_chat_proxy_base_url();
@@ -292,7 +292,7 @@ async fn handle_get_auto_topup_rule(agent: &MvpAgent) -> ExtResult {
     let auth = super::auth_gate::require_xai_auth(
         &agent.auth_manager,
         "Authentication required to fetch auto top-up rule",
-        "Auto top-up data requires auth with grok.com. Run `grok login` to authenticate.",
+        "Auto top-up data requires auth with grok.com. Run `open-grok login` to authenticate.",
     )?;
 
     let proxy_base = agent.cli_chat_proxy_base_url();

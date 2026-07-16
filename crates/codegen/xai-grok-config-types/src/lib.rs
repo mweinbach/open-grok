@@ -764,7 +764,7 @@ pub struct RemoteSettings {
     /// See `Config::resolve_image_edit`.
     #[serde(default)]
     pub imagine_tools_disabled: Option<Vec<String>>,
-    /// remote settings gate for the `grok workspace` CLI command (Computer Hub
+    /// remote settings gate for the `open-grok workspace` CLI command (Computer Hub
     /// workspace exposure), from `grok_build_settings.workspace_command_enabled`.
     /// `Some(true)` enables it; `None`/`Some(false)` (the default) keep it off.
     #[serde(default)]

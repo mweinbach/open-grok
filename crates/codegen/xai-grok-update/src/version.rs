@@ -35,7 +35,7 @@ pub(crate) const CLI_BASE_URLS: &[&str] = &[CLI_BASE_URL_PRIMARY, CLI_BASE_URL_F
 pub struct UpdateConfig {
     /// Chat API proxy base URL (versioned `https://cli-chat-proxy.grok.com/v1` endpoint).
     pub proxy_base_url: String,
-    /// Auth scope key for `~/.grok/auth.json`.
+    /// Auth scope key for `~/.opengrok/auth.json`.
     pub auth_scope: String,
     /// Enterprise deployment key (GROK_DEPLOYMENT_KEY).
     pub deployment_key: Option<String>,
@@ -354,8 +354,9 @@ pub async fn fetch_latest_version(installer: &str, config: &UpdateConfig) -> Res
 /// current time. Call after confirming the version is current (no update
 /// needed) or after a successful install.
 ///
-/// `stable_version` records the current stable channel pointer so that
-/// `channel_label()` can derive `[alpha]` vs `[stable]` without network I/O.
+/// `stable_version` preserves the upstream updater cache shape for backwards
+/// compatibility. Open Grok release provenance is GitHub and is not inferred
+/// from this pointer.
 pub async fn write_version_cache(version: &str, stable_version: Option<&str>) {
     let version_path = grok_home().join("version.json");
     let now = time::OffsetDateTime::now_utc();
@@ -416,18 +417,19 @@ pub async fn is_version_cache_fresh() -> bool {
 
 pub use xai_grok_version::installed as get_installed_grok_version;
 
-/// Version of the managed grok binary currently on disk, read from the
-/// `~/.grok/bin/grok` symlink target (`../downloads/grok-<version>-<platform>`)
+/// Version of the managed Open Grok binary currently on disk, read from the
+/// `~/.opengrok/bin/open-grok` symlink target
+/// (`../downloads/grok-<version>-<platform>`)
 /// without exec'ing anything.
 ///
 /// Concurrent updaters (TUI background download, leader hourly checker,
-/// explicit `grok update`) decide staleness from this instead of their own
+/// explicit `open-grok update`) decide staleness from this instead of their own
 /// compiled-in version, so a binary another process already installed is
 /// never downloaded a second time.
 ///
 /// Returns `None` when there is no parseable managed symlink (Windows
 /// copy-based installs, dev builds) or when the symlink is DANGLING — a
-/// link whose target binary was deleted (e.g. manual `~/.grok/downloads`
+/// link whose target binary was deleted (e.g. manual `~/.opengrok/downloads`
 /// cleanup) must not report an installed version, or every updater would
 /// claim "already up to date" forever while no runnable binary exists.
 /// NOTE: the symlink existing does not prove the *active installer*
@@ -480,14 +482,11 @@ pub(crate) fn version_from_versioned_binary_name(name: &str, bin_prefix: &str) -
 ///
 /// Tries each base URL in [`CLI_BASE_URLS`] and returns the first success.
 /// Best-effort: returns `None` on any failure (the caller will simply omit
-/// the stable pointer from the cache, and `channel_label()` will return `""`
-/// until the next successful fetch).
+/// the stable pointer from the cache).
 ///
-/// The entire operation is capped at 500 ms. The stable pointer is only used
-/// to derive the `[alpha]`/`[stable]` channel label — it is never required
-/// for correctness. On slow or unreachable networks the timeout fires and we
-/// return `None`; the label will populate on the next successful TTL check
-/// (~30 min). This keeps startup and post-install paths fast.
+/// The entire operation is capped at 500 ms. The pointer is never required
+/// for correctness; on slow or unreachable networks the timeout fires and we
+/// return `None`. This keeps legacy updater paths fast.
 pub(crate) async fn try_fetch_stable_pointer() -> Option<String> {
     tokio::time::timeout(Duration::from_millis(500), async {
         for base in CLI_BASE_URLS {
@@ -501,71 +500,8 @@ pub(crate) async fn try_fetch_stable_pointer() -> Option<String> {
     .unwrap_or(None)
 }
 
-/// Read the cached stable version from `~/.grok/version.json` (sync, for display).
-///
-/// Returns `None` if the file doesn't exist, can't be parsed, or has no
-/// `stable_version` field (e.g. written by an older binary).
-pub fn cached_stable_version() -> Option<String> {
-    let version_path = grok_home().join("version.json");
-    let content = std::fs::read_to_string(&version_path).ok()?;
-    let gv: GrokVersion = serde_json::from_str(&content).ok()?;
-    gv.stable_version
-}
-
-/// Pure comparison: derive the channel name from current vs stable pointer.
-///
-/// Returns `Some("alpha")` when `current > stable`, `Some("stable")` when
-/// `current <= stable`, or `None` when either version fails to parse.
-fn derive_channel<'a>(current: &str, stable: &str) -> Option<&'a str> {
-    let current_v = semver::Version::parse(current).ok()?;
-    let stable_v = semver::Version::parse(stable).ok()?;
-    if current_v > stable_v {
-        Some("alpha")
-    } else {
-        Some("stable")
-    }
-}
-
-/// Machine-readable channel name derived from the cached stable pointer.
-///
-/// Returns `Some("alpha")` when the current version is ahead of the cached
-/// stable pointer, `Some("stable")` when at or behind, or `None` when no
-/// cached pointer is available (first launch, old cache format, parse error).
-///
-/// The result is computed once and cached for the process lifetime.
-pub fn channel_name() -> Option<&'static str> {
-    use std::sync::OnceLock;
-    static NAME: OnceLock<Option<&'static str>> = OnceLock::new();
-    *NAME.get_or_init(|| {
-        let stable = cached_stable_version()?;
-        derive_channel(xai_grok_version::VERSION, &stable)
-    })
-}
-
-/// Channel label derived from the cached stable pointer.
-///
-/// Compares the compiled-in `VERSION` against the stable pointer stored in
-/// `~/.grok/version.json` (written by the auto-updater):
-/// - `" [alpha]"` when the current version is ahead of stable,
-/// - `" [stable]"` when at or behind stable,
-/// - `""` when no cached pointer is available (first launch, old cache format).
-///
-/// The result is computed once and cached for the process lifetime.
-pub fn channel_label() -> &'static str {
-    use std::sync::OnceLock;
-    static LABEL: OnceLock<&'static str> = OnceLock::new();
-    LABEL.get_or_init(|| {
-        let stable = match cached_stable_version() {
-            Some(s) => s,
-            None => return "",
-        };
-        match derive_channel(xai_grok_version::VERSION, &stable) {
-            Some("alpha") => " [alpha]",
-            Some(_) => " [stable]",
-            None => "",
-        }
-    })
-}
+/// Machine-readable provenance for Open Grok releases.
+pub const RELEASE_SOURCE: &str = "github";
 
 #[cfg(test)]
 mod tests {
@@ -621,48 +557,6 @@ mod tests {
                 .as_deref(),
             Some("0.1.5")
         );
-    }
-
-    // ──────────────────────────────────────────────────────────────────────
-    // derive_channel — invariant matrix
-    //
-    // Tests the pure comparison logic that determines [alpha] vs [stable].
-    // Covers current 0.1.X-alpha.N, future 0.2.X, edge cases, and errors.
-    // ──────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_derive_channel_matrix() {
-        // (current, stable_pointer, expected_channel)
-        let cases: &[(&str, &str, Option<&str>)] = &[
-            // ── Current 0.1.X workflow ──
-            ("0.1.220-alpha.2", "0.1.219", Some("alpha")), // alpha ahead of stable
-            ("0.1.219", "0.1.219", Some("stable")),        // stable user on latest
-            ("0.1.218", "0.1.219", Some("stable")),        // stable user behind latest
-            ("0.1.220-alpha.2", "0.1.220-alpha.2", Some("stable")), // pointer matches exactly
-            ("0.1.220-alpha.2", "0.1.220", Some("stable")), // semver: release > pre-release
-            // ── Future 0.2.X workflow ──
-            ("0.2.5", "0.2.3", Some("alpha")), // alpha ahead of stable
-            ("0.2.5", "0.2.5", Some("stable")), // promoted to stable
-            ("0.2.3", "0.2.5", Some("stable")), // behind stable
-            ("0.2.0", "0.2.0", Some("stable")), // first release, both 0.2.0
-            // ── Cross-regime upgrade ──
-            ("0.2.0", "0.1.219", Some("alpha")), // new regime ahead of old stable
-            ("0.1.220-alpha.2", "0.2.0", Some("stable")), // old pre-release < new stable
-            // ── Error cases ──
-            ("garbage", "0.1.219", None), // unparseable current
-            ("0.1.219", "garbage", None), // unparseable stable
-            ("", "0.1.219", None),        // empty current
-            ("0.1.219", "", None),        // empty stable
-        ];
-
-        for (current, stable, expected) in cases {
-            let result = derive_channel(current, stable);
-            assert_eq!(
-                result, *expected,
-                "derive_channel({:?}, {:?}) = {:?}, expected {:?}",
-                current, stable, result, expected,
-            );
-        }
     }
 
     // ──────────────────────────────────────────────────────────────────────

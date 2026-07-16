@@ -14,7 +14,7 @@ Agents and personas both customize behavior, but they operate at different level
 |---|---|---|
 | **What they configure** | The whole session: model, tools, prompt mode, system prompt | A behavioral overlay added to a subagent's prompt |
 | **Scope** | Primary session or subagent | Subagents only |
-| **How you set them** | At startup, or with agent definitions (`.md` files in `.grok/agents/` or `~/.grok/agents/`) | In `config.toml` (`[subagents.personas]`) or `.toml` files under `.grok/personas/`; applied during subagent resolution |
+| **How you set them** | At startup, or with agent definitions (`.md` files in `.opengrok/agents/` or `~/.opengrok/agents/`) | In `config.toml` (`[subagents.personas]`) or `.toml` files under `.opengrok/personas/`; applied during subagent resolution |
 | **What they control** | Model, tool availability, prompt body, skills | Tone, output format, task focus, and input/output contracts |
 | **Who edits them** | You -- create, delete, or toggle them in the agents modal or by editing files | You -- define custom personas in config or files; bundled personas are read-only |
 | **Examples** | `grok-build`, `explore`, `plan` | `researcher`, `concise` |
@@ -34,7 +34,7 @@ export GROK_SUBAGENTS=0              # Environment variable
 ```
 
 ```toml
-# ~/.grok/config.toml
+# ~/.opengrok/config.toml
 [subagents]
 enabled = false
 ```
@@ -81,8 +81,8 @@ description = "Deep investigator."
 
 Grok Build discovers file-based personas from these locations, in priority order:
 
-- `.grok/personas/*.toml` (project)
-- `~/.grok/personas/*.toml` (user)
+- `.opengrok/personas/*.toml` (project)
+- `~/.opengrok/personas/*.toml` (user)
 - The bundled personas directory (lowest priority)
 
 Each file defines one persona, and the file name (without the extension) becomes the persona name. Inline `config.toml` personas take precedence over files. Only `.toml` files are discovered.
@@ -223,7 +223,7 @@ Define custom roles with their own capability and model defaults:
 description = "Deep research agent"
 default_capability_mode = "read-only"
 model = "grok-build"
-prompt_file = ".grok/prompts/researcher.md"
+prompt_file = ".opengrok/prompts/researcher.md"
 ```
 
 Define custom personas with behavioral instructions:
@@ -231,10 +231,10 @@ Define custom personas with behavioral instructions:
 ```toml
 [subagents.personas.concise]
 instructions = "Be concise. No filler words."
-# instructions_file = ".grok/personas/concise.md"  # or load from a file
+# instructions_file = ".opengrok/personas/concise.md"  # or load from a file
 ```
 
-Grok Build also discovers roles from `.grok/roles/*.toml` and personas from `.grok/personas/*.toml`. Inline `config.toml` definitions take precedence over files.
+Grok Build also discovers roles from `.opengrok/roles/*.toml` and personas from `.opengrok/personas/*.toml`. Inline `config.toml` definitions take precedence over files.
 
 ---
 

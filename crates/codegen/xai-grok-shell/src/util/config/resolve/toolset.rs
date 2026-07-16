@@ -11,7 +11,7 @@ use xai_grok_tools::implementations::grok_build::ask_user_question;
 ///
 /// Pass the **merged** requirements ([`crate::config::load_merged_requirements`])
 /// so an org policy in any requirements layer — not only
-/// `~/.grok/requirements.toml` — is honored. Returns `(find_bfs, grep_ugrep)`,
+/// `~/.opengrok/requirements.toml` — is honored. Returns `(find_bfs, grep_ugrep)`,
 /// which the caller bakes into a
 /// [`xai_grok_tools::computer::local::SearchShadowConfig`] on the local terminal
 /// backend.

@@ -2,7 +2,7 @@
 #
 # Grok CLI installer — https://x.ai/cli/install.sh
 #
-# Auth: GROK_DEPLOYMENT_KEY (takes precedence) or ~/.grok/auth.json from `grok login`.
+# Auth: GROK_DEPLOYMENT_KEY (takes precedence) or ~/.opengrok/auth.json from `open-grok login`.
 # Env: GROK_CHANNEL (stable|alpha|enterprise, default: stable), GROK_BIN_DIR, GROK_PROXY_URL
 #
 # Usage:
@@ -107,10 +107,10 @@ json_get() {
         | sed -e 's/\\"/"/g' -e 's/\\n/\'$'\n''/g' -e 's/\\t/\'$'\t''/g' -e 's/\\\\/\\/g'
 }
 
-# Read a token from ~/.grok/auth.json for the given scope key.
+# Read a token from ~/.opengrok/auth.json for the given scope key.
 # Format: {"scope_url": {"key": "token"}, ...}
 read_grok_token() {
-    local auth_file="$HOME/.grok/auth.json"
+    local auth_file="$HOME/.opengrok/auth.json"
     local scope="$1"
     [ -f "$auth_file" ] || return 1
     # Flatten to one line then extract: find the scope, then the "key" value after it
@@ -130,10 +130,10 @@ else
     LEGACY_TOKEN=$(read_grok_token "$LEGACY_SCOPE" 2>/dev/null) || true
     if [ -n "$OIDC_TOKEN" ]; then
         AUTH_SOURCE="auth.json (oidc)"
-        echo "Auth: using OIDC token from ~/.grok/auth.json." >&2
+        echo "Auth: using OIDC token from ~/.opengrok/auth.json." >&2
     elif [ -n "$LEGACY_TOKEN" ]; then
         AUTH_SOURCE="auth.json (legacy)"
-        echo "Auth: using legacy token from ~/.grok/auth.json." >&2
+        echo "Auth: using legacy token from ~/.opengrok/auth.json." >&2
     fi
 fi
 
@@ -153,8 +153,8 @@ esac
 
 BASE_URL_PRIMARY="https://x.ai/cli"
 BASE_URL_FALLBACK="https://storage.googleapis.com/grok-build-public-artifacts/cli"
-DOWNLOAD_DIR="$HOME/.grok/downloads"
-BIN_DIR="${GROK_BIN_DIR:-$HOME/.grok/bin}"
+DOWNLOAD_DIR="$HOME/.opengrok/downloads"
+BIN_DIR="${GROK_BIN_DIR:-$HOME/.opengrok/bin}"
 mkdir -p "$DOWNLOAD_DIR" "$BIN_DIR"
 
 platform="${os}-${arch}"
@@ -254,7 +254,7 @@ else
     fi
     mv -f "$binary_tmp" "$binary_path"
     # Use relative symlinks when BIN_DIR and DOWNLOAD_DIR share a parent
-    # (default layout: ~/.grok/bin and ~/.grok/downloads are siblings).
+    # (default layout: ~/.opengrok/bin and ~/.opengrok/downloads are siblings).
     # Relative symlinks survive Docker bind-mounts with a different $HOME.
     if [ "$(dirname "$BIN_DIR")" = "$(dirname "$DOWNLOAD_DIR")" ]; then
         link_target="../$(basename "$DOWNLOAD_DIR")/$(basename "$binary_path")"
@@ -267,16 +267,16 @@ else
 fi
 
 # Generate shell completions (best-effort)
-mkdir -p "$HOME/.grok/completions/bash" "$HOME/.grok/completions/zsh"
-"$BIN_DIR/grok" completions bash > "$HOME/.grok/completions/bash/grok.bash" 2>/dev/null || true
-"$BIN_DIR/grok" completions zsh  > "$HOME/.grok/completions/zsh/_grok"     2>/dev/null || true
+mkdir -p "$HOME/.opengrok/completions/bash" "$HOME/.opengrok/completions/zsh"
+"$BIN_DIR/grok" completions bash > "$HOME/.opengrok/completions/bash/grok.bash" 2>/dev/null || true
+"$BIN_DIR/grok" completions zsh  > "$HOME/.opengrok/completions/zsh/_grok"     2>/dev/null || true
 # Fish: write to the auto-loaded completions dir so it works immediately
 if mkdir -p "$HOME/.config/fish/completions" 2>/dev/null; then
     "$BIN_DIR/grok" completions fish > "$HOME/.config/fish/completions/grok.fish" 2>/dev/null || true
 fi
 
 # Persist installer source and channel to config
-CONFIG_FILE="$HOME/.grok/config.toml"
+CONFIG_FILE="$HOME/.opengrok/config.toml"
 CLI_BLOCK="installer = \"internal\""
 if [ "$CHANNEL" != "stable" ]; then
     CLI_BLOCK="${CLI_BLOCK}\nchannel = \"${CHANNEL}\""
@@ -317,16 +317,16 @@ if [ -n "$GROK_DEPLOYMENT_KEY" ]; then
         MANAGED_CONFIG=$(json_get "$DEPLOY_RESPONSE" "managed_config")
         REQUIREMENTS=$(json_get "$DEPLOY_RESPONSE" "requirements")
         if [ -n "$MANAGED_CONFIG" ] && [ "$MANAGED_CONFIG" != "null" ]; then
-            printf '%s\n' "$MANAGED_CONFIG" > "$HOME/.grok/managed_config.toml"
+            printf '%s\n' "$MANAGED_CONFIG" > "$HOME/.opengrok/managed_config.toml"
             echo "  Managed config applied." >&2
         else
-            rm -f "$HOME/.grok/managed_config.toml"
+            rm -f "$HOME/.opengrok/managed_config.toml"
         fi
         if [ -n "$REQUIREMENTS" ] && [ "$REQUIREMENTS" != "null" ]; then
-            printf '%s\n' "$REQUIREMENTS" > "$HOME/.grok/requirements.toml"
+            printf '%s\n' "$REQUIREMENTS" > "$HOME/.opengrok/requirements.toml"
             echo "  Requirements applied." >&2
         else
-            rm -f "$HOME/.grok/requirements.toml"
+            rm -f "$HOME/.opengrok/requirements.toml"
         fi
     fi
 fi
@@ -359,7 +359,7 @@ if [ "$os" != "windows" ] && ! path_has_dir "$BIN_DIR"; then
     done
 fi
 
-# Also update shell config so ~/.grok/bin is on PATH for future sessions
+# Also update shell config so ~/.opengrok/bin is on PATH for future sessions
 user_shell="$(basename "${SHELL:-}")"
 config_file=""
 
@@ -394,18 +394,18 @@ if [ -n "$config_file" ]; then
     # Build the new installer block
     if [ "$user_shell" = "fish" ]; then
         new_block='# >>> grok installer >>>
-fish_add_path $HOME/.grok/bin
+fish_add_path $HOME/.opengrok/bin
 # <<< grok installer <<<'
     elif [ "$user_shell" = "zsh" ]; then
         new_block='# >>> grok installer >>>
-export PATH="$HOME/.grok/bin:$PATH"
-fpath=(~/.grok/completions/zsh $fpath)
+export PATH="$HOME/.opengrok/bin:$PATH"
+fpath=(~/.opengrok/completions/zsh $fpath)
 autoload -Uz compinit && compinit -C
 # <<< grok installer <<<'
     else
         new_block='# >>> grok installer >>>
-export PATH="$HOME/.grok/bin:$PATH"
-[[ -r "$HOME/.grok/completions/bash/grok.bash" ]] && source "$HOME/.grok/completions/bash/grok.bash"
+export PATH="$HOME/.opengrok/bin:$PATH"
+[[ -r "$HOME/.opengrok/completions/bash/grok.bash" ]] && source "$HOME/.opengrok/completions/bash/grok.bash"
 # <<< grok installer <<<'
     fi
 
@@ -439,9 +439,9 @@ elif [ -n "$config_file" ]; then
     echo "Restart your terminal, then run 'grok' or 'agent' to get started!" >&2
 else
     echo "Add $BIN_DIR to your PATH, then run 'grok' or 'agent' to get started:" >&2
-    echo '  export PATH="$HOME/.grok/bin:$PATH"' >&2
+    echo '  export PATH="$HOME/.opengrok/bin:$PATH"' >&2
 fi
 
 if [ "$os" = "windows" ]; then
-    echo "To use grok from cmd.exe or PowerShell, add %USERPROFILE%\\.grok\\bin to your PATH." >&2
+    echo "To use grok from cmd.exe or PowerShell, add %USERPROFILE%\\.opengrok\\bin to your PATH." >&2
 fi

@@ -4,7 +4,7 @@
 //! Scenario (mirrors the field report "clients see `unknown session id` after
 //! the leader dies"):
 //!
-//! 1. Two stdio clients (`grok agent --leader stdio`) share one leader.
+//! 1. Two stdio clients (`open-grok agent --leader stdio`) share one leader.
 //! 2. Each creates its own session and completes a prompt round-trip.
 //! 3. The leader is killed with SIGKILL (crash, no graceful shutdown).
 //! 4. Each client's bridge must reconnect (re-electing / spawning a fresh
@@ -39,7 +39,7 @@ async fn test_leader_sigkill_clients_recover_sessions() {
             let server = MockInferenceServer::start().await.unwrap();
             let workdir = git_workdir();
             let home = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+            std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
 
             // ── Phase 1: two clients, one leader, two sessions ────────────
             let client_a = LeaderStdioClient::spawn(&server, workdir.path(), home.path()).await;
@@ -134,7 +134,7 @@ async fn test_leader_sigkill_single_client_recovers() {
             let server = MockInferenceServer::start().await.unwrap();
             let workdir = git_workdir();
             let home = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+            std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
 
             let client = LeaderStdioClient::spawn(&server, workdir.path(), home.path()).await;
             client.initialize().await;
@@ -192,7 +192,7 @@ async fn test_leader_sigkill_multi_session_client_recovers_all_sessions() {
             let server = MockInferenceServer::start().await.unwrap();
             let workdir = git_workdir();
             let home = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+            std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
 
             let client = LeaderStdioClient::spawn(&server, workdir.path(), home.path()).await;
             client.initialize().await;
@@ -261,7 +261,7 @@ async fn test_prompt_sent_during_outage_is_delivered_after_recovery() {
             let server = MockInferenceServer::start().await.unwrap();
             let workdir = git_workdir();
             let home = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+            std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
 
             let client = LeaderStdioClient::spawn(&server, workdir.path(), home.path()).await;
             client.initialize().await;

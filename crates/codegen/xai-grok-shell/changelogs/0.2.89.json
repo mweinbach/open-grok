@@ -31,7 +31,7 @@
   },
   {
     "category": "fixes",
-    "description": "**Plan files** now default to .grok/plan.md to match Grok conventions.",
+    "description": "**Plan files** now default to .opengrok/plan.md to match Grok conventions.",
     "breaking_change": false
   },
   {

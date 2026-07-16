@@ -85,8 +85,8 @@ pub fn inference_request_count(content: &ContentController) -> usize {
 /// `expires_at` must be far-future so no network refresh is attempted; the
 /// mock server accepts any bearer. Pair with [`oauth_env_for_pager`].
 pub fn seed_fake_oauth(content: &ContentController, user: &str) {
-    let grok_home = content.home().join(".grok");
-    std::fs::create_dir_all(&grok_home).expect("create temp .grok");
+    let grok_home = content.home().join(".opengrok");
+    std::fs::create_dir_all(&grok_home).expect("create temp .opengrok");
     std::fs::write(
         grok_home.join("auth.json"),
         format!(

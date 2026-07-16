@@ -126,7 +126,7 @@ pub fn prune_hidden_announcement_ids(
     ids.len() != before
 }
 
-/// Read hidden announcement ids from `~/.grok/announcements.json`.
+/// Read hidden announcement ids from `~/.opengrok/announcements.json`.
 /// Returns an empty set (everything visible) on missing or malformed file.
 pub async fn read_hidden_announcement_ids() -> BTreeSet<String> {
     let path = announcements_state_path();
@@ -136,7 +136,7 @@ pub async fn read_hidden_announcement_ids() -> BTreeSet<String> {
     }
 }
 
-/// Write hidden announcement ids to `~/.grok/announcements.json`.
+/// Write hidden announcement ids to `~/.opengrok/announcements.json`.
 pub async fn write_hidden_announcement_ids(ids: &BTreeSet<String>) {
     let path = announcements_state_path();
     if let Some(s) = serialize_hidden_announcement_ids(ids) {

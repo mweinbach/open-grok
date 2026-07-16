@@ -9,7 +9,7 @@
 //! - Same-type model switching (no rebuild)
 //! - Session resume
 //!
-//! Each test spawns a real `grok agent stdio` process, speaks the full ACP
+//! Each test spawns a real `open-grok agent stdio` process, speaks the full ACP
 //! protocol, and asserts on the inference request bodies (system prompt) and
 //! stderr tracing output to verify the correct harness was used.
 //!
@@ -33,7 +33,7 @@ where
 /// second spawn in a resume test reads the stale cache written by phase 1
 /// and never sees the updated model list.
 fn invalidate_models_cache(home: &std::path::Path) {
-    let cache = home.join(".grok").join("models_cache.json");
+    let cache = home.join(".opengrok").join("models_cache.json");
     if cache.exists() {
         std::fs::remove_file(&cache).expect("failed to delete models_cache.json");
     }

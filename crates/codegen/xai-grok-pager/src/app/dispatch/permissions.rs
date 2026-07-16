@@ -22,7 +22,7 @@ use agent_client_protocol as acp;
 /// resolves the id to `PromptOutcome::AllowOnce`), then (b) reuses the
 /// existing `set_yolo_mode(true)` flow to flip the local YOLO state, drain
 /// any remaining queued permissions, persist `[ui] permission_mode =
-/// "always-approve"` to `~/.grok/config.toml`, and fire the
+/// "always-approve"` to `~/.opengrok/config.toml`, and fire the
 /// `x.ai/yolo_mode_changed` ACP notification. See the option-id constant
 /// doc-comment for the full client/shell split. Under a managed-policy
 /// pin step (b) is refused with a toast — the request is still allowed once.

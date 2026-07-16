@@ -404,7 +404,7 @@ async fn most_recent_session_id(cwd: &str) -> anyhow::Result<(String, Option<Str
     let first = summaries.first().ok_or_else(|| {
         anyhow::anyhow!(
             "No session found for current directory. \
-             Use 'grok' to start a new session."
+             Use 'open-grok' to start a new session."
         )
     })?;
     Ok((first.info.id.to_string(), first.display_title_opt()))
@@ -1022,11 +1022,11 @@ mod tests {
     }
     /// The chat passthrough does not bypass the cwd-collision refusal that
     /// `app/mod.rs` runs on the materialized id.
-    #[serial_test::serial(GROK_HOME)]
+    #[serial_test::serial(OPENGROK_HOME)]
     #[tokio::test]
     async fn chat_resume_passthrough_keeps_cwd_collision_refusal() {
         let home = tempfile::tempdir().expect("home tempdir");
-        unsafe { std::env::set_var("GROK_HOME", home.path()) };
+        unsafe { std::env::set_var("OPENGROK_HOME", home.path()) };
         let cwd = tempfile::tempdir().expect("cwd tempdir");
         let cwd_str = cwd.path().to_string_lossy().to_string();
         let id = "aaaaaaaa-1111-2222-3333-444444444444";

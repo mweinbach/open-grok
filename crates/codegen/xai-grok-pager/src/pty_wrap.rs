@@ -2,7 +2,7 @@
 //!
 //! Spawns a command inside a local pseudo-terminal, intercepts the OSC 52
 //! clipboard escape sequences it emits, and writes their payload to the local
-//! system clipboard. This is the engine behind `grok wrap` (see
+//! system clipboard. This is the engine behind `open-grok wrap` (see
 //! [`crate::wrap_cmd`]); it makes clipboard "copy" work for programs running
 //! somewhere that cannot reach the user's clipboard (containers, SSH) even when
 //! the outer terminal does not handle OSC 52 itself (for example Apple
@@ -51,7 +51,7 @@ const BASE64_STANDARD_INDIFFERENT: base64::engine::GeneralPurpose =
 
 /// Run an arbitrary command inside a local PTY with OSC 52 output filtering.
 ///
-/// This is the engine behind `grok wrap`: it spawns
+/// This is the engine behind `open-grok wrap`: it spawns
 /// `program` (with `args`) attached to a local pseudo-terminal, forwards the
 /// outer terminal's size changes to it, and filters its output through
 /// [`Osc52Filter`], which intercepts OSC 52 clipboard sequences and writes
@@ -106,7 +106,7 @@ pub(crate) fn run_wrapped_command(program: &str, args: &[String]) -> Result<i32>
     // channel. Cross-thread use of portable-pty's `Write` impl observed EIO
     // (errno 5) on macOS even for small inject payloads; confining `write_all`
     // to a single owner thread avoids that. Handles are intentionally
-    // detached — `grok wrap` is short-lived and exits with the child.
+    // detached — `open-grok wrap` is short-lived and exits with the child.
     let mut pty_reader = pair.master.try_clone_reader()?;
 
     // NOTE: we intentionally do NOT block SIGWINCH here. The resize handler

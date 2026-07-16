@@ -1,7 +1,7 @@
 //! Vendor-compatibility end-to-end tests.
 //!
 //! Each test builds a fake `$HOME` containing skills/rules/AGENTS.md under the
-//! `.grok`, `.cursor`, and `.claude` vendor dirs, spawns a real `grok agent
+//! `.opengrok`, `.cursor`, and `.claude` vendor dirs, spawns a real `open-grok agent
 //! stdio` process against the mock inference server (toggling the
 //! `GROK_<VENDOR>_<SURFACE>_ENABLED` env vars via `cmd.env`), sends one prompt,
 //! and asserts on the full inference request bodies:
@@ -63,7 +63,7 @@ fn write_skill(home: &Path, vendor_dir: &str, name: &str, marker: &str) {
 /// Populate a fake `$HOME` + repo cwd with the full vendor-compat fixture set.
 fn seed_fixtures(home: &Path, cwd: &Path) {
     // Skills (User scope, home-based).
-    write_skill(home, ".grok", "grok-skill", MARKER_GROK_SKILL);
+    write_skill(home, ".opengrok", "grok-skill", MARKER_GROK_SKILL);
     write_skill(home, ".cursor", "my-cursor-skill", MARKER_CURSOR_SKILL);
     // `shell` is a Cursor vendor-default → must be denylisted under ~/.cursor.
     write_skill(home, ".cursor", "shell", MARKER_CURSOR_SHELL);

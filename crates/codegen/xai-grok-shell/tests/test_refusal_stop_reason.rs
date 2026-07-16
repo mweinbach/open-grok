@@ -137,7 +137,7 @@ mod leader {
             let server = refusal_messages_server().await;
             let workdir = git_workdir();
             let home = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+            std::fs::create_dir_all(home.path().join(".opengrok")).unwrap();
 
             let client = LeaderStdioClient::spawn(&server, workdir.path(), home.path()).await;
             client.initialize().await;

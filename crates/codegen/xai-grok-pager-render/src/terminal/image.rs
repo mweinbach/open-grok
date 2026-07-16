@@ -54,7 +54,7 @@ static GRAPHICS_PROTOCOL: OnceLock<GraphicsProtocol> = OnceLock::new();
 
 /// When set, scrollback inline-media overlays are forced **off** process-wide,
 /// regardless of the terminal's graphics capability. The scrollback-native
-/// minimal mode (`grok --minimal`) sets this once at startup: it never runs the
+/// minimal mode (`open-grok --minimal`) sets this once at startup: it never runs the
 /// interactive draw loop that paints inline images, so committed media blocks
 /// must always fall back to the `[Open …]` text affordance — and must not
 /// reserve blank image rows. See [`set_inline_overlay_force_off`].

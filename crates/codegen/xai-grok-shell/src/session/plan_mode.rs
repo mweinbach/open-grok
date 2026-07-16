@@ -75,7 +75,7 @@ pub struct PlanModeTracker {
     pending_activation: Option<PendingActivation>,
     /// Absolute path to the plan file on disk.
     /// Lives inside the session directory:
-    /// `~/.grok/sessions/<cwd>/<session_id>/plan.md`
+    /// `~/.opengrok/sessions/<cwd>/<session_id>/plan.md`
     plan_file_path: PathBuf,
 }
 /// A buffered mid-turn activation reminder plus the state needed to roll the
@@ -106,7 +106,7 @@ pub struct PlanModeSnapshot {
 }
 impl PlanModeTracker {
     /// Create a new tracker. `session_dir` is the session's storage
-    /// directory (e.g., `~/.grok/sessions/<encoded-cwd>/<session-id>/`).
+    /// directory (e.g., `~/.opengrok/sessions/<encoded-cwd>/<session-id>/`).
     pub fn new(session_dir: PathBuf) -> Self {
         Self {
             state: PlanModeState::Inactive,
@@ -553,10 +553,10 @@ mod tests {
     }
     #[test]
     fn plan_file_in_session_dir() {
-        let t = PlanModeTracker::new(PathBuf::from("/home/user/.grok/sessions/proj/abc-123"));
+        let t = PlanModeTracker::new(PathBuf::from("/home/user/.opengrok/sessions/proj/abc-123"));
         assert_eq!(
             t.plan_file_path(),
-            Path::new("/home/user/.grok/sessions/proj/abc-123/plan.md")
+            Path::new("/home/user/.opengrok/sessions/proj/abc-123/plan.md")
         );
     }
     #[test]
@@ -889,13 +889,13 @@ mod tests {
     }
     #[test]
     fn is_plan_file_write_exact_match() {
-        let plan = Path::new("/home/user/.grok/sessions/proj/abc/plan.md");
-        let target = Path::new("/home/user/.grok/sessions/proj/abc/plan.md");
+        let plan = Path::new("/home/user/.opengrok/sessions/proj/abc/plan.md");
+        let target = Path::new("/home/user/.opengrok/sessions/proj/abc/plan.md");
         assert!(is_plan_file_write(target, plan));
     }
     #[test]
     fn is_plan_file_write_different_path() {
-        let plan = Path::new("/home/user/.grok/sessions/proj/abc/plan.md");
+        let plan = Path::new("/home/user/.opengrok/sessions/proj/abc/plan.md");
         let target = Path::new("/home/user/project/src/main.rs");
         assert!(!is_plan_file_write(target, plan));
     }

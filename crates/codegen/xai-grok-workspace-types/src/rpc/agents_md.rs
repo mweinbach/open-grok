@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::WorkspaceRpc;
 
 /// `workspace.discover_agents_md` — project-instruction files (AGENTS.md /
-/// Claude.md / `.grok/rules/*.md`) discovered from the workspace root up to
-/// the git root, plus `~/.grok` and compat dirs.
+/// Claude.md / `.opengrok/rules/*.md`) discovered from the workspace root up to
+/// the git root, plus `~/.opengrok` and compat dirs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscoverAgentsMdReq {}
 

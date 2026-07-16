@@ -16,7 +16,7 @@
 //! (same `workspace_key`), each reloaded against its OWN cwd. Project LSP is NOT
 //! hot-reloaded — the LSP backend is baked into the agent's tool bridge at build
 //! time (one-shot startup coordinator, no in-place reconfigure API), so repo-local
-//! `.grok/lsp.json` servers start on the NEXT session open (the durable grant
+//! `.opengrok/lsp.json` servers start on the NEXT session open (the durable grant
 //! makes the re-spawn trusted). `lsp` is still REPORTED in the prompt's
 //! `configKinds` (it is a real reason the folder is gated) — only the post-grant
 //! hot-reload skips it.
@@ -361,7 +361,7 @@ async fn reload_project_servers_after_grant(ctx: ReloadAfterGrant<'_>) {
         let _ = target
             .cmd_tx
             .send(crate::session::SessionCommand::ReloadPlugins { registry });
-        // The session's OWN project hooks (`.grok/hooks`, `.cursor/hooks.json`),
+        // The session's OWN project hooks (`.opengrok/hooks`, `.cursor/hooks.json`),
         // which `ReloadPlugins` does NOT touch — re-discovered against the actor's
         // own `session_info.cwd` on the now-trusted verdict by `reload_hooks_impl`.
         let _ = target

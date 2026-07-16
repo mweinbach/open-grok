@@ -70,9 +70,9 @@ fn new_filtered_debouncer<F: notify_debouncer_mini::DebounceEventHandler>(
 pub enum ConfigChangeEvent {
     AuthChanged,
     GlobalConfigChanged,
-    /// `~/.grok/models_cache.json` changed — the on-disk `/v1/models`
+    /// `~/.opengrok/models_cache.json` changed — the on-disk `/v1/models`
     /// catalog cache was rewritten, possibly by **another** grok process
-    /// sharing the same `~/.grok` (the writer may also be this process;
+    /// sharing the same `~/.opengrok` (the writer may also be this process;
     /// the [`ModelsManager`](crate::agent::models::ModelsManager) dedupes
     /// by content before applying).
     ModelsCacheChanged,
@@ -98,8 +98,8 @@ pub enum ConfigChangeEvent {
     HomeClaudeJsonChanged,
 }
 
-/// Watches `~/.grok/` for `auth.json`, `config.toml`, and `models_cache.json`
-/// changes, plus any extra paths (project `.grok/config.toml`, `.mcp.json`,
+/// Watches `~/.opengrok/` for `auth.json`, `config.toml`, and `models_cache.json`
+/// changes, plus any extra paths (project `.opengrok/config.toml`, `.mcp.json`,
 /// etc.) provided at startup.
 ///
 /// Uses `notify-debouncer-mini` for built-in debounce that coalesces rapid
@@ -112,11 +112,11 @@ pub enum ConfigChangeEvent {
 /// comparison) skips the update when nothing actually changed, so the
 /// redundant read is harmless. This avoids a class of bugs where an
 /// optimistic suppression window accidentally swallows writes from external
-/// processes (e.g. `grok login` in another terminal).
+/// processes (e.g. `open-grok login` in another terminal).
 ///
 /// Adds two **non-recursive** watches per `cwd` argument:
 /// `<cwd>/` (catches `.mcp.json` and `.claude.json` at the project root) and
-/// `<cwd>/.grok/` (catches `<cwd>/.grok/config.toml`). Recursing on `<cwd>`
+/// `<cwd>/.opengrok/` (catches `<cwd>/.opengrok/config.toml`). Recursing on `<cwd>`
 /// would walk `node_modules/`, `target/`, `.git/`, etc. and blow through
 /// `fs.inotify.max_user_watches` on large repos. Use [`Self::watch_path`]
 /// to register additional cwds at runtime when new sessions open in
@@ -137,7 +137,7 @@ impl ConfigFileWatcher {
     /// Start watching. Returns `None` if the OS watcher fails to initialize.
     ///
     /// `cwd`, when `Some`, adds two non-recursive watches: `<cwd>/` and
-    /// `<cwd>/.grok/`. Use [`Self::watch_path`] later to register additional
+    /// `<cwd>/.opengrok/`. Use [`Self::watch_path`] later to register additional
     /// project cwds for sessions that open in previously-unwatched
     /// directories.
     pub fn start(
@@ -250,8 +250,8 @@ impl ConfigFileWatcher {
         //
         // When the leader's own cwd is also covered by
         // `extra_paths` (e.g. `find_project_configs(cwd)` already
-        // includes `<cwd>/.grok/config.toml` so the loop above
-        // watches `<cwd>/.grok/`), the call below installs a
+        // includes `<cwd>/.opengrok/config.toml` so the loop above
+        // watches `<cwd>/.opengrok/`), the call below installs a
         // duplicate watch on the same directory. `notify` dedupes
         // silently in its `RecommendedWatcher` (last-write-wins for
         // the recursion mode), so this is cosmetic — both
@@ -279,12 +279,12 @@ impl ConfigFileWatcher {
         ))
     }
 
-    /// Register `<cwd>/` and `<cwd>/.grok/` as **non-recursive** watch
+    /// Register `<cwd>/` and `<cwd>/.opengrok/` as **non-recursive** watch
     /// targets, in addition to whatever was passed to [`Self::start`].
     ///
     /// Intended for the session-open path: when a session opens in a cwd
     /// the leader hasn't seen before, calling this method ensures edits to
-    /// `<cwd>/.mcp.json` and `<cwd>/.grok/config.toml` trigger a
+    /// `<cwd>/.mcp.json` and `<cwd>/.opengrok/config.toml` trigger a
     /// [`ConfigChangeEvent`] (and downstream [`ConfigUpdate::
     /// ProjectMcpServersChanged`](super::reloader::ConfigUpdate::
     /// ProjectMcpServersChanged)) within the debounce window.
@@ -310,7 +310,7 @@ impl ConfigFileWatcher {
     }
 
     /// Remove the two non-recursive watches (`<cwd>/` and
-    /// `<cwd>/.grok/`) previously registered for `cwd` via
+    /// `<cwd>/.opengrok/`) previously registered for `cwd` via
     /// [`Self::start`] / [`Self::watch_path`].
     ///
     /// Best-effort and idempotent: a `cwd` that was never registered
@@ -345,10 +345,10 @@ fn parent_is_dir(parent: Option<&Path>, dir: &Path) -> bool {
 /// directory, quota exhausted, permission denied, etc.) — the caller has
 /// no reasonable recovery path beyond the existing user-triggered refresh.
 ///
-/// **Known limitation:** if `<cwd>/.grok/` does not yet
-/// exist at session-open time, the `.grok/` watch fails ENOENT and is
-/// swallowed at `debug!`. A later `mkdir <cwd>/.grok/` followed by a
-/// write to `<cwd>/.grok/config.toml` will NOT be observed — the
+/// **Known limitation:** if `<cwd>/.opengrok/` does not yet
+/// exist at session-open time, the `.opengrok/` watch fails ENOENT and is
+/// swallowed at `debug!`. A later `mkdir <cwd>/.opengrok/` followed by a
+/// write to `<cwd>/.opengrok/config.toml` will NOT be observed — the
 /// `<cwd>/` watch is non-recursive, so subdirectory creation isn't
 /// surfaced as a watch-add trigger. Users hitting this case must hit
 /// the explicit refresh button. A robust fix (re-attempt on parent-
@@ -357,14 +357,14 @@ fn watch_cwd_dirs(debouncer: &mut Debouncer<AccessFilteredWatcher>, cwd: &Path) 
     if let Err(e) = debouncer.watcher().watch(cwd, RecursiveMode::NonRecursive) {
         log_watch_error(&e, "failed to watch project cwd (non-recursive)");
     }
-    let grok_dir = cwd.join(".grok");
+    let grok_dir = cwd.join(".opengrok");
     if let Err(e) = debouncer
         .watcher()
         .watch(&grok_dir, RecursiveMode::NonRecursive)
     {
         log_watch_error(
             &e,
-            "failed to watch project .grok directory (non-recursive)",
+            "failed to watch project .opengrok directory (non-recursive)",
         );
     }
 }
@@ -376,15 +376,15 @@ fn unwatch_cwd_dirs(debouncer: &mut Debouncer<AccessFilteredWatcher>, cwd: &Path
     if let Err(e) = debouncer.watcher().unwatch(cwd) {
         tracing::debug!(error = %e, "failed to unwatch project cwd");
     }
-    let grok_dir = cwd.join(".grok");
+    let grok_dir = cwd.join(".opengrok");
     if let Err(e) = debouncer.watcher().unwatch(&grok_dir) {
-        tracing::debug!(error = %e, "failed to unwatch project .grok directory");
+        tracing::debug!(error = %e, "failed to unwatch project .opengrok directory");
     }
 }
 
 /// Log a `notify` watch failure, distinguishing the benign
 /// "directory doesn't exist yet" case (logged at `debug!` — it's
-/// expected for a freshly-opened session whose `<cwd>/.grok/` hasn't
+/// expected for a freshly-opened session whose `<cwd>/.opengrok/` hasn't
 /// been created) from genuinely actionable failures like
 /// `fs.inotify.max_user_watches` exhaustion or permission denied
 /// (logged at `warn!` — these mean live edits will be silently
@@ -399,7 +399,7 @@ fn log_watch_error(err: &notify::Error, msg: &str) {
     }
 }
 
-/// Watches skill directories (`~/.grok/skills/`, `<repo>/.grok/skills/`, etc.)
+/// Watches skill directories (`~/.opengrok/skills/`, `<repo>/.opengrok/skills/`, etc.)
 /// for new, modified, or removed `SKILL.md` files.
 ///
 /// When a change is detected the receiver gets a `()` signal. The caller is
@@ -423,10 +423,10 @@ fn is_skill_change_path(p: &Path) -> bool {
 }
 
 /// True for a global/home-level config dir that must never be watched
-/// recursively: `grok_home` (`~/.grok`, or `$GROK_HOME`) or a known vendor dir
+/// recursively: `grok_home` (`~/.opengrok`, or `$OPENGROK_HOME`) or a known vendor dir
 /// directly under `$HOME` ([`HOME_VENDOR_DIRS`]).
 ///
-/// These hold large non-skill trees — `~/.grok` alone has `worktrees/`,
+/// These hold large non-skill trees — `~/.opengrok` alone has `worktrees/`,
 /// `sessions/`, `logs/`, `upload_queue/` — so recursing them exhausted the
 /// inotify quota (~780k watches on a devbox) and, since each worktree is a full
 /// checkout, fired skill reloads on ordinary repo activity. They get scoped
@@ -443,7 +443,7 @@ fn is_global_config_dir(dir: &Path, grok_home: &Path) -> bool {
 /// Vendor config dir names that sit directly under `$HOME` and carry large
 /// non-skill trees. Kept in sync with the home-level dirs added by
 /// `collect_skill_config_dirs`.
-const HOME_VENDOR_DIRS: &[&str] = &[".grok", ".agents", ".claude", ".cursor"];
+const HOME_VENDOR_DIRS: &[&str] = &[".opengrok", ".agents", ".claude", ".cursor"];
 
 /// Testable core of [`is_global_config_dir`] with `$HOME` injected.
 fn is_global_config_dir_impl(dir: &Path, grok_home: &Path, home: Option<&Path>) -> bool {
@@ -463,7 +463,7 @@ fn is_global_config_dir_impl(dir: &Path, grok_home: &Path, home: Option<&Path>) 
 /// Watch only a config dir's skill subtrees — `<dir>/skills` recursively and
 /// `<dir>/commands` flat — never the dir root (see [`is_global_config_dir`]).
 /// Returns the number of watches registered; a missing subdir is skipped (for
-/// `~/.grok` these exist at startup; later creation is caught on restart).
+/// `~/.opengrok` these exist at startup; later creation is caught on restart).
 fn watch_skill_subdirs(
     debouncer: &mut Debouncer<AccessFilteredWatcher>,
     config_dir: &Path,
@@ -572,7 +572,7 @@ mod tests {
     fn is_global_config_dir_matches_only_grok_home_and_vendor_dirs() {
         let home = TempDir::new().unwrap();
         let home = home.path();
-        let grok_home = home.join(".grok");
+        let grok_home = home.join(".opengrok");
 
         let g = |dir: &Path| is_global_config_dir_impl(dir, &grok_home, Some(home));
 
@@ -586,11 +586,11 @@ mod tests {
         assert!(!g(&home.join("my-skills")));
         assert!(!g(&home.join(".config")));
         // A project/repo config dir (parent isn't $HOME): NOT global.
-        assert!(!g(&home.join("repo").join(".grok")));
+        assert!(!g(&home.join("repo").join(".opengrok")));
     }
 
-    /// Regression for the ~/.grok inotify-exhaustion / worktree-noise bug: a
-    /// `SKILL.md` under a sibling subtree (e.g. `~/.grok/worktrees/`) must not
+    /// Regression for the ~/.opengrok inotify-exhaustion / worktree-noise bug: a
+    /// `SKILL.md` under a sibling subtree (e.g. `~/.opengrok/worktrees/`) must not
     /// drive a reload, while a real `<dir>/skills/**/SKILL.md` change still does.
     #[test]
     #[cfg(target_os = "linux")]
@@ -607,7 +607,7 @@ mod tests {
         let wt_skill = global
             .join("worktrees")
             .join("wt1")
-            .join(".grok")
+            .join(".opengrok")
             .join("skills")
             .join("beta");
         fs::create_dir_all(&wt_skill).unwrap();
@@ -832,7 +832,7 @@ mod tests {
         assert!(count <= 3, "expected coalesced events (<=3), got {count}");
     }
 
-    /// A write to `<cwd>/.grok/config.toml` must surface as
+    /// A write to `<cwd>/.opengrok/config.toml` must surface as
     /// a `ConfigChangeEvent::ProjectConfigChanged` so the reloader emits
     /// `ConfigUpdate::ProjectMcpServersChanged { cwd }`. Uses a longer
     /// debounce and explicit poll loop so it survives the slower-than-
@@ -845,7 +845,7 @@ mod tests {
     fn project_cwd_toml_triggers_reload() {
         let grok_home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
-        let project_grok = cwd.path().join(".grok");
+        let project_grok = cwd.path().join(".opengrok");
         fs::create_dir_all(&project_grok).unwrap();
         // Seed the file before the watcher starts so we observe the
         // modification rather than the creation event.
@@ -879,7 +879,7 @@ mod tests {
         }
         assert!(
             found,
-            "expected ProjectConfigChanged for <cwd>/.grok/config.toml within 2s"
+            "expected ProjectConfigChanged for <cwd>/.opengrok/config.toml within 2s"
         );
     }
 
@@ -971,7 +971,7 @@ mod tests {
     }
 
     /// [`ConfigFileWatcher::watch_path`] registered after
-    /// `start` must light up `<new_cwd>/.grok/config.toml` writes
+    /// `start` must light up `<new_cwd>/.opengrok/config.toml` writes
     /// identically to a cwd passed in at `start`. Exercises the
     /// session-open registration path where the leader learns about a
     /// new project root after the watcher is already running.
@@ -983,7 +983,7 @@ mod tests {
     fn watch_path_dynamic_registration() {
         let grok_home = TempDir::new().unwrap();
         let new_cwd = TempDir::new().unwrap();
-        let project_grok = new_cwd.path().join(".grok");
+        let project_grok = new_cwd.path().join(".opengrok");
         fs::create_dir_all(&project_grok).unwrap();
         fs::write(project_grok.join("config.toml"), "").unwrap();
 

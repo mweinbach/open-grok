@@ -1470,10 +1470,10 @@ impl MvpAgent {
             "WORKTREE_CONFIG_SHELL: resolved worktree type at agent startup"
         );
         if relay_sync_enabled {
-            tracing::info!("[grok] Relay sync: ENABLED");
+            tracing::info!("[open-grok] Relay sync: ENABLED");
         } else if tui_mode && relay_config_enabled && !has_xai_auth {
             tracing::info!(
-                "[grok] Relay sync: DISABLED (no auth - run 'grok login' first)"
+                "[open-grok] Relay sync: DISABLED (no auth - run 'open-grok login' first)"
             );
         } else if tui_mode && !relay_config_enabled {
             tracing::debug!(
@@ -3287,7 +3287,7 @@ impl MvpAgent {
                 && sampling_config.api_key.is_some();
             if !has_codex_oauth && !has_codex_byok {
                 return Err(acp::Error::auth_required().data(
-                    "Codex authentication required; run `grok login --codex` or configure an API key for this model",
+                    "Codex authentication required; run `open-grok login --codex` or configure an API key for this model",
                 ));
             }
             // Keep sharing the agent's live xAI auth cell even while it is
@@ -3357,7 +3357,7 @@ impl MvpAgent {
             if servers.is_empty() {
                 let user_path = xai_grok_tools::util::grok_home::grok_home()
                     .join("lsp.json");
-                let project_path = tool_ctx.cwd.as_path().join(".grok").join("lsp.json");
+                let project_path = tool_ctx.cwd.as_path().join(".opengrok").join("lsp.json");
                 tracing::warn!(
                     cwd = % tool_ctx.cwd, user_lsp_path = % user_path.display(),
                     project_lsp_path = % project_path.display(),

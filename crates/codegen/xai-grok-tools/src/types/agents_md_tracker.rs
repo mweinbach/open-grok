@@ -35,7 +35,7 @@ pub(crate) const AGENT_FILENAMES: &[&str] = &[
 /// The runtime list is produced by `CompatConfig::rules_dirs()`; this constant
 /// is retained only as the all-on reference for the pinning test.
 #[cfg(test)]
-pub(crate) const RULES_DIRS: &[&str] = &[".grok/rules", ".claude/rules", ".cursor/rules"];
+pub(crate) const RULES_DIRS: &[&str] = &[".opengrok/rules", ".claude/rules", ".cursor/rules"];
 
 /// Maximum number of parent directories to walk upward per call.
 ///
@@ -303,7 +303,7 @@ impl AgentsMdTracker {
                     }
                 }
 
-                // Check for rules files in .grok/rules/, .claude/rules/, and
+                // Check for rules files in .opengrok/rules/, .claude/rules/, and
                 // .cursor/rules/ subdirectories (vendor-compat paths).
                 // `rules_dirs` is computed once above the walk.
                 for rules_subdir in &rules_dirs {

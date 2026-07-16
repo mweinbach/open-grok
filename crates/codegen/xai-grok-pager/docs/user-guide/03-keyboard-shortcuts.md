@@ -11,14 +11,14 @@ Grok has two input modes that control how you navigate the scrollback:
 - **Simple mode** (default): Arrow keys for navigation, `Shift+Arrow` for turn navigation, `Space` to focus the prompt, and any letter key auto-focuses the prompt.
 - **Vim mode** (opt-in): `j`/`k` for navigation, `H`/`L` for turn navigation, `J`/`K` for response navigation, `h`/`l` for fold, `e`/`E` for expand/collapse, and `i`/`Tab`/`Space` to focus the prompt.
 
-Simple mode is active by default. To switch to Vim mode, set `vim_mode = true` under `[ui]` in `~/.grok/config.toml`, or toggle it at runtime with `/vim-mode`. See [Configuration](05-configuration.md) for details.
+Simple mode is active by default. To switch to Vim mode, set `vim_mode = true` under `[ui]` in `~/.opengrok/config.toml`, or toggle it at runtime with `/vim-mode`. See [Configuration](05-configuration.md) for details.
 
 The tables below document bindings for both modes. The "Key" column shows the Vim-mode binding, and the "Alt Key" column shows the equivalent in simple mode (arrow keys, etc.).
 
 > **Vim-mode required**: Single-letter and `Shift+letter` bindings in the
 > **Scrollback** context (`j/k`, `h/l`, `g/G`, `L/H`, `y/Y`, `o/O`, `r`,
 > `x`, `e/E`, and the `i` insert-mode alt) require `[ui].vim_mode = true`
-> in `~/.grok/config.toml` (or `/vim-mode` to toggle). Arrow keys, `Tab`,
+> in `~/.opengrok/config.toml` (or `/vim-mode` to toggle). Arrow keys, `Tab`,
 > `Esc`, `Space`, `PageUp/Down`, and every `Ctrl+letter` shortcut work in
 > both modes.
 

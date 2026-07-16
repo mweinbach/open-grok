@@ -290,7 +290,7 @@ impl Default for MemoryDreamConfig {
 
 /// File watcher configuration for detecting external memory edits (`[memory.watcher]`).
 ///
-/// When enabled, watches `~/.grok/memory/` for `.md` file changes (create,
+/// When enabled, watches `~/.opengrok/memory/` for `.md` file changes (create,
 /// modify, delete) and syncs the index on the next `memory_search` call:
 /// - Created/modified files are reindexed.
 /// - Deleted files have their stale chunks removed from the index.
@@ -318,7 +318,7 @@ impl Default for MemoryWatcherConfig {
 
 /// Garbage collection for orphaned workspace memory directories (`[memory.gc]`).
 ///
-/// On session init, directories under `~/.grok/memory/` are scanned:
+/// On session init, directories under `~/.opengrok/memory/` are scanned:
 /// - `tmp*` dirs: empty ones removed unconditionally, non-empty ones removed
 ///   after 7 days.
 /// - Other workspaces with no session files: removed after `max_age_days`.

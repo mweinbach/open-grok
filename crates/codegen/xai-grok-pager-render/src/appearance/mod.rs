@@ -2,7 +2,7 @@
 //!
 //! Two unrelated concerns live under this module name:
 //!
-//! - **`config` + `watcher`**: dev-only `~/.grok/pager.toml` RenderConfig
+//! - **`config` + `watcher`**: dev-only `~/.opengrok/pager.toml` RenderConfig
 //!   (200+ fields for terminal rendering tuning). Hot-reloaded in dev mode,
 //!   static defaults in prod.
 //! - **`cache`**: thread-local in-memory caches for the user-facing UI bool

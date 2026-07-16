@@ -16,7 +16,7 @@ See the [MCP specification](https://modelcontextprotocol.io) for protocol detail
 
 ## Configuration
 
-MCP servers are configured in `~/.grok/config.toml` under `[mcp_servers.<name>]` sections.
+MCP servers are configured in `~/.opengrok/config.toml` under `[mcp_servers.<name>]` sections.
 
 ### stdio Transport (Local Process)
 
@@ -46,8 +46,8 @@ tool_timeouts = { slow_op = 120 }     # Per-tool timeout overrides, seconds
 >
 > - env `GROK_MAX_MCP_OUTPUT_BYTES` or `MAX_MCP_OUTPUT_BYTES` (bytes; Grok-native
 >   wins if both set; Claude-style name, but we bound by **bytes** not tokens)
-> - `config.toml` — user-level (`~/.grok/config.toml`) **or repo-level**
->   (`.grok/config.toml` anywhere on the cwd → git-root chain; the deepest
+> - `config.toml` — user-level (`~/.opengrok/config.toml`) **or repo-level**
+>   (`.opengrok/config.toml` anywhere on the cwd → git-root chain; the deepest
 >   file wins, and the repo value applies only once the folder is trusted):
 >
 > ```toml
@@ -55,7 +55,7 @@ tool_timeouts = { slow_op = 120 }     # Per-tool timeout overrides, seconds
 > max_output_bytes = 40000
 > ```
 >
-> Precedence: requirements.toml > env > repo `.grok/config.toml` >
+> Precedence: requirements.toml > env > repo `.opengrok/config.toml` >
 > user/managed config > default. Repo edits apply to running sessions in that
 > directory via config hot-reload.
 
@@ -85,39 +85,39 @@ Manage MCP servers from the command line without editing config files:
 
 ```bash
 # List configured MCP servers
-grok mcp list
-grok mcp list --json          # Machine-readable output
+open-grok mcp list
+open-grok mcp list --json          # Machine-readable output
 
 # Add a stdio server. Everything after -- is the server command, so flags
 # like -y reach the server instead of being parsed by grok.
-grok mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /path/to/dir
+open-grok mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /path/to/dir
 
 # Add a stdio server with environment variables (-e is repeatable)
-grok mcp add postgres -e DATABASE_URL=postgres://localhost/mydb -- npx -y @modelcontextprotocol/server-postgres
+open-grok mcp add postgres -e DATABASE_URL=postgres://localhost/mydb -- npx -y @modelcontextprotocol/server-postgres
 
 # Add a remote HTTP server
-grok mcp add --transport http sentry https://mcp.sentry.dev/mcp
+open-grok mcp add --transport http sentry https://mcp.sentry.dev/mcp
 
 # Add a remote server with an authentication header (--header is repeatable)
-grok mcp add --transport http api https://mcp.example.com/mcp --header "Authorization: Bearer YOUR_TOKEN"
+open-grok mcp add --transport http api https://mcp.example.com/mcp --header "Authorization: Bearer YOUR_TOKEN"
 
 # Add a remote SSE server
-grok mcp add --transport sse linear https://mcp.linear.app/sse
+open-grok mcp add --transport sse linear https://mcp.linear.app/sse
 
 # Remove a server
-grok mcp remove github
+open-grok mcp remove github
 
 # Diagnose a server's configuration and connectivity
-grok mcp doctor               # Check every configured server
-grok mcp doctor github        # Check one server
-grok mcp doctor --json        # Machine-readable output
+open-grok mcp doctor               # Check every configured server
+open-grok mcp doctor github        # Check one server
+open-grok mcp doctor --json        # Machine-readable output
 ```
 
 The transport defaults to `stdio`; pass `--transport http` or `--transport sse` for remote servers.
 
-By default `grok mcp add` writes to `~/.grok/config.toml` (`--scope user`). Use `--scope project` to write to `.grok/config.toml` in the current directory instead, which can be committed and shared with your team (see [Project-Scoped MCP Servers](#project-scoped-mcp-servers)). Header and environment variable values are stored verbatim, so reference secrets as `${VAR}` instead of pasting them into a committed project config (see [Example Configurations](#example-configurations)). `grok mcp list` shows servers from both scopes, marking project-scoped ones with `(project)`.
+By default `open-grok mcp add` writes to `~/.opengrok/config.toml` (`--scope user`). Use `--scope project` to write to `.opengrok/config.toml` in the current directory instead, which can be committed and shared with your team (see [Project-Scoped MCP Servers](#project-scoped-mcp-servers)). Header and environment variable values are stored verbatim, so reference secrets as `${VAR}` instead of pasting them into a committed project config (see [Example Configurations](#example-configurations)). `open-grok mcp list` shows servers from both scopes, marking project-scoped ones with `(project)`.
 
-`grok mcp remove` searches both scopes and exits 0 after removing the server. It exits 1 when the name is not found, or when the name is defined in both user and project scope — pass `--scope` to say which one to remove.
+`open-grok mcp remove` searches both scopes and exits 0 after removing the server. It exits 1 when the name is not found, or when the name is defined in both user and project scope — pass `--scope` to say which one to remove.
 
 Breaking changes from earlier releases: `--env` now takes one `KEY=value` per flag (use `-e A=1 -e B=2`, not `--env A=1 B=2`), and server names may only contain letters, numbers, hyphens, and underscores.
 
@@ -125,18 +125,18 @@ Breaking changes from earlier releases: `--env` now takes one `KEY=value` per fl
 
 ## Project-Scoped MCP Servers
 
-MCP servers can be configured per-project by placing a `.grok/config.toml` in your repository:
+MCP servers can be configured per-project by placing a `.opengrok/config.toml` in your repository:
 
 ```
 my-project/
-  .grok/
+  .opengrok/
     config.toml
   src/
   ...
 ```
 
 ```toml
-# .grok/config.toml
+# .opengrok/config.toml
 [mcp_servers.linear]
 url = "https://mcp.linear.app/mcp"
 enabled = true
@@ -144,17 +144,17 @@ enabled = true
 
 When a server exposes a native HTTP/SSE endpoint, prefer the `url` form over wrapping it in a stdio proxy such as `npx mcp-remote <url>`. Grok handles HTTP/SSE and OAuth directly, so the native form avoids an extra subprocess per session. It also registers Grok's own OAuth client with the provider.
 
-Grok walks from the current directory up to the git repo root, loading `.grok/config.toml` at each level:
+Grok walks from the current directory up to the git repo root, loading `.opengrok/config.toml` at each level:
 
 | Location | Scope | Priority |
 |----------|-------|----------|
-| `~/.grok/config.toml` | All projects | Lowest |
-| `<repo-root>/.grok/config.toml` | This repository | Medium |
-| `<cwd>/.grok/config.toml` | Current directory | Highest |
+| `~/.opengrok/config.toml` | All projects | Lowest |
+| `<repo-root>/.opengrok/config.toml` | This repository | Medium |
+| `<cwd>/.opengrok/config.toml` | Current directory | Highest |
 
 If a project defines a server with the same name as a global one, the project version replaces it entirely (fields are not merged).
 
-Project-scoped files contribute `[mcp_servers]`, `[plugins]`, and `[permission]` entries. Grok reads most other config sections only from `~/.grok/config.toml`.
+Project-scoped files contribute `[mcp_servers]`, `[plugins]`, and `[permission]` entries. Grok reads most other config sections only from `~/.opengrok/config.toml`.
 
 ---
 
@@ -202,14 +202,14 @@ Grok loads MCP server configurations from multiple sources for compatibility:
 
 | Source | Format | Location | Configurable |
 |--------|--------|----------|-------------|
-| `config.toml` | Native Grok config | `~/.grok/config.toml`, `.grok/config.toml` | Always on |
+| `config.toml` | Native Grok config | `~/.opengrok/config.toml`, `.opengrok/config.toml` | Always on |
 | `.claude.json` | Claude Code format | `~/.claude.json` | `[compat.claude] mcps` |
 | `.cursor/mcp.json` | Cursor format | `~/.cursor/mcp.json`, `<project>/.cursor/mcp.json` | `[compat.cursor] mcps` |
 | `.mcp.json` | MCP standard format | Project root (cwd to git root) | Loaded unless you have imported or dismissed the Claude import prompt (the import marker is set) |
 
 All sources are merged in priority order: config.toml > Claude > Cursor > `.mcp.json`. Servers from higher-priority sources take precedence when names conflict.
 
-The Claude and Cursor MCP sources are scanned by default. To disable scanning for a specific vendor, set `[compat.<vendor>] mcps = false` in `~/.grok/config.toml` or the corresponding environment variable (`GROK_CURSOR_MCPS_ENABLED`, `GROK_CLAUDE_MCPS_ENABLED`). See [Configuration](05-configuration.md#harness-compatibility) for details. Use `grok inspect` to see which MCP servers were loaded and their vendor origin (`[cursor]`, `[claude]`).
+The Claude and Cursor MCP sources are scanned by default. To disable scanning for a specific vendor, set `[compat.<vendor>] mcps = false` in `~/.opengrok/config.toml` or the corresponding environment variable (`GROK_CURSOR_MCPS_ENABLED`, `GROK_CLAUDE_MCPS_ENABLED`). See [Configuration](05-configuration.md#harness-compatibility) for details. Use `open-grok inspect` to see which MCP servers were loaded and their vendor origin (`[cursor]`, `[claude]`).
 
 ---
 
@@ -225,7 +225,7 @@ Use the `url` form for hosted MCP servers and the `command` / `args` form for lo
 
 ### Native HTTP (hosted services)
 
-You must authenticate OAuth-based MCP servers before you can use them. Grok stores the resulting tokens under `~/.grok/mcp_credentials.json`. After you edit `config.toml`, press `r` in the `/mcps` modal to refresh the server list.
+You must authenticate OAuth-based MCP servers before you can use them. Grok stores the resulting tokens under `~/.opengrok/mcp_credentials.json`. After you edit `config.toml`, press `r` in the `/mcps` modal to refresh the server list.
 
 ```toml
 [mcp_servers.linear]
@@ -324,19 +324,19 @@ npx -y @modelcontextprotocol/server-filesystem /path
 startup_timeout_sec = 30
 ```
 
-For stdio servers, Grok captures the process's standard error to `~/.grok/logs/mcp/<server>.stderr.log`, truncated on each launch. Check this file when a server starts but fails to handshake:
+For stdio servers, Grok captures the process's standard error to `~/.opengrok/logs/mcp/<server>.stderr.log`, truncated on each launch. Check this file when a server starts but fails to handshake:
 
 ```bash
-tail -f ~/.grok/logs/mcp/filesystem.stderr.log
+tail -f ~/.opengrok/logs/mcp/filesystem.stderr.log
 ```
 
 ### Viewing Server Status
 
-Use `grok inspect` to see all loaded MCP servers and their sources:
+Use `open-grok inspect` to see all loaded MCP servers and their sources:
 
 ```bash
-grok inspect          # Human-readable
-grok inspect --json   # Machine-readable
+open-grok inspect          # Human-readable
+open-grok inspect --json   # Machine-readable
 ```
 
 ### Debug Logging

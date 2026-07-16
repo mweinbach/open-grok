@@ -114,7 +114,7 @@ async fn internal_install_stable_rollback_0_2_7_to_0_2_5() {
         .join(format!("grok-0.2.5-{platform}"));
     assert!(downloaded.exists(), "rolled-back binary must be downloaded");
 
-    let symlink = home.join("bin").join("grok");
+    let symlink = home.join("bin").join("open-grok");
     let target = std::fs::read_link(&symlink).unwrap();
     assert!(
         target.to_string_lossy().contains("0.2.5"),
@@ -136,7 +136,7 @@ async fn internal_install_stable_upgrade_0_2_5_to_0_2_7() {
         .await
         .unwrap();
 
-    let symlink = test_home().join("bin").join("grok");
+    let symlink = test_home().join("bin").join("open-grok");
     let target = std::fs::read_link(&symlink).unwrap();
     assert!(target.to_string_lossy().contains("0.2.7"));
 }
@@ -163,7 +163,7 @@ async fn internal_install_rollback_then_upgrade_sequence() {
             .unwrap();
     }
 
-    let target = std::fs::read_link(test_home().join("bin").join("grok")).unwrap();
+    let target = std::fs::read_link(test_home().join("bin").join("open-grok")).unwrap();
     assert!(
         target.to_string_lossy().contains("0.2.8"),
         "final symlink must point to 0.2.8: {target:?}"
@@ -445,14 +445,14 @@ async fn auto_update_target_npm_rollback_returns_none() {
 // Disk-aware convergence: ensure_latest_on_disk + installed_on_disk_version
 //
 // Concurrent updaters (TUI background download, leader hourly checker,
-// explicit `grok update`) must decide staleness from the on-disk install, not
+// explicit `open-grok update`) must decide staleness from the on-disk install, not
 // their own compiled-in version — a binary another process already installed
 // is never downloaded a second time, but a stale running process still gets
 // the relaunch signal.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Lay down a managed-install layout in the test GROK_HOME:
-/// `bin/grok -> ../downloads/grok-<version>-<platform>` (what
+/// Lay down a managed-install layout in the test OPENGROK_HOME:
+/// `bin/open-grok -> ../downloads/grok-<version>-<platform>` (what
 /// `install_internal_from_base` produces).
 fn fake_managed_install(version: &str) {
     let home = test_home();
@@ -464,7 +464,7 @@ fn fake_managed_install(version: &str) {
     std::fs::write(downloads.join(&name), b"#!/bin/sh\nexit 0\n").unwrap();
     std::os::unix::fs::symlink(
         std::path::Path::new("../downloads").join(&name),
-        bin.join("grok"),
+        bin.join("open-grok"),
     )
     .unwrap();
 }
@@ -538,7 +538,7 @@ async fn ensure_latest_relaunches_onto_rolled_back_disk() {
 #[tokio::test]
 #[serial]
 async fn npm_user_upgraded_then_stable_rolled_back_stays_on_newer() {
-    // User ran `grok update` and got 0.2.7. Then stable was rolled back to
+    // User ran `open-grok update` and got 0.2.7. Then stable was rolled back to
     // 0.2.5. Next check_update_status sees 0.2.5 from npm. npm installer
     // must NOT report a downgrade.
     let g = setup_npm("0.2.7");
@@ -602,7 +602,7 @@ async fn internal_install_double_rollback() {
             .await
             .unwrap();
 
-        let target = std::fs::read_link(test_home().join("bin").join("grok")).unwrap();
+        let target = std::fs::read_link(test_home().join("bin").join("open-grok")).unwrap();
         assert!(
             target.to_string_lossy().contains(version),
             "symlink must point to {version} after install: {target:?}"

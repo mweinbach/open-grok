@@ -1,6 +1,6 @@
 //! Merged session listing — combines local and remote session data.
 //!
-//! Used by both the ACP `x.ai/session/list` handler and the `grok sessions`
+//! Used by both the ACP `x.ai/session/list` handler and the `open-grok sessions`
 //! CLI command. Deduplicates by session ID (remote wins), filters local
 //! results by query, and sorts by the same key the picker UI displays
 //! (`last_active_at` falling back to `updated_at`) descending.

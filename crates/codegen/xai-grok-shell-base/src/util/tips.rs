@@ -3,7 +3,7 @@
 //! Tips are fetched at startup via `RemoteSettings.tips` (from `/v1/settings`).
 //! This module provides per-session rotation: each launch shows the next tip
 //! in sequence, cycling through all tips before repeating. The cursor is
-//! persisted to `~/.grok/tip_cursor.json`.
+//! persisted to `~/.opengrok/tip_cursor.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +21,7 @@ fn cursor_path(grok_home: &Path) -> PathBuf {
     grok_home.join(CURSOR_FILE)
 }
 
-/// Load the cursor from `~/.grok/tip_cursor.json`. Returns 0 on any error.
+/// Load the cursor from `~/.opengrok/tip_cursor.json`. Returns 0 on any error.
 fn load_cursor(grok_home: &Path) -> u64 {
     let text = match std::fs::read_to_string(cursor_path(grok_home)) {
         Ok(t) => t,
@@ -32,7 +32,7 @@ fn load_cursor(grok_home: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Save the cursor to `~/.grok/tip_cursor.json`. Silently ignores write errors.
+/// Save the cursor to `~/.opengrok/tip_cursor.json`. Silently ignores write errors.
 fn save_cursor(grok_home: &Path, cursor: u64) {
     if let Ok(text) = serde_json::to_string(&TipState { cursor }) {
         let _ = std::fs::write(cursor_path(grok_home), text);
@@ -42,7 +42,7 @@ fn save_cursor(grok_home: &Path, cursor: u64) {
 /// Pick the next tip for this session and advance the persistent cursor.
 ///
 /// Each call returns the tip at `cursor % tips.len()` and increments the
-/// cursor in `~/.grok/tip_cursor.json`, so every session sees the next tip
+/// cursor in `~/.opengrok/tip_cursor.json`, so every session sees the next tip
 /// in sequence. After all tips have been shown, the cycle repeats.
 ///
 /// Returns `None` if `tips` is empty (cursor is not advanced in that case).

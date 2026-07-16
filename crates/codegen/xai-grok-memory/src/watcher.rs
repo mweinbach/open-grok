@@ -1,6 +1,6 @@
 //! File watcher for detecting external memory edits.
 //!
-//! Watches `~/.grok/memory/` for `.md` file changes (create, modify, remove)
+//! Watches `~/.opengrok/memory/` for `.md` file changes (create, modify, remove)
 //! and accumulates the affected paths.  The search path checks [`is_dirty`]
 //! before each query and syncs the index for all dirty paths:
 //! - **created / modified** files are reindexed via `MemoryIndex::reindex_file`

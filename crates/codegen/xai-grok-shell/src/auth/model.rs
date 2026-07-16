@@ -10,7 +10,7 @@ const DEFAULT_EARLY_INVALIDATION_SECS: u64 = 300; // 5 minutes
 /// Legacy auth.json scope key. Fallback for old devbox auth files.
 pub(super) const LEGACY_SCOPE: &str = "https://accounts.x.ai/sign-in";
 
-/// auth.json scope key for plain API key auth (desktop login, `grok login --api-key`).
+/// auth.json scope key for plain API key auth (desktop login, `open-grok login --api-key`).
 pub const API_KEY_SCOPE: &str = "xai::api_key";
 
 const BLOCKED_REASON_NO_LOGS: &str = "BLOCKED_REASON_NO_LOGS";
@@ -28,7 +28,7 @@ pub enum AuthMode {
     Oidc,
     /// External auth provider binary
     External,
-    /// Plain API key (e.g. from grok-desktop login or `grok login --api-key`)
+    /// Plain API key (e.g. from grok-desktop login or `open-grok login --api-key`)
     ApiKey,
 }
 
@@ -286,7 +286,7 @@ pub(crate) fn token_suffix(t: &str) -> &str {
 
 /// Look up auth from the store by scope key.
 ///
-/// Legacy `WebLogin` tokens (from the pre-OIDC `grok login --legacy`
+/// Legacy `WebLogin` tokens (from the pre-OIDC `open-grok login --legacy`
 /// flow) are skipped — they are validated via a per-request DB lookup
 /// server-side which fails at high volume.  Skipping them here forces
 /// affected users to re-authenticate via OIDC on next launch.

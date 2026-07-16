@@ -8,7 +8,7 @@
 //! [`AuthManager::current_api_key`] value. The two sinks are:
 //!
 //! 1. [`xai_grok_telemetry::unified_log::warn`] for the local
-//!    `~/.grok/logs/unified.jsonl` file (best-effort; ships to GCS
+//!    `~/.opengrok/logs/unified.jsonl` file (best-effort; ships to GCS
 //!    only on OIDC refresh failure via `auth/refresh.rs`).
 //! 2. A discrete `tracing::warn_span!("auth_401_attribution", ...)`
 //!    captured by the OTel layer in `util/otel_layer.rs` and shipped
@@ -318,7 +318,7 @@ pub(crate) fn record_auth_401(
 ) {
     let payload = compute_attribution_payload(auth_manager, consumer, sent_bearer);
 
-    // Sink 1 -- local file (~/.grok/logs/unified.jsonl) + scrubbed
+    // Sink 1 -- local file (~/.opengrok/logs/unified.jsonl) + scrubbed
     // tracing event. The local file is reliable but only ships to GCS
     // on OIDC refresh failure (auth/refresh.rs::spawn_diagnostic_upload),
     // so by itself it does not give visibility into the steady-state
@@ -454,7 +454,7 @@ mod tests {
     use super::*;
 
     /// Test helper: build a fresh `AuthManager` rooted at a tempdir so
-    /// nothing from a developer's actual `~/.grok/auth.json` leaks in.
+    /// nothing from a developer's actual `~/.opengrok/auth.json` leaks in.
     fn empty_auth_manager() -> (tempfile::TempDir, AuthManager) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = GrokComConfig::default();

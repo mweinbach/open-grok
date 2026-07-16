@@ -398,7 +398,7 @@ mod tests {
         let output = r#"Found 1 memory result(s):
 
 ### Result 1 (score: 0.72, source: global)
-**File:** /root/.grok/memory/MEMORY.md (lines 0-10)
+**File:** /root/.opengrok/memory/MEMORY.md (lines 0-10)
 ```
 ## Project Conventions
 * Always use graphite for PRs
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!((results[0].score - 0.72).abs() < 0.01);
         assert_eq!(results[0].source, "global");
-        assert_eq!(results[0].path, "/root/.grok/memory/MEMORY.md");
+        assert_eq!(results[0].path, "/root/.opengrok/memory/MEMORY.md");
         assert_eq!(results[0].start_line, 0);
         assert_eq!(results[0].end_line, 10);
         assert!(results[0].snippet.contains("graphite"));
@@ -419,13 +419,13 @@ mod tests {
         let output = r#"Found 2 memory result(s):
 
 ### Result 1 (score: 0.85, source: workspace)
-**File:** /root/.grok/memory/ws/MEMORY.md (lines 1-5)
+**File:** /root/.opengrok/memory/ws/MEMORY.md (lines 1-5)
 ```
 workspace content
 ```
 
 ### Result 2 (score: 0.42, source: session)
-**File:** /root/.grok/memory/ws/sessions/2026-05-01.md (lines 10-20)
+**File:** /root/.opengrok/memory/ws/sessions/2026-05-01.md (lines 10-20)
 ```
 session content
 ```

@@ -1,4 +1,4 @@
-//! Unit tests for the `grok wrap` spawn planning in [`super`] (`wrap_cmd`),
+//! Unit tests for the `open-grok wrap` spawn planning in [`super`] (`wrap_cmd`),
 //! split out via `#[path]` to keep the module itself small.
 //!
 //! Everything is pure — `derive_spawn` takes the PATH lookup result and the

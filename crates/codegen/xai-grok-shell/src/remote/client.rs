@@ -1862,7 +1862,7 @@ mod tests {
         assert_eq!(ep.url, "https://models.acme.com/v1/models");
         assert_eq!(ep.auth, EndpointAuth::ApiKey);
     }
-    /// REGRESSION: `grok setup` must send the deployment key to
+    /// REGRESSION: `open-grok setup` must send the deployment key to
     /// the proxy, never the inference endpoint.
     #[test]
     #[serial_test::serial]

@@ -40,7 +40,7 @@ impl SlashCommand for ToggleMouseReportingCommand {
         } else {
             CommandResult::Message(
                 "Mouse reporting toggle is off. Set `[ui] mouse_reporting_toggle = true` \
-                 in ~/.grok/config.toml to enable it."
+                 in ~/.opengrok/config.toml to enable it."
                     .to_string(),
             )
         }

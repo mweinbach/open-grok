@@ -1,4 +1,4 @@
-//! Minimal (scrollback-native) render mode — `grok --minimal`.
+//! Minimal (scrollback-native) render mode — `open-grok --minimal`.
 //!
 //! In this mode finalized conversation blocks are printed once into the
 //! terminal's *native* scrollback (via `xai_ratatui_inline::Terminal::insert_before`,

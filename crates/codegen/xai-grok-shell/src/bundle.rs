@@ -86,7 +86,7 @@ struct BundleFile<'a> {
 pub fn bundled_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".grok")
+        .join(".opengrok")
         .join(BUNDLED_DIR_NAME)
 }
 

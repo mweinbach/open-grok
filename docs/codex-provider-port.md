@@ -10,15 +10,16 @@ revision as the Code Mode port:
 
 ## Authentication
 
-`grok login --codex` uses Codex's ChatGPT OAuth client, PKCE authorization
+`open-grok login --codex` uses Codex's ChatGPT OAuth client, PKCE authorization
 contract, callback ports, device-code flow, token refresh rules, and best-effort
-revocation behavior. `grok login --codex --device-auth` is the headless form.
+revocation behavior. `open-grok login --codex --device-auth` is the headless form.
 
-Codex credentials are auxiliary and isolated in `~/.grok/codex-auth.json`.
+Codex credentials are auxiliary and isolated in `~/.opengrok/codex-auth.json`.
 They never enter Grok's primary xAI `auth.json`, ACP auth-method ordering, or xAI
 logout and billing state. The file uses the Codex `auth.json` token shape and
-owner-only permissions. Bare `grok login` and `grok logout` remain xAI commands;
-use `grok logout --codex` for Codex or `grok logout --all` for both.
+owner-only permissions. Bare `open-grok login` and `open-grok logout` remain xAI
+commands; use `open-grok logout --codex` for Codex or `open-grok logout --all`
+for both.
 
 A Codex-selected headless session can start with only its model API key or this
 isolated OAuth store; xAI authentication is not required. Codex provenance stays

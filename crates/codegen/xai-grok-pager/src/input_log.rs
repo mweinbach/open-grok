@@ -1,6 +1,6 @@
 //! Input flight recorder — rolling buffer of recent key events.
 //!
-//! Ctrl+Shift+D dumps to `~/.grok/logs/input-debug-<timestamp>.json`.
+//! Ctrl+Shift+D dumps to `~/.opengrok/logs/input-debug-<timestamp>.json`.
 //! Can be better utilized once input bugs are fully resolved.
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use serde::Serialize;

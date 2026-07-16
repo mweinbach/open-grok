@@ -40,7 +40,7 @@ const META_KEY_LAST_BOOTSTRAP: &str = "last_bootstrap_at";
 
 /// Configuration for remote index sync.
 ///
-/// Parsed from `[session_search.remote_sync]` in `~/.grok/config.toml`.
+/// Parsed from `[session_search.remote_sync]` in `~/.opengrok/config.toml`.
 /// Default: disabled.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]

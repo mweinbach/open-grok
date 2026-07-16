@@ -93,8 +93,8 @@ pub fn load_managed_config() -> std::io::Result<toml::Value> {
 
 /// Load a user-tier config layer from `<home>/<filename>`. With no resolvable
 /// user home, returns an empty table rather than reading a cwd-relative
-/// `.grok/<filename>` (the cwd-fallback would silently promote an untrusted
-/// project `.grok` to the user tier).
+/// `.opengrok/<filename>` (the cwd-fallback would silently promote an untrusted
+/// project `.opengrok` to the user tier).
 fn load_user_config_layer(home: Option<&Path>, filename: &str) -> std::io::Result<toml::Value> {
     match home {
         Some(g) => load_config_file(&g.join(filename)),
@@ -116,7 +116,7 @@ pub fn load_system_managed_config() -> std::io::Result<toml::Value> {
 pub struct ManagedConfigLayer {
     pub value: toml::Value,
     pub path: std::path::PathBuf,
-    /// `true` for the root-owned system layer (`/etc/grok`), derived from the
+    /// `true` for the root-owned system layer (`/etc/opengrok`), derived from the
     /// load directory.
     pub is_system: bool,
 }
@@ -377,12 +377,12 @@ pub struct CampaignsState {
     pub dismissed_ids: Vec<String>,
 }
 
-/// Path to `$GROK_HOME/campaigns_state.json` under `home`.
+/// Path to `$OPENGROK_HOME/campaigns_state.json` under `home`.
 pub fn campaigns_state_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join(CAMPAIGNS_STATE_FILE)
 }
 
-/// Fail-open dismissed ids from `$GROK_HOME/campaigns_state.json`.
+/// Fail-open dismissed ids from `$OPENGROK_HOME/campaigns_state.json`.
 pub fn load_dismissed_ids_from_home() -> std::collections::HashSet<String> {
     let Some(home) = crate::user_grok_home() else {
         return std::collections::HashSet::new();
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn load_user_config_layer_is_empty_without_user_home() {
         // No resolvable user home: no user layer, and crucially no
-        // cwd-relative .grok read.
+        // cwd-relative .opengrok read.
         let v = load_user_config_layer(None, "config.toml").unwrap();
         assert_eq!(v.as_table().map(|t| t.is_empty()), Some(true));
     }

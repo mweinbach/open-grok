@@ -121,7 +121,7 @@
   },
   {
     "category": "features",
-    "description": "**MCP tool output truncation** can now be set per-repo in `.grok/config.toml`.",
+    "description": "**MCP tool output truncation** can now be set per-repo in `.opengrok/config.toml`.",
     "breaking_change": false
   },
   {

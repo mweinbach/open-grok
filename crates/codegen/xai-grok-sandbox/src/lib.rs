@@ -612,7 +612,7 @@ mod tests {
         set_configured_profile("read-only");
         assert_eq!(configured_profile_name(), Some("read-only"));
     }
-    /// Create a temp workspace whose `.grok/sandbox.toml` contains `toml_body`.
+    /// Create a temp workspace whose `.opengrok/sandbox.toml` contains `toml_body`.
     /// Returns the workspace path (caller removes it).
     #[cfg(all(feature = "enforce", unix))]
     fn temp_workspace_with_sandbox_toml(tag: &str, toml_body: &str) -> PathBuf {
@@ -621,7 +621,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let ws = std::env::temp_dir().join(format!("grok-{tag}-{}-{nanos}", std::process::id()));
-        let grok = ws.join(".grok");
+        let grok = ws.join(".opengrok");
         std::fs::create_dir_all(&grok).unwrap();
         std::fs::write(grok.join("sandbox.toml"), toml_body).unwrap();
         ws

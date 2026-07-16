@@ -3,7 +3,7 @@
 use super::common::*;
 
 /// 11. **Initial prompt positional.**
-/// Launching `grok "<prompt>"` (the prompt passed as a positional CLI arg)
+/// Launching `open-grok "<prompt>"` (the prompt passed as a positional CLI arg)
 /// auto-starts a new session and submits the prompt as the first turn —
 /// no keystrokes injected. This exercises the full loop end-to-end:
 /// CLI positional → TUI launch → NewSession → SendPrompt → shell agent →
@@ -17,7 +17,7 @@ async fn initial_prompt_positional_auto_submits() {
     ));
 
     let binary = pager_binary().expect("resolve pager binary");
-    // Pass the prompt as a positional argument, exactly like `grok "go"`.
+    // Pass the prompt as a positional argument, exactly like `open-grok "go"`.
     let mut harness =
         PtyHarness::spawn_with_content(&binary, DEFAULT_ROWS, DEFAULT_COLS, &content, &[PROMPT])
             .expect("spawn pager with initial prompt");

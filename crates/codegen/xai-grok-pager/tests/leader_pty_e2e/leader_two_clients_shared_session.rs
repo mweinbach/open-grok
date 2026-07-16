@@ -14,7 +14,7 @@ use super::common::*;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test leader_pty_e2e -- --ignored --test-threads=1"]
 async fn leader_two_clients_shared_session() {
-    // One shared leader (shared HOME/GROK_HOME hold the sessions AND the
+    // One shared leader (shared HOME/OPENGROK_HOME hold the sessions AND the
     // explicit leader socket), so B attaches to the leader A spawned instead
     // of the machine's default one.
     let cluster = LeaderCluster::start(DEFAULT_ROWS, DEFAULT_COLS)

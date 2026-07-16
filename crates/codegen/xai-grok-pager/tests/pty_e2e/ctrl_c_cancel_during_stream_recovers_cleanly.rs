@@ -85,7 +85,7 @@ async fn ctrl_c_cancel_during_stream_recovers_cleanly() {
     // incident undiagnosable.
     let unified_log = content
         .home()
-        .join(".grok")
+        .join(".opengrok")
         .join("logs")
         .join("unified.jsonl");
     let unified = std::fs::read_to_string(&unified_log).unwrap_or_default();

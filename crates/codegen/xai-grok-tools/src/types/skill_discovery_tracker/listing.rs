@@ -402,7 +402,7 @@ impl<'a> SkillListing<'a> {
 
 /// Extract the skill source directory from a SKILL.md display path.
 ///
-/// `"/path/.grok/skills/my-skill/SKILL.md"` -> `"/path/.grok/skills/"`
+/// `"/path/.opengrok/skills/my-skill/SKILL.md"` -> `"/path/.opengrok/skills/"`
 fn skill_source_dir(display_path: &str) -> Option<&str> {
     let p = std::path::Path::new(display_path);
     // SKILL.md -> skill-name dir -> skills dir

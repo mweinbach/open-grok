@@ -66,7 +66,7 @@ fn target_dir() -> PathBuf {
 fn local_grok_binary_path() -> PathBuf {
     target_dir()
         .join("debug")
-        .join(format!("xai-grok-pager{}", std::env::consts::EXE_SUFFIX))
+        .join(format!("open-grok{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn ensure_local_grok_binary(binary: &Path) {
@@ -77,25 +77,25 @@ fn ensure_local_grok_binary(binary: &Path) {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let output = Command::new(&cargo)
         .current_dir(workspace_root())
-        .args(["build", "-p", "xai-grok-pager", "--bin", "xai-grok-pager"])
+        .args(["build", "-p", "xai-grok-pager-bin", "--bin", "open-grok"])
         .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build xai-grok-pager: {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build open-grok: {e}"));
 
     assert!(
         output.status.success(),
-        "failed to build xai-grok-pager for lifecycle tests (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        "failed to build open-grok for lifecycle tests (exit {:?})\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
         binary.exists(),
-        "xai-grok-pager build completed but binary missing at {}",
+        "open-grok build completed but binary missing at {}",
         binary.display()
     );
 }
 
-/// Resolve grok binary: `GROK_BINARY` env (CI) or a locally built `xai-grok-pager` binary.
+/// Resolve the Open Grok binary: `GROK_BINARY` env (CI) or a local `open-grok` build.
 pub fn grok_binary() -> PathBuf {
     if let Ok(path) = std::env::var("GROK_BINARY") {
         let p = PathBuf::from(path);
@@ -103,7 +103,7 @@ pub fn grok_binary() -> PathBuf {
         return p;
     }
 
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_xai-grok-pager") {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_open-grok") {
         let p = PathBuf::from(path);
         if p.exists() {
             return p;
@@ -158,12 +158,12 @@ pub fn test_env_cmd_tokio(
     cmd.env("HOME", home)
         // HOME alone does not sandbox grok on Windows: the product resolves
         // `~` via `USERPROFILE`/Known Folders (`std::env::home_dir()`), so
-        // without an explicit GROK_HOME every spawned child shares the real
-        // `%USERPROFILE%\.grok` — test 1's models_cache.json (which embeds
+        // without an explicit OPENGROK_HOME every spawned child shares the real
+        // `%USERPROFILE%\.opengrok` — test 1's models_cache.json (which embeds
         // its per-test mock-server URL) then poisons every later test's
         // prompt (the windows-x86_64 lifecycle "prompt timed out" failure).
         // Mirrors `leader.rs` and the pty-harness `env_for_pager`.
-        .env("GROK_HOME", home.join(".grok"))
+        .env("OPENGROK_HOME", home.join(".opengrok"))
         .env("GROK_CLI_CHAT_PROXY_BASE_URL", mock_url)
         .env("GROK_XAI_API_BASE_URL", mock_url)
         .env("XAI_API_KEY", "test-key-for-ci")

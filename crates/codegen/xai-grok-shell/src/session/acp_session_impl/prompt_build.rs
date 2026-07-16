@@ -3,10 +3,10 @@
 //! payload preparation.
 #![allow(clippy::items_after_test_module)]
 use super::*;
-/// Partition the AGENTS.md / Claude.md / `.grok/rules/*.md` files returned
+/// Partition the AGENTS.md / Claude.md / `.opengrok/rules/*.md` files returned
 /// by `read_agents_config_with_paths` into "workspace" (cwd / repo root /
-/// extra workspace user dir) and "user" (`~/.grok/`, `~/.claude/`,
-/// `~/.grok/bundled/`) buckets, mirroring the split between
+/// extra workspace user dir) and "user" (`~/.opengrok/`, `~/.claude/`,
+/// `~/.opengrok/bundled/`) buckets, mirroring the split between
 /// `<always_applied_workspace_rules>` and `<user_rules>`.
 /// Normalize a free-form name (e.g. an MCP server identifier) into a
 /// single safe filesystem segment.
@@ -47,7 +47,7 @@ fn partition_rules_by_scope(
 ) {
     let home = dirs::home_dir().map(|p| p.to_string_lossy().to_string());
     let user_prefixes: Vec<String> = match home {
-        Some(h) => vec![format!("{h}/.grok/"), format!("{h}/.claude/")],
+        Some(h) => vec![format!("{h}/.opengrok/"), format!("{h}/.claude/")],
         None => vec![],
     };
     let mut workspace = Vec::new();

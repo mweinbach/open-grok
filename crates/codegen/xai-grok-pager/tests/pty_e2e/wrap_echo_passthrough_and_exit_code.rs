@@ -2,7 +2,7 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Direct-route e2e: `grok wrap` with a resolvable explicit path runs the
+/// Direct-route e2e: `open-grok wrap` with a resolvable explicit path runs the
 /// command inside the wrap PTY with output passing through, and propagates the
 /// child's exit code — both for success and for a nonzero exit.
 #[test]

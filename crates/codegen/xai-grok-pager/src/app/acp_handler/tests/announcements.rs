@@ -70,7 +70,7 @@
 
     /// A push prunes hidden ids whose announcement is gone and schedules a
     /// persist so the on-disk set cannot grow unboundedly. Driven through the
-    /// layer-injected seam so the developer's real `~/.grok` cannot leak in.
+    /// layer-injected seam so the developer's real `~/.opengrok` cannot leak in.
     #[test]
     fn announcements_update_prunes_stale_hidden_ids_and_persists() {
         let mut app = make_app_with_agent("sess-ann");
@@ -108,7 +108,7 @@
 
     /// A pushed critical with a NEW id must re-arm the banner even though an
     /// older critical was hidden (the whole point of per-ID hide). Driven
-    /// through the layer-injected seam (no real `~/.grok` reads).
+    /// through the layer-injected seam (no real `~/.opengrok` reads).
     #[test]
     fn announcements_update_new_critical_id_rearms_hidden_banner() {
         let mut app = make_app_with_agent("sess-ann");
@@ -200,7 +200,7 @@
 
     /// A mid-session push must open the `/announcements` gate on already-live
     /// subagent child views, not just top-level agents. Driven through the
-    /// layer-injected seam (no real `~/.grok` reads).
+    /// layer-injected seam (no real `~/.opengrok` reads).
     #[test]
     fn announcements_update_fans_slash_gate_to_live_subagent_views() {
         let mut app = make_app_with_parent_and_child("parent-sess", "child-sess");

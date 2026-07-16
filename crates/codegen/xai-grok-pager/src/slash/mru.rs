@@ -1,4 +1,4 @@
-//! Slash command MRU / recency (`$GROK_HOME/slash-mru.json`).
+//! Slash command MRU / recency (`$OPENGROK_HOME/slash-mru.json`).
 //!
 //! Flat `command → last_used` map (canonical names). Tiebreaks use recency
 //! decay (7-day half-life, 0.1 floor). Bounded to [`MAX_ENTRIES`].

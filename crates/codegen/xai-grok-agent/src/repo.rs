@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// and ONE upward walk.
 ///
 /// The folder-trust gate's `repo_configs_present` probes a dozen repo-local
-/// code-exec markers (`.mcp.json`, `.grok/config.toml`, `.claude/settings.json`,
+/// code-exec markers (`.mcp.json`, `.opengrok/config.toml`, `.claude/settings.json`,
 /// project plugin/agent dirs, …) back-to-back on the agent startup path. Each
 /// marker walker used to run its own `discover` + cwd→root walk; sharing one
 /// `RepoDirChain` collapses that to a single traversal (each redundant syscall
@@ -47,7 +47,7 @@ impl RepoDirChain {
             .and_then(|repo| repo.workdir().map(|p| p.to_path_buf()))
             // Home-is-a-git-repo (dotfiles in $HOME): a discovery that walks up
             // to $HOME must NOT treat the whole home subtree as one repo, or
-            // home-level `.grok`/`.mcp.json`/plugins would look repo-local. Drop
+            // home-level `.opengrok`/`.mcp.json`/plugins would look repo-local. Drop
             // it so cwd is handled as no-repo (probe cwd only). Home is compared
             // canonically to match the symlink handling in the walk below.
             .filter(|root| !is_home_dir(root));

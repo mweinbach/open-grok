@@ -147,7 +147,7 @@ fn main() {
         Err(_) => {
             eprintln!("Set GROK_SESSION_PATH to a session's updates.jsonl path");
             eprintln!(
-                "Example: GROK_SESSION_PATH=$HOME/.grok/sessions/<cwd-encoded>/019e0000-0000-7000-8000-000000000001/updates.jsonl"
+                "Example: GROK_SESSION_PATH=$HOME/.opengrok/sessions/<cwd-encoded>/019e0000-0000-7000-8000-000000000001/updates.jsonl"
             );
             return;
         }

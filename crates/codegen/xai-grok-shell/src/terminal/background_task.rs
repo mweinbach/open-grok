@@ -271,7 +271,7 @@ impl BackgroundTaskRegistry {
 /// Get output file path for a background task.
 ///
 /// Creates the directory structure if it doesn't exist.
-/// Path format: `~/.grok/sessions/{session_id}/tasks/{task_id}.log`
+/// Path format: `~/.opengrok/sessions/{session_id}/tasks/{task_id}.log`
 pub fn get_task_output_path(session_id: &str, task_id: &str) -> PathBuf {
     use crate::util::grok_home::grok_home;
 

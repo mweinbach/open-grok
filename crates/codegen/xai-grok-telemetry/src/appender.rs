@@ -36,7 +36,7 @@ pub(crate) fn non_blocking_file_writer(path: &Path) -> std::io::Result<NonBlocki
 }
 
 /// Drop all parked worker guards, flushing their non-blocking writers. Call at
-/// process exit so short-lived runs (e.g. headless `grok -p`) don't lose buffered logs.
+/// process exit so short-lived runs (e.g. headless `open-grok -p`) don't lose buffered logs.
 pub(crate) fn flush_file_log_guards() {
     if let Some(m) = FILE_LOG_GUARDS.get() {
         // Recover from a poisoned mutex so exit-flush still drains the guards.

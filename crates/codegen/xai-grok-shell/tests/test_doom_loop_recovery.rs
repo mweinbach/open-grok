@@ -538,8 +538,8 @@ async fn headless_config_enables_doom_loop_check_header() {
     let workdir = xai_grok_test_support::git_workdir();
     let home = tempfile::TempDir::new().unwrap();
 
-    let grok_home = home.path().join(".grok");
-    std::fs::create_dir_all(&grok_home).expect("create .grok home");
+    let grok_home = home.path().join(".opengrok");
+    std::fs::create_dir_all(&grok_home).expect("create .opengrok home");
     std::fs::write(
         grok_home.join("config.toml"),
         "[doom_loop_recovery]\nenabled = true\n",
@@ -556,7 +556,7 @@ async fn headless_config_enables_doom_loop_check_header() {
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     xai_grok_test_support::env::test_env_cmd_tokio(&mut cmd, &server.url(), home.path());
-    cmd.env("GROK_HOME", grok_home);
+    cmd.env("OPENGROK_HOME", grok_home);
     // Don't attach to a developer's ambient leader; spawn fresh against the mock.
     cmd.env_remove("GROK_LEADER_SOCKET");
 

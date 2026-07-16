@@ -877,7 +877,7 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
         // the registry under `When::DashboardFocused`. The dispatch
         // path in `dashboard::state::handle_key` looks these up via
         // `registry.lookup(key, When::DashboardFocused)` so users can
-        // rebind any of them through `~/.grok/config.toml`.
+        // rebind any of them through `~/.opengrok/config.toml`.
         ActionDef {
             id: ActionId::DashboardSelectNext,
             label: "next",

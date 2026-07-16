@@ -1,6 +1,6 @@
 # Agent Mode (ACP) and IDE Integration
 
-Agent mode runs Grok as an ACP (Agent Client Protocol) server for integration with IDEs, editors, and custom tooling. Unlike single-prompt mode (`grok -p`, which prints one response and exits), agent mode keeps a persistent process running and communicates through structured JSON-RPC messages.
+Agent mode runs Grok as an ACP (Agent Client Protocol) server for integration with IDEs, editors, and custom tooling. Unlike single-prompt mode (`open-grok -p`, which prints one response and exits), agent mode keeps a persistent process running and communicates through structured JSON-RPC messages.
 
 ---
 
@@ -21,7 +21,7 @@ The [Agent Client Protocol (ACP)](https://agentclientprotocol.com) is a standard
 stdio is the primary integration mode. The agent exchanges JSON-RPC messages over stdin and stdout:
 
 ```bash
-grok agent stdio
+open-grok agent stdio
 ```
 
 Clients that use this mode include:
@@ -32,7 +32,7 @@ Clients that use this mode include:
 
 ### Options
 
-These options belong to the `grok agent` command and apply to every mode. Pass them before the mode name, for example `grok agent --model grok-build stdio`. The `stdio` subcommand itself takes no options.
+These options belong to the `open-grok agent` command and apply to every mode. Pass them before the mode name, for example `open-grok agent --model grok-build stdio`. The `stdio` subcommand itself takes no options.
 
 | Flag                       | Description                                                       |
 | -------------------------- | ---------------------------------------------------------------- |
@@ -48,7 +48,7 @@ These options belong to the `grok agent` command and apply to every mode. Pass t
 Run the agent as a WebSocket server for remote clients:
 
 ```bash
-grok agent serve --bind 127.0.0.1:2419 --secret <token>
+open-grok agent serve --bind 127.0.0.1:2419 --secret <token>
 ```
 
 Clients connect over WebSocket and authenticate with the secret token. If you omit `--secret`, the agent generates a token and prints it at startup; you can also supply one through the `GROK_AGENT_SECRET` environment variable. The agent persists across reconnections, so a client can disconnect and later resume in-flight work.
@@ -60,7 +60,7 @@ Clients connect over WebSocket and authenticate with the secret token. If you om
 To reach the agent over the internet instead of the local network, run a WebSocket relay server and have the agent connect to it:
 
 ```bash
-grok agent headless --grok-ws-url wss://your-relay.example.com/ws
+open-grok agent headless --grok-ws-url wss://your-relay.example.com/ws
 ```
 
 The agent connects out to your relay, and your web clients connect to the same relay. This is useful for building web UIs where browsers cannot spawn local processes.
@@ -86,7 +86,7 @@ Communication follows the JSON-RPC 2.0 format. A typical session lifecycle:
 +-------------------+----------------------+
                     | JSON-RPC over stdio
 +-------------------v----------------------+
-|           grok agent stdio               |
+|           open-grok agent stdio               |
 |                                          |
 |  +---------+  +---------+  +---------+   |
 |  | Session |  |  Tools  |  |   MCP   |   |

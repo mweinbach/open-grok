@@ -40,7 +40,7 @@ pub fn discover_hook_source_paths(
     // Compat gate: skip .claude hook sources when disabled.
     let skip_claude_compat = !compat.claude.hooks;
     // Phase 2 cutoff: if the user has imported, skip .claude/settings.json
-    // sources. Native .grok/hooks/ directories are still scanned (they hold
+    // sources. Native .opengrok/hooks/ directories are still scanned (they hold
     // any hooks that were imported by /import-claude).
     let skip_claude = skip_claude_compat
         || crate::claude_import::is_claude_import_marked_with_log("discover_hook_source_paths");
@@ -50,7 +50,7 @@ pub fn discover_hook_source_paths(
 
     let home = dirs::home_dir();
     // user_grok_home() is None when no home resolves, so inspect lists the same
-    // sources a live session loads, instead of a cwd-relative .grok.
+    // sources a live session loads, instead of a cwd-relative .opengrok.
     let grok = xai_grok_config::user_grok_home();
     let mut global = Vec::new();
 
@@ -88,7 +88,7 @@ pub fn discover_hook_source_paths(
             project.push(root.join(".claude").join("settings.json"));
             project.push(root.join(".claude").join("settings.local.json"));
         }
-        project.push(root.join(".grok").join("hooks"));
+        project.push(root.join(".opengrok").join("hooks"));
         if !skip_cursor {
             project.push(root.join(".cursor").join("hooks.json"));
         }

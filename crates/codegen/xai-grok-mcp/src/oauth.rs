@@ -33,7 +33,7 @@ const CREDENTIAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 // (multiple async tasks / sessions) and across separate processes (leader
 // mode disabled, multiple `grok` invocations).
 //
-// Layer 1 (cross-process): filesystem lock at $GROK_HOME/mcp_auth_{safe_name}.lock
+// Layer 1 (cross-process): filesystem lock at $OPENGROK_HOME/mcp_auth_{safe_name}.lock
 // Layer 2 (in-process):    watch channel so only one task runs the flow
 // ---------------------------------------------------------------------------
 

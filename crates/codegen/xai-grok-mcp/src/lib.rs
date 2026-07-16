@@ -14,7 +14,7 @@
 //!    (`xai_grok_mcp::rmcp::*`).
 //!
 //! 2. **Owns MCP-specific integration code**:
-//!    - [`credentials`] -- on-disk `$GROK_HOME/mcp_credentials.json` store and
+//!    - [`credentials`] -- on-disk `$OPENGROK_HOME/mcp_credentials.json` store and
 //!      the rmcp `CredentialStore` adapter.
 //!    - [`oauth`] -- browser-based OAuth flow with cross-process + in-process
 //!      dedup.

@@ -2,7 +2,7 @@
 //!
 //! WAL keeps its wal-index in an mmap'd `-shm` file and relies on coherent
 //! shared memory plus reliable POSIX locks — guarantees network filesystems
-//! do not provide. When `$HOME` (and thus `~/.grok`) is NFS-mounted on
+//! do not provide. When `$HOME` (and thus `~/.opengrok`) is NFS-mounted on
 //! several machines at once, a peer host truncating/rebuilding the `-shm`
 //! during WAL recovery or close rips the backing out from under our mapping
 //! and the next wal-index read dies with SIGBUS. On such mounts we use a

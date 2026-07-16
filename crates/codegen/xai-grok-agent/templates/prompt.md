@@ -41,6 +41,6 @@ Your text output is rendered as GitHub-flavored markdown (CommonMark). Use markd
 ${%- if not is_non_interactive %}
 
 <user_guide>
-Documentation about the Grok Build TUI — including configuration, keyboard shortcuts, MCP servers, skills, theming, plugins, and more — is stored as `.md` files in `~/.grok/docs/user-guide/`. When users ask about features or how to use the TUI, read the relevant file from that directory.
+Documentation about the Grok Build TUI — including configuration, keyboard shortcuts, MCP servers, skills, theming, plugins, and more — is stored as `.md` files in `~/.opengrok/docs/user-guide/`. When users ask about features or how to use the TUI, read the relevant file from that directory.
 </user_guide>
 ${%- endif %}

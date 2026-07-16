@@ -2,7 +2,7 @@
 //!
 //! Extracted from `xai-grok-shell::agent::unique_identifier` so the
 //! telemetry engine can stamp events without depending on shell internals.
-//! `$GROK_HOME` is resolved through `xai-grok-config::grok_home`.
+//! `$OPENGROK_HOME` is resolved through `xai-grok-config::grok_home`.
 
 use std::sync::OnceLock;
 
@@ -14,7 +14,7 @@ static AGENT_INSTANCE_ID: OnceLock<String> = OnceLock::new();
 /// Returns the agent ID, using a file-based cache to avoid expensive system calls.
 ///
 /// On macOS, `mid::get()` calls `system_profiler` which takes ~1-3 seconds.
-/// This function caches the result in `$GROK_HOME/agent_id` so subsequent calls
+/// This function caches the result in `$OPENGROK_HOME/agent_id` so subsequent calls
 /// (even across process restarts) are instant file reads.
 ///
 /// The in-memory `OnceLock` ensures we only read the file once per process.

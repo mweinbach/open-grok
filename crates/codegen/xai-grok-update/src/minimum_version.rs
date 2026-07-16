@@ -2,7 +2,7 @@
 //!
 //! When `cli.minimum_version` is set in any config layer, Grok refuses to
 //! start below that floor. With auto-update on, we install
-//! `max(latest, minimum)`; otherwise the user is asked to run `grok update`.
+//! `max(latest, minimum)`; otherwise the user is asked to run `open-grok update`.
 //!
 //! Set `GROK_TEST_VERSION` to manually exercise either path without producing
 //! a real out-of-date build.
@@ -46,13 +46,13 @@ pub(crate) enum MinimumVersionError {
     },
     #[error(
         "This version of Grok ({current}) is no longer supported. \
-         Run `grok update` to install version {minimum} or later."
+         Run `open-grok update` to install version {minimum} or later."
     )]
     AutoUpdateDisabled { current: String, minimum: String },
     /// `npm` / `gh` / `internal` GCS — none detected.
     #[error(
         "This version of Grok ({current}) is no longer supported. \
-         Run `grok update` to install version {minimum} or later."
+         Run `open-grok update` to install version {minimum} or later."
     )]
     NoInstaller { current: String, minimum: String },
     /// `detail` is telemetry-only; omitted from `Display` to avoid stacking
@@ -60,7 +60,7 @@ pub(crate) enum MinimumVersionError {
     #[error(
         "This version of Grok ({current}) is no longer supported, \
          and the update to version {minimum} didn't complete.\n\n\
-         Run `grok update` to try again."
+         Run `open-grok update` to try again."
     )]
     UpgradeFailed {
         current: String,
@@ -86,10 +86,10 @@ pub(crate) enum MinimumVersionError {
          Check your network connection, or contact your administrator."
     )]
     NoReleaseFound { current: String, minimum: String },
-    /// `grok update --version X` requested a version below the floor.
+    /// `open-grok update --version X` requested a version below the floor.
     #[error(
         "Cannot install Grok {target}: the configured minimum is {minimum}. \
-         Run `grok update` to install the latest allowed version."
+         Run `open-grok update` to install the latest allowed version."
     )]
     TargetBelowFloor { target: String, minimum: String },
 }
@@ -133,7 +133,7 @@ fn evaluate_minimum_version(
 }
 
 /// Refuse an explicit install target below the configured floor.
-/// Used by `grok update --version X`.
+/// Used by `open-grok update --version X`.
 pub(crate) fn check_install_target(target: &str) -> Result<(), MinimumVersionError> {
     let floor = resolve_floor_or_error()?;
     check_install_target_inner(target, floor.as_deref())
@@ -154,7 +154,7 @@ fn check_install_target_inner(
 }
 
 /// `max(target, configured_floor)`; passthrough when no floor is set.
-/// Used by `grok update` to keep the install target at or above the pin.
+/// Used by `open-grok update` to keep the install target at or above the pin.
 pub(crate) fn apply_floor(target: &str) -> Result<String, MinimumVersionError> {
     let floor = resolve_floor_or_error()?;
     apply_floor_inner(target, floor.as_deref())
@@ -281,7 +281,7 @@ pub async fn enforce_minimum_version_or_exit(update_config: &UpdateConfig) {
             // child process ever writes to a broken pipe. For now this
             // path is rare (only fires when the server pushes a minimum
             // version bump), so print a relaunch message instead.
-            eprintln!("Update installed. Run `grok` to start.");
+            eprintln!("Update installed. Run `open-grok` to start.");
             std::process::exit(0);
         }
         Err(e) => {

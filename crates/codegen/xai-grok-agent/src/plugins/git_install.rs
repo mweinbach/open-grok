@@ -381,7 +381,7 @@ pub fn remove_repo_path(path: &Path) -> Result<(), InstallError> {
 
 /// Clean up plugin data directories for all plugins in a repo.
 ///
-/// Each plugin has a data dir at `~/.grok/plugin-data/<plugin_id>/`.
+/// Each plugin has a data dir at `~/.opengrok/plugin-data/<plugin_id>/`.
 /// This iterates all plugins in the repo and removes their data dirs.
 pub fn cleanup_plugin_data(repo: &InstalledRepo, scope: super::discovery::PluginScope) {
     let plugin_data_base = xai_grok_config::grok_home().join("plugin-data");

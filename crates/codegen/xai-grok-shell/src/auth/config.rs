@@ -185,7 +185,7 @@ pub fn xai_oauth2_issuer() -> &'static str {
 pub fn is_xai_oauth2_issuer(issuer: &str) -> bool {
     issuer == XAI_OAUTH2_ISSUER || issuer == XAI_OAUTH2_LOCAL_ISSUER
 }
-/// auth.json scope key used by the pre-OIDC `grok login --legacy` flow.
+/// auth.json scope key used by the pre-OIDC `open-grok login --legacy` flow.
 /// Matches the key format produced by the original `accounts.x.ai` relay auth.
 pub const LEGACY_AUTH_SCOPE: &str = "https://accounts.x.ai/sign-in";
 impl GrokComConfig {
@@ -204,7 +204,7 @@ impl GrokComConfig {
     }
     /// When `preferred_method = api_key`, automatic OIDC paths (devbox mint,
     /// interactive browser login, external auth provider) must not run — the
-    /// pin is fail-closed. Explicit `grok login --devbox` / `--api-key` bypass
+    /// pin is fail-closed. Explicit `open-grok login --devbox` / `--api-key` bypass
     /// this by not consulting automatic flow helpers.
     pub fn blocks_automatic_oidc(&self) -> bool {
         matches!(self.preferred_method, Some(PreferredAuthMethod::ApiKey))

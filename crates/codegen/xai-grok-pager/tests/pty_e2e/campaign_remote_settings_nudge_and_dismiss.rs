@@ -39,8 +39,8 @@ async fn campaign_remote_settings_nudge_and_dismiss() {
     }));
 
     // Seed config.toml with the user's own default model.
-    let grok_home = content.home().join(".grok");
-    std::fs::create_dir_all(&grok_home).expect("create GROK_HOME");
+    let grok_home = content.home().join(".opengrok");
+    std::fs::create_dir_all(&grok_home).expect("create OPENGROK_HOME");
     std::fs::write(
         grok_home.join("config.toml"),
         format!("[models]\ndefault = \"{CONFIG_MODEL}\"\n"),

@@ -245,7 +245,7 @@ pub(crate) async fn spawn_session_actor(
                 "CLI --allow catch-all ignored: always-approve disabled by managed policy"
             );
             if startup_hints.non_interactive {
-                eprintln!("grok: --allow catch-all ignored: {reason}");
+                eprintln!("open-grok: --allow catch-all ignored: {reason}");
             }
         }
         if !cli_permission_rules.is_empty() {

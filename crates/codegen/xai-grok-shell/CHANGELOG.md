@@ -118,7 +118,7 @@
 - **Dashboard shortcuts** now advertise ? instead of Ctrl+. on terminals that cannot deliver the latter.
 - **Double-clicking** scrollback while Text selection is fold/nav now shows a tip offering Ctrl+Y to enable Word select.
 - **`grok worktree ls`** now works as a short alias for `grok worktree list`.
-- **MCP tool output truncation** can now be set per-repo in `.grok/config.toml`.
+- **MCP tool output truncation** can now be set per-repo in `.opengrok/config.toml`.
 - **Auto-send of queued follow-ups** during task waits can now be enabled fleet-wide via remote settings.
 - **Welcome screen** now offers one-click resume of a recent Claude Code session via ctrl+u.
 
@@ -159,7 +159,7 @@
 - **IME text input in Otty** no longer attaches unrelated clipboard images on every character.
 - **Rewind** now fully removes the selected turn from both scrollback and the model's conversation history.
 - **Queued prompts** now abort long blocking waits instead of waiting for the full timeout.
-- **File links and media** now work for worktree sessions under ~/.grok/worktrees/.
+- **File links and media** now work for worktree sessions under ~/.opengrok/worktrees/.
 - **Collapsed Read/Edit tool rows** now show only the filename instead of long absolute paths.
 - **Clipboard copies on Wayland** now succeed even when the terminal loses focus mid-copy.
 - **User messages queued** behind an auto-wake turn are no longer lost when the user presses Ctrl+C.
@@ -297,7 +297,7 @@
 - **Try Again** on the free-usage paywall now correctly resubmits after rate-limit retries.
 - **Cursor** now respects your terminal's default blink style instead of always blinking.
 - **Skill commands** in scrollback now highlight only the command name, not the arguments.
-- **Plan files** now default to.grok/plan.md to match Grok conventions.
+- **Plan files** now default to.opengrok/plan.md to match Grok conventions.
 - **LaTeX math** renders correctly for display equations and complex subscripts.
 - **Queue hint** in the terminal no longer shows incorrect bold text on part of the message.
 
@@ -972,7 +972,7 @@
 - **Dashboard empty state** is now a single hint line; dispatch and peek placeholders appear only when unfocused.
 - **Fixed memory leaks** that could cause the CLI to use tens of gigabytes during long sessions with many tool calls.
 - **Login on SSH or headless machines** now tells you when the browser cannot be opened automatically and shows the URL to visit manually.
-- **Fixed git clone failures** on Windows when the CLI tries to clone marketplace plugins into ~/.grok.
+- **Fixed git clone failures** on Windows when the CLI tries to clone marketplace plugins into ~/.opengrok.
 
 ## Performance
 
@@ -1115,7 +1115,7 @@
 
 ## Features
 
-- **`grok --debug`** now produces per-session log files under ~/.grok/debug/ even with a leader process.
+- **`grok --debug`** now produces per-session log files under ~/.opengrok/debug/ even with a leader process.
 
 ## Bug Fixes
 
@@ -2746,7 +2746,7 @@
 
 ## Features
 
-- **Import Claude settings** from `.claude/` into `.grok/config.toml` via welcome screen ('i') or `/import-claude`.
+- **Import Claude settings** from `.claude/` into `.opengrok/config.toml` via welcome screen ('i') or `/import-claude`.
 - **Skills reload automatically** when editing/saving SKILL.md files without restarting `grok`.
 
 ## Bug Fixes
@@ -3139,7 +3139,7 @@
 
 - **`grok sessions search`** now supports **full-text queries** across chat content and tools.
 - **Session picker** now combines fuzzy matching with **deep content search** results.
-- **Unified logs** now saved to `~/.grok/logs/unified.jsonl` with **Download Logs** in desktop.
+- **Unified logs** now saved to `~/.opengrok/logs/unified.jsonl` with **Download Logs** in desktop.
 
 ## Bug Fixes
 
@@ -3462,11 +3462,11 @@
 - **Startup announcements** emits x.ai/announcements/refreshed ACP notification on agent init.
 - **Auto-enroll updates** defaults to enabling automatic updates without interactive prompt.
 - **Subagent visualizations** in pager now show persona, role, and model metadata.
-- **Bundled agents** discovered from ~/.grok/bundled/agents/ with lowest precedence after project/user/built-in.
+- **Bundled agents** discovered from ~/.opengrok/bundled/agents/ with lowest precedence after project/user/built-in.
 - **Pager welcome screen** displays rotated tip-of-the-day from RemoteSettings honoring config and env overrides.
 - **image_gen/video_gen tools** instruct model to display generated media inline via markdown.
 - **Project plugins** default disabled with enable via [plugins].enabled and added counts for UI.
-- **Enterprise managed configs** via ~/.grok/managed_config.toml/requirements.toml with `grok inspect` and `grok setup`.
+- **Enterprise managed configs** via ~/.opengrok/managed_config.toml/requirements.toml with `grok inspect` and `grok setup`.
 - **web_fetch tool** enabled via [features] web_fetch in config.toml alongside env/remote settings.
 - **grok login defaults to OAuth** instead of legacy relay; use --legacy or GROK_OAUTH_ENABLED=0 for old behavior.
 - **Clipboard copy over SSH/tmux** now reaches local terminal via OSC 52 alongside native clipboard writes.
@@ -3526,7 +3526,7 @@
 
 ## Features
 
-- **Per-hook enable/disable toggles** via ~/.grok/disabled-hooks file and 'e' key with **multi-line j/k navigation fix**.
+- **Per-hook enable/disable toggles** via ~/.opengrok/disabled-hooks file and 'e' key with **multi-line j/k navigation fix**.
 - **Bash-mode execute blocks auto-expand** after completion to display output immediately.
 - **Video generation tool** supports xAI API with async polling, download and sequential MP4 naming.
 - **Marketplace plugin installs** route through git_install with provenance tracking.
@@ -3604,7 +3604,7 @@
 
 ## Features
 
-- **LSP integration** injects diagnostics as reminders and exposes opt-in code intelligence tools via `.grok/lsp.json`.
+- **LSP integration** injects diagnostics as reminders and exposes opt-in code intelligence tools via `.opengrok/lsp.json`.
 - **Glob-aware permission rules** support prefix/suffix wildcards, tool=* and refined bash/edit matching.
 - **Claude settings.json compatibility** loads legacy rules as fallback when native TOML absent.
 - **Path-specific Read permissions** match against file paths from read_file/list_dir tools.
@@ -3614,7 +3614,7 @@
 - **Image generation tool** creates Imagine API images saved to session/images/ folder.
 - **Configurable web search disable** from config.toml via `disable_web_search = true`, OR-ed with CLI flag.
 - **Image generation tool** gated behind a server-side flag or `GROK_IMAGE_GEN=1` env var with session auth.
-- **Dynamic nested skill discovery** in `.grok/skills/` subdirs with runtime system reminder announcements.
+- **Dynamic nested skill discovery** in `.opengrok/skills/` subdirs with runtime system reminder announcements.
 
 ## Bug Fixes
 
@@ -3628,7 +3628,7 @@
 
 ## Features
 
-- **Configurable permission policies** enable automatic allow/deny rules via ~/.grok/config.toml before existing checks.
+- **Configurable permission policies** enable automatic allow/deny rules via ~/.opengrok/config.toml before existing checks.
 - **Prevents timeout doom loops** by auto-backgrounding foreground commands exceeding default 120s without explicit timeout.
 - **ACP git extensions** enable desktop git info/branches/checkout without local shelling, supporting cloud workspaces.
 - **Richer hook annotations** add HTTP URL/status/response previews to scrollback for pre-tool-use summaries.
@@ -3649,7 +3649,7 @@
 ## Features
 
 - **New TUI slash commands** /clear alias, /context usage breakdown, /version, and /login auth status.
-- **Skills discovery expands** to.agents/skills directories alongside.grok and.claude.
+- **Skills discovery expands** to.agents/skills directories alongside.opengrok and.claude.
 
 ## Performance
 
@@ -3673,7 +3673,7 @@
 - **Management actions for hooks/plugins** via x.ai/{hooks,plugins}/action with live modal refresh.
 - **disable_web_search now honors config.toml** value ORed with CLI flag.
 - **WebFetch tool scaffold** securely fetches URLs to markdown with SSRF protection.
-- **Dynamic discovery of nested skills** from.grok/skills/ subdirs at runtime via reminders.
+- **Dynamic discovery of nested skills** from.opengrok/skills/ subdirs at runtime via reminders.
 - **PR status extension (x.ai/pr/status)** fetches branch PR state, title, number, and URL via gh CLI.
 - **Web fetch domain allowlist support** with enum outputs for blocked domains and cross-host redirects.
 
@@ -3771,7 +3771,7 @@
 - **Execute inline hooks and MCP servers** from plugin manifests with shell `/plugins add/remove` and HTTP handler support.
 - **Redesigned OAuth consent page** uses icon cards; shell callback pages now styled with success/error feedback.
 - **MCP catalogs expose scope_name** for human-readable labels alongside scope/scope_id.
-- **Discover skills from**.claude/skills directories alongside.grok/skills.
+- **Discover skills from**.claude/skills directories alongside.opengrok/skills.
 - **TUI hook messages render** inline as scrollback annotations with hashline aliases.
 
 ## Bug Fixes
@@ -3792,7 +3792,7 @@
 - **Claude frontmatter parity** parses allowed-tools lists/strings, model, and effort in skill frontmatter.
 - **Auto-injected managed MCPs** from grok.com for WebLogin, deduped with config.toml opt-out.
 - **ACP worktree management** adds list/show/gc/db methods with filters and dry-run.
-- **ACP x.ai/auth/logout** removes scopes from ~/.grok/auth.json.
+- **ACP x.ai/auth/logout** removes scopes from ~/.opengrok/auth.json.
 - **Custom npm registry** via config.toml or GROK_NPM_REGISTRY respects enterprise.npmrc.
 - **CLI worktree commands use ACP** with repo-wide session resolution for -w -r.
 - **Repo-wide worktree session resume** resolves locally across same-repo directories via ACP before remote fallback.
@@ -3822,7 +3822,7 @@
 
 - **Subagent worktrees preserved** after completion with path in output; role-level fork and isolation defaults added.
 - **Always-approve mode** renames yolo flag/slash command with backward-compatible aliases preserved.
-- **Help skill reads ~/.grok/config.toml** to answer MCP server and model configuration queries.
+- **Help skill reads ~/.opengrok/config.toml** to answer MCP server and model configuration queries.
 - **Deployment keys supported** on all API proxy endpoints including storage and sessions.
 - **Public install-grok.sh script** supports deployment keys and channels without VPN.
 - **Subagent prompts** use dedicated compact template with system role/persona.
@@ -3861,7 +3861,7 @@
 - **Structured subagent details and lineage** render diagnostics below selected TUI tasks rows.
 - **TUI /plugins commands** support live reload, qualified autocomplete, and plugin source display.
 - **Subagent safety guards** fallback to parent model on unknown config or fork context overflow.
-- **Bundled /help skill** extracts README.md to ~/.grok/ for slash command and model self-help.
+- **Bundled /help skill** extracts README.md to ~/.opengrok/ for slash command and model self-help.
 - **Identifies worktree sessions** in client sidebars via session_kind and source_workspace_dir metadata in summary.json.
 
 ## Bug Fixes
@@ -3874,7 +3874,7 @@
 
 ## Features
 
-- **Subagent persona support** enables layered instructions from config.toml and.grok/personas/*.toml with fail-closed resolution.
+- **Subagent persona support** enables layered instructions from config.toml and.opengrok/personas/*.toml with fail-closed resolution.
 - **Compaction-safe fork inheritance** preserves parent prefix while summarizing only child-owned suffix.
 - **Enhanced task tool guidance** coaches model on fork_context, capability_mode, overrides, and personas.
 - **External auth providers** support custom login binaries with TUI/headless flows.
@@ -3930,8 +3930,8 @@
 - **Plugin install/uninstall commands** support git repos, tags, subdirs, local paths.
 - **Auto-injects managed MCPs** from grok.com into CLI/TUI for WebLogin users.
 - **ACP worktree management** adds list/show/gc/db methods with filters and dry-run.
-- **ACP logout method** removes scopes from ~/.grok/auth.json.
-- **Discovers skills from.claude/skills** alongside.grok/skills across local, repo, and user directories.
+- **ACP logout method** removes scopes from ~/.opengrok/auth.json.
+- **Discovers skills from.claude/skills** alongside.opengrok/skills across local, repo, and user directories.
 - **Inline TUI scrollback annotations** for hooks with ✓ success indicator and hashline_* Claude aliases.
 - **New hook events** Stop/Notification/UserPromptSubmit/SubagentStart/Stop with Claude-compatible PreToolUse schema.
 - **Exposes resolvedModelId** in feedback submissions and /session-info slash command.
@@ -4181,7 +4181,7 @@
 - **OIDC manual paste fallback** races stdin against the loopback server so remote VM users can paste auth codes directly, with `[auth]` config alias.
 - **Session ID clipboard copy** on /session-info, with a transient status banner for success and error feedback.
 - **Telemetry defaults to off** with centralized env > config > remote settings > default precedence for telemetry and trace uploads.
-- **User-defined subagents** via .grok/agents/*.md files with per-subagent config toggles and dynamic Task tool descriptions.
+- **User-defined subagents** via .opengrok/agents/*.md files with per-subagent config toggles and dynamic Task tool descriptions.
 
 ## Bug Fixes
 
@@ -4289,7 +4289,7 @@
 
 - **Remote announcements** from remote settings with tolerant deserializer.
 - **Shell completions** via `grok completions <shell>`, leader CLI, and stdio reconnect replay.
-- **User-defined subagents** via.grok/agents/*.md with config toggles.
+- **User-defined subagents** via.opengrok/agents/*.md with config toggles.
 - **Post-compaction reminder includes running subagents** with IDs, types, and poll/cancel instructions.
 - **External auth provider binary** enables login via custom commands in sandboxed/air-gapped environments.
 - **Custom models_base_url auto-fetches** OpenAI-compatible model list for enterprise proxies.
@@ -4309,7 +4309,7 @@
 - **Auto-installs grok-pager** alongside grok during internal and GitHub release updates.
 - **Mid-session token refresh** via OIDC grants or external auth binaries prevents expiry.
 - **Hashline toolset** enables anchor-stable file read/edit/grep with validation, recovery, ranges, and config integration.
-- **Hooks system** executes custom scripts for pre/post-tool and session events from ~/.grok/hooks/ with deny-wins trust controls.
+- **Hooks system** executes custom scripts for pre/post-tool and session events from ~/.opengrok/hooks/ with deny-wins trust controls.
 - **Independent feedback flag** gates /feedback and popups separately from telemetry via GROK_FEEDBACK_ENABLED.
 - **Leader CLI** adds `grok leader list/info/profile/kill/dev` for discovery and CPU profiling.
 - **Plan mode state machine** enables agent planning phase with enter/exit tools and session persistence.
@@ -4622,7 +4622,7 @@
 - **PTY notifications reach the correct client** via _meta routing metadata, with shared helpers and session-aware cwd fallback.
 - **Concurrent tool calls no longer crash** the tools server; semaphore serializes access to the thread-local toolset.
 - **Cross-session notification leaks eliminated** in leader mode for relay, dead-client, and ext/notification routing paths.
-- **Leader auto-update pre-downloads the binary** before shutdown and resolves the ~/.grok/bin symlink at spawn time.
+- **Leader auto-update pre-downloads the binary** before shutdown and resolves the ~/.opengrok/bin symlink at spawn time.
 - **First-compaction memory flush fires correctly** by pre-incrementing the compaction counter before the flush guard.
 - **Interval memory flush resumes after compaction** by resetting the conversation length counter when history is compacted.
 - **Session content restored on TUI reconnect** by clearing stale scrollback, resetting turn state, and gating live updates during replay.
@@ -4798,7 +4798,7 @@
 - **Accurate prompt re-rendering** now respects active tool overrides and disabled tools by centralizing all prompt assembly through a shared PromptContext.
 - **A/B cancellation no longer double-finishes comparisons** by suppressing completion notifications and after-uploads when cancel handlers already removed active comparison state.
 - **Running outside git repos no longer panics** by skipping gitignore construction without a repo root and guarding absolute-path ignore checks.
-- **npm installs now use a canonical Grok binary path** via postinstall copy to `~/.grok/bin/grok`, preventing installer conflicts and version confusion.
+- **npm installs now use a canonical Grok binary path** via postinstall copy to `~/.opengrok/bin/grok`, preventing installer conflicts and version confusion.
 
 
 # 0.1.142

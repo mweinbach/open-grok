@@ -949,7 +949,7 @@ impl SessionActor {
                 "{detailed_message}\n\n\
                  You are using a deprecated authentication method (WebLogin).\n\
                  This auth method is no longer supported and will cause errors.\n\n\
-                 To fix: run `grok logout` then `grok login` to re-authenticate with OAuth2.\n\n\
+                 To fix: run `open-grok logout` then `open-grok login` to re-authenticate with OAuth2.\n\n\
                  Version: {client_version}"
             );
             self.log_terminal_failure("legacy_auth", error.status_code, &msg, request_provider);
@@ -999,7 +999,7 @@ impl SessionActor {
                 && request_provider == xai_grok_sampling_types::ModelProvider::Codex
                 && request_auth_type == xai_chat_state::AuthType::SessionToken
             {
-                msg.push_str("\n\n  Reconnect with `grok login --codex`.");
+                msg.push_str("\n\n  Reconnect with `open-grok login --codex`.");
             }
             msg
         } else {

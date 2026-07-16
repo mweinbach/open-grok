@@ -1903,7 +1903,7 @@ pub async fn checkout_session_commit(
 /// The restore-code path runs `git fetch origin` + `git checkout <sha>`,
 /// which *detaches HEAD*. That is only acceptable in two situations:
 ///
-/// 1. `supplied_cwd` is a grok-managed worktree (`~/.grok/worktrees/...`).
+/// 1. `supplied_cwd` is a grok-managed worktree (`~/.opengrok/worktrees/...`).
 ///    These are disposable snapshots that exist precisely to carry a
 ///    detached session HEAD.
 /// 2. `supplied_cwd` is exactly the cwd the session was persisted with
@@ -1920,7 +1920,7 @@ pub fn restore_code_checkout_allowed(supplied_cwd: &Path, persisted_cwd: Option<
 }
 /// Pure core of [`restore_code_checkout_allowed`] with the worktrees root
 /// injected so the decision can be unit-tested without touching
-/// `~/.grok`.
+/// `~/.opengrok`.
 fn restore_code_checkout_allowed_in(
     supplied_cwd: &Path,
     persisted_cwd: Option<&str>,
@@ -2683,25 +2683,29 @@ mod tests {
     }
     #[test]
     fn test_effective_worktree_cwd_empty_offset() {
-        let result =
-            effective_worktree_cwd("/home/user/.grok/worktrees/repo/ab-123-a", Path::new(""));
-        assert_eq!(result, "/home/user/.grok/worktrees/repo/ab-123-a");
+        let result = effective_worktree_cwd(
+            "/home/user/.opengrok/worktrees/repo/ab-123-a",
+            Path::new(""),
+        );
+        assert_eq!(result, "/home/user/.opengrok/worktrees/repo/ab-123-a");
     }
     #[test]
     fn test_effective_worktree_cwd_single_level_offset() {
-        let result =
-            effective_worktree_cwd("/home/user/.grok/worktrees/repo/ab-123-a", Path::new("src"));
-        assert_eq!(result, "/home/user/.grok/worktrees/repo/ab-123-a/src");
+        let result = effective_worktree_cwd(
+            "/home/user/.opengrok/worktrees/repo/ab-123-a",
+            Path::new("src"),
+        );
+        assert_eq!(result, "/home/user/.opengrok/worktrees/repo/ab-123-a/src");
     }
     #[test]
     fn test_effective_worktree_cwd_nested_offset() {
         let result = effective_worktree_cwd(
-            "/home/user/.grok/worktrees/repo/ab-123-b",
+            "/home/user/.opengrok/worktrees/repo/ab-123-b",
             Path::new("packages/frontend/src"),
         );
         assert_eq!(
             result,
-            "/home/user/.grok/worktrees/repo/ab-123-b/packages/frontend/src"
+            "/home/user/.opengrok/worktrees/repo/ab-123-b/packages/frontend/src"
         );
     }
     #[test]
@@ -2772,7 +2776,7 @@ mod tests {
         let sub = repo_root.join("src").join("lib");
         std::fs::create_dir_all(&sub).unwrap();
         let (offset, _git_root) = compute_subdir_offset(&sub.to_string_lossy());
-        let worktree_root = "/home/user/.grok/worktrees/myrepo/ab-test-a";
+        let worktree_root = "/home/user/.opengrok/worktrees/myrepo/ab-test-a";
         let effective = effective_worktree_cwd(worktree_root, &offset);
         assert_eq!(effective, format!("{}/src/lib", worktree_root));
     }
@@ -3588,16 +3592,16 @@ mod restore_code_tests {
     }
     #[test]
     fn restore_code_checkout_allowed_worktree_cwd_is_allowed() {
-        let worktrees = Path::new("/home/u/.grok/worktrees");
+        let worktrees = Path::new("/home/u/.opengrok/worktrees");
         assert!(restore_code_checkout_allowed_in(
-            Path::new("/home/u/.grok/worktrees/home-u-repo/2026-05-22-9f2e51ce"),
+            Path::new("/home/u/.opengrok/worktrees/home-u-repo/2026-05-22-9f2e51ce"),
             Some("/home/u/repo"),
             worktrees,
         ));
     }
     #[test]
     fn restore_code_checkout_allowed_same_cwd_is_allowed() {
-        let worktrees = Path::new("/home/u/.grok/worktrees");
+        let worktrees = Path::new("/home/u/.opengrok/worktrees");
         assert!(restore_code_checkout_allowed_in(
             Path::new("/home/u/repo"),
             Some("/home/u/repo"),
@@ -3611,16 +3615,16 @@ mod restore_code_tests {
     }
     #[test]
     fn restore_code_checkout_allowed_source_repo_with_worktree_session_is_refused() {
-        let worktrees = Path::new("/home/u/.grok/worktrees");
+        let worktrees = Path::new("/home/u/.opengrok/worktrees");
         assert!(!restore_code_checkout_allowed_in(
             Path::new("/home/u/repo"),
-            Some("/home/u/.grok/worktrees/home-u-repo/2026-05-22-9f2e51ce"),
+            Some("/home/u/.opengrok/worktrees/home-u-repo/2026-05-22-9f2e51ce"),
             worktrees,
         ));
     }
     #[test]
     fn restore_code_checkout_allowed_missing_persisted_cwd_is_refused() {
-        let worktrees = Path::new("/home/u/.grok/worktrees");
+        let worktrees = Path::new("/home/u/.opengrok/worktrees");
         assert!(!restore_code_checkout_allowed_in(
             Path::new("/home/u/repo"),
             None,

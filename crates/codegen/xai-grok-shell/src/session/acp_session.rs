@@ -1231,7 +1231,7 @@ const PROMPT_CONTEXT_FILENAME: &str = "prompt_context.json";
 /// Persist the structured prompt context to `{session_dir}/prompt_context.json`.
 ///
 /// This is best-effort: failures are logged but do not block session creation.
-/// The saved JSON enables deterministic re-rendering, `grok prompt --json`
+/// The saved JSON enables deterministic re-rendering, `open-grok prompt --json`
 /// inspection, and post-hoc debugging of what went into a session's system prompt.
 fn save_prompt_context(session_info: &SessionInfo, prompt_context: &xai_grok_agent::PromptContext) {
     let dir = crate::session::persistence::session_dir(session_info);

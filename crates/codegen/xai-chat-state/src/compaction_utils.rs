@@ -2821,12 +2821,12 @@ actual user question";
             summary_count: 1,
         };
         let summary = build_compacted_history(input(Some(
-            "/home/user/.grok/sessions/abc/updates.jsonl".to_string(),
+            "/home/user/.opengrok/sessions/abc/updates.jsonl".to_string(),
         )))
         .last()
         .unwrap()
         .text_content();
-        assert!(summary.contains("/home/user/.grok/sessions/abc/updates.jsonl"));
+        assert!(summary.contains("/home/user/.opengrok/sessions/abc/updates.jsonl"));
         let summary = build_compacted_history(input(None))
             .last()
             .unwrap()

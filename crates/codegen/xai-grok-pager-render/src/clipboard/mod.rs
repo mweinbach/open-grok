@@ -27,7 +27,7 @@ fn is_container_no_display() -> bool {
 
 /// Cached result of the "an upstream OSC 52 sink is capturing our output" check.
 ///
-/// `grok wrap` runs a command inside a local PTY, scans its output for OSC 52
+/// `open-grok wrap` runs a command inside a local PTY, scans its output for OSC 52
 /// clipboard sequences, and writes their payload to the *real* (local) system
 /// clipboard (see `xai-grok-pager`'s `pty_wrap` module). It advertises this to
 /// the wrapped program via an environment variable so the
@@ -124,7 +124,7 @@ pub fn resolve_clipboard_route(ctx: &TerminalContext) -> ClipboardRoute {
         // Linux: always emit OSC 52 as a safety net. This matches other
         // terminal agent CLIs which emit OSC 52 on every copy.
         // macOS/Windows: only in tmux/SSH/container contexts, or when an
-        // upstream `grok wrap` sink is capturing our output and will forward
+        // upstream `open-grok wrap` sink is capturing our output and will forward
         // the sequence to the real clipboard.
         osc52: cfg!(target_os = "linux")
             || is_tmux

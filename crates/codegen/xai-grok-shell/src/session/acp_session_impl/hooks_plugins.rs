@@ -159,7 +159,7 @@ impl SessionActor {
                         requires_restart: false,
                     };
                 }
-                // CWE-427: add_hooks_path() validates path is under ~/.grok/.
+                // CWE-427: add_hooks_path() validates path is under ~/.opengrok/.
                 match crate::config::add_hooks_path(&path) {
                     Ok(()) => ActionOutcome {
                         status: OutcomeStatus::Success,

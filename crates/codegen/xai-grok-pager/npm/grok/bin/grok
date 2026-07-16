@@ -2,11 +2,11 @@
 // Thin trampoline: resolves the grok binary from the matching per-platform
 // optional dependency package and execs it.
 //
-// Falls back to bootstrapping the canonical ~/.grok/bin/grok-<version> symlink
+// Falls back to bootstrapping the canonical ~/.opengrok/bin/grok-<version> symlink
 // layout if postinstall hasn't run (e.g. npx, or postinstall failure).
 //
 // Binary location strategy (in priority order):
-//   1. ~/.grok/bin/grok        — canonical versioned symlink (postinstall.js)
+//   1. ~/.opengrok/bin/grok        — canonical versioned symlink (postinstall.js)
 //   2. @xai-official/grok-<platform>/bin/grok[.exe]      — decompressed sibling
 //   3. @xai-official/grok-<platform>/bin/grok[.exe].br   — brotli-compressed
 //
@@ -22,7 +22,7 @@ const pkgName = '@xai-official/grok';
 const IS_WINDOWS = process.platform === 'win32';
 const EXE = IS_WINDOWS ? '.exe' : '';
 const BIN_NAME = `grok${EXE}`;
-const CANONICAL_DIR = path.join(os.homedir(), '.grok', 'bin');
+const CANONICAL_DIR = path.join(os.homedir(), '.opengrok', 'bin');
 const CANONICAL_PATH = path.join(CANONICAL_DIR, BIN_NAME);
 
 function readLocalVersion() {

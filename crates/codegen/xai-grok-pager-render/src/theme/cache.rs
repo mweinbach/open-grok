@@ -1,7 +1,7 @@
 //! In-memory theme cache + resolution.
 //!
 //! The pager reads the active `ThemeKind` on every render frame, so the
-//! lookup must be cheaper than re-loading from `~/.grok/config.toml`.
+//! lookup must be cheaper than re-loading from `~/.opengrok/config.toml`.
 //! [`current_kind`] returns the in-memory value, lazily seeding from the
 //! shell's layered effective config on first call.
 //!
@@ -72,7 +72,7 @@ pub struct AutoThemeConfig {
 
 /// Get the current theme kind.
 ///
-/// On the first call, reads from `~/.grok/config.toml` (via the shell's
+/// On the first call, reads from `~/.opengrok/config.toml` (via the shell's
 /// `load_effective_config`). After that, returns the in-memory value
 /// (updated by [`set`]).
 pub fn current_kind() -> ThemeKind {

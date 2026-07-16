@@ -19,10 +19,10 @@ Common use cases:
 
 1. Create the hooks directory:
    ```sh
-   mkdir -p ~/.grok/hooks
+   mkdir -p ~/.opengrok/hooks
    ```
 
-2. Create a simple hook file, e.g. `~/.grok/hooks/session-start.json`:
+2. Create a simple hook file, e.g. `~/.opengrok/hooks/session-start.json`:
    ```json
    {
      "hooks": {
@@ -47,13 +47,13 @@ Hooks are discovered from several places (all are merged):
 
 | Scope     | Path                              | Trusted?     | Notes |
 |-----------|-----------------------------------|--------------|-------|
-| Global    | `~/.grok/hooks/*.json`            | Always       | Best for personal hooks |
+| Global    | `~/.opengrok/hooks/*.json`            | Always       | Best for personal hooks |
 | Global    | `~/.claude/settings.json`         | Always       | Claude Code compatibility |
-| Project   | `<project>/.grok/hooks/*.json`    | Requires trust | Per-repo automation |
+| Project   | `<project>/.opengrok/hooks/*.json`    | Requires trust | Per-repo automation |
 | Project   | `<project>/.claude/settings.json` | Requires trust | Claude compatibility |
 | Plugin    | Bundled inside installed plugins  | Per-plugin   | Shared team hooks |
 
-**Trusting a project**: Open the hooks modal (`Ctrl+L` on non–VS Code family, or `/hooks` on any terminal including VS Code family) or run `/hooks-trust` (the same folder-trust gate as `--trust`, recorded in `~/.grok/trusted_folders.toml`) the first time you open a project with hooks. This prevents untrusted repos from running arbitrary code.
+**Trusting a project**: Open the hooks modal (`Ctrl+L` on non–VS Code family, or `/hooks` on any terminal including VS Code family) or run `/hooks-trust` (the same folder-trust gate as `--trust`, recorded in `~/.opengrok/trusted_folders.toml`) the first time you open a project with hooks. This prevents untrusted repos from running arbitrary code.
 
 ## The Hook JSON Format
 
@@ -223,7 +223,7 @@ In the **Hooks** tab you can:
 - `r` — Remove
 - `Space` — Expand groups
 
-Hooks from `~/.grok/hooks/` appear under **Global**, project ones under **Project**, etc.
+Hooks from `~/.opengrok/hooks/` appear under **Global**, project ones under **Project**, etc.
 
 ## HTTP Hooks
 
@@ -241,11 +241,11 @@ The full event envelope is POSTed as JSON. Useful for webhooks, analytics, or se
 2. **Use explicit `deny` to block** — hooks fail-open on any error (timeout, crash, missing env var, etc.), so a hook that crashes will not block the tool call. To enforce policy, your hook must run to completion and emit `{"decision":"deny","reason":"..."}` on stdout.
 3. **Use absolute paths or relative to hook file** — scripts in `bin/` next to the JSON are portable.
 4. **Test with `Ctrl+L` (non–VS Code family) / `/hooks`** — verify loading and matching before relying on them.
-5. **Version control project hooks** — commit `.grok/hooks/` (but never secrets).
+5. **Version control project hooks** — commit `.opengrok/hooks/` (but never secrets).
 
 ## Security Notes
 
-- Global hooks (`~/.grok/...`) run with your user permissions — treat them like shell scripts.
+- Global hooks (`~/.opengrok/...`) run with your user permissions — treat them like shell scripts.
 - Project hooks require explicit trust (run `/hooks-trust` or use the modal) to prevent supply-chain attacks from malicious repos.
 - HTTP hooks send session data — only use trusted endpoints.
 
@@ -254,7 +254,7 @@ The full event envelope is POSTed as JSON. Useful for webhooks, analytics, or se
 - **Hook not running?** → Press `Ctrl+L` on non–VS Code family (or run `/hooks` anywhere) to see if it's loaded and matched.
 - **Project hooks ignored?** → Trust the project first.
 - **Script not found?** → Check the path is relative to the `.json` file and executable (`chmod +x`).
-- **See errors?** → Check the pager logs (usually in the tracing pane or `~/.grok/logs`).
+- **See errors?** → Check the pager logs (usually in the tracing pane or `~/.opengrok/logs`).
 
 ## More Examples
 
@@ -265,7 +265,7 @@ See the built-in examples in the `xai-grok-hooks` crate:
 - [Session Audit Log](../../../xai-grok-hooks/examples/hooks/session-log.json)
 - [Tool Activity Logger](../../../xai-grok-hooks/examples/hooks/tool-logger.json)
 
-Copy them to `~/.grok/hooks/` and customize.
+Copy them to `~/.opengrok/hooks/` and customize.
 
 ## Full Reference
 

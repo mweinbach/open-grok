@@ -1,6 +1,6 @@
 //! `/expand` -- re-print the last collapsed block, fully expanded (minimal mode).
 //!
-//! In the scrollback-native minimal mode (`grok --minimal`) finalized blocks are
+//! In the scrollback-native minimal mode (`open-grok --minimal`) finalized blocks are
 //! printed once into the terminal's native scrollback, with reasoning collapsed
 //! and large tool output truncated (design decision K9). Committed terminal text
 //! can't be mutated, so "expanding" one is an honest re-print of the same block

@@ -9,28 +9,28 @@ Grok supports several authentication methods, including interactive browser logi
 On first launch, Grok opens your browser to authenticate with grok.com:
 
 ```bash
-grok
+open-grok
 ```
 
-Grok stores credentials in `~/.grok/auth.json` and reuses them across sessions. Grok refreshes access tokens automatically in the background. When a token can't be refreshed, Grok prompts you to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
+Grok stores credentials in `~/.opengrok/auth.json` and reuses them across sessions. Grok refreshes access tokens automatically in the background. When a token can't be refreshed, Grok prompts you to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
 
 ### Re-authenticate
 
 To switch accounts or resolve an authentication problem, run:
 
 ```bash
-grok login
+open-grok login
 ```
 
-Running `grok login` starts the sign-in flow again, replacing your cached session. By default, it opens your browser and signs in through SpaceXAI OAuth at `auth.x.ai`. Pass a flag to select a different flow:
+Running `open-grok login` starts the sign-in flow again, replacing your cached session. By default, it opens your browser and signs in through SpaceXAI OAuth at `auth.x.ai`. Pass a flag to select a different flow:
 
 | Flag | Description |
 |------|-------------|
 | `--oauth` | Sign in through SpaceXAI OAuth at `auth.x.ai`. This is the default, so the flag is optional. |
 | `--device-auth` (alias `--device-code`) | Sign in with the device-code flow for headless or remote environments. |
 
-To sign out of xAI, run `grok logout`. It clears only the xAI credentials in
-`~/.grok/auth.json`.
+To sign out of xAI, run `open-grok logout`. It clears only the xAI credentials in
+`~/.opengrok/auth.json`.
 
 ### OpenAI Codex OAuth
 
@@ -39,9 +39,9 @@ quota usage. This is a second, independent account: connecting or
 disconnecting Codex never replaces the xAI login used by the Grok shell.
 
 ```bash
-grok login --codex
-grok login --codex --device-auth   # headless or remote environments
-grok logout --codex
+open-grok login --codex
+open-grok login --codex --device-auth   # headless or remote environments
+open-grok logout --codex
 ```
 
 Inside an active session, use `/login codex` and `/logout codex` for the same
@@ -49,13 +49,13 @@ independent account. Bare `/login` and `/logout` continue to operate on xAI.
 
 The Codex flow follows the OpenAI Codex OAuth authorization-code + PKCE setup,
 refreshes access tokens automatically, and stores the resulting tokens in
-`~/.grok/codex-auth.json` with owner-only permissions. Keeping that file
-separate from `~/.grok/auth.json` prevents a Codex refresh, logout, or usage
+`~/.opengrok/codex-auth.json` with owner-only permissions. Keeping that file
+separate from `~/.opengrok/auth.json` prevents a Codex refresh, logout, or usage
 failure from changing xAI authentication or paywall state.
 
 Run `/usage` to view xAI billing and OpenAI Codex quota windows together. If
 Codex is not connected, the OpenAI section says so and points to
-`grok login --codex`; xAI usage still loads independently.
+`open-grok login --codex`; xAI usage still loads independently.
 
 ---
 
@@ -65,10 +65,10 @@ For CI/CD, automation, or environments without browser access, use an API key fr
 
 ```bash
 export XAI_API_KEY="xai-..."
-grok
+open-grok
 ```
 
-Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `grok logout` or delete `~/.grok/auth.json`.
+Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `open-grok logout` or delete `~/.opengrok/auth.json`.
 
 ---
 
@@ -87,7 +87,7 @@ Authenticate developers through your own Identity Provider (IdP) -- such as Okta
 Via config file:
 
 ```toml
-# ~/.grok/config.toml
+# ~/.opengrok/config.toml
 [grok_com_config.oidc]
 issuer = "https://acme.okta.com"
 client_id = "0oa1b2c3d4e5f6g7h8i9"
@@ -106,9 +106,9 @@ You can also override the API endpoint to point at your own proxy:
 export GROK_CLI_CHAT_PROXY_BASE_URL="https://grok-proxy.acme.com/v1"
 ```
 
-### 3. Run `grok`
+### 3. Run `open-grok`
 
-The CLI discovers endpoints via `{issuer}/.well-known/openid-configuration`, opens the IdP login page, and stores tokens in `~/.grok/auth.json`. Tokens auto-refresh silently via the stored `refresh_token`.
+The CLI discovers endpoints via `{issuer}/.well-known/openid-configuration`, opens the IdP login page, and stores tokens in `~/.opengrok/auth.json`. Tokens auto-refresh silently via the stored `refresh_token`.
 
 ### Optional fields
 
@@ -171,7 +171,7 @@ Use JSON if your tokens expire and you want Grok to automatically re-run the bin
 Via config file:
 
 ```toml
-# ~/.grok/config.toml
+# ~/.opengrok/config.toml
 [auth]
 auth_provider_command = "/usr/local/bin/my-auth-provider"
 auth_provider_label = "Acme Corp"   # optional -- customizes the TUI login button
@@ -225,7 +225,7 @@ echo "{\"access_token\": \"$TOKEN\", \"expires_in\": 3600}"
 For headless environments (SSH sessions, Docker containers, remote VMs) where no browser is available locally:
 
 ```bash
-grok login --device-auth    # or: grok login --device-code
+open-grok login --device-auth    # or: open-grok login --device-code
 ```
 
 This prints a URL and code to the terminal. Open the URL on any device, enter the code, and complete authentication. Grok polls until the login is confirmed.
@@ -256,7 +256,7 @@ export GROK_AUTH_EARLY_INVALIDATION_SECS=0
 
 ## Hot Reload
 
-Grok picks up changes to `~/.grok/auth.json` automatically. If you update credentials externally (for example, with a script that writes new tokens), Grok uses the new credentials on the next API call without a restart.
+Grok picks up changes to `~/.opengrok/auth.json` automatically. If you update credentials externally (for example, with a script that writes new tokens), Grok uses the new credentials on the next API call without a restart.
 
 ---
 
@@ -265,7 +265,7 @@ Grok picks up changes to `~/.grok/auth.json` automatically. If you update creden
 Grok resolves credentials for each request in this order, highest to lowest:
 
 1. **Per-model `api_key` or `env_key`** -- set under `[model.<name>]` in `config.toml`. Wins whenever present.
-2. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.grok/auth.json`.
+2. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.opengrok/auth.json`.
 3. **`XAI_API_KEY`** -- fallback when no session token is active.
 
 When more than one login flow is configured, Grok populates the session token from the first available source, highest to lowest:
@@ -311,7 +311,7 @@ RUST_LOG=debug grok -p "hello" 2> /tmp/grok.log
 
 ### Common fixes
 
-- **"Authentication failed"** -- Run `grok logout` to clear cached credentials, then `grok login` to sign in again.
+- **"Authentication failed"** -- Run `open-grok logout` to clear cached credentials, then `open-grok login` to sign in again.
 - **Token expires too quickly** -- Set `auth_token_ttl` or return `expires_in` in your auth provider's JSON output.
 - **OIDC redirect fails** -- Ensure your IdP allows loopback redirect URIs (`http://127.0.0.1/callback`).
 - **External auth provider not found** -- Check that the `auth_provider_command` path is correct and the binary is executable.

@@ -1,8 +1,8 @@
-//! Hub [`AuthProvider`] from `~/.grok/auth.json` for the standalone
+//! Hub [`AuthProvider`] from `~/.opengrok/auth.json` for the standalone
 //! `workspace_server` binary: loopback `ws://` uses a plain bearer, otherwise
 //! an auto-refreshing OIDC provider that persists rotated tokens to disk.
 //!
-//! The in-leader `grok workspace` exposure does NOT use this path — it sources
+//! The in-leader `open-grok workspace` exposure does NOT use this path — it sources
 //! an in-memory provider from the leader's `AuthManager` (see
 //! `LeaderAuthProvider`) to avoid racing the leader's own auth.json writer.
 
@@ -74,7 +74,7 @@ struct AuthEntry {
 
 fn default_auth_path() -> anyhow::Result<PathBuf> {
     let grok = xai_grok_config::user_grok_home()
-        .ok_or_else(|| anyhow::anyhow!("no user grok home (set $GROK_HOME or $HOME)"))?;
+        .ok_or_else(|| anyhow::anyhow!("no user grok home (set $OPENGROK_HOME or $HOME)"))?;
     Ok(grok.join("auth.json"))
 }
 
@@ -83,7 +83,7 @@ fn default_auth_path() -> anyhow::Result<PathBuf> {
 fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
     if !path.exists() {
         anyhow::bail!(
-            "No auth credentials found at {}. Run `grok login` first.",
+            "No auth credentials found at {}. Run `open-grok login` first.",
             path.display()
         );
     }
@@ -98,7 +98,7 @@ fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
         .find(|(_, e)| e.refresh_token.is_some() && e.oidc_issuer.is_some())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no OIDC auth entry found in {}. Run `grok login` first.",
+                "no OIDC auth entry found in {}. Run `open-grok login` first.",
                 path.display()
             )
         })
@@ -207,7 +207,7 @@ fn write_json_atomic(path: &Path, value: &serde_json::Value) -> anyhow::Result<(
 }
 
 /// Build a hub auth provider for `hub_url`. `auth_config` overrides
-/// the default credential path (`~/.grok/auth.json`).
+/// the default credential path (`~/.opengrok/auth.json`).
 pub fn provider(
     hub_url: &Url,
     auth_config: Option<&Path>,

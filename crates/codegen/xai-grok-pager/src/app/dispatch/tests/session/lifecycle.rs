@@ -349,7 +349,7 @@ fn worktree_session_preserves_subdirectory_offset() {
         &mut app,
     );
     let id = AgentId(0);
-    let worktree_root = PathBuf::from("/home/user/.grok/worktrees/repo/pager-123");
+    let worktree_root = PathBuf::from("/home/user/.opengrok/worktrees/repo/pager-123");
     let session_cwd = worktree_root.join("crates/codegen/xai-grok-pager");
     let effects = dispatch(
         Action::TaskComplete(TaskResult::WorktreeSessionCreated {
@@ -924,13 +924,13 @@ fn finish_trust_resolves_and_replays_startup() {
     );
 }
 /// Accepting the trust question persists the grant to the store and resolves
-/// trust. GROK_HOME-isolated so the write hits a temp store, not the real one.
-#[serial_test::serial(GROK_HOME)]
+/// trust. OPENGROK_HOME-isolated so the write hits a temp store, not the real one.
+#[serial_test::serial(OPENGROK_HOME)]
 #[test]
 fn trust_folder_grants_and_resolves() {
     use xai_grok_workspace::trust::{TrustStore, workspace_key};
     let home = tempfile::tempdir().expect("home tempdir");
-    unsafe { std::env::set_var("GROK_HOME", home.path()) };
+    unsafe { std::env::set_var("OPENGROK_HOME", home.path()) };
     simulate_release_build();
     let repo = tempfile::tempdir().expect("repo tempdir");
     let workspace = workspace_key(repo.path());

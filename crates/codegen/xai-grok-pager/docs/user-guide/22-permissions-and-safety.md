@@ -98,7 +98,7 @@ disable_bypass_permissions_mode = true   # default: false. true = locked off.
 
 Do not use `permission_mode` for this; it is a user-switchable default, not a lock. The legacy `[ui] yolo = false` key in `requirements.toml` also disables the mode, for backward compatibility; in `config.toml` the same key remains a togglable preference.
 
-The user-level `~/.grok/requirements.toml` is under the user's control, so a developer can remove the lock by editing that file. For enforcement that users cannot override, deploy the setting in the root-owned system file `/etc/grok/requirements.toml`.
+The user-level `~/.opengrok/requirements.toml` is under the user's control, so a developer can remove the lock by editing that file. For enforcement that users cannot override, deploy the setting in the root-owned system file `/etc/opengrok/requirements.toml`.
 
 > **Note:** Grok honors the permission rules in Claude Code's `managed-settings.json`, but not its `disableBypassPermissionsMode` lock. To disable always-approve in Grok, use `requirements.toml` as shown above.
 
@@ -114,19 +114,19 @@ Permission rules can be global (all projects), project-scoped (one repository), 
 
 | Scope | File | Shared with teammates |
 |-------|------|-----------------------|
-| Global (all projects) | `~/.grok/config.toml` | No |
-| Project (committed) | `<project>/.grok/config.toml` | Yes (commit it) |
+| Global (all projects) | `~/.opengrok/config.toml` | No |
+| Project (committed) | `<project>/.opengrok/config.toml` | Yes (commit it) |
 | Project (personal) | `<project>/.claude/settings.local.json` | No (gitignore it) |
 | Interactive grants | Stored internally by Grok, per project | No |
 
 Notes on scoping:
 
-- Grok discovers a `.grok/config.toml` at every directory level from the repository root down to your working directory, so a subdirectory can add rules on top of the repo root's.
+- Grok discovers a `.opengrok/config.toml` at every directory level from the repository root down to your working directory, so a subdirectory can add rules on top of the repo root's.
 - Rules from all scopes are merged into one rule set; `deny` > `ask` > `allow` applies across scopes, so a global `deny` cannot be overridden by a project `allow`.
 - Grok has no native `config.local.toml`. For personal, uncommitted rules in a project, use `.claude/settings.local.json`; Grok reads it directly (see [Claude Code Compatibility](#3-claude-code-compatibility-claudesettingsjson)).
 - Interactive "Always allow" decisions are stored outside the repository, scoped to the project (see [Interactive Approvals](#interactive-approvals-and-where-they-persist)).
 
-To stop prompts for a specific command in one project, add a narrow allow rule to that project's `.grok/config.toml` (or `.claude/settings.json`):
+To stop prompts for a specific command in one project, add a narrow allow rule to that project's `.opengrok/config.toml` (or `.claude/settings.json`):
 
 ```toml
 [permission]
@@ -138,7 +138,7 @@ This approves only the listed commands. Always-approve mode, by contrast, approv
 ### 1. CLI Flags
 
 ```bash
-grok -p "Review the API changes" \
+open-grok -p "Review the API changes" \
   --allow 'Bash(git *)' \
   --allow 'Bash(gh *)' \
   --allow 'Read' \
@@ -159,7 +159,7 @@ Rule syntax examples:
 
 See [Rule Matching Reference](#rule-matching-reference) for the exact matching semantics, including how chained commands and wildcards are evaluated.
 
-### 2. Native Configuration (`~/.grok/config.toml` and `.grok/config.toml`)
+### 2. Native Configuration (`~/.opengrok/config.toml` and `.opengrok/config.toml`)
 
 ```toml
 [permission]
@@ -177,9 +177,9 @@ The structured `tool` field accepts the lowercase names `bash`, `read`, `edit`, 
 
 Because `deny` always wins, you cannot combine these `allow` rules with a catch-all `deny` on `bash` to mean "only allow git/gh"; a `deny tool = "bash"` rule would block `git` and `gh` too. For deny-by-default, use `defaultMode: "dontAsk"` in `.claude/settings.json` or a `PreToolUse` hook (below).
 
-Rules from the global `~/.grok/config.toml` and every project `.grok/config.toml` (from the repo root down to your working directory) are merged into one rule set, alongside any `.claude/settings.json` rules.
+Rules from the global `~/.opengrok/config.toml` and every project `.opengrok/config.toml` (from the repo root down to your working directory) are merged into one rule set, alongside any `.claude/settings.json` rules.
 
-Managed configuration deployed by your organization also contributes `[permission]` rules: the system `/etc/grok/managed_config.toml`, and a user-level copy that Grok maintains automatically at `~/.grok/managed_config.toml`. Managed rules merge like rules from any other source, with two properties specific to managed `allow` rules: your own `deny` and `ask` rules win over a managed `allow` (severity ordering), and a catch-all managed `allow` is ignored when always-approve is locked off. For rules that users cannot edit away, use the root-owned system `/etc/grok/requirements.toml`.
+Managed configuration deployed by your organization also contributes `[permission]` rules: the system `/etc/opengrok/managed_config.toml`, and a user-level copy that Grok maintains automatically at `~/.opengrok/managed_config.toml`. Managed rules merge like rules from any other source, with two properties specific to managed `allow` rules: your own `deny` and `ask` rules win over a managed `allow` (severity ordering), and a catch-all managed `allow` is ignored when always-approve is locked off. For rules that users cannot edit away, use the root-owned system `/etc/opengrok/requirements.toml`.
 
 Permission rules from every source are read once, when a session starts. Changes apply to the next session.
 
@@ -202,7 +202,7 @@ allow = [
 
 ### 3. Claude Code Compatibility (`.claude/settings.json`)
 
-Grok reads `~/.claude/settings.json` and `~/.claude/settings.local.json`, plus the project-level `<project>/.claude/settings.json` and `settings.local.json` (walking up to the repo root). The native `.grok` source for permission rules is `config.toml`, described in the section above.
+Grok reads `~/.claude/settings.json` and `~/.claude/settings.local.json`, plus the project-level `<project>/.claude/settings.json` and `settings.local.json` (walking up to the repo root). The native `.opengrok` source for permission rules is `config.toml`, described in the section above.
 
 Example:
 
@@ -310,7 +310,7 @@ When a tool call requires approval, the permission prompt offers these choices:
 A narrower set of options remembers just the specific command, MCP tool, or web-fetch domain being prompted, for example "Always allow `cargo test`". These rows are off by default. Enable them with:
 
 ```toml
-# ~/.grok/config.toml
+# ~/.opengrok/config.toml
 [ui]
 remember_tool_approvals = true
 ```
@@ -327,7 +327,7 @@ The remembered prefix is limited to a short form of the command: read-only comma
 
 Interactive grants are stored in Grok's own state directory under your home directory, scoped to the directory you launched Grok from. A grant made in one project never applies in another, grants are not written into the repository, and they are not meant to be hand-edited.
 
-Interactive grants are personal, per-machine state. For an allowlist you can review in code review and share with teammates, use declarative rules in the project's `.grok/config.toml` instead.
+Interactive grants are personal, per-machine state. For an allowlist you can review in code review and share with teammates, use declarative rules in the project's `.opengrok/config.toml` instead.
 
 ---
 
@@ -339,7 +339,7 @@ A `PreToolUse` hook can enforce an allow list on the `Bash` tool that applies in
 
 ### Example: Allow Only `git` and `gh`
 
-**`~/.grok/hooks/git-gh-only.json`**
+**`~/.opengrok/hooks/git-gh-only.json`**
 
 ```json
 {
@@ -360,7 +360,7 @@ A `PreToolUse` hook can enforce an allow list on the `Bash` tool that applies in
 }
 ```
 
-**`~/.grok/hooks/git-gh-only.sh`**
+**`~/.opengrok/hooks/git-gh-only.sh`**
 
 ```bash
 #!/bin/sh
@@ -397,7 +397,7 @@ done
 ```
 
 ```bash
-chmod +x ~/.grok/hooks/git-gh-only.sh
+chmod +x ~/.opengrok/hooks/git-gh-only.sh
 ```
 
 This hook denies every `Bash` command unless each chained segment starts with `git` or `gh`, and rejects command substitution, backgrounding, and redirection outright because it cannot verify what they execute. It works in every permission mode.
@@ -411,7 +411,7 @@ For hook installation, the JSON format, the trust model for project hooks, and o
 ### Headless git and gh Only (CI and Automation)
 
 ```bash
-grok -p "Implement the feature using only git and GitHub CLI" \
+open-grok -p "Implement the feature using only git and GitHub CLI" \
   --allow 'Read' \
   --allow 'Grep' \
   --allow 'Bash(git *)' \
@@ -423,7 +423,7 @@ Install the `git-gh-only` hook above to deny every other `Bash` command. For den
 ### Read-Only Code Reviewer
 
 ```toml
-# .grok/config.toml
+# .opengrok/config.toml
 [permission]
 rules = [
   { action = "allow", tool = "read" },
@@ -464,7 +464,7 @@ Recommended combination for untrusted code:
 
 1. **Prefer narrow patterns.** `Bash(git *)` grants less access than a bare `Bash` allow rule.
 2. **Combine layers.** `dontAsk`, narrow allow rules, a restrictive hook, and the sandbox each restrict independently.
-3. **Review project configuration from unfamiliar sources.** Project permission rules in `.grok/config.toml` and `.claude/settings.json`, including `allow` rules, apply without a separate trust prompt. Review them, and any project hooks, before working in an unfamiliar checkout (see the security notes in [10-hooks.md](10-hooks.md)).
+3. **Review project configuration from unfamiliar sources.** Project permission rules in `.opengrok/config.toml` and `.claude/settings.json`, including `allow` rules, apply without a separate trust prompt. Review them, and any project hooks, before working in an unfamiliar checkout (see the security notes in [10-hooks.md](10-hooks.md)).
 4. **Test your policy.** With `defaultMode: "dontAsk"` set (or your `PreToolUse` hook installed), run representative commands and confirm what is blocked.
 5. **Treat the read-only command list as a convenience, not a security boundary.**
 

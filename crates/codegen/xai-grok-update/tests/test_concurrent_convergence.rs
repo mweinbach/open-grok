@@ -7,9 +7,9 @@
 //! Production has three independent downloader paths that can race around a
 //! release:
 //!
-//! 1. TUI startup: `check_update_background` spawns a detached `grok update`
+//! 1. TUI startup: `check_update_background` spawns a detached `open-grok update`
 //!    (the Ctrl+U path now adopts this child instead of spawning a second).
-//! 2. Explicit `grok update` (incl. the Ctrl+U fallback when there is no
+//! 2. Explicit `open-grok update` (incl. the Ctrl+U fallback when there is no
 //!    live child).
 //! 3. Leader mode: the hourly checker runs `ensure_latest_on_disk`
 //!    in-process.
@@ -45,18 +45,18 @@ use common::{
 use xai_grok_update::auto_update::{ensure_latest_on_disk, install_internal_from_base, run_update};
 use xai_grok_update::version::installed_on_disk_version;
 
-/// Assert the active `~/.grok/bin/grok` resolves to the expected versioned
+/// Assert the active `~/.opengrok/bin/open-grok` resolves to the expected versioned
 /// binary, actually runs, and has exactly the expected content (the content
 /// check is what catches a cross-racer temp-file corruption).
 fn assert_active_binary(home: &Path, version: &str, platform: &str, expected_content: &[u8]) {
-    let link = home.join("bin").join("grok");
-    assert!(link.is_symlink(), "grok must be a symlink");
+    let link = home.join("bin").join("open-grok");
+    assert!(link.is_symlink(), "open-grok must be a symlink");
     let resolved = dunce::canonicalize(&link)
-        .unwrap_or_else(|e| panic!("active grok symlink does not resolve: {e}"));
+        .unwrap_or_else(|e| panic!("active open-grok symlink does not resolve: {e}"));
     assert_eq!(
         resolved.file_name().unwrap().to_string_lossy(),
         format!("grok-{version}-{platform}"),
-        "active grok must be the expected version"
+        "active open-grok must be the expected version"
     );
     assert_eq!(
         std::fs::read(&resolved).unwrap(),
@@ -72,11 +72,11 @@ fn assert_active_binary(home: &Path, version: &str, platform: &str, expected_con
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    assert!(ran_ok, "active grok must pass the smoke-test");
+    assert!(ran_ok, "active open-grok must pass the smoke-test");
 }
 
-/// Lay down a managed-install layout in the test GROK_HOME:
-/// `bin/grok -> ../downloads/grok-<version>-<platform>` (what
+/// Lay down a managed-install layout in the test OPENGROK_HOME:
+/// `bin/open-grok -> ../downloads/grok-<version>-<platform>` (what
 /// `install_internal_from_base` produces).
 fn fake_managed_install(version: &str) {
     let home = test_home();
@@ -93,7 +93,7 @@ fn fake_managed_install(version: &str) {
     .unwrap();
     std::os::unix::fs::symlink(
         std::path::Path::new("../downloads").join(&name),
-        bin.join("grok"),
+        bin.join("open-grok"),
     )
     .unwrap();
 }
@@ -185,7 +185,7 @@ async fn ensure_latest_downloads_once_then_converges_without_redownload() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Convergence: explicit `grok update` (the Ctrl+U fallback path) finds the
+// Convergence: explicit `open-grok update` (the Ctrl+U fallback path) finds the
 // binary another process already installed and skips the download — while
 // still returning the target version so stale leaders get signalled.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -242,7 +242,7 @@ async fn run_update_force_still_redownloads_when_disk_current() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Installer gating: the disk-version probe must only be trusted for
-// installers that actually maintain the managed `~/.grok/bin/grok` symlink
+// installers that actually maintain the managed `~/.opengrok/bin/open-grok` symlink
 // (internal, gh-release). For npm, a symlink left over from a previous
 // internal install LIES about the npm install's version — and in the worst
 // direction (leftover "newer" than the registry) it would silently suppress
@@ -335,7 +335,7 @@ async fn disk_probe_preserves_prerelease_versions() {
 #[serial]
 async fn disk_probe_rejects_dangling_symlink() {
     // If the symlink survives but its target binary was deleted (manual
-    // ~/.grok/downloads cleanup), the probe must report None — otherwise
+    // ~/.opengrok/downloads cleanup), the probe must report None — otherwise
     // every updater would claim "already up to date" forever while no
     // runnable binary exists, and nothing would ever repair the install.
     let home = test_home();
@@ -485,7 +485,7 @@ async fn concurrent_different_version_installs_do_not_corrupt_each_other() {
 
     // The active symlink points at whichever racer swapped last; it must
     // resolve and run regardless.
-    let resolved = dunce::canonicalize(home.join("bin").join("grok")).unwrap();
+    let resolved = dunce::canonicalize(home.join("bin").join("open-grok")).unwrap();
     assert_eq!(std::fs::read(&resolved).unwrap(), artifact);
     let name = resolved.file_name().unwrap().to_string_lossy().to_string();
     assert!(

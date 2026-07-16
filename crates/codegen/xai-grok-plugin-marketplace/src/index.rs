@@ -1,7 +1,7 @@
 //! Parse repo-level marketplace index.
 //!
-//! Catalog file lookup, in order: `.grok-plugin/marketplace.json` (preferred),
-//! `.grok-plugin/plugin.json`, `.claude-plugin/marketplace.json`,
+//! Catalog file lookup, in order: `.opengrok-plugin/marketplace.json` (preferred),
+//! `.opengrok-plugin/plugin.json`, `.claude-plugin/marketplace.json`,
 //! `.claude-plugin/plugin.json` (alternate layout compatibility).
 //!
 //! When present, an index is the preferred browse source — faster than
@@ -211,15 +211,15 @@ impl IndexEntry {
 /// Attempt to load the marketplace index from the given root directory.
 ///
 /// Checks (in order):
-/// 1. `.grok-plugin/marketplace.json` (preferred xAI convention)
-/// 2. `.grok-plugin/plugin.json`
+/// 1. `.opengrok-plugin/marketplace.json` (preferred xAI convention)
+/// 2. `.opengrok-plugin/plugin.json`
 /// 3. `.claude-plugin/marketplace.json` (alternate layout compatibility)
 /// 4. `.claude-plugin/plugin.json`
 ///
 /// Returns `None` if no file exists. Returns `Err` if a file exists
 /// but can't be parsed.
 pub fn load_index(marketplace_root: &Path) -> Result<Option<MarketplaceIndex>, String> {
-    let grok_dir = marketplace_root.join(".grok-plugin");
+    let grok_dir = marketplace_root.join(".opengrok-plugin");
     let claude_dir = marketplace_root.join(".claude-plugin");
     let candidates = [
         grok_dir.join("marketplace.json"),
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn load_index_valid_grok_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let grok_dir = dir.path().join(".grok-plugin");
+        let grok_dir = dir.path().join(".opengrok-plugin");
         std::fs::create_dir_all(&grok_dir).unwrap();
         std::fs::write(
             grok_dir.join("marketplace.json"),
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn load_index_grok_dir_takes_precedence_over_claude_dir() {
         let dir = tempfile::tempdir().unwrap();
-        for (sub, name) in [(".grok-plugin", "grok"), (".claude-plugin", "claude")] {
+        for (sub, name) in [(".opengrok-plugin", "grok"), (".claude-plugin", "claude")] {
             let d = dir.path().join(sub);
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(

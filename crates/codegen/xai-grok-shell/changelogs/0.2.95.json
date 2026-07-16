@@ -21,7 +21,7 @@
   },
   {
     "category": "fixes",
-    "description": "**File links and media** now work for worktree sessions under ~/.grok/worktrees/.",
+    "description": "**File links and media** now work for worktree sessions under ~/.opengrok/worktrees/.",
     "breaking_change": false
   },
   {

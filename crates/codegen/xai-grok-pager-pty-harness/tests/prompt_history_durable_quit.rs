@@ -225,9 +225,9 @@ fn assert_prompt_durable(home: &Path, canary: &str) -> Result<()> {
     Ok(())
 }
 
-/// The per-CWD history file lives at `<home>/.grok/sessions/<enc-cwd>/prompt_history.jsonl`.
+/// The per-CWD history file lives at `<home>/.opengrok/sessions/<enc-cwd>/prompt_history.jsonl`.
 fn find_prompt_history(home: &Path) -> Result<PathBuf> {
-    let root = home.join(".grok").join("sessions");
+    let root = home.join(".opengrok").join("sessions");
     for cwd_ent in std::fs::read_dir(&root).with_context(|| format!("read {}", root.display()))? {
         let cwd_ent = cwd_ent?;
         if !cwd_ent.file_type()?.is_dir() {

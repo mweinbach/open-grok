@@ -104,7 +104,7 @@ const FILE_REGEX: &str = r"^(?:file://)?([^#]+)(?:#L(\d+)-L?(\d+))?$";
 /// Parses URIs in the format: `file://[path]#L[start]-[end]` or `file://[path]#L[start]-L[end]`
 ///
 /// When content exceeds [`MAX_FILE_TOKENS`], the text is written to
-/// `~/.grok/sessions/{cwd}/{session_id}/pasted/` so the model can `read_file`
+/// `~/.opengrok/sessions/{cwd}/{session_id}/pasted/` so the model can `read_file`
 /// specific sections instead of receiving the full content inline.
 ///
 /// Binary blob resources are written to `attachments/` and a path hint is returned.

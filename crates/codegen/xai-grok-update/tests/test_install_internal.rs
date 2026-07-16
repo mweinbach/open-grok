@@ -1,13 +1,13 @@
 //! End-to-end tests for `install_internal` — the GCS-bucket installer used
 //! when `installer = "internal"` is configured.
 //!
-//! Wires together a wiremock-mocked GCS bucket + an isolated `GROK_HOME`
+//! Wires together a wiremock-mocked GCS bucket + an isolated `OPENGROK_HOME`
 //! tempdir so we can verify the full install pipeline:
 //!   fetch version → download grok binary → chmod → atomic symlink →
 //!   cleanup_old_downloads → persist installer config.
 //!
 //! The function reads `grok_home()` (a process-wide `OnceLock`), so all
-//! tests in this binary share a single `GROK_HOME` and run serially via
+//! tests in this binary share a single `OPENGROK_HOME` and run serially via
 //! `#[serial]`.
 
 #![cfg(unix)]
@@ -96,33 +96,35 @@ async fn install_internal_pinned_version_writes_binary_and_symlink() {
     assert!(downloaded.exists(), "binary downloaded: {downloaded:?}");
     assert_eq!(std::fs::read(&downloaded).unwrap(), b"#!/bin/sh\nexit 0\n");
 
-    let symlink = home.join("bin").join("grok");
-    assert!(symlink.is_symlink(), "grok symlink created");
+    let symlink = home.join("bin").join("open-grok");
+    assert!(symlink.is_symlink(), "open-grok symlink created");
     let target = std::fs::read_link(&symlink).unwrap();
     assert_eq!(
         target.file_name().unwrap(),
         format!("grok-0.1.181-{platform}").as_str()
     );
 
-    // `grok` and `agent` move together — see `swap_managed_bin_links`.
-    let agent_link = home.join("bin").join("agent");
-    assert!(agent_link.is_symlink(), "agent symlink created");
-    let agent_target = std::fs::read_link(&agent_link).unwrap();
-    assert_eq!(agent_target, target, "agent and grok point at same target");
+    assert!(
+        !home.join("bin").join("grok").exists(),
+        "upstream grok alias must stay untouched"
+    );
+    assert!(
+        !home.join("bin").join("agent").exists(),
+        "legacy agent alias must stay untouched"
+    );
 }
 
-/// Regression: pre-existing `agent` symlink from a prior install must be
-/// swapped to the new version, not left stale (the original bug).
+/// A prior managed Open Grok link must advance to the downloaded version.
 #[tokio::test]
 #[serial]
-async fn install_internal_updates_stale_agent_symlink_to_new_version() {
+async fn install_internal_updates_stale_open_grok_symlink_to_new_version() {
     let _ = test_home();
     reset_home();
     let platform = host_platform();
     let server = mount_gcs("0.1.181", &platform).await;
     let cfg = make_config("stable");
 
-    // Prior install: both links point at an older versioned binary.
+    // Prior install: the namespaced link points at an older versioned binary.
     let home = test_home();
     let bin_dir = home.join("bin");
     let download_dir = home.join("downloads");
@@ -133,27 +135,26 @@ async fn install_internal_updates_stale_agent_symlink_to_new_version() {
     let rel_old = std::path::Path::new("..")
         .join("downloads")
         .join(format!("grok-0.1.180-{platform}"));
-    std::os::unix::fs::symlink(&rel_old, bin_dir.join("grok")).unwrap();
-    std::os::unix::fs::symlink(&rel_old, bin_dir.join("agent")).unwrap();
+    std::os::unix::fs::symlink(&rel_old, bin_dir.join("open-grok")).unwrap();
 
     install_internal_from_base(Some("0.1.181"), &cfg, &server.uri())
         .await
         .unwrap();
 
-    let agent_link = bin_dir.join("agent");
-    let agent_target = std::fs::read_link(&agent_link).unwrap();
+    let open_grok_link = bin_dir.join("open-grok");
+    let open_grok_target = std::fs::read_link(&open_grok_link).unwrap();
     assert_eq!(
-        agent_target.file_name().unwrap(),
+        open_grok_target.file_name().unwrap(),
         format!("grok-0.1.181-{platform}").as_str(),
-        "agent symlink must swap to the new version, not stay on old"
+        "open-grok symlink must swap to the new version, not stay on old"
     );
 }
 
-/// Rollback regression: if `agent` swap fails after `grok` succeeded,
-/// `grok` must roll back to its prior target (all-or-nothing).
+/// A conflicting directory at the managed path must fail closed without
+/// modifying that directory or creating the upstream aliases.
 #[tokio::test]
 #[serial]
-async fn install_internal_rolls_back_grok_when_agent_swap_fails() {
+async fn install_internal_preserves_conflicting_open_grok_directory() {
     let _ = test_home();
     reset_home();
     let platform = host_platform();
@@ -162,69 +163,24 @@ async fn install_internal_rolls_back_grok_when_agent_swap_fails() {
 
     let home = test_home();
     let bin_dir = home.join("bin");
-    let download_dir = home.join("downloads");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    std::fs::create_dir_all(&download_dir).unwrap();
-    let old_binary = download_dir.join(format!("grok-0.1.180-{platform}"));
-    std::fs::write(&old_binary, b"#!/bin/sh\nexit 0\n").unwrap();
-    let rel_old = std::path::Path::new("..")
-        .join("downloads")
-        .join(format!("grok-0.1.180-{platform}"));
-    std::os::unix::fs::symlink(&rel_old, bin_dir.join("grok")).unwrap();
-
-    // Sabotage the agent swap: non-empty directory → rename fails with EISDIR.
-    let agent_dir = bin_dir.join("agent");
-    std::fs::create_dir(&agent_dir).unwrap();
-    std::fs::write(agent_dir.join("blocker"), b"x").unwrap();
+    let open_grok_dir = bin_dir.join("open-grok");
+    std::fs::create_dir(&open_grok_dir).unwrap();
+    std::fs::write(open_grok_dir.join("blocker"), b"x").unwrap();
 
     let err = install_internal_from_base(Some("0.1.181"), &cfg, &server.uri())
         .await
-        .expect_err("agent swap must fail when target is a non-empty dir");
+        .expect_err("open-grok swap must fail when target is a non-empty dir");
     drop(err);
 
-    // grok must be rolled back to the prior version.
-    let grok_target = std::fs::read_link(bin_dir.join("grok")).unwrap();
     assert_eq!(
-        grok_target.file_name().unwrap(),
-        format!("grok-0.1.180-{platform}").as_str(),
-        "grok must be rolled back when agent swap fails"
+        std::fs::read(open_grok_dir.join("blocker")).unwrap(),
+        b"x",
+        "conflicting directory must be preserved"
     );
-}
-
-/// Absent-prior rollback regression: fresh install (no prior `grok` /
-/// `agent`), sabotaged `agent` swap must *remove* the just-created `grok`
-/// link so we don't leave it on the new binary while `agent` is absent.
-#[tokio::test]
-#[serial]
-async fn install_internal_rollback_removes_absent_prior_grok_link() {
-    let _ = test_home();
-    reset_home();
-    let platform = host_platform();
-    let server = mount_gcs("0.1.181", &platform).await;
-    let cfg = make_config("stable");
-
-    let home = test_home();
-    let bin_dir = home.join("bin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-
-    // No prior `grok`. Sabotage `agent` swap: non-empty directory → EISDIR.
-    let agent_dir = bin_dir.join("agent");
-    std::fs::create_dir(&agent_dir).unwrap();
-    std::fs::write(agent_dir.join("blocker"), b"x").unwrap();
     assert!(
-        !bin_dir.join("grok").exists() && !bin_dir.join("grok").is_symlink(),
-        "precondition: grok must not exist before install",
-    );
-
-    let err = install_internal_from_base(Some("0.1.181"), &cfg, &server.uri())
-        .await
-        .expect_err("agent swap must fail when target is a non-empty dir");
-    drop(err);
-
-    let grok_path = bin_dir.join("grok");
-    assert!(
-        !grok_path.is_symlink() && !grok_path.exists(),
-        "grok must be removed on rollback when there was no prior link",
+        !bin_dir.join("grok").exists() && !bin_dir.join("agent").exists(),
+        "failed install must not create upstream aliases"
     );
 }
 
@@ -254,7 +210,7 @@ async fn install_internal_chmods_binary_executable() {
 #[serial]
 async fn install_internal_cleans_up_stale_pager_symlink() {
     // Old installations shipped a separate grok-pager binary. Verify the
-    // update removes the stale symlink from ~/.grok/bin/.
+    // update removes the stale symlink from ~/.opengrok/bin/.
     let _ = test_home();
     reset_home();
     let platform = host_platform();
@@ -451,7 +407,7 @@ async fn install_internal_cleans_up_old_versions_keeping_n_minus_one() {
     );
 
     // Symlink updated to latest.
-    let target = std::fs::read_link(home.join("bin").join("grok")).unwrap();
+    let target = std::fs::read_link(home.join("bin").join("open-grok")).unwrap();
     assert!(
         target
             .file_name()
@@ -494,7 +450,7 @@ async fn install_internal_idempotent_for_same_version() {
     .unwrap();
 
     assert_eq!(first, second);
-    let target = std::fs::read_link(test_home().join("bin").join("grok")).unwrap();
+    let target = std::fs::read_link(test_home().join("bin").join("open-grok")).unwrap();
     assert!(target.to_string_lossy().contains("0.1.181"));
 }
 
@@ -623,7 +579,7 @@ async fn install_internal_from_bases_propagates_last_error_when_all_fail() {
 }
 
 /// Regression: a local failure after a successful download (sabotaged
-/// `agent` swap) must fail the install immediately — the fallback base must
+/// `open-grok` swap) must fail the install immediately — the fallback base must
 /// never be contacted for a pointless re-download.
 #[tokio::test]
 #[serial]
@@ -639,11 +595,11 @@ async fn install_internal_from_bases_does_not_redownload_on_local_swap_failure()
     let home = test_home();
     let bin_dir = home.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    // Sabotage activation: agent as a non-empty dir fails the swap's
+    // Sabotage activation: open-grok as a non-empty dir fails the swap's
     // rollback capture (read_link on a directory) before any rename.
-    let agent_dir = bin_dir.join("agent");
-    std::fs::create_dir(&agent_dir).unwrap();
-    std::fs::write(agent_dir.join("blocker"), b"x").unwrap();
+    let open_grok_dir = bin_dir.join("open-grok");
+    std::fs::create_dir(&open_grok_dir).unwrap();
+    std::fs::write(open_grok_dir.join("blocker"), b"x").unwrap();
 
     install_internal_from_bases(
         Some("0.1.181"),

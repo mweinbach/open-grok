@@ -89,7 +89,7 @@ fn main() {
     let _ = std::fs::remove_file(&test_file);
 
     // Test 5: Write to /tmp (should work for workspace/strict, blocked for read-only)
-    let tmp_test = Path::new("/tmp/.grok-sandbox-test");
+    let tmp_test = Path::new("/tmp/.opengrok-sandbox-test");
     test_write("Write to /tmp", tmp_test);
     let _ = std::fs::remove_file(tmp_test);
 

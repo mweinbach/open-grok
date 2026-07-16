@@ -585,7 +585,7 @@ pub struct AppView {
     pub scroll_state: MouseScrollState,
     /// Scroll config derived from terminal detection.
     pub scroll_config: ScrollConfig,
-    /// Current appearance config (hot-reloadable from ~/.grok/pager.toml).
+    /// Current appearance config (hot-reloadable from ~/.opengrok/pager.toml).
     /// Stored here so new agents inherit the current config.
     pub appearance: AppearanceConfig,
     /// Notification service (terminal bell, OSC sequences, title updates).
@@ -653,7 +653,7 @@ pub struct AppView {
     /// dashboard); deny wins over all other visibility gates.
     pub tier_restricted_commands: Vec<String>,
     /// Whether the pager is connected via a leader (leader mode). The Agent
-    /// Dashboard entry points (`/dashboard`, `Ctrl+\`, `grok dashboard`, the
+    /// Dashboard entry points (`/dashboard`, `Ctrl+\`, `open-grok dashboard`, the
     /// startup hook) are only meaningful when a leader is coordinating a
     /// fleet of sessions, so they are gated on this flag. Set in
     /// `event_loop::run` from `connection.leader_status_rx.is_some()`;
@@ -1045,7 +1045,7 @@ pub struct AppView {
     pub dashboard: Option<crate::views::dashboard::DashboardState>,
     /// Persisted dashboard configuration (pinned rows, reorderings,
     /// grouping). Loaded once on startup from
-    /// `~/.grok/config.toml`. `None` when the file/section is absent
+    /// `~/.opengrok/config.toml`. `None` when the file/section is absent
     /// or contained malformed data — falls back to in-memory defaults.
     pub dashboard_persisted: Option<crate::views::dashboard::PersistedDashboard>,
     /// Per-platform key event normalizer.
