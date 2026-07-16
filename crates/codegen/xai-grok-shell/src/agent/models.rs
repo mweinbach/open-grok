@@ -3381,6 +3381,7 @@ mod tests {
             api_key: None,
             env_key: None,
             api_backend: Default::default(),
+            provider: Default::default(),
             tool_mode: None,
             context_window: std::num::NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,

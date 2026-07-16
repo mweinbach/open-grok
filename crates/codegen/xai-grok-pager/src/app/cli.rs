@@ -16,7 +16,14 @@ pub enum Command {
         json: bool,
     },
     /// Sign out and clear cached credentials
-    Logout,
+    Logout {
+        /// Sign out of the separate OpenAI Codex account instead of xAI.
+        #[arg(long, conflicts_with = "all")]
+        codex: bool,
+        /// Sign out of both xAI and OpenAI Codex.
+        #[arg(long, conflicts_with = "codex")]
+        all: bool,
+    },
     /// Sign in to Grok
     Login {
         /// Ignored (kept for backwards compatibility). OAuth2 is now the only auth method.
@@ -25,6 +32,9 @@ pub enum Command {
         /// Use Grok OAuth via auth.x.ai.
         #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth"])]
         oauth: bool,
+        /// Sign in to the separate OpenAI Codex account with ChatGPT OAuth.
+        #[arg(long, conflicts_with = "oauth")]
+        codex: bool,
         /// Use device-code authentication for headless/remote environments.
         #[arg(
             long = "device-auth",
@@ -1107,8 +1117,37 @@ mod tests {
     #[test]
     fn subcommand_takes_precedence_over_positional_prompt() {
         let args = PagerArgs::try_parse_from(["grok", "logout"]).expect("subcommand parses");
-        assert!(matches!(args.command, Some(Command::Logout)));
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout {
+                codex: false,
+                all: false
+            })
+        ));
         assert!(args.prompt.is_none());
+    }
+    #[test]
+    fn codex_account_flags_parse_without_changing_bare_xai_behavior() {
+        let login = PagerArgs::try_parse_from(["grok", "login", "--codex", "--device-auth"])
+            .expect("Codex device login parses");
+        assert!(matches!(
+            login.command,
+            Some(Command::Login {
+                codex: true,
+                device_auth: true,
+                oauth: false,
+                ..
+            })
+        ));
+        let logout = PagerArgs::try_parse_from(["grok", "logout", "--codex"])
+            .expect("Codex logout parses");
+        assert!(matches!(
+            logout.command,
+            Some(Command::Logout {
+                codex: true,
+                all: false
+            })
+        ));
     }
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {

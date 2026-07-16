@@ -1097,7 +1097,8 @@ impl MvpAgent {
             model,
             session.as_ref().map(|a| a.key.as_str()),
         );
-        if matches!(preferred, Some(crate ::auth::PreferredAuthMethod::Oidc))
+        if model.info().provider != xai_grok_sampling_types::ModelProvider::Codex
+            && matches!(preferred, Some(crate ::auth::PreferredAuthMethod::Oidc))
             && !model.has_own_credentials()
             && credentials.auth_type == xai_chat_state::AuthType::ApiKey
         {
@@ -1109,7 +1110,8 @@ impl MvpAgent {
             self.cfg.borrow().grok_com_config.api_key_auth_disabled(),
             session.as_ref().map(|a| a.key.as_str()),
         );
-        if !has_session_key && credentials.auth_type == xai_chat_state::AuthType::ApiKey
+        if model.info().provider != xai_grok_sampling_types::ModelProvider::Codex
+            && !has_session_key && credentials.auth_type == xai_chat_state::AuthType::ApiKey
             && !model.has_own_credentials() && self.is_session_based_auth()
         {
             tracing::info!(
@@ -1123,7 +1125,9 @@ impl MvpAgent {
             );
             credentials.auth_type = xai_chat_state::AuthType::SessionToken;
         }
-        if !has_session_key && !model.has_own_credentials() {
+        if model.info().provider != xai_grok_sampling_types::ModelProvider::Codex
+            && !has_session_key && !model.has_own_credentials()
+        {
             tracing::warn!(
                 model = model.info().model.as_str(), is_expired = self.auth_manager
                 .is_expired(), auth_type = ? credentials.auth_type,

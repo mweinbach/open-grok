@@ -11,7 +11,7 @@ use std::sync::Arc;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_sampler::{AuthScheme, SamplerConfig};
 use xai_grok_sampling_types::{
-    CompactionAtTokens, CompactionsRemaining, REASONING_EFFORT_META_KEY,
+    CompactionAtTokens, CompactionsRemaining, ModelProvider, REASONING_EFFORT_META_KEY,
     REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption, ToolMode,
     reasoning_effort_meta_value, reasoning_efforts_meta_value,
 };
@@ -3351,6 +3351,8 @@ struct DefaultModelJson {
     top_p: Option<f32>,
     max_completion_tokens: Option<u32>,
     api_backend: ApiBackend,
+    #[serde(default)]
+    provider: ModelProvider,
     /// Model-selected tool presentation. `None` keeps the direct-tool default.
     tool_mode: Option<ToolMode>,
     #[serde(default = "default_agent_type")]
@@ -3413,6 +3415,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 top_p: m.top_p,
                 max_completion_tokens: m.max_completion_tokens,
                 api_backend: m.api_backend,
+                provider: m.provider,
                 tool_mode: m.tool_mode,
                 auth_scheme: None,
                 agent_type: m.agent_type,
@@ -3472,6 +3475,10 @@ pub struct ModelEntryConfig {
     /// Values: "chat_completions" (default), "responses"
     #[serde(default)]
     pub api_backend: ApiBackend,
+    /// First-party provider contract. `codex` selects the isolated ChatGPT
+    /// OAuth account and OpenAI hosted-tool dialect.
+    #[serde(default, skip_serializing_if = "is_default_model_provider")]
+    pub provider: ModelProvider,
     /// Model-selected tool presentation. Model metadata takes precedence over
     /// the user Code Mode preference, matching the Codex model catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3591,6 +3598,7 @@ pub struct ConfigModelOverride {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: Option<ApiBackend>,
+    pub provider: Option<ModelProvider>,
     pub tool_mode: Option<ToolMode>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
@@ -3654,6 +3662,9 @@ impl ConfigModelOverride {
         }
         if let Some(ref v) = self.api_backend {
             entry.info.api_backend = v.clone();
+        }
+        if let Some(v) = self.provider {
+            entry.info.provider = v;
         }
         if let Some(v) = self.tool_mode {
             entry.info.tool_mode = Some(v);
@@ -3745,6 +3756,8 @@ pub struct ModelInfo {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: ApiBackend,
+    #[serde(default)]
+    pub provider: ModelProvider,
     /// Model-selected tool presentation. `None` lets the session preference
     /// decide; `Some` is authoritative for compatibility-sensitive models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3814,6 +3827,7 @@ impl ModelInfo {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::default(),
+            provider: ModelProvider::default(),
             tool_mode: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
@@ -3850,6 +3864,7 @@ impl ModelInfo {
             temperature: entry.temperature,
             top_p: entry.top_p,
             api_backend: entry.api_backend.clone(),
+            provider: entry.provider,
             tool_mode: entry.tool_mode,
             auth_scheme: entry.auth_scheme.unwrap_or_default(),
             extra_headers: entry.extra_headers.clone(),
@@ -3958,6 +3973,9 @@ impl std::ops::Deref for ModelEntry {
 }
 fn is_false(v: &bool) -> bool {
     !v
+}
+fn is_default_model_provider(provider: &ModelProvider) -> bool {
+    *provider == ModelProvider::default()
 }
 fn default_true() -> bool {
     true
@@ -4327,6 +4345,23 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
+    } else if info.provider == ModelProvider::Codex {
+        let credential = crate::codex_auth::load_credentials()
+            .map_err(|error| {
+                tracing::warn!(%error, "could not read isolated Codex OAuth credentials");
+                error
+            })
+            .ok()
+            .flatten();
+        (
+            credential.map(|credential| credential.access_token),
+            if info.base_url.trim().is_empty() {
+                crate::codex_auth::CODEX_INFERENCE_BASE_URL.to_owned()
+            } else {
+                info.base_url.clone()
+            },
+            xai_chat_state::AuthType::SessionToken,
+        )
     } else if let Some(key) = session_key {
         (
             Some(key.to_owned()),
@@ -4433,6 +4468,7 @@ pub fn try_resolve_model_credentials(
 pub struct ModelAuthFacts {
     pub byok: ModelByok,
     pub auth_scheme: AuthScheme,
+    pub provider: ModelProvider,
 }
 /// Resolve `model_id` to its auth facts from one effective-config load.
 /// Load/parse failure → `byok = Unknown`; model absent from the catalog →
@@ -4443,6 +4479,7 @@ pub fn resolve_model_auth_facts(model_id: &str) -> ModelAuthFacts {
         return ModelAuthFacts {
             byok: ModelByok::Unknown,
             auth_scheme: AuthScheme::default(),
+            provider: ModelProvider::default(),
         };
     }
     with_resolved_model(model_id, |lookup| ModelAuthFacts {
@@ -4450,6 +4487,10 @@ pub fn resolve_model_auth_facts(model_id: &str) -> ModelAuthFacts {
         auth_scheme: match lookup {
             ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
             _ => AuthScheme::default(),
+        },
+        provider: match lookup {
+            ModelLookup::Loaded(Some(e)) => e.info().provider,
+            _ => ModelProvider::default(),
         },
     })
 }
@@ -4531,6 +4572,7 @@ pub fn resolve_aux_model_sampling_config(
                 temperature: None,
                 top_p: None,
                 api_backend: ApiBackend::Responses,
+                provider: ModelProvider::Xai,
                 tool_mode: None,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
@@ -4652,6 +4694,31 @@ pub fn sampling_config_for_model(
         &credentials.base_url,
     );
     let api_backend = info.api_backend.clone();
+    // An explicit per-model API key is authoritative even for a Codex model.
+    // Only the OAuth-backed path may refresh and replace the bearer token.
+    let uses_codex_oauth = info.provider == ModelProvider::Codex
+        && credentials.auth_type == xai_chat_state::AuthType::SessionToken;
+    let codex_credentials = uses_codex_oauth
+        .then(crate::codex_auth::load_credentials)
+        .transpose()
+        .ok()
+        .flatten()
+        .flatten();
+    if let Some(credentials) = codex_credentials.as_ref() {
+        if let Some(account_id) = credentials.account_id.as_ref() {
+            extra_headers
+                .entry("ChatGPT-Account-ID".to_owned())
+                .or_insert_with(|| account_id.clone());
+        }
+        if credentials.account_is_fedramp {
+            extra_headers
+                .entry("X-OpenAI-Fedramp".to_owned())
+                .or_insert_with(|| "true".to_owned());
+        }
+        extra_headers
+            .entry("version".to_owned())
+            .or_insert_with(|| xai_grok_version::VERSION.to_owned());
+    }
     SamplerConfig {
         api_key: credentials.api_key,
         model: model_name,
@@ -4660,21 +4727,31 @@ pub fn sampling_config_for_model(
         temperature,
         top_p,
         api_backend,
+        provider: info.provider,
         auth_scheme: credentials.auth_scheme,
         extra_headers,
         context_window: info.context_window.get(),
-        client_version,
+        client_version: (info.provider != ModelProvider::Codex)
+            .then_some(client_version)
+            .flatten(),
         reasoning_effort: info.reasoning_effort,
         force_http1: false,
         max_retries: info.max_retries,
         stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
         idle_timeout_secs: None,
         client_identifier: None,
-        deployment_id,
-        user_id,
+        deployment_id: (info.provider != ModelProvider::Codex)
+            .then_some(deployment_id)
+            .flatten(),
+        user_id: (info.provider != ModelProvider::Codex)
+            .then_some(user_id)
+            .flatten(),
         origin_client: None,
         attribution_callback: None,
-        bearer_resolver: None,
+        bearer_resolver: uses_codex_oauth.then(|| {
+            std::sync::Arc::new(crate::codex_auth::CodexBearerResolver)
+                as xai_grok_sampler::SharedBearerResolver
+        }),
         supports_backend_search: info.supports_backend_search,
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
@@ -4754,6 +4831,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::Responses,
+            provider: ModelProvider::Xai,
             tool_mode: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
@@ -5422,6 +5500,7 @@ reasoning_effort = "low"
                 temperature: None,
                 top_p: None,
                 api_backend: ApiBackend::default(),
+                provider: ModelProvider::default(),
                 tool_mode: None,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
@@ -6236,6 +6315,63 @@ reasoning_effort = "low"
         assert_eq!(model.info.context_window, NonZeroU64::new(256_000).unwrap());
     }
     #[test]
+    fn parses_codex_provider_for_model_credentials_and_wire_contract() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.gpt-5-6-sol]
+            model = "gpt-5.6-sol"
+            name = "GPT-5.6 Sol"
+            provider = "codex"
+            base_url = "https://chatgpt.com/backend-api/codex"
+            api_backend = "responses"
+            tool_mode = "code_mode_only"
+            supports_backend_search = true
+            context_window = 353000
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("gpt-5-6-sol").expect("model should exist");
+        assert_eq!(model.info.provider, ModelProvider::Codex);
+        assert_eq!(model.info.api_backend, ApiBackend::Responses);
+        assert_eq!(model.info.tool_mode, Some(ToolMode::CodeModeOnly));
+        assert!(model.info.supports_backend_search);
+        let sampling = sampling_config_for_model(
+            model,
+            ResolvedCredentials {
+                api_key: Some("oauth-access".to_owned()),
+                base_url: model.info.base_url.clone(),
+                auth_type: xai_chat_state::AuthType::SessionToken,
+                auth_scheme: AuthScheme::Bearer,
+            },
+            None,
+            Some("ignored-x-grok-version".to_owned()),
+            Some("ignored-xai-deployment".to_owned()),
+            Some("ignored-xai-user".to_owned()),
+        );
+        assert_eq!(sampling.provider, ModelProvider::Codex);
+        assert!(sampling.bearer_resolver.is_some());
+        assert!(sampling.client_version.is_none());
+        assert!(sampling.deployment_id.is_none());
+        assert!(sampling.user_id.is_none());
+
+        let byok_sampling = sampling_config_for_model(
+            model,
+            ResolvedCredentials {
+                api_key: Some("explicit-openai-key".to_owned()),
+                base_url: model.info.base_url.clone(),
+                auth_type: xai_chat_state::AuthType::ApiKey,
+                auth_scheme: AuthScheme::Bearer,
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(byok_sampling.bearer_resolver.is_none());
+    }
+    #[test]
     fn sampling_config_context_window_from_entry_or_default() {
         let model = test_model_entry("any-model", "https://api.x.ai/v1", None, None, None);
         let config = sampling_config_for_model(
@@ -6490,6 +6626,7 @@ reasoning_effort = "low"
             api_key: None,
             env_key: None,
             api_backend: ApiBackend::default(),
+            provider: ModelProvider::default(),
             tool_mode: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
@@ -6650,6 +6787,7 @@ reasoning_effort = "low"
             api_key: None,
             env_key: None,
             api_backend: ApiBackend::default(),
+            provider: ModelProvider::default(),
             tool_mode: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
@@ -7102,6 +7240,7 @@ reasoning_effort = "low"
             api_key: None,
             env_key: None,
             api_backend: ApiBackend::default(),
+            provider: ModelProvider::default(),
             tool_mode: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
@@ -10667,6 +10806,7 @@ default = "grok-4.5"
                 temperature: None,
                 top_p: None,
                 api_backend,
+                provider: ModelProvider::default(),
                 tool_mode: None,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),

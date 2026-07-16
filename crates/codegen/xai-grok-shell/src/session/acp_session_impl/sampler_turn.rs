@@ -315,6 +315,7 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             api_backend: cfg.api_backend,
+            provider: model_facts.provider,
             auth_scheme,
             extra_headers,
             context_window: cfg.context_window.get(),
@@ -325,18 +326,30 @@ impl SessionActor {
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
             idle_timeout_secs: None,
             client_identifier: self.client_identifier.clone(),
-            deployment_id: crate::managed_config::resolve_deployment_id(
-                crate::managed_config::resolve_deployment_key().as_deref(),
-            ),
-            user_id: self
-                .auth_manager
-                .as_ref()
-                .and_then(|am| am.current_or_expired())
-                .filter(|a| a.is_xai_auth())
-                .map(|a| a.user_id),
+            deployment_id: (model_facts.provider
+                != xai_grok_sampling_types::ModelProvider::Codex)
+                .then(|| {
+                    crate::managed_config::resolve_deployment_id(
+                        crate::managed_config::resolve_deployment_key().as_deref(),
+                    )
+                })
+                .flatten(),
+            user_id: (model_facts.provider != xai_grok_sampling_types::ModelProvider::Codex)
+                .then(|| {
+                    self.auth_manager
+                        .as_ref()
+                        .and_then(|am| am.current_or_expired())
+                        .filter(|a| a.is_xai_auth())
+                        .map(|a| a.user_id)
+                })
+                .flatten(),
             origin_client: self.origin_client.clone(),
             attribution_callback: self.attribution_callback.clone(),
-            bearer_resolver: if use_bearer_resolver {
+            bearer_resolver: if model_facts.provider
+                == xai_grok_sampling_types::ModelProvider::Codex
+            {
+                Some(std::sync::Arc::new(crate::codex_auth::CodexBearerResolver))
+            } else if use_bearer_resolver {
                 self.auth_manager
                     .as_ref()
                     .map(|am| -> xai_grok_sampler::SharedBearerResolver {

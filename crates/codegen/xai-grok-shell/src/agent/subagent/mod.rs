@@ -917,6 +917,7 @@ async fn read_parent_sampling_config(
                 temperature: cfg.temperature,
                 top_p: cfg.top_p,
                 api_backend: cfg.api_backend,
+                provider: ctx.sampling_config.provider,
                 auth_scheme,
                 extra_headers,
                 context_window: cfg.context_window.get(),
@@ -931,7 +932,12 @@ async fn read_parent_sampling_config(
                 user_id: ctx.sampling_config.user_id.clone(),
                 origin_client: ctx.sampling_config.origin_client.clone(),
                 attribution_callback: ctx.attribution_callback.clone(),
-                bearer_resolver: None,
+                bearer_resolver: (ctx.sampling_config.provider
+                    == xai_grok_sampling_types::ModelProvider::Codex)
+                    .then(|| {
+                        std::sync::Arc::new(crate::codex_auth::CodexBearerResolver)
+                            as xai_grok_sampler::SharedBearerResolver
+                    }),
                 supports_backend_search: ctx
                     .models_manager
                     .model_supports_backend_search(ctx.model_id.0.as_ref()),

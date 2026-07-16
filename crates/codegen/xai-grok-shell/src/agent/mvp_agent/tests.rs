@@ -2091,6 +2091,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             temperature: None,
             top_p: None,
             api_backend: crate::sampling::ApiBackend::default(),
+            provider: Default::default(),
             tool_mode: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),

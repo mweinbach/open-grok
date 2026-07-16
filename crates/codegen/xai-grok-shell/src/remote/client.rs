@@ -826,6 +826,18 @@ pub fn parse_remote_model_value(
             _ => None,
         })
         .unwrap_or_default();
+    let provider = get_string(obj, "provider")
+        .or_else(|| get_string(obj, "modelProvider"))
+        .or_else(|| get_string(obj, "model_provider"))
+        .or_else(|| meta.and_then(|m| get_string(m, "provider")))
+        .and_then(|value| match value.as_str() {
+            "xai" => Some(xai_grok_sampling_types::ModelProvider::Xai),
+            "codex" | "openai" | "openai_codex" => {
+                Some(xai_grok_sampling_types::ModelProvider::Codex)
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
     let tool_mode = get_string(obj, "toolMode")
         .or_else(|| get_string(obj, "tool_mode"))
         .or_else(|| meta.and_then(|m| get_string(m, "toolMode")))
@@ -850,6 +862,7 @@ pub fn parse_remote_model_value(
         api_key: get_string(obj, "apiKey").or_else(|| get_string(obj, "api_key")),
         env_key: get_env_keys(obj, "envKey").or_else(|| get_env_keys(obj, "env_key")),
         api_backend,
+        provider,
         tool_mode,
         context_window,
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")
@@ -1431,14 +1444,19 @@ mod tests {
     fn parse_reads_code_mode_only_from_remote_catalog() {
         let value = serde_json::json!({
             "model": "gpt-5.6-sol",
-            "contextWindow": 372_000,
+            "contextWindow": 353_000,
             "apiBackend": "responses",
-            "toolMode": "code_mode_only"
+            "toolMode": "code_mode_only",
+            "provider": "openai"
         });
         let result = parse_remote_model_value(&value, "https://api.openai.com/v1").unwrap();
         assert_eq!(
             result.tool_mode,
             Some(xai_grok_sampling_types::ToolMode::CodeModeOnly)
+        );
+        assert_eq!(
+            result.provider,
+            xai_grok_sampling_types::ModelProvider::Codex
         );
     }
     #[test]

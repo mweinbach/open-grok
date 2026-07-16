@@ -275,6 +275,26 @@ context_window = 128000               # context window size (for auto-compact)
 
 Credential resolution: `api_key` > `env_key` > signed-in session token > `XAI_API_KEY`.
 
+OpenAI Codex models use a separate ChatGPT OAuth account. Connect it with
+`grok login --codex` (or add `--device-auth` on a remote machine), then select
+the provider explicitly in the model entry:
+
+```toml
+[model.gpt-5-6-sol]
+model = "gpt-5.6-sol"
+name = "GPT-5.6 Sol"
+provider = "codex"
+base_url = "https://chatgpt.com/backend-api/codex"
+api_backend = "responses"
+tool_mode = "code_mode_only"
+supports_backend_search = true
+context_window = 353000
+```
+
+`provider = "codex"` reads only `~/.grok/codex-auth.json`; it never falls
+back to or modifies the xAI account in `~/.grok/auth.json`. Explicit `api_key`
+or `env_key` values on that model still take precedence over OAuth.
+
 Override built-in models by using their name as the section key:
 
 ```toml

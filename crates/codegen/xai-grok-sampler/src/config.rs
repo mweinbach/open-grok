@@ -9,7 +9,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{
-    ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ReasoningEffort,
+    ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ModelProvider,
+    ReasoningEffort,
 };
 
 use crate::attribution::SharedAttributionCallback;
@@ -54,6 +55,9 @@ pub struct SamplerConfig {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: ApiBackend,
+    /// Provider-specific wire/auth contract for this model.
+    #[serde(default)]
+    pub provider: ModelProvider,
     #[serde(default)]
     pub auth_scheme: AuthScheme,
     /// Extra request headers applied verbatim. The sampler never inspects
@@ -138,6 +142,7 @@ impl Default for SamplerConfig {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::default(),
+            provider: ModelProvider::default(),
             auth_scheme: AuthScheme::default(),
             extra_headers: IndexMap::new(),
             context_window: 0,

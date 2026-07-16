@@ -1020,6 +1020,20 @@ pub enum ApiBackend {
     Messages,
 }
 
+/// First-party provider contract selected by a model catalog entry.
+///
+/// This is deliberately explicit rather than inferred from a model slug or
+/// URL: the provider controls both credential resolution and which hosted
+/// tools are valid on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProvider {
+    #[default]
+    Xai,
+    #[serde(alias = "openai", alias = "openai_codex")]
+    Codex,
+}
+
 /// How client-executed tools are exposed to the model.
 ///
 /// This selector is shared by model metadata, session resolution, and the
