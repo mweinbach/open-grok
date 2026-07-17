@@ -346,10 +346,10 @@ pub(crate) struct SubagentSpawnContext {
     pub managed_mcp_state: crate::session::managed_mcp::ManagedMcpStateHandle,
     /// Snapshot of the parent session's MCP client pool at spawn time.
     pub parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
-    /// Snapshot of the parent session's resolved tool schema at spawn time.
-    /// `Some` only when a fork parent's actor answered; threaded to the child so a
-    /// verbatim mirror-fork sends the parent's exact tool prefix for cache reuse.
-    pub parent_tool_snapshot: Option<Vec<xai_grok_sampling_types::ToolSpec>>,
+    /// Snapshot of the parent session's resolved ordinary-tool inputs.
+    /// `Some` only for an explicitly requested fork whose parent actor answered;
+    /// the child rebuilds the exact provider/mode surface for cache reuse.
+    pub parent_tool_snapshot: Option<crate::session::tool_surface::ToolSurfaceSnapshot>,
     /// Pre-discovered skills from the parent session, captured at spawn time.
     pub parent_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
     /// Parent's skills config for the child's SkillManager.

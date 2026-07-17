@@ -1045,7 +1045,7 @@ pub fn reasoning_efforts_meta_value(opts: &[ReasoningEffortOption]) -> serde_jso
 }
 
 /// Which API backend to use for model inference.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiBackend {
     /// Use the Chat Completions API (/v1/chat/completions)
@@ -1099,6 +1099,22 @@ impl ResponsesDialect {
     pub const fn is_codex(self) -> bool {
         matches!(self, Self::Codex)
     }
+}
+
+/// Wire representation used for Code Mode's client-executed `exec` tool.
+///
+/// This capability is independent from [`ToolMode`]: the mode controls which
+/// tools the model can see, while this value controls how the selected
+/// provider can represent the Code Mode transport on its Responses wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeModeTransport {
+    /// Native Responses `type: "custom"` with a free-form grammar.
+    NativeCustomGrammar,
+    /// Ordinary Responses function call with `{ "source": <javascript> }`.
+    FunctionEnvelope,
+    /// The provider cannot carry Code Mode on its supported API backends.
+    Unsupported,
 }
 
 /// Wire protocols accepted by one provider.
@@ -1245,6 +1261,8 @@ pub struct ProviderProfile {
     /// value and [`ModelProvider::name`] for its display name.
     pub provider: ModelProvider,
     pub backends: ProviderBackends,
+    /// Provider-native wire representation for Code Mode's `exec` transport.
+    pub code_mode_transport: CodeModeTransport,
     /// `None` means the provider accepts no hosted tools.
     pub hosted_tool_dialect: Option<HostedToolDialect>,
     pub request_metadata: RequestMetadataPolicy,
@@ -1260,6 +1278,7 @@ impl ProviderProfile {
             responses: Some(ResponsesDialect::Xai),
             messages: true,
         },
+        code_mode_transport: CodeModeTransport::FunctionEnvelope,
         hosted_tool_dialect: Some(HostedToolDialect::Xai),
         request_metadata: RequestMetadataPolicy::XGrokHeaders,
         session_auth: BuiltInSessionAuthKind::XaiSession,
@@ -1273,6 +1292,7 @@ impl ProviderProfile {
             responses: Some(ResponsesDialect::Codex),
             messages: false,
         },
+        code_mode_transport: CodeModeTransport::NativeCustomGrammar,
         hosted_tool_dialect: Some(HostedToolDialect::OpenAi),
         request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
         session_auth: BuiltInSessionAuthKind::CodexOAuth,
@@ -1289,6 +1309,7 @@ impl ProviderProfile {
             responses: None,
             messages: false,
         },
+        code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
         request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
         session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
@@ -1372,8 +1393,9 @@ impl ModelProvider {
 /// How client-executed tools are exposed to the model.
 ///
 /// This selector is shared by model metadata, session resolution, and the
-/// sampling transport. `Direct` preserves the existing JSON function-calling
-/// behavior; code-mode variants opt into the native Responses custom-tool lane.
+/// sampling transport. `Direct` exposes ordinary tools only; code-mode
+/// variants add the Code Mode control surface. The provider's
+/// [`CodeModeTransport`] independently selects its native wire representation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolMode {
@@ -1596,6 +1618,7 @@ mod tests {
             id: &'static str,
             name: &'static str,
             backends: ProviderBackends,
+            code_mode_transport: CodeModeTransport,
             hosted_tools: Option<HostedToolDialect>,
             request_metadata: RequestMetadataPolicy,
             session_auth: BuiltInSessionAuthKind,
@@ -1612,6 +1635,7 @@ mod tests {
                     responses: Some(ResponsesDialect::Xai),
                     messages: true,
                 },
+                code_mode_transport: CodeModeTransport::FunctionEnvelope,
                 hosted_tools: Some(HostedToolDialect::Xai),
                 request_metadata: RequestMetadataPolicy::XGrokHeaders,
                 session_auth: BuiltInSessionAuthKind::XaiSession,
@@ -1626,6 +1650,7 @@ mod tests {
                     responses: Some(ResponsesDialect::Codex),
                     messages: false,
                 },
+                code_mode_transport: CodeModeTransport::NativeCustomGrammar,
                 hosted_tools: Some(HostedToolDialect::OpenAi),
                 request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
                 session_auth: BuiltInSessionAuthKind::CodexOAuth,
@@ -1640,6 +1665,7 @@ mod tests {
                     responses: None,
                     messages: false,
                 },
+                code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
                 request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
                 session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
@@ -1653,6 +1679,7 @@ mod tests {
             assert_eq!(profile.id(), case.id);
             assert_eq!(profile.name(), case.name);
             assert_eq!(profile.backends, case.backends);
+            assert_eq!(profile.code_mode_transport, case.code_mode_transport);
             assert_eq!(profile.responses_dialect(), case.backends.responses);
             assert_eq!(profile.hosted_tool_dialect, case.hosted_tools);
             assert_eq!(profile.request_metadata, case.request_metadata);

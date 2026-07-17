@@ -1184,6 +1184,187 @@ pub struct RawInputItemReplacement {
     pub value: serde_json::Value,
 }
 
+/// Why a provider-aware Code Mode request projection could not produce a
+/// valid Responses request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CodeModeProjectionError {
+    #[error("{provider:?} does not support native custom Code Mode content")]
+    UnsupportedTransport { provider: crate::ModelProvider },
+    #[error("{provider:?} cannot represent native custom tool `{name}`")]
+    UnsupportedCustomTool {
+        provider: crate::ModelProvider,
+        name: String,
+    },
+    #[error("{provider:?} cannot represent native custom tool choice `{name}`")]
+    UnsupportedCustomToolChoice {
+        provider: crate::ModelProvider,
+        name: String,
+    },
+    #[error("{provider:?} cannot represent native custom call `{name}`")]
+    UnsupportedCustomCall {
+        provider: crate::ModelProvider,
+        name: String,
+    },
+    #[error("native custom output `{call_id}` has no matching `exec` call")]
+    OrphanCustomOutput { call_id: String },
+}
+
+const CODE_MODE_EXEC_TOOL_NAME: &str = "exec";
+const CODE_MODE_NATIVE_EXEC_INPUT_GUIDANCE: &str =
+    "- Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.";
+const CODE_MODE_FUNCTION_EXEC_INPUT_GUIDANCE: &str = "- Call this function with JSON arguments shaped as `{\"source\":\"<raw JavaScript>\"}`; the `source` string must contain JavaScript, not a nested JSON object or Markdown code fence.";
+
+/// Adapt a native-custom Code Mode `exec` description to the JSON function
+/// envelope used by providers such as xAI. The operation is idempotent so both
+/// tool-surface construction and final provider projection can apply it.
+pub fn code_mode_exec_function_description(description: Option<&str>) -> String {
+    let Some(description) = description.filter(|description| !description.trim().is_empty()) else {
+        return CODE_MODE_FUNCTION_EXEC_INPUT_GUIDANCE.to_string();
+    };
+    if description.contains(CODE_MODE_FUNCTION_EXEC_INPUT_GUIDANCE) {
+        return description.to_string();
+    }
+    if description.contains(CODE_MODE_NATIVE_EXEC_INPUT_GUIDANCE) {
+        return description.replacen(
+            CODE_MODE_NATIVE_EXEC_INPUT_GUIDANCE,
+            CODE_MODE_FUNCTION_EXEC_INPUT_GUIDANCE,
+            1,
+        );
+    }
+    format!("{CODE_MODE_FUNCTION_EXEC_INPUT_GUIDANCE}\n\n{description}")
+}
+
+fn code_mode_exec_function_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "source": {
+                "type": "string",
+                "description": "JavaScript source code to execute"
+            }
+        },
+        "required": ["source"],
+        "additionalProperties": false
+    })
+}
+
+fn custom_result_content(result: &ToolResultItem) -> Vec<CustomToolOutputContent> {
+    if !result.ordered_content.is_empty() {
+        return result.ordered_content.clone();
+    }
+
+    let mut content = vec![CustomToolOutputContent::text(result.content.clone())];
+    content.extend(result.images.iter().filter_map(|part| match part {
+        ContentPart::Image { url } => Some(CustomToolOutputContent::image(
+            url.clone(),
+            CustomToolOutputImageDetail::Auto,
+        )),
+        ContentPart::Text { .. } => None,
+    }));
+    content
+}
+
+/// Collapse runtime notifications attached to an ordinary function-envelope
+/// `exec` call into its single function result. This normalization is needed
+/// even when the destination supports native custom tools: a conversation may
+/// have originated on xAI and later switch to Codex, but its prior function
+/// call must not acquire unmatched native custom outputs on replay.
+fn coalesce_function_exec_outputs(
+    items: &mut Vec<ConversationItem>,
+    provider: crate::ModelProvider,
+) -> Result<(), CodeModeProjectionError> {
+    let function_exec_call_ids = items
+        .iter()
+        .filter_map(|item| match item {
+            ConversationItem::Assistant(assistant) => Some(&assistant.tool_calls),
+            _ => None,
+        })
+        .flatten()
+        .filter(|call| !call.is_custom() && call.name == CODE_MODE_EXEC_TOOL_NAME)
+        .map(|call| call.id.as_ref().to_owned())
+        .collect::<std::collections::HashSet<_>>();
+    if function_exec_call_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut notification_call_ids = std::collections::HashSet::new();
+    for item in items.iter() {
+        let ConversationItem::CustomToolOutput(output) = item else {
+            continue;
+        };
+        if !function_exec_call_ids.contains(&output.call_id) {
+            continue;
+        }
+        if output
+            .name
+            .as_deref()
+            .is_some_and(|name| name != CODE_MODE_EXEC_TOOL_NAME)
+        {
+            return Err(CodeModeProjectionError::UnsupportedCustomCall {
+                provider,
+                name: output.name.clone().unwrap_or_default(),
+            });
+        }
+        notification_call_ids.insert(output.call_id.clone());
+    }
+    if notification_call_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut combined_outputs =
+        std::collections::HashMap::<String, Vec<CustomToolOutputContent>>::new();
+    let mut last_output_index = std::collections::HashMap::<String, usize>::new();
+    for (index, item) in items.iter().enumerate() {
+        let (call_id, content) = match item {
+            ConversationItem::CustomToolOutput(output)
+                if notification_call_ids.contains(&output.call_id) =>
+            {
+                (output.call_id.clone(), output.content.clone())
+            }
+            ConversationItem::ToolResult(result)
+                if notification_call_ids.contains(&result.tool_call_id) =>
+            {
+                (result.tool_call_id.clone(), custom_result_content(result))
+            }
+            _ => continue,
+        };
+        combined_outputs
+            .entry(call_id.clone())
+            .or_default()
+            .extend(content);
+        last_output_index.insert(call_id, index);
+    }
+
+    let mut projected_items = Vec::with_capacity(items.len());
+    for (index, item) in items.drain(..).enumerate() {
+        let call_id = match &item {
+            ConversationItem::CustomToolOutput(output)
+                if notification_call_ids.contains(&output.call_id) =>
+            {
+                Some(output.call_id.clone())
+            }
+            ConversationItem::ToolResult(result)
+                if notification_call_ids.contains(&result.tool_call_id) =>
+            {
+                Some(result.tool_call_id.clone())
+            }
+            _ => None,
+        };
+        let Some(call_id) = call_id else {
+            projected_items.push(item);
+            continue;
+        };
+        if last_output_index.get(&call_id) == Some(&index) {
+            projected_items.push(ConversationItem::tool_result_with_ordered_content(
+                call_id.clone(),
+                combined_outputs.remove(&call_id).unwrap_or_default(),
+            ));
+        }
+    }
+    *items = projected_items;
+    Ok(())
+}
+
 impl ConversationRequest {
     /// Add a client-executed tool while preserving the existing function-tool
     /// storage and backend behavior.
@@ -1230,6 +1411,264 @@ impl ConversationRequest {
                 HostedTool::WebSearch { .. } | HostedTool::XSearch => None,
             })
             .collect()
+    }
+
+    /// Project Code Mode's client custom-tool transport to the wire shape
+    /// supported by `provider`.
+    ///
+    /// Codex retains native Responses custom tools and free-form history. xAI
+    /// receives an ordinary `exec` function whose single `source` argument
+    /// carries the raw JavaScript. Existing custom calls and outputs are
+    /// rewritten to the matching function-call history while preserving call
+    /// IDs and all ordered result content. Any other native custom content is
+    /// rejected rather than being sent to an incompatible provider.
+    ///
+    /// The projection is idempotent, so request-building layers may apply it at
+    /// their own fail-closed boundary without coordinating mutable state.
+    pub fn project_code_mode_for_provider(
+        &mut self,
+        provider: crate::ModelProvider,
+    ) -> Result<(), CodeModeProjectionError> {
+        self.project_code_mode_for_transport(provider, provider.profile().code_mode_transport)
+    }
+
+    /// Project any legacy native Code Mode history to ordinary function calls
+    /// for APIs that have no Responses custom-tool grammar (Chat Completions
+    /// and Anthropic Messages). The provider is still explicit so failures and
+    /// policy decisions follow model metadata rather than model-name guesses.
+    pub fn project_code_mode_for_function_backend(
+        &mut self,
+        provider: crate::ModelProvider,
+    ) -> Result<(), CodeModeProjectionError> {
+        self.project_code_mode_for_transport(provider, crate::CodeModeTransport::FunctionEnvelope)
+    }
+
+    fn project_code_mode_for_transport(
+        &mut self,
+        provider: crate::ModelProvider,
+        transport: crate::CodeModeTransport,
+    ) -> Result<(), CodeModeProjectionError> {
+        use crate::CodeModeTransport;
+
+        coalesce_function_exec_outputs(&mut self.items, provider)?;
+
+        if transport == CodeModeTransport::NativeCustomGrammar {
+            return Ok(());
+        }
+
+        let custom_declarations = self.hosted_tools.iter().filter_map(|tool| match tool {
+            HostedTool::ClientCustom(tool) => Some(tool),
+            HostedTool::WebSearch { .. } | HostedTool::XSearch => None,
+        });
+        let has_custom_declarations = custom_declarations.clone().next().is_some();
+        let has_custom_history = self.items.iter().any(|item| match item {
+            ConversationItem::Assistant(assistant) => {
+                assistant.tool_calls.iter().any(ToolCall::is_custom)
+            }
+            ConversationItem::ToolResult(result) => {
+                decode_custom_tool_call_id(&result.tool_call_id).is_some()
+            }
+            ConversationItem::CustomToolOutput(_) => true,
+            _ => false,
+        });
+        let has_custom_choice = matches!(
+            self.tool_choice.as_ref(),
+            Some(ConversationToolChoice::Custom(_))
+        );
+
+        if transport == CodeModeTransport::Unsupported {
+            if has_custom_declarations || has_custom_history || has_custom_choice {
+                return Err(CodeModeProjectionError::UnsupportedTransport { provider });
+            }
+            return Ok(());
+        }
+
+        for tool in custom_declarations {
+            if tool.name != CODE_MODE_EXEC_TOOL_NAME {
+                return Err(CodeModeProjectionError::UnsupportedCustomTool {
+                    provider,
+                    name: tool.name.clone(),
+                });
+            }
+        }
+        if let Some(ConversationToolChoice::Custom(name)) = &self.tool_choice
+            && name != CODE_MODE_EXEC_TOOL_NAME
+        {
+            return Err(CodeModeProjectionError::UnsupportedCustomToolChoice {
+                provider,
+                name: name.clone(),
+            });
+        }
+
+        let mut exec_call_ids = std::collections::HashSet::new();
+        for item in &self.items {
+            if let ConversationItem::Assistant(assistant) = item {
+                for call in &assistant.tool_calls {
+                    if !call.is_custom() {
+                        if call.name == CODE_MODE_EXEC_TOOL_NAME {
+                            exec_call_ids.insert(call.id.as_ref().to_owned());
+                        }
+                        continue;
+                    }
+                    if call.name != CODE_MODE_EXEC_TOOL_NAME {
+                        return Err(CodeModeProjectionError::UnsupportedCustomCall {
+                            provider,
+                            name: call.name.clone(),
+                        });
+                    }
+                    exec_call_ids.insert(call.call_id().to_owned());
+                }
+            }
+        }
+
+        for item in &self.items {
+            let custom_output = match item {
+                ConversationItem::CustomToolOutput(output) => {
+                    if output
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name != CODE_MODE_EXEC_TOOL_NAME)
+                    {
+                        return Err(CodeModeProjectionError::UnsupportedCustomCall {
+                            provider,
+                            name: output.name.clone().unwrap_or_default(),
+                        });
+                    }
+                    Some(output.call_id.as_str())
+                }
+                ConversationItem::ToolResult(result) => {
+                    decode_custom_tool_call_id(&result.tool_call_id).map(|(call_id, _)| call_id)
+                }
+                _ => None,
+            };
+            if let Some(call_id) = custom_output
+                && !exec_call_ids.contains(call_id)
+            {
+                return Err(CodeModeProjectionError::OrphanCustomOutput {
+                    call_id: call_id.to_owned(),
+                });
+            }
+        }
+
+        let mut projected_exec: Option<ToolSpec> = None;
+        self.hosted_tools.retain(|tool| match tool {
+            HostedTool::ClientCustom(custom) => {
+                projected_exec = Some(ToolSpec {
+                    name: custom.name.clone(),
+                    description: Some(code_mode_exec_function_description(
+                        custom.description.as_deref(),
+                    )),
+                    parameters: code_mode_exec_function_parameters(),
+                });
+                false
+            }
+            HostedTool::WebSearch { .. } | HostedTool::XSearch => true,
+        });
+        if let Some(exec) = projected_exec
+            && !self.tools.iter().any(|tool| tool.name == exec.name)
+        {
+            self.tools.push(exec);
+        }
+        if matches!(
+            self.tool_choice.as_ref(),
+            Some(ConversationToolChoice::Custom(name)) if name == CODE_MODE_EXEC_TOOL_NAME
+        ) {
+            self.tool_choice = Some(ConversationToolChoice::Function(
+                CODE_MODE_EXEC_TOOL_NAME.to_owned(),
+            ));
+        }
+
+        for item in &mut self.items {
+            if let ConversationItem::Assistant(assistant) = item {
+                for call in &mut assistant.tool_calls {
+                    if !call.is_custom() {
+                        continue;
+                    }
+                    let call_id = call.call_id().to_owned();
+                    let arguments = serde_json::to_string(&serde_json::json!({
+                        "source": call.arguments.as_ref(),
+                    }))
+                    .expect("Code Mode function arguments must serialize");
+                    call.id = Arc::<str>::from(call_id);
+                    call.arguments = Arc::<str>::from(arguments);
+                }
+            }
+        }
+
+        let custom_output_call_ids = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::CustomToolOutput(output) => Some(output.call_id.clone()),
+                ConversationItem::ToolResult(result) => {
+                    decode_custom_tool_call_id(&result.tool_call_id)
+                        .map(|(call_id, _)| call_id.to_owned())
+                }
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut combined_outputs =
+            std::collections::HashMap::<String, Vec<CustomToolOutputContent>>::new();
+        let mut last_output_index = std::collections::HashMap::<String, usize>::new();
+        for (index, item) in self.items.iter().enumerate() {
+            match item {
+                ConversationItem::CustomToolOutput(output) => {
+                    combined_outputs
+                        .entry(output.call_id.clone())
+                        .or_default()
+                        .extend(output.content.clone());
+                    last_output_index.insert(output.call_id.clone(), index);
+                }
+                ConversationItem::ToolResult(result) => {
+                    if let Some((call_id, _)) = decode_custom_tool_call_id(&result.tool_call_id) {
+                        combined_outputs
+                            .entry(call_id.to_owned())
+                            .or_default()
+                            .extend(custom_result_content(result));
+                        last_output_index.insert(call_id.to_owned(), index);
+                    } else if custom_output_call_ids.contains(&result.tool_call_id) {
+                        combined_outputs
+                            .entry(result.tool_call_id.clone())
+                            .or_default()
+                            .extend(custom_result_content(result));
+                        last_output_index.insert(result.tool_call_id.clone(), index);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !last_output_index.is_empty() {
+            let mut projected_items = Vec::with_capacity(self.items.len());
+            for (index, item) in self.items.drain(..).enumerate() {
+                let custom_call_id = match &item {
+                    ConversationItem::CustomToolOutput(output) => Some(output.call_id.clone()),
+                    ConversationItem::ToolResult(result) => {
+                        decode_custom_tool_call_id(&result.tool_call_id)
+                            .map(|(call_id, _)| call_id.to_owned())
+                            .or_else(|| {
+                                custom_output_call_ids
+                                    .contains(&result.tool_call_id)
+                                    .then(|| result.tool_call_id.clone())
+                            })
+                    }
+                    _ => None,
+                };
+                let Some(call_id) = custom_call_id else {
+                    projected_items.push(item);
+                    continue;
+                };
+                if last_output_index.get(&call_id) == Some(&index) {
+                    projected_items.push(ConversationItem::tool_result_with_ordered_content(
+                        call_id.clone(),
+                        combined_outputs.remove(&call_id).unwrap_or_default(),
+                    ));
+                }
+            }
+            self.items = projected_items;
+        }
+
+        Ok(())
     }
 
     /// Locate provider-native items that async-openai cannot represent in the
@@ -1438,8 +1877,7 @@ pub const CODEX_IMAGE_PROCESSING_ERROR_PLACEHOLDER: &str =
 pub const CODEX_REMOTE_IMAGE_URL_PLACEHOLDER: &str =
     "image content omitted because remote image URLs are not supported";
 /// Placeholder when tool-output `detail: low` is rejected (Codex).
-pub const CODEX_UNSUPPORTED_LOW_DETAIL_PLACEHOLDER: &str =
-    "image content omitted because detail 'low' is not supported; use 'high', 'original', or 'auto'";
+pub const CODEX_UNSUPPORTED_LOW_DETAIL_PLACEHOLDER: &str = "image content omitted because detail 'low' is not supported; use 'high', 'original', or 'auto'";
 
 /// Walk conversation items and replace images the Codex Responses API would
 /// reject (invalid base64 data URLs, remote URLs, unsupported low detail).
@@ -5185,6 +5623,28 @@ mod tests {
         .unwrap()
     }
 
+    fn contains_native_custom_wire_type(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            "custom" | "custom_tool_call" | "custom_tool_call_output"
+                        )
+                    })
+                {
+                    return true;
+                }
+                object.values().any(contains_native_custom_wire_type)
+            }
+            serde_json::Value::Array(values) => values.iter().any(contains_native_custom_wire_type),
+            _ => false,
+        }
+    }
+
     #[test]
     fn client_custom_tool_serializes_natively_without_changing_function_tools() {
         let request = ConversationRequest::from_items(vec![ConversationItem::user("run it")])
@@ -5222,6 +5682,369 @@ mod tests {
         assert!(
             chat.tool_choice.is_none(),
             "custom choice is Responses-only"
+        );
+    }
+
+    #[test]
+    fn xai_projects_exec_declaration_and_history_to_function_envelope() {
+        let raw_source = "const answer = 40 + 2;\ntools.notify(answer);";
+        let mut request = ConversationRequest::from_items(vec![
+            ConversationItem::user("run it"),
+            ConversationItem::assistant_tool_calls(vec![ToolCall::custom(
+                "call-exec",
+                "ctc-exec",
+                "exec",
+                raw_source,
+            )]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-exec", "progress").with_name("exec"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-exec", "42").with_name("exec"),
+            ),
+        ])
+        .with_tools(vec![ToolSpec {
+            name: "read_file".into(),
+            description: Some("Read a file".into()),
+            parameters: serde_json::json!({"type": "object"}),
+        }])
+        .with_client_tools([ClientTool::Custom {
+            name: "exec".into(),
+            description: Some("Execute JavaScript".into()),
+            format: rs::CustomToolParamFormat::Text,
+        }])
+        .with_tool_choice(ConversationToolChoice::Custom("exec".into()));
+
+        request
+            .project_code_mode_for_provider(crate::ModelProvider::Xai)
+            .expect("xAI exec projection must succeed");
+        request
+            .project_code_mode_for_provider(crate::ModelProvider::Xai)
+            .expect("xAI exec projection must be idempotent");
+
+        let wire = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+        assert!(
+            !contains_native_custom_wire_type(&wire),
+            "xAI projection must remove every native custom wire shape: {wire}"
+        );
+        assert_eq!(
+            wire["tool_choice"],
+            serde_json::json!({"type": "function", "name": "exec"})
+        );
+
+        let tools = wire["tools"].as_array().expect("projected tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "read_file");
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["name"], "exec");
+        assert_eq!(
+            tools[1]["parameters"]["required"],
+            serde_json::json!(["source"])
+        );
+        let description = tools[1]["description"].as_str().unwrap();
+        assert!(description.contains(r#"`{"source":"<raw JavaScript>"}`"#));
+        assert!(description.contains("Execute JavaScript"));
+        assert!(!description.contains("Accepts raw JavaScript source text, not JSON"));
+
+        let input = wire["input"].as_array().expect("projected input");
+        let exec_call = input
+            .iter()
+            .find(|item| item["type"] == "function_call" && item["name"] == "exec")
+            .expect("projected exec function call");
+        assert_eq!(exec_call["call_id"], "call-exec");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(exec_call["arguments"].as_str().unwrap())
+                .unwrap(),
+            serde_json::json!({"source": raw_source})
+        );
+
+        let outputs = input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 1, "repeated custom outputs are coalesced");
+        assert_eq!(outputs[0]["call_id"], "call-exec");
+        assert_eq!(
+            outputs[0]["output"],
+            serde_json::json!([
+                {"type": "input_text", "text": "progress"},
+                {"type": "input_text", "text": "42"}
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_preserves_native_custom_exec_transport() {
+        let mut request = ConversationRequest::from_items(vec![
+            ConversationItem::assistant_tool_calls(vec![ToolCall::custom(
+                "call-exec",
+                "ctc-exec",
+                "exec",
+                "return 42",
+            )]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-exec", "42").with_name("exec"),
+            ),
+        ])
+        .with_client_tools([ClientTool::Custom {
+            name: "exec".into(),
+            description: None,
+            format: rs::CustomToolParamFormat::Text,
+        }]);
+
+        request
+            .project_code_mode_for_provider(crate::ModelProvider::Codex)
+            .expect("Codex native custom transport remains supported");
+        let wire = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+        assert!(contains_native_custom_wire_type(&wire));
+        assert_eq!(wire["tools"][0]["type"], "custom");
+        assert_eq!(wire["input"][0]["type"], "custom_tool_call");
+        assert_eq!(wire["input"][1]["type"], "custom_tool_call_output");
+    }
+
+    #[test]
+    fn codex_coalesces_prior_xai_function_exec_outputs_without_reclassifying_them() {
+        let mut request = ConversationRequest::from_items(vec![
+            ConversationItem::assistant_tool_calls(vec![ToolCall {
+                id: Arc::<str>::from("call-xai-exec"),
+                name: "exec".into(),
+                arguments: Arc::<str>::from(r#"{"source":"return 42"}"#),
+            }]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-xai-exec", "notify one").with_name("exec"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-xai-exec", "notify two").with_name("exec"),
+            ),
+            ConversationItem::tool_result_with_ordered_content(
+                "call-xai-exec",
+                vec![CustomToolOutputContent::text("final")],
+            ),
+        ]);
+
+        request
+            .project_code_mode_for_provider(crate::ModelProvider::Codex)
+            .expect("Codex must accept prior xAI function-envelope history");
+        let wire = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+        let input = wire["input"].as_array().unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .count(),
+            1
+        );
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != "custom_tool_call_output"),
+            "function-envelope history must not gain unmatched native output: {wire}"
+        );
+        let output = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(output["call_id"], "call-xai-exec");
+        assert_eq!(
+            output["output"],
+            serde_json::json!([
+                {"type": "input_text", "text": "notify one"},
+                {"type": "input_text", "text": "notify two"},
+                {"type": "input_text", "text": "final"}
+            ])
+        );
+    }
+
+    fn native_exec_history_request() -> ConversationRequest {
+        let call = ToolCall::custom(
+            "call-native-exec",
+            "ctc-native-exec",
+            "exec",
+            "const answer = 40 + 2;",
+        );
+        let encoded_result_id = call.id.clone();
+        ConversationRequest::from_items(vec![
+            ConversationItem::assistant_tool_calls(vec![call]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-native-exec", "progress").with_name("exec"),
+            ),
+            ConversationItem::tool_result_with_ordered_content(
+                encoded_result_id.as_ref(),
+                vec![CustomToolOutputContent::text("42")],
+            ),
+        ])
+    }
+
+    #[test]
+    fn native_exec_history_projects_to_chat_function_call_and_one_ordered_result() {
+        let mut request = native_exec_history_request();
+        request
+            .project_code_mode_for_function_backend(crate::ModelProvider::Kimi)
+            .expect("Chat backends must receive function-envelope history");
+
+        let wire = serde_json::to_value(ChatCompletionRequest::from(request)).unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        let call = messages
+            .iter()
+            .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+            .find(|call| call["function"]["name"] == "exec")
+            .expect("projected exec function call");
+        assert_eq!(call["id"], "call-native-exec");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                call["function"]["arguments"].as_str().unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({"source": "const answer = 40 + 2;"})
+        );
+        let results = messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["tool_call_id"], "call-native-exec");
+        assert_eq!(
+            results[0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "progress"},
+                {"type": "text", "text": "42"}
+            ])
+        );
+    }
+
+    #[test]
+    fn native_exec_history_projects_to_messages_tool_use_and_one_ordered_result() {
+        let mut request = native_exec_history_request();
+        request
+            .project_code_mode_for_function_backend(crate::ModelProvider::Kimi)
+            .expect("Messages backends must receive function-envelope history");
+
+        let wire = serde_json::to_value(build_messages_request(&request)).unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        let blocks = messages
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .collect::<Vec<_>>();
+        let call = blocks
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .expect("projected exec tool use");
+        assert_eq!(call["id"], "call-native-exec");
+        assert_eq!(call["name"], "exec");
+        assert_eq!(
+            call["input"],
+            serde_json::json!({"source": "const answer = 40 + 2;"})
+        );
+        let results = blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_result")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["tool_use_id"], "call-native-exec");
+        assert_eq!(
+            results[0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "progress"},
+                {"type": "text", "text": "42"}
+            ])
+        );
+    }
+
+    #[test]
+    fn function_backend_projection_rejects_non_exec_native_history() {
+        let mut request = ConversationRequest::from_items(vec![
+            ConversationItem::assistant_tool_calls(vec![ToolCall::custom(
+                "call-code",
+                "ctc-code",
+                "code",
+                "return 42",
+            )]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "42").with_name("code"),
+            ),
+        ]);
+        assert_matches!(
+            request.project_code_mode_for_function_backend(crate::ModelProvider::Kimi),
+            Err(CodeModeProjectionError::UnsupportedCustomCall { name, .. }) if name == "code"
+        );
+    }
+
+    #[test]
+    fn xai_coalesces_exec_notifications_with_final_function_result() {
+        let mut request = ConversationRequest::from_items(vec![
+            ConversationItem::assistant_tool_calls(vec![ToolCall {
+                id: Arc::<str>::from("call-exec"),
+                name: "exec".into(),
+                arguments: Arc::<str>::from(r#"{"source":"return 42"}"#),
+            }]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-exec", "notify one").with_name("exec"),
+            ),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-exec", "notify two").with_name("exec"),
+            ),
+            ConversationItem::tool_result_with_ordered_content(
+                "call-exec",
+                vec![CustomToolOutputContent::text("final")],
+            ),
+        ])
+        .with_tools(vec![ToolSpec {
+            name: "exec".into(),
+            description: Some("Execute JavaScript".into()),
+            parameters: code_mode_exec_function_parameters(),
+        }]);
+
+        request
+            .project_code_mode_for_provider(crate::ModelProvider::Xai)
+            .expect("xAI mixed internal exec history must project");
+        let wire = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+        assert!(!contains_native_custom_wire_type(&wire));
+
+        let outputs = wire["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 1, "one function output is valid per call");
+        assert_eq!(outputs[0]["call_id"], "call-exec");
+        assert_eq!(
+            outputs[0]["output"],
+            serde_json::json!([
+                {"type": "input_text", "text": "notify one"},
+                {"type": "input_text", "text": "notify two"},
+                {"type": "input_text", "text": "final"}
+            ])
+        );
+    }
+
+    #[test]
+    fn xai_rejects_non_exec_native_custom_declarations_and_history() {
+        let mut declaration = ConversationRequest::new().with_client_tools([ClientTool::Custom {
+            name: "code".into(),
+            description: None,
+            format: rs::CustomToolParamFormat::Text,
+        }]);
+        assert_matches!(
+            declaration.project_code_mode_for_provider(crate::ModelProvider::Xai),
+            Err(CodeModeProjectionError::UnsupportedCustomTool { name, .. }) if name == "code"
+        );
+
+        let mut history = ConversationRequest::from_items(vec![
+            ConversationItem::assistant_tool_calls(vec![ToolCall::custom(
+                "call-code",
+                "ctc-code",
+                "code",
+                "return 42",
+            )]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("call-code", "42").with_name("code"),
+            ),
+        ]);
+        assert_matches!(
+            history.project_code_mode_for_provider(crate::ModelProvider::Xai),
+            Err(CodeModeProjectionError::UnsupportedCustomCall { name, .. }) if name == "code"
         );
     }
 
@@ -9845,15 +10668,15 @@ mod tests {
             .decode(png_b64)
             .unwrap();
         let good = format!("data:image/png;base64,{png_b64}");
-        let mut req = ConversationRequest::from_items(vec![
-            ConversationItem::custom_tool_output(CustomToolOutputItem::new(
+        let mut req = ConversationRequest::from_items(vec![ConversationItem::custom_tool_output(
+            CustomToolOutputItem::new(
                 "call-exec",
                 [CustomToolOutputContent::image(
                     good,
                     CustomToolOutputImageDetail::Low,
                 )],
-            )),
-        ]);
+            ),
+        )]);
         assert_eq!(req.prepare_images_for_codex(), 1);
         assert_matches!(
             &req.items[0],

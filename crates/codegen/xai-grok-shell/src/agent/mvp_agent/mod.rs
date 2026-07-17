@@ -208,6 +208,12 @@ pub(crate) struct SessionSpawnOptions<'a> {
         crate::session::announcement_state::AnnouncementState,
     >,
     pub previous_turn_model: Option<crate::session::compaction_config::PreviousModelInfo>,
+    /// Validated cold-resume policy for the actor's initial provider route.
+    pub resolved_tool_policy_override:
+        Option<crate::session::tool_surface::ResolvedToolPolicy>,
+    /// New sessions persist their initial model immediately. Resumed sessions
+    /// defer this write until final catalog/fallback selection is committed.
+    pub persist_initial_model: bool,
     pub session_meta: Option<&'a acp::Meta>,
     pub managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub model_agent_type: Option<&'a str>,
@@ -345,6 +351,8 @@ pub(crate) fn chat_session_spawn_options<'a>(
         persisted_goal_mode: None,
         persisted_announcement_state: None,
         previous_turn_model: None,
+        resolved_tool_policy_override: None,
+        persist_initial_model: true,
         session_meta,
         managed_mcp_expires_at: None,
         model_agent_type,
@@ -1321,6 +1329,24 @@ pub(crate) struct OrphanedTask {
     cwd: String,
 }
 impl MvpAgent {
+    fn is_code_mode_exec_call(call: &xai_grok_sampling_types::ToolCall) -> bool {
+        if call.name != xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME {
+            return false;
+        }
+        if call.is_custom() {
+            return true;
+        }
+        serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some()
+    }
+
     fn collect_code_mode_transport_ids(
         models: &IndexMap<String, ModelEntry>,
         conversation: &[xai_grok_sampling_types::ConversationItem],
@@ -1347,15 +1373,14 @@ impl MvpAgent {
                             )
                         )
                     });
-                    let has_custom_exec = assistant.tool_calls.iter().any(|call| {
-                        call.is_custom()
-                            && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
-                    });
-                    code_mode_turn |= model_uses_code_mode || has_custom_exec;
+                    let has_code_mode_exec = assistant
+                        .tool_calls
+                        .iter()
+                        .any(Self::is_code_mode_exec_call);
+                    code_mode_turn |= model_uses_code_mode || has_code_mode_exec;
 
                     for call in &assistant.tool_calls {
-                        let is_exec = call.is_custom()
-                            && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME;
+                        let is_exec = Self::is_code_mode_exec_call(call);
                         let is_wait = code_mode_turn
                             && !call.is_custom()
                             && call.name == xai_grok_code_mode_protocol::WAIT_TOOL_NAME

@@ -698,9 +698,11 @@ pub fn current_value_for(
         "remember_tool_approvals" => Some(SettingValue::Bool(
             ui.remember_tool_approvals.unwrap_or(false),
         )),
-        // code_mode: Option<bool>; unset means the model/default decides, which
-        // presents as the explicit force switch being off.
-        "code_mode" => Some(SettingValue::Bool(ui.code_mode.unwrap_or(false))),
+        // code_mode: unset is the explicit Direct default. Legacy booleans are
+        // normalized by UiConfig deserialization before reaching the pager.
+        "code_mode" => Some(SettingValue::Enum(
+            ui.code_mode.unwrap_or_default().as_canonical(),
+        )),
         // ask_user_question timeout: reflects the effective TOML merge; the
         // toggle writes the user layer, and env/remote settings tiers feed the
         // final gate at agent build. None → the resolver-shared default (ON).
@@ -1041,14 +1043,26 @@ mod tests {
                         "remember_tool_approvals default drifts from UiConfig::default()"
                     );
                 }
-                // code_mode: Option<bool>; None means no forced override (off).
-                ("code_mode", SettingKind::Bool { default }) => {
+                // code_mode: None resolves to the explicit Direct preference.
+                (
+                    "code_mode",
+                    SettingKind::Enum {
+                        default, choices, ..
+                    },
+                ) => {
                     assert_eq!(
                         *default,
-                        ui.code_mode.unwrap_or(false),
+                        ui.code_mode.unwrap_or_default().as_canonical(),
                         "code_mode default drifts from UiConfig::default()"
                     );
-                    assert!(!*default, "code_mode must default off");
+                    assert_eq!(*default, "direct", "code_mode must default direct");
+                    assert_eq!(
+                        choices
+                            .iter()
+                            .map(|choice| choice.canonical)
+                            .collect::<Vec<_>>(),
+                        vec!["direct", "code_mode", "code_mode_only"],
+                    );
                 }
                 // ask_user_question timeout: no UiConfig mirror (lives under
                 // `[toolset]`); default anchored on the resolver-shared const.

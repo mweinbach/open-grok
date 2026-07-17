@@ -4,6 +4,26 @@
 //! Co-located child of `mvp_agent` (`use super::*`).
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LoadModelSelectionOrigin {
+    PersistedIdentity,
+    UnavailableFallback,
+}
+
+impl LoadModelSelectionOrigin {
+    pub(super) fn restores_persisted_tool_policy(
+        self,
+        requested_model_id: Option<&acp::ModelId>,
+        policy: crate::session::tool_surface::ResolvedToolPolicy,
+        provider: xai_grok_sampling_types::ModelProvider,
+        backend: &xai_grok_sampling_types::ApiBackend,
+    ) -> bool {
+        requested_model_id.is_none()
+            && self == Self::PersistedIdentity
+            && policy.is_exact_route(provider, backend)
+    }
+}
+
 /// Build the post-login Codex catalog response without coupling OAuth success
 /// to the optional live fetch. `models` is sampled after the login attempt, so
 /// on refresh failure it still contains auth-visible cached/embedded fallbacks.
@@ -1159,6 +1179,8 @@ impl acp::Agent for MvpAgent {
                         persisted_goal_mode: None,
                         persisted_announcement_state: None,
                         previous_turn_model: None,
+                        resolved_tool_policy_override: None,
+                        persist_initial_model: true,
                         session_meta: arguments.meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: model_agent_type.as_deref(),
@@ -1547,6 +1569,16 @@ impl acp::Agent for MvpAgent {
             &startup_auth_model_id,
             origin_client.clone(),
         );
+        let startup_tool_policy_override = requested_model_id
+            .is_none()
+            .then_some(summary.resolved_tool_policy)
+            .flatten()
+            .filter(|policy| {
+                policy.is_exact_route(
+                    startup_sampling.provider,
+                    &startup_sampling.api_backend,
+                )
+            });
         match startup_sampling.provider.profile().session_auth {
             xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly
                 if startup_sampling.api_key.is_none()
@@ -1793,6 +1825,8 @@ impl acp::Agent for MvpAgent {
                         persisted_goal_mode: _persisted_goal_mode,
                         persisted_announcement_state,
                         previous_turn_model: summary.previous_turn_model.clone(),
+                        resolved_tool_policy_override: startup_tool_policy_override,
+                        persist_initial_model: false,
                         session_meta: request_meta.as_ref(),
                         managed_mcp_expires_at,
                         model_agent_type: persisted_agent_name.as_deref(),
@@ -1930,7 +1964,7 @@ impl acp::Agent for MvpAgent {
             &available,
             &persisted_model,
         );
-        let model_id = if let Some(catalog_key) = selectable_catalog_key {
+        let (model_id, model_selection_origin) = if let Some(catalog_key) = selectable_catalog_key {
             if catalog_key != persisted_model {
                 tracing::info!(
                     session_id = % session_id.0, persisted = % persisted_model.0,
@@ -1948,7 +1982,7 @@ impl acp::Agent for MvpAgent {
                     ),
                 );
             }
-            catalog_key
+            (catalog_key, LoadModelSelectionOrigin::PersistedIdentity)
         } else if available.is_empty() {
             tracing::warn!(
                 session_id = % session_id.0, persisted = % persisted_model.0,
@@ -1963,7 +1997,10 @@ impl acp::Agent for MvpAgent {
                     ),
                 ),
             );
-            persisted_model
+            (
+                persisted_model,
+                LoadModelSelectionOrigin::PersistedIdentity,
+            )
         } else if let Some(fallback) = same_family_fallback {
             tracing::warn!(
                 session_id = % session_id.0, previous = % persisted_model.0, new = %
@@ -1981,7 +2018,7 @@ impl acp::Agent for MvpAgent {
                     &reason,
                 )
                 .await;
-            fallback
+            (fallback, LoadModelSelectionOrigin::UnavailableFallback)
         } else {
             let fallback = available
                 .keys()
@@ -2020,12 +2057,34 @@ impl acp::Agent for MvpAgent {
             self.model_unavailable_sessions
                 .borrow_mut()
                 .insert(session_id.0.to_string(), persisted_model.clone());
-            fallback
+            (fallback, LoadModelSelectionOrigin::UnavailableFallback)
         };
         tracing::debug!(
             session_id = % session_id.0, final_model_id = % model_id.0,
             "load_session: resolved final model_id for set_session_model"
         );
+        let selected_sampling =
+            self.resolve_sampling_config_for_model(&model_id, origin_client.clone());
+        let restored_tool_policy = summary.resolved_tool_policy.filter(|policy| {
+            model_selection_origin.restores_persisted_tool_policy(
+                requested_model_id.as_ref(),
+                *policy,
+                selected_sampling.provider,
+                &selected_sampling.api_backend,
+            )
+        });
+        if requested_model_id.is_none()
+            && model_selection_origin == LoadModelSelectionOrigin::PersistedIdentity
+            && summary.resolved_tool_policy.is_some()
+            && restored_tool_policy.is_none()
+        {
+            tracing::info!(
+                session_id = % session_id.0,
+                provider = % selected_sampling.provider.name(),
+                backend = ?selected_sampling.api_backend,
+                "load_session: persisted tool policy route changed; resolving policy fresh"
+            );
+        }
         {
             let _timer = crate::instrumentation_timer!("session.restore_model");
             let restore_meta = requested_model_id.is_none().then(|| summary.reasoning_effort)
@@ -2038,12 +2097,19 @@ impl acp::Agent for MvpAgent {
                     );
                     map
                 });
-            let _ = crate::agent::handlers::model_switch::apply(
+            let restore_request =
+                acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
+                    .meta(restore_meta);
+            if let Some(policy) = restored_tool_policy {
+                crate::agent::handlers::model_switch::apply_restored(
                     self,
-                    acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
-                        .meta(restore_meta),
+                    restore_request,
+                    policy,
                 )
-                .await;
+                .await?;
+            } else {
+                crate::agent::handlers::model_switch::apply(self, restore_request).await?;
+            }
         }
         let mut response_meta_map = serde_json::Map::new();
         response_meta_map.insert("sessionId".to_string(), serde_json::json!(session_id));

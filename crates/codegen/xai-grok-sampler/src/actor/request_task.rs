@@ -449,12 +449,13 @@ async fn run_one_attempt(
             drive_l2(l2, request_id, event_tx, cancel_token, captured, None).await
         }
         ApiBackend::Responses => {
-            let client_custom_tool_names = request.client_custom_tool_names();
-            let (raw, metadata, doom_loop) =
-                match client.conversation_stream_responses(request).await {
-                    Ok(parts) => parts,
-                    Err(e) => return AttemptOutcome::InitFailed { error: e },
-                };
+            let (raw, metadata, doom_loop, client_custom_tool_names) = match client
+                .conversation_stream_responses_with_client_custom_tools(request)
+                .await
+            {
+                Ok(parts) => parts,
+                Err(e) => return AttemptOutcome::InitFailed { error: e },
+            };
             if doom_check.is_none()
                 && let Some(collector) = &doom_loop
             {

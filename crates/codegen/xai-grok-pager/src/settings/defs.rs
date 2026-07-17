@@ -119,6 +119,24 @@ const PERMISSION_MODE_CHOICES: &[EnumChoice] = &[
     },
 ];
 
+const CODE_MODE_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "direct",
+        display: "Direct",
+        description: "Expose ordinary tools directly; do not add the Code Mode transport.",
+    },
+    EnumChoice {
+        canonical: "code_mode",
+        display: "Code Mode",
+        description: "Expose exec and wait alongside ordinary top-level tools.",
+    },
+    EnumChoice {
+        canonical: "code_mode_only",
+        display: "Code Mode Only",
+        description: "Expose ordinary tools only through nested tools.* calls.",
+    },
+];
+
 // ---------------------------------------------------------------------------
 // Coding-data-sharing catalog.
 //
@@ -824,13 +842,15 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Agent,
             owner: SettingOwner::Shell,
             label: "Code mode",
-            description: "When on, new Responses-backed sessions use mixed Code Mode with ordinary tools still available when the model does not specify a tool mode. Model metadata can still require Code Mode Only. Restart required.",
+            description: "Choose direct tools, mixed Code Mode, or Code Mode Only for Responses-backed sessions. OpenAI Codex models may require Code Mode Only. Restart Open Grok to apply.",
             keywords: &[
                 "code", "mode", "codex", "coding", "agent", "session", "fallback", "mixed",
-                "model", "metadata", "default",
+                "model", "metadata", "default", "direct", "only",
             ],
-            kind: SettingKind::Bool {
-                default: ui_default.code_mode.unwrap_or(false),
+            kind: SettingKind::Enum {
+                default: ui_default.code_mode.unwrap_or_default().as_canonical(),
+                choices: CODE_MODE_CHOICES,
+                supports_preview: false,
             },
             restart_required: true,
             hidden_in_minimal: false,

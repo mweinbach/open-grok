@@ -830,16 +830,23 @@ pub fn parse_remote_model_value(
         Some(value) => serde_json::from_value(serde_json::Value::String(value)).ok()?,
         None => xai_grok_sampling_types::ModelProvider::default(),
     };
-    let tool_mode = get_string(obj, "toolMode")
-        .or_else(|| get_string(obj, "tool_mode"))
-        .or_else(|| meta.and_then(|m| get_string(m, "toolMode")))
-        .or_else(|| meta.and_then(|m| get_string(m, "tool_mode")))
-        .and_then(|value| match value.as_str() {
-            "direct" => Some(xai_grok_sampling_types::ToolMode::Direct),
-            "code_mode" => Some(xai_grok_sampling_types::ToolMode::CodeMode),
-            "code_mode_only" => Some(xai_grok_sampling_types::ToolMode::CodeModeOnly),
-            _ => None,
-        });
+    // Catalog serializers commonly emit a top-level `null` for an omitted
+    // optional field while retaining the provider metadata in `_meta`. Treat
+    // null as absent at every precedence level, but keep rejecting the first
+    // non-null value when it is unknown or malformed.
+    let tool_mode_value = [
+        obj.get("toolMode"),
+        obj.get("tool_mode"),
+        meta.and_then(|m| m.get("toolMode")),
+        meta.and_then(|m| m.get("tool_mode")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !value.is_null());
+    let tool_mode = match tool_mode_value {
+        Some(value) => Some(serde_json::from_value(value.clone()).ok()?),
+        None => None,
+    };
     Some(crate::agent::config::ModelEntryConfig {
         id,
         model,
@@ -1452,6 +1459,52 @@ mod tests {
         assert_eq!(
             result.provider,
             xai_grok_sampling_types::ModelProvider::Codex
+        );
+    }
+
+    #[test]
+    fn parse_rejects_explicit_unknown_tool_mode() {
+        for tool_mode in [serde_json::json!("automatic"), serde_json::json!(42)] {
+            let value = serde_json::json!({
+                "model": "future-model",
+                "apiBackend": "responses",
+                "toolMode": tool_mode,
+                "provider": "xai"
+            });
+            assert!(
+                parse_remote_model_value(&value, "https://api.x.ai/v1").is_none(),
+                "an unknown explicit tool mode must reject the catalog entry",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_treats_null_tool_mode_as_unspecified() {
+        let value = serde_json::json!({
+            "model": "nullable-model",
+            "apiBackend": "responses",
+            "toolMode": null,
+            "provider": "xai"
+        });
+        let parsed = parse_remote_model_value(&value, "https://api.x.ai/v1")
+            .expect("an optional null tool mode must not reject the catalog entry");
+        assert_eq!(parsed.tool_mode, None);
+    }
+
+    #[test]
+    fn parse_top_level_null_tool_mode_falls_through_to_meta() {
+        let value = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "apiBackend": "responses",
+            "toolMode": null,
+            "provider": "openai",
+            "_meta": { "toolMode": "code_mode_only" }
+        });
+        let parsed = parse_remote_model_value(&value, "https://api.openai.com/v1")
+            .expect("top-level null must not mask provider metadata");
+        assert_eq!(
+            parsed.tool_mode,
+            Some(xai_grok_sampling_types::ToolMode::CodeModeOnly)
         );
     }
 

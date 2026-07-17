@@ -42,16 +42,86 @@ pub const DEFAULT_AGENT_TYPE: &str = "grok-build-plan";
 pub fn default_agent_type() -> String {
     DEFAULT_AGENT_TYPE.to_owned()
 }
-/// Resolve the session's tool presentation using Codex's model-first
-/// precedence. The Settings switch supplies mixed Code Mode only for models
-/// that do not declare their own mode.
-pub fn effective_tool_mode(model_mode: Option<ToolMode>, code_mode_enabled: bool) -> ToolMode {
-    model_mode.unwrap_or({
-        if code_mode_enabled {
-            ToolMode::CodeMode
-        } else {
-            ToolMode::Direct
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolModeSource {
+    Default,
+    UserPreference,
+    ModelRequirement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedToolMode {
+    pub mode: ToolMode,
+    pub source: ToolModeSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolModeResolutionError {
+    pub provider: ModelProvider,
+    pub api_backend: ApiBackend,
+    pub required_mode: ToolMode,
+}
+
+impl std::fmt::Display for ToolModeResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "model provider {} requires {:?}, but backend {:?} does not support Code Mode",
+            self.provider.as_str(),
+            self.required_mode,
+            self.api_backend,
+        )
+    }
+}
+
+impl std::error::Error for ToolModeResolutionError {}
+
+/// Resolve the session's effective tool presentation and its precedence source.
+///
+/// The user preference controls Responses-backed sessions, except that an
+/// OpenAI Codex model may require Code Mode Only in its catalog metadata.
+/// Non-Responses backends cannot carry custom/freeform Code Mode tools and
+/// therefore fail closed to direct tools.
+pub fn effective_tool_mode(
+    provider: ModelProvider,
+    api_backend: &ApiBackend,
+    model_mode: Option<ToolMode>,
+    preference: Option<ToolModePreference>,
+) -> Result<ResolvedToolMode, ToolModeResolutionError> {
+    if provider == ModelProvider::Codex && model_mode == Some(ToolMode::CodeModeOnly) {
+        if !matches!(api_backend, ApiBackend::Responses) {
+            return Err(ToolModeResolutionError {
+                provider,
+                api_backend: *api_backend,
+                required_mode: ToolMode::CodeModeOnly,
+            });
         }
+        return Ok(ResolvedToolMode {
+            mode: ToolMode::CodeModeOnly,
+            source: ToolModeSource::ModelRequirement,
+        });
+    }
+    if !matches!(api_backend, ApiBackend::Responses) {
+        return Ok(ResolvedToolMode {
+            mode: ToolMode::Direct,
+            source: ToolModeSource::Default,
+        });
+    }
+    let Some(preference) = preference else {
+        return Ok(ResolvedToolMode {
+            mode: ToolMode::Direct,
+            source: ToolModeSource::Default,
+        });
+    };
+    let mode = match preference {
+        ToolModePreference::Direct => ToolMode::Direct,
+        ToolModePreference::CodeMode => ToolMode::CodeMode,
+        ToolModePreference::CodeModeOnly => ToolMode::CodeModeOnly,
+    };
+    Ok(ResolvedToolMode {
+        mode,
+        source: ToolModeSource::UserPreference,
     })
 }
 /// Default base URL for the cli chat proxy.
@@ -1628,7 +1698,7 @@ fn resolve_subagent_permission_mode(
 pub use xai_grok_agent::config::AgentDefinition;
 pub use xai_grok_agent::config::Effort;
 pub use xai_grok_agent::config::PermissionMode;
-pub use xai_grok_shared::ui_config::{ContextualHints, UiConfig};
+pub use xai_grok_shared::ui_config::{ContextualHints, ToolModePreference, UiConfig};
 /// Configuration for selecting the agent definition.
 ///
 /// Set in `config.toml` under `[agent]`:
@@ -3423,7 +3493,7 @@ pub fn resolve_model_list_with_provider_catalogs(
                 entry.info.model.clone(),
                 (
                     entry.info.context_window,
-                    entry.info.api_backend.clone(),
+                    entry.info.api_backend,
                     entry.info.tool_mode,
                 ),
             );
@@ -3771,8 +3841,8 @@ pub struct ModelEntryConfig {
     /// OAuth account and OpenAI hosted-tool dialect.
     #[serde(default, skip_serializing_if = "is_default_model_provider")]
     pub provider: ModelProvider,
-    /// Model-selected tool presentation. Model metadata takes precedence over
-    /// the user Code Mode preference, matching the Codex model catalog.
+    /// Catalog tool presentation. A Codex `CodeModeOnly` value is a hard model
+    /// requirement; other Responses-backed routes follow the user preference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<ToolMode>,
     /// Whether this Codex model advertises `multi_agent_version = "v2"`.
@@ -3900,6 +3970,7 @@ pub struct ConfigModelOverride {
     pub top_p: Option<f32>,
     pub api_backend: Option<ApiBackend>,
     pub provider: Option<ModelProvider>,
+    pub auth_scheme: Option<AuthScheme>,
     pub tool_mode: Option<ToolMode>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
@@ -3963,11 +4034,52 @@ impl ConfigModelOverride {
         if self.top_p.is_some() {
             entry.info.top_p = self.top_p;
         }
-        if let Some(ref v) = self.api_backend {
-            entry.info.api_backend = v.clone();
-        }
+        let provider_changed = self
+            .provider
+            .is_some_and(|provider| provider != entry.info.provider);
         if let Some(v) = self.provider {
             entry.info.provider = v;
+        }
+        if provider_changed {
+            // Catalog capabilities are provider-local. Do not carry a donor's
+            // wire backend, Code Mode policy, harness, or hosted-search flags
+            // across a provider override. Explicit fields below may opt back
+            // into values valid for the newly selected provider.
+            entry.info.api_backend = match entry.info.provider {
+                ModelProvider::Codex => ApiBackend::Responses,
+                ModelProvider::Xai | ModelProvider::Kimi => ApiBackend::ChatCompletions,
+            };
+            if self.base_url.is_none() {
+                entry.info.base_url.clear();
+            }
+            entry.info.tool_mode = None;
+            entry.info.codex_multi_agent_v2 = false;
+            entry.info.auth_scheme = AuthScheme::default();
+            entry.info.extra_headers.clear();
+            entry.info.agent_type = if entry.info.provider == ModelProvider::Codex {
+                "codex".to_owned()
+            } else {
+                default_agent_type()
+            };
+            entry.info.supports_backend_search = false;
+            entry.info.reasoning_effort = None;
+            entry.info.supports_reasoning_effort = false;
+            entry.info.reasoning_efforts.clear();
+            entry.info.supports_reasoning_summary_parameter = false;
+            entry.info.default_reasoning_summary = ReasoningSummary::None;
+            entry.info.compactions_remaining = None;
+            entry.info.compaction_at_tokens = None;
+            entry.info.show_model_fingerprint = false;
+            entry.info.stream_tool_calls = None;
+            entry.api_key = None;
+            entry.env_key = None;
+            entry.api_base_url = None;
+        }
+        if let Some(ref v) = self.api_backend {
+            entry.info.api_backend = *v;
+        }
+        if let Some(v) = self.auth_scheme {
+            entry.info.auth_scheme = v;
         }
         if self.base_url.is_none()
             && entry.info.provider.profile().session_auth.is_api_key_only()
@@ -4076,8 +4188,8 @@ pub struct ModelInfo {
     pub api_backend: ApiBackend,
     #[serde(default)]
     pub provider: ModelProvider,
-    /// Model-selected tool presentation. `None` lets the session preference
-    /// decide; `Some` is authoritative for compatibility-sensitive models.
+    /// Catalog tool presentation. Only Codex `CodeModeOnly` is treated as a
+    /// hard requirement; otherwise the session preference decides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<ToolMode>,
     /// Live Codex multi-agent protocol capability. This is provider metadata,
@@ -4194,7 +4306,7 @@ impl ModelInfo {
             max_completion_tokens: entry.max_completion_tokens,
             temperature: entry.temperature,
             top_p: entry.top_p,
-            api_backend: entry.api_backend.clone(),
+            api_backend: entry.api_backend,
             provider: entry.provider,
             tool_mode: entry.tool_mode,
             codex_multi_agent_v2: entry.codex_multi_agent_v2,
@@ -5274,7 +5386,7 @@ pub fn sampling_config_for_model(
         alpha_test_key.as_deref(),
         &credentials.base_url,
     );
-    let api_backend = info.api_backend.clone();
+    let api_backend = info.api_backend;
     // An explicit per-model API key is authoritative even for a Codex model.
     // Only the OAuth-backed path may refresh and replace the bearer token.
     let uses_codex_oauth = info.provider.profile().session_auth.is_codex()
@@ -5609,9 +5721,8 @@ pub fn to_acp_model_info(
 /// Error code for model switch rejection due to agent type mismatch.
 pub const MODEL_SWITCH_INCOMPATIBLE_AGENT: &str = "MODEL_SWITCH_INCOMPATIBLE_AGENT";
 /// Error code for model switch failure during the zero-turn full harness
-/// rebuild path. Emitted when `RebuildAgentForDefinition` fails (definition
-/// could not be resolved at handler time, `AgentBuilder::build()` errored,
-/// or a turn started racing the rebuild).
+/// rebuild path. Emitted when the definition cannot be resolved, the staged
+/// `AgentBuilder::build()` fails, or a live turn blocks the actor mutation.
 pub const MODEL_SWITCH_REBUILD_FAILED: &str = "MODEL_SWITCH_REBUILD_FAILED";
 /// Structured error payload for model switch rejection due to agent type
 /// incompatibility. Serialized into `acp::Error.data` by the shell and
@@ -7285,25 +7396,96 @@ reasoning_effort = "low"
         assert_eq!(resolved["direct"].info.tool_mode, None);
     }
     #[test]
-    fn effective_tool_mode_uses_mixed_settings_fallback_and_model_first_override() {
+    fn effective_tool_mode_uses_explicit_preference_and_codex_only_override() {
         assert_eq!(
-            effective_tool_mode(Some(ToolMode::Direct), true),
-            ToolMode::Direct
+            effective_tool_mode(
+                ModelProvider::Xai,
+                &ApiBackend::Responses,
+                Some(ToolMode::CodeModeOnly),
+                Some(ToolModePreference::CodeMode),
+            )
+            .unwrap(),
+            ResolvedToolMode {
+                mode: ToolMode::CodeMode,
+                source: ToolModeSource::UserPreference,
+            },
+            "xAI catalog metadata must not silently force Code Mode Only",
         );
         assert_eq!(
-            effective_tool_mode(Some(ToolMode::CodeMode), false),
-            ToolMode::CodeMode
+            effective_tool_mode(
+                ModelProvider::Xai,
+                &ApiBackend::Responses,
+                None,
+                Some(ToolModePreference::CodeModeOnly),
+            )
+            .unwrap(),
+            ResolvedToolMode {
+                mode: ToolMode::CodeModeOnly,
+                source: ToolModeSource::UserPreference,
+            },
+            "Code Mode Only remains an explicit user option",
         );
         assert_eq!(
-            effective_tool_mode(Some(ToolMode::CodeModeOnly), false),
-            ToolMode::CodeModeOnly
+            effective_tool_mode(
+                ModelProvider::Codex,
+                &ApiBackend::Responses,
+                Some(ToolMode::CodeModeOnly),
+                Some(ToolModePreference::Direct),
+            )
+            .unwrap(),
+            ResolvedToolMode {
+                mode: ToolMode::CodeModeOnly,
+                source: ToolModeSource::ModelRequirement,
+            },
+            "Codex model requirements override Settings",
         );
         assert_eq!(
-            effective_tool_mode(Some(ToolMode::CodeModeOnly), true),
-            ToolMode::CodeModeOnly
+            effective_tool_mode(
+                ModelProvider::Codex,
+                &ApiBackend::Responses,
+                None,
+                Some(ToolModePreference::CodeMode),
+            )
+            .unwrap(),
+            ResolvedToolMode {
+                mode: ToolMode::CodeMode,
+                source: ToolModeSource::UserPreference,
+            },
         );
-        assert_eq!(effective_tool_mode(None, true), ToolMode::CodeMode);
-        assert_eq!(effective_tool_mode(None, false), ToolMode::Direct);
+        assert_eq!(
+            effective_tool_mode(
+                ModelProvider::Kimi,
+                &ApiBackend::ChatCompletions,
+                Some(ToolMode::CodeModeOnly),
+                Some(ToolModePreference::CodeModeOnly),
+            )
+            .unwrap(),
+            ResolvedToolMode {
+                mode: ToolMode::Direct,
+                source: ToolModeSource::Default,
+            },
+        );
+        assert_eq!(
+            effective_tool_mode(ModelProvider::Xai, &ApiBackend::Responses, None, None,).unwrap(),
+            ResolvedToolMode {
+                mode: ToolMode::Direct,
+                source: ToolModeSource::Default,
+            },
+        );
+    }
+
+    #[test]
+    fn effective_tool_mode_rejects_incompatible_codex_requirement() {
+        let error = effective_tool_mode(
+            ModelProvider::Codex,
+            &ApiBackend::ChatCompletions,
+            Some(ToolMode::CodeModeOnly),
+            Some(ToolModePreference::Direct),
+        )
+        .expect_err("required Code Mode Only must fail before a prompt is sent");
+        assert_eq!(error.provider, ModelProvider::Codex);
+        assert_eq!(error.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(error.required_mode, ToolMode::CodeModeOnly);
     }
     /// Messages backend (Anthropic) auto-defaults supports_reasoning_effort=true.
     /// Without this, `--reasoning-effort` is silently dropped in
@@ -12235,6 +12417,86 @@ default = "grok-4.5"
             entry.info.base_url.is_empty(),
             "a Kimi credential must never inherit the built-in xAI endpoint"
         );
+    }
+
+    #[test]
+    fn provider_changing_override_clears_inherited_execution_metadata() {
+        let endpoints = EndpointsConfig::default();
+        let mut base = default_model_entries(&endpoints)
+            .shift_remove("gpt-5.6-sol")
+            .expect("embedded Codex entry");
+        base.info
+            .extra_headers
+            .insert("authorization".to_owned(), "Bearer donor-secret".to_owned());
+        base.info.auth_scheme = AuthScheme::XApiKey;
+        base.info.stream_tool_calls = Some(true);
+        base.info.compactions_remaining = Some(CompactionsRemaining::Fixed(3));
+        base.info.compaction_at_tokens = Some(CompactionAtTokens::Fixed(123_000));
+        base.info.show_model_fingerprint = true;
+        base.api_key = Some("donor-api-key".to_owned());
+        base.env_key = Some(EnvKeys::single("DONOR_API_KEY"));
+        base.api_base_url = Some("https://donor-api.invalid/v1".to_owned());
+        let entry = ConfigModelOverride {
+            model: Some("kimi-k3".to_owned()),
+            provider: Some(ModelProvider::Kimi),
+            base_url: Some("https://api.moonshot.ai/v1".to_owned()),
+            ..Default::default()
+        }
+        .apply("gpt-5.6-sol", Some(base), &endpoints);
+        assert_eq!(entry.info.provider, ModelProvider::Kimi);
+        assert_eq!(entry.info.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(entry.info.tool_mode, None);
+        assert!(!entry.info.codex_multi_agent_v2);
+        assert_eq!(entry.info.agent_type, DEFAULT_AGENT_TYPE);
+        assert!(!entry.info.supports_backend_search);
+        assert!(!entry.info.supports_reasoning_summary_parameter);
+        assert_eq!(entry.info.default_reasoning_summary, ReasoningSummary::None);
+        assert_eq!(entry.info.auth_scheme, AuthScheme::Bearer);
+        assert!(entry.info.extra_headers.is_empty());
+        assert_eq!(entry.info.stream_tool_calls, None);
+        assert_eq!(entry.info.compactions_remaining, None);
+        assert_eq!(entry.info.compaction_at_tokens, None);
+        assert!(!entry.info.show_model_fingerprint);
+        assert!(entry.api_key.is_none());
+        assert!(entry.env_key.is_none());
+        assert!(entry.api_base_url.is_none());
+    }
+
+    #[test]
+    fn provider_changing_override_applies_explicit_execution_metadata_after_reset() {
+        let endpoints = EndpointsConfig::default();
+        let base = default_model_entries(&endpoints)
+            .shift_remove("gpt-5.6-sol")
+            .expect("embedded Codex entry");
+        let entry = ConfigModelOverride {
+            model: Some("grok-custom".to_owned()),
+            provider: Some(ModelProvider::Xai),
+            base_url: Some("https://api.x.ai/v1".to_owned()),
+            api_backend: Some(ApiBackend::Responses),
+            auth_scheme: Some(AuthScheme::XApiKey),
+            tool_mode: Some(ToolMode::CodeMode),
+            agent_type: Some("custom-harness".to_owned()),
+            supports_backend_search: Some(true),
+            extra_headers: [("x-custom".to_owned(), "fresh".to_owned())]
+                .into_iter()
+                .collect(),
+            api_key: Some("fresh-key".to_owned()),
+            api_base_url: Some("https://api.x.ai/v1".to_owned()),
+            stream_tool_calls: Some(true),
+            ..Default::default()
+        }
+        .apply("gpt-5.6-sol", Some(base), &endpoints);
+        assert_eq!(entry.info.provider, ModelProvider::Xai);
+        assert_eq!(entry.info.api_backend, ApiBackend::Responses);
+        assert_eq!(entry.info.tool_mode, Some(ToolMode::CodeMode));
+        assert_eq!(entry.info.agent_type, "custom-harness");
+        assert!(entry.info.supports_backend_search);
+        assert!(!entry.info.codex_multi_agent_v2);
+        assert_eq!(entry.info.auth_scheme, AuthScheme::XApiKey);
+        assert_eq!(entry.info.extra_headers["x-custom"], "fresh");
+        assert_eq!(entry.api_key.as_deref(), Some("fresh-key"));
+        assert_eq!(entry.api_base_url.as_deref(), Some("https://api.x.ai/v1"));
+        assert_eq!(entry.info.stream_tool_calls, Some(true));
     }
     #[test]
     fn embedded_codex_fallback_uses_codex_transport_and_harness() {

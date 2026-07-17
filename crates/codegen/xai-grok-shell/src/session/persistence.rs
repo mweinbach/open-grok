@@ -322,6 +322,9 @@ pub enum PersistenceMsg {
         /// on the mutable model catalog.
         agent_name: Option<String>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+        /// When present, model identity and provider transport are committed
+        /// in the same summary patch so cold resume cannot observe a torn pair.
+        resolved_tool_policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
     },
     /// Persist the model compaction contract captured at turn start. Unlike
     /// `CurrentModel`, this remains the previous turn's contract if the user
@@ -812,6 +815,10 @@ pub struct Summary {
     #[serde(default)]
     pub num_chat_messages: usize,
     pub current_model_id: acp::ModelId,
+    /// Effective tool presentation and transport pinned for this session.
+    /// Legacy summaries omit it and re-resolve from model metadata + Settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_tool_policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
     /// Compaction contract used by the most recently started model turn.
     /// Restored so live Codex `comp_hash` changes are detected after resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -945,6 +952,7 @@ impl Summary {
             num_messages: 0,
             num_chat_messages: 0,
             current_model_id: model_id,
+            resolved_tool_policy: None,
             previous_turn_model: None,
             ever_used_codex: false,
             parent_session_id: None,
@@ -1080,6 +1088,45 @@ mod is_hidden_tests {
         assert_eq!(previous.model_slug, "gpt-5.6-sol");
         assert_eq!(previous.context_window, 353_400);
         assert_eq!(previous.comp_hash.as_deref(), Some("3000"));
+    }
+
+    #[test]
+    fn summary_round_trips_resolved_tool_policy_and_legacy_defaults_none() {
+        let mut summary = summary_with_kind(None);
+        summary.resolved_tool_policy = Some(crate::session::tool_surface::ResolvedToolPolicy {
+            resolved: crate::agent::config::ResolvedToolMode {
+                mode: xai_grok_sampling_types::ToolMode::CodeMode,
+                source: crate::agent::config::ToolModeSource::UserPreference,
+            },
+            transport: Some(xai_grok_sampling_types::CodeModeTransport::FunctionEnvelope),
+            route_provider: Some(xai_grok_sampling_types::ModelProvider::Xai),
+            route_backend: Some(xai_grok_sampling_types::ApiBackend::Responses),
+        });
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let restored: Summary = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.resolved_tool_policy, summary.resolved_tool_policy);
+
+        let mut value = serde_json::to_value(summary).unwrap();
+        let policy = value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("resolved_tool_policy")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        policy.remove("route_provider");
+        policy.remove("route_backend");
+        let legacy_route: Summary = serde_json::from_value(value.clone()).unwrap();
+        let legacy_policy = legacy_route.resolved_tool_policy.unwrap();
+        assert_eq!(legacy_policy.route_provider, None);
+        assert_eq!(legacy_policy.route_backend, None);
+
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("resolved_tool_policy");
+        let legacy: Summary = serde_json::from_value(value).unwrap();
+        assert!(legacy.resolved_tool_policy.is_none());
     }
 
     #[test]
@@ -1758,6 +1805,7 @@ impl SessionPersistence {
                     provider,
                     agent_name,
                     reasoning_effort,
+                    resolved_tool_policy,
                 } => {
                     self.current_provider = provider;
                     self.observe_provider(provider).await;
@@ -1768,6 +1816,7 @@ impl SessionPersistence {
                             &model_id,
                             agent_name.as_deref(),
                             reasoning_effort,
+                            resolved_tool_policy,
                         )
                         .await
                     {

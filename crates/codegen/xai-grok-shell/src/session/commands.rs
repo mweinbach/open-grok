@@ -59,6 +59,48 @@ pub struct PromptTurnOk {
 /// Result of a prompt turn, containing the stop reason, accumulated token count,
 /// and an optional turn-end signals snapshot (for trace metadata enrichment).
 pub type PromptTurnResult = Result<PromptTurnOk, acp::Error>;
+
+/// Canonical session mutations that must run between turns.
+///
+/// The session actor uses this as a start gate: prompts may still be queued
+/// while a mutation is active, but no queued or synthetic turn may be promoted
+/// until the matching mutation ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleMutationKind {
+    ModelSwitch,
+    Rewind,
+    ManualCompaction,
+    HistoryRepair,
+}
+
+impl LifecycleMutationKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelSwitch => "model switch",
+            Self::Rewind => "rewind",
+            Self::ManualCompaction => "manual compaction",
+            Self::HistoryRepair => "history repair",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleMutationBlock {
+    ActiveTurn,
+    MutationInProgress(LifecycleMutationKind),
+}
+
+impl LifecycleMutationBlock {
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::ActiveTurn => "a turn is active; cancel it or wait for it to finish".to_string(),
+            Self::MutationInProgress(kind) => {
+                format!("a session {} is already in progress", kind.as_str())
+            }
+        }
+    }
+}
+
 /// Convenience: successful end-of-turn result.
 pub(crate) fn ok_end_turn(tokens: u64, snapshot: Option<TurnDeltaSnapshot>) -> PromptTurnResult {
     Ok(PromptTurnOk {
@@ -170,11 +212,9 @@ pub enum SessionCommand {
         /// cannot contaminate the inherited prompt configuration.
         apply_prompt_override: bool,
         /// When `true`, suppress the system prompt rewrite even though
-        /// `apply_prompt_override` may be `true`. Set by the model-switch
-        /// orchestrator immediately after a successful
-        /// `RebuildAgentForDefinition` so the fresh harness's prompt
-        /// (already installed by the rebuild handler) is not clobbered by
-        /// the concise/default swap below.
+        /// `apply_prompt_override` may be `true`. Set when this same command
+        /// carries an agent rebuild so the fresh harness prompt installed by
+        /// that atomic mutation is not clobbered by the concise/default swap.
         skip_prompt_rewrite: bool,
         /// Re-resolved auto-compact threshold for the new model. Computed
         /// by `MvpAgent` against the new model id so per-model remote settings
@@ -183,22 +223,13 @@ pub enum SessionCommand {
         /// `compaction.threshold_percent` (which is `Cell<u8>` so it can
         /// update without `&mut self`).
         auto_compact_threshold_percent: u8,
+        /// Optional provider-harness rebuild performed atomically inside the
+        /// same actor command before model state is committed.
+        agent_rebuild: Option<(Box<xai_grok_agent::AgentDefinition>, bool)>,
+        /// Cold-resume pin from summary.json. The actor validates it against
+        /// the selected route; current model requirements still take priority.
+        resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
-    },
-    /// Between-turn harness rebuild: build a brand-new `Agent` from the
-    /// session's `AgentRebuildSpec` and the new `AgentDefinition`,
-    /// re-register MCP tools, swap the live `Agent`, rewrite the
-    /// system message in the conversation, persist the new prompt
-    /// artifacts, and update `active_agent_type`.
-    ///
-    /// Triggered by `MvpAgent::set_session_model` when the new model's
-    /// `agent_type` differs from the session's current one. With prior turns,
-    /// `preserve_history` keeps the original user-prefix item untouched while
-    /// the system prompt, live tools, and provider configuration are rebuilt.
-    RebuildAgentForDefinition {
-        definition: xai_grok_agent::AgentDefinition,
-        preserve_history: bool,
-        responds_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Override the model name and optionally inject extra HTTP headers
     /// into the session's sampling config.
@@ -398,10 +429,11 @@ pub enum SessionCommand {
     SnapshotClientHooks {
         respond_to: oneshot::Sender<crate::extensions::hooks::ClientHooks>,
     },
-    /// Snapshot the session's resolved tool schema (same list the parent's own turn
-    /// sends) so a verbatim-fork child can present a byte-identical tool prefix.
+    /// Snapshot the session's resolved ordinary-tool inputs. A verbatim-fork
+    /// child feeds these through the shared effective-surface builder so its
+    /// provider/mode transport prefix is byte-identical to the parent's.
     SnapshotToolDefinitions {
-        respond_to: oneshot::Sender<Vec<xai_grok_sampling_types::ToolSpec>>,
+        respond_to: oneshot::Sender<crate::session::tool_surface::ToolSurfaceSnapshot>,
     },
     /// Replace the session's client-registered hooks. Sent on `load_session` reconnect to a
     /// live actor so a client can re-register (or clear) its hooks without a fresh session.

@@ -6,7 +6,7 @@
 //! truncation that counts only non-synthetic `User` items therefore leaves
 //! the "rewound" turn in the model's context.
 
-use super::support::create_test_actor;
+use super::support::{create_test_actor, spawn_persistence_ack_drainer};
 
 use crate::sampling::ConversationItem;
 use crate::session::{RewindMode, RewindRequest};
@@ -49,7 +49,8 @@ fn seed_conversation(mark_turn_starts: bool) -> Vec<ConversationItem> {
 
 async fn run_rewind_over_synthetic_turn(mark_turn_starts: bool) {
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_persistence_ack_drainer(persistence_rx);
     let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let mut snap = actor
@@ -68,6 +69,7 @@ async fn run_rewind_over_synthetic_turn(mark_turn_starts: bool) {
     actor.chat_state_handle.restore_snapshot(snap);
 
     // Rewind to prompt #2 — "restore state before P2 ran".
+    let runtime_generation = actor.rebuild_spec.code_mode_runtime.generation();
     let resp = actor
         .handle_rewind(RewindRequest {
             target_prompt_index: 2,
@@ -77,6 +79,11 @@ async fn run_rewind_over_synthetic_turn(mark_turn_starts: bool) {
         .await
         .expect("handle_rewind ok");
     assert!(resp.success, "rewind should succeed: {resp:?}");
+    assert_eq!(
+        actor.rebuild_spec.code_mode_runtime.generation(),
+        runtime_generation + 1,
+        "conversation rewind must invalidate the prior JavaScript timeline"
+    );
     assert_eq!(resp.prompt_text.as_deref(), Some("P2"));
 
     let conv = actor.chat_state_handle.get_conversation().await;
@@ -127,7 +134,8 @@ async fn rewind_with_no_prompts_lists_no_points_and_rejects_execute() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            spawn_persistence_ack_drainer(persistence_rx);
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             let points = actor.get_rewind_points().await;
@@ -165,7 +173,8 @@ async fn rewind_to_start_keeps_only_preamble() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            spawn_persistence_ack_drainer(persistence_rx);
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             let mut conversation = seed_conversation(true);
@@ -230,7 +239,8 @@ async fn rewind_twice_narrows_history_each_time() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            spawn_persistence_ack_drainer(persistence_rx);
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             // 5 turns: real, wake, real, wake, real.
@@ -343,7 +353,8 @@ async fn rewind_to_midpoint_with_synthetic_turns_on_both_sides() {
         .run_until(async {
             for mark_turn_starts in [false, true] {
                 let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                spawn_persistence_ack_drainer(persistence_rx);
                 let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
                 let user = |text: &str, idx: usize| {
@@ -428,7 +439,8 @@ async fn rewind_to_synthetic_auto_wake_turn_cuts_at_the_wake() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            spawn_persistence_ack_drainer(persistence_rx);
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             let mut snap = actor

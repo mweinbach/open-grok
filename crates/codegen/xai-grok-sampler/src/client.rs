@@ -25,11 +25,11 @@ use std::sync::{Arc, OnceLock};
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
-    ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    ModelProvider, NamedCustomToolOutputOccurrence, OriginalDetailCustomOutputImageOccurrence,
-    ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
-    rs,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CodeModeTransport,
+    ConversationRequest, ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER,
+    MessagesRequestWrapper, ModelProvider, NamedCustomToolOutputOccurrence,
+    OriginalDetailCustomOutputImageOccurrence, ResponseModelMetadata, Result, SamplingError,
+    build_messages_request, is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
@@ -568,6 +568,50 @@ fn patch_raw_input_replacements(
             ),
         )?;
         *slot = replacement.value.clone();
+    }
+    Ok(())
+}
+
+fn contains_native_custom_responses_lane(body: &serde_json::Value) -> bool {
+    let custom_tool = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("custom"));
+    let custom_input = body
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| {
+            item.get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| matches!(kind, "custom_tool_call" | "custom_tool_call_output"))
+        });
+    let custom_choice = body
+        .get("tool_choice")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|choice| choice.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("custom");
+    custom_tool || custom_input || custom_choice
+}
+
+/// Final defense-in-depth boundary before a Responses body reaches the
+/// network. Providers without native custom-tool support must receive the
+/// function-envelope projection, never `type: "custom"` declarations or
+/// custom call/output history.
+fn validate_responses_wire_body_for_provider(
+    body: &serde_json::Value,
+    provider: ModelProvider,
+) -> Result<()> {
+    if provider.profile().code_mode_transport != CodeModeTransport::NativeCustomGrammar
+        && contains_native_custom_responses_lane(body)
+    {
+        return Err(SamplingError::InvalidConfiguration(
+            "selected provider does not support native Responses custom tools",
+        ));
     }
     Ok(())
 }
@@ -1129,7 +1173,7 @@ impl SamplingClient {
         provider_adapter.validate_backend(&config.api_backend)?;
         let codex_turn_state = provider_adapter
             .supports_turn_state(&config.api_backend)
-            .then(|| codex_turn_state)
+            .then_some(codex_turn_state)
             .flatten();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -1252,7 +1296,7 @@ impl SamplingClient {
 
     /// The configured API backend for this client.
     pub fn api_backend(&self) -> ApiBackend {
-        self.defaults.api_backend.clone()
+        self.defaults.api_backend
     }
 
     /// Provider selected when this client was constructed.
@@ -1972,6 +2016,7 @@ impl SamplingClient {
         }
 
         self.apply_conversation_defaults(&mut request)?;
+        self.project_responses_conversation(&mut request)?;
         request.hosted_tools = xai_grok_sampling_types::hosted_tools_for_provider(
             &request.hosted_tools,
             self.defaults.provider,
@@ -2064,6 +2109,7 @@ impl SamplingClient {
         }
 
         self.apply_conversation_defaults(&mut request)?;
+        self.project_responses_conversation(&mut request)?;
         request.hosted_tools = xai_grok_sampling_types::hosted_tools_for_provider(
             &request.hosted_tools,
             self.defaults.provider,
@@ -2264,6 +2310,7 @@ impl SamplingClient {
                 reasoning_summary: self.defaults.reasoning_summary,
             },
         );
+        validate_responses_wire_body_for_provider(&request_body, self.defaults.provider)?;
         let http_request = self
             .provider_adapter
             .apply_request_headers(self.post(self.endpoint("responses")), grok_headers)
@@ -2434,6 +2481,7 @@ impl SamplingClient {
                 reasoning_summary: self.defaults.reasoning_summary,
             },
         );
+        validate_responses_wire_body_for_provider(&request_body, self.defaults.provider)?;
         // Fresh per attempt so signals never leak across retries; `None`
         // disables collection. The opt-in wire header is xAI-only below.
         let doom_loop = self
@@ -2978,6 +3026,57 @@ impl SamplingClient {
         Ok(())
     }
 
+    /// Apply the provider's Code Mode wire projection before Responses
+    /// serialization. The provider comes from the selected model's sampling
+    /// configuration, never from its slug or endpoint.
+    fn project_responses_conversation(&self, request: &mut ConversationRequest) -> Result<()> {
+        request
+            .project_code_mode_for_provider(self.defaults.provider)
+            .map_err(|error| {
+                tracing::error!(
+                    provider = ?self.defaults.provider,
+                    %error,
+                    "Responses request is incompatible with the selected provider"
+                );
+                SamplingError::InvalidConfiguration(
+                    "Responses request contains unsupported native custom tool content",
+                )
+            })
+    }
+
+    /// Apply all typed request preparation that must happen before a
+    /// `ConversationRequest` is converted to the Responses wire model.
+    fn prepare_responses_conversation(&self, request: &mut ConversationRequest) -> Result<()> {
+        self.apply_conversation_defaults(request)?;
+        self.project_responses_conversation(request)?;
+        request.hosted_tools = xai_grok_sampling_types::hosted_tools_for_provider(
+            &request.hosted_tools,
+            self.defaults.provider,
+        );
+        Ok(())
+    }
+
+    /// Normalize native Responses Code Mode history before converting it to a
+    /// function-only API. The provider is the explicit catalog-selected
+    /// profile carried by this client, never inferred from model or URL.
+    pub(crate) fn project_function_backend_conversation(
+        &self,
+        request: &mut ConversationRequest,
+    ) -> Result<()> {
+        request
+            .project_code_mode_for_function_backend(self.defaults.provider)
+            .map_err(|error| {
+                tracing::error!(
+                    provider = ?self.defaults.provider,
+                    %error,
+                    "request history is incompatible with the selected function-only backend"
+                );
+                SamplingError::InvalidConfiguration(
+                    "request contains unsupported native custom tool history",
+                )
+            })
+    }
+
     /// Send a conversation request using the Chat Completions API (streaming).
     ///
     /// Converts the `ConversationRequest` to `ChatCompletionRequest` internally.
@@ -2990,6 +3089,7 @@ impl SamplingClient {
         Option<ResponseModelMetadata>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+        self.project_function_backend_conversation(&mut request)?;
 
         let trace = request.trace.take();
         let mut chat_request: ChatCompletionRequest = request.into();
@@ -3008,6 +3108,7 @@ impl SamplingClient {
         mut request: ConversationRequest,
     ) -> Result<ChatCompletionResponse> {
         self.apply_conversation_defaults(&mut request)?;
+        self.project_function_backend_conversation(&mut request)?;
 
         let trace = request.trace.take();
         let mut chat_request: ChatCompletionRequest = request.into();
@@ -3027,17 +3128,34 @@ impl SamplingClient {
     #[allow(clippy::type_complexity)]
     pub async fn conversation_stream_responses(
         &self,
-        mut request: ConversationRequest,
+        request: ConversationRequest,
     ) -> Result<(
         BoxStream<'static, Result<rs::ResponseStreamEvent>>,
         Option<ResponseModelMetadata>,
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
-        self.apply_conversation_defaults(&mut request)?;
-        request.hosted_tools = xai_grok_sampling_types::hosted_tools_for_provider(
-            &request.hosted_tools,
-            self.defaults.provider,
-        );
+        let (stream, metadata, doom_loop, _) = self
+            .conversation_stream_responses_with_client_custom_tools(request)
+            .await?;
+        Ok((stream, metadata, doom_loop))
+    }
+
+    /// Streaming Responses request plus the native custom-tool names from the
+    /// exact post-projection request. The actor needs those names to classify
+    /// returned custom calls without projecting the conversation a second
+    /// time. External callers retain the stable three-part API above.
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn conversation_stream_responses_with_client_custom_tools(
+        &self,
+        mut request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        Option<ResponseModelMetadata>,
+        Option<crate::doom_loop::DoomLoopSignalCollector>,
+        Vec<String>,
+    )> {
+        self.prepare_responses_conversation(&mut request)?;
+        let client_custom_tool_names = request.client_custom_tool_names();
 
         let trace = request.trace.take();
         let local_reasoning_effort = request.reasoning_effort;
@@ -3076,7 +3194,8 @@ impl SamplingClient {
             wrapper.trace = Some(trace);
         }
 
-        self.create_response_stream(wrapper).await
+        let (stream, metadata, doom_loop) = self.create_response_stream(wrapper).await?;
+        Ok((stream, metadata, doom_loop, client_custom_tool_names))
     }
 
     /// Send a conversation request using the Responses API (non-streaming).
@@ -3086,11 +3205,7 @@ impl SamplingClient {
         &self,
         mut request: ConversationRequest,
     ) -> Result<rs::Response> {
-        self.apply_conversation_defaults(&mut request)?;
-        request.hosted_tools = xai_grok_sampling_types::hosted_tools_for_provider(
-            &request.hosted_tools,
-            self.defaults.provider,
-        );
+        self.prepare_responses_conversation(&mut request)?;
 
         let trace = request.trace.take();
         let local_reasoning_effort = request.reasoning_effort;
@@ -3140,6 +3255,7 @@ impl SamplingClient {
         Option<ResponseModelMetadata>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+        self.project_function_backend_conversation(&mut request)?;
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -3172,6 +3288,7 @@ impl SamplingClient {
         mut request: ConversationRequest,
     ) -> Result<messages::MessagesResponse> {
         self.apply_conversation_defaults(&mut request)?;
+        self.project_function_backend_conversation(&mut request)?;
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -3211,8 +3328,9 @@ impl SamplingClient {
                 crate::stream::collect_response(events).await
             }
             ApiBackend::Responses => {
-                let client_custom_tool_names = request.client_custom_tool_names();
-                let (raw, meta, doom_loop) = self.conversation_stream_responses(request).await?;
+                let (raw, meta, doom_loop, client_custom_tool_names) = self
+                    .conversation_stream_responses_with_client_custom_tools(request)
+                    .await?;
                 let events = crate::stream::stream_responses_with_client_custom_tools(
                     raw,
                     meta,
@@ -3250,6 +3368,112 @@ mod tests {
     use indexmap::IndexMap;
     use xai_grok_sampling_types::ModelProvider;
     use xai_grok_sampling_types::types::ChatRequestMessage;
+
+    #[test]
+    fn responses_wire_guard_rejects_native_custom_for_xai_and_allows_codex() {
+        for body in [
+            serde_json::json!({"tools": [{"type": "custom", "name": "exec"}]}),
+            serde_json::json!({"input": [{"type": "custom_tool_call", "name": "exec"}]}),
+            serde_json::json!({"input": [{"type": "custom_tool_call_output", "call_id": "c"}]}),
+            serde_json::json!({"tool_choice": {"type": "custom", "name": "exec"}}),
+        ] {
+            assert!(matches!(
+                validate_responses_wire_body_for_provider(&body, ModelProvider::Xai),
+                Err(SamplingError::InvalidConfiguration(_))
+            ));
+            validate_responses_wire_body_for_provider(&body, ModelProvider::Codex)
+                .expect("Codex supports native custom Responses content");
+        }
+
+        validate_responses_wire_body_for_provider(
+            &serde_json::json!({
+                "tools": [{
+                    "type": "function",
+                    "name": "exec",
+                    "parameters": {"type": "object"}
+                }],
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call-exec",
+                        "name": "exec",
+                        "arguments": "{\"source\":\"return 42\"}"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call-exec",
+                        "output": "42"
+                    }
+                ]
+            }),
+            ModelProvider::Xai,
+        )
+        .expect("xAI function-envelope Code Mode is supported");
+
+        validate_responses_wire_body_for_provider(
+            &serde_json::json!({
+                "tools": [{
+                    "type": "function",
+                    "name": "inspect_schema",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "examples": {
+                                "type": "array",
+                                "examples": [{"type": "custom"}]
+                            }
+                        }
+                    }
+                }],
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "custom"}]
+                }]
+            }),
+            ModelProvider::Xai,
+        )
+        .expect("nested schema examples are data, not Responses custom-tool lanes");
+    }
+
+    #[test]
+    fn responses_preparation_reports_custom_names_from_projected_request() {
+        fn custom_exec_request() -> ConversationRequest {
+            ConversationRequest::from_items(vec![xai_grok_sampling_types::ConversationItem::user(
+                "run JavaScript",
+            )])
+            .with_client_tools([xai_grok_sampling_types::ClientTool::Custom {
+                name: "exec".to_owned(),
+                description: Some("Execute JavaScript".to_owned()),
+                format: xai_grok_sampling_types::rs::CustomToolParamFormat::Text,
+            }])
+        }
+
+        let mut xai_config = minimal_config();
+        xai_config.api_backend = ApiBackend::Responses;
+        xai_config.provider = ModelProvider::Xai;
+        let xai_client = SamplingClient::new(xai_config).expect("xAI Responses client");
+        let mut xai_request = custom_exec_request();
+        xai_client
+            .prepare_responses_conversation(&mut xai_request)
+            .expect("xAI should project exec to a function envelope");
+        assert!(xai_request.client_custom_tool_names().is_empty());
+        assert!(xai_request.tools.iter().any(|tool| tool.name == "exec"));
+
+        let mut codex_config = minimal_config();
+        codex_config.api_backend = ApiBackend::Responses;
+        codex_config.provider = ModelProvider::Codex;
+        let codex_client = SamplingClient::new(codex_config).expect("Codex Responses client");
+        let mut codex_request = custom_exec_request();
+        codex_client
+            .prepare_responses_conversation(&mut codex_request)
+            .expect("Codex should retain native custom exec");
+        assert_eq!(
+            codex_request.client_custom_tool_names(),
+            vec!["exec".to_owned()]
+        );
+        assert!(!codex_request.tools.iter().any(|tool| tool.name == "exec"));
+    }
 
     fn minimal_config() -> SamplerConfig {
         SamplerConfig {

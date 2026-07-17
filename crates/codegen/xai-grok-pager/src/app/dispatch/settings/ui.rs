@@ -836,7 +836,10 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("remember_tool_approvals", SettingValue::Bool(b)) => {
             Some(Action::SetRememberToolApprovals(*b))
         }
-        ("code_mode", SettingValue::Bool(b)) => Some(Action::SetCodeMode(*b)),
+        ("code_mode", SettingValue::Enum(value)) => {
+            xai_grok_shell::agent::config::ToolModePreference::from_canonical(value)
+                .map(Action::SetCodeMode)
+        }
         ("toolset.ask_user_question.timeout_enabled", SettingValue::Bool(b)) => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(*b))
         }
@@ -1207,7 +1210,13 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("remember_tool_approvals", SettingValue::Bool(b)) => {
             set_remember_tool_approvals_inner(app, *b)
         }
-        ("code_mode", SettingValue::Bool(b)) => set_code_mode_inner(app, *b),
+        ("code_mode", SettingValue::Enum(value)) => {
+            if let Some(preference) =
+                xai_grok_shell::agent::config::ToolModePreference::from_canonical(value)
+            {
+                set_code_mode_inner(app, preference);
+            }
+        }
         // ask_user_question timeout: if rollback equals the effective
         // default, restore to None (keeps mirror in sync with disk).
         ("toolset.ask_user_question.timeout_enabled", SettingValue::Bool(b)) => {

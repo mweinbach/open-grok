@@ -909,6 +909,264 @@ pub use xai_grok_workspace_types::rpc::session::{
     ConflictType, FileRewindConflict, FileRewindResponse,
 };
 
+#[derive(Debug, Clone)]
+struct StagedFileRewindEntry {
+    path: PathBuf,
+    display_path: String,
+    target: Option<String>,
+    original: Option<String>,
+}
+
+/// Fully preflighted file rewind shared by local shell and workspace RPC
+/// paths. All paths are resolved to an absolute identity before de-duplication,
+/// so legacy absolute snapshots and current relative snapshots cannot apply the
+/// same file twice.
+#[derive(Debug, Clone)]
+pub struct StagedFileRewind {
+    entries: Vec<StagedFileRewindEntry>,
+    clean_files: Vec<String>,
+    conflicts: Vec<FileRewindConflict>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileRewindTransactionError {
+    pub message: String,
+    /// Paths whose final state could not be verified as the pre-rewind state.
+    pub unresolved_paths: Vec<String>,
+}
+
+impl std::fmt::Display for FileRewindTransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FileRewindTransactionError {}
+
+impl StagedFileRewind {
+    pub fn clean_files(&self) -> &[String] {
+        &self.clean_files
+    }
+
+    pub fn conflicts(&self) -> &[FileRewindConflict] {
+        &self.conflicts
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Apply the complete plan with compensating rollback.
+    ///
+    /// Each path is re-read immediately before mutation to catch edits that
+    /// raced the preview. A failed non-atomic write is treated as attempted and
+    /// restored unconditionally; earlier successful paths are restored only if
+    /// they still match this plan's target, so rollback never overwrites a new
+    /// external edit.
+    pub async fn apply(
+        &self,
+        fs: &AsyncFsWrapper,
+    ) -> Result<Vec<String>, FileRewindTransactionError> {
+        let mut attempted = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let current = match read_optional_text(fs, &entry.path).await {
+                Ok(current) => current,
+                Err(error) => {
+                    let unresolved_paths =
+                        rollback_file_rewind(fs, &self.entries, &attempted, None).await;
+                    return Err(FileRewindTransactionError {
+                        message: format!(
+                            "Cannot rewind `{}` because its current content could not be re-read: {error}",
+                            entry.display_path
+                        ),
+                        unresolved_paths,
+                    });
+                }
+            };
+            if current != entry.original {
+                let unresolved_paths =
+                    rollback_file_rewind(fs, &self.entries, &attempted, None).await;
+                return Err(FileRewindTransactionError {
+                    message: format!(
+                        "Cannot rewind `{}` because it changed after preview; earlier file changes were rolled back and retry data was retained",
+                        entry.display_path
+                    ),
+                    unresolved_paths,
+                });
+            }
+
+            // A non-atomic backend write can partially mutate before returning
+            // an error, so include this entry in rollback before applying it.
+            attempted.push(index);
+            if let Err(error) = write_optional_text(fs, &entry.path, entry.target.as_deref()).await
+            {
+                let unresolved_paths =
+                    rollback_file_rewind(fs, &self.entries, &attempted, Some(index)).await;
+                let rollback = if unresolved_paths.is_empty() {
+                    "all file changes were rolled back".to_string()
+                } else {
+                    format!(
+                        "rollback was incomplete for: {}",
+                        unresolved_paths.join(", ")
+                    )
+                };
+                return Err(FileRewindTransactionError {
+                    message: format!(
+                        "Failed to rewind `{}`: {error}; {rollback}. Rewind snapshots were retained",
+                        entry.display_path
+                    ),
+                    unresolved_paths,
+                });
+            }
+        }
+
+        Ok(self
+            .entries
+            .iter()
+            .map(|entry| entry.display_path.clone())
+            .collect())
+    }
+
+    /// Restore a successfully applied plan when a later conversation/runtime
+    /// phase fails. The same external-edit protection and final verification as
+    /// apply-time rollback are used.
+    pub async fn rollback(&self, fs: &AsyncFsWrapper) -> Vec<String> {
+        let attempted: Vec<usize> = (0..self.entries.len()).collect();
+        rollback_file_rewind(fs, &self.entries, &attempted, None).await
+    }
+}
+
+async fn read_optional_text(
+    fs: &AsyncFsWrapper,
+    path: &Path,
+) -> Result<Option<String>, crate::file_system::FsError> {
+    fs.try_read_to_string(path).await
+}
+
+async fn write_optional_text(
+    fs: &AsyncFsWrapper,
+    path: &Path,
+    content: Option<&str>,
+) -> Result<(), crate::file_system::FsError> {
+    match content {
+        Some(content) => fs.write_file(path, content.as_bytes()).await,
+        None => {
+            if fs.try_read_file(path).await?.is_some() {
+                fs.delete_file(path).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn rollback_file_rewind(
+    fs: &AsyncFsWrapper,
+    entries: &[StagedFileRewindEntry],
+    attempted: &[usize],
+    unconditional_index: Option<usize>,
+) -> Vec<String> {
+    let mut unresolved = Vec::new();
+    for &index in attempted.iter().rev() {
+        let entry = &entries[index];
+        if Some(index) != unconditional_index {
+            match read_optional_text(fs, &entry.path).await {
+                Ok(current) if current == entry.target => {}
+                Ok(_) | Err(_) => {
+                    unresolved.push(entry.display_path.clone());
+                    continue;
+                }
+            }
+        }
+        if write_optional_text(fs, &entry.path, entry.original.as_deref())
+            .await
+            .is_err()
+        {
+            unresolved.push(entry.display_path.clone());
+        }
+    }
+
+    for &index in attempted {
+        let entry = &entries[index];
+        if read_optional_text(fs, &entry.path).await.ok() != Some(entry.original.clone())
+            && !unresolved.contains(&entry.display_path)
+        {
+            unresolved.push(entry.display_path.clone());
+        }
+    }
+    unresolved.sort();
+    unresolved.dedup();
+    unresolved
+}
+
+/// Stage every file and conflict decision without mutating disk.
+pub async fn stage_file_rewind(
+    tracker: &FileStateTracker,
+    fs: &AsyncFsWrapper,
+    target_prompt_index: usize,
+) -> Result<StagedFileRewind, FileRewindTransactionError> {
+    let all_points = tracker.get_rewind_points().await;
+    let mut targets: HashMap<PathBuf, (String, Option<String>)> = HashMap::new();
+    let mut latest_after: HashMap<PathBuf, Option<String>> = HashMap::new();
+
+    for point in &all_points {
+        for (path, after) in &point.after_snapshots {
+            latest_after.insert(path.to_absolute(fs.root()), after.content.clone());
+        }
+        if point.prompt_index >= target_prompt_index {
+            for (path, before) in &point.file_snapshots {
+                let absolute = path.to_absolute(fs.root());
+                targets
+                    .entry(absolute)
+                    .or_insert_with(|| (path.to_string(), before.content.clone()));
+            }
+        }
+    }
+
+    let mut targets: Vec<_> = targets.into_iter().collect();
+    targets.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut entries = Vec::with_capacity(targets.len());
+    let mut clean_files = Vec::new();
+    let mut conflicts = Vec::new();
+    for (path, (display_path, target)) in targets {
+        let original = read_optional_text(fs, &path).await.map_err(|error| {
+            FileRewindTransactionError {
+                message: format!(
+                    "Cannot safely rewind `{display_path}` because its current content could not be read: {error}"
+                ),
+                unresolved_paths: Vec::new(),
+            }
+        })?;
+        let after = latest_after.get(&path).cloned().flatten();
+        if original == after {
+            clean_files.push(display_path.clone());
+        } else {
+            let conflict_type = if original.is_none() && after.is_some() {
+                ConflictType::DeletedExternally
+            } else if original.is_some() && after.is_none() {
+                ConflictType::CreatedExternally
+            } else {
+                ConflictType::ModifiedExternally
+            };
+            conflicts.push(FileRewindConflict {
+                path: display_path.clone(),
+                conflict_type,
+            });
+        }
+        entries.push(StagedFileRewindEntry {
+            path,
+            display_path,
+            target,
+            original,
+        });
+    }
+
+    Ok(StagedFileRewind {
+        entries,
+        clean_files,
+        conflicts,
+    })
+}
+
 /// Rewind files to the state before `target_prompt_index`.
 ///
 /// Shared implementation used by both `hub_server.rs` (workspace-side)
@@ -924,99 +1182,41 @@ pub async fn rewind_files(
     fs: &crate::file_system::AsyncFsWrapper,
     target_prompt_index: usize,
 ) -> FileRewindResponse {
-    let all_points = tracker.get_rewind_points().await;
-
-    let mut reverted_files = Vec::new();
-    let mut clean_files = Vec::new();
-    let mut conflicts = Vec::new();
-    let mut had_errors = false;
-
-    // Collect files to revert: gather earliest before-snapshot per file
-    let mut files_to_revert: HashMap<FlexiblePath, Option<String>> = HashMap::new();
-
-    for point in all_points
-        .iter()
-        .filter(|p| p.prompt_index >= target_prompt_index)
-    {
-        for (path, before_snapshot) in &point.file_snapshots {
-            files_to_revert
-                .entry(path.clone())
-                .or_insert_with(|| before_snapshot.content.clone());
-        }
-    }
-
-    // Conflict detection + revert
-    for (rel_path, content) in &files_to_revert {
-        let current_content = match fs.try_read_to_string(rel_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(?rel_path, ?e, "rewind: failed to read current content");
-                None
-            }
-        };
-        let after_content = all_points
-            .iter()
-            .rev()
-            .find_map(|p| p.after_snapshots.get(rel_path))
-            .and_then(|s| s.content.clone());
-
-        if current_content == after_content {
-            clean_files.push(rel_path.to_string());
-        } else {
-            let conflict_type = if current_content.is_none() && after_content.is_some() {
-                ConflictType::DeletedExternally
-            } else if current_content.is_some() && after_content.is_none() {
-                ConflictType::CreatedExternally
-            } else {
-                ConflictType::ModifiedExternally
+    let staged = match stage_file_rewind(tracker, fs, target_prompt_index).await {
+        Ok(staged) => staged,
+        Err(error) => {
+            return FileRewindResponse {
+                success: false,
+                target_prompt_index,
+                reverted_files: error.unresolved_paths,
+                clean_files: vec![],
+                conflicts: vec![],
+                error: Some(error.message),
             };
-            conflicts.push(FileRewindConflict {
-                path: rel_path.to_string(),
-                conflict_type,
-            });
         }
-
-        // Perform the revert — AsyncFsWrapper resolves FlexiblePath via ToAbsPath
-        match content {
-            Some(data) => {
-                if let Err(e) = fs.write_file(rel_path, data.as_bytes()).await {
-                    tracing::warn!(?rel_path, ?e, "rewind: failed to restore file");
-                    had_errors = true;
-                    continue;
-                }
-            }
-            None => {
-                if fs.exists(rel_path).await.unwrap_or(false)
-                    && let Err(e) = fs.delete_file(rel_path).await
-                {
-                    tracing::warn!(?rel_path, ?e, "rewind: failed to delete file");
-                    had_errors = true;
-                    continue;
-                }
-            }
-        }
-        reverted_files.push(rel_path.to_string());
-    }
-
-    // Truncate rewind points from the target index onward.
-    // Skip truncation when errors occurred so retry data is preserved.
-    if !had_errors {
-        tracker.truncate_from(target_prompt_index).await;
-    }
-
-    let error = if had_errors {
-        Some("Some files could not be reverted".to_string())
-    } else {
-        None
     };
-
-    FileRewindResponse {
-        success: !had_errors,
-        target_prompt_index,
-        reverted_files,
-        clean_files,
-        conflicts,
-        error,
+    let clean_files = staged.clean_files.clone();
+    let conflicts = staged.conflicts.clone();
+    match staged.apply(fs).await {
+        Ok(reverted_files) => {
+            tracker.truncate_from(target_prompt_index).await;
+            FileRewindResponse {
+                success: true,
+                target_prompt_index,
+                reverted_files,
+                clean_files,
+                conflicts,
+                error: None,
+            }
+        }
+        Err(error) => FileRewindResponse {
+            success: false,
+            target_prompt_index,
+            reverted_files: error.unresolved_paths,
+            clean_files,
+            conflicts,
+            error: Some(error.message),
+        },
     }
 }
 
@@ -1069,9 +1269,263 @@ impl FileStateHandle {
 mod tests {
     use super::ToolContext; // from stub above
     use super::*;
-    use crate::file_system::MockFs;
+    use crate::file_system::{AsyncFileSystem, FsError, MockFs};
+    use std::collections::HashMap;
+    use std::io;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::RwLock;
     use xai_grok_paths::AbsPathBuf;
+
+    struct FaultInjectingFs {
+        root: PathBuf,
+        files: RwLock<HashMap<PathBuf, Vec<u8>>>,
+        fail_read_at: Option<usize>,
+        fail_write_at: Option<usize>,
+        read_calls: AtomicUsize,
+        write_calls: AtomicUsize,
+    }
+
+    impl FaultInjectingFs {
+        fn new(
+            root: PathBuf,
+            files: &[(&str, &str)],
+            fail_read_at: Option<usize>,
+            fail_write_at: Option<usize>,
+        ) -> Self {
+            let files = files
+                .iter()
+                .map(|(path, content)| (root.join(path), content.as_bytes().to_vec()))
+                .collect();
+            Self {
+                root,
+                files: RwLock::new(files),
+                fail_read_at,
+                fail_write_at,
+                read_calls: AtomicUsize::new(0),
+                write_calls: AtomicUsize::new(0),
+            }
+        }
+
+        async fn text(&self, relative_path: &str) -> Option<String> {
+            self.files
+                .read()
+                .await
+                .get(&self.root.join(relative_path))
+                .map(|bytes| String::from_utf8(bytes.clone()).unwrap())
+        }
+
+        fn write_count(&self) -> usize {
+            self.write_calls.load(Ordering::SeqCst)
+        }
+
+        fn next_read_fails(&self) -> bool {
+            let call = self.read_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.fail_read_at == Some(call)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncFileSystem for FaultInjectingFs {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        async fn exists(&self, path: &Path) -> Result<bool, FsError> {
+            Ok(self.files.read().await.contains_key(path))
+        }
+
+        async fn read_file(&self, path: &Path) -> Result<Vec<u8>, FsError> {
+            self.try_read_file(path).await?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "fault-injecting file not found").into()
+            })
+        }
+
+        async fn try_read_file(&self, path: &Path) -> Result<Option<Vec<u8>>, FsError> {
+            if self.next_read_fails() {
+                return Err(FsError::Other("injected read failure".to_string()));
+            }
+            Ok(self.files.read().await.get(path).cloned())
+        }
+
+        async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FsError> {
+            let call = self.write_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_write_at == Some(call) {
+                // Model a non-atomic backend that mutates the path before
+                // reporting failure. The transaction must restore this path too.
+                self.files
+                    .write()
+                    .await
+                    .insert(path.to_path_buf(), b"partial write".to_vec());
+                return Err(FsError::Other("injected write failure".to_string()));
+            }
+            self.files
+                .write()
+                .await
+                .insert(path.to_path_buf(), data.to_vec());
+            Ok(())
+        }
+
+        async fn delete_file(&self, path: &Path) -> Result<(), FsError> {
+            self.files.write().await.remove(path);
+            Ok(())
+        }
+    }
+
+    fn rewind_point_with_paths(
+        prompt_index: usize,
+        files: &[(FlexiblePath, &str, &str)],
+    ) -> RewindPoint {
+        let mut point = RewindPoint::new(prompt_index);
+        for (path, before, after) in files {
+            point.add_snapshot(FileSnapshot::new_flexible(
+                path.clone(),
+                Some((*before).to_string()),
+            ));
+            point.set_after_snapshot(FileSnapshot::new_flexible(
+                path.clone(),
+                Some((*after).to_string()),
+            ));
+        }
+        point
+    }
+
+    async fn tracker_with_points(points: Vec<RewindPoint>) -> FileStateTracker {
+        let tracker = FileStateTracker::new();
+        {
+            let mut stored = tracker.rewind_points.lock().await;
+            for point in points {
+                stored.insert(point.prompt_index, point);
+            }
+        }
+        tracker
+    }
+
+    #[tokio::test]
+    async fn staged_rewind_rolls_back_mid_apply_write_failure() {
+        let root = PathBuf::from("/repo");
+        let fs = Arc::new(FaultInjectingFs::new(
+            root,
+            &[
+                ("a.txt", "after-a"),
+                ("b.txt", "after-b"),
+                ("c.txt", "after-c"),
+            ],
+            None,
+            Some(2),
+        ));
+        let wrapper = AsyncFsWrapper::new(fs.clone());
+        let point = rewind_point_with_paths(
+            0,
+            &[
+                (
+                    FlexiblePath::Relative(RelPathBuf::new("a.txt").unwrap()),
+                    "before-a",
+                    "after-a",
+                ),
+                (
+                    FlexiblePath::Relative(RelPathBuf::new("b.txt").unwrap()),
+                    "before-b",
+                    "after-b",
+                ),
+                (
+                    FlexiblePath::Relative(RelPathBuf::new("c.txt").unwrap()),
+                    "before-c",
+                    "after-c",
+                ),
+            ],
+        );
+        let tracker = tracker_with_points(vec![point]).await;
+
+        let response = rewind_files(&tracker, &wrapper, 0).await;
+
+        assert!(!response.success);
+        assert!(response.reverted_files.is_empty());
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("all file changes were rolled back"))
+        );
+        assert_eq!(fs.text("a.txt").await.as_deref(), Some("after-a"));
+        assert_eq!(fs.text("b.txt").await.as_deref(), Some("after-b"));
+        assert_eq!(fs.text("c.txt").await.as_deref(), Some("after-c"));
+        assert_eq!(fs.write_count(), 4, "apply twice, then roll back twice");
+        assert!(tracker.get_rewind_point(0).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn staged_rewind_preflight_read_failure_performs_zero_writes() {
+        let root = PathBuf::from("/repo");
+        let fs = Arc::new(FaultInjectingFs::new(
+            root,
+            &[("a.txt", "after-a"), ("b.txt", "after-b")],
+            Some(2),
+            None,
+        ));
+        let wrapper = AsyncFsWrapper::new(fs.clone());
+        let point = rewind_point_with_paths(
+            0,
+            &[
+                (
+                    FlexiblePath::Relative(RelPathBuf::new("a.txt").unwrap()),
+                    "before-a",
+                    "after-a",
+                ),
+                (
+                    FlexiblePath::Relative(RelPathBuf::new("b.txt").unwrap()),
+                    "before-b",
+                    "after-b",
+                ),
+            ],
+        );
+        let tracker = tracker_with_points(vec![point]).await;
+
+        let response = rewind_files(&tracker, &wrapper, 0).await;
+
+        assert!(!response.success);
+        assert_eq!(fs.write_count(), 0);
+        assert_eq!(fs.text("a.txt").await.as_deref(), Some("after-a"));
+        assert_eq!(fs.text("b.txt").await.as_deref(), Some("after-b"));
+        assert!(tracker.get_rewind_point(0).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn staged_rewind_applies_absolute_relative_alias_once() {
+        let root = PathBuf::from("/repo");
+        let fs = Arc::new(FaultInjectingFs::new(
+            root.clone(),
+            &[("same.txt", "after")],
+            None,
+            None,
+        ));
+        let wrapper = AsyncFsWrapper::new(fs.clone());
+        let first = rewind_point_with_paths(
+            0,
+            &[(
+                FlexiblePath::Relative(RelPathBuf::new("same.txt").unwrap()),
+                "before",
+                "intermediate",
+            )],
+        );
+        let second = rewind_point_with_paths(
+            1,
+            &[(
+                FlexiblePath::Absolute(root.join("same.txt")),
+                "intermediate",
+                "after",
+            )],
+        );
+        let tracker = tracker_with_points(vec![first, second]).await;
+
+        let response = rewind_files(&tracker, &wrapper, 0).await;
+
+        assert!(response.success, "{:?}", response.error);
+        assert_eq!(response.reverted_files, vec!["same.txt"]);
+        assert_eq!(fs.text("same.txt").await.as_deref(), Some("before"));
+        assert_eq!(fs.write_count(), 1);
+        assert!(tracker.get_rewind_points().await.is_empty());
+    }
 
     #[tokio::test]
     async fn test_rewind_point_creation() {

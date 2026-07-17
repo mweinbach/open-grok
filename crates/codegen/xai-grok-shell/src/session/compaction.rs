@@ -317,9 +317,29 @@ impl SessionActor {
                 return None;
             }
         };
-        let tool_defs = self.prepare_tool_definitions().await;
-        let tools = self.turn_base_tool_specs(&tool_defs, sampling_config.provider);
-        let (hosted_tools, wall_clock_budget_secs) = {
+        let tool_defs = self
+            .prepare_tool_definitions()
+            .await
+            .into_iter()
+            .filter(|definition| {
+                self.local_tool_allowed_for_provider(
+                    &definition.function.name,
+                    sampling_config.provider,
+                )
+            })
+            .collect::<Vec<_>>();
+        let forked_tool_override = self
+            .forked_tool_override
+            .as_deref()
+            .map(|tools| self.provider_filtered_tool_specs(tools, sampling_config.provider));
+        let base_tools = forked_tool_override
+            .clone()
+            .unwrap_or_else(|| self.turn_base_tool_specs(&tool_defs, sampling_config.provider));
+        let nested_tool_defs = forked_tool_override
+            .as_deref()
+            .map(crate::session::tool_surface::tool_specs_as_definitions)
+            .unwrap_or_else(|| tool_defs.clone());
+        let (hosted_tools, tool_mode, wall_clock_budget_secs) = {
             let agent = self.agent.borrow();
             let use_backend_search =
                 agent.backend_search_enabled() && self.supports_backend_search.get();
@@ -329,18 +349,29 @@ impl SessionActor {
                 Vec::new()
             };
             (
-                crate::session::code_mode::hosted_tools_for_code_mode(
-                    &hosted_tools,
-                    agent.tool_mode(),
-                    sampling_config.provider,
-                ),
+                hosted_tools,
+                agent.tool_mode(),
                 agent.compaction_policy().wall_clock_budget_secs,
             )
         };
+        let surface = match crate::session::tool_surface::EffectiveToolSurface::build(
+            base_tools,
+            &nested_tool_defs,
+            &hosted_tools,
+            tool_mode,
+            sampling_config.provider,
+            &sampling_config.api_backend,
+        ) {
+            Ok(surface) => surface,
+            Err(error) => {
+                tracing::warn!(%error, "two_pass: incompatible effective tool surface");
+                return None;
+            }
+        };
         match generate_session_compact(
             history,
-            tools,
-            hosted_tools,
+            surface.function_tools,
+            surface.hosted_tools,
             client,
             self.session_info.id.clone(),
             &sampling_config,
@@ -1433,31 +1464,49 @@ impl SessionActor {
             .await?;
         let use_backend_search =
             self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
-        let effective_tool_defs: Vec<xai_grok_sampling_types::ToolDefinition> = self
+        let effective_tool_defs = self
             .prepare_tool_definitions()
             .await
             .into_iter()
-            .filter(|td| !use_backend_search || td.function.name != "web_search")
-            .collect();
-        let compaction_tool_tokens =
-            xai_chat_state::estimate_tool_definitions_tokens(&effective_tool_defs);
-        let compaction_tools: Vec<xai_grok_sampling_types::ToolSpec> = effective_tool_defs
-            .into_iter()
-            .map(xai_grok_sampling_types::ToolSpec::from)
-            .collect();
-        let compaction_hosted_tools: Vec<xai_grok_sampling_types::HostedTool> = {
+            .filter(|definition| {
+                self.local_tool_allowed_for_provider(
+                    &definition.function.name,
+                    sampling_config.provider,
+                )
+            })
+            .collect::<Vec<_>>();
+        let forked_tool_override = self
+            .forked_tool_override
+            .as_deref()
+            .map(|tools| self.provider_filtered_tool_specs(tools, sampling_config.provider));
+        let base_tools = forked_tool_override.clone().unwrap_or_else(|| {
+            self.turn_base_tool_specs(&effective_tool_defs, sampling_config.provider)
+        });
+        let nested_tool_defs = forked_tool_override
+            .as_deref()
+            .map(crate::session::tool_surface::tool_specs_as_definitions)
+            .unwrap_or_else(|| effective_tool_defs.clone());
+        let (hosted_tool_candidates, tool_mode) = {
             let agent = self.agent.borrow();
             let hosted_tools = if use_backend_search {
                 agent.hosted_tools().to_vec()
             } else {
                 Vec::new()
             };
-            crate::session::code_mode::hosted_tools_for_code_mode(
-                &hosted_tools,
-                agent.tool_mode(),
-                sampling_config.provider,
-            )
+            (hosted_tools, agent.tool_mode())
         };
+        let compaction_surface = crate::session::tool_surface::EffectiveToolSurface::build(
+            base_tools,
+            &nested_tool_defs,
+            &hosted_tool_candidates,
+            tool_mode,
+            sampling_config.provider,
+            &sampling_config.api_backend,
+        )
+        .map_err(|error| acp::Error::internal_error().data(error))?;
+        let compaction_tool_tokens = compaction_surface.estimated_definition_tokens();
+        let compaction_tools = compaction_surface.function_tools;
+        let compaction_hosted_tools = compaction_surface.hosted_tools;
         let estimated_input_tokens =
             xai_chat_state::estimate_conversation_tokens(&simplified_messages);
         let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
@@ -2832,6 +2881,7 @@ mod inline_auto_compact_flow_tests {
             running_task: None,
             pending_inputs: VecDeque::new(),
             pending_notifications: Vec::new(),
+            lifecycle_mutation: None,
             notifications_suppressed: false,
             rewindable: false,
             nudges_used_this_session: 0,

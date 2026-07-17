@@ -9,8 +9,8 @@
 //! - Session → Client: `session_notification` via a shared gateway handle
 //!
 use super::commands::{
-    ParsedPromptInfo, PromptCompletionKind, PromptTurnOk, PromptTurnResult, SessionCommand,
-    ok_end_turn,
+    LifecycleMutationBlock, LifecycleMutationKind, ParsedPromptInfo, PromptCompletionKind,
+    PromptTurnOk, PromptTurnResult, SessionCommand, ok_end_turn,
 };
 use super::handle::SessionHandle;
 use super::notifications::NotificationSender;
@@ -107,6 +107,8 @@ mod laziness;
 pub(crate) use laziness::*;
 #[path = "acp_session_impl/hooks_plugins.rs"]
 mod hooks_plugins;
+#[path = "acp_session_impl/lifecycle.rs"]
+mod lifecycle;
 #[path = "acp_session_impl/mcp.rs"]
 mod mcp;
 #[path = "acp_session_impl/model_switch.rs"]
@@ -272,6 +274,10 @@ pub(crate) struct State {
     pub(crate) running_task: Option<AgentTask>,
     pub(crate) pending_inputs: VecDeque<InputItem>,
     pub(crate) pending_notifications: Vec<PendingNotification>,
+    /// A canonical between-turn mutation owns this gate. New inputs remain in
+    /// `pending_inputs`, but no scheduler path may promote them until the gate
+    /// is released.
+    pub(crate) lifecycle_mutation: Option<LifecycleMutationKind>,
     /// When true, notifications are buffered but not drained until the next
     /// user-initiated prompt arrives. Set on cancel, cleared on user Prompt.
     pub(crate) notifications_suppressed: bool,
@@ -343,20 +349,24 @@ impl State {
 /// and `arm_idle_notification` (idle-notification debounce) — all consult this
 /// so they share one definition of idleness, with no drift between them.
 ///
-/// Returns `true` exactly when: no turn is running, no user prompt is
-/// queued, and notifications haven't been suppressed by a cancel.
+/// Returns `true` exactly when: no turn is running, no user prompt is queued,
+/// no lifecycle mutation owns the start gate, and notifications haven't been
+/// suppressed by a cancel.
 pub(crate) fn is_session_idle_for_injection(state: &State) -> bool {
     state.running_task.is_none()
         && state.pending_inputs.is_empty()
+        && state.lifecycle_mutation.is_none()
         && !state.notifications_suppressed
 }
 /// Predicate behind `SessionCommand::IsBusy`: the session has work in flight
-/// when a turn is running **or** inputs are queued. Consulted by the leader's
-/// idle-unload decision on client disconnect. Kept as a free function so
-/// it can be unit-tested directly against a `State` without spawning a full
-/// actor + leader.
+/// when a turn is running, inputs are queued, **or** a lifecycle mutation is
+/// active. Consulted by the leader's idle-unload decision on client disconnect.
+/// Kept as a free function so it can be unit-tested directly against a `State`
+/// without spawning a full actor + leader.
 pub(crate) fn state_is_busy(state: &State) -> bool {
-    state.running_task.is_some() || !state.pending_inputs.is_empty()
+    state.running_task.is_some()
+        || !state.pending_inputs.is_empty()
+        || state.lifecycle_mutation.is_some()
 }
 use crate::auth::AuthManager;
 #[derive(Clone)]
@@ -1866,6 +1876,9 @@ mod media_gen_auth_retry_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/memory_config_tests.rs"]
 mod memory_config_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/model_switch_midturn_tests.rs"]
+mod model_switch_midturn_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/parallel_dispatch_tests.rs"]
 mod parallel_dispatch_tests;

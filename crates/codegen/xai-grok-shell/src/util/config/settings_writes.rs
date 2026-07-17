@@ -226,7 +226,7 @@ pub async fn set_remember_tool_approvals(value: bool) -> Result<()> {
 }
 
 /// Persist the restart-required `[ui].code_mode` override.
-pub async fn set_code_mode(value: bool) -> Result<()> {
+pub async fn set_code_mode(value: crate::agent::config::ToolModePreference) -> Result<()> {
     update_config(|cfg| cfg.ui.code_mode = Some(value)).await
 }
 

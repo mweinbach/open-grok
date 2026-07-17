@@ -1,6 +1,113 @@
 use super::*;
 
 #[test]
+fn persisted_tool_policy_is_not_reused_for_unavailable_model_fallback() {
+    let persisted = acp::ModelId::new("xai-persisted");
+    let xai_policy = crate::session::tool_surface::ResolvedToolPolicy::for_route(
+        crate::agent::config::ResolvedToolMode {
+            mode: xai_grok_sampling_types::ToolMode::CodeMode,
+            source: crate::agent::config::ToolModeSource::UserPreference,
+        },
+        xai_grok_sampling_types::ModelProvider::Xai,
+        &xai_grok_sampling_types::ApiBackend::Responses,
+    )
+    .unwrap();
+
+    assert!(
+        acp_agent::LoadModelSelectionOrigin::PersistedIdentity
+            .restores_persisted_tool_policy(
+                None,
+                xai_policy,
+                xai_grok_sampling_types::ModelProvider::Xai,
+                &xai_grok_sampling_types::ApiBackend::Responses,
+            ),
+        "an exact or routing-slug restoration keeps the session's persisted policy"
+    );
+    assert!(
+        !acp_agent::LoadModelSelectionOrigin::UnavailableFallback
+            .restores_persisted_tool_policy(
+                None,
+                xai_policy,
+                xai_grok_sampling_types::ModelProvider::Codex,
+                &xai_grok_sampling_types::ApiBackend::Responses,
+            ),
+        "an unavailable-model fallback must resolve policy for the fallback route"
+    );
+    assert!(
+        !acp_agent::LoadModelSelectionOrigin::PersistedIdentity
+            .restores_persisted_tool_policy(
+                Some(&persisted),
+                xai_policy,
+                xai_grok_sampling_types::ModelProvider::Xai,
+                &xai_grok_sampling_types::ApiBackend::Responses,
+            ),
+        "an explicit load override must not inherit the persisted model's policy"
+    );
+}
+
+#[test]
+fn persisted_tool_policy_is_not_reused_when_same_model_changes_route() {
+    let policy = crate::session::tool_surface::ResolvedToolPolicy::for_route(
+        crate::agent::config::ResolvedToolMode {
+            mode: xai_grok_sampling_types::ToolMode::CodeMode,
+            source: crate::agent::config::ToolModeSource::UserPreference,
+        },
+        xai_grok_sampling_types::ModelProvider::Xai,
+        &xai_grok_sampling_types::ApiBackend::Responses,
+    )
+    .unwrap();
+
+    assert!(
+        !acp_agent::LoadModelSelectionOrigin::PersistedIdentity
+            .restores_persisted_tool_policy(
+                None,
+                policy,
+                xai_grok_sampling_types::ModelProvider::Codex,
+                &xai_grok_sampling_types::ApiBackend::Responses,
+            ),
+        "a provider change on the same catalog identity must resolve policy fresh"
+    );
+    assert!(
+        !acp_agent::LoadModelSelectionOrigin::PersistedIdentity
+            .restores_persisted_tool_policy(
+                None,
+                policy,
+                xai_grok_sampling_types::ModelProvider::Xai,
+                &xai_grok_sampling_types::ApiBackend::ChatCompletions,
+            ),
+        "a backend change on the same catalog identity must resolve policy fresh"
+    );
+}
+
+#[test]
+fn replay_recovers_xai_function_envelope_exec_and_wait_transport_ids() {
+    let exec = xai_grok_sampling_types::ToolCall {
+        id: std::sync::Arc::from("call-exec"),
+        name: xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME.to_string(),
+        arguments: std::sync::Arc::from(r#"{"source":"return 42"}"#),
+    };
+    let wait = xai_grok_sampling_types::ToolCall {
+        id: std::sync::Arc::from("call-wait"),
+        name: xai_grok_code_mode_protocol::WAIT_TOOL_NAME.to_string(),
+        arguments: std::sync::Arc::from(r#"{"cell_id":"cell-1"}"#),
+    };
+    let conversation = vec![xai_grok_sampling_types::ConversationItem::assistant_tool_calls(
+        vec![exec, wait],
+    )];
+    let mut ids = std::collections::HashSet::new();
+
+    MvpAgent::collect_code_mode_transport_ids(&IndexMap::new(), &conversation, &mut ids);
+
+    assert_eq!(
+        ids,
+        std::collections::HashSet::from([
+            acp::ToolCallId::new(std::sync::Arc::from("call-exec")),
+            acp::ToolCallId::new(std::sync::Arc::from("call-wait")),
+        ])
+    );
+}
+
+#[test]
 fn codex_refresh_failure_payload_keeps_auth_visible_fallback_models() {
     let model_id = acp::ModelId::new("gpt-5.6-sol");
     let models = acp::SessionModelState::new(
@@ -1080,10 +1187,7 @@ fn harnesses_are_compatible_rejects_strict_mismatches() {
 /// harness in place instead of forcing the user to abandon the session.
 #[test]
 fn post_turn_cross_provider_switches_plan_history_preserving_rebuilds() {
-    for (active, required) in [
-        ("grok-build-plan", "codex"),
-        ("codex", "grok-build-plan"),
-    ] {
+    for (active, required) in [("grok-build-plan", "codex"), ("codex", "grok-build-plan")] {
         assert_eq!(
             plan_harness_switch(Some(active), required, 7),
             HarnessSwitchPlan::Rebuild {
@@ -1359,6 +1463,139 @@ async fn set_session_model_does_not_cross_contaminate() {
         "Session B's model must not be affected by session A's model change"
     );
 }
+
+/// The resident handle is the routing source of truth for later prompts and
+/// reconnects. An actor-side rejection (for example, an active-turn guard)
+/// must propagate through the outer model-switch orchestrator before that
+/// handle, broadcasts, or the global model selection are updated.
+#[test]
+fn rejected_actor_model_switch_keeps_resident_handle_unchanged() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{EndpointsConfig, ModelEntry};
+
+        let agent = build_minimal_agent_for_tests();
+        agent.models_manager.insert_test_entry(
+            "replacement-model",
+            ModelEntry::fallback("replacement-model", &EndpointsConfig::default()),
+        );
+        let session_id = acp::SessionId::new("model-switch-rejected");
+        let mut handle = make_test_handle("original-model", false, None);
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = command_tx;
+        agent
+            .sessions
+            .borrow_mut()
+            .insert(session_id.clone(), handle);
+
+        let actor = tokio::task::spawn_local(async move {
+            while let Some(command) = command_rx.recv().await {
+                match command {
+                    crate::session::SessionCommand::GetActiveAgent { responds_to } => {
+                        let _ = responds_to.send(Some("grok-build".to_string()));
+                    }
+                    crate::session::SessionCommand::SetSessionModel { responds_to, .. } => {
+                        let _ = responds_to.send(Err(acp::Error::invalid_request().data(
+                            "Cannot switch models while a turn is active; cancel it or wait for it to finish.",
+                        )));
+                        break;
+                    }
+                    _ => panic!("unexpected command during model-switch rejection test"),
+                }
+            }
+        });
+
+        let error = crate::agent::handlers::model_switch::apply(
+            &agent,
+            acp::SetSessionModelRequest::new(
+                session_id.clone(),
+                acp::ModelId::new("replacement-model"),
+            ),
+        )
+        .await
+        .expect_err("the actor's model-switch rejection must propagate");
+
+        assert_eq!(
+            error.data.as_ref().and_then(serde_json::Value::as_str),
+            Some(
+                "Cannot switch models while a turn is active; cancel it or wait for it to finish."
+            )
+        );
+        assert_eq!(
+            agent.sessions.borrow()[&session_id].model_id.0.as_ref(),
+            "original-model",
+            "an actor-side rejection must not update the resident session handle"
+        );
+        actor.await.expect("test actor must exit cleanly");
+    });
+}
+
+#[test]
+fn invalid_required_code_mode_route_fails_before_harness_or_handle_mutation() {
+    run_local_for_bridge_test(|| async {
+        use crate::agent::config::{EndpointsConfig, ModelEntry};
+        use xai_grok_sampling_types::{ApiBackend, ModelProvider, ToolMode};
+
+        let agent = build_minimal_agent_for_tests();
+        let mut entry = ModelEntry::fallback("invalid-codex-route", &EndpointsConfig::default());
+        entry.info.provider = ModelProvider::Codex;
+        entry.info.api_backend = ApiBackend::ChatCompletions;
+        entry.info.tool_mode = Some(ToolMode::CodeModeOnly);
+        entry.info.agent_type = "codex".to_string();
+        agent
+            .models_manager
+            .insert_test_entry("invalid-codex-route", entry);
+
+        let session_id = acp::SessionId::new("invalid-required-code-mode");
+        let mut handle = make_test_handle("original-model", false, None);
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.cmd_tx = command_tx;
+        agent
+            .sessions
+            .borrow_mut()
+            .insert(session_id.clone(), handle);
+
+        let actor = tokio::task::spawn_local(async move {
+            let command = command_rx.recv().await.expect("active-agent query");
+            match command {
+                crate::session::SessionCommand::GetActiveAgent { responds_to } => {
+                    let _ = responds_to.send(Some("grok-build".to_string()));
+                }
+                _ => panic!("model route must query the active agent first"),
+            }
+            tokio::time::timeout(std::time::Duration::from_millis(100), command_rx.recv())
+                .await
+                .is_err()
+        });
+
+        let error = crate::agent::handlers::model_switch::apply(
+            &agent,
+            acp::SetSessionModelRequest::new(
+                session_id.clone(),
+                acp::ModelId::new("invalid-codex-route"),
+            ),
+        )
+        .await
+        .expect_err("required Code Mode Only on Chat Completions must fail closed");
+
+        assert!(
+            error
+                .data
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|message| message.contains("requires CodeModeOnly")),
+            "unexpected model-route error: {error:?}"
+        );
+        assert_eq!(
+            agent.sessions.borrow()[&session_id].model_id.0.as_ref(),
+            "original-model"
+        );
+        assert!(
+            actor.await.expect("test actor must exit cleanly"),
+            "invalid route must not send rebuild or model-mutation commands"
+        );
+    });
+}
+
 #[tokio::test]
 async fn model_state_prefers_session_reasoning_effort_over_global() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};

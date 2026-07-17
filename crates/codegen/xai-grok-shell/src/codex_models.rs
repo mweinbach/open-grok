@@ -563,7 +563,17 @@ impl CodexModelsClient {
             .filter(|description| !description.is_empty());
         info.api_backend = ApiBackend::Responses;
         info.provider = ModelProvider::Codex;
-        info.tool_mode = parse_tool_mode(wire.tool_mode.as_deref());
+        info.tool_mode = match parse_tool_mode(wire.tool_mode.as_deref()) {
+            Ok(tool_mode) => tool_mode,
+            Err(value) => {
+                tracing::warn!(
+                    model = slug,
+                    tool_mode = value,
+                    "skipping Codex model with unknown tool mode"
+                );
+                return None;
+            }
+        };
         info.codex_multi_agent_v2 = wire.multi_agent_version.as_deref() == Some("v2");
         info.agent_type = "codex".to_owned();
         info.hidden = !wire.visibility.is_list_visible();
@@ -791,12 +801,13 @@ fn effort_label(effort: ReasoningEffort) -> &'static str {
     }
 }
 
-fn parse_tool_mode(value: Option<&str>) -> Option<ToolMode> {
+fn parse_tool_mode(value: Option<&str>) -> Result<Option<ToolMode>, String> {
     match value {
-        Some("direct") => Some(ToolMode::Direct),
-        Some("code_mode") => Some(ToolMode::CodeMode),
-        Some("code_mode_only") => Some(ToolMode::CodeModeOnly),
-        _ => None,
+        Some("direct") => Ok(Some(ToolMode::Direct)),
+        Some("code_mode") => Ok(Some(ToolMode::CodeMode)),
+        Some("code_mode_only") => Ok(Some(ToolMode::CodeModeOnly)),
+        Some(value) => Err(value.to_owned()),
+        None => Ok(None),
     }
 }
 
@@ -942,6 +953,15 @@ mod tests {
                     "supported_in_api": false,
                     "priority": 2,
                     "context_window": 200000
+                },
+                {
+                    "slug": "unknown-tool-mode",
+                    "display_name": "Unknown Tool Mode",
+                    "visibility": "list",
+                    "supported_in_api": false,
+                    "priority": 3,
+                    "context_window": 200000,
+                    "tool_mode": "automatic"
                 }
             ]
         })
@@ -1114,6 +1134,13 @@ mod tests {
         assert_eq!(catalog.etag.as_deref(), Some("live-etag"));
         assert!(catalog.is_authoritative());
         assert_eq!(catalog.models.len(), 2);
+        assert!(
+            catalog
+                .models
+                .iter()
+                .all(|model| model.slug() != "unknown-tool-mode"),
+            "unknown explicit tool modes must fail closed",
+        );
         let live = &catalog.models[0];
         assert_eq!(live.slug(), "gpt-5.6-sol");
         assert_eq!(live.entry.info.name.as_deref(), Some("GPT-5.6 Sol Live"));

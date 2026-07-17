@@ -533,6 +533,29 @@ impl ChatStateActor {
         self.state.prompt_usage = None;
     }
 
+    /// Install a rewind snapshot as a new canonical timeline.
+    ///
+    /// Rewind differs from a generic restore: discarded turns must disappear
+    /// from durable history, and provider-reported usage from the abandoned
+    /// longer timeline must be replaced by a fresh estimate of the retained
+    /// context. This runs as one actor command so no turn write can interleave
+    /// between the state replacement and persistence enqueue.
+    pub(super) fn commit_rewind_snapshot(&mut self, mut snap: ChatStateSnapshot) {
+        let total_tokens = super::state::estimate_conversation_tokens(&snap.conversation);
+        snap.total_tokens = total_tokens;
+        snap.estimate_at_last_response = total_tokens;
+        let new_len = snap.conversation.len();
+
+        self.persistence.replace_history(&snap.conversation);
+        self.restore_snapshot(snap);
+        // A rewind is only admitted between turns. Any leftover capture belongs
+        // to the abandoned timeline and must not be folded into the next turn.
+        self.state.turn_capture = None;
+
+        self.send_event(ChatStateEvent::ConversationReset { new_len });
+        self.send_event(ChatStateEvent::TokensUpdated { total_tokens });
+    }
+
     /// If turn capture is active, append the current turn's tail items into
     /// `pre_replacement_messages` before an in-place mutation shifts or drops them.
     pub(super) fn snapshot_turn_slice(&mut self) {

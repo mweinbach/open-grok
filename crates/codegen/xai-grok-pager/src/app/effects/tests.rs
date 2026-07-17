@@ -696,16 +696,25 @@ async fn persist_setting_type_mismatch_errors_simple_mode() {
     );
 }
 
-/// Type-mismatch for the restart-required Code mode switch.
+/// Type-mismatch for the restart-required Code mode selector.
 #[tokio::test]
 async fn persist_setting_type_mismatch_errors_code_mode() {
     use crate::settings::SettingValue;
     let r = persist_setting("code_mode", SettingValue::String("on".into())).await;
     let err = r.expect_err("code_mode with String payload must return Err");
     assert!(
-        err.contains("persist_setting(code_mode) expected Bool"),
+        err.contains("persist_setting(code_mode) expected Enum"),
         "error message must mention key + expected kind, got: {err}",
     );
+}
+
+#[tokio::test]
+async fn persist_setting_rejects_unknown_code_mode_choice() {
+    use crate::settings::SettingValue;
+    let error = persist_setting("code_mode", SettingValue::Enum("automatic"))
+        .await
+        .expect_err("unknown Code mode choices must fail closed");
+    assert!(error.contains("unknown value: automatic"));
 }
 
 #[tokio::test]

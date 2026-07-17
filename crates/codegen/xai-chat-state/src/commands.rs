@@ -158,6 +158,15 @@ pub enum ChatStateCommand {
     /// Restore from a snapshot.
     RestoreSnapshot(Box<ChatStateSnapshot>),
 
+    /// Commit a staged rewind snapshot as the canonical timeline. Unlike a
+    /// generic restore, this persists the replacement history, recomputes the
+    /// token budget for the shortened conversation, and acknowledges after
+    /// the actor has applied the mutation.
+    CommitRewindSnapshot {
+        snapshot: Box<ChatStateSnapshot>,
+        reply: oneshot::Sender<()>,
+    },
+
     /// Start capturing turn messages. Clears any previous buffer.
     BeginTurnCapture,
 

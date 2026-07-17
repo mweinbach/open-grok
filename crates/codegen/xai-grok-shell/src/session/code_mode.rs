@@ -5,8 +5,8 @@
 //! and are dispatched by the single local task started with
 //! [`CodeModeRuntime::start_dispatch_loop`].
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -144,9 +144,18 @@ enum DispatchMessage {
 /// session, including values written through `store()`.
 pub(crate) struct CodeModeRuntime {
     session: OnceCell<Arc<dyn CodeModeSession>>,
+    known_cells: Mutex<HashSet<CellId>>,
     dispatch_tx: mpsc::UnboundedSender<DispatchMessage>,
     dispatch_rx: Mutex<Option<mpsc::UnboundedReceiver<DispatchMessage>>>,
+    dispatch_task: Mutex<Option<tokio::task::AbortHandle>>,
     shutting_down: AtomicBool,
+}
+
+/// The V8 session must not strongly retain its owner: `CodeModeRuntime` owns
+/// the session, so installing the runtime itself as the delegate would create
+/// an `Arc` cycle and keep every reset isolate allocated forever.
+struct CodeModeRuntimeDelegate {
+    runtime: Weak<CodeModeRuntime>,
 }
 
 impl CodeModeRuntime {
@@ -154,8 +163,10 @@ impl CodeModeRuntime {
         let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             session: OnceCell::new(),
+            known_cells: Mutex::new(HashSet::new()),
             dispatch_tx,
             dispatch_rx: Mutex::new(Some(dispatch_rx)),
+            dispatch_task: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -164,9 +175,10 @@ impl CodeModeRuntime {
     ///
     /// The receiver can only be taken once. A second call returns an error
     /// rather than silently creating a competing consumer.
-    pub(crate) async fn start_dispatch_loop(
+    async fn start_dispatch_loop(
         self: &Arc<Self>,
         session_actor: Weak<SessionActor>,
+        generation: RuntimeGeneration,
     ) -> Result<(), String> {
         let mut receiver = self
             .dispatch_rx
@@ -174,18 +186,19 @@ impl CodeModeRuntime {
             .take()
             .ok_or_else(|| "code mode dispatch loop already started".to_string())?;
 
-        tokio::task::spawn_local(async move {
+        let task = tokio::task::spawn_local(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
                     message @ DispatchMessage::InvokeTool { .. } => {
-                        spawn_dispatch_message(session_actor.clone(), message);
+                        spawn_dispatch_message(session_actor.clone(), generation.clone(), message);
                     }
                     message @ DispatchMessage::Notify { .. } => {
-                        dispatch_message(session_actor.clone(), message).await;
+                        dispatch_message(session_actor.clone(), &generation, message).await;
                     }
                 }
             }
         });
+        self.dispatch_task.lock().replace(task.abort_handle());
         Ok(())
     }
 
@@ -214,7 +227,18 @@ impl CodeModeRuntime {
                 max_output_tokens,
             })
             .await?;
-        let response = started_cell.initial_response().await?;
+        self.known_cells.lock().insert(started_cell.cell_id.clone());
+        let cell_id = started_cell.cell_id.clone();
+        let response = match started_cell.initial_response().await {
+            Ok(response) => response,
+            Err(error) => {
+                self.known_cells.lock().remove(&cell_id);
+                return Err(error);
+            }
+        };
+        if is_terminal_runtime_response(&response) {
+            self.known_cells.lock().remove(&cell_id);
+        }
         Ok(format_runtime_response(
             response,
             max_output_tokens,
@@ -229,20 +253,28 @@ impl CodeModeRuntime {
         raw_arguments: &str,
     ) -> Result<CodeModeToolOutput, String> {
         let arguments = parse_wait_arguments(raw_arguments)?;
+        let cell_id = CellId::new(arguments.cell_id);
+        if !self.known_cells.lock().contains(&cell_id) {
+            return Err(format!(
+                "code mode wait cell `{cell_id}` is not live in the current runtime generation; it belongs to a prior runtime generation or has already completed, and yielded cells cannot be resumed after session reload or timeline reset"
+            ));
+        }
         let started_at = Instant::now();
         let session = self.session().await?;
-        let cell_id = CellId::new(arguments.cell_id);
         let response: RuntimeResponse = if arguments.terminate {
-            session.terminate(cell_id).await?
+            session.terminate(cell_id.clone()).await?
         } else {
             session
                 .wait(WaitRequest {
-                    cell_id,
+                    cell_id: cell_id.clone(),
                     yield_time_ms: arguments.yield_time_ms,
                 })
                 .await?
         }
         .into();
+        if is_terminal_runtime_response(&response) {
+            self.known_cells.lock().remove(&cell_id);
+        }
         Ok(format_runtime_response(
             response,
             arguments.max_tokens,
@@ -255,7 +287,7 @@ impl CodeModeRuntime {
     /// matching Codex's session-lifecycle contract.
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
         self.shutting_down.store(true, Ordering::Release);
-        match self
+        let result = match self
             .session
             .get_or_try_init(|| async {
                 Err::<Arc<dyn CodeModeSession>, String>(
@@ -266,7 +298,11 @@ impl CodeModeRuntime {
         {
             Ok(session) => session.shutdown().await,
             Err(_) => Ok(()),
+        };
+        if let Some(task) = self.dispatch_task.lock().take() {
+            task.abort();
         }
+        result
     }
 
     async fn session(self: &Arc<Self>) -> Result<Arc<dyn CodeModeSession>, String> {
@@ -275,7 +311,10 @@ impl CodeModeRuntime {
         }
         self.session
             .get_or_try_init(|| {
-                let delegate: Arc<dyn CodeModeSessionDelegate> = self.clone();
+                let delegate: Arc<dyn CodeModeSessionDelegate> =
+                    Arc::new(CodeModeRuntimeDelegate {
+                        runtime: Arc::downgrade(self),
+                    });
                 async move {
                     if self.shutting_down.load(Ordering::Acquire) {
                         return Err("code mode session is shutting down".to_string());
@@ -293,6 +332,218 @@ impl CodeModeRuntime {
             .await
             .map(Arc::clone)
     }
+}
+
+impl CodeModeSessionDelegate for CodeModeRuntimeDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        invocation: CodeModeNestedToolCall,
+        cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async move {
+            let runtime = self
+                .runtime
+                .upgrade()
+                .ok_or_else(|| "code mode runtime owner is unavailable".to_string())?;
+            CodeModeSessionDelegate::invoke_tool(runtime.as_ref(), invocation, cancellation_token)
+                .await
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        call_id: String,
+        cell_id: CellId,
+        text: String,
+        cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            let runtime = self
+                .runtime
+                .upgrade()
+                .ok_or_else(|| "code mode runtime owner is unavailable".to_string())?;
+            CodeModeSessionDelegate::notify(
+                runtime.as_ref(),
+                call_id,
+                cell_id,
+                text,
+                cancellation_token,
+            )
+            .await
+        })
+    }
+
+    fn cell_closed(&self, cell_id: &CellId) {
+        if let Some(runtime) = self.runtime.upgrade() {
+            CodeModeSessionDelegate::cell_closed(runtime.as_ref(), cell_id);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeGeneration {
+    current: Arc<AtomicU64>,
+    expected: u64,
+}
+
+struct BindRuntimeRequest {
+    runtime: Arc<CodeModeRuntime>,
+    generation: RuntimeGeneration,
+    respond_to: oneshot::Sender<Result<(), String>>,
+}
+
+impl RuntimeGeneration {
+    fn is_current(&self) -> bool {
+        self.current.load(Ordering::Acquire) == self.expected
+    }
+}
+
+/// Replaceable owner for the session's persistent JavaScript runtime.
+///
+/// A model/provider transition or conversation rewind can invalidate the old
+/// timeline without making future Code Mode calls permanently unusable. Each
+/// dispatcher carries the generation it was created for, so callbacks that
+/// race shutdown fail closed instead of attaching to the replacement runtime's
+/// conversation.
+pub(crate) struct CodeModeRuntimeSlot {
+    current: Mutex<Arc<CodeModeRuntime>>,
+    generation: Arc<AtomicU64>,
+    bind_tx: Mutex<Option<mpsc::UnboundedSender<BindRuntimeRequest>>>,
+    bind_task: Mutex<Option<tokio::task::AbortHandle>>,
+    reset_lock: tokio::sync::Mutex<()>,
+}
+
+impl CodeModeRuntimeSlot {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new(CodeModeRuntime::new()),
+            generation: Arc::new(AtomicU64::new(0)),
+            bind_tx: Mutex::new(None),
+            bind_task: Mutex::new(None),
+            reset_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    pub(crate) fn current(&self) -> Arc<CodeModeRuntime> {
+        Arc::clone(&self.current.lock())
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Snapshot the current runtime before awaiting. The slot mutex is never
+    /// held across V8 work, while a concurrent reset can still swap the owner,
+    /// shut down this snapshot, and invalidate its callback generation.
+    pub(crate) async fn exec(
+        &self,
+        call_id: &str,
+        raw_input: &str,
+        enabled_tools: &[GrokToolDefinition],
+    ) -> Result<CodeModeToolOutput, String> {
+        self.current().exec(call_id, raw_input, enabled_tools).await
+    }
+
+    pub(crate) async fn wait(&self, raw_arguments: &str) -> Result<CodeModeToolOutput, String> {
+        self.current().wait(raw_arguments).await
+    }
+
+    pub(crate) async fn start_dispatch_loop(
+        self: &Arc<Self>,
+        session_actor: Weak<SessionActor>,
+    ) -> Result<(), String> {
+        let (bind_tx, mut bind_rx) = mpsc::unbounded_channel::<BindRuntimeRequest>();
+        {
+            let mut active = self.bind_tx.lock();
+            if active.is_some() {
+                return Err("code mode runtime binder already started".to_string());
+            }
+            active.replace(bind_tx.clone());
+        }
+        let bind_task = tokio::task::spawn_local(async move {
+            while let Some(request) = bind_rx.recv().await {
+                let result = request
+                    .runtime
+                    .start_dispatch_loop(session_actor.clone(), request.generation)
+                    .await;
+                let _ = request.respond_to.send(result);
+            }
+        });
+        self.bind_task.lock().replace(bind_task.abort_handle());
+        let generation = RuntimeGeneration {
+            current: Arc::clone(&self.generation),
+            expected: self.generation(),
+        };
+        let result = bind_runtime(&bind_tx, self.current(), generation).await;
+        if result.is_err() {
+            self.bind_tx.lock().take();
+            if let Some(task) = self.bind_task.lock().take() {
+                task.abort();
+            }
+        }
+        result
+    }
+
+    /// Install a fresh lazy runtime and invalidate every callback owned by the
+    /// prior timeline. An unbound slot (unit-test / pre-actor construction)
+    /// remains unbound until `start_dispatch_loop` is called.
+    pub(crate) async fn reset(&self) -> Result<(), String> {
+        let _reset_guard = self.reset_lock.lock().await;
+        let next_generation = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(|| "code mode runtime generation exhausted".to_string())?;
+        let replacement = CodeModeRuntime::new();
+        let bind_tx = self.bind_tx.lock().clone();
+        if let Some(bind_tx) = bind_tx {
+            bind_runtime(
+                &bind_tx,
+                replacement.clone(),
+                RuntimeGeneration {
+                    current: Arc::clone(&self.generation),
+                    expected: next_generation,
+                },
+            )
+            .await?;
+        }
+        let previous = {
+            let mut current = self.current.lock();
+            self.generation.store(next_generation, Ordering::Release);
+            std::mem::replace(&mut *current, replacement)
+        };
+        if let Err(error) = previous.shutdown().await {
+            tracing::warn!(%error, "failed to shut down superseded Code Mode runtime");
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
+        let _reset_guard = self.reset_lock.lock().await;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.bind_tx.lock().take();
+        if let Some(task) = self.bind_task.lock().take() {
+            task.abort();
+        }
+        self.current().shutdown().await
+    }
+}
+
+async fn bind_runtime(
+    bind_tx: &mpsc::UnboundedSender<BindRuntimeRequest>,
+    runtime: Arc<CodeModeRuntime>,
+    generation: RuntimeGeneration,
+) -> Result<(), String> {
+    let (respond_to, response) = oneshot::channel();
+    bind_tx
+        .send(BindRuntimeRequest {
+            runtime,
+            generation,
+            respond_to,
+        })
+        .map_err(|_| "code mode runtime binder is unavailable".to_string())?;
+    response
+        .await
+        .map_err(|_| "code mode runtime binder stopped".to_string())?
 }
 
 impl CodeModeSessionDelegate for CodeModeRuntime {
@@ -356,19 +607,29 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
         })
     }
 
-    fn cell_closed(&self, _cell_id: &CellId) {}
+    fn cell_closed(&self, cell_id: &CellId) {
+        self.known_cells.lock().remove(cell_id);
+    }
 }
 
-fn spawn_dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMessage) {
+fn spawn_dispatch_message(
+    session_actor: Weak<SessionActor>,
+    generation: RuntimeGeneration,
+    message: DispatchMessage,
+) {
     tokio::task::spawn_local(async move {
-        dispatch_message(session_actor, message).await;
+        dispatch_message(session_actor, &generation, message).await;
     });
 }
 
 /// Dispatch one runtime callback. Notifications are awaited serially by the
 /// receiver loop so repeated `notify()` outputs retain FIFO order; nested tool
 /// invocations call this from their own local tasks and may run concurrently.
-async fn dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMessage) {
+async fn dispatch_message(
+    session_actor: Weak<SessionActor>,
+    generation: &RuntimeGeneration,
+    message: DispatchMessage,
+) {
     match message {
         DispatchMessage::InvokeTool {
             invocation,
@@ -378,6 +639,7 @@ async fn dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMe
             let response = match wait_for_active_code_mode_turn(
                 &session_actor,
                 &cancellation_token,
+                generation,
                 "nested tool call",
             )
             .await
@@ -404,6 +666,7 @@ async fn dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMe
             let response = match wait_for_active_code_mode_turn(
                 &session_actor,
                 &cancellation_token,
+                generation,
                 "notification",
             )
             .await
@@ -429,9 +692,15 @@ async fn dispatch_message(session_actor: Weak<SessionActor>, message: DispatchMe
 async fn wait_for_active_code_mode_turn(
     session_actor: &Weak<SessionActor>,
     cancellation_token: &CancellationToken,
+    generation: &RuntimeGeneration,
     operation: &str,
 ) -> Result<Arc<SessionActor>, String> {
     loop {
+        if !generation.is_current() {
+            return Err(format!(
+                "code mode {operation} belongs to a superseded runtime generation"
+            ));
+        }
         if cancellation_token.is_cancelled() {
             return Err(format!("code mode {operation} cancelled"));
         }
@@ -546,6 +815,39 @@ pub(crate) fn create_exec_tool(
         format: CustomToolParamFormat::Grammar(CustomGrammarFormatParam {
             definition: CODE_MODE_FREEFORM_GRAMMAR.to_string(),
             syntax: GrammarSyntax::Lark,
+        }),
+    }
+}
+
+/// Creates the xAI Responses function-envelope `exec` declaration. Its nested
+/// tool guidance matches native Code Mode, while the input contract explicitly
+/// describes the required JSON `source` string instead of raw top-level input.
+pub(crate) fn create_exec_function_tool(
+    enabled_tools: &[GrokToolDefinition],
+    code_mode_only: bool,
+) -> ToolSpec {
+    let enabled_tools = collect_code_mode_tool_definitions(enabled_tools);
+    let native_description = xai_grok_code_mode_protocol::build_exec_tool_description(
+        &enabled_tools,
+        &[],
+        &BTreeMap::new(),
+        code_mode_only,
+    );
+    ToolSpec {
+        name: xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME.to_string(),
+        description: Some(
+            xai_grok_sampling_types::code_mode_exec_function_description(Some(&native_description)),
+        ),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Raw JavaScript source to run in the persistent Code Mode session."
+                }
+            },
+            "required": ["source"],
+            "additionalProperties": false
         }),
     }
 }
@@ -686,6 +988,13 @@ fn format_runtime_response(
     }
 }
 
+fn is_terminal_runtime_response(response: &RuntimeResponse) -> bool {
+    matches!(
+        response,
+        RuntimeResponse::Terminated { .. } | RuntimeResponse::Result { .. }
+    )
+}
+
 fn resolve_max_tokens(max_output_tokens: Option<usize>) -> usize {
     max_output_tokens
         .unwrap_or(xai_grok_code_mode_protocol::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
@@ -807,6 +1116,111 @@ fn truncate_middle_with_token_budget(text: &str, max_tokens: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn runtime_slot_remains_send_and_sync_without_storing_the_local_actor() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CodeModeRuntimeSlot>();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_reset_replaces_generation_and_rejects_stale_callbacks() {
+        let slot = CodeModeRuntimeSlot::new();
+        let previous_runtime = slot.current();
+        let previous_generation = RuntimeGeneration {
+            current: Arc::clone(&slot.generation),
+            expected: slot.generation(),
+        };
+        assert!(previous_generation.is_current());
+
+        slot.reset().await.expect("runtime reset must succeed");
+
+        assert_eq!(slot.generation(), 1);
+        assert!(!previous_generation.is_current());
+        assert!(!Arc::ptr_eq(&previous_runtime, &slot.current()));
+        let error = match wait_for_active_code_mode_turn(
+            &Weak::<SessionActor>::new(),
+            &CancellationToken::new(),
+            &previous_generation,
+            "nested tool call",
+        )
+        .await
+        {
+            Ok(_) => panic!("a stale callback must fail before it can reach the actor"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "code mode nested tool call belongs to a superseded runtime generation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_shutdown_invalidates_the_live_generation() {
+        let slot = CodeModeRuntimeSlot::new();
+        let live_generation = RuntimeGeneration {
+            current: Arc::clone(&slot.generation),
+            expected: slot.generation(),
+        };
+
+        slot.shutdown()
+            .await
+            .expect("runtime shutdown must succeed");
+
+        assert!(!live_generation.is_current());
+    }
+
+    #[test]
+    fn runtime_cell_closed_forgets_yielded_cell() {
+        let runtime = CodeModeRuntime::new();
+        let cell_id = CellId::new("closed-cell".to_string());
+        runtime.known_cells.lock().insert(cell_id.clone());
+
+        CodeModeSessionDelegate::cell_closed(runtime.as_ref(), &cell_id);
+
+        assert!(
+            !runtime.known_cells.lock().contains(&cell_id),
+            "a runtime close callback must make later wait calls fail locally"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_runtime_rejects_wait_from_a_prior_generation_without_initializing_v8() {
+        let runtime = CodeModeRuntime::new();
+
+        let error = runtime
+            .wait(r#"{"cell_id":"persisted-cell","yield_time_ms":1}"#)
+            .await
+            .expect_err("a fresh runtime must reject a persisted yielded cell");
+
+        assert_eq!(
+            error,
+            "code mode wait cell `persisted-cell` is not live in the current runtime generation; it belongs to a prior runtime generation or has already completed, and yielded cells cannot be resumed after session reload or timeline reset"
+        );
+        assert!(
+            runtime.session.get().is_none(),
+            "rejecting a prior-generation wait must not initialize a replacement isolate"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initialized_runtime_drops_after_shutdown_without_a_delegate_cycle() {
+        let runtime = CodeModeRuntime::new();
+        let weak_runtime = Arc::downgrade(&runtime);
+
+        let output = runtime
+            .exec("cycle-test", r#"text("done");"#, &[])
+            .await
+            .expect("simple V8 cell must complete");
+        assert!(output.success);
+        runtime.shutdown().await.expect("runtime shutdown");
+        drop(runtime);
+
+        assert!(
+            weak_runtime.upgrade().is_none(),
+            "the V8 session delegate must not strongly retain its runtime owner"
+        );
+    }
 
     #[test]
     fn only_exec_and_wait_are_hidden_transport_tools() {

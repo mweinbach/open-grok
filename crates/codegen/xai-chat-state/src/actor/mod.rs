@@ -223,6 +223,10 @@ impl ChatStateActor {
             ChatStateCommand::RestoreSnapshot(snapshot) => {
                 self.restore_snapshot(*snapshot);
             }
+            ChatStateCommand::CommitRewindSnapshot { snapshot, reply } => {
+                self.commit_rewind_snapshot(*snapshot);
+                let _ = reply.send(());
+            }
             ChatStateCommand::BeginTurnCapture => {
                 self.state.turn_capture = Some(state::TurnCaptureState {
                     turn_start_offset: self.state.conversation.len(),

@@ -2929,6 +2929,8 @@ impl MvpAgent {
             persisted_goal_mode,
             persisted_announcement_state,
             previous_turn_model,
+            resolved_tool_policy_override,
+            persist_initial_model,
             session_meta,
             managed_mcp_expires_at,
             model_agent_type,
@@ -3414,7 +3416,7 @@ impl MvpAgent {
         let write_file_enabled = self.cfg.borrow().resolve_write_file().value;
         let goal_enabled = self.cfg.borrow().resolve_goal().value;
         let subagents_enabled = self.cfg.borrow().subagents_enabled;
-        let code_mode_enabled = self.cfg.borrow().ui.code_mode.unwrap_or(false);
+        let tool_mode_preference = self.cfg.borrow().ui.code_mode;
         let ask_user_question_enabled = crate::upload::turn::parse_ask_user_question_from_meta(
                 session_meta,
             )
@@ -3554,17 +3556,6 @@ impl MvpAgent {
                     }
                     Some(std::sync::Arc::new(merged))
                 });
-            let initial_reasoning_effort = chat_history
-                .is_empty()
-                .then_some(sampling_config.reasoning_effort);
-            let _ = persistence
-                .tx
-                .send(crate::session::persistence::PersistenceMsg::CurrentModel {
-                    model_id: session_model_id.clone(),
-                    provider: sampling_config.provider,
-                    agent_name: Some(agent_definition.name.clone()),
-                    reasoning_effort: initial_reasoning_effort,
-                });
             let acp_mcp_servers = crate::session::acp_mcp::parse_acp_mcp_servers(
                 session_meta,
             );
@@ -3623,7 +3614,9 @@ impl MvpAgent {
                     client_fs_read && client_fs_write,
                     gateway_enabled,
                     agent_definition,
-                    code_mode_enabled,
+                    tool_mode_preference,
+                    resolved_tool_policy_override,
+                    persist_initial_model,
                     session_default_agent_profile,
                     skills,
                     None,

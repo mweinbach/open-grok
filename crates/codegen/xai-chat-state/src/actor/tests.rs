@@ -466,6 +466,64 @@ async fn replace_conversation_persists_and_emits_reset() {
 }
 
 #[tokio::test]
+async fn commit_rewind_snapshot_persists_and_recomputes_tokens() {
+    let full = vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("first prompt"),
+        ConversationItem::assistant("first answer"),
+        ConversationItem::user("discarded prompt ".repeat(2_000)),
+        ConversationItem::assistant("discarded answer ".repeat(2_000)),
+    ];
+    let mut h = TestHarness::with_conversation(full);
+    h.handle.record_token_usage(900_000);
+
+    let mut rewind = h.handle.snapshot().await.expect("snapshot available");
+    let retained = rewind.conversation[..3].to_vec();
+    let expected_tokens = crate::estimate_conversation_tokens(&retained);
+    rewind.conversation = retained.clone();
+    rewind.prompt_index = 1;
+    rewind.prompt_texts = vec!["first prompt".to_string()];
+    h.drain_events();
+    h.drain_persistence();
+
+    h.handle
+        .commit_rewind_snapshot(rewind)
+        .await
+        .expect("rewind commit acknowledged");
+
+    let after = h.handle.snapshot().await.expect("snapshot available");
+    assert_eq!(
+        serde_json::to_value(&after.conversation).unwrap(),
+        serde_json::to_value(&retained).unwrap()
+    );
+    assert_eq!(after.prompt_index, 1);
+    assert_eq!(after.prompt_texts, vec!["first prompt"]);
+    assert_eq!(after.total_tokens, expected_tokens);
+    assert_eq!(after.estimate_at_last_response, expected_tokens);
+    assert!(after.total_tokens < 900_000);
+
+    let records = h.drain_persistence();
+    assert_eq!(records.len(), 1);
+    let PersistenceRecord::ReplaceHistory(items) = &records[0] else {
+        panic!("rewind must replace durable history");
+    };
+    assert_eq!(
+        serde_json::to_value(items).unwrap(),
+        serde_json::to_value(&retained).unwrap()
+    );
+    let events = h.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ChatStateEvent::ConversationReset { new_len: 3 }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ChatStateEvent::TokensUpdated { total_tokens } if *total_tokens == expected_tokens
+    )));
+}
+
+#[tokio::test]
 async fn compaction_reseed_carries_provider_overhead() {
     let h = TestHarness::new();
     // ~1k estimated tokens; provider reports 51k → 50k overhead.

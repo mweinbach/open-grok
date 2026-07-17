@@ -88,12 +88,12 @@ pub(crate) struct AgentRebuildSpec {
     pub models_manager: crate::agent::models::ModelsManager,
     pub compaction_policy: CompactionPolicy,
     pub reminder_policy: ReminderPolicy,
-    /// Restart-scoped Settings fallback. Model catalog metadata remains
-    /// authoritative when the effective mode is resolved.
-    pub code_mode_enabled: bool,
+    /// Restart-scoped Settings preference. The active model's provider,
+    /// backend, and metadata are applied by the spawn/model-switch paths.
+    pub tool_mode_preference: Option<crate::agent::config::ToolModePreference>,
     /// Session-owned embedded runtime. It lives on the rebuild spec so Agent
     /// harness rebuilds and model switches cannot discard persistent JS state.
-    pub code_mode_runtime: Arc<crate::session::code_mode::CodeModeRuntime>,
+    pub code_mode_runtime: Arc<crate::session::code_mode::CodeModeRuntimeSlot>,
     pub memory_enabled: bool,
     pub memory_global_path: Option<String>,
     pub memory_workspace_path: Option<String>,
@@ -193,7 +193,7 @@ impl AgentRebuildSpec {
             models_manager,
             compaction_policy,
             reminder_policy,
-            code_mode_enabled,
+            tool_mode_preference,
             code_mode_runtime,
             memory_enabled,
             memory_global_path,
@@ -321,10 +321,16 @@ impl AgentRebuildSpec {
             builder = builder.with_preloaded_skills(skills);
         }
         let mut agent = builder.build().await?;
-        agent.set_tool_mode(crate::agent::config::effective_tool_mode(
-            None,
-            *code_mode_enabled,
-        ));
+        agent.set_tool_mode(
+            crate::agent::config::effective_tool_mode(
+                xai_grok_sampling_types::ModelProvider::Xai,
+                &crate::sampling::ApiBackend::Responses,
+                None,
+                *tool_mode_preference,
+            )
+            .expect("xAI Responses with no model requirement is always compatible")
+            .mode,
+        );
         let model_validator = models_manager.clone();
         agent
             .tool_bridge()
@@ -403,8 +409,8 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         models_manager: crate::agent::models::ModelsManager::default(),
         compaction_policy: CompactionPolicy::default(),
         reminder_policy: ReminderPolicy::default(),
-        code_mode_enabled: false,
-        code_mode_runtime: crate::session::code_mode::CodeModeRuntime::new(),
+        tool_mode_preference: None,
+        code_mode_runtime: crate::session::code_mode::CodeModeRuntimeSlot::new(),
         memory_enabled: false,
         memory_global_path: None,
         memory_workspace_path: None,
@@ -476,7 +482,8 @@ mod tests {
                 let mut spec = test_rebuild_spec_default();
                 Arc::get_mut(&mut spec)
                     .expect("test rebuild spec should be uniquely owned")
-                    .code_mode_enabled = true;
+                    .tool_mode_preference =
+                    Some(crate::agent::config::ToolModePreference::CodeMode);
                 let agent = spec
                     .build_agent(AgentDefinition::default_grok_build())
                     .await

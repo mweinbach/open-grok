@@ -511,6 +511,7 @@ mod tests {
             top_p: Some(0.9),
             api_backend: Some(ApiBackend::Messages),
             provider: Some(xai_grok_sampling_types::ModelProvider::Codex),
+            auth_scheme: Some(xai_grok_sampler::AuthScheme::Bearer),
             extra_headers: [("x-team".to_owned(), "codegen".to_owned())]
                 .into_iter()
                 .collect(),

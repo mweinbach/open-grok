@@ -1458,10 +1458,19 @@ auto_update = true
         assert_eq!(cfg.ui.simple_mode, Some(false));
 
         // set_code_mode wraps `cfg.ui.code_mode = Some(value)`.
-        let cfg = apply(|cfg| cfg.ui.code_mode = Some(true));
-        assert_eq!(cfg.ui.code_mode, Some(true));
-        let cfg = apply(|cfg| cfg.ui.code_mode = Some(false));
-        assert_eq!(cfg.ui.code_mode, Some(false));
+        let cfg = apply(|cfg| {
+            cfg.ui.code_mode = Some(crate::agent::config::ToolModePreference::CodeMode)
+        });
+        assert_eq!(
+            cfg.ui.code_mode,
+            Some(crate::agent::config::ToolModePreference::CodeMode)
+        );
+        let cfg =
+            apply(|cfg| cfg.ui.code_mode = Some(crate::agent::config::ToolModePreference::Direct));
+        assert_eq!(
+            cfg.ui.code_mode,
+            Some(crate::agent::config::ToolModePreference::Direct)
+        );
 
         // set_theme wraps `cfg.ui.theme = Some(value)` (canonical name).
         let cfg = apply(|cfg| cfg.ui.theme = Some("tokyonight".to_string()));
@@ -1623,14 +1632,22 @@ custom_user_key = "preserve-me"
 "#;
         let root: TomlValue = toml::from_str(original).unwrap();
         let mut cfg = load_config_from_toml(&root);
+        assert_eq!(
+            cfg.ui.code_mode,
+            Some(crate::agent::config::ToolModePreference::Direct),
+            "legacy false must migrate to the explicit Direct preference",
+        );
 
-        cfg.ui.code_mode = Some(true);
+        cfg.ui.code_mode = Some(crate::agent::config::ToolModePreference::CodeModeOnly);
 
         let mut table = root.as_table().unwrap().clone();
         merge_section(&mut table, "ui", &cfg.ui);
 
         let ui = table.get("ui").unwrap().as_table().unwrap();
-        assert_eq!(ui.get("code_mode").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            ui.get("code_mode").and_then(|v| v.as_str()),
+            Some("code_mode_only")
+        );
         assert_eq!(
             ui.get("show_timestamps").and_then(|v| v.as_bool()),
             Some(true),

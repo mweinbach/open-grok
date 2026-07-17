@@ -35,6 +35,24 @@ fn memory_embedding_uses_live_xai_auth(
     crate::util::is_first_party_xai_url(base_url)
         && xai_auth_key.is_some_and(|xai_key| route_key.is_none_or(|key| key == xai_key))
 }
+
+fn initial_model_persistence_message(
+    persist: bool,
+    model_id: acp::ModelId,
+    provider: xai_grok_sampling_types::ModelProvider,
+    reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+    agent_name: String,
+    resolved_tool_policy: crate::session::tool_surface::ResolvedToolPolicy,
+) -> Option<PersistenceMsg> {
+    persist.then(|| PersistenceMsg::CurrentModel {
+        model_id,
+        provider,
+        agent_name: Some(agent_name),
+        reasoning_effort: Some(reasoning_effort),
+        resolved_tool_policy: Some(resolved_tool_policy),
+    })
+}
+
 /// Partition CLI `--allow` rules under the pin: blanket catch-all allows
 /// (`Allow(Any)` `*` / `**`, plus bare/match-all Bash/MCP/WebFetch grants — see
 /// `resolution::is_catchall_allow`) substitute for the blocked `--yolo`, so drop them when
@@ -63,10 +81,13 @@ fn drop_cli_catchall_allows(
 }
 #[cfg(test)]
 mod cli_catchall_drop_tests {
+    use agent_client_protocol::ModelId;
+
     use super::{
-        drop_cli_catchall_allows, memory_embedding_uses_live_xai_auth,
-        select_memory_embedding_route,
+        drop_cli_catchall_allows, initial_model_persistence_message,
+        memory_embedding_uses_live_xai_auth, select_memory_embedding_route,
     };
+    use crate::session::persistence::PersistenceMsg;
     use xai_grok_workspace::permission::resolution::YOLO_PIN_REASON_REQUIREMENTS;
     use xai_grok_workspace::permission::rules::parse_permission_rule;
     use xai_grok_workspace::permission::types::{PermissionRule, RuleAction, ToolFilter};
@@ -90,6 +111,49 @@ mod cli_catchall_drop_tests {
         let (kept, dropped) = drop_cli_catchall_allows(rules, None);
         assert_eq!(kept.len(), 3);
         assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn resumed_session_defers_initial_model_persistence_until_final_selection() {
+        let provider = xai_grok_sampling_types::ModelProvider::Xai;
+        let backend = xai_grok_sampling_types::ApiBackend::Responses;
+        let reasoning_effort = Some(xai_grok_sampling_types::ReasoningEffort::High);
+        let policy = crate::session::tool_surface::ResolvedToolPolicy::for_route(
+            crate::agent::config::ResolvedToolMode {
+                mode: xai_grok_sampling_types::ToolMode::CodeMode,
+                source: crate::agent::config::ToolModeSource::UserPreference,
+            },
+            provider,
+            &backend,
+        )
+        .expect("xAI Responses supports mixed Code Mode");
+
+        assert!(
+            initial_model_persistence_message(
+                false,
+                ModelId::new("grok-resume"),
+                provider,
+                reasoning_effort,
+                "grok-build".to_string(),
+                policy,
+            )
+            .is_none(),
+            "cold resume must not persist the provisional startup route"
+        );
+        assert!(matches!(
+            initial_model_persistence_message(
+                true,
+                ModelId::new("grok-new"),
+                provider,
+                reasoning_effort,
+                "grok-build".to_string(),
+                policy,
+            ),
+            Some(PersistenceMsg::CurrentModel {
+                resolved_tool_policy: Some(saved),
+                ..
+            }) if saved == policy
+        ));
     }
     /// FIX 2: a bare `--allow Bash` and a `?*` Bash pattern are `--yolo`
     /// substitutes on the freeform-execution dimension, so the pin drops them
@@ -223,7 +287,9 @@ pub(crate) async fn spawn_session_actor(
     client_fs_capable: bool,
     gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     agent_definition: AgentDefinition,
-    code_mode_enabled: bool,
+    tool_mode_preference: Option<crate::agent::config::ToolModePreference>,
+    resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
+    persist_initial_model: bool,
     session_default_agent_profile: Option<String>,
     skills_config: SkillsConfig,
     preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
@@ -550,7 +616,7 @@ pub(crate) async fn spawn_session_actor(
         max_completion_tokens: sampling_config.max_completion_tokens,
         temperature: sampling_config.temperature,
         top_p: sampling_config.top_p,
-        api_backend: sampling_config.api_backend.clone(),
+        api_backend: sampling_config.api_backend,
         provider: sampling_config.provider,
         extra_headers: sampling_config.extra_headers.clone(),
         context_window: context_window_override.unwrap_or(baseline_context_window),
@@ -595,6 +661,7 @@ pub(crate) async fn spawn_session_actor(
         running_task: None,
         pending_inputs: VecDeque::new(),
         pending_notifications: Vec::new(),
+        lifecycle_mutation: None,
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,
@@ -925,8 +992,21 @@ pub(crate) async fn spawn_session_actor(
         .unwrap_or(sampling_config.context_window);
     let model_tool_mode =
         crate::agent::models::resolve_model_tool_mode(&models_manager.models(), &session_model_id);
-    let effective_tool_mode =
-        crate::agent::config::effective_tool_mode(model_tool_mode, code_mode_enabled);
+    let resolved_tool_mode = crate::agent::config::effective_tool_mode(
+        sampling_config.provider,
+        &sampling_config.api_backend,
+        model_tool_mode,
+        tool_mode_preference,
+    )
+    .map_err(|error| xai_grok_agent::AgentBuildError::InvalidConfig(error.to_string()))?;
+    let resolved_tool_policy =
+        crate::session::tool_surface::ResolvedToolPolicy::select_for_fork_route(
+            resolved_tool_mode,
+            resolved_tool_policy_override,
+            sampling_config.provider,
+            &sampling_config.api_backend,
+        )
+        .map_err(xai_grok_agent::AgentBuildError::InvalidConfig)?;
     let managed_gateway_tool_client = auth_manager.as_ref().map(|am| {
         xai_grok_tools::types::resources::ManagedGatewayToolClient(Arc::new(
             ShellManagedGatewayToolClient {
@@ -967,8 +1047,8 @@ pub(crate) async fn spawn_session_actor(
         models_manager: models_manager.clone(),
         compaction_policy,
         reminder_policy,
-        code_mode_enabled,
-        code_mode_runtime: crate::session::code_mode::CodeModeRuntime::new(),
+        tool_mode_preference,
+        code_mode_runtime: crate::session::code_mode::CodeModeRuntimeSlot::new(),
         memory_enabled: memory_config.as_ref().is_some_and(|mc| mc.enabled),
         memory_global_path: memory_storage_for_session
             .as_ref()
@@ -1036,7 +1116,7 @@ pub(crate) async fn spawn_session_actor(
             );
             e
         })?;
-    agent.set_tool_mode(effective_tool_mode);
+    agent.set_tool_mode(resolved_tool_policy.resolved.mode);
     let resolved_task_output =
         xai_grok_tools::reminders::task_completion::resolve_task_output_tool_name(
             agent.tool_bridge(),
@@ -1492,6 +1572,25 @@ pub(crate) async fn spawn_session_actor(
     {
         tracing::error!(%error, "failed to start Code Mode nested-tool dispatcher");
     }
+    let active_sampling_config = session
+        .chat_state_handle
+        .get_sampling_config()
+        .await
+        .ok_or_else(|| {
+            xai_grok_agent::AgentBuildError::InvalidConfig(
+                "spawned session has no sampling configuration".to_string(),
+            )
+        })?;
+    if let Some(message) = initial_model_persistence_message(
+        persist_initial_model,
+        session_model_id.clone(),
+        active_sampling_config.provider,
+        active_sampling_config.reasoning_effort,
+        session.agent.borrow().definition().name.clone(),
+        resolved_tool_policy,
+    ) {
+        let _ = session.notifications.persistence_tx.send(message);
+    }
     {
         let drainer_session = session.clone();
         let mut sampler_event_rx = sampler_event_rx;
@@ -1874,7 +1973,9 @@ pub(crate) async fn spawn_session_on_thread(
     client_fs_capable: bool,
     gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     agent_definition: AgentDefinition,
-    code_mode_enabled: bool,
+    tool_mode_preference: Option<crate::agent::config::ToolModePreference>,
+    resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
+    persist_initial_model: bool,
     session_default_agent_profile: Option<String>,
     skills_config: SkillsConfig,
     preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
@@ -2038,7 +2139,9 @@ pub(crate) async fn spawn_session_on_thread(
                         client_fs_capable,
                         gateway_enabled,
                         agent_definition,
-                        code_mode_enabled,
+                        tool_mode_preference,
+                        resolved_tool_policy_override,
+                        persist_initial_model,
                         session_default_agent_profile,
                         skills_config,
                         preloaded_skills,

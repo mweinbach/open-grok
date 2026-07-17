@@ -1127,18 +1127,26 @@ fn every_persisting_setting_has_rollback_arm() {
 
 #[test]
 fn code_mode_setter_persists_and_rolls_back_with_restart_toast() {
+    use xai_grok_shell::agent::config::ToolModePreference;
+
     let mut app = test_app_with_agent();
     assert_eq!(app.current_ui.code_mode, None);
 
-    let effects = dispatch(Action::SetCodeMode(true), &mut app);
-    assert_eq!(app.current_ui.code_mode, Some(true));
+    let effects = dispatch(
+        Action::SetCodeMode(ToolModePreference::CodeModeOnly),
+        &mut app,
+    );
+    assert_eq!(
+        app.current_ui.code_mode,
+        Some(ToolModePreference::CodeModeOnly)
+    );
     assert_eq!(effects.len(), 1);
     assert!(matches!(
         &effects[0],
         Effect::PersistSetting {
             key: "code_mode",
-            value: crate::settings::SettingValue::Bool(true),
-            rollback_value: crate::settings::SettingValue::Bool(false),
+            value: crate::settings::SettingValue::Enum("code_mode_only"),
+            rollback_value: crate::settings::SettingValue::Enum("direct"),
         }
     ));
     let toast = app
@@ -1147,15 +1155,18 @@ fn code_mode_setter_persists_and_rolls_back_with_restart_toast() {
         .and_then(|a| a.toast.as_ref())
         .map(|(message, _)| message.as_str())
         .expect("code_mode setter must show a toast");
-    assert!(toast.contains("restart to apply"));
+    assert!(
+        toast.contains("restart Open Grok to apply"),
+        "the persisted preference does not update the already-loaded shell config",
+    );
 
     let rollback_effects = apply_setting_rollback(
         &mut app,
         "code_mode",
-        &crate::settings::SettingValue::Bool(false),
+        &crate::settings::SettingValue::Enum("direct"),
     );
     assert!(rollback_effects.is_empty());
-    assert_eq!(app.current_ui.code_mode, Some(false));
+    assert_eq!(app.current_ui.code_mode, Some(ToolModePreference::Direct));
 }
 
 /// Pin the
@@ -1515,7 +1526,10 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
             let _ = dispatch(Action::SetRememberToolApprovals(true), app);
         }
         "code_mode" => {
-            let _ = dispatch(Action::SetCodeMode(true), app);
+            let _ = dispatch(
+                Action::SetCodeMode(xai_grok_shell::agent::config::ToolModePreference::CodeMode),
+                app,
+            );
         }
         "toolset.ask_user_question.timeout_enabled" => {
             let _ = dispatch(Action::SetAskUserQuestionTimeoutEnabled(false), app);

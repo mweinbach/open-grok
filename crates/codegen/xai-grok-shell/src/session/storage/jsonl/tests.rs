@@ -77,18 +77,36 @@ async fn update_current_model_persists_leaves_and_clears_reasoning_effort() {
     let info = create_test_info();
     let model = default_model_id();
     adapter.init_session(&info, model.clone()).await.unwrap();
+    let policy = crate::session::tool_surface::ResolvedToolPolicy {
+        resolved: crate::agent::config::ResolvedToolMode {
+            mode: xai_grok_sampling_types::ToolMode::CodeMode,
+            source: crate::agent::config::ToolModeSource::UserPreference,
+        },
+        transport: Some(xai_grok_sampling_types::CodeModeTransport::FunctionEnvelope),
+        route_provider: Some(xai_grok_sampling_types::ModelProvider::Xai),
+        route_backend: Some(xai_grok_sampling_types::ApiBackend::Responses),
+    };
     adapter
         .update_current_model_and_agent(
             &info,
             &model,
             None,
             Some(Some(ReasoningEffort::High)),
+            Some(policy),
         )
         .await
         .unwrap();
     assert_eq!(
         adapter.read_summary_sync(& info).unwrap().reasoning_effort,
         Some(ReasoningEffort::High),
+    );
+    assert_eq!(
+        adapter
+            .read_summary_sync(&info)
+            .unwrap()
+            .resolved_tool_policy,
+        Some(policy),
+        "model identity and its resolved transport must share one summary patch",
     );
     adapter.update_current_model(&info, &model).await.unwrap();
     assert_eq!(
@@ -97,7 +115,7 @@ async fn update_current_model_persists_leaves_and_clears_reasoning_effort() {
         "model-only update must not wipe the persisted effort",
     );
     adapter
-        .update_current_model_and_agent(&info, &model, None, Some(None))
+        .update_current_model_and_agent(&info, &model, None, Some(None), None)
         .await
         .unwrap();
     assert_eq!(adapter.read_summary_sync(& info).unwrap().reasoning_effort, None,);
@@ -736,6 +754,25 @@ async fn test_copy_session_data_with_model_override() {
         cwd: "/source".to_string(),
     };
     adapter.init_session(&source_info, default_model_id()).await.unwrap();
+    let source_policy = crate::session::tool_surface::ResolvedToolPolicy {
+        resolved: crate::agent::config::ResolvedToolMode {
+            mode: xai_grok_sampling_types::ToolMode::CodeMode,
+            source: crate::agent::config::ToolModeSource::UserPreference,
+        },
+        transport: Some(xai_grok_sampling_types::CodeModeTransport::FunctionEnvelope),
+        route_provider: Some(xai_grok_sampling_types::ModelProvider::Xai),
+        route_backend: Some(xai_grok_sampling_types::ApiBackend::Responses),
+    };
+    adapter
+        .update_current_model_and_agent(
+            &source_info,
+            &default_model_id(),
+            None,
+            None,
+            Some(source_policy),
+        )
+        .await
+        .unwrap();
     let target_info = Info {
         id: acp::SessionId::new("fork-model-test"),
         cwd: "/target".to_string(),
@@ -750,6 +787,10 @@ async fn test_copy_session_data_with_model_override() {
     let loaded = adapter.load_session(&target_info).await.unwrap();
     assert_eq!(loaded.summary.current_model_id.0.as_ref(), "grok-3");
     assert_eq!(loaded.summary.parent_session_id, Some("source-model-test".to_string()));
+    assert!(
+        loaded.summary.resolved_tool_policy.is_none(),
+        "a model-changing fork must resolve its provider transport afresh"
+    );
 }
 #[tokio::test]
 async fn test_load_prompts_only() {
@@ -1816,6 +1857,7 @@ fn write_test_summary(
         num_messages: 1,
         num_chat_messages: 1,
         current_model_id: default_model_id(),
+        resolved_tool_policy: None,
         previous_turn_model: None,
         ever_used_codex: false,
         parent_session_id: None,

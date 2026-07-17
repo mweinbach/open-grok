@@ -474,30 +474,43 @@ pub(in crate::app::dispatch) fn set_remember_tool_approvals(
     }]
 }
 
-/// Mirror the user-config override in `current_ui`. Runtime mode resolution is
-/// intentionally left untouched; new sessions consume this preference.
-pub(super) fn set_code_mode_inner(app: &mut AppView, new: bool) {
+/// Mirror the user-config preference in `current_ui`. Runtime mode resolution
+/// is intentionally left untouched; the next Open Grok process consumes it.
+pub(super) fn set_code_mode_inner(
+    app: &mut AppView,
+    new: xai_grok_shell::agent::config::ToolModePreference,
+) {
     app.current_ui.code_mode = Some(new);
 }
 
-/// SHELL-owned setter for the restart-required `[ui].code_mode` switch.
-pub(in crate::app::dispatch) fn set_code_mode(app: &mut AppView, new: bool) -> Vec<Effect> {
+/// SHELL-owned setter for the restart-required `[ui].code_mode` selector.
+pub(in crate::app::dispatch) fn set_code_mode(
+    app: &mut AppView,
+    new: xai_grok_shell::agent::config::ToolModePreference,
+) -> Vec<Effect> {
     let prev_state = app.current_ui.code_mode;
-    let prev_effective = prev_state.unwrap_or(false);
+    let prev_effective = prev_state.unwrap_or_default();
     if prev_effective == new && prev_state.is_some() {
         return vec![];
     }
     set_code_mode_inner(app, new);
     refresh_open_settings_modals(app);
-    tracing::info!(target: "settings", key = "code_mode", value = new, "setting changed");
-    app.show_toast(&format!(
-        "{} (restart to apply)",
-        save_success_toast("Code mode", new),
-    ));
+    tracing::info!(
+        target: "settings",
+        key = "code_mode",
+        value = new.as_canonical(),
+        "setting changed",
+    );
+    let label = match new {
+        xai_grok_shell::agent::config::ToolModePreference::Direct => "Direct",
+        xai_grok_shell::agent::config::ToolModePreference::CodeMode => "Code Mode",
+        xai_grok_shell::agent::config::ToolModePreference::CodeModeOnly => "Code Mode Only",
+    };
+    app.show_toast(&format!("Code mode: {label} (restart Open Grok to apply)"));
     vec![Effect::PersistSetting {
         key: "code_mode",
-        value: crate::settings::SettingValue::Bool(new),
-        rollback_value: crate::settings::SettingValue::Bool(prev_effective),
+        value: crate::settings::SettingValue::Enum(new.as_canonical()),
+        rollback_value: crate::settings::SettingValue::Enum(prev_effective.as_canonical()),
     }]
 }
 

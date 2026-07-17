@@ -245,6 +245,18 @@ impl ChatStateHandle {
             .send(ChatStateCommand::RestoreSnapshot(Box::new(snapshot)));
     }
 
+    /// Atomically install and persist a staged rewind snapshot. Returns
+    /// `None` if the chat-state actor is no longer available.
+    pub async fn commit_rewind_snapshot(&self, snapshot: ChatStateSnapshot) -> Option<()> {
+        self.query("CommitRewindSnapshot", |reply| {
+            ChatStateCommand::CommitRewindSnapshot {
+                snapshot: Box::new(snapshot),
+                reply,
+            }
+        })
+        .await
+    }
+
     /// Begin capturing turn messages. Call at the start of a real user turn
     /// (in `handle_prompt`), before `push_user_message`.
     pub fn begin_turn_capture(&self) {

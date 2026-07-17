@@ -3,6 +3,11 @@
 
 use super::*;
 
+struct StagedConversationRewind {
+    snapshot: xai_chat_state::ChatStateSnapshot,
+    prompt_text: Option<String>,
+}
+
 impl SessionActor {
     pub(super) async fn close_rewind_window(&self) {
         let mut state = self.state.lock().await;
@@ -118,38 +123,105 @@ impl SessionActor {
         Ok(prompts)
     }
 
-    /// Check whether rewinding to `target_index` needs replay because a
-    /// compaction has occurred, meaning we need to replay `updates.jsonl`
-    /// to reconstruct the conversation.
-    ///
-    /// Always use replay when compaction has occurred, regardless of whether
-    /// the target is before, at, or after the compaction point.
-    ///
-    /// Post-compaction, the in-memory conversation has a different number of
-    /// User messages than `prompt_index` implies (compaction collapses N+1
-    /// user messages into ~3). `truncate_to_prompt_index` counts User items
-    /// to find the cut point, so it produces wrong results for ALL
-    /// post-compaction targets — not just at the boundary.
-    ///
-    /// `replay_to_prompt` reads `updates.jsonl` from scratch and handles
-    /// compaction checkpoints correctly, so it always produces the right
-    /// conversation regardless of target position.
-    async fn needs_compaction_replay(&self) -> bool {
-        let last = self
+    /// Build and validate the complete post-rewind chat snapshot without
+    /// mutating chat state or the Code Mode runtime. In particular, checkpoint
+    /// replay must succeed before the old JavaScript timeline is invalidated.
+    async fn stage_conversation_rewind(
+        &self,
+        target_index: usize,
+        mode: RewindMode,
+    ) -> anyhow::Result<Result<StagedConversationRewind, RewindResponse>> {
+        let mut snapshot = self
             .chat_state_handle
             .snapshot()
             .await
-            .and_then(|s| s.last_compaction_prompt_index);
-        match last {
-            Some(compaction_at) => {
-                tracing::info!(
-                    compaction_at,
-                    "Compaction detected — using replay for rewind"
-                );
-                true
+            .ok_or_else(|| anyhow::anyhow!("chat state unavailable while staging rewind"))?;
+        let prompt_text = snapshot.prompt_texts.get(target_index).cloned();
+        let mut conversation = snapshot.conversation.clone();
+        let mut replay_compaction_marker: Option<Option<usize>> = None;
+
+        if let Some(compaction_at) = snapshot.last_compaction_prompt_index {
+            tracing::info!(
+                compaction_at,
+                "Compaction detected — staging replay for rewind"
+            );
+            let session_dir = crate::session::persistence::session_dir(&self.session_info);
+            let updates_path = session_dir.join("updates.jsonl");
+            let replay_result = tokio::task::spawn_blocking(move || {
+                crate::session::helpers::replay::replay_to_prompt(
+                    &updates_path,
+                    &session_dir,
+                    target_index,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?;
+
+            let replay_result = match replay_result {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        target_index,
+                        "Cross-compaction replay validation failed — rewind aborted"
+                    );
+                    return Ok(Err(RewindResponse {
+                        success: false,
+                        target_prompt_index: target_index,
+                        mode,
+                        reverted_files: vec![],
+                        clean_files: vec![],
+                        conflicts: vec![],
+                        prompt_text: None,
+                        error: Some(format!(
+                            "Cannot rewind to prompt #{} — compaction checkpoint data is \
+                             unavailable ({error}). Try rewinding to a prompt after the \
+                             compaction point instead.",
+                            target_index,
+                        )),
+                    }));
+                }
+            };
+
+            tracing::info!(
+                target_index,
+                prompt_index_reached = replay_result.prompt_index_reached,
+                conversation_len = replay_result.conversation.len(),
+                "Cross-compaction rewind staged via replay"
+            );
+            replay_compaction_marker = Some(replay_result.last_compaction_prompt_index);
+            if matches!(
+                replay_result.conversation.first(),
+                Some(ConversationItem::System(_))
+            ) {
+                conversation = replay_result.conversation;
+            } else {
+                // Raw pre-compaction replay contains only turns. Preserve the
+                // System prefix and restore the historical user-info payload
+                // captured in the checkpoint before appending those turns.
+                if let Some(original_user_info) = replay_result.original_user_info {
+                    conversation.truncate(1);
+                    conversation.push(ConversationItem::user(original_user_info));
+                } else {
+                    conversation.truncate(2);
+                }
+                conversation.extend(replay_result.conversation);
             }
-            None => false,
+        } else {
+            let keep_count = conversation_truncate_for_prompt(&conversation, target_index);
+            conversation.truncate(keep_count);
         }
+
+        snapshot.conversation = conversation;
+        snapshot.prompt_index = target_index;
+        snapshot.prompt_texts.truncate(target_index);
+        snapshot.last_compaction_prompt_index =
+            replay_compaction_marker.unwrap_or(snapshot.last_compaction_prompt_index);
+
+        Ok(Ok(StagedConversationRewind {
+            snapshot,
+            prompt_text,
+        }))
     }
 
     /// Handle a rewind request with mode support.
@@ -164,9 +236,36 @@ impl SessionActor {
         &self,
         request: RewindRequest,
     ) -> anyhow::Result<RewindResponse> {
-        // Track revert for feedback signals
-        self.signals_handle().mark_reverted();
+        if !request.force {
+            return self.handle_rewind_while_gated(request).await;
+        }
 
+        if let Err(blocked) = self
+            .begin_lifecycle_mutation(LifecycleMutationKind::Rewind)
+            .await
+        {
+            return Ok(RewindResponse {
+                success: false,
+                target_prompt_index: request.target_prompt_index,
+                mode: request.mode,
+                reverted_files: vec![],
+                clean_files: vec![],
+                conflicts: vec![],
+                prompt_text: None,
+                error: Some(format!("Cannot rewind while {}.", blocked.message())),
+            });
+        }
+
+        let result = self.handle_rewind_while_gated(request).await;
+        self.end_lifecycle_mutation(LifecycleMutationKind::Rewind)
+            .await;
+        result
+    }
+
+    async fn handle_rewind_while_gated(
+        &self,
+        request: RewindRequest,
+    ) -> anyhow::Result<RewindResponse> {
         let target_index = request.target_prompt_index;
         let mode = request.mode;
 
@@ -194,69 +293,49 @@ impl SessionActor {
             });
         }
 
-        // ── Build file revert preview (for All and FilesOnly modes) ─────
-        let mut clean_files = Vec::new();
-        let mut conflicts = Vec::new();
-
         let wants_file_revert = matches!(mode, RewindMode::All | RewindMode::FilesOnly);
         let wants_conversation_rewind =
             matches!(mode, RewindMode::All | RewindMode::ConversationOnly);
-
-        // Collect files that would be reverted and detect conflicts.
-        // This is read-only — no mutations happen here.
-        let mut files_to_revert: std::collections::HashMap<
-            xai_grok_workspace::session::file_state::FlexiblePath,
-            Option<String>,
-        > = std::collections::HashMap::new();
-
-        if wants_file_revert {
-            let all_points = self.file_state_tracker.get_rewind_points().await;
-
-            for point in all_points.iter().filter(|p| p.prompt_index >= target_index) {
-                for (path, before_snapshot) in &point.file_snapshots {
-                    // Only keep the earliest snapshot for each file
-                    files_to_revert
-                        .entry(path.clone())
-                        .or_insert_with(|| before_snapshot.content.clone());
-                }
-            }
-
-            // Build conflict/clean lists for the preview
-            for path in files_to_revert.keys() {
-                let current_content = self
-                    .tool_context
-                    .fs
-                    .try_read_to_string(path)
-                    .await
-                    .unwrap_or(None);
-
-                // Find the latest after_snapshot for this file (what the agent
-                // most recently left it as) for conflict detection.
-                let after_content = all_points
-                    .iter()
-                    .rev()
-                    .find_map(|p| p.after_snapshots.get(path))
-                    .and_then(|s| s.content.clone());
-
-                let is_clean = current_content == after_content;
-
-                if is_clean {
-                    clean_files.push(path.to_string());
-                } else {
-                    let conflict_type = if current_content.is_none() && after_content.is_some() {
+        // Preflight and de-duplicate file paths once for both preview and
+        // commit. The workspace transaction re-checks every path immediately
+        // before mutation and compensates prior writes on failure.
+        let staged_files = if wants_file_revert {
+            Some(
+                xai_grok_workspace::session::file_state::stage_file_rewind(
+                    &self.file_state_tracker,
+                    &self.tool_context.fs,
+                    target_index,
+                )
+                .await
+                .map_err(anyhow::Error::new)?,
+            )
+        } else {
+            None
+        };
+        let clean_files = staged_files
+            .as_ref()
+            .map(|staged| staged.clean_files().to_vec())
+            .unwrap_or_default();
+        let conflicts: Vec<RewindConflictInfo> = staged_files
+            .as_ref()
+            .into_iter()
+            .flat_map(|staged| staged.conflicts())
+            .map(|conflict| RewindConflictInfo {
+                path: conflict.path.clone(),
+                conflict_type: match &conflict.conflict_type {
+                    xai_grok_workspace::session::file_state::ConflictType::DeletedExternally => {
                         "deleted_externally"
-                    } else if current_content.is_some() && after_content.is_none() {
+                    }
+                    xai_grok_workspace::session::file_state::ConflictType::CreatedExternally => {
                         "created_externally"
-                    } else {
+                    }
+                    xai_grok_workspace::session::file_state::ConflictType::ModifiedExternally => {
                         "modified_externally"
-                    };
-                    conflicts.push(RewindConflictInfo {
-                        path: path.to_string(),
-                        conflict_type: conflict_type.to_string(),
-                    });
+                    }
                 }
-            }
-        }
+                .to_string(),
+            })
+            .collect();
 
         // ── Preview mode (force=false): pure dry run, no mutations ────
         // Return what WOULD happen so the TUI can show a confirmation
@@ -281,173 +360,89 @@ impl SessionActor {
 
         // ── Commit mode (force=true): execute the rewind ─────────────
 
-        // Execute file revert
-        let mut reverted_files = Vec::new();
-        if wants_file_revert {
-            for (rel_path, content) in files_to_revert {
-                match &content {
-                    Some(data) => {
-                        if let Err(e) = self
-                            .tool_context
-                            .fs
-                            .write_file(&rel_path, data.as_bytes())
-                            .await
-                        {
-                            tracing::warn!(?e, "Failed to restore file during rewind");
-                            continue;
-                        }
-                    }
-                    None => {
-                        if self
-                            .tool_context
-                            .fs
-                            .exists(&rel_path)
-                            .await
-                            .unwrap_or(false)
-                            && let Err(e) = self.tool_context.fs.delete_file(&rel_path).await
-                        {
-                            tracing::warn!(?e, "Failed to delete file during rewind");
-                        }
-                    }
-                }
-                reverted_files.push(rel_path.to_string());
+        // Stage every fallible conversation/replay decision first. A missing
+        // or corrupt compaction checkpoint must leave both the canonical chat
+        // snapshot and the persistent JavaScript timeline untouched.
+        let staged_conversation = if wants_conversation_rewind {
+            match self.stage_conversation_rewind(target_index, mode).await? {
+                Ok(staged) => Some(staged),
+                Err(rejected) => return Ok(rejected),
             }
+        } else {
+            None
+        };
+
+        let reverted_files = match staged_files.as_ref() {
+            Some(staged) => match staged.apply(&self.tool_context.fs).await {
+                Ok(reverted) => reverted,
+                Err(error) => {
+                    return Ok(RewindResponse {
+                        success: false,
+                        target_prompt_index: target_index,
+                        mode,
+                        reverted_files: error.unresolved_paths,
+                        clean_files: vec![],
+                        conflicts,
+                        prompt_text: None,
+                        error: Some(error.message),
+                    });
+                }
+            },
+            None => Vec::new(),
+        };
+
+        if wants_conversation_rewind
+            && let Err(error) = self.rebuild_spec.code_mode_runtime.reset().await
+        {
+            let rollback_failures = match staged_files.as_ref() {
+                Some(staged) => staged.rollback(&self.tool_context.fs).await,
+                None => Vec::new(),
+            };
+            let rollback_note = if rollback_failures.is_empty() {
+                "file changes were rolled back".to_string()
+            } else {
+                format!(
+                    "file rollback also failed for: {}",
+                    rollback_failures.join(", ")
+                )
+            };
+            return Ok(RewindResponse {
+                success: false,
+                target_prompt_index: target_index,
+                mode,
+                reverted_files: vec![],
+                clean_files: vec![],
+                conflicts,
+                prompt_text: None,
+                error: Some(format!(
+                    "Failed to reset the Code Mode runtime: {error}; {rollback_note}. Rewind snapshots were preserved."
+                )),
+            });
         }
 
-        // Execute conversation rewind
-        let mut prompt_text: Option<String> = None;
-        if wants_conversation_rewind {
-            let session_dir = crate::session::persistence::session_dir(&self.session_info);
-            let updates_path = session_dir.join("updates.jsonl");
-
-            if let Some(snap) = self.chat_state_handle.snapshot().await {
-                prompt_text = snap.prompt_texts.get(target_index).cloned();
-            }
-
-            // Store for edit-and-retry detection in the next prompt() call
-            if let Ok(mut pending) = self.rewind_pending_prompt.lock() {
-                *pending = prompt_text.clone();
-            }
-
-            // Check cross-compaction before rewinding.
-            let needs_replay = self.needs_compaction_replay().await;
-
-            // Get conversation from the chat state actor for truncation logic.
-            let mut conversation = self.chat_state_handle.get_conversation().await;
-
-            // Cross-compaction replay recomputes whether a compaction summary
-            // survives; `None` keeps the existing marker (standard truncation).
-            let mut replay_compaction_marker: Option<Option<usize>> = None;
-
-            if needs_replay {
-                // Cross-compaction rewind: reconstruct conversation from updates.jsonl.
-                // Run on the blocking pool since replay does synchronous file I/O
-                // (reading checkpoint files + scanning updates.jsonl).
-                let replay_updates = updates_path.clone();
-                let replay_session_dir = session_dir.clone();
-                let replay_target = target_index;
-                let replay_result = tokio::task::spawn_blocking(move || {
-                    crate::session::helpers::replay::replay_to_prompt(
-                        &replay_updates,
-                        &replay_session_dir,
-                        replay_target,
-                    )
-                })
+        // Commit the already-validated chat snapshot only after the runtime
+        // reset and transactional file phase have succeeded.
+        let prompt_text = staged_conversation
+            .as_ref()
+            .and_then(|staged| staged.prompt_text.clone());
+        if let Some(staged) = staged_conversation {
+            if self
+                .chat_state_handle
+                .commit_rewind_snapshot(staged.snapshot)
                 .await
-                .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?;
-                match replay_result {
-                    Ok(replay_result) => {
-                        tracing::info!(
-                            target_index,
-                            prompt_index_reached = replay_result.prompt_index_reached,
-                            conversation_len = replay_result.conversation.len(),
-                            "Cross-compaction rewind: conversation reconstructed via replay"
-                        );
-                        // The rebuilt conversation drops the summary unless a
-                        // checkpoint survived; carry the recomputed marker to
-                        // the snapshot restore so the stale value isn't reused.
-                        replay_compaction_marker = Some(replay_result.last_compaction_prompt_index);
-                        // The replay result may or may not include the session
-                        // preamble (System + User(user_info)):
-                        // - Checkpoint loaded (target >= compaction_at): the
-                        //   checkpoint's compacted_history already has System +
-                        //   User prefix. Use directly.
-                        // - Raw updates (target < compaction_at): replay only
-                        //   accumulates user/agent turns from updates.jsonl.
-                        //   Prepend System + original User(user_info) so the
-                        //   model sees the same preamble it originally saw.
-                        if matches!(
-                            replay_result.conversation.first(),
-                            Some(ConversationItem::System(_))
-                        ) {
-                            conversation = replay_result.conversation;
-                        } else {
-                            // Keep System (index 0). Replace User(user_info) at
-                            // index 1 with the original from the checkpoint if
-                            // available, otherwise keep the current one.
-                            if let Some(ui0) = replay_result.original_user_info {
-                                conversation.truncate(1); // keep System only
-                                conversation.push(ConversationItem::user(ui0));
-                            } else {
-                                conversation.truncate(2); // keep System + current user_info
-                            }
-                            conversation.extend(replay_result.conversation);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            ?e,
-                            target_index,
-                            "Cross-compaction replay failed — rewind aborted"
-                        );
-                        // Do NOT fall back to truncation: the post-compaction
-                        // conversation has wrong user-message counts, and raw
-                        // replay without a checkpoint produces an oversized
-                        // conversation that will exceed the context window.
-                        // Return a clear error so the user can rewind to a
-                        // different (post-compaction) prompt instead.
-                        return Ok(RewindResponse {
-                            success: false,
-                            target_prompt_index: target_index,
-                            mode,
-                            reverted_files: vec![],
-                            clean_files: vec![],
-                            conflicts: vec![],
-                            prompt_text: None,
-                            error: Some(format!(
-                                "Cannot rewind to prompt #{} — compaction checkpoint data is \
-                                 unavailable ({e}). Try rewinding to a prompt after the \
-                                 compaction point instead.",
-                                target_index,
-                            )),
-                        });
-                    }
-                }
-            } else {
-                // Standard rewind: truncate in-memory conversation. "Rewind
-                // to N" = restore state before prompt N ran, keeping 0..N-1;
-                // target 0 keeps only the session preamble.
-                let keep_count = conversation_truncate_for_prompt(&conversation, target_index);
-                conversation.truncate(keep_count);
+                .is_none()
+            {
+                let rollback_failures = match staged_files.as_ref() {
+                    Some(staged) => staged.rollback(&self.tool_context.fs).await,
+                    None => Vec::new(),
+                };
+                anyhow::bail!(
+                    "chat state unavailable while committing rewind; file rollback failures: {:?}",
+                    rollback_failures
+                );
             }
-
-            // Write the truncated conversation back via the actor
-            // (handles both state update + persistence).
-            self.chat_state_handle.replace_conversation(conversation);
-            // Use a snapshot to set the correct prompt_index and truncated prompt_texts.
-            // The actor's TruncateToPromptIndex doesn't apply here because the
-            // conversation was already truncated locally. Instead, snapshot + restore
-            // with the corrected fields.
-            if let Some(mut snap) = self.chat_state_handle.snapshot().await {
-                snap.prompt_index = target_index;
-                snap.prompt_texts.truncate(target_index);
-                // Cross-compaction rewind recomputes the marker (the rebuilt
-                // conversation may have dropped the summary); standard
-                // truncation keeps the existing marker.
-                let new_marker =
-                    replay_compaction_marker.unwrap_or(snap.last_compaction_prompt_index);
-                snap.last_compaction_prompt_index = new_marker;
-                self.chat_state_handle.restore_snapshot(snap);
+            if let Ok(mut pending) = self.rewind_pending_prompt.lock() {
+                *pending = staged.prompt_text.clone();
             }
 
             // Conversation shrank — clear budget-based (size/schema) and stale
@@ -488,6 +483,34 @@ impl SessionActor {
             // ConversationOnly: files are untouched but the conversation is rewound.
             self.merge_rewind_tracker_from(target_index).await;
         }
+
+        // Preserve FIFO ordering with the persistence actor before reporting
+        // the already-committed in-memory/file result. `FlushAndAck` is an
+        // ordering barrier (the storage layer logs individual I/O failures); a
+        // closed persistence channel cannot safely turn this into a retryable
+        // rewind error because replaying now would mutate the new timeline a
+        // second time.
+        let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
+        if self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::FlushAndAck {
+                respond_to: flush_tx,
+            })
+            .is_err()
+            || flush_rx.await.is_err()
+        {
+            tracing::warn!(
+                session_id = %self.session_info.id.0,
+                target_prompt_index = target_index,
+                "rewind committed, but the persistence ordering barrier was unavailable"
+            );
+        }
+
+        // Feedback should reflect a committed timeline change only. Previews,
+        // invalid targets, failed replay validation, and runtime-reset failures
+        // all return before this point.
+        self.signals_handle().mark_reverted();
 
         Ok(RewindResponse {
             success: true,

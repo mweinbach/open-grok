@@ -1,4 +1,4 @@
-use super::support::create_test_actor;
+use super::support::{create_test_actor, spawn_persistence_ack_drainer};
 
 use crate::extensions::notification::{
     CompactionCheckpointFile, CompactionCheckpointInfo, SessionNotification as XaiNotification,
@@ -57,7 +57,8 @@ async fn rewind_pre_compaction_with_cancelled_turns_truncates_context_gb2961() {
 
 async fn run_rewind_scenario() {
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_persistence_ack_drainer(persistence_rx);
     let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let unique = std::time::SystemTime::now()
@@ -124,6 +125,7 @@ async fn run_rewind_scenario() {
     snap.prompt_texts = (0..7).map(|i| format!("P{i}")).collect();
     snap.last_compaction_prompt_index = Some(5);
     actor.chat_state_handle.restore_snapshot(snap);
+    let runtime_generation = actor.rebuild_spec.code_mode_runtime.generation();
 
     let resp = actor
         .handle_rewind(RewindRequest {
@@ -134,6 +136,11 @@ async fn run_rewind_scenario() {
         .await
         .expect("handle_rewind ok");
     assert!(resp.success, "rewind should succeed: {resp:?}");
+    assert_eq!(
+        actor.rebuild_spec.code_mode_runtime.generation(),
+        runtime_generation + 1,
+        "cross-compaction rewind must invalidate the prior JavaScript timeline"
+    );
 
     let conv = actor.chat_state_handle.get_conversation().await;
     let texts: Vec<String> = conv.iter().map(|c| c.text_content()).collect();
@@ -158,6 +165,158 @@ async fn run_rewind_scenario() {
     );
 }
 
+/// Replay validation is a pre-commit phase. A missing checkpoint must not
+/// invalidate the persistent JavaScript timeline, alter chat state, or emit a
+/// successful-revert feedback signal.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_cross_compaction_rewind_preserves_code_mode_runtime() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(run_failed_rewind_preserves_runtime_scenario())
+        .await;
+}
+
+async fn run_failed_rewind_preserves_runtime_scenario() {
+    let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_persistence_ack_drainer(persistence_rx);
+    let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    actor.session_info.id = acp::SessionId::new(format!("rw-missing-checkpoint-{unique}"));
+    let session_dir = crate::session::persistence::session_dir(&actor.session_info);
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    // The update points at a checkpoint that deliberately does not exist.
+    let updates = vec![
+        user_chunk("P0", 0),
+        user_chunk("P1", 1),
+        user_chunk("P2", 2),
+        user_chunk("P3", 3),
+        user_chunk("P4", 4),
+        checkpoint_update("missing", 5),
+        user_chunk("P5", 5),
+        agent_chunk("R5"),
+        user_chunk("P6", 6),
+    ];
+    let mut content = Vec::new();
+    for update in &updates {
+        let envelope = SessionUpdateEnvelope::from_update(update).unwrap();
+        content.extend(serde_json::to_vec(&envelope).unwrap());
+        content.push(b'\n');
+    }
+    std::fs::write(session_dir.join("updates.jsonl"), content).unwrap();
+
+    let mut snapshot = actor
+        .chat_state_handle
+        .snapshot()
+        .await
+        .expect("snapshot available");
+    snapshot.conversation = vec![
+        ConversationItem::system("SYS"),
+        ConversationItem::user("UI1"),
+        ConversationItem::user("SUMMARY"),
+        ConversationItem::user("P5"),
+        ConversationItem::assistant("R5"),
+        ConversationItem::user("P6"),
+    ];
+    snapshot.prompt_index = 7;
+    snapshot.prompt_texts = (0..7).map(|i| format!("P{i}")).collect();
+    snapshot.last_compaction_prompt_index = Some(5);
+    actor.chat_state_handle.restore_snapshot(snapshot.clone());
+
+    let runtime_slot = actor.rebuild_spec.code_mode_runtime.clone();
+    let runtime_before = runtime_slot.current();
+    let generation_before = runtime_slot.generation();
+    let seeded = runtime_slot
+        .exec(
+            "seed-rewind-sentinel",
+            r#"store("rewind_sentinel", "alive"); text("seeded");"#,
+            &[],
+        )
+        .await
+        .expect("seed persistent Code Mode state");
+    assert!(seeded.success, "sentinel script must complete: {seeded:?}");
+    assert!(
+        !actor
+            .signals_handle()
+            .snapshot()
+            .await
+            .expect("signals available")
+            .has_reverted
+    );
+
+    let response = actor
+        .handle_rewind(RewindRequest {
+            target_prompt_index: 3,
+            force: true,
+            mode: RewindMode::ConversationOnly,
+        })
+        .await
+        .expect("rewind reports validation failure as a response");
+    assert!(!response.success, "missing checkpoint must reject rewind");
+    assert!(
+        response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("checkpoint data is unavailable")),
+        "rejection should explain missing checkpoint: {response:?}"
+    );
+
+    assert_eq!(runtime_slot.generation(), generation_before);
+    assert!(
+        std::sync::Arc::ptr_eq(&runtime_before, &runtime_slot.current()),
+        "failed validation must preserve the live runtime instance"
+    );
+    let loaded = runtime_slot
+        .exec(
+            "read-rewind-sentinel",
+            r#"text(String(load("rewind_sentinel")));"#,
+            &[],
+        )
+        .await
+        .expect("read persistent Code Mode state after rejected rewind");
+    assert!(
+        loaded.text().contains("alive"),
+        "runtime store was preserved"
+    );
+
+    let after = actor
+        .chat_state_handle
+        .snapshot()
+        .await
+        .expect("snapshot remains available");
+    assert_eq!(
+        serde_json::to_value(&after.conversation).unwrap(),
+        serde_json::to_value(&snapshot.conversation).unwrap()
+    );
+    assert_eq!(after.prompt_index, snapshot.prompt_index);
+    assert_eq!(after.prompt_texts, snapshot.prompt_texts);
+    assert_eq!(
+        after.last_compaction_prompt_index,
+        snapshot.last_compaction_prompt_index
+    );
+    assert!(
+        !actor
+            .signals_handle()
+            .snapshot()
+            .await
+            .expect("signals available")
+            .has_reverted,
+        "failed rewind must not emit a reverted signal"
+    );
+    assert!(
+        actor.state.lock().await.lifecycle_mutation.is_none(),
+        "failed rewind releases lifecycle gate"
+    );
+
+    runtime_slot.shutdown().await.expect("runtime shutdown");
+    let _ = std::fs::remove_dir_all(&session_dir);
+}
+
 /// `FilesOnly` is exempt from the chat-state prompt-index bound (its real bound
 /// is the on-disk snapshot index), so it no-ops to success when out of range —
 /// the property the bridge relies on when the chat-state index is empty.
@@ -170,7 +329,8 @@ async fn files_only_rewind_is_exempt_from_chat_state_bound() {
 
 async fn run_files_only_bound_scenario() {
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_persistence_ack_drainer(persistence_rx);
     let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let mut snap = actor
@@ -181,6 +341,7 @@ async fn run_files_only_bound_scenario() {
     snap.prompt_index = 2;
     snap.prompt_texts = vec!["P0".into(), "P1".into()];
     actor.chat_state_handle.restore_snapshot(snap);
+    let runtime_generation = actor.rebuild_spec.code_mode_runtime.generation();
 
     // Out-of-range FilesOnly: exempt → reverts nothing (no snapshots) but
     // succeeds.
@@ -197,6 +358,11 @@ async fn run_files_only_bound_scenario() {
         "out-of-range FilesOnly must no-op succeed: {oor:?}"
     );
     assert!(oor.reverted_files.is_empty());
+    assert_eq!(
+        actor.rebuild_spec.code_mode_runtime.generation(),
+        runtime_generation,
+        "files-only rewind must preserve the live JavaScript timeline"
+    );
 
     // In-range FilesOnly also succeeds.
     let in_range = actor
@@ -210,6 +376,11 @@ async fn run_files_only_bound_scenario() {
     assert!(
         in_range.success,
         "in-range FilesOnly must succeed: {in_range:?}"
+    );
+    assert_eq!(
+        actor.rebuild_spec.code_mode_runtime.generation(),
+        runtime_generation,
+        "files-only rewind must not replace the runtime"
     );
 
     // ConversationOnly is still bounded by the chat-state index.
@@ -240,7 +411,8 @@ async fn run_file_counts_scenario() {
     use std::path::Path;
 
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_persistence_ack_drainer(persistence_rx);
     let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let cwd = Path::new("/tmp");
@@ -277,7 +449,8 @@ async fn rewind_before_compaction_clears_stale_compaction_marker() {
 async fn run_clears_marker_scenario() {
     use xai_grok_sampling_types::CompactionsRemaining;
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_persistence_ack_drainer(persistence_rx);
     let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let unique = std::time::SystemTime::now()

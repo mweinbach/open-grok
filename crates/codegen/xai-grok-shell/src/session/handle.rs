@@ -348,10 +348,13 @@ impl SessionHandle {
             Default::default()
         })
     }
-    /// Snapshot the session's resolved tool schema for verbatim-fork inheritance.
-    /// A dead actor or dropped reply fails open to an empty list (child then builds
-    /// its own toolset, same as a non-fork spawn).
-    pub(crate) async fn snapshot_tool_definitions(&self) -> Vec<xai_grok_sampling_types::ToolSpec> {
+    /// Snapshot the session's resolved ordinary-tool inputs for verbatim-fork
+    /// inheritance. The child applies the shared provider/mode surface policy.
+    /// A dead actor or dropped reply fails open to an empty snapshot (child then
+    /// builds its own toolset, same as a non-fork spawn).
+    pub(crate) async fn snapshot_tool_definitions(
+        &self,
+    ) -> crate::session::tool_surface::ToolSurfaceSnapshot {
         let (tx, rx) = oneshot::channel();
         if self
             .cmd_tx
@@ -361,13 +364,13 @@ impl SessionHandle {
             tracing::warn!(
                 "snapshot_tool_definitions: session actor gone; fork child inherits no parent tools"
             );
-            return Vec::new();
+            return Default::default();
         }
         rx.await.unwrap_or_else(|_| {
             tracing::warn!(
                 "snapshot_tool_definitions: reply dropped; fork child inherits no parent tools"
             );
-            Vec::new()
+            Default::default()
         })
     }
     /// Replace the live session's client-registered hooks (see `SessionCommand::SetClientHooks`).

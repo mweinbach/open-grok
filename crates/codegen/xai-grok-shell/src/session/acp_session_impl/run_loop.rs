@@ -309,14 +309,14 @@ pub(super) async fn run_session(
             => { session.handle_session_mode(session_mode). await; let _ = responds_to
             .send(()); } SessionCommand::SetSessionModel { model_id, sampling_config, use_concise,
             apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent,
-            responds_to } => { let updated_model_id = session
+            agent_rebuild, resolved_tool_policy_override, responds_to } => { let updated_model_id = session
             .handle_set_session_model(model_id, sampling_config, use_concise,
-            apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).
-            await; let _ = responds_to.send(updated_model_id); }
-            SessionCommand::RebuildAgentForDefinition { definition, preserve_history,
-            responds_to } => { let outcome = session
-            .handle_rebuild_agent_for_definition(definition, preserve_history). await;
-            let _ = responds_to.send(outcome); } SessionCommand::OverrideModelName {
+            apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent,
+            agent_rebuild, resolved_tool_policy_override).
+            await; let _ = responds_to.send(updated_model_id);
+            SessionActor::maybe_start_running_task(session.clone(), completion_tx
+            .clone()).await; SessionActor::maybe_drain_notifications(session.clone(),
+            completion_tx.clone()).await; } SessionCommand::OverrideModelName {
             model_name, extra_headers, context_window } => { if let Some(mut cfg) =
             session.chat_state_handle.get_sampling_config(). await {
             tracing::info!(target : SESSION_LOG, session_id = % session.session_info.id,
@@ -431,9 +431,8 @@ pub(super) async fn run_session(
             ::session::goal_tracker::GoalPauseReason::User,). await;
             SessionActor::maybe_start_running_task(session.clone(), completion_tx
             .clone()). await; } SessionCommand::CompactSession { user_context, respond_to
-            } => { let s = session.clone(); tokio::task::spawn_local(async move { let
-            compact_session = s.run_compact(user_context). await; let _ = respond_to
-            .send(compact_session); }); } SessionCommand::ReloadPlugins { registry } => {
+            } => { session.start_manual_compaction(user_context, respond_to,
+            completion_tx.clone()).await; } SessionCommand::ReloadPlugins { registry } => {
             if ! session.startup_hints.is_subagent { let registry = session
             .preserve_session_plugin_dirs(registry); session
             .apply_plugin_registry_snapshot(registry). await; } }
@@ -469,12 +468,14 @@ pub(super) async fn run_session(
             .set_llm_side_query_wired(false); } } SessionCommand::ResetPermissionState =>
             { session.permissions.reset_state(); tracing::info!(session_id = % session
             .session_info.id, "Permission state reset via notification"); }
-            SessionCommand::Rewind { request, respond_to } => { let s = session.clone();
-            tokio::task::spawn_local(async move { let result = s.handle_rewind(request).
-            await; let _ = respond_to.send(result); }); } SessionCommand::RepairHistory {
-            dry_run, respond_to } => { let s = session.clone();
-            tokio::task::spawn_local(async move { let result = s
-            .handle_repair_history(dry_run). await; let _ = respond_to.send(result); });
+            SessionCommand::Rewind { request, respond_to } => { let result = session
+            .handle_rewind(request).await; let _ = respond_to.send(result);
+            SessionActor::maybe_start_running_task(session.clone(), completion_tx
+            .clone()).await; SessionActor::maybe_drain_notifications(session.clone(),
+            completion_tx.clone()).await; }
+            SessionCommand::RepairHistory {
+            dry_run, respond_to } => { session.start_history_repair(dry_run, respond_to,
+            completion_tx.clone()).await;
             } SessionCommand::GetRewindPoints { respond_to } => { let response = session
             .get_rewind_points(). await; let _ = respond_to.send(response); }
             SessionCommand::GetRewindFileCounts { respond_to } => { let _ = respond_to
@@ -642,10 +643,15 @@ pub(super) async fn run_session(
             SessionCommand::SnapshotClientHooks { respond_to } => { let _ = respond_to
             .send(session.client_hooks.borrow().clone()); }
             SessionCommand::SnapshotToolDefinitions { respond_to } => { let defs =
-            session.prepare_tool_definitions_inner(). await; let provider = session
-            .chat_state_handle.get_sampling_config().await.map(| config | config.provider)
-            .unwrap_or_default(); let specs = session.turn_base_tool_specs(& defs,
-            provider); let _ = respond_to.send(specs); }
+            session.prepare_tool_definitions_inner(). await; let sampling_config = session
+            .chat_state_handle.get_sampling_config().await; let provider = sampling_config
+            .as_ref().map(| config | config.provider).unwrap_or_default(); let specs = session
+            .forked_tool_override.as_deref().map(| tools | session.provider_filtered_tool_specs(
+            tools, provider)).unwrap_or_else(|| session.turn_base_tool_specs(& defs, provider));
+            let resolved_policy = sampling_config.as_ref().and_then(| config |
+            session.snapshot_resolved_tool_policy(config));
+            let _ = respond_to.send(crate::session::tool_surface::ToolSurfaceSnapshot {
+            function_tools : specs, resolved_policy, }); }
             SessionCommand::SetClientHooks { hooks } => { * session.client_hooks
             .borrow_mut() = hooks; } SessionCommand::GetMcpStatus { respond_to } => { let
             mcp_state = session.mcp_state.clone(); let tool_bridge = session.agent

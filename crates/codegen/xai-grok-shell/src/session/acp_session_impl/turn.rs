@@ -1725,6 +1725,7 @@ impl SessionActor {
         &self,
         call: &xai_grok_sampling_types::ToolCall,
         enabled_tools: &[ToolDefinition],
+        transport: Option<xai_grok_sampling_types::CodeModeTransport>,
     ) {
         let ui_call_id = call.call_id().to_string();
         let show_transport = !crate::session::code_mode::is_code_mode_transport_tool(&call.name);
@@ -1766,24 +1767,19 @@ impl SessionActor {
         let started_at = self.events.tool_started(call.name.clone());
 
         let runtime = &self.rebuild_spec.code_mode_runtime;
-        let result = if call.is_custom()
-            && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
-        {
-            runtime
-                .exec(
-                    call.call_id(),
-                    call.custom_input().unwrap_or_default(),
-                    enabled_tools,
-                )
-                .await
+        let exec_source = crate::session::tool_surface::code_mode_exec_source(call, transport);
+        let result = if let Ok(Some(source)) = exec_source.as_ref() {
+            runtime.exec(call.call_id(), source, enabled_tools).await
         } else if !call.is_custom() && call.name == xai_grok_code_mode_protocol::WAIT_TOOL_NAME {
             runtime.wait(call.arguments.as_ref()).await
         } else {
-            Err(format!(
-                "Code Mode only accepts the custom `{}` tool and function `{}` tool",
-                xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME,
-                xai_grok_code_mode_protocol::WAIT_TOOL_NAME,
-            ))
+            match exec_source {
+                Err(error) => Err(error),
+                _ => Err(format!(
+                    "Code Mode received an incompatible `{}` call for the active {:?} transport",
+                    call.name, transport,
+                )),
+            }
         };
 
         let duration_ms = started_at.elapsed().as_millis() as u64;
@@ -1935,12 +1931,15 @@ impl SessionActor {
         let mut prompt_timing = Some(crate::session::prompt_timing::PromptTiming::start());
         let tool_prep_start = std::time::Instant::now();
         let (mut tool_definitions, mcp_wait_ms) = self.prepare_tool_definitions_timed().await;
-        let model_provider = self
+        let turn_sampling_config = self
             .chat_state_handle
             .get_sampling_config()
             .await
-            .map(|config| config.provider)
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                acp::Error::internal_error().data("active session has no sampling configuration")
+            })?;
+        let model_provider = turn_sampling_config.provider;
+        let api_backend = turn_sampling_config.api_backend;
         tool_definitions.retain(|definition| {
             self.local_tool_allowed_for_provider(&definition.function.name, model_provider)
         });
@@ -1951,17 +1950,47 @@ impl SessionActor {
                 | xai_grok_sampling_types::ToolMode::CodeModeOnly
         );
         let code_mode_only = tool_mode == xai_grok_sampling_types::ToolMode::CodeModeOnly;
-        if code_mode_enabled {
-            let backend = self
-                .chat_state_handle
-                .get_sampling_config()
-                .await
-                .map(|config| config.api_backend);
-            if backend != Some(xai_grok_sampling_types::ApiBackend::Responses) {
-                return Err(acp::Error::internal_error().data(format!(
-                    "Code Mode requires a Responses-backed model; active backend: {backend:?}"
-                )));
-            }
+        let code_mode_transport = crate::session::tool_surface::resolve_code_mode_transport(
+            tool_mode,
+            model_provider,
+            &api_backend,
+        )
+        .map_err(|error| acp::Error::internal_error().data(error))?;
+        let forked_tool_override = self
+            .forked_tool_override
+            .as_deref()
+            .map(|tools| self.provider_filtered_tool_specs(tools, model_provider));
+        let nested_tool_definitions = if let Some(ref override_tools) = forked_tool_override {
+            crate::session::tool_surface::tool_specs_as_definitions(override_tools)
+        } else {
+            tool_definitions.clone()
+        };
+        let use_backend_search =
+            self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
+        let base_function_tools = if let Some(ref override_tools) = forked_tool_override {
+            override_tools.clone()
+        } else {
+            self.turn_base_tool_specs(&tool_definitions, model_provider)
+        };
+        let hosted_tools = if use_backend_search {
+            self.agent.borrow().hosted_tools().to_vec()
+        } else {
+            Vec::new()
+        };
+        let base_tool_surface = crate::session::tool_surface::EffectiveToolSurface::build(
+            base_function_tools,
+            &nested_tool_definitions,
+            &hosted_tools,
+            tool_mode,
+            model_provider,
+            &api_backend,
+        )
+        .map_err(|error| acp::Error::internal_error().data(error))?;
+        if !base_tool_surface.reserved_name_collisions.is_empty() {
+            tracing::warn!(
+                collisions = ?base_tool_surface.reserved_name_collisions,
+                "Code Mode reserved tool names displaced ordinary tools"
+            );
         }
         let total_prep_ms = tool_prep_start.elapsed().as_millis() as u64;
         if let Some(ref mut pt) = prompt_timing {
@@ -2063,27 +2092,10 @@ impl SessionActor {
             {
                 tracing::error!(error = % e, "Pre-sampling auto-compaction failed");
             }
-            let use_backend_search =
-                self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
             tracing::debug!(use_backend_search, "backend_search: turn tool resolution");
-            let mut effective_tools: Vec<ToolSpec> =
-                if let Some(ref override_tools) = self.forked_tool_override {
-                    override_tools.clone()
-                } else {
-                    self.turn_base_tool_specs(&tool_definitions, model_provider)
-                };
-            effective_tools
-                .retain(|tool| self.local_tool_allowed_for_provider(&tool.name, model_provider));
-            if code_mode_only {
-                effective_tools.retain(|tool| {
-                    crate::session::code_mode::is_code_mode_direct_only_tool(&tool.name)
-                });
-            }
-            if code_mode_enabled {
-                effective_tools.push(crate::session::code_mode::create_wait_tool());
-            }
+            let mut tool_surface = base_tool_surface.clone();
             if structured_output_tool && let Some(schema) = json_schema.clone() {
-                effective_tools.push(ToolSpec {
+                tool_surface.function_tools.push(ToolSpec {
                     name: STRUCTURED_OUTPUT_TOOL.to_string(),
                     description: Some(
                         "Return your final answer as JSON matching the required schema. \
@@ -2097,7 +2109,7 @@ impl SessionActor {
             let request = self
                 .chat_state_handle
                 .build_request(
-                    effective_tools,
+                    tool_surface.function_tools,
                     memory_reminder,
                     self.memory.is_enabled(),
                     trace_gcs_config
@@ -2134,29 +2146,7 @@ impl SessionActor {
             if structured_output_native {
                 request.json_schema = json_schema.clone();
             }
-            if use_backend_search {
-                request.hosted_tools = self.agent.borrow().hosted_tools().to_vec();
-            }
-            request.hosted_tools = crate::session::code_mode::hosted_tools_for_code_mode(
-                &request.hosted_tools,
-                tool_mode,
-                model_provider,
-            );
-            if code_mode_enabled {
-                // Codex keeps provider-hosted web search at the top level in
-                // Code Mode. Do not also advertise the local web_search
-                // function inside the nested `exec` tool.
-                let code_mode_tool_definitions =
-                    crate::session::code_mode::nested_tool_definitions_for_provider(
-                        &tool_definitions,
-                        model_provider,
-                        &request.hosted_tools,
-                    );
-                request.add_client_tool(crate::session::code_mode::create_exec_tool(
-                    &code_mode_tool_definitions,
-                    code_mode_only,
-                ));
-            }
+            request.hosted_tools = tool_surface.hosted_tools;
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
             });
@@ -2538,9 +2528,20 @@ impl SessionActor {
                 .await;
             let mut direct_tool_calls = Vec::new();
             for call in tool_calls {
+                let code_mode_exec_call = match code_mode_transport {
+                    Some(xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar) => {
+                        call.is_custom()
+                            && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
+                    }
+                    Some(xai_grok_sampling_types::CodeModeTransport::FunctionEnvelope) => {
+                        !call.is_custom()
+                            && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
+                    }
+                    Some(xai_grok_sampling_types::CodeModeTransport::Unsupported) => false,
+                    None => false,
+                };
                 let code_mode_control_call = code_mode_enabled
-                    && ((call.is_custom()
-                        && call.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME)
+                    && (code_mode_exec_call
                         || (!call.is_custom()
                             && call.name == xai_grok_code_mode_protocol::WAIT_TOOL_NAME));
                 let direct_only_call = code_mode_only
@@ -2549,8 +2550,12 @@ impl SessionActor {
                     || (code_mode_only && !direct_only_call)
                     || call.is_custom()
                 {
-                    self.execute_code_mode_control_call(&call, &tool_definitions)
-                        .await;
+                    self.execute_code_mode_control_call(
+                        &call,
+                        &nested_tool_definitions,
+                        code_mode_transport,
+                    )
+                    .await;
                     continue;
                 }
                 direct_tool_calls.push(ToolCallResponse {

@@ -1,6 +1,28 @@
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
+
+const MODEL_SWITCH_ACTIVE_TURN_ERROR: &str =
+    "Cannot switch models while a turn is active; cancel it or wait for it to finish.";
+
+fn code_mode_transport_enabled(mode: xai_grok_sampling_types::ToolMode) -> bool {
+    matches!(
+        mode,
+        xai_grok_sampling_types::ToolMode::CodeMode
+            | xai_grok_sampling_types::ToolMode::CodeModeOnly
+    )
+}
+
+fn code_mode_runtime_reset_required(
+    previous_provider: xai_grok_sampling_types::ModelProvider,
+    next_provider: xai_grok_sampling_types::ModelProvider,
+    previous_mode: xai_grok_sampling_types::ToolMode,
+    next_mode: xai_grok_sampling_types::ToolMode,
+) -> bool {
+    previous_provider != next_provider
+        || code_mode_transport_enabled(previous_mode) != code_mode_transport_enabled(next_mode)
+}
+
 impl SessionActor {
     pub(super) async fn handle_set_session_model(
         &self,
@@ -10,11 +32,115 @@ impl SessionActor {
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
+        agent_rebuild: Option<(Box<xai_grok_agent::AgentDefinition>, bool)>,
+        resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
     ) -> Result<acp::ModelId, acp::Error> {
+        if let Err(blocked) = self
+            .begin_lifecycle_mutation(LifecycleMutationKind::ModelSwitch)
+            .await
+        {
+            tracing::warn!(
+                session_id = %self.session_info.id.0,
+                reason = %blocked.message(),
+                "handle_set_session_model: lifecycle gate unavailable"
+            );
+            let message = match blocked {
+                LifecycleMutationBlock::ActiveTurn => MODEL_SWITCH_ACTIVE_TURN_ERROR.to_string(),
+                LifecycleMutationBlock::MutationInProgress(_) => blocked.message(),
+            };
+            return Err(acp::Error::invalid_request().data(message));
+        }
+
+        let result = self
+            .handle_set_session_model_while_gated(
+                selected_model_id,
+                sampling_config,
+                use_concise,
+                apply_prompt_override,
+                skip_prompt_rewrite,
+                auto_compact_threshold_percent,
+                agent_rebuild,
+                resolved_tool_policy_override,
+            )
+            .await;
+        self.end_lifecycle_mutation(LifecycleMutationKind::ModelSwitch)
+            .await;
+        result
+    }
+
+    async fn handle_set_session_model_while_gated(
+        &self,
+        selected_model_id: acp::ModelId,
+        sampling_config: xai_grok_sampler::SamplerConfig,
+        use_concise: bool,
+        apply_prompt_override: bool,
+        skip_prompt_rewrite: bool,
+        auto_compact_threshold_percent: u8,
+        agent_rebuild: Option<(Box<xai_grok_agent::AgentDefinition>, bool)>,
+        resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
+    ) -> Result<acp::ModelId, acp::Error> {
+        let previous_provider = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|config| config.provider)
+            .unwrap_or_default();
+        let previous_tool_mode = self.agent.borrow().tool_mode();
+        let model_tool_mode = crate::agent::models::resolve_model_tool_mode(
+            &self.models_manager.models(),
+            &selected_model_id,
+        );
+        let current_resolution = crate::agent::config::effective_tool_mode(
+            sampling_config.provider,
+            &sampling_config.api_backend,
+            model_tool_mode,
+            self.rebuild_spec.tool_mode_preference,
+        )
+        .map_err(|error| acp::Error::invalid_request().data(error.to_string()))?;
+        let resolved_tool_policy =
+            crate::session::tool_surface::ResolvedToolPolicy::select_for_route(
+                current_resolution,
+                resolved_tool_policy_override,
+                sampling_config.provider,
+                &sampling_config.api_backend,
+            )
+            .map_err(|error| acp::Error::invalid_request().data(error))?;
+        let effective_tool_mode = resolved_tool_policy.resolved.mode;
+        // Build a replacement harness to completion before invalidating the
+        // live JavaScript timeline. Agent construction is the fallible part of
+        // a harness switch; staging it here keeps a failed model switch from
+        // resetting an otherwise unchanged Code Mode session.
+        let prepared_agent_rebuild = match agent_rebuild {
+            Some((definition, preserve_history)) => Some((
+                self.build_agent_for_definition(*definition, effective_tool_mode)
+                    .await?,
+                preserve_history,
+            )),
+            None => None,
+        };
+
         // Close the cumulative xAI export boundary synchronously before any
         // state mutation, await, or telemetry task can observe Codex content.
         self.feedback_manager
             .observe_provider(sampling_config.provider);
+        if code_mode_runtime_reset_required(
+            previous_provider,
+            sampling_config.provider,
+            previous_tool_mode,
+            effective_tool_mode,
+        ) {
+            self.rebuild_spec
+                .code_mode_runtime
+                .reset()
+                .await
+                .map_err(|error| {
+                    acp::Error::internal_error()
+                        .data(format!("failed to reset Code Mode runtime: {error}"))
+                })?;
+        }
+        if let Some((agent, preserve_history)) = prepared_agent_rebuild {
+            self.install_rebuilt_agent(agent, preserve_history).await;
+        }
         let model_id = acp::ModelId::new(sampling_config.model.clone());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
             std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
@@ -41,14 +167,6 @@ impl SessionActor {
             .set(sampling_config.compactions_remaining);
         self.compaction_at_tokens
             .set(sampling_config.compaction_at_tokens);
-        let model_tool_mode = crate::agent::models::resolve_model_tool_mode(
-            &self.models_manager.models(),
-            &selected_model_id,
-        );
-        let effective_tool_mode = crate::agent::config::effective_tool_mode(
-            model_tool_mode,
-            self.rebuild_spec.code_mode_enabled,
-        );
         self.agent.borrow_mut().set_tool_mode(effective_tool_mode);
         xai_grok_telemetry::unified_log::info(
             "backend_search: model switch",
@@ -68,7 +186,7 @@ impl SessionActor {
                 max_completion_tokens: sampling_config.max_completion_tokens,
                 temperature: sampling_config.temperature,
                 top_p: sampling_config.top_p,
-                api_backend: sampling_config.api_backend.clone(),
+                api_backend: sampling_config.api_backend,
                 provider: sampling_config.provider,
                 extra_headers: sampling_config.extra_headers.clone(),
                 context_window: new_context_window,
@@ -130,10 +248,11 @@ impl SessionActor {
                 provider: sampling_config.provider,
                 agent_name: Some(agent_name),
                 reasoning_effort: Some(sampling_config.reasoning_effort),
+                resolved_tool_policy: Some(resolved_tool_policy),
             });
         Ok(model_id)
     }
-    /// Handle [`SessionCommand::RebuildAgentForDefinition`].
+    /// Rebuild the active provider harness between turns.
     ///
     /// Builds a fresh [`xai_grok_agent::Agent`] from the cached
     /// [`crate::session::agent_rebuild::AgentRebuildSpec`] + the supplied
@@ -146,33 +265,44 @@ impl SessionActor {
     /// Defense-in-depth: rejects if a turn is in flight. When
     /// `preserve_history` is true, the existing first user/prefix item is not
     /// rewritten because it is no longer safe to infer its role by position.
+    #[cfg(test)]
     pub(super) async fn handle_rebuild_agent_for_definition(
         &self,
         definition: xai_grok_agent::AgentDefinition,
         preserve_history: bool,
     ) -> Result<(), acp::Error> {
-        {
-            let state = self.state.lock().await;
-            if state.running_task.is_some() {
-                tracing::warn!(
-                    session_id = % self.session_info.id.0, new_agent_type = % definition
-                    .name,
-                    "handle_rebuild_agent_for_definition: turn in flight, rejecting rebuild"
-                );
-                return Err(acp::Error::internal_error()
-                    .data("rebuild_agent: turn in flight, refusing to rebuild harness"));
-            }
+        let turn_slot_active = self.state.lock().await.running_task.is_some();
+        let turn_future_active = self
+            .session_turn_active
+            .load(std::sync::atomic::Ordering::Acquire);
+        if turn_slot_active || turn_future_active {
+            tracing::warn!(
+                session_id = % self.session_info.id.0, new_agent_type = % definition.name,
+                turn_slot_active,
+                turn_future_active,
+                "handle_rebuild_agent_for_definition: turn in flight, rejecting rebuild"
+            );
+            return Err(acp::Error::invalid_request().data(MODEL_SWITCH_ACTIVE_TURN_ERROR));
         }
+        let current_tool_mode = self.agent.borrow().tool_mode();
+        let new_agent = self
+            .build_agent_for_definition(definition, current_tool_mode)
+            .await?;
+        self.install_rebuilt_agent(new_agent, preserve_history)
+            .await;
+        Ok(())
+    }
+
+    async fn build_agent_for_definition(
+        &self,
+        definition: xai_grok_agent::AgentDefinition,
+        tool_mode: xai_grok_sampling_types::ToolMode,
+    ) -> Result<xai_grok_agent::Agent, acp::Error> {
         let new_agent_name = definition.name.clone();
         tracing::info!(
             session_id = % self.session_info.id.0, new_agent_type = % new_agent_name,
-            "handle_rebuild_agent_for_definition: rebuilding harness"
+            "handle_rebuild_agent_for_definition: building replacement harness"
         );
-        // The model switch resolves metadata-first tool mode before requesting
-        // a between-turn harness rebuild. Preserve that resolved session mode;
-        // the rebuild spec only owns the Settings fallback and cannot infer
-        // which model is currently active.
-        let current_tool_mode = self.agent.borrow().tool_mode();
         let mut new_agent = self
             .rebuild_spec
             .build_agent(definition)
@@ -187,7 +317,16 @@ impl SessionActor {
                     "rebuild_agent: build failed for agent_type={new_agent_name}: {e}"
                 ))
             })?;
-        new_agent.set_tool_mode(current_tool_mode);
+        new_agent.set_tool_mode(tool_mode);
+        Ok(new_agent)
+    }
+
+    async fn install_rebuilt_agent(
+        &self,
+        new_agent: xai_grok_agent::Agent,
+        preserve_history: bool,
+    ) {
+        let new_agent_name = new_agent.definition().name.clone();
         let new_system_prompt = new_agent.system_prompt().to_string();
         let mut new_prompt_context = new_agent.prompt_context().clone();
         new_prompt_context.normalize_for_persistence();
@@ -304,7 +443,6 @@ impl SessionActor {
             session_id = % self.session_info.id.0, new_agent_type = % new_agent_name,
             "handle_rebuild_agent_for_definition: harness rebuild complete"
         );
-        Ok(())
     }
     /// Apply a client-supplied `systemPromptOverride` on session attach without
     /// wiping user/assistant history: swap only the leading `System` message,
@@ -345,5 +483,83 @@ impl SessionActor {
                 "handle_replace_system_prompt: head already matches, no-op"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_reset_policy_tests {
+    use super::code_mode_runtime_reset_required;
+    use xai_grok_sampling_types::{ApiBackend, CodeModeTransport, ModelProvider, ToolMode};
+
+    #[test]
+    fn provider_or_transport_boundary_resets_but_presentation_only_change_does_not() {
+        assert!(code_mode_runtime_reset_required(
+            ModelProvider::Xai,
+            ModelProvider::Codex,
+            ToolMode::CodeMode,
+            ToolMode::CodeMode,
+        ));
+        assert!(code_mode_runtime_reset_required(
+            ModelProvider::Xai,
+            ModelProvider::Xai,
+            ToolMode::Direct,
+            ToolMode::CodeMode,
+        ));
+        assert!(!code_mode_runtime_reset_required(
+            ModelProvider::Xai,
+            ModelProvider::Xai,
+            ToolMode::CodeMode,
+            ToolMode::CodeModeOnly,
+        ));
+        assert!(!code_mode_runtime_reset_required(
+            ModelProvider::Xai,
+            ModelProvider::Xai,
+            ToolMode::Direct,
+            ToolMode::Direct,
+        ));
+    }
+
+    #[test]
+    fn cold_resume_keeps_persisted_preference_but_not_over_model_requirement() {
+        let persisted = crate::session::tool_surface::ResolvedToolPolicy {
+            resolved: crate::agent::config::ResolvedToolMode {
+                mode: ToolMode::CodeMode,
+                source: crate::agent::config::ToolModeSource::UserPreference,
+            },
+            transport: Some(CodeModeTransport::NativeCustomGrammar),
+            route_provider: Some(ModelProvider::Codex),
+            route_backend: Some(ApiBackend::Responses),
+        };
+        let current_default = crate::agent::config::ResolvedToolMode {
+            mode: ToolMode::Direct,
+            source: crate::agent::config::ToolModeSource::Default,
+        };
+        assert_eq!(
+            crate::session::tool_surface::ResolvedToolPolicy::select_for_route(
+                current_default,
+                Some(persisted),
+                ModelProvider::Codex,
+                &ApiBackend::Responses,
+            )
+            .unwrap(),
+            persisted,
+        );
+
+        let required = crate::agent::config::ResolvedToolMode {
+            mode: ToolMode::CodeModeOnly,
+            source: crate::agent::config::ToolModeSource::ModelRequirement,
+        };
+        let selected = crate::session::tool_surface::ResolvedToolPolicy::select_for_route(
+            required,
+            Some(persisted),
+            ModelProvider::Codex,
+            &ApiBackend::Responses,
+        )
+        .unwrap();
+        assert_eq!(selected.resolved, required);
+        assert_eq!(
+            selected.transport,
+            Some(CodeModeTransport::NativeCustomGrammar)
+        );
     }
 }

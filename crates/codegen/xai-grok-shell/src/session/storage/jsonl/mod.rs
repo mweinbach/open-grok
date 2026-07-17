@@ -734,10 +734,18 @@ impl JsonlStorageAdapter {
         }
         let num_chat_messages = chat_to_copy.len();
         let num_messages = updates_to_copy.len();
+        let source_model_id = source_summary.current_model_id.clone();
         let target_model_id = options
             .new_model_id
             .map(acp::ModelId::new)
-            .unwrap_or(source_summary.current_model_id);
+            .unwrap_or_else(|| source_model_id.clone());
+        // The provider transport is part of the model route. A fork that
+        // explicitly changes models must resolve a fresh policy at spawn;
+        // carrying the donor pin can make cold load reject the target before
+        // its actor has a chance to persist the new route.
+        let resolved_tool_policy = (target_model_id == source_model_id)
+            .then_some(source_summary.resolved_tool_policy)
+            .flatten();
         let target_summary = crate::session::persistence::Summary {
             info: target_info.clone(),
             session_summary: source_summary.session_summary,
@@ -746,6 +754,7 @@ impl JsonlStorageAdapter {
             num_messages,
             num_chat_messages,
             current_model_id: target_model_id,
+            resolved_tool_policy,
             previous_turn_model: source_summary.previous_turn_model,
             ever_used_codex: source_summary.ever_used_codex,
             parent_session_id: options.parent_session_id,
@@ -999,6 +1008,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         model_id: &acp::ModelId,
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<xai_grok_sampling_types::ReasoningEffort>>,
+        resolved_tool_policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
     ) -> io::Result<()> {
         self.apply_summary_patch(
             info,
@@ -1008,6 +1018,7 @@ impl StorageAdapter for JsonlStorageAdapter {
                     agent_name: agent_name.map(String::from),
                     reasoning_effort,
                 }),
+                resolved_tool_policy,
                 ..Default::default()
             },
         )

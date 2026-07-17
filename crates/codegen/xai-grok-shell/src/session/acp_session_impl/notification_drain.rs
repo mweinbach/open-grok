@@ -24,6 +24,16 @@ impl SessionActor {
         completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
     ) {
         let mut state = self.state.lock().await;
+        if let Some(mutation) = state.lifecycle_mutation {
+            tracing::debug!(
+                target: "qtrace",
+                mutation = mutation.as_str(),
+                queue_depth = state.pending_inputs.len(),
+                session = self.session_info.id.0.as_ref(),
+                "maybe_start_running_task blocked: lifecycle mutation in progress",
+            );
+            return;
+        }
         if state.running_task.is_some() {
             let queue_depth = state.pending_inputs.len();
             if queue_depth > 0 {

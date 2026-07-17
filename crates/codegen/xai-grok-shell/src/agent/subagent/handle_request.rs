@@ -1098,24 +1098,19 @@ pub(crate) async fn handle_subagent_request(
     });
     let subagent_session_default_agent_profile = Some(definition.name.clone());
     let subagent_model_id = effective_sampling_config.model.clone();
-    let _ = persistence
-        .tx
-        .send(crate::session::persistence::PersistenceMsg::CurrentModel {
-            model_id: effective_model_id.clone(),
-            provider: effective_sampling_config.provider,
-            agent_name: Some(definition.name.clone()),
-            reasoning_effort: Some(effective_sampling_config.reasoning_effort),
-        });
-    let forked_tool_override = if verbatim_mirror_fork {
-        ctx.parent_tool_snapshot.clone()
-    } else {
-        None
-    };
-    let code_mode_enabled = ctx
+    let parent_surface_snapshot = verbatim_mirror_fork
+        .then(|| ctx.parent_tool_snapshot.clone())
+        .flatten();
+    let forked_tool_override = parent_surface_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.function_tools.clone());
+    let resolved_tool_policy_override = parent_surface_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.resolved_policy);
+    let tool_mode_preference = ctx
         .agent_config
         .as_ref()
-        .and_then(|config| config.ui.code_mode)
-        .unwrap_or(false);
+        .and_then(|config| config.ui.code_mode);
     let spawn_result = session::spawn_session_on_thread(
             child_session_info,
             gateway.clone(),
@@ -1174,7 +1169,9 @@ pub(crate) async fn handle_subagent_request(
             false,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             definition,
-            code_mode_enabled,
+            tool_mode_preference,
+            resolved_tool_policy_override,
+            true,
             subagent_session_default_agent_profile,
             if inherit_skills {
                 ctx.parent_skills_config.clone()

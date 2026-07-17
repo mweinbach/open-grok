@@ -1,6 +1,65 @@
 use serde::{Deserialize, Serialize};
 use xai_grok_config_types::DisplayRefreshSettings;
 
+/// User-selected tool presentation for Responses-backed sessions.
+///
+/// The custom deserializer preserves compatibility with the original boolean
+/// setting: `false` meant direct tools and `true` meant mixed Code Mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolModePreference {
+    #[default]
+    Direct,
+    CodeMode,
+    CodeModeOnly,
+}
+
+impl ToolModePreference {
+    pub const fn as_canonical(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::CodeMode => "code_mode",
+            Self::CodeModeOnly => "code_mode_only",
+        }
+    }
+
+    pub fn from_canonical(value: &str) -> Option<Self> {
+        match value {
+            "direct" => Some(Self::Direct),
+            "code_mode" => Some(Self::CodeMode),
+            "code_mode_only" => Some(Self::CodeModeOnly),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolModePreference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum PersistedPreference {
+            Legacy(bool),
+            Canonical(String),
+        }
+
+        match PersistedPreference::deserialize(deserializer)? {
+            PersistedPreference::Legacy(false) => Ok(Self::Direct),
+            PersistedPreference::Legacy(true) => Ok(Self::CodeMode),
+            PersistedPreference::Canonical(value) => {
+                Self::from_canonical(&value).ok_or_else(|| {
+                    serde::de::Error::unknown_variant(
+                        &value,
+                        &["direct", "code_mode", "code_mode_only"],
+                    )
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -107,12 +166,12 @@ pub struct UiConfig {
     /// effective gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remember_tool_approvals: Option<bool>,
-    /// Use Codex-style code mode for new sessions whose model metadata does not
-    /// declare a tool mode. Explicit model metadata remains authoritative;
-    /// unset or false keeps the built-in fallback. Written by the settings
-    /// modal and applied at session startup.
+    /// Tool presentation for new sessions. OpenAI Codex models that explicitly
+    /// require Code Mode Only override this preference; non-Responses backends
+    /// remain direct. Legacy booleans deserialize as `false` = Direct and
+    /// `true` = mixed Code Mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code_mode: Option<bool>,
+    pub code_mode: Option<ToolModePreference>,
     /// In-app drag selection highlight: `flash` | `hold` (legacy bool accepted).
     #[serde(
         default,
@@ -309,16 +368,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn code_mode_defaults_off_and_round_trips_explicit_values() {
+    fn code_mode_defaults_direct_and_migrates_legacy_booleans() {
         assert_eq!(UiConfig::default().code_mode, None);
 
         let enabled: UiConfig = serde_json::from_str(r#"{"code_mode":true}"#).unwrap();
-        assert_eq!(enabled.code_mode, Some(true));
+        assert_eq!(enabled.code_mode, Some(ToolModePreference::CodeMode));
         let disabled: UiConfig = serde_json::from_str(r#"{"code_mode":false}"#).unwrap();
-        assert_eq!(disabled.code_mode, Some(false));
+        assert_eq!(disabled.code_mode, Some(ToolModePreference::Direct));
+
+        let only: UiConfig = serde_json::from_str(r#"{"code_mode":"code_mode_only"}"#).unwrap();
+        assert_eq!(only.code_mode, Some(ToolModePreference::CodeModeOnly));
 
         let value = serde_json::to_value(enabled).unwrap();
-        assert_eq!(value.get("code_mode").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            value.get("code_mode").and_then(|v| v.as_str()),
+            Some("code_mode")
+        );
+    }
+
+    #[test]
+    fn code_mode_rejects_unknown_explicit_preference() {
+        let error = serde_json::from_str::<UiConfig>(r#"{"code_mode":"automatic"}"#)
+            .expect_err("unknown code mode must not silently become direct");
+        assert!(error.to_string().contains("unknown variant"));
     }
 
     #[test]

@@ -70,7 +70,7 @@ impl MvpAgent {
     }
     /// Get-or-create the per-session prompt-intake lock (see
     /// [`Self::prompt_intake_locks`]). Cheap clone of the shared `Rc`.
-    pub(super) fn prompt_intake_lock(
+    pub(crate) fn prompt_intake_lock(
         &self,
         id: &acp::SessionId,
     ) -> std::rc::Rc<tokio::sync::Mutex<()>> {

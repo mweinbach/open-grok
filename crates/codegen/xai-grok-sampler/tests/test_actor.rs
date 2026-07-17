@@ -26,8 +26,9 @@ use xai_grok_sampler::{
     SamplingClient, SamplingErrorKind, SamplingEvent,
 };
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, HostedTool, ModelProvider,
-    ReasoningSummary, UserItem,
+    ClientTool, ConversationItem, ConversationRequest, CustomToolOutputContent,
+    CustomToolOutputItem, DoomLoopRecoveryPolicy, HostedTool, ModelProvider, ReasoningSummary,
+    ToolCall, ToolSpec, UserItem,
 };
 use xai_grok_test_support::{SseEvent, sse};
 
@@ -117,6 +118,45 @@ fn user_request(text: &str) -> ConversationRequest {
         })],
         ..Default::default()
     }
+}
+
+fn native_exec_history_request() -> ConversationRequest {
+    let call = ToolCall::custom(
+        "call-native-exec",
+        "ctc-native-exec",
+        "exec",
+        "const answer = 40 + 2;",
+    );
+    let encoded_result_id = call.id.clone();
+    ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![call]),
+        ConversationItem::custom_tool_output(
+            CustomToolOutputItem::text("call-native-exec", "progress").with_name("exec"),
+        ),
+        ConversationItem::tool_result_with_ordered_content(
+            encoded_result_id.as_ref(),
+            vec![CustomToolOutputContent::text("42")],
+        ),
+        ConversationItem::user("continue"),
+    ])
+}
+
+fn xai_function_exec_history_request() -> ConversationRequest {
+    ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call-xai-exec".into(),
+            name: "exec".into(),
+            arguments: r#"{"source":"return 42"}"#.into(),
+        }]),
+        ConversationItem::custom_tool_output(
+            CustomToolOutputItem::text("call-xai-exec", "progress").with_name("exec"),
+        ),
+        ConversationItem::tool_result_with_ordered_content(
+            "call-xai-exec",
+            vec![CustomToolOutputContent::text("42")],
+        ),
+        ConversationItem::user("continue"),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +672,65 @@ fn messages_config(base_url: String) -> SamplerConfig {
     cfg
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messages_backend_projects_native_exec_history_before_streaming_conversion() {
+    use std::sync::Mutex;
+
+    let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let captured = Arc::clone(&captured_handler);
+            async move {
+                captured.lock().unwrap().push(body);
+                let events =
+                    sse::messages_api_events("done", "messages-compatible-model", "end_turn");
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let mut config = messages_config(server.base_url());
+    config.provider = ModelProvider::Xai;
+    config.model = "gpt-slug-does-not-select-provider".into();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+
+    handle
+        .submit_and_collect(
+            RequestId::from("messages-native-exec-history"),
+            native_exec_history_request(),
+        )
+        .await
+        .expect("native exec history should project before Messages conversion");
+    server.shutdown();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let blocks = captured[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .collect::<Vec<_>>();
+    let call = blocks
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .expect("projected exec tool use");
+    assert_eq!(call["id"], "call-native-exec");
+    assert_eq!(call["name"], "exec");
+    assert_eq!(call["input"], json!({"source": "const answer = 40 + 2;"}));
+    let results = blocks
+        .iter()
+        .filter(|block| block["type"] == "tool_result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["tool_use_id"], "call-native-exec");
+}
+
 /// Regression for the refusal-stop_reason incident: a well-formed stream
 /// terminated by `stop_reason: "refusal"` must produce a successful
 /// completion from EXACTLY ONE request — no retry storm.
@@ -1029,6 +1128,324 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xai_responses_projects_exec_to_function_and_rejects_other_custom_before_network() {
+    use std::sync::Mutex;
+
+    let captured: Arc<Mutex<Vec<(bool, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let captured = Arc::clone(&captured_handler);
+            async move {
+                let streaming = body
+                    .get("stream")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                captured.lock().unwrap().push((streaming, body));
+                let events =
+                    sse::responses_api_reasoning_and_text_events("projected", "done", "test-model");
+                if streaming {
+                    Sse::new(stream::iter(
+                        sse_events_to_axum(events)
+                            .into_iter()
+                            .map(Ok::<_, std::convert::Infallible>),
+                    ))
+                    .into_response()
+                } else {
+                    let response = events
+                        .into_iter()
+                        .find_map(|event| {
+                            let payload =
+                                serde_json::from_str::<serde_json::Value>(&event.data).ok()?;
+                            (payload.get("type").and_then(serde_json::Value::as_str)
+                                == Some("response.completed"))
+                            .then(|| payload["response"].clone())
+                        })
+                        .expect("test fixture must include a completed response");
+                    axum::Json(response).into_response()
+                }
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let mut config = responses_config(server.base_url(), None);
+    config.provider = ModelProvider::Xai;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config.clone(), RetryPolicy::default(), event_tx);
+    let client = SamplingClient::new(config).expect("xAI Responses client");
+
+    let source = "const answer = 40 + 2;";
+    let valid = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall::custom(
+            "call-exec",
+            "ctc-exec",
+            "exec",
+            source,
+        )]),
+        ConversationItem::custom_tool_output(
+            CustomToolOutputItem::text("call-exec", "42").with_name("exec"),
+        ),
+        ConversationItem::user("continue"),
+    ])
+    .with_tools(vec![ToolSpec {
+        name: "read_file".into(),
+        description: Some("Read a file".into()),
+        parameters: json!({"type": "object"}),
+    }])
+    .with_client_tools([ClientTool::Custom {
+        name: "exec".into(),
+        description: Some("Execute JavaScript".into()),
+        format: xai_grok_sampling_types::rs::CustomToolParamFormat::Text,
+    }]);
+
+    handle
+        .submit_and_collect(RequestId::from("xai-projected-exec-stream"), valid.clone())
+        .await
+        .expect("the actor should use the client's single projection pass");
+    client
+        .conversation_responses(valid)
+        .await
+        .expect("xAI exec should use the function envelope");
+
+    let invalid = ConversationRequest::from_items(vec![ConversationItem::user("run")])
+        .with_client_tools([ClientTool::Custom {
+            name: "other_custom".into(),
+            description: None,
+            format: xai_grok_sampling_types::rs::CustomToolParamFormat::Text,
+        }]);
+    let error = handle
+        .submit_and_collect(RequestId::from("xai-invalid-custom-stream"), invalid)
+        .await
+        .expect_err("non-exec xAI custom tool must fail before network");
+    assert!(matches!(
+        error,
+        xai_grok_sampling_types::SamplingError::InvalidConfiguration(_)
+    ));
+    server.shutdown();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "the rejected native custom request must never reach the server"
+    );
+    assert_eq!(
+        captured
+            .iter()
+            .map(|(streaming, _)| *streaming)
+            .collect::<Vec<_>>(),
+        vec![true, false]
+    );
+    for (_, body) in captured.iter() {
+        let serialized = body.to_string();
+        assert!(
+            !serialized.contains("\"type\":\"custom\"") && !serialized.contains("custom_tool_call"),
+            "xAI request leaked a native custom wire shape: {body}"
+        );
+        let tools = body["tools"].as_array().expect("function tools");
+        assert!(
+            tools
+                .iter()
+                .any(|tool| { tool["type"] == "function" && tool["name"] == "read_file" })
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| { tool["type"] == "function" && tool["name"] == "exec" })
+        );
+        let exec = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call" && item["name"] == "exec")
+            .expect("projected exec call");
+        assert_eq!(exec["call_id"], "call-exec");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(exec["arguments"].as_str().unwrap()).unwrap(),
+            json!({"source": source})
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_backend_projects_native_exec_history_before_streaming_conversion() {
+    use std::sync::Mutex;
+
+    let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let captured = Arc::clone(&captured_handler);
+            async move {
+                captured.lock().unwrap().push(body);
+                Sse::new(stream::iter(vec![
+                    Ok::<_, std::convert::Infallible>(text_chunk_event("done", false)),
+                    Ok::<_, std::convert::Infallible>(text_chunk_event("", true)),
+                    Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]")),
+                ]))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let mut config = test_config(server.base_url(), "gpt-slug-does-not-select-provider");
+    config.provider = ModelProvider::Kimi;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+
+    handle
+        .submit_and_collect(
+            RequestId::from("chat-native-exec-history"),
+            native_exec_history_request(),
+        )
+        .await
+        .expect("native exec history should project before Chat conversion");
+
+    let invalid = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall::custom(
+            "call-code",
+            "ctc-code",
+            "code",
+            "return 42",
+        )]),
+        ConversationItem::custom_tool_output(
+            CustomToolOutputItem::text("call-code", "42").with_name("code"),
+        ),
+    ]);
+    handle
+        .submit_and_collect(RequestId::from("chat-invalid-custom"), invalid)
+        .await
+        .expect_err("non-exec native custom history must fail before network");
+    server.shutdown();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1, "invalid custom history reached Chat API");
+    let messages = captured[0]["messages"].as_array().unwrap();
+    let call = messages
+        .iter()
+        .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+        .find(|call| call["function"]["name"] == "exec")
+        .expect("projected exec function call");
+    assert_eq!(call["id"], "call-native-exec");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(call["function"]["arguments"].as_str().unwrap())
+            .unwrap(),
+        json!({"source": "const answer = 40 + 2;"})
+    );
+    let results = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["tool_call_id"], "call-native-exec");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unary_chat_and_messages_project_native_exec_history_before_conversion() {
+    use std::sync::Mutex;
+
+    let chat_body: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let messages_body: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let chat_handler = Arc::clone(&chat_body);
+    let messages_handler = Arc::clone(&messages_body);
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&chat_handler);
+                async move {
+                    *captured.lock().unwrap() = Some(body);
+                    axum::Json(json!({
+                        "id": "chatcmpl-unary",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "test-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "done"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&messages_handler);
+                async move {
+                    *captured.lock().unwrap() = Some(body);
+                    axum::Json(json!({
+                        "id": "msg-unary",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "done"}],
+                        "model": "test-model",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+    let server = MockServer::spawn(app).await;
+
+    let mut chat_config = test_config(server.base_url(), "misleading-gpt-slug");
+    chat_config.provider = ModelProvider::Kimi;
+    SamplingClient::new(chat_config)
+        .unwrap()
+        .conversation(native_exec_history_request())
+        .await
+        .expect("unary Chat request");
+
+    let mut messages_config = messages_config(server.base_url());
+    messages_config.provider = ModelProvider::Xai;
+    messages_config.model = "gpt-slug-does-not-select-provider".into();
+    SamplingClient::new(messages_config)
+        .unwrap()
+        .conversation_messages(native_exec_history_request())
+        .await
+        .expect("unary Messages request");
+    server.shutdown();
+
+    let assert_projected = |body: &serde_json::Value, call_kind: &str, id_key: &str| {
+        let blocks = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| {
+                if call_kind == "tool_use" {
+                    message["content"].as_array().into_iter().flatten()
+                } else {
+                    message["tool_calls"].as_array().into_iter().flatten()
+                }
+            })
+            .collect::<Vec<_>>();
+        let call = blocks
+            .iter()
+            .find(|call| {
+                if call_kind == "tool_use" {
+                    call["type"] == call_kind
+                } else {
+                    call["function"]["name"] == "exec"
+                }
+            })
+            .expect("projected native exec call");
+        assert_eq!(call[id_key], "call-native-exec");
+    };
+    assert_projected(
+        chat_body.lock().unwrap().as_ref().unwrap(),
+        "function",
+        "id",
+    );
+    assert_projected(
+        messages_body.lock().unwrap().as_ref().unwrap(),
+        "tool_use",
+        "id",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
     use std::sync::Mutex;
 
@@ -1103,7 +1520,7 @@ async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
         .insert("x-openai-fedramp".into(), "false".into());
 
     let client = SamplingClient::new(config).expect("Codex sampling client should construct");
-    let mut compact_request = user_request("history to compact");
+    let mut compact_request = xai_function_exec_history_request();
     compact_request.x_grok_session_id = Some("session-cache-key".into());
     let replacement = client
         .compact_codex_conversation(compact_request, "base instructions")
@@ -1151,6 +1568,20 @@ async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
     assert_eq!(body["prompt_cache_key"], "session-cache-key");
     assert_eq!(body.pointer("/reasoning/summary"), Some(&json!("auto")));
     assert!(body["input"].is_array());
+    let compact_input = body["input"].as_array().unwrap();
+    assert_eq!(
+        compact_input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .count(),
+        1,
+        "xAI function exec notifications must coalesce before Codex compaction: {body}"
+    );
+    assert!(
+        compact_input
+            .iter()
+            .all(|item| item["type"] != "custom_tool_call_output")
+    );
     for forbidden in [
         "store",
         "stream",
@@ -1271,7 +1702,7 @@ async fn codex_remote_compaction_v2_uses_responses_stream_contract() {
     let turn_state = Arc::new(OnceLock::new());
     let client = SamplingClient::new_with_codex_turn_state(config, Arc::clone(&turn_state))
         .expect("Codex sampling client should construct");
-    let mut request = user_request("history to compact");
+    let mut request = xai_function_exec_history_request();
     request.x_grok_session_id = Some("session-cache-key".into());
     request.reasoning_effort = Some(xai_grok_sampling_types::ReasoningEffort::High);
     request.hosted_tools = vec![HostedTool::web_search(None)];
@@ -1336,6 +1767,19 @@ async fn codex_remote_compaction_v2_uses_responses_stream_contract() {
             .any(|include| include == "reasoning.encrypted_content")
     }));
     let input = body["input"].as_array().expect("input must be an array");
+    assert_eq!(
+        input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .count(),
+        1,
+        "xAI function exec notifications must coalesce before remote v2 compaction: {body}"
+    );
+    assert!(
+        input
+            .iter()
+            .all(|item| item["type"] != "custom_tool_call_output")
+    );
     assert_eq!(
         input.last(),
         Some(&json!({"type": "compaction_trigger"})),

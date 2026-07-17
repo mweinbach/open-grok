@@ -556,16 +556,78 @@ impl SessionActor {
             .as_ref()
             .map(xai_chat_state::estimate_system_message_tokens)
             .unwrap_or(0);
-        let use_backend_search =
-            self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
-        let tool_defs: Vec<_> = self
+        let provider = config
+            .as_ref()
+            .map(|value| value.provider)
+            .unwrap_or_default();
+        let tool_defs = self
             .prepare_tool_definitions_inner()
             .await
             .into_iter()
-            .filter(|td| !use_backend_search || td.function.name != "web_search")
-            .collect();
-        let tool_definitions_count = tool_defs.len();
-        let tool_definitions_tokens = xai_chat_state::estimate_tool_definitions_tokens(&tool_defs);
+            .filter(|definition| {
+                self.local_tool_allowed_for_provider(&definition.function.name, provider)
+            })
+            .collect::<Vec<_>>();
+        let forked_tool_override = self
+            .forked_tool_override
+            .as_deref()
+            .map(|tools| self.provider_filtered_tool_specs(tools, provider));
+        let base_tools = if let Some(ref override_tools) = forked_tool_override {
+            override_tools.clone()
+        } else {
+            self.turn_base_tool_specs(&tool_defs, provider)
+        };
+        let nested_tool_defs = forked_tool_override
+            .as_deref()
+            .map(crate::session::tool_surface::tool_specs_as_definitions)
+            .unwrap_or_else(|| tool_defs.clone());
+        let (tool_mode, hosted_tools) = {
+            let agent = self.agent.borrow();
+            let hosted_tools =
+                if agent.backend_search_enabled() && self.supports_backend_search.get() {
+                    agent.hosted_tools().to_vec()
+                } else {
+                    Vec::new()
+                };
+            (agent.tool_mode(), hosted_tools)
+        };
+        let tool_surface = config.as_ref().and_then(|sampling_config| {
+            match crate::session::tool_surface::EffectiveToolSurface::build(
+                base_tools.clone(),
+                &nested_tool_defs,
+                &hosted_tools,
+                tool_mode,
+                sampling_config.provider,
+                &sampling_config.api_backend,
+            ) {
+                Ok(surface) => Some(surface),
+                Err(error) => {
+                    tracing::warn!(%error, "session info: incompatible effective tool surface");
+                    None
+                }
+            }
+        });
+        let tool_definitions_count = tool_surface
+            .as_ref()
+            .map(|surface| {
+                surface.function_tools.len()
+                    + surface
+                        .hosted_tools
+                        .iter()
+                        .filter(|tool| {
+                            matches!(tool, xai_grok_sampling_types::HostedTool::ClientCustom(_))
+                        })
+                        .count()
+            })
+            .unwrap_or(base_tools.len());
+        let tool_definitions_tokens = tool_surface
+            .as_ref()
+            .map(crate::session::tool_surface::EffectiveToolSurface::estimated_definition_tokens)
+            .unwrap_or_else(|| {
+                let definitions =
+                    crate::session::tool_surface::tool_specs_as_definitions(&base_tools);
+                xai_chat_state::estimate_tool_definitions_tokens(&definitions)
+            });
         let message_count = self.chat_state_handle.get_conversation_len().await;
         let message_tokens = self.chat_state_handle.get_estimated_messages_tokens().await;
         let usage_categories = self.usage_categories().await;

@@ -15,6 +15,25 @@ pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
+    apply_with_resolved_tool_policy(agent, args, None).await
+}
+
+/// Restore a persisted session model while retaining the session's pinned tool
+/// presentation. The actor revalidates the policy against the selected route,
+/// and current catalog model requirements still take precedence.
+pub(crate) async fn apply_restored(
+    agent: &MvpAgent,
+    args: acp::SetSessionModelRequest,
+    policy: crate::session::tool_surface::ResolvedToolPolicy,
+) -> Result<acp::SetSessionModelResponse, acp::Error> {
+    apply_with_resolved_tool_policy(agent, args, Some(policy)).await
+}
+
+async fn apply_with_resolved_tool_policy(
+    agent: &MvpAgent,
+    args: acp::SetSessionModelRequest,
+    resolved_tool_policy_override: Option<crate::session::tool_surface::ResolvedToolPolicy>,
+) -> Result<acp::SetSessionModelResponse, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
     xai_grok_telemetry::unified_log::info(
         "model changed",
@@ -28,6 +47,11 @@ pub(crate) async fn apply(
         model_id,
         ..
     } = args;
+    // Serialize the full harness/model transaction with prompt intake. A
+    // prompt already enqueued wins FIFO and makes the actor's active-turn gate
+    // reject this switch; a later prompt cannot enter the atomic actor command.
+    let prompt_intake_lock = agent.prompt_intake_lock(&session_id);
+    let _prompt_intake_guard = prompt_intake_lock.lock().await;
     let handle = agent
         .session_handle_waiting_for_load(&session_id)
         .await
@@ -41,7 +65,7 @@ pub(crate) async fn apply(
     let required_agent_type =
         resolve_required_agent_type(Some(model.info().agent_type.as_str()), session_default);
     let previous_model_id = handle.model_id.0.clone();
-    let mut pending_rebuild: Option<(xai_grok_agent::AgentDefinition, bool)> = None;
+    let mut pending_rebuild: Option<(Box<xai_grok_agent::AgentDefinition>, bool)> = None;
     {
         let required = &required_agent_type;
         let turn_count = handle
@@ -77,7 +101,7 @@ pub(crate) async fn apply(
                         has_prior_turns,
                         "set_session_model: provider harness switch — queued agent rebuild"
                     );
-                    pending_rebuild = Some((def, has_prior_turns));
+                    pending_rebuild = Some((Box::new(def), has_prior_turns));
                 }
                 None => {
                     tracing::error!(
@@ -123,6 +147,25 @@ pub(crate) async fn apply(
             );
         }
     }
+    // A provider-harness rebuild happens before the actor applies the model.
+    // Preflight the complete effective policy here so an unsupported provider
+    // capability, a hard model requirement, or a stale cold-resume pin cannot
+    // replace the harness and then fail later in `SetSessionModel`. The actor
+    // repeats this resolution as the authoritative mutation boundary.
+    let current_resolution = config::effective_tool_mode(
+        model_sampling.provider,
+        &model_sampling.api_backend,
+        model.info().tool_mode,
+        agent.cfg.borrow().ui.code_mode,
+    )
+    .map_err(|error| acp::Error::invalid_request().data(error.to_string()))?;
+    crate::session::tool_surface::ResolvedToolPolicy::select_for_route(
+        current_resolution,
+        resolved_tool_policy_override,
+        model_sampling.provider,
+        &model_sampling.api_backend,
+    )
+    .map_err(|error| acp::Error::invalid_request().data(error))?;
     let applied_effort = model_sampling.reasoning_effort;
     let gate_closed = !handle
         .gateway_enabled
@@ -147,42 +190,7 @@ pub(crate) async fn apply(
                 .data("provider harness cannot be rebuilt while session replay is still loading"));
         }
     }
-    let did_rebuild = if let Some((def, preserve_history)) = pending_rebuild {
-        let (rebuild_tx, rebuild_rx) = oneshot::channel();
-        let _ = handle
-            .cmd_tx
-            .send(SessionCommand::RebuildAgentForDefinition {
-                definition: def,
-                preserve_history,
-                responds_to: rebuild_tx,
-            });
-        let rebuild_result = rebuild_rx
-            .await
-            .map_err(|_| acp::Error::internal_error().data("rebuild_agent: actor closed"))?;
-        match rebuild_result {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::error!(
-                    session_id = % session_id.0, model_id = % model_id.0, error = ? e,
-                    "set_session_model: provider harness rebuild failed; aborting model switch"
-                );
-                xai_grok_telemetry::session_ctx::log_event(
-                    xai_grok_telemetry::events::ModelSwitched {
-                        session_id: session_id.0.to_string(),
-                        previous_model_id: previous_model_id.to_string(),
-                        new_model_id: model_id.0.to_string(),
-                        success: false,
-                        error_code: Some(config::MODEL_SWITCH_REBUILD_FAILED.to_string()),
-                        required_agent_type: Some(required_agent_type.clone()),
-                        current_agent_type: None,
-                    },
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        false
-    };
+    let did_rebuild = pending_rebuild.is_some();
     let model_unchanged = previous_model_id == model_id.0;
     let new_threshold = {
         let cfg = agent.cfg.borrow();
@@ -202,11 +210,13 @@ pub(crate) async fn apply(
         apply_prompt_override,
         skip_prompt_rewrite: did_rebuild || model_unchanged,
         auto_compact_threshold_percent: new_threshold,
+        agent_rebuild: pending_rebuild,
+        resolved_tool_policy_override,
         responds_to: tx,
     });
     let updated_model = rx
         .await
-        .map_err(|_| acp::Error::internal_error().data("failed to set session model"))?;
+        .map_err(|_| acp::Error::internal_error().data("failed to set session model"))??;
     if let Some(handle) = agent.sessions.borrow_mut().get_mut(&session_id) {
         handle.model_id = model_id.clone();
         handle.reasoning_effort = applied_effort;

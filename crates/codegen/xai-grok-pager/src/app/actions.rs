@@ -470,9 +470,9 @@ pub enum Action {
     /// Toggle the per-tool "Always allow …" prompt options. SHELL-owned;
     /// persisted to `[ui].remember_tool_approvals`. Applies to new sessions.
     SetRememberToolApprovals(bool),
-    /// Use Codex-style code mode for new sessions whose model metadata does not
-    /// declare a tool mode. SHELL-owned; persisted to `[ui].code_mode`.
-    SetCodeMode(bool),
+    /// Select direct, mixed Code Mode, or Code Mode Only after Open Grok is
+    /// restarted. SHELL-owned; persisted to `[ui].code_mode`.
+    SetCodeMode(xai_grok_shell::agent::config::ToolModePreference),
     /// Toggle the ask_user_question timeout. SHELL-owned; persisted to
     /// `[toolset.ask_user_question].timeout_enabled`. Applies to new sessions.
     SetAskUserQuestionTimeoutEnabled(bool),

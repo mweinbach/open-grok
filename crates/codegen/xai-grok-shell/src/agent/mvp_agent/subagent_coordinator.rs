@@ -38,9 +38,15 @@ impl MvpAgent {
                                 if let Some(handle) = parent_handle {
                                     ctx.parent_mcp_pool = handle.snapshot_mcp_pool().await;
                                     ctx.client_hooks = handle.snapshot_client_hooks().await;
-                                    let parent_tools = handle.snapshot_tool_definitions().await;
-                                    ctx.parent_tool_snapshot =
-                                        (!parent_tools.is_empty()).then_some(parent_tools);
+                                    if request.fork_context {
+                                        let parent_tools =
+                                            handle.snapshot_tool_definitions().await;
+                                        ctx.parent_tool_snapshot = (!parent_tools
+                                            .function_tools
+                                            .is_empty()
+                                            || parent_tools.resolved_policy.is_some())
+                                        .then_some(parent_tools);
+                                    }
                                 }
                                 crate::agent::subagent::handle_subagent_request(
                                     request,

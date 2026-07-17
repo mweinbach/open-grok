@@ -1193,7 +1193,16 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 header_injector: None,
             };
             let _ = actor
-                .handle_set_session_model(acp::ModelId::new(model), cfg, false, false, true, 85)
+                .handle_set_session_model(
+                    acp::ModelId::new(model),
+                    cfg,
+                    false,
+                    false,
+                    true,
+                    85,
+                    None,
+                    None,
+                )
                 .await;
 
             assert!(

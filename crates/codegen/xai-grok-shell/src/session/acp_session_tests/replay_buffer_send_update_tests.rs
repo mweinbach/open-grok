@@ -66,6 +66,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         running_task: None,
         pending_inputs: VecDeque::new(),
         pending_notifications: Vec::new(),
+        lifecycle_mutation: None,
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,

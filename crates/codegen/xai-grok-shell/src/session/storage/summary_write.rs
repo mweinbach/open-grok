@@ -85,6 +85,7 @@ pub(crate) struct SummaryPatch {
     pub trace_turn: Option<TraceTurnPatch>,
     pub model: Option<ModelPatch>,
     pub previous_turn_model: Option<crate::session::compaction_config::PreviousModelInfo>,
+    pub resolved_tool_policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
     pub git_head: Option<GitHeadPatch>,
     pub collection_id: Option<String>,
     /// Set the session title unconditionally (last-writer-wins). Used by the
@@ -145,6 +146,9 @@ impl Summary {
         }
         if let Some(previous_turn_model) = &patch.previous_turn_model {
             self.previous_turn_model = Some(previous_turn_model.clone());
+        }
+        if let Some(policy) = patch.resolved_tool_policy {
+            self.resolved_tool_policy = Some(policy);
         }
         if let Some(git_head) = &patch.git_head {
             self.head_commit = git_head.commit.clone();

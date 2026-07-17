@@ -68,6 +68,115 @@ fn bash_item(id: &str, owner: &str, command: &str) -> InputItem {
     item
 }
 
+/// Detached producers such as restored plan approval and subagent completion
+/// call the scheduler directly rather than waiting behind the actor mailbox.
+/// The actor-level lifecycle gate must therefore block promotion in the shared
+/// scheduler itself, while preserving the synthetic input for post-mutation
+/// delivery.
+#[tokio::test(flavor = "current_thread")]
+async fn lifecycle_mutation_gate_blocks_direct_synthetic_turn_start() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _gateway_rx) = build_actor().await;
+            actor
+                .begin_lifecycle_mutation(crate::session::LifecycleMutationKind::ModelSwitch)
+                .await
+                .expect("idle actor claims lifecycle gate");
+
+            let (respond_to, _response_rx) = tokio::sync::oneshot::channel();
+            let cancel = actor
+                .queue_input(
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "subagent finished",
+                    ))],
+                    "subagent-completed-gate-test".to_string(),
+                    PromptMode::Agent,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    None,
+                    false,
+                    respond_to,
+                    None,
+                    None,
+                )
+                .await;
+            assert!(!cancel);
+
+            let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
+            SessionActor::maybe_start_running_task(actor.clone(), completion_tx.clone()).await;
+            {
+                let state = actor.state.lock().await;
+                assert!(
+                    state.running_task.is_none(),
+                    "synthetic turn must not start during lifecycle mutation"
+                );
+                assert_eq!(state.pending_inputs.len(), 1, "input remains queued");
+            }
+
+            actor
+                .end_lifecycle_mutation(crate::session::LifecycleMutationKind::ModelSwitch)
+                .await;
+            SessionActor::maybe_start_running_task(actor.clone(), completion_tx).await;
+            let task = actor
+                .state
+                .lock()
+                .await
+                .running_task
+                .take()
+                .expect("queued synthetic turn starts after gate release");
+            task.handle.abort();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn maintenance_mutations_share_the_model_switch_and_rewind_gate() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _gateway_rx) = build_actor().await;
+            for maintenance in [
+                crate::session::LifecycleMutationKind::ManualCompaction,
+                crate::session::LifecycleMutationKind::HistoryRepair,
+            ] {
+                actor
+                    .begin_lifecycle_mutation(maintenance)
+                    .await
+                    .expect("idle maintenance claims lifecycle gate");
+                assert_eq!(
+                    actor
+                        .begin_lifecycle_mutation(
+                            crate::session::LifecycleMutationKind::ModelSwitch
+                        )
+                        .await,
+                    Err(crate::session::LifecycleMutationBlock::MutationInProgress(
+                        maintenance
+                    ))
+                );
+                assert_eq!(
+                    actor
+                        .begin_lifecycle_mutation(crate::session::LifecycleMutationKind::Rewind)
+                        .await,
+                    Err(crate::session::LifecycleMutationBlock::MutationInProgress(
+                        maintenance
+                    ))
+                );
+                let state = actor.state.lock().await;
+                assert!(
+                    crate::session::state_is_busy(&state),
+                    "maintenance must keep the session resident"
+                );
+                drop(state);
+                actor.end_lifecycle_mutation(maintenance).await;
+            }
+        })
+        .await;
+}
+
 /// Two prompts arrive (serialized by the actor mailbox → FIFO); the agent
 /// drains the front; an edit against the already-drained item is a benign
 /// no-op that re-broadcasts the current queue; a stale-version edit is also

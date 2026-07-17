@@ -262,6 +262,67 @@ impl SessionActor {
             .collect()
     }
 
+    /// Revalidate a persisted/forked ordinary-tool snapshot against the active
+    /// provider. A later model switch must not carry xAI-only search/media
+    /// tools into Codex or Kimi merely because the fork prefix was cached.
+    pub(crate) fn provider_filtered_tool_specs(
+        &self,
+        tools: &[ToolSpec],
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> Vec<ToolSpec> {
+        tools
+            .iter()
+            .filter(|tool| self.local_tool_allowed_for_provider(&tool.name, provider))
+            .cloned()
+            .collect()
+    }
+
+    /// Reconstruct the active policy for a verbatim-fork snapshot from the
+    /// same model metadata and restart-scoped preference used at spawn/switch.
+    /// This preserves the precedence source as well as the mode; in particular
+    /// a Codex hard requirement must not be mislabeled as a user preference.
+    pub(crate) fn snapshot_resolved_tool_policy(
+        &self,
+        sampling_config: &xai_grok_sampling_types::SamplingConfig,
+    ) -> Option<crate::session::tool_surface::ResolvedToolPolicy> {
+        let model_mode = crate::agent::models::resolve_model_tool_mode(
+            &self.models_manager.models(),
+            &acp::ModelId::new(sampling_config.model.clone()),
+        );
+        let mut resolved = crate::agent::config::effective_tool_mode(
+            sampling_config.provider,
+            &sampling_config.api_backend,
+            model_mode,
+            self.rebuild_spec.tool_mode_preference,
+        )
+        .ok()?;
+        let active_mode = self.agent.borrow().tool_mode();
+        if resolved.mode != active_mode {
+            tracing::warn!(
+                active_mode = ?active_mode,
+                recomputed_mode = ?resolved.mode,
+                model = %sampling_config.model,
+                "fork snapshot could not recover the active tool-policy source exactly"
+            );
+            resolved = crate::agent::config::ResolvedToolMode {
+                mode: active_mode,
+                source: if active_mode == xai_grok_sampling_types::ToolMode::Direct
+                    && self.rebuild_spec.tool_mode_preference.is_none()
+                {
+                    crate::agent::config::ToolModeSource::Default
+                } else {
+                    crate::agent::config::ToolModeSource::UserPreference
+                },
+            };
+        }
+        crate::session::tool_surface::ResolvedToolPolicy::for_route(
+            resolved,
+            sampling_config.provider,
+            &sampling_config.api_backend,
+        )
+        .ok()
+    }
+
     /// Keep provider-specific local tools out of Codex requests and Code Mode
     /// dispatch. Search may cross providers only through an explicit
     /// non-default model route; xAI media tools have no equivalent explicit

@@ -966,10 +966,14 @@ pub(crate) async fn persist_setting(
                 .map_err(|e| e.to_string())
         }
         "code_mode" => {
-            let SettingValue::Bool(b) = value else {
-                return Err(kind_mismatch("code_mode", "Bool", &value));
+            let SettingValue::Enum(value) = value else {
+                return Err(kind_mismatch("code_mode", "Enum", &value));
             };
-            xai_grok_shell::util::config::set_code_mode(b)
+            let preference = xai_grok_shell::agent::config::ToolModePreference::from_canonical(
+                value,
+            )
+            .ok_or_else(|| format!("persist_setting(code_mode) unknown value: {value}"))?;
+            xai_grok_shell::util::config::set_code_mode(preference)
                 .await
                 .map_err(|e| e.to_string())
         }

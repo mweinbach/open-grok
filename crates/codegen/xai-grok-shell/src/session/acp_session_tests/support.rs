@@ -1,4 +1,19 @@
 use super::*;
+
+/// Drain persistence traffic for tests that exercise a synchronous flush
+/// barrier without running the full persistence actor.
+pub(crate) fn spawn_persistence_ack_drainer(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg>,
+) {
+    tokio::task::spawn_local(async move {
+        while let Some(message) = rx.recv().await {
+            if let PersistenceMsg::FlushAndAck { respond_to } = message {
+                let _ = respond_to.send(());
+            }
+        }
+    });
+}
+
 /// Wrap `id` in a shared auth-method handle for `SessionActor` test literals
 /// (the field is now a shared live handle, not an owned id).
 pub(crate) fn test_auth_method_id(id: &str) -> crate::agent::auth_method::SharedAuthMethodId {
@@ -164,6 +179,7 @@ pub(crate) async fn create_test_actor_ex(
         running_task: None,
         pending_inputs: VecDeque::new(),
         pending_notifications: Vec::new(),
+        lifecycle_mutation: None,
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,

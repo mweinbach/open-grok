@@ -783,7 +783,6 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "multiline_mode" => Some(Action::SetMultilineMode(new)),
         "vim_mode" => Some(Action::SetVimMode(new)),
         "remember_tool_approvals" => Some(Action::SetRememberToolApprovals(new)),
-        "code_mode" => Some(Action::SetCodeMode(new)),
         "toolset.ask_user_question.timeout_enabled" => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(new))
         }
@@ -856,6 +855,8 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
             "off" => Some(Action::SetPlanMode(crate::app::actions::PlanModeKind::Off)),
             _ => None,
         },
+        "code_mode" => xai_grok_shell::agent::config::ToolModePreference::from_canonical(choice)
+            .map(Action::SetCodeMode),
         "hunk_tracker_mode" => Some(Action::SetHunkTrackerMode(choice.to_string())),
         "screen_mode" => Some(Action::SetScreenMode(choice.to_string())),
         "kimi_api_endpoint" => Some(Action::SetKimiApiEndpoint(choice.to_string())),
