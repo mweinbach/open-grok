@@ -71,6 +71,11 @@ The implementation and compatibility contract are documented in
 contract for adding providers, wire formats, and API-key or OAuth credentials
 is in [`docs/provider-architecture.md`](docs/provider-architecture.md).
 
+For AI coding agents and contributors working in this tree, start with
+[`AGENTS.md`](AGENTS.md) and the deep dives under
+[`docs/agents/`](docs/agents/) (architecture, agent runtime, file edits, TUI
+and config, providers, and development workflow).
+
 ## Install
 
 The initial binary release supports **Apple Silicon macOS only** (`arm64` /
@@ -271,7 +276,9 @@ an upstream installation.
 | `crates/codegen/xai-grok-shell` | Agent runtime, sessions, provider routing, and headless modes |
 | `crates/codegen/xai-grok-code-mode*` | Codex-compatible Code Mode protocol and runtime |
 | `crates/codegen/xai-grok-tools` | Terminal, file, search, and other tool implementations |
-| `docs/` | Fork compatibility and implementation notes |
+| `AGENTS.md` | Instructions for coding agents working in this repo |
+| `docs/` | Fork compatibility notes, release notes, and agent developer docs |
+| `docs/agents/` | Architecture, runtime, editing, TUI/config, providers, development |
 | `scripts/` | Release packaging helpers |
 
 > [!IMPORTANT]

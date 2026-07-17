@@ -8,6 +8,10 @@ Keep changes scoped, explain user-visible behavior in the pull request, add or
 update tests, and run the relevant Rust checks before requesting review. Do not
 include credentials, generated release artifacts, or unrelated formatting.
 
+For architecture, feature maps, edit pipelines, provider isolation, and
+build/test commands, see [`AGENTS.md`](AGENTS.md) and
+[`docs/agents/`](docs/agents/).
+
 Open Grok is a community fork of `xai-org/grok-build`; it is not affiliated
 with or endorsed by xAI or OpenAI. Upstream-only bugs should be reported to the
 upstream project.
