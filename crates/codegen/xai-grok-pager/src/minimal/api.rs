@@ -32,7 +32,7 @@ use ratatui::style::Color;
 
 use crate::acp::tracker::TurnActivity;
 // Only the test-only setters below reference `AgentSession`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::app::agent::AgentSession;
 use crate::app::agent_view::{AgentView, McpInitProgress};
 use crate::app::app_view::{ActiveView, AppView, SessionPickerEntry};
@@ -581,49 +581,49 @@ pub fn record_committed_for_expand(sb: &mut ScrollbackState, id: EntryId) {
 // ── Test-only surface (minimal's unit tests, via the test-only helpers) ──
 
 /// [`crate::app::agent_view::test_agent_view`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_agent_view(session_id: Option<&str>, cwd: std::path::PathBuf) -> AgentView {
     crate::app::agent_view::test_agent_view(session_id, cwd)
 }
 
 /// Test-only setter for `AgentView::extensions_modal`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_extensions_modal(v: &mut AgentView, val: Option<ExtensionsModalState>) {
     v.extensions_modal = val;
 }
 
 /// Test-only setter for `AgentView::question_view`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_question_view(v: &mut AgentView, val: Option<QuestionViewState>) {
     v.question_view = val;
 }
 
 /// Test-only setter for `AgentView::plan_mode_active`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_plan_mode_active(v: &mut AgentView, on: bool) {
     v.plan_mode_active = on;
 }
 
 /// Test-only setter for `AgentView::plan_mode_pending`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_plan_mode_pending(v: &mut AgentView, val: Option<bool>) {
     v.plan_mode_pending = val;
 }
 
 /// Test-only mutable access to `PromptWidget::suggestions`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn prompt_suggestions_mut(pw: &mut PromptWidget) -> &mut SuggestionController {
     &mut pw.suggestions
 }
 
 /// Test-only setter for `AgentSession`'s yolo mode.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_yolo_mode_for_test(session: &mut AgentSession, on: bool) {
     session.set_yolo_mode_for_test(on);
 }
 
 /// Test-only setter for `AgentSession`'s auto mode.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_auto_mode_for_test(session: &mut AgentSession, on: bool) {
     session.set_auto_mode_for_test(on);
 }
@@ -632,7 +632,7 @@ pub fn set_auto_mode_for_test(session: &mut AgentSession, on: bool) {
 /// toggle. Thinking blocks render zero rows when this is off (the default), so
 /// minimal's commit-height tests must force it on to exercise a thinking
 /// block's committed height instead of getting an order-dependent 0.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_show_thinking_blocks(enabled: bool) {
     crate::appearance::cache::set_show_thinking_blocks(enabled);
 }

@@ -102,9 +102,10 @@ serial_test = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
+test-support = []
 # CI builds a single shared rlib variant per crate, so the pager's CI
 # test target links the same render lib as production. Enabling the test-only
 # helpers in the CI default set keeps them present for the pager test while
 # leaving cargo's `default` (and thus cargo production builds) without them.
 # The helpers are inert unless their mock setters are called.
-default-bazel = []
+default-bazel = ["test-support"]

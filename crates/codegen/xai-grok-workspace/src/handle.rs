@@ -4300,7 +4300,7 @@ impl WorkspaceHandle {
         )
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl WorkspaceHandle {
     fn test_config(
         root_cwd: std::path::PathBuf,

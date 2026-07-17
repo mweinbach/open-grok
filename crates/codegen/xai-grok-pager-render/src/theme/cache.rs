@@ -21,7 +21,7 @@ use super::system_appearance;
 /// `load_from_disk()`, then kept in sync by `set()`.
 static CURRENT: AtomicU8 = AtomicU8::new(ThemeKind::GrokNight as u8);
 static LOADED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Whether auto-switching mode is active. Set when the config file
@@ -270,7 +270,7 @@ fn load_auto_theme_config() -> AutoThemeConfig {
 
 // -- Test support ------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn reset_for_test() {
     // Tests are serialized via TEST_LOCK so the AtomicU8/AtomicBool
     // pair is safe to reset without any cross-thread coordination.
@@ -284,12 +284,12 @@ pub fn reset_for_test() {
 /// Seed `AUTO_THEME_CONFIG` with explicit defaults so `auto_theme_config()`
 /// never falls through to `load_auto_theme_config()` (which reads the
 /// user's real `config.toml`). Call from test setup after `reset_for_test()`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn seed_auto_theme_defaults_for_test() {
     *AUTO_THEME_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(AutoThemeConfig::default());
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_lock() -> &'static Mutex<()> {
     &TEST_LOCK
 }
@@ -300,7 +300,7 @@ pub fn test_lock() -> &'static Mutex<()> {
 /// `set_theme` tests mutate) and `Theme::current()` reads the global color
 /// level; holding the shared test lock blocks a mid-test theme change. Hold the
 /// returned guard for the whole test.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn pin_theme() -> std::sync::MutexGuard<'static, ()> {
     let guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     set(ThemeKind::GrokNight);

@@ -50,8 +50,48 @@ const fn const_str_eq(a: &str, b: &str) -> bool {
     }
     true
 }
+/// Test-only trusted-key override. The feature is enabled only through downstream
+/// dev-dependencies, so shipped binaries always use the compiled-in key set.
+#[cfg(feature = "test-support")]
+pub mod test_seam {
+    type OwnedKey = (String, Vec<u8>);
+
+    static KEYS: std::sync::OnceLock<std::sync::Mutex<Vec<OwnedKey>>> = std::sync::OnceLock::new();
+
+    fn keys() -> &'static std::sync::Mutex<Vec<OwnedKey>> {
+        KEYS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    pub fn set_embedded_keys(new_keys: &[(&str, &[u8])]) {
+        let mut guard = keys()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = new_keys
+            .iter()
+            .map(|(id, bytes)| ((*id).to_owned(), (*bytes).to_vec()))
+            .collect();
+    }
+
+    pub(super) fn with_embedded_keys<R>(f: impl FnOnce(&[(&str, &[u8])]) -> R) -> R {
+        let guard = keys()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let borrowed: Vec<(&str, &[u8])> = guard
+            .iter()
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect();
+        f(&borrowed)
+    }
+}
+
 /// Run `f` over the trusted key set — the compiled-in [`EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS`],
 /// unless the compile-time-excluded test seam overrides it.
+#[cfg(feature = "test-support")]
+fn with_embedded_keys<R>(f: impl FnOnce(&[(&str, &[u8])]) -> R) -> R {
+    test_seam::with_embedded_keys(f)
+}
+
+#[cfg(not(feature = "test-support"))]
 fn with_embedded_keys<R>(f: impl FnOnce(&[(&str, &[u8])]) -> R) -> R {
     f(EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS)
 }

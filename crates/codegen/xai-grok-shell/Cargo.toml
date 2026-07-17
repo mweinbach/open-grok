@@ -186,12 +186,12 @@ windows = { workspace = true }
 criterion = { workspace = true }
 filetime = { workspace = true }
 tempfile = { workspace = true }
-xai-grok-memory = { workspace = true, features = [] }
-xai-grok-workspace = { workspace = true, features = [] }
+xai-grok-memory = { workspace = true, features = ["test-support"] }
+xai-grok-workspace = { workspace = true, features = ["test-support"] }
 # Feature-unification applies the signing seam to the lib when building tests, so
 # integration tests can inject a throwaway trusted key; production builds exclude
 # dev-deps and compile the seam out.
-xai-grok-config = { workspace = true, features = [] }
+xai-grok-config = { workspace = true, features = ["test-support"] }
 # Ed25519 signing for the managed-config signature tests.
 ring = { workspace = true }
 tar = { workspace = true }
@@ -201,7 +201,7 @@ semver = { workspace = true }
 serial_test = { workspace = true }
 # Test-only builds expose `env::EnvVarGuard` and the cpu_profile test seams to
 # this crate's test targets.
-xai-grok-shell-base = { workspace = true, features = [] }
+xai-grok-shell-base = { workspace = true, features = ["test-support"] }
 xai-grok-test-support = { workspace = true, features = [] }
 xai-test-utils = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` (paused virtual

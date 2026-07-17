@@ -214,12 +214,12 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
 
 /// A mock embedding provider for testing that returns deterministic vectors.
 /// Uses blake3 hash of text → float values for reproducible results.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct MockEmbeddingProvider {
     pub dimensions: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl EmbeddingProvider for MockEmbeddingProvider {
     async fn embed_batch(

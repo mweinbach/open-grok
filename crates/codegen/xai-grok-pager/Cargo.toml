@@ -162,7 +162,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 # Enable the render crate's test-only helpers for the pager's test build.
-xai-grok-pager-render = { path = "../xai-grok-pager-render", features = [] }
+xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }
 pretty_assertions = { workspace = true }
 insta = { workspace = true }
 criterion = { workspace = true }
@@ -248,6 +248,7 @@ default = ["jemalloc", "sandbox-enforce"]
 default-bazel = [
     "jemalloc",
     "sandbox-enforce",
+    "test-support",
     ]
 # No-op on this crate: the actual `#[global_allocator]` (and the
 # `tikv-jemallocator` dep) live on the composition-root binary
@@ -257,3 +258,4 @@ default-bazel = [
 jemalloc = []
 sandbox-enforce = ["xai-grok-sandbox/enforce"]
 release-dist = []
+test-support = ["xai-grok-pager-render/test-support"]
