@@ -125,10 +125,12 @@ impl DiscoveredWorktree {
             .unwrap_or_else(|| "unknown".to_string());
         let source_repo = self.source_repo.unwrap_or_else(|| PathBuf::from("unknown"));
         let created_at = fs_creation_time(&self.path);
+        // Match `WorktreeDb::get`, which looks up by canonical path.
+        let path = dunce::canonicalize(&self.path).unwrap_or(self.path);
 
         WorktreeRecord {
-            id: id_from_path(&self.path),
-            path: self.path,
+            id: id_from_path(&path),
+            path,
             source_repo,
             repo_name,
             kind: self.kind,
@@ -163,8 +165,9 @@ pub fn rebuild_worktree_db(
     };
 
     for wt in discovery.found {
-        let id = id_from_path(&wt.path);
-        let path_str = wt.path.to_string_lossy();
+        let path = dunce::canonicalize(&wt.path).unwrap_or_else(|_| wt.path.clone());
+        let id = id_from_path(&path);
+        let path_str = path.to_string_lossy();
         if db.get_by_id(&id)?.is_some() || db.get(&path_str)?.is_some() {
             report.already_tracked += 1;
             continue;

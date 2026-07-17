@@ -131,6 +131,16 @@ async fn validate_hook_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the reqwest client used to send a hook request.
+fn build_hook_client(timeout_ms: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        // `validate_hook_url` only vets the initial URL, not redirect targets.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
+}
+
 /// Run a single HTTP hook.
 ///
 /// POSTs the serialized `HookEventEnvelope` as JSON to `spec.url`.
@@ -223,10 +233,7 @@ pub async fn run_http_hook(
         }
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(spec.timeout_ms))
-        .build()
-        .unwrap_or_default();
+    let client = build_hook_client(spec.timeout_ms);
 
     let response = match client
         .post(url)
@@ -922,6 +929,58 @@ mod tests {
             "https://192.0.2.1/check?token=ghp_VERY_REAL_SECRET_TOKEN_42"
         );
         assert_eq!(info.raw_url.as_deref(), Some(raw));
+    }
+
+    /// The hook client must not follow HTTP redirects: `validate_hook_url`
+    /// only vets the initial URL, so a followed 3xx would reach an unvalidated
+    /// target. The local server answers every request with a 302 pointing at a
+    /// blocked address; with redirects disabled the client returns the 302
+    /// verbatim and never issues a second request to the target.
+    #[tokio::test]
+    async fn hook_client_does_not_follow_redirects() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = "HTTP/1.1 302 Found\r\n\
+                     Location: http://169.254.169.254/latest/meta-data/\r\n\
+                     Content-Length: 0\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        let client = build_hook_client(5000);
+        let resp = client
+            .post(format!("http://{addr}/hook"))
+            .body("{}")
+            .send()
+            .await
+            .expect("request should succeed without following the redirect");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "redirect must be surfaced, not followed"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "client must not issue a second request to the redirect target"
+        );
     }
 
     /// Unresolved `${VAR}` refs are preserved verbatim by the helper,

@@ -838,14 +838,18 @@ fn state_database_probes_have_a_supported_generation_ceiling() {
     fs::write(&boundary, "").unwrap();
     fs::write(&beyond, "").unwrap();
     let approved_root = ApprovedRoot::new(root.path()).unwrap();
+    let root_path = approved_root.path();
     assert_eq!(
         state_databases(&approved_root).collect::<Vec<_>>(),
-        vec![boundary.clone(), root.path().join("state_2.sqlite")]
+        vec![
+            root_path.join(format!("state_{MAX_STATE_DB_GENERATION}.sqlite")),
+            root_path.join("state_2.sqlite"),
+        ]
     );
-    fs::remove_file(boundary).unwrap();
+    fs::remove_file(root_path.join(format!("state_{MAX_STATE_DB_GENERATION}.sqlite"))).unwrap();
     assert_eq!(
         state_databases(&approved_root).collect::<Vec<_>>(),
-        vec![root.path().join("state_2.sqlite")]
+        vec![root_path.join("state_2.sqlite")]
     );
 }
 

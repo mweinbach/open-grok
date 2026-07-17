@@ -2158,12 +2158,12 @@ mod tests {
     #[tokio::test]
     async fn full_toolset_descriptions_render_cleanly() {
         use crate::implementations::grok_build::{
-            DEPLOY_APP_TOOL_NAME, IMAGE_GEN_TOOL_NAME, IMAGE_TO_VIDEO_TOOL_NAME,
-            REFERENCE_TO_VIDEO_TOOL_NAME, SCHEDULER_CREATE_TOOL_NAME, SCHEDULER_DELETE_TOOL_NAME,
+            IMAGE_GEN_TOOL_NAME, IMAGE_TO_VIDEO_TOOL_NAME, REFERENCE_TO_VIDEO_TOOL_NAME,
+            SCHEDULER_CREATE_TOOL_NAME, SCHEDULER_DELETE_TOOL_NAME,
         };
         let builder = ToolRegistryBuilder::new();
         let config = ToolServerConfig {
-            tools: vec![
+            tools: [
                 "read_file",
                 "search_replace",
                 "run_terminal_cmd",
@@ -2180,7 +2180,6 @@ mod tests {
                 "web_fetch",
                 "lsp",
                 IMAGE_GEN_TOOL_NAME,
-                DEPLOY_APP_TOOL_NAME,
                 IMAGE_TO_VIDEO_TOOL_NAME,
                 REFERENCE_TO_VIDEO_TOOL_NAME,
                 "monitor",

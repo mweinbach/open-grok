@@ -156,9 +156,22 @@ impl ApprovedRoot {
 
     fn relative_path(&self, path: &Path) -> Option<PathBuf> {
         let relative = if path.is_absolute() {
-            path.strip_prefix(&self.path).ok()?
+            // `self.path` is always canonical. Prefer a pure strip so openat
+            // paths still resolve after the on-disk entry is replaced
+            // (symlink swap); fall back to canonicalize for non-canonical
+            // absolute inputs.
+            path.strip_prefix(&self.path)
+                .ok()
+                .map(|r| r.to_path_buf())
+                .or_else(|| {
+                    let absolute = dunce::canonicalize(path).ok()?;
+                    absolute
+                        .strip_prefix(&self.path)
+                        .ok()
+                        .map(|r| r.to_path_buf())
+                })?
         } else {
-            path
+            path.to_path_buf()
         };
         relative
             .components()
@@ -168,7 +181,7 @@ impl ApprovedRoot {
                     std::path::Component::Normal(_) | std::path::Component::CurDir
                 )
             })
-            .then(|| relative.to_path_buf())
+            .then_some(relative)
     }
 
     pub fn resolve_regular_file(&self, path: &Path) -> Option<(PathBuf, Metadata)> {

@@ -1411,11 +1411,15 @@ pub(crate) fn register_worktree(
             return;
         }
     };
+    // Same canonical path as discovery rebuild / WorktreeDb::get so macOS
+    // /var vs /private/var (and other symlink roots) do not create duplicate rows.
+    let path = dunce::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+    let source = dunce::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     let record = db::WorktreeRecord {
-        id: worktree_id.unwrap_or_else(|| db::id_from_path(worktree_path)),
-        path: worktree_path.to_path_buf(),
-        source_repo: source.to_path_buf(),
-        repo_name: db::repo_name_from_path(source),
+        id: worktree_id.unwrap_or_else(|| db::id_from_path(&path)),
+        path,
+        source_repo: source.clone(),
+        repo_name: db::repo_name_from_path(&source),
         kind,
         creation_mode: creation_mode.to_owned(),
         git_ref: Some(git_ref.to_owned()),
@@ -1435,7 +1439,9 @@ pub(crate) fn register_worktree(
 #[cfg(feature = "metadata")]
 fn unregister_worktree(worktree_path: &std::path::Path) {
     if let Ok(db) = crate::db::WorktreeDb::open_default() {
-        let _ = db.unregister_by_path(worktree_path);
+        let path =
+            dunce::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+        let _ = db.unregister_by_path(&path);
     }
 }
 
