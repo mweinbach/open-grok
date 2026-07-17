@@ -35,7 +35,7 @@ xai-grok-shell          ← sessions, turns, auth, providers, subagents
         │
         ├── xai-grok-sampler     (xAI / Codex / Kimi adapters)
         ├── xai-grok-tools       (bash, edit, plan, web, …)
-        ├── xai-grok-code-mode   (V8 exec/wait when Code Mode Only)
+        ├── xai-grok-code-mode   (persistent V8 exec/wait when Code Mode is active)
         ├── xai-grok-workspace   (permissions, sandbox FS, worktrees)
         └── xai-chat-state       (conversation / tokens)
 ```
@@ -97,7 +97,7 @@ Detailed behavior: [`docs/agents/agent-runtime.md`](docs/agents/agent-runtime.md
 | `search_replace` | Default Grok Build toolset | `xai-grok-tools/.../grok_build/search_replace/` |
 | `apply_patch` | Codex toolset / freeform patches | `.../implementations/codex/apply_patch/` |
 | Hashline edit | Alternate edit scheme | `.../grok_build_hashline/` |
-| Nested tools | Code Mode Only | JS `tools.*` → same prepare/dispatch path |
+| Nested tools | Code Mode / Code Mode Only | JS `tools.*` → same prepare/dispatch path |
 
 **Plan mode:** only the session plan file (`session_dir/plan.md`) may be edited; other `AccessKind::Edit` tools (including `apply_patch`) are rejected. Non-edit tools (bash, read, MCP) still go through normal permissions/YOLO.
 
@@ -120,11 +120,11 @@ Subagents **inherit** the parent `PermissionHandle` (including always-approve). 
 
 ### 4.5 Code Mode
 
-When **Code Mode Only** is effective (model metadata wins over Settings):
+When Code Mode is effective (an OpenAI Codex Code Mode Only model requirement wins over Settings):
 
-- Top-level: freeform `exec` (raw JS), `wait`, plus direct-only tools (human interaction / multi-agent).
-- Ordinary tools remain registered for `tools.*` only.
-- Persistent V8 session for the agent session; disposed on session end.
+- Codex exposes native custom/freeform `exec`; xAI exposes function `exec` with raw JavaScript in `source`. Both expose `wait`.
+- Mixed Code Mode keeps ordinary tools top-level. Code Mode Only keeps them under `tools.*`, with direct-only human/multi-agent controls top-level.
+- Persistent V8 session for a compatible timeline; reset on rewind/incompatible route changes and disposed on session end.
 - Deep map: [`docs/agents/code-mode.md`](docs/agents/code-mode.md).
 - Parity contract: [`docs/code-mode-port.md`](docs/code-mode-port.md).
 

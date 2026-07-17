@@ -191,23 +191,30 @@ providers—for example, GPT chat with Grok memory—using each provider's isola
 credentials and endpoint. Codex reasoning summaries default to detailed when
 the selected model supports them.
 
-## Codex Code Mode
+## Code Mode
 
-There are two related behaviors:
+Settings exposes three explicit tool presentations for Responses-backed
+models:
 
-- **Code Mode** can be enabled in Settings for newly started sessions whose
-  Responses-backed model does not declare an explicit tool mode.
-- **Code Mode Only** is selected by model metadata and takes precedence over
-  the preference. GPT-5.6 Sol always uses this mode.
+- **Direct** exposes ordinary function tools only.
+- **Code Mode** adds `exec` and `wait` alongside the ordinary tools.
+- **Code Mode Only** keeps ordinary tools behind JavaScript `tools.*`, leaving
+  `exec`, `wait`, and direct-only interaction/collaboration controls top-level.
 
-In Code Mode Only, the model calls the native freeform `exec` tool with raw
-JavaScript. Local tools are invoked through `tools.*`, and `wait` resumes or
-terminates a yielded JavaScript cell. The runtime persists for the session and
-is disposed when the session ends. The TUI and restored transcripts hide the
-outer `exec`/`wait` transport—including raw JavaScript and wrapper JSON—and show
-only the decoded inner tool calls and their normal structured results. Hosted
-search remains available directly through the selected provider. Changing the
-setting requires starting a new session.
+OpenAI Codex model metadata may require Code Mode Only and overrides the user
+preference; GPT-5.6 Sol does so. xAI Responses models use the explicit Settings
+choice.
+
+Codex carries `exec` as its native freeform custom tool with raw JavaScript;
+xAI carries the same runtime control as an ordinary function whose `source`
+field contains the JavaScript, because xAI Responses does not accept OpenAI's
+native custom-tool type. `wait` resumes or terminates a yielded cell in both
+routes. The V8 runtime persists for the active session, resets on timeline or
+incompatible provider changes, and is disposed when the session ends. The TUI
+and restored transcripts hide the outer `exec`/`wait` transport and show only
+decoded nested calls and their normal structured results. Hosted search remains
+provider-local. Changing this restart-scoped setting requires restarting Open
+Grok; existing persisted sessions retain their resolved mode when resumed.
 
 ## Build from source
 

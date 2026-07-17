@@ -229,11 +229,11 @@ Deep map: **[code-mode.md](code-mode.md)**. Parity contract: [`../code-mode-port
 | Nested tools | `tool_calls.rs` → `dispatch_code_mode_nested_tool` |
 | Contract | `docs/code-mode-port.md` |
 
-When CodeModeOnly:
+When Code Mode is effective:
 
-- Top-level freeform `exec` + `wait` + direct-only tools + provider hosted search.
-- Ordinary tools only via `tools.*`.
-- Session-persistent V8; dispose on session end.
+- `exec` is provider-compatible: Codex custom/freeform raw JS, xAI function envelope with a `source` string. `wait` is a function tool.
+- Mixed Code Mode retains ordinary top-level tools; Code Mode Only leaves ordinary tools only under `tools.*` plus direct-only controls.
+- Session-persistent V8; reset on rewind/incompatible route changes and dispose on session end.
 - Mark transport with meta (`open-grok/codeModeTransport`); **do not** key UI on tool name alone (MCP might define `exec`).
 
 ## ACP surfaces

@@ -57,6 +57,8 @@ max_thoughts_width = 120               # max column width for reasoning display
 default_selected_permission = "always_allow_all_sessions" # preselected row on the FIRST approval prompt
 remember_tool_approvals = false        # show per-command "Always allow" options on permission prompts;
                                        # grants are remembered per project (default: false); see 22-permissions-and-safety.md
+code_mode = "direct"                   # "direct", "code_mode" (mixed), or "code_mode_only";
+                                       # restart Open Grok after changing this setting
 show_thinking_blocks = true            # show agent thinking blocks in the TUI (default: true)
 group_tool_verbs = true                # fold runs of read/search/list tool calls and subagent rows
                                        # — and finished thoughts among them — into one row (default: true)
@@ -89,6 +91,24 @@ and **Memory model**. Their **Automatic** choice clears the corresponding TOML
 key. Model selection, endpoint, context window, OAuth/API credentials, and
 reasoning effort are resolved together, so a Grok helper can safely serve a
 Codex chat (or the reverse) without sending a model slug to the wrong API.
+
+#### Code Mode
+
+`[ui] code_mode` selects the tool presentation used by Responses-backed
+sessions:
+
+| Value | Behavior |
+|-------|----------|
+| `"direct"` (default) | Ordinary tools are exposed directly. |
+| `"code_mode"` | Mixed Code Mode: `exec` and `wait` are available alongside ordinary top-level tools. This is the normal xAI Code Mode choice. |
+| `"code_mode_only"` | Ordinary tools are available only through nested `tools.*` calls. |
+
+Legacy `true` and `false` values remain accepted and map to `"code_mode"` and
+`"direct"`, respectively. New writes use the string values above. Restart Open
+Grok after changing the setting; the running process keeps the configuration it
+loaded at startup. An OpenAI Codex catalog entry that explicitly requires
+`code_mode_only` overrides this preference. Non-Responses models remain in
+direct mode.
 
 #### Input Mode
 

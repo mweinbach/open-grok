@@ -207,12 +207,13 @@ Workspace `capability_mode` filters by `ToolKind`. Tools with `kind: None` (typi
 
 ### Code Mode
 
-When **Code Mode Only** is effective (model metadata wins over Settings — see [agent-runtime.md](agent-runtime.md) and `docs/code-mode-port.md`):
+When Code Mode is effective (a Codex Code Mode Only model requirement wins over Settings — see [agent-runtime.md](agent-runtime.md) and `docs/code-mode-port.md`):
 
 | Surface | Tools |
 | --- | --- |
-| Top-level | Freeform `exec`, `wait`, plus direct-only (human interaction / multi-agent) |
-| Nested | Ordinary tools via JS `tools.*` — still full prepare (plan + hooks + permissions) |
+| Mixed | Provider-compatible `exec`, `wait`, and ordinary top-level tools |
+| Only | Provider-compatible `exec`, `wait`, plus direct-only (human interaction / multi-agent) |
+| Nested | Ordinary tools via JS `tools.*` in either Code Mode variant — still full prepare (plan + hooks + permissions) |
 | UI | Transport tools hidden; nested `tools.*` are the cards users see |
 
 Nested results must not append as ordinary model tool history (`ModelToolResultSink::CodeMode`).

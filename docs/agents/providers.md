@@ -130,12 +130,12 @@ Also isolated:
 
 ## Code Mode and tools
 
-When **Code Mode Only** is effective (model metadata beats Settings toggle):
+When Code Mode is effective (a Codex Code Mode Only requirement beats Settings):
 
-1. Responses exposes freeform `exec`, schema `wait`, plus direct-only exceptions.
-2. `exec` body is **raw JavaScript**, not a JSON object wrapping JS.
-3. Ordinary tools stay registered for `tools.*` only.
-4. Persistent V8 for the session; disposed on session end.
+1. Responses exposes provider-compatible `exec` plus schema `wait`; Code Mode Only also retains direct-only exceptions.
+2. Codex uses native custom/freeform raw JavaScript. xAI uses a function envelope with that JavaScript in the required `source` string; native custom items are projected or rejected before xAI network I/O.
+3. Mixed mode retains ordinary top-level tools. Only mode keeps them registered for `tools.*` only.
+4. Persistent V8 for a compatible timeline; reset on rewind/provider boundaries and disposed on session end.
 5. UI hides transport; shows nested tools.
 6. Requires Responses-backed models.
 
