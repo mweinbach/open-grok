@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use tokio_util::sync::CancellationToken;
 
 use agent_client_protocol as acp;
-use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, acp_send};
+use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, AcpClientRx, acp_send};
 use xai_grok_shell::agent::auth_method::AuthMethodKind;
 use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::extensions::task::{CancelSubagentRequest, KillTaskRequest};
@@ -1398,19 +1398,22 @@ pub async fn run_single_turn(
                 prompt_result = Some(res);
                 prompt_done_at = Some(Instant::now());
                 if !options.wait_for_background {
-                    // Drain notifications already queued ahead of the response.
-                    while let Ok(msg) = acp_rx.try_recv() {
-                        handle_headless_acp_message(
-                            msg.boxed(),
-                            &mut emitter,
-                            t_prompt,
-                            &mut ttf_logged,
-                            options.yolo,
-                            options.output_format,
-                            &mut pending_bg,
-                            &mut completed_before_bg,
-                        );
-                    }
+                    // PromptResponse and its final notifications travel on
+                    // different channels. Give notifications a short bounded
+                    // grace window so a just-behind lifecycle/text update is
+                    // not silently lost at process exit.
+                    drain_acp_with_grace(
+                        &mut acp_rx,
+                        Duration::from_millis(750),
+                        &mut emitter,
+                        t_prompt,
+                        &mut ttf_logged,
+                        options.yolo,
+                        options.output_format,
+                        &mut pending_bg,
+                        &mut completed_before_bg,
+                    )
+                    .await;
                     break;
                 }
                 // With wait_for_background: keep draining ACP for task_completed.
@@ -1635,6 +1638,61 @@ fn track_background_lifecycle(
 }
 
 // ── ACP client message handling (select arm + pre-exit drain) ────────────
+
+/// Drain all queued ACP client messages, then wait up to `grace` for messages
+/// that race just behind the prompt response. The bound keeps ordinary
+/// no-background headless runs from waiting indefinitely.
+#[allow(clippy::too_many_arguments)]
+async fn drain_acp_with_grace(
+    acp_rx: &mut AcpClientRx,
+    grace: Duration,
+    emitter: &mut HeadlessEmitter,
+    t_prompt: Instant,
+    ttf_logged: &mut bool,
+    yolo: bool,
+    output_format: OutputFormat,
+    pending_bg: &mut HashSet<String>,
+    completed_before_bg: &mut HashSet<String>,
+) {
+    let deadline = Instant::now() + grace;
+    loop {
+        while let Ok(msg) = acp_rx.try_recv() {
+            handle_headless_acp_message(
+                msg.boxed(),
+                emitter,
+                t_prompt,
+                ttf_logged,
+                yolo,
+                output_format,
+                pending_bg,
+                completed_before_bg,
+            );
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            msg = acp_rx.recv() => {
+                let Some(msg) = msg else { break; };
+                handle_headless_acp_message(
+                    msg.boxed(),
+                    emitter,
+                    t_prompt,
+                    ttf_logged,
+                    yolo,
+                    output_format,
+                    pending_bg,
+                    completed_before_bg,
+                );
+            }
+            _ = tokio::time::sleep(remaining) => {
+                break;
+            }
+        }
+    }
+}
 
 /// Process one inbound ACP client message. Used by both `acp_rx.recv()` and
 /// `try_recv()` so buffered `task_backgrounded` is not dropped when
@@ -1927,6 +1985,65 @@ fn handle_ext_notification(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn grace_drain_captures_notification_sent_after_wait_begins() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Waker};
+
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(matches!(
+            client_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let mut emitter = super::HeadlessEmitter::new(super::OutputFormat::Plain, false);
+        let mut ttf_logged = false;
+        let mut pending = std::collections::HashSet::new();
+        let mut completed = std::collections::HashSet::new();
+        let mut drain = Box::pin(super::drain_acp_with_grace(
+            &mut client_rx,
+            std::time::Duration::from_secs(1),
+            &mut emitter,
+            std::time::Instant::now(),
+            &mut ttf_logged,
+            false,
+            super::OutputFormat::Plain,
+            &mut pending,
+            &mut completed,
+        ));
+
+        // Poll once while the channel is empty. This deterministically proves
+        // the notification was not pre-queued: the drain is already waiting.
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(drain.as_mut().poll(&mut context), Poll::Pending));
+
+        let payload = serde_json::json!({
+            "sessionId": "sess-1",
+            "update": {
+                "sessionUpdate": "task_backgrounded",
+                "task_id": "late-task",
+            },
+        });
+        let raw = serde_json::value::to_raw_value(&payload).unwrap();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        client_tx
+            .send(xai_acp_lib::AcpClientMessage::ExtNotification(
+                xai_acp_lib::AcpArgs {
+                    request: acp::ExtNotification::new("x.ai/task_backgrounded", raw.into()),
+                    response_tx,
+                },
+            ))
+            .unwrap();
+        // Closing the sender lets the drain return immediately after processing
+        // the delayed notification rather than consuming wall-clock grace.
+        drop(client_tx);
+
+        drain.await;
+        assert!(pending.contains("late-task"));
+        assert!(response_rx.await.unwrap().is_ok());
+    }
+
     #[test]
     fn lifecycle_tracking_is_independent_of_wait_flag() {
         let mut pending = std::collections::HashSet::new();
