@@ -21,6 +21,8 @@ use reqwest::header::{
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
 
+#[cfg(test)]
+use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
@@ -29,8 +31,6 @@ use xai_grok_sampling_types::{
     ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
     rs,
 };
-#[cfg(test)]
-use xai_grok_sampling_types::ReasoningEffort;
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 #[cfg(test)]
@@ -133,8 +133,8 @@ fn is_unknown_top_level_response_event(error: &SamplingError, data: &str) -> boo
     provider_adapter(ModelProvider::Codex).ignores_unknown_response_event(error, data)
 }
 
-/// Normalize valid custom-tool stream shapes that async-openai 0.33.1 models
-/// more strictly than the wire protocol used by some Responses deployments.
+/// Normalize valid Responses stream shapes that async-openai 0.33.1 models
+/// more strictly than the wire protocol used by some deployments.
 ///
 /// The normalization mutates only missing compatibility fields. In particular,
 /// optional `status` and provider extension fields remain on the raw object for
@@ -182,6 +182,16 @@ fn normalize_response_event_compat(value: &mut serde_json::Value) {
         event_type = "response.web_search_call.searching".to_owned();
     }
 
+    // OpenAI may announce a web search before its action is populated. The
+    // typed SDK requires `action` on every WebSearchToolCall, so project this
+    // nonterminal OutputItemAdded frame onto the equivalent lifecycle event.
+    // The later OutputItemDone remains strict and carries the durable action.
+    if event_type == "response.output_item.added"
+        && normalize_actionless_web_search_item_added(value)
+    {
+        return;
+    }
+
     match event_type.as_str() {
         "response.output_item.added" | "response.output_item.done" => {
             if let Some(item) = value.get_mut("item") {
@@ -218,6 +228,38 @@ fn normalize_response_event_compat(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+/// Convert only nonterminal actionless web-search announcements into the
+/// progress event the typed SDK can represent without inventing an action.
+fn normalize_actionless_web_search_item_added(value: &mut serde_json::Value) -> bool {
+    let Some(event) = value.as_object_mut() else {
+        return false;
+    };
+    let Some(item_id) = (|| {
+        let item = event.get("item")?.as_object()?;
+        if item.get("type")?.as_str()? != "web_search_call"
+            || !matches!(
+                item.get("status").and_then(serde_json::Value::as_str),
+                Some("in_progress" | "searching")
+            )
+            || item.get("action").is_some_and(|action| !action.is_null())
+        {
+            return None;
+        }
+        item.get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    })() else {
+        return false;
+    };
+
+    event.insert(
+        "type".to_owned(),
+        serde_json::Value::String("response.web_search_call.in_progress".to_owned()),
+    );
+    event.insert("item_id".to_owned(), serde_json::Value::String(item_id));
+    true
 }
 
 /// Normalize a complete Responses object before handing it to async-openai.
@@ -4693,6 +4735,50 @@ mod tests {
                 .and_then(|reasoning| reasoning.effort),
             Some(rs::ReasoningEffort::Xhigh),
         );
+    }
+
+    #[test]
+    fn codex_actionless_web_search_item_added_is_treated_as_progress() {
+        let sse = r#"{
+            "type": "response.output_item.added",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": {
+                "id": "ws_123",
+                "type": "web_search_call",
+                "status": "in_progress"
+            }
+        }"#;
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(sse).is_err());
+
+        let event =
+            deserialize_response_event_for_adapter(sse, provider_adapter(ModelProvider::Codex))
+                .expect("an actionless in-progress web search item should parse as progress");
+        let rs::ResponseStreamEvent::ResponseWebSearchCallInProgress(event) = event else {
+            panic!("expected web search progress event");
+        };
+        assert_eq!(event.sequence_number, 2);
+        assert_eq!(event.output_index, 0);
+        assert_eq!(event.item_id, "ws_123");
+    }
+
+    #[test]
+    fn codex_actionless_web_search_item_done_remains_invalid() {
+        let sse = r#"{
+            "type": "response.output_item.done",
+            "sequence_number": 3,
+            "output_index": 0,
+            "item": {
+                "id": "ws_123",
+                "type": "web_search_call",
+                "status": "completed"
+            }
+        }"#;
+
+        let error =
+            deserialize_response_event_for_adapter(sse, provider_adapter(ModelProvider::Codex))
+                .expect_err("a completed web search item must retain its action payload");
+        assert!(matches!(error, SamplingError::Serialization(_)));
     }
 
     #[test]
