@@ -492,15 +492,14 @@ pub(super) fn available_commands(
                             }))
                             .meta(meta.clone())
                     };
-                    // Always advertise the qualified name for plugin skills.
-                    // Also advertise the bare name if it doesn't collide.
-                    if bare_collides {
-                        vec![make_entry(qualified)]
-                    } else {
-                        // No collision — bare name only. The qualified form
-                        // would just duplicate the entry in autocomplete.
-                        vec![make_entry(s.name.clone())]
+                    let mut entries = Vec::new();
+                    if bare_collides || s.plugin_name.is_some() {
+                        entries.push(make_entry(qualified));
                     }
+                    if !bare_collides {
+                        entries.push(make_entry(s.name.clone()));
+                    }
+                    entries
                 }
             };
             entries
@@ -1900,6 +1899,13 @@ mod tests {
         }
     }
 
+    fn make_plugin_skill(plugin: &str, name: &str) -> SkillInfo {
+        SkillInfo {
+            plugin_name: Some(plugin.to_string()),
+            ..make_scoped_skill(name, SkillScope::Plugin)
+        }
+    }
+
     #[test]
     fn resolve_ambiguous_bare_name_passes_through() {
         // Two skills share the bare name "commit" in different scopes.
@@ -1997,6 +2003,88 @@ mod tests {
         );
         // Non-colliding skill keeps bare name.
         assert!(names.contains(&"deploy"));
+    }
+
+    #[test]
+    fn available_commands_qualifies_plugin_skill_colliding_with_client_builtin() {
+        let skills = vec![make_plugin_skill("acme", "login")];
+        let commands = available_commands(&skills, all_gated());
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"acme:login"),
+            "plugin skill must be reachable under its qualified name, got: {names:?}"
+        );
+        let qualified = commands.iter().find(|c| c.name == "acme:login").unwrap();
+        assert!(
+            qualified.meta.is_some(),
+            "qualified plugin entry must carry skill meta (scope + path)"
+        );
+        let bare = commands.iter().find(|c| c.name == "login").unwrap();
+        assert!(bare.meta.is_some(), "bare 'login' here is the plugin skill");
+    }
+
+    #[test]
+    fn available_commands_offers_bare_and_qualified_for_noncolliding_plugin_skill() {
+        let skills = vec![make_plugin_skill("acme", "deploy")];
+        let commands = available_commands(&skills, all_gated());
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"acme:deploy"),
+            "expected qualified entry, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"deploy"),
+            "expected bare convenience entry, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn available_commands_plugin_skill_colliding_with_shell_builtin_is_qualified_only() {
+        let skills = vec![make_plugin_skill("acme", "compact")];
+        let commands = available_commands(&skills, all_gated());
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"acme:compact"),
+            "expected qualified entry, got: {names:?}"
+        );
+        let compact_entries: Vec<_> = commands.iter().filter(|c| c.name == "compact").collect();
+        assert_eq!(compact_entries.len(), 1, "exactly one bare 'compact' entry");
+        assert!(
+            compact_entries[0].meta.is_none(),
+            "bare 'compact' must be the builtin, not the plugin skill"
+        );
+    }
+
+    #[test]
+    fn available_commands_two_plugins_same_bare_name_qualify_both() {
+        let skills = vec![
+            make_plugin_skill("acme", "login"),
+            make_plugin_skill("globex", "login"),
+        ];
+        let commands = available_commands(&skills, all_gated());
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"acme:login"), "got: {names:?}");
+        assert!(names.contains(&"globex:login"), "got: {names:?}");
+        assert!(
+            !names.contains(&"login"),
+            "bare 'login' must not be advertised when two plugins collide, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_qualified_plugin_skill_name() {
+        let skills = vec![make_plugin_skill("acme", "login")];
+        let outcome = resolve(
+            vec![text_block("/acme:login now")],
+            &skills,
+            all_gated(),
+            SkillSlashRewrite::default(),
+        )
+        .unwrap_err();
+        let skill = first_skill(outcome);
+        assert_eq!(skill.name, "acme:login");
+        assert_eq!(skill.args, "now");
     }
 
     #[test]
