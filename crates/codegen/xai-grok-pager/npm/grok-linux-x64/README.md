@@ -3,5 +3,5 @@
 Source package for the `linux-x64` binary used by
 `@mweinbach/open-grok`.
 
-The `v0.1.220-open-grok.9` GitHub release does not publish npm packages. Use the
+The `v0.1.220-open-grok.10` GitHub release does not publish npm packages. Use the
 [GitHub release installer](https://github.com/mweinbach/open-grok#install).

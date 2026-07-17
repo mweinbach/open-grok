@@ -1,6 +1,6 @@
 {
     "name": "@mweinbach/open-grok-win32-arm64",
-    "version": "0.1.220-open-grok.9",
+    "version": "0.1.220-open-grok.10",
     "description": "win32-arm64 binary package for @mweinbach/open-grok.",
     "license": "Apache-2.0",
     "files": [
