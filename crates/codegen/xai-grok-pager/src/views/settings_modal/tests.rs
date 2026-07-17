@@ -101,7 +101,11 @@ fn kimi_secret_paste_is_masked_redacted_and_commits_typed_action() {
         &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     );
     assert!(!format!("{outcome:?}").contains(secret));
-    let SettingsKeyOutcome::Action(Action::SetKimiApiKey(secret_input)) = outcome else {
+    let SettingsKeyOutcome::Action(Action::SetKimiApiKey {
+        endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+        key: secret_input,
+    }) = outcome
+    else {
         panic!("expected typed Kimi key action");
     };
     assert_eq!(secret_input.expose(), secret);
@@ -792,8 +796,10 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "coding_data_sharing",
             // SHELL-owned default_model (Models category).
             "default_model",
-            // Fork-specific secret credential setting.
+            // Kimi service selector and isolated credentials.
+            "kimi_api_endpoint",
             "kimi_api_key",
+            "kimi_code_api_key",
             // Auxiliary model selectors persist IDs while rendering names.
             "recap_model",
             "memory_model",

@@ -116,6 +116,8 @@ fn handle_picking_enum(state: &mut SettingsModalState, key: &KeyEvent) -> Settin
                 state.registry.find(setting_key).map(|m| &m.kind),
                 Some(SettingKind::DynamicEnum { .. })
             );
+            let kimi_provider_login = state.entry_point == SettingsEntryPoint::ProviderLogin
+                && setting_key == "kimi_api_endpoint";
             state.transition_to_browse();
             if kind_is_dynamic {
                 let Some(canonical) = picker_choice_at_owned(state, setting_key, choices_idx)
@@ -132,12 +134,31 @@ fn handle_picking_enum(state: &mut SettingsModalState, key: &KeyEvent) -> Settin
             let Some(current_canonical) = picker_choice_at(state, setting_key, choices_idx) else {
                 return SettingsKeyOutcome::Changed;
             };
-            if let Some(action) = action_for_enum_commit(setting_key, current_canonical) {
+            let action = action_for_enum_commit(setting_key, current_canonical);
+            if kimi_provider_login {
+                if !state.advance_kimi_provider_login_to_secret(current_canonical) {
+                    tracing::error!(
+                        target: "settings",
+                        endpoint = current_canonical,
+                        "Kimi provider login could not open the matching secret editor",
+                    );
+                    return SettingsKeyOutcome::Changed;
+                }
+                return action
+                    .map(SettingsKeyOutcome::Action)
+                    .unwrap_or(SettingsKeyOutcome::Changed);
+            }
+            if let Some(action) = action {
                 return SettingsKeyOutcome::Action(action);
             }
             SettingsKeyOutcome::Changed
         }
         KeyCode::Esc => {
+            if state.entry_point == SettingsEntryPoint::ProviderLogin
+                && setting_key == "kimi_api_endpoint"
+            {
+                return SettingsKeyOutcome::Close;
+            }
             // Revert preview and return to Browse. Non-preview Enums
             // skip the revert (no live visual was applied).
             state.transition_to_browse();
@@ -486,8 +507,16 @@ fn handle_editing_secret(state: &mut SettingsModalState, key: &KeyEvent) -> Sett
                 SettingsModalMode::EditingSecret { buffer, .. } => std::mem::take(buffer),
                 _ => return SettingsKeyOutcome::Unchanged,
             };
-            if setting_key == "kimi_api_key" {
-                let action = Action::SetKimiApiKey(secret);
+            let endpoint = match setting_key {
+                "kimi_api_key" => Some(xai_grok_shell::kimi_models::KimiApiEndpoint::Platform),
+                "kimi_code_api_key" => Some(xai_grok_shell::kimi_models::KimiApiEndpoint::Code),
+                _ => None,
+            };
+            if let Some(endpoint) = endpoint {
+                let action = Action::SetKimiApiKey {
+                    endpoint,
+                    key: secret,
+                };
                 if state.entry_point == SettingsEntryPoint::ProviderLogin {
                     SettingsKeyOutcome::ActionAndClose(action)
                 } else {

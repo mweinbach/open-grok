@@ -7,6 +7,28 @@ use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
 use crate::scrollback::block::RenderBlock;
 
+fn requeue_consumed_prompt(
+    agent: &mut AgentView,
+    text: &str,
+    images: Vec<crate::prompt_images::PastedImage>,
+    toast: &str,
+) {
+    let queue_id = agent.session.next_queue_id;
+    agent.session.next_queue_id += 1;
+    agent
+        .session
+        .pending_prompts
+        .push_front(crate::app::agent::QueuedPrompt {
+            images,
+            ..crate::app::agent::QueuedPrompt::plain(
+                queue_id,
+                text,
+                crate::app::agent::QueueEntryKind::Prompt,
+            )
+        });
+    agent.show_toast(toast);
+}
+
 /// Send a mid-turn interjection. Pushes a standard user prompt block locally
 /// for instant feedback, records the text in prompt history, clears the
 /// prompt, and fires the `x.ai/interject` ext method carrying a client-minted
@@ -34,6 +56,20 @@ pub(super) fn dispatch_interject(
     // even when there is no active session, matching the prompt/bash/
     // feedback/remember paths.
     agent.ephemeral_tip.clear_on_submit();
+
+    // A Kimi service/key change invalidates the sampler that owns this
+    // session. Preserve the already-consumed payload locally until the
+    // automatic rebind finishes instead of letting an explicit interject use
+    // the stale credential.
+    if agent.session.provider_rebind_pending {
+        requeue_consumed_prompt(
+            agent,
+            &text,
+            images,
+            "Kimi service update in progress; prompt queued",
+        );
+        return vec![];
+    }
 
     let Some(session_id) = agent.session.session_id.clone() else {
         agent.show_toast("No active session");
@@ -101,21 +137,13 @@ pub(super) fn dispatch_send_prompt_now(
     // Mid-outage guard (mirrors the plain prompt path): the producers already
     // consumed the payload (composer text / queue row), so requeue it locally
     // instead of firing into a dead channel and losing the message.
-    if reconnect_pending {
-        let queue_id = agent.session.next_queue_id;
-        agent.session.next_queue_id += 1;
-        agent
-            .session
-            .pending_prompts
-            .push_front(crate::app::agent::QueuedPrompt {
-                images,
-                ..crate::app::agent::QueuedPrompt::plain(
-                    queue_id,
-                    &text,
-                    crate::app::agent::QueueEntryKind::Prompt,
-                )
-            });
-        agent.show_toast("Reconnecting, please wait...");
+    if reconnect_pending || agent.session.provider_rebind_pending {
+        let toast = if reconnect_pending {
+            "Reconnecting, please wait..."
+        } else {
+            "Kimi service update in progress; prompt queued"
+        };
+        requeue_consumed_prompt(agent, &text, images, toast);
         return vec![];
     }
 
@@ -364,5 +392,67 @@ mod tests {
             effects.as_slice(),
             [Effect::SendInterject { blocks: None, .. }]
         ));
+    }
+
+    #[test]
+    fn kimi_rebind_hold_requeues_explicit_interject_payload() {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .session
+            .provider_rebind_pending = true;
+
+        let effects = dispatch(
+            Action::Interject {
+                text: "wait for the fresh key".into(),
+                images: vec![],
+            },
+            &mut app,
+        );
+
+        assert!(effects.is_empty());
+        let agent = &app.agents[&id];
+        assert_eq!(
+            agent
+                .session
+                .pending_prompts
+                .front()
+                .map(|prompt| prompt.text.as_str()),
+            Some("wait for the fresh key")
+        );
+        assert!(agent.session.provider_rebind_pending);
+    }
+
+    #[test]
+    fn kimi_rebind_hold_requeues_send_now_payload() {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .session
+            .provider_rebind_pending = true;
+
+        let effects = dispatch(
+            Action::SendPromptNow {
+                text: "do not use the stale sampler".into(),
+                images: vec![],
+            },
+            &mut app,
+        );
+
+        assert!(effects.is_empty());
+        let agent = &app.agents[&id];
+        assert_eq!(
+            agent
+                .session
+                .pending_prompts
+                .front()
+                .map(|prompt| prompt.text.as_str()),
+            Some("do not use the stale sampler")
+        );
+        assert!(agent.session.provider_rebind_pending);
     }
 }

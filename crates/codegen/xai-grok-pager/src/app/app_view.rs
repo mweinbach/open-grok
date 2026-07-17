@@ -642,6 +642,30 @@ pub struct AppView {
     /// optimistically by Settings. `None` means provider-aware Automatic.
     pub recap_model: Option<String>,
     pub memory_model: Option<String>,
+    /// Active Kimi service profile mirrored from `[models].kimi_endpoint`.
+    /// Updated optimistically by Settings so rendering stays sans-IO.
+    pub kimi_api_endpoint: String,
+    /// Runtime-effective service after applying the explicit base-URL
+    /// override. This drives model/key rebinding while Settings continues to
+    /// display the persisted selection above.
+    pub(crate) kimi_effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+    /// Last endpoint whose persistence transaction completed. Optimistic UI
+    /// selections use this as their rollback anchor across rapid changes.
+    pub(crate) kimi_confirmed_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+    /// Latest Kimi settings/key operation. Async completions carry this value
+    /// so an older endpoint or credential refresh cannot overwrite newer UI.
+    pub(crate) kimi_operation_generation: u64,
+    /// Latest operation allowed to replace the active Kimi runtime/catalog.
+    /// Inactive-service credential edits advance the operation counter but do
+    /// not invalidate an in-flight active-service update.
+    pub(crate) kimi_active_operation_generation: u64,
+    /// An active-service persistence/catalog transaction has started but its
+    /// current completion has not yet been applied. Newly created Kimi tabs
+    /// join the provider hold so startup cannot race onto an old sampler.
+    pub(crate) kimi_runtime_update_pending: bool,
+    /// Loaded Kimi sessions awaiting a sampler rebuild for the selected
+    /// service. Targets remain pending while that service has no credential.
+    pub(crate) pending_kimi_rebind_agents: std::collections::HashSet<AgentId>,
     /// Working directory.
     pub cwd: PathBuf,
     /// Whether the project picker question has already been shown this session.
@@ -1187,6 +1211,19 @@ pub struct AppView {
     pub voice_state: VoiceState,
 }
 impl AppView {
+    /// Cancel an automatic Kimi sampler refresh after an authoritative user or
+    /// remote switch moved the tab to a different provider.
+    pub(crate) fn cancel_pending_kimi_rebind(&mut self, agent_id: AgentId) -> bool {
+        let removed = self.pending_kimi_rebind_agents.remove(&agent_id);
+        if let Some(agent) = self.agents.get_mut(&agent_id) {
+            let was_pending = agent.session.provider_rebind_pending;
+            agent.session.provider_rebind_pending = false;
+            removed || was_pending
+        } else {
+            removed
+        }
+    }
+
     pub fn is_zdr_blocked(&self) -> bool {
         self.is_zdr && !self.zdr_access_enabled
     }
@@ -1429,6 +1466,13 @@ impl AppView {
             current_ui: xai_grok_shell::agent::config::UiConfig::default(),
             recap_model: None,
             memory_model: None,
+            kimi_api_endpoint: "platform".to_owned(),
+            kimi_effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            kimi_confirmed_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            kimi_operation_generation: 0,
+            kimi_active_operation_generation: 0,
+            kimi_runtime_update_pending: false,
+            pending_kimi_rebind_agents: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             project_picker_shown: false,
             project_picker_disabled: false,
@@ -5555,6 +5599,13 @@ pub(crate) mod tests {
             current_ui: xai_grok_shell::agent::config::UiConfig::default(),
             recap_model: None,
             memory_model: None,
+            kimi_api_endpoint: "platform".to_owned(),
+            kimi_effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            kimi_confirmed_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            kimi_operation_generation: 0,
+            kimi_active_operation_generation: 0,
+            kimi_runtime_update_pending: false,
+            pending_kimi_rebind_agents: Default::default(),
             cwd: std::path::PathBuf::from("/tmp"),
             project_picker_shown: true,
             project_picker_disabled: false,
@@ -5766,6 +5817,7 @@ pub(crate) mod tests {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                provider_rebind_pending: false,
                 user_model_preference: None,
                 deferred_model_switch: None,
                 bg_tasks: std::collections::BTreeMap::new(),
@@ -6038,6 +6090,7 @@ pub(crate) mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),

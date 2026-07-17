@@ -190,6 +190,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     }
     let mut plugins_changed_needs_skills_refetch = false;
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
+    let mut cancel_pending_kimi_rebind = false;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
     let changed = match session_notif.update {
         ref update @ (XaiSessionUpdate::AutoCompactStarted { .. }
@@ -361,6 +362,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                provider_rebind_pending: false,
                 user_model_preference: None,
                 deferred_model_switch: None,
                 in_flight_prompt: None,
@@ -836,7 +838,14 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             model_id,
             reasoning_effort,
         } => {
-            if agent.session.model_switch_pending {
+            let new_model_id = acp::ModelId::new(model_id.clone());
+            let authoritative_non_kimi_override = agent.session.provider_rebind_pending
+                && agent.session.models.available.contains_key(&new_model_id)
+                && crate::app::app_view::PrimaryProvider::for_model(
+                    &agent.session.models,
+                    &new_model_id,
+                ) != Some(crate::app::app_view::PrimaryProvider::Kimi);
+            if agent.session.model_switch_pending && !authoritative_non_kimi_override {
                 tracing::debug!(
                     session_id = session_notif.session_id.0.as_ref(), model_id = %
                     model_id,
@@ -845,7 +854,6 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 return false;
             }
             use xai_grok_shell::sampling::types::ReasoningEffort;
-            let new_model_id = acp::ModelId::new(model_id.clone());
             if !agent.session.models.available.contains_key(&new_model_id) {
                 if xai_grok_shell::agent::chat_modes::process_chat_mode_enabled() {
                     agent.session.models.available.insert(
@@ -871,6 +879,17 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 .models
                 .set_current(new_model_id.clone(), effort);
             agent.session.user_model_preference = Some(new_model_id.clone());
+            if crate::app::app_view::PrimaryProvider::for_model(
+                &agent.session.models,
+                &new_model_id,
+            ) != Some(crate::app::app_view::PrimaryProvider::Kimi)
+                && agent.session.provider_rebind_pending
+            {
+                agent.session.provider_rebind_pending = false;
+                cancel_pending_kimi_rebind = true;
+                let effects = crate::app::dispatch::maybe_drain_queue(agent);
+                agent.pending_effects.extend(effects);
+            }
             let resolved_effort = agent.session.models.reasoning_effort;
             let actually_changed =
                 prev_model.as_ref() != Some(&new_model_id) || prev_effort != resolved_effort;
@@ -1025,6 +1044,9 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         } else {
             tracing::warn!("PluginsChanged: agent or modal disappeared before skills re-fetch");
         }
+    }
+    if cancel_pending_kimi_rebind {
+        app.pending_kimi_rebind_agents.remove(&parent_id);
     }
     if let Some(agent) = app.agents.get_mut(&parent_id) {
         if let Some(seq) = meta.event_seq

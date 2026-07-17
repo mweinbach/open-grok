@@ -25,14 +25,21 @@ use crate::scrollback::block::RenderBlock;
 use agent_client_protocol as acp;
 
 pub(in crate::app::dispatch) fn kimi_api_key_status() -> crate::settings::SecretStatus {
-    if std::env::var("MOONSHOT_API_KEY")
-        .ok()
-        .is_some_and(|key| !key.trim().is_empty())
-    {
+    kimi_api_key_status_for(xai_grok_shell::kimi_models::KimiApiEndpoint::Platform)
+}
+
+pub(in crate::app::dispatch) fn kimi_code_api_key_status() -> crate::settings::SecretStatus {
+    kimi_api_key_status_for(xai_grok_shell::kimi_models::KimiApiEndpoint::Code)
+}
+
+fn kimi_api_key_status_for(
+    endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+) -> crate::settings::SecretStatus {
+    if xai_grok_shell::kimi_models::environment_api_key_is_configured(endpoint) {
         crate::settings::SecretStatus::EnvironmentOverride
-    } else if xai_grok_shell::auth::provider_api_key_is_configured(
+    } else if xai_grok_shell::auth::kimi_api_key_is_configured(
         &xai_grok_tools::util::grok_home::grok_home(),
-        xai_grok_shell::sampling::types::ModelProvider::Kimi,
+        endpoint,
     ) {
         crate::settings::SecretStatus::Stored
     } else {
@@ -79,6 +86,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let recap_model_from_app = app.recap_model.clone();
     let memory_model_from_app = app.memory_model.clone();
     let kimi_api_key_status = kimi_api_key_status();
+    let kimi_code_api_key_status = kimi_code_api_key_status();
+    let kimi_api_endpoint = app.kimi_api_endpoint.clone();
     for agent in app.agents.values_mut() {
         // Walk both `Settings` and `ResetSettingsConfirm` — the
         // confirm dialog embeds settings state that must stay fresh
@@ -108,6 +117,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 recap_model: recap_model_from_app.clone(),
                 memory_model: memory_model_from_app.clone(),
                 kimi_api_key_status,
+                kimi_code_api_key_status,
+                kimi_api_endpoint: kimi_api_endpoint.clone(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 // Prefer optimistic pending over confirmed active.
                 plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
@@ -201,6 +212,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
     let recap_model_from_app = app.recap_model.clone();
     let memory_model_from_app = app.memory_model.clone();
     let kimi_api_key_status = kimi_api_key_status();
+    let kimi_code_api_key_status = kimi_code_api_key_status();
+    let kimi_api_endpoint = app.kimi_api_endpoint.clone();
 
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
@@ -236,6 +249,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
         recap_model: recap_model_from_app,
         memory_model: memory_model_from_app,
         kimi_api_key_status,
+        kimi_code_api_key_status,
+        kimi_api_endpoint,
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
         // Prefer optimistic pending over confirmed active.
         plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
@@ -257,10 +272,9 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
     vec![]
 }
 
-/// Open the existing zeroizing Settings credential editor as a focused Kimi
-/// login task. Agent views host it in `ActiveModal::Settings`; the session-less
-/// dashboard hosts the same `SettingsModalState` directly. Both surfaces keep
-/// paste ownership and input-log suppression at their secure modal boundary.
+/// Open the Kimi service picker followed by the matching zeroizing credential
+/// editor as one focused login task. Agent views host it in
+/// `ActiveModal::Settings`; the session-less dashboard hosts the same state.
 pub(in crate::app::dispatch) fn dispatch_open_kimi_api_key_editor(
     app: &mut AppView,
 ) -> Vec<Effect> {
@@ -272,10 +286,10 @@ pub(in crate::app::dispatch) fn dispatch_open_kimi_api_key_editor(
     let pager_snapshot = build_pager_snapshot(app);
 
     let mut state = SettingsModalState::new(registry, ui_snapshot, pager_snapshot);
-    if !state.try_open_provider_login_secret("kimi_api_key") {
+    if !state.try_open_kimi_provider_login() {
         tracing::error!(
             target: "settings",
-            "Kimi API-key setting is missing or is no longer a secret setting",
+            "Kimi endpoint or API-key settings are missing from the registry",
         );
         return vec![];
     }
@@ -289,6 +303,31 @@ pub(in crate::app::dispatch) fn dispatch_open_kimi_api_key_editor(
         dashboard.settings_modal = Some(Box::new(state));
     }
     vec![]
+}
+
+/// If a focused Kimi login's optimistic endpoint write fails, return that
+/// modal to the service picker. Keeping the secret editor open would let Save
+/// store a key for a service that was just rolled back.
+pub(in crate::app::dispatch) fn restart_failed_kimi_provider_login(app: &mut AppView) {
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsEntryPoint;
+
+    if let Some(agent) = get_visible_agent_mut(app)
+        && let Some(ActiveModal::Settings { state }) = agent.active_modal.as_mut()
+        && state.entry_point == SettingsEntryPoint::ProviderLogin
+    {
+        let _ = state.try_open_kimi_provider_login();
+        return;
+    }
+    if matches!(app.active_view, ActiveView::AgentDashboard)
+        && let Some(state) = app
+            .dashboard
+            .as_mut()
+            .and_then(|dashboard| dashboard.settings_modal.as_deref_mut())
+        && state.entry_point == SettingsEntryPoint::ProviderLogin
+    {
+        let _ = state.try_open_kimi_provider_login();
+    }
 }
 
 /// Open the reset-settings confirmation modal.
@@ -744,6 +783,8 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         recap_model: app.recap_model.clone(),
         memory_model: app.memory_model.clone(),
         kimi_api_key_status: kimi_api_key_status(),
+        kimi_code_api_key_status: kimi_code_api_key_status(),
+        kimi_api_endpoint: app.kimi_api_endpoint.clone(),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         plan_mode_active: agent_plan_mode(app),
         show_tips: app.show_tips,
@@ -909,6 +950,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
             Some(Action::SetHunkTrackerMode((*s).to_string()))
         }
         ("screen_mode", SettingValue::Enum(s)) => Some(Action::SetScreenMode((*s).to_string())),
+        ("kimi_api_endpoint", SettingValue::Enum(s)) => {
+            Some(Action::SetKimiApiEndpoint((*s).to_string()))
+        }
         ("voice_capture_mode", SettingValue::Enum(s)) => {
             Some(Action::SetVoiceCaptureMode((*s).to_string()))
         }
@@ -954,8 +998,16 @@ pub(in crate::app::dispatch) fn action_for_reset(
             }
         }
         ("kimi_api_key", SettingValue::SecretStatus(crate::settings::SecretStatus::Missing)) => {
-            Some(Action::ClearKimiApiKey)
+            Some(Action::ClearKimiApiKey {
+                endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            })
         }
+        (
+            "kimi_code_api_key",
+            SettingValue::SecretStatus(crate::settings::SecretStatus::Missing),
+        ) => Some(Action::ClearKimiApiKey {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        }),
 
         _ => None,
     }

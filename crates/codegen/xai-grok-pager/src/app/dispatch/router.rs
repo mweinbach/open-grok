@@ -82,11 +82,11 @@ use super::settings::setters::{
     set_contextual_hint_small_screen, set_contextual_hint_undo, set_contextual_hint_word_select,
     set_default_model, set_default_selected_permission, set_display_refresh_auto_cadence,
     set_fork_secondary_model, set_group_tool_verbs, set_hunk_tracker_mode, set_invert_scroll,
-    set_keep_text_selection, set_kimi_api_key, set_max_thoughts_width, set_memory_model,
-    set_multiline_mode, set_prompt_suggestions, set_recap_model, set_remember_tool_approvals,
-    set_render_mermaid, set_respect_manual_folds, set_screen_mode, set_scroll_lines,
-    set_scroll_mode, set_scroll_speed, set_show_thinking_blocks, set_show_tips, set_simple_mode,
-    set_theme, set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode,
+    set_keep_text_selection, set_kimi_api_endpoint, set_kimi_api_key, set_max_thoughts_width,
+    set_memory_model, set_multiline_mode, set_prompt_suggestions, set_recap_model,
+    set_remember_tool_approvals, set_render_mermaid, set_respect_manual_folds, set_screen_mode,
+    set_scroll_lines, set_scroll_mode, set_scroll_speed, set_show_thinking_blocks, set_show_tips,
+    set_simple_mode, set_theme, set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode,
     set_voice_stt_language,
 };
 use super::settings::ui::{
@@ -803,6 +803,10 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
+            if agent.session.model_switch_pending && agent.session.provider_rebind_pending {
+                agent.show_toast("Finishing the Kimi service change before switching models…");
+                return vec![];
+            }
             let Some(session_id) = agent.session.session_id.clone() else {
                 agent.session.deferred_model_switch = Some((model_id, effort));
                 return vec![];
@@ -940,8 +944,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetAutoDarkTheme(v) => set_auto_dark_theme(app, v),
         Action::SetAutoLightTheme(v) => set_auto_light_theme(app, v),
         Action::SetDefaultModel(v) => set_default_model(app, v),
-        Action::SetKimiApiKey(key) => set_kimi_api_key(app, key),
-        Action::ClearKimiApiKey => clear_kimi_api_key(app),
+        Action::SetKimiApiEndpoint(endpoint) => set_kimi_api_endpoint(app, endpoint),
+        Action::SetKimiApiKey { endpoint, key } => set_kimi_api_key(app, endpoint, key),
+        Action::ClearKimiApiKey { endpoint } => clear_kimi_api_key(app, endpoint),
         Action::ClearDefaultModel => clear_default_model(app),
         Action::SetRecapModel(v) => set_recap_model(app, v),
         Action::ClearRecapModel => clear_recap_model(app),

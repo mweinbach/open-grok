@@ -425,6 +425,8 @@ pub(super) fn dispatch_send_prompt_inner(
                     recap_model: app.recap_model.clone(),
                     memory_model: app.memory_model.clone(),
                     kimi_api_key_status: crate::settings::SecretStatus::Missing,
+                    kimi_code_api_key_status: crate::settings::SecretStatus::Missing,
+                    kimi_api_endpoint: app.kimi_api_endpoint.clone(),
                     coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                     // Prefer optimistic pending over confirmed active.
                     plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),

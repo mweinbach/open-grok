@@ -11,6 +11,25 @@ fn provider_model_info(model_id: &acp::ModelId, name: &str, provider: &str) -> a
     acp::ModelInfo::new(model_id.clone(), name.to_string()).meta(Some(meta))
 }
 
+fn prepare_kimi_rebind(
+    app: &mut AppView,
+    agent_id: AgentId,
+    endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+    generation: u64,
+) {
+    app.kimi_api_endpoint = endpoint.as_canonical().to_owned();
+    app.kimi_effective_endpoint = endpoint;
+    app.kimi_operation_generation = generation;
+    app.kimi_active_operation_generation = generation;
+    app.kimi_runtime_update_pending = true;
+    app.pending_kimi_rebind_agents.insert(agent_id);
+    app.agents
+        .get_mut(&agent_id)
+        .unwrap()
+        .session
+        .provider_rebind_pending = true;
+}
+
 #[test]
 fn kimi_key_update_rebinds_loaded_kimi_session_to_same_model() {
     let mut app = test_app_with_agent();
@@ -25,12 +44,24 @@ fn kimi_key_update_rebinds_loaded_kimi_session_to_same_model() {
         models.current = Some(model_id.clone());
         models.reasoning_effort = Some(xai_grok_shell::sampling::types::ReasoningEffort::High);
     }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+        1,
+    );
 
     let effects = dispatch(
         Action::TaskComplete(TaskResult::KimiApiKeyUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            generation: 1,
+            stale: false,
             configured: true,
+            active: true,
             warning: None,
             error: None,
+            models: None,
         }),
         &mut app,
     );
@@ -38,18 +69,17 @@ fn kimi_key_update_rebinds_loaded_kimi_session_to_same_model() {
     assert!(app.agents[&agent_id].session.model_switch_pending);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::SwitchModel {
+        [Effect::RebindKimiModel {
             agent_id: effect_agent,
             model_id: effect_model,
             effort: Some(xai_grok_shell::sampling::types::ReasoningEffort::High),
-            prev_model_id: None,
             ..
         }] if *effect_agent == agent_id && effect_model == &model_id
     ));
 }
 
 #[test]
-fn failed_kimi_key_update_does_not_rebind_session() {
+fn failed_active_kimi_key_update_keeps_session_fail_closed() {
     let mut app = test_app_with_agent();
     let agent_id = AgentId(0);
     let model_id = acp::ModelId::new("kimi-coding");
@@ -61,29 +91,50 @@ fn failed_kimi_key_update_does_not_rebind_session() {
         );
         models.current = Some(model_id);
     }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+        1,
+    );
 
     let effects = dispatch(
         Action::TaskComplete(TaskResult::KimiApiKeyUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            generation: 1,
+            stale: false,
             configured: true,
+            active: true,
             warning: None,
             error: Some("credential store unavailable".to_owned()),
+            models: None,
         }),
         &mut app,
     );
 
     assert!(effects.is_empty());
     assert!(!app.agents[&agent_id].session.model_switch_pending);
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(app.pending_kimi_rebind_agents.contains(&agent_id));
 }
 
 #[test]
 fn kimi_model_query_warning_does_not_claim_models_refreshed() {
     let mut app = test_app_with_agent();
+    app.kimi_active_operation_generation = 1;
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::KimiApiKeyUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            generation: 1,
+            stale: false,
             configured: true,
+            active: true,
             warning: Some("catalog unavailable".to_owned()),
             error: None,
+            models: None,
         }),
         &mut app,
     );
@@ -91,6 +142,564 @@ fn kimi_model_query_warning_does_not_claim_models_refreshed() {
     let toast = read_toast(&app);
     assert!(toast.contains("model query warning"), "got: {toast}");
     assert!(!toast.contains("models refreshed"), "got: {toast}");
+}
+
+#[test]
+fn kimi_endpoint_update_rebinds_loaded_kimi_session() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let model_id = acp::ModelId::new("kimi-for-coding");
+    {
+        let models = &mut app.agents[&agent_id].session.models;
+        models.available.insert(
+            model_id.clone(),
+            provider_model_info(&model_id, "Kimi for Coding", "kimi"),
+        );
+        models.current = Some(model_id.clone());
+    }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        1,
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiEndpointUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            generation: 1,
+            stale: false,
+            credential_configured: true,
+            warning: None,
+            error: None,
+            models: None,
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.kimi_api_endpoint, "code");
+    assert!(app.agents[&agent_id].session.model_switch_pending);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::RebindKimiModel {
+            agent_id: effect_agent,
+            model_id: effect_model,
+            ..
+        }] if *effect_agent == agent_id && effect_model == &model_id
+    ));
+}
+
+#[test]
+fn kimi_endpoint_update_maps_platform_session_to_code_catalog_model() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let platform_id = acp::ModelId::new("kimi-k3");
+    let code_id = acp::ModelId::new("kimi-for-coding");
+    let fallback_id = acp::ModelId::new("grok-4.5");
+    {
+        let models = &mut app.agents[&agent_id].session.models;
+        models.available.insert(
+            platform_id.clone(),
+            provider_model_info(&platform_id, "Kimi K3", "kimi"),
+        );
+        models.current = Some(platform_id);
+    }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        1,
+    );
+    let refreshed = acp::SessionModelState::new(
+        fallback_id.clone(),
+        vec![
+            provider_model_info(&fallback_id, "Grok 4.5", "xai"),
+            provider_model_info(&code_id, "Kimi for Coding", "kimi"),
+        ],
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiEndpointUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            generation: 1,
+            stale: false,
+            credential_configured: true,
+            warning: None,
+            error: None,
+            models: Some(refreshed),
+        }),
+        &mut app,
+    );
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::RebindKimiModel {
+            agent_id: effect_agent,
+            model_id: effect_model,
+            effort: None,
+            ..
+        }] if *effect_agent == agent_id && effect_model == &code_id
+    ));
+    assert!(
+        app.agents[&agent_id]
+            .session
+            .models
+            .available
+            .contains_key(&code_id)
+    );
+    assert!(app.pending_kimi_rebind_agents.contains(&agent_id));
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+}
+
+#[test]
+fn kimi_endpoint_without_credential_keeps_loaded_session_fail_closed() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let code_id = acp::ModelId::new("kimi-for-coding");
+    {
+        let models = &mut app.agents[&agent_id].session.models;
+        models.available.insert(
+            code_id.clone(),
+            provider_model_info(&code_id, "Kimi for Coding", "kimi"),
+        );
+        models.current = Some(code_id);
+    }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        1,
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiEndpointUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            generation: 1,
+            stale: false,
+            credential_configured: false,
+            warning: None,
+            error: None,
+            models: None,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(!app.agents[&agent_id].session.model_switch_pending);
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(app.pending_kimi_rebind_agents.contains(&agent_id));
+}
+
+#[test]
+fn late_kimi_session_load_rebinds_before_draining_after_runtime_update() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let model_id = acp::ModelId::new("kimi-for-coding");
+    app.kimi_effective_endpoint = xai_grok_shell::kimi_models::KimiApiEndpoint::Code;
+    app.kimi_operation_generation = 1;
+    app.kimi_active_operation_generation = 1;
+    app.kimi_runtime_update_pending = false;
+    {
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        agent.session.loading_replay = true;
+        agent
+            .session
+            .enqueue_prompt("must wait for the new Kimi sampler".to_owned());
+    }
+    let models = acp::SessionModelState::new(
+        model_id.clone(),
+        vec![provider_model_info(&model_id, "Kimi for Coding", "kimi")],
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionLoaded {
+            agent_id,
+            session_id: acp::SessionId::new("test-session"),
+            models: Some(models),
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            running_prompt_id: None,
+        }),
+        &mut app,
+    );
+
+    assert!(matches!(
+        effects
+            .iter()
+            .find(|effect| matches!(effect, Effect::RebindKimiModel { .. })),
+        Some(Effect::RebindKimiModel {
+            agent_id: effect_agent,
+            model_id: effect_model,
+            generation: 1,
+            ..
+        }) if *effect_agent == agent_id && effect_model == &model_id
+    ));
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendPrompt { .. })),
+        "queued prompt must remain held until the Kimi sampler is rebound"
+    );
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(app.agents[&agent_id].session.model_switch_pending);
+    assert_eq!(app.agents[&agent_id].session.pending_prompts.len(), 1);
+}
+
+#[test]
+fn kimi_endpoint_never_rebinds_to_a_model_from_the_other_service() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let platform_id = acp::ModelId::new("kimi-k3");
+    {
+        let models = &mut app.agents[&agent_id].session.models;
+        models.available.insert(
+            platform_id.clone(),
+            provider_model_info(&platform_id, "Kimi K3", "kimi"),
+        );
+        models.current = Some(platform_id);
+    }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        1,
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiEndpointUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            generation: 1,
+            stale: false,
+            credential_configured: true,
+            warning: None,
+            error: None,
+            models: None,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(!app.agents[&agent_id].session.model_switch_pending);
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(app.pending_kimi_rebind_agents.contains(&agent_id));
+}
+
+#[test]
+fn failed_kimi_endpoint_persistence_rolls_back_without_rebinding() {
+    let mut app = test_app_with_agent();
+    prepare_kimi_rebind(
+        &mut app,
+        AgentId(0),
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        1,
+    );
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiEndpointUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            generation: 1,
+            stale: false,
+            credential_configured: false,
+            warning: None,
+            error: Some("config unavailable".to_owned()),
+            models: None,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert_eq!(app.kimi_api_endpoint, "platform");
+    assert!(!app.agents[&AgentId(0)].session.model_switch_pending);
+    assert!(app.agents[&AgentId(0)].session.provider_rebind_pending);
+}
+
+#[test]
+fn failed_endpoint_uses_durable_previous_as_retry_anchor() {
+    let mut app = test_app_with_agent();
+    prepare_kimi_rebind(
+        &mut app,
+        AgentId(0),
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+        2,
+    );
+    app.kimi_confirmed_endpoint = xai_grok_shell::kimi_models::KimiApiEndpoint::Platform;
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiEndpointUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            generation: 2,
+            stale: false,
+            credential_configured: true,
+            warning: None,
+            error: Some("config unavailable".to_owned()),
+            models: None,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert_eq!(app.kimi_api_endpoint, "code");
+    assert_eq!(
+        app.kimi_confirmed_endpoint,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code
+    );
+
+    let retry = dispatch(Action::SetKimiApiEndpoint("code".to_owned()), &mut app);
+    assert!(matches!(
+        retry.as_slice(),
+        [Effect::UpdateKimiApiEndpoint {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn automatic_kimi_rebind_never_persists_a_model_preference() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let model_id = acp::ModelId::new("kimi-for-coding-highspeed");
+    let prior_preference = acp::ModelId::new("grok-4.5");
+    {
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        agent.session.models.available.insert(
+            model_id.clone(),
+            provider_model_info(&model_id, "Kimi for Coding Highspeed", "kimi"),
+        );
+        agent.session.models.current = Some(model_id.clone());
+        agent.session.user_model_preference = Some(prior_preference.clone());
+        agent.session.model_switch_pending = true;
+    }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        7,
+    );
+    app.agents
+        .get_mut(&agent_id)
+        .unwrap()
+        .session
+        .model_switch_pending = true;
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiModelRebindComplete {
+            agent_id,
+            session_id: acp::SessionId::new("test-session"),
+            model_id: model_id.clone(),
+            effort: None,
+            generation: 7,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistPreferredModel { .. }))
+    );
+    assert_eq!(
+        app.agents[&agent_id].session.user_model_preference,
+        Some(prior_preference)
+    );
+    assert!(!app.agents[&agent_id].session.model_switch_pending);
+    assert!(!app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(!app.pending_kimi_rebind_agents.contains(&agent_id));
+}
+
+#[test]
+fn stale_kimi_rebind_completion_reconciles_latest_service() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let code_id = acp::ModelId::new("kimi-for-coding");
+    {
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        agent.session.models.available.insert(
+            code_id.clone(),
+            provider_model_info(&code_id, "Kimi for Coding", "kimi"),
+        );
+        agent.session.models.current = Some(code_id.clone());
+        agent.session.model_switch_pending = true;
+    }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        2,
+    );
+    app.agents
+        .get_mut(&agent_id)
+        .unwrap()
+        .session
+        .model_switch_pending = true;
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiModelRebindComplete {
+            agent_id,
+            session_id: acp::SessionId::new("test-session"),
+            model_id: acp::ModelId::new("kimi-k3"),
+            effort: None,
+            generation: 1,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::RebindKimiModel {
+            model_id,
+            generation: 2,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            ..
+        }] if model_id == &code_id
+    ));
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(app.agents[&agent_id].session.model_switch_pending);
+}
+
+#[test]
+fn failed_kimi_rebind_keeps_queue_fail_closed() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let model_id = acp::ModelId::new("kimi-for-coding");
+    {
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        agent.session.models.available.insert(
+            model_id.clone(),
+            provider_model_info(&model_id, "Kimi for Coding", "kimi"),
+        );
+        agent.session.models.current = Some(model_id.clone());
+        agent.session.model_switch_pending = true;
+    }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        3,
+    );
+    app.agents
+        .get_mut(&agent_id)
+        .unwrap()
+        .session
+        .model_switch_pending = true;
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::KimiModelRebindComplete {
+            agent_id,
+            session_id: acp::SessionId::new("test-session"),
+            model_id,
+            effort: None,
+            generation: 3,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            result: Err(crate::app::actions::SwitchModelError::Other(
+                "transport unavailable".to_owned(),
+            )),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(!app.agents[&agent_id].session.model_switch_pending);
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(app.pending_kimi_rebind_agents.contains(&agent_id));
+}
+
+#[test]
+fn failed_correction_after_cancelled_late_kimi_rebind_keeps_queue_fail_closed() {
+    let mut app = test_app_with_agent();
+    let agent_id = AgentId(0);
+    let kimi_id = acp::ModelId::new("kimi-for-coding");
+    let grok_id = acp::ModelId::new("grok-4.5");
+    {
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        agent.session.models.available.insert(
+            kimi_id.clone(),
+            provider_model_info(&kimi_id, "Kimi for Coding", "kimi"),
+        );
+        agent.session.models.available.insert(
+            grok_id.clone(),
+            provider_model_info(&grok_id, "Grok 4.5", "xai"),
+        );
+        agent.session.models.current = Some(kimi_id.clone());
+        agent.session.model_switch_pending = true;
+    }
+    prepare_kimi_rebind(
+        &mut app,
+        agent_id,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        3,
+    );
+    app.agents
+        .get_mut(&agent_id)
+        .unwrap()
+        .session
+        .model_switch_pending = true;
+
+    // An authoritative switch cancels the automatic operation while its ACP
+    // request is still in flight.
+    app.cancel_pending_kimi_rebind(agent_id);
+    app.agents
+        .get_mut(&agent_id)
+        .unwrap()
+        .session
+        .models
+        .current = Some(grok_id.clone());
+
+    let correction = dispatch(
+        Action::TaskComplete(TaskResult::KimiModelRebindComplete {
+            agent_id,
+            session_id: acp::SessionId::new("test-session"),
+            model_id: kimi_id,
+            effort: None,
+            generation: 3,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            result: Ok(()),
+        }),
+        &mut app,
+    );
+
+    assert!(matches!(
+        correction.as_slice(),
+        [Effect::SwitchModel { model_id, .. }] if model_id == &grok_id
+    ));
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(!app.pending_kimi_rebind_agents.contains(&agent_id));
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id,
+            model_id: grok_id,
+            effort: None,
+            result: Err(crate::app::actions::SwitchModelError::Other(
+                "transport unavailable".to_owned(),
+            )),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(!app.agents[&agent_id].session.model_switch_pending);
+    assert!(app.agents[&agent_id].session.provider_rebind_pending);
+    assert!(!app.pending_kimi_rebind_agents.contains(&agent_id));
 }
 
 fn foreign_resume_hint(

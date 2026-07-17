@@ -1373,6 +1373,8 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                     .collect(),
                 recap_model: app.recap_model.clone(),
                 kimi_api_key_status: crate::settings::SecretStatus::Missing,
+                kimi_code_api_key_status: crate::settings::SecretStatus::Missing,
+                kimi_api_endpoint: app.kimi_api_endpoint.clone(),
                 memory_model: app.memory_model.clone(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 plan_mode_active: false,

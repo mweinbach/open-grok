@@ -45,7 +45,9 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "multiline_mode",
     "permission_mode",
     "default_model",
+    "kimi_api_endpoint",
     "kimi_api_key",
+    "kimi_code_api_key",
     "recap_model",
     "memory_model",
     "max_thoughts_width",
@@ -413,22 +415,53 @@ fn code_mode_registry_contract_is_restart_required_and_off_by_default() {
 }
 
 #[test]
-fn enter_on_kimi_api_key_opens_empty_secret_editor() {
+fn enter_on_kimi_service_opens_picker_and_commits_code() {
     let mut s = make_state();
-    navigate_to(&mut s, "kimi_api_key");
+    navigate_to(&mut s, "kimi_api_endpoint");
 
-    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
-
-    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert!(matches!(
+        handle_settings_key(&mut s, &press(KeyCode::Enter)),
+        SettingsKeyOutcome::Changed
+    ));
     assert!(matches!(
         s.mode,
-        SettingsModalMode::EditingSecret {
-            key: "kimi_api_key",
-            ref buffer,
-            cursor_byte: 0,
-            validation_error: None,
-        } if buffer.is_empty()
+        SettingsModalMode::PickingEnum {
+            key: "kimi_api_endpoint",
+            choices_idx: 0,
+            supports_preview: false,
+            original_value: SettingValue::Enum("platform"),
+        }
     ));
+    assert!(matches!(
+        handle_settings_key(&mut s, &press(KeyCode::Down)),
+        SettingsKeyOutcome::Changed
+    ));
+    assert!(matches!(
+        handle_settings_key(&mut s, &press(KeyCode::Enter)),
+        SettingsKeyOutcome::Action(Action::SetKimiApiEndpoint(ref endpoint))
+            if endpoint == "code"
+    ));
+}
+
+#[test]
+fn enter_on_each_kimi_api_key_opens_matching_empty_secret_editor() {
+    for setting_key in ["kimi_api_key", "kimi_code_api_key"] {
+        let mut s = make_state();
+        navigate_to(&mut s, setting_key);
+
+        let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+
+        assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+        assert!(matches!(
+            s.mode,
+            SettingsModalMode::EditingSecret {
+                key,
+                ref buffer,
+                cursor_byte: 0,
+                validation_error: None,
+            } if key == setting_key && buffer.is_empty()
+        ));
+    }
 }
 
 #[test]
@@ -477,11 +510,64 @@ fn provider_login_kimi_editor_save_closes_with_redacted_typed_action() {
         ));
     }
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
-    let SettingsKeyOutcome::ActionAndClose(Action::SetKimiApiKey(secret)) = outcome else {
+    let SettingsKeyOutcome::ActionAndClose(Action::SetKimiApiKey {
+        endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+        key: secret,
+    }) = outcome
+    else {
         panic!("expected focused Kimi editor to save and close, got {outcome:?}");
     };
     assert_eq!(secret.expose(), "sk-kimi-test");
     assert_eq!(format!("{secret:?}"), "SecretInput([REDACTED])");
+}
+
+#[test]
+fn provider_login_selects_kimi_code_then_opens_code_key_editor() {
+    let mut s = make_state();
+    assert!(s.try_open_kimi_provider_login());
+    assert!(matches!(
+        s.mode,
+        SettingsModalMode::PickingEnum {
+            key: "kimi_api_endpoint",
+            choices_idx: 0,
+            ..
+        }
+    ));
+
+    assert!(matches!(
+        handle_settings_key(&mut s, &press(KeyCode::Down)),
+        SettingsKeyOutcome::Changed
+    ));
+    assert!(matches!(
+        handle_settings_key(&mut s, &press(KeyCode::Enter)),
+        SettingsKeyOutcome::Action(Action::SetKimiApiEndpoint(ref endpoint))
+            if endpoint == "code"
+    ));
+    assert!(matches!(
+        s.mode,
+        SettingsModalMode::EditingSecret {
+            key: "kimi_code_api_key",
+            ref buffer,
+            cursor_byte: 0,
+            validation_error: None,
+        } if buffer.is_empty()
+    ));
+
+    for c in "sk-kimi-code-test".chars() {
+        assert!(matches!(
+            handle_settings_key(&mut s, &press(KeyCode::Char(c))),
+            SettingsKeyOutcome::Changed
+        ));
+    }
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    let SettingsKeyOutcome::ActionAndClose(Action::SetKimiApiKey {
+        endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        key: secret,
+    }) = outcome
+    else {
+        panic!("expected Kimi Code key save, got {outcome:?}");
+    };
+    assert_eq!(secret.expose(), "sk-kimi-code-test");
 }
 
 /// The Ask-Question timeout row renders in Agent & Approval directly above
@@ -731,10 +817,10 @@ fn mouse_click_on_code_mode_indicator_toggles_in_one_click() {
 }
 
 #[test]
-fn mouse_click_on_kimi_api_key_value_opens_secret_editor() {
+fn mouse_click_on_kimi_service_value_opens_picker() {
     let mut s = make_state();
     synth_rects(&mut s);
-    let row_y = row_idx_for(&s, "kimi_api_key") as u16;
+    let row_y = row_idx_for(&s, "kimi_api_endpoint") as u16;
 
     let outcome = handle_settings_mouse(
         &mut s,
@@ -746,13 +832,39 @@ fn mouse_click_on_kimi_api_key_value_opens_secret_editor() {
     assert!(matches!(outcome, SettingsKeyOutcome::Changed));
     assert!(matches!(
         s.mode,
-        SettingsModalMode::EditingSecret {
-            key: "kimi_api_key",
-            ref buffer,
-            cursor_byte: 0,
-            validation_error: None,
-        } if buffer.is_empty()
+        SettingsModalMode::PickingEnum {
+            key: "kimi_api_endpoint",
+            choices_idx: 0,
+            ..
+        }
     ));
+}
+
+#[test]
+fn mouse_click_on_each_kimi_key_value_opens_matching_secret_editor() {
+    for setting_key in ["kimi_api_key", "kimi_code_api_key"] {
+        let mut s = make_state();
+        synth_rects(&mut s);
+        let row_y = row_idx_for(&s, setting_key) as u16;
+
+        let outcome = handle_settings_mouse(
+            &mut s,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            72,
+            row_y,
+        );
+
+        assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+        assert!(matches!(
+            s.mode,
+            SettingsModalMode::EditingSecret {
+                key,
+                ref buffer,
+                cursor_byte: 0,
+                validation_error: None,
+            } if key == setting_key && buffer.is_empty()
+        ));
+    }
 }
 
 /// Value-column click toggles the Ask-Question timeout in one click.
@@ -1762,6 +1874,7 @@ fn registry_kind_membership_through_pr_14() {
             "default_selected_permission",
             "hunk_tracker_mode",
             "keep_text_selection",
+            "kimi_api_endpoint",
             "permission_mode",
             "plan_mode",
             "render_mermaid",
@@ -1812,7 +1925,7 @@ fn registry_kind_membership_through_pr_14() {
     let secret_keys = by_kind.remove("Secret").unwrap_or_default();
     assert_eq!(
         secret_keys,
-        vec!["kimi_api_key"],
+        vec!["kimi_api_key", "kimi_code_api_key"],
         "Secret kind membership drift",
     );
 
@@ -1843,6 +1956,7 @@ fn enum_settings_membership_through_pr_14() {
             "default_selected_permission",
             "hunk_tracker_mode",
             "keep_text_selection",
+            "kimi_api_endpoint",
             "permission_mode",
             "plan_mode",
             "render_mermaid",
@@ -1899,7 +2013,11 @@ fn defaults_round_trip_through_registry() {
             "multiline_mode" => SettingValue::Bool(false),
             "permission_mode" => SettingValue::Enum("ask"),
             "default_model" => SettingValue::String(String::new()),
+            "kimi_api_endpoint" => SettingValue::Enum("platform"),
             "kimi_api_key" => {
+                SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
+            }
+            "kimi_code_api_key" => {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
             }
             "recap_model" => SettingValue::String(String::new()),
@@ -4139,11 +4257,16 @@ fn reset_confirm_prompt_helper_builds_well_formed_string_for_every_setting() {
             "prompt for `{}` must be phrased as a question, got: {prompt:?}",
             meta.key,
         );
-        if meta.key == "kimi_api_key" {
-            assert!(
+        match meta.key {
+            "kimi_api_key" => assert!(
                 prompt.contains("UI-stored") && prompt.contains("MOONSHOT_API_KEY"),
-                "Kimi reset must distinguish UI storage from the environment override: {prompt:?}",
-            );
+                "Kimi Platform reset must distinguish UI storage from the environment override: {prompt:?}",
+            ),
+            "kimi_code_api_key" => assert!(
+                prompt.contains("UI-stored") && prompt.contains("KIMI_CODE_API_KEY"),
+                "Kimi Code reset must distinguish UI storage from the environment override: {prompt:?}",
+            ),
+            _ => {}
         }
     }
 }

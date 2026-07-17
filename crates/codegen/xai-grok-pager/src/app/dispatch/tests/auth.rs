@@ -128,7 +128,7 @@ fn attached_dashboard_login_opens_picker_on_visible_agent() {
 }
 
 #[test]
-fn login_picker_kimi_selection_routes_through_secure_save_flow() {
+fn login_picker_kimi_code_selection_routes_through_matching_secure_save_flow() {
     use crate::app::app_view::InputOutcome;
     use crate::views::modal::ActiveModal;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -162,6 +162,34 @@ fn login_picker_kimi_selection_routes_through_secure_save_flow() {
         Some(ActiveModal::Settings { .. })
     ));
 
+    let service_nav = app
+        .agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .handle_modal_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert!(matches!(service_nav, InputOutcome::Changed));
+    let service_outcome = app
+        .agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .handle_modal_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let InputOutcome::Action(service_action) = service_outcome else {
+        panic!("Kimi service choice should emit a typed action, got {service_outcome:?}");
+    };
+    assert!(matches!(
+        &service_action,
+        Action::SetKimiApiEndpoint(endpoint) if endpoint == "code"
+    ));
+    let service_effects = dispatch(service_action, &mut app);
+    assert!(matches!(
+        service_effects.as_slice(),
+        [Effect::UpdateKimiApiEndpoint {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            ..
+        }]
+    ));
+
     for c in "sk-kimi-routed".chars() {
         let outcome = app
             .agents
@@ -183,8 +211,69 @@ fn login_picker_kimi_selection_routes_through_secure_save_flow() {
     let effects = dispatch(save_action, &mut app);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::UpdateKimiApiKey { key: Some(key) }]
+        [Effect::UpdateKimiApiKey {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            active: true,
+            key: Some(key),
+            ..
+        }]
             if key.expose() == "sk-kimi-routed"
+    ));
+}
+
+#[test]
+fn failed_kimi_service_write_returns_focused_login_to_service_picker() {
+    use crate::app::app_view::InputOutcome;
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsModalMode;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app_with_agent();
+    let _ = dispatch(Action::OpenKimiApiKeyEditor, &mut app);
+    let _ = app
+        .agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .handle_modal_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let outcome = app
+        .agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .handle_modal_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let InputOutcome::Action(action) = outcome else {
+        panic!("Kimi Code selection should emit an action");
+    };
+    let _ = dispatch(action, &mut app);
+    assert_eq!(app.kimi_api_endpoint, "code");
+    let generation = app.kimi_active_operation_generation;
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::KimiApiEndpointUpdated {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            generation,
+            stale: false,
+            credential_configured: false,
+            warning: None,
+            error: Some("config unavailable".to_owned()),
+            models: None,
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.kimi_api_endpoint, "platform");
+    let Some(ActiveModal::Settings { state }) = app.agents[&AgentId(0)].active_modal.as_ref()
+    else {
+        panic!("focused Kimi login should remain open");
+    };
+    assert!(matches!(
+        state.mode,
+        SettingsModalMode::PickingEnum {
+            key: "kimi_api_endpoint",
+            original_value: crate::settings::SettingValue::Enum("platform"),
+            ..
+        }
     ));
 }
 

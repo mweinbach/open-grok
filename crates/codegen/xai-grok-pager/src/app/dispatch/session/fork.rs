@@ -409,6 +409,7 @@ fn build_fork_placeholder(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),

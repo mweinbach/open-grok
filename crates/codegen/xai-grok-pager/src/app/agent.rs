@@ -687,6 +687,10 @@ pub struct AgentSession {
     /// `SwitchModelComplete`, or by `begin_session_reload` when a reconnect
     /// drops the in-flight RPC — else a lost completion jams the queue forever.
     pub model_switch_pending: bool,
+    /// A provider settings/key change requires this session's sampler to be
+    /// rebuilt before another queued prompt may start. Unlike the RPC-local
+    /// `model_switch_pending`, this spans endpoint/key refresh work.
+    pub provider_rebind_pending: bool,
     /// Model the user chose this session via `/model` / the model picker, or
     /// the last successfully applied live remote `ModelChanged` (leader-mode
     /// fan-out). Survives reconnect (`begin_session_reload` does **not** clear
@@ -1005,6 +1009,7 @@ mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: BTreeMap::new(),

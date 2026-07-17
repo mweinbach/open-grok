@@ -1275,6 +1275,7 @@ mod cancel_turn_mouse_tests {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                provider_rebind_pending: false,
                 user_model_preference: None,
                 deferred_model_switch: None,
                 bg_tasks: std::collections::BTreeMap::new(),

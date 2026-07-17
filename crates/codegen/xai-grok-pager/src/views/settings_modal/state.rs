@@ -389,6 +389,54 @@ impl SettingsModalState {
         self.try_enter_editing_value()
     }
 
+    /// Start Kimi's provider-login flow at the service selector. Committing the
+    /// choice advances to the matching zeroizing secret editor; the full
+    /// Settings surface uses the same registered rows independently.
+    pub fn try_open_kimi_provider_login(&mut self) -> bool {
+        let Some(row_idx) = self.rows.iter().position(
+            |row| matches!(row, RowEntry::Setting { key, .. } if *key == "kimi_api_endpoint"),
+        ) else {
+            return false;
+        };
+        if !matches!(
+            self.registry
+                .find("kimi_api_endpoint")
+                .map(|meta| &meta.kind),
+            Some(SettingKind::Enum { .. })
+        ) {
+            return false;
+        }
+        self.selected = row_idx;
+        self.query.clear();
+        self.query_cursor = 0;
+        self.invalidate_filter();
+        self.entry_point = SettingsEntryPoint::ProviderLogin;
+        self.try_enter_picking_enum()
+    }
+
+    /// Advance a focused Kimi login from its service selector to the matching
+    /// credential editor while keeping the provider-login close semantics.
+    pub(crate) fn advance_kimi_provider_login_to_secret(&mut self, endpoint: &'static str) -> bool {
+        let key = match endpoint {
+            "platform" => "kimi_api_key",
+            "code" => "kimi_code_api_key",
+            _ => return false,
+        };
+        let Some(row_idx) = self.rows.iter().position(
+            |row| matches!(row, RowEntry::Setting { key: row_key, .. } if *row_key == key),
+        ) else {
+            return false;
+        };
+        if !matches!(
+            self.registry.find(key).map(|meta| &meta.kind),
+            Some(SettingKind::Secret)
+        ) {
+            return false;
+        }
+        self.selected = row_idx;
+        self.try_enter_editing_value()
+    }
+
     /// Reset hit-test geometry so mouse handlers degrade gracefully
     /// when render is aborted. Does NOT clear `hover_row` — that's
     /// cleared on mode transitions instead to avoid per-frame flicker.
@@ -810,6 +858,7 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
         },
         "hunk_tracker_mode" => Some(Action::SetHunkTrackerMode(choice.to_string())),
         "screen_mode" => Some(Action::SetScreenMode(choice.to_string())),
+        "kimi_api_endpoint" => Some(Action::SetKimiApiEndpoint(choice.to_string())),
         "voice_capture_mode" => Some(Action::SetVoiceCaptureMode(choice.to_string())),
         "voice_stt_language" => Some(Action::SetVoiceSttLanguage(choice.to_string())),
         "render_mermaid" => {

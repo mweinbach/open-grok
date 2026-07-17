@@ -144,6 +144,27 @@ const CODING_DATA_SHARING_CHOICES: &[EnumChoice] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Kimi service catalog.
+//
+// Kimi Platform and Kimi Code use different base URLs, model catalogs, and
+// non-interchangeable credentials. The selector therefore chooses a service
+// profile rather than merely rewriting one URL under a shared key.
+// ---------------------------------------------------------------------------
+
+const KIMI_API_ENDPOINT_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "platform",
+        display: "Kimi Platform",
+        description: "Pay-as-you-go API at api.moonshot.ai with the Platform model catalog.",
+    },
+    EnumChoice {
+        canonical: "code",
+        display: "Kimi Code",
+        description: "Kimi membership coding API at api.kimi.com with coding-specific models.",
+    },
+];
+
+// ---------------------------------------------------------------------------
 // Plan-mode catalog.
 //
 // PAGER-owned, per-session, ACP-mediated via `session/set_mode`.
@@ -844,18 +865,57 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
-        // Provider credential stored in owner-only auth.json under the Kimi
-        // provider scope. The settings registry carries presence status only;
-        // key material never enters UiConfig or SettingValue.
+        // Kimi Platform and Kimi Code are separate services with distinct,
+        // non-interchangeable credentials. The active profile lives under
+        // `[models].kimi_endpoint`; key material remains in owner-only
+        // `auth.json` and never enters UiConfig or SettingValue.
+        SettingMeta {
+            key: "kimi_api_endpoint",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Kimi service",
+            description: "Choose Kimi Platform (pay-as-you-go) or Kimi Code (membership). Each service keeps its own API key and model catalog.",
+            keywords: &[
+                "kimi", "moonshot", "platform", "code", "endpoint", "service", "api",
+            ],
+            kind: SettingKind::Enum {
+                default: "platform",
+                choices: KIMI_API_ENDPOINT_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         SettingMeta {
             key: "kimi_api_key",
             category: SettingCategory::Models,
             owner: SettingOwner::Shell,
-            label: "Kimi API key",
-            description: "API key used for Kimi coding models. Saving queries Kimi's model catalog; resetting removes only the UI-stored Kimi key.",
+            label: "Kimi Platform API key",
+            description: "Pay-as-you-go key for Kimi Platform. Saving queries the Platform model catalog; resetting leaves the Kimi Code key untouched.",
             keywords: &[
                 "kimi",
                 "moonshot",
+                "platform",
+                "api",
+                "key",
+                "credential",
+                "coding",
+                "models",
+            ],
+            kind: SettingKind::Secret,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "kimi_code_api_key",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Kimi Code API key",
+            description: "Membership key from the Kimi Code console. Resetting leaves the Kimi Platform key untouched.",
+            keywords: &[
+                "kimi",
+                "code",
+                "membership",
                 "api",
                 "key",
                 "credential",

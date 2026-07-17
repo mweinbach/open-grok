@@ -211,37 +211,385 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
         }
     }
 }
-/// Handle a completed async task result.
+fn apply_kimi_catalog(app: &mut AppView, model_state: acp::SessionModelState) {
+    let new_models = crate::acp::model_state::ModelState::from(Some(model_state));
+    let fallback_current = new_models.current.clone();
+    let mut app_models = new_models.clone();
+    if let ActiveView::Agent(agent_id) = app.active_view
+        && let Some(current) = app
+            .agents
+            .get(&agent_id)
+            .and_then(|agent| agent.session.models.current.as_ref())
+        && app_models.available.contains_key(current)
+    {
+        app_models.current = Some(current.clone());
+    }
+    app.models = app_models;
+    for agent in app.agents.values_mut() {
+        agent
+            .session
+            .models
+            .update_catalog(new_models.available.clone(), fallback_current.clone());
+    }
+}
+
+fn capture_kimi_sessions_created_during_update(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models) == Some(PrimaryProvider::Kimi)
+        {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_kimi_rebind_agents.extend(targets);
+}
+
+fn pending_kimi_model(
+    models: &crate::acp::model_state::ModelState,
+    endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+) -> Option<acp::ModelId> {
+    let is_kimi = |model_id: &acp::ModelId| {
+        PrimaryProvider::for_model(models, model_id) == Some(PrimaryProvider::Kimi)
+    };
+    let exact = |slug: &str| {
+        let id = acp::ModelId::new(slug);
+        (models.available.contains_key(&id) && is_kimi(&id)).then_some(id)
+    };
+    let code = models
+        .current
+        .clone()
+        .filter(|id| is_kimi(id) && id.0.as_ref().starts_with("kimi-for-coding"))
+        .or_else(|| exact("kimi-for-coding"))
+        .or_else(|| exact("kimi-for-coding-highspeed"));
+    let platform = models
+        .current
+        .clone()
+        .filter(|id| is_kimi(id) && !id.0.as_ref().starts_with("kimi-for-coding"))
+        .or_else(|| exact("kimi-k3"))
+        .or_else(|| {
+            models
+                .available
+                .keys()
+                .find(|id| is_kimi(id) && !id.0.as_ref().starts_with("kimi-for-coding"))
+                .cloned()
+        });
+    match endpoint {
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code => code,
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Platform => platform,
+    }
+}
+
+fn rebind_pending_kimi_sessions(
+    app: &mut AppView,
+    endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+    generation: u64,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let targets = app
+        .pending_kimi_rebind_agents
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let mut completed = Vec::new();
+    for agent_id in targets {
+        let Some(agent) = app.agents.get_mut(&agent_id) else {
+            completed.push(agent_id);
+            continue;
+        };
+        if !agent.session.provider_rebind_pending {
+            completed.push(agent_id);
+            continue;
+        }
+        if agent.session.model_switch_pending {
+            continue;
+        }
+        let Some(session_id) = agent.session.session_id.clone() else {
+            // Creation/load may already be racing the runtime update. Keep the
+            // hold and retry from the session-ready result once it has an ID.
+            continue;
+        };
+        let Some(model_id) = pending_kimi_model(&agent.session.models, endpoint) else {
+            tracing::warn!(?agent_id, %endpoint, "Kimi sampler rebind has no matching model");
+            agent.scrollback.push_block(RenderBlock::system(format!(
+                "No {} model is available for this session; queued prompts are paused. Adjust the model allowlist or switch this tab to another provider.",
+                kimi_endpoint_label(endpoint),
+            )));
+            continue;
+        };
+        let effort = (agent.session.models.current.as_ref() == Some(&model_id))
+            .then_some(agent.session.models.reasoning_effort)
+            .flatten();
+
+        agent.session.model_switch_pending = true;
+        effects.push(Effect::RebindKimiModel {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+            effective_endpoint: endpoint,
+        });
+    }
+    for agent_id in completed {
+        app.pending_kimi_rebind_agents.remove(&agent_id);
+    }
+    effects
+}
+
+fn after_kimi_session_ready(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    mut effects: Vec<Effect>,
+) -> Vec<Effect> {
+    if app.kimi_runtime_update_pending {
+        if let Some(agent) = app.agents.get_mut(&agent_id)
+            && PrimaryProvider::for_current_model(&agent.session.models)
+                == Some(PrimaryProvider::Kimi)
+        {
+            agent.session.provider_rebind_pending = true;
+            app.pending_kimi_rebind_agents.insert(agent_id);
+        }
+        return effects;
+    }
+    if app.pending_kimi_rebind_agents.contains(&agent_id)
+        && app.agents.get(&agent_id).is_some_and(|agent| {
+            agent.session.provider_rebind_pending && !agent.session.model_switch_pending
+        })
+    {
+        let endpoint = app.kimi_effective_endpoint;
+        let generation = app.kimi_active_operation_generation;
+        effects.extend(rebind_pending_kimi_sessions(app, endpoint, generation));
+    }
+    effects
+}
+
+fn mark_runtime_pending_kimi_session(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    incoming_models: Option<&acp::SessionModelState>,
+) {
+    // A load/create response can race the completion of a Kimi runtime
+    // mutation. The shell may have captured the old sampler before the
+    // mutation completed even though the pager observes this result after the
+    // global pending flag was cleared. Once this process has performed a Kimi
+    // mutation, conservatively rebind every subsequently-ready Kimi session.
+    if !app.kimi_runtime_update_pending && app.kimi_active_operation_generation == 0 {
+        return;
+    }
+    let incoming = incoming_models
+        .cloned()
+        .map(|models| crate::acp::model_state::ModelState::from(Some(models)));
+    let is_kimi = incoming.as_ref().map_or_else(
+        || {
+            app.agents.get(&agent_id).is_some_and(|agent| {
+                PrimaryProvider::for_current_model(&agent.session.models)
+                    == Some(PrimaryProvider::Kimi)
+            })
+        },
+        |models| PrimaryProvider::for_current_model(models) == Some(PrimaryProvider::Kimi),
+    );
+    if incoming.is_some() && !is_kimi {
+        app.cancel_pending_kimi_rebind(agent_id);
+        return;
+    }
+    if is_kimi && let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.provider_rebind_pending = true;
+        app.pending_kimi_rebind_agents.insert(agent_id);
+    }
+}
+
+fn finish_kimi_rebind(app: &mut AppView, agent_id: crate::app::agent::AgentId) {
+    app.pending_kimi_rebind_agents.remove(&agent_id);
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.provider_rebind_pending = false;
+    }
+}
+
+fn handle_kimi_model_rebind_complete(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    session_id: acp::SessionId,
+    model_id: acp::ModelId,
+    effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
+    generation: u64,
+    effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+    result: Result<(), crate::app::actions::SwitchModelError>,
+) -> Vec<Effect> {
+    let still_owned = app.pending_kimi_rebind_agents.contains(&agent_id);
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        app.pending_kimi_rebind_agents.remove(&agent_id);
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(&session_id) {
+        if !agent.session.provider_rebind_pending {
+            app.pending_kimi_rebind_agents.remove(&agent_id);
+            return vec![];
+        }
+        if agent.session.model_switch_pending {
+            return vec![];
+        }
+        return rebind_pending_kimi_sessions(
+            app,
+            app.kimi_effective_endpoint,
+            app.kimi_active_operation_generation,
+        );
+    }
+    if !still_owned || !agent.session.provider_rebind_pending {
+        // An authoritative local/remote switch canceled this automatic
+        // refresh while its ACP request was in flight. The shell may have
+        // accepted the late Kimi request, so reconcile it back to the model
+        // the pager now considers current before releasing the queue.
+        agent.session.model_switch_pending = false;
+        let Some(target_model) = agent.session.models.current.clone() else {
+            return crate::app::dispatch::maybe_drain_queue(agent);
+        };
+        if target_model == model_id {
+            return crate::app::dispatch::maybe_drain_queue(agent);
+        }
+        let Some(current_session_id) = agent.session.session_id.clone() else {
+            agent.session.provider_rebind_pending = true;
+            return vec![];
+        };
+        let target_effort = agent.session.models.reasoning_effort;
+        // This is a reconciliation-only hold: the automatic Kimi operation no
+        // longer owns the tab, so keep it out of `pending_kimi_rebind_agents`.
+        // If the corrective switch fails, queue draining must remain blocked
+        // because the late Kimi request may now own the shell sampler.
+        agent.session.provider_rebind_pending = true;
+        agent.session.model_switch_pending = true;
+        return vec![Effect::SwitchModel {
+            agent_id,
+            session_id: current_session_id,
+            model_id: target_model,
+            effort: target_effort,
+            prev_model_id: None,
+        }];
+    }
+    agent.session.model_switch_pending = false;
+
+    if generation != app.kimi_active_operation_generation
+        || effective_endpoint != app.kimi_effective_endpoint
+    {
+        // The shell accepted (or rejected) an obsolete rebind. Keep the
+        // provider hold and immediately reconcile to the latest catalog.
+        return rebind_pending_kimi_sessions(
+            app,
+            app.kimi_effective_endpoint,
+            app.kimi_active_operation_generation,
+        );
+    }
+
+    match result {
+        Ok(()) => {
+            // This is a sampler refresh, not a user preference change. Update
+            // only the live session mirror: never overwrite models.default or
+            // user_model_preference for background tabs.
+            agent.session.models.set_current(model_id, effort);
+        }
+        Err(error) => {
+            agent.scrollback.push_block(RenderBlock::system(format!(
+                "Couldn't refresh the Kimi session after its service changed; queued prompts are paused. Update the selected Kimi key or switch this tab to another provider. ({})",
+                match error {
+                    crate::app::actions::SwitchModelError::Other(message) => {
+                        scrub_error_for_toast(&message)
+                    }
+                    crate::app::actions::SwitchModelError::IncompatibleAgent { .. } => {
+                        "the current agent is incompatible with the selected Kimi model".to_owned()
+                    }
+                },
+            )));
+            // Fail closed: the old sampler may still hold the previous
+            // service/key. A later Kimi settings operation retries; an
+            // explicit switch to a non-Kimi provider cancels this hold.
+            return vec![];
+        }
+    }
+    finish_kimi_rebind(app, agent_id);
+
+    let mut effects = app
+        .agents
+        .get_mut(&agent_id)
+        .map(crate::app::dispatch::queue::maybe_drain_queue)
+        .unwrap_or_default();
+    if matches!(app.active_view, ActiveView::Agent(active) if active == agent_id) {
+        effects.extend(app.sync_primary_provider_from_active_agent());
+    }
+    effects
+}
+
+fn kimi_endpoint_label(endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint) -> &'static str {
+    match endpoint {
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Platform => "Kimi Platform",
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code => "Kimi Code",
+    }
+}
+
+fn kimi_credential_configured(endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint) -> bool {
+    xai_grok_shell::kimi_models::environment_api_key_is_configured(endpoint)
+        || xai_grok_shell::auth::kimi_api_key_is_configured(
+            &xai_grok_tools::util::grok_home::grok_home(),
+            endpoint,
+        )
+}
+
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
     match result {
         TaskResult::KimiApiKeyUpdated {
+            endpoint,
+            effective_endpoint,
+            generation,
             configured,
+            active,
             warning,
             error,
+            models,
+            stale,
         } => {
+            if stale || (active && generation != app.kimi_active_operation_generation) {
+                return vec![];
+            }
+            if active {
+                capture_kimi_sessions_created_during_update(app);
+            }
             let storage_succeeded = error.is_none();
             super::settings::ui::refresh_open_settings_modals(app);
-            let credential_status = super::settings::ui::kimi_api_key_status();
+            let credential_status = match endpoint {
+                xai_grok_shell::kimi_models::KimiApiEndpoint::Platform => {
+                    super::settings::ui::kimi_api_key_status()
+                }
+                xai_grok_shell::kimi_models::KimiApiEndpoint::Code => {
+                    super::settings::ui::kimi_code_api_key_status()
+                }
+            };
+            let label = kimi_endpoint_label(endpoint);
+            let runtime_apply_unconfirmed = active && warning.is_some() && models.is_none();
             if let Some(error) = error {
                 app.show_toast(&format!(
-                    "✗ Could not {} Kimi API key: {}",
+                    "✗ Could not {} {label} API key: {}{}",
                     if configured { "save" } else { "remove" },
                     scrub_error_for_toast(&error),
+                    if active {
+                        "; queued Kimi prompts remain paused"
+                    } else {
+                        ""
+                    },
                 ));
             } else {
                 let message = if configured {
                     if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
-                        "✓ Kimi API key saved to UI storage; MOONSHOT_API_KEY remains active"
-                            .to_owned()
-                    } else if warning.is_some() {
-                        "✓ Kimi API key saved".to_owned()
+                        format!(
+                            "✓ {label} API key saved to UI storage; environment key remains active"
+                        )
+                    } else if warning.is_some() || !active {
+                        format!("✓ {label} API key saved")
                     } else {
-                        "✓ Kimi API key saved; models refreshed".to_owned()
+                        format!("✓ {label} API key saved; models refreshed")
                     }
                 } else if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
-                    "✓ UI-stored Kimi API key cleared; MOONSHOT_API_KEY remains active".to_owned()
+                    format!("✓ UI-stored {label} API key cleared; environment key remains active")
                 } else {
-                    "✓ UI-stored Kimi API key cleared".to_owned()
+                    format!("✓ UI-stored {label} API key cleared")
                 };
                 if let Some(warning) = warning {
                     let operation = if configured
@@ -252,8 +600,13 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                         "catalog clear"
                     };
                     app.show_toast(&format!(
-                        "{message}; {operation} warning: {}",
+                        "{message}; {operation} warning: {}{}",
                         scrub_error_for_toast(&warning),
+                        if runtime_apply_unconfirmed {
+                            "; queued Kimi prompts remain paused"
+                        } else {
+                            ""
+                        },
                     ));
                 } else {
                     app.show_toast(&message);
@@ -261,6 +614,39 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
 
             if !storage_succeeded {
+                // A prior serialized endpoint operation may already have
+                // changed the runtime before this credential write failed.
+                // Keep active Kimi tabs fail-closed until retry/cancellation.
+                return vec![];
+            }
+            if !active {
+                return vec![];
+            }
+            if runtime_apply_unconfirmed {
+                // No ACP catalog means the runtime apply itself was not
+                // confirmed (as opposed to a Platform `/models` warning,
+                // which still returns the rebuilt fallback catalog). Keep the
+                // old sampler fail-closed until a retry can reconcile it.
+                return vec![];
+            }
+
+            app.kimi_effective_endpoint = effective_endpoint;
+            app.kimi_confirmed_endpoint =
+                xai_grok_shell::kimi_models::KimiApiEndpoint::from_canonical(
+                    &app.kimi_api_endpoint,
+                )
+                .unwrap_or_default();
+            app.kimi_runtime_update_pending = false;
+            if let Some(models) = models {
+                apply_kimi_catalog(app, models);
+                super::settings::ui::refresh_open_settings_modals(app);
+            }
+            if !configured && !kimi_credential_configured(effective_endpoint) {
+                app.show_toast(&format!(
+                    "✓ {} API key {}; API key required and queued Kimi prompts remain paused",
+                    kimi_endpoint_label(endpoint),
+                    if configured { "saved" } else { "cleared" },
+                ));
                 return vec![];
             }
 
@@ -269,39 +655,77 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             // model rebuilds that sampler immediately after a save or clear,
             // so callers never have to restart the pager for the credential
             // change to take effect.
-            let mut effects = Vec::new();
-            for (&agent_id, agent) in &mut app.agents {
-                if agent.session.model_switch_pending {
-                    continue;
-                }
-                let Some(session_id) = agent.session.session_id.clone() else {
-                    continue;
-                };
-                let Some(model_id) = agent.session.models.current.clone() else {
-                    continue;
-                };
-                if PrimaryProvider::for_model(&agent.session.models, &model_id)
-                    != Some(PrimaryProvider::Kimi)
-                {
-                    continue;
-                }
-
-                agent.session.model_switch_pending = true;
-                effects.push(Effect::SwitchModel {
-                    agent_id,
-                    session_id,
-                    model_id,
-                    effort: agent.session.models.reasoning_effort,
-                    prev_model_id: None,
-                });
+            rebind_pending_kimi_sessions(app, effective_endpoint, generation)
+        }
+        TaskResult::KimiApiEndpointUpdated {
+            endpoint,
+            previous,
+            effective_endpoint,
+            generation,
+            credential_configured,
+            warning,
+            error,
+            models,
+            stale,
+        } => {
+            if stale || generation != app.kimi_active_operation_generation {
+                return vec![];
             }
-            effects
+            capture_kimi_sessions_created_during_update(app);
+            if let Some(error) = error {
+                super::settings::setters::set_kimi_api_endpoint_inner(app, previous);
+                // `previous` is read from durable config inside the serialized
+                // effect, so it may be newer than the pager's last completion.
+                // Adopt it as the rollback anchor; otherwise selecting that
+                // same value cannot retry the still-fail-closed live apply.
+                app.kimi_confirmed_endpoint = previous;
+                super::settings::ui::refresh_open_settings_modals(app);
+                super::settings::ui::restart_failed_kimi_provider_login(app);
+                app.show_toast(&format!(
+                    "✗ Could not switch Kimi service: {}; queued Kimi prompts remain paused",
+                    scrub_error_for_toast(&error),
+                ));
+                return vec![];
+            }
+
+            if let Some(models) = models {
+                apply_kimi_catalog(app, models);
+            }
+            super::settings::setters::set_kimi_api_endpoint_inner(app, endpoint);
+            app.kimi_effective_endpoint = effective_endpoint;
+            app.kimi_confirmed_endpoint = endpoint;
+            app.kimi_runtime_update_pending = false;
+            super::settings::ui::refresh_open_settings_modals(app);
+            let message = format!("✓ Kimi service: {}", kimi_endpoint_label(endpoint));
+            if let Some(warning) = warning {
+                app.show_toast(&format!(
+                    "{message}; model refresh warning: {}",
+                    scrub_error_for_toast(&warning),
+                ));
+            } else {
+                app.show_toast(&format!(
+                    "{message}; {}",
+                    if credential_configured {
+                        "models refreshed"
+                    } else {
+                        "API key required"
+                    }
+                ));
+            }
+            if !credential_configured {
+                return vec![];
+            }
+            rebind_pending_kimi_sessions(app, effective_endpoint, generation)
         }
         TaskResult::SessionCreated {
             agent_id,
             session_id,
             models: new_models,
-        } => handle_session_created(app, agent_id, session_id, new_models),
+        } => {
+            mark_runtime_pending_kimi_session(app, agent_id, new_models.as_ref());
+            let effects = handle_session_created(app, agent_id, session_id, new_models);
+            after_kimi_session_ready(app, agent_id, effects)
+        }
         TaskResult::SessionFailed { agent_id, error } => {
             tracing::error!(
                 agent = ? agent_id, error = % error, "Session creation failed"
@@ -318,14 +742,18 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             worktree_path,
             session_cwd,
             models: new_models,
-        } => handle_worktree_session_created(
-            app,
-            agent_id,
-            session_id,
-            worktree_path,
-            session_cwd,
-            new_models,
-        ),
+        } => {
+            mark_runtime_pending_kimi_session(app, agent_id, new_models.as_ref());
+            let effects = handle_worktree_session_created(
+                app,
+                agent_id,
+                session_id,
+                worktree_path,
+                session_cwd,
+                new_models,
+            );
+            after_kimi_session_ready(app, agent_id, effects)
+        }
         TaskResult::WorktreeForked {
             agent_id,
             session_id,
@@ -400,16 +828,20 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             restore_summary,
             restore_degree,
             running_prompt_id,
-        } => handle_session_loaded(
-            app,
-            agent_id,
-            session_id,
-            new_models,
-            code_restored,
-            restore_summary,
-            restore_degree,
-            running_prompt_id,
-        ),
+        } => {
+            mark_runtime_pending_kimi_session(app, agent_id, new_models.as_ref());
+            let effects = handle_session_loaded(
+                app,
+                agent_id,
+                session_id,
+                new_models,
+                code_restored,
+                restore_summary,
+                restore_degree,
+                running_prompt_id,
+            );
+            after_kimi_session_ready(app, agent_id, effects)
+        }
         TaskResult::SessionTitleFromDisk { agent_id, title } => {
             if let Some(agent) = app.agents.get_mut(&agent_id)
                 && let Some((t, is_manual)) = title.filter(|(s, _)| !s.trim().is_empty())
@@ -494,7 +926,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::SessionRestored {
             agent_id,
             local_session_id,
-        } => handle_session_restored(app, agent_id, local_session_id),
+        } => {
+            mark_runtime_pending_kimi_session(app, agent_id, None);
+            let effects = handle_session_restored(app, agent_id, local_session_id);
+            after_kimi_session_ready(app, agent_id, effects)
+        }
         TaskResult::SessionRestoreFailed { agent_id, error } => {
             handle_session_restore_failed(app, agent_id, error)
         }
@@ -598,7 +1034,55 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             effort,
             result,
             prev_model_id,
-        } => handle_switch_model_complete(app, agent_id, model_id, effort, result, prev_model_id),
+        } => {
+            let switch_succeeded = result.is_ok();
+            let left_kimi = switch_succeeded
+                && app.agents.get(&agent_id).is_some_and(|agent| {
+                    PrimaryProvider::for_model(&agent.session.models, &model_id)
+                        != Some(PrimaryProvider::Kimi)
+                });
+            if left_kimi {
+                app.cancel_pending_kimi_rebind(agent_id);
+            }
+            let mut effects = handle_switch_model_complete(
+                app,
+                agent_id,
+                model_id,
+                effort,
+                result,
+                prev_model_id,
+            );
+            if app.pending_kimi_rebind_agents.contains(&agent_id)
+                && app.agents.get(&agent_id).is_some_and(|agent| {
+                    agent.session.provider_rebind_pending && !agent.session.model_switch_pending
+                })
+            {
+                effects.extend(rebind_pending_kimi_sessions(
+                    app,
+                    app.kimi_effective_endpoint,
+                    app.kimi_active_operation_generation,
+                ));
+            }
+            effects
+        }
+        TaskResult::KimiModelRebindComplete {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+            effective_endpoint,
+            result,
+        } => handle_kimi_model_rebind_complete(
+            app,
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+            effective_endpoint,
+            result,
+        ),
         TaskResult::BgTaskKilled {
             session_id,
             task_id,

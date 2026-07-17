@@ -57,6 +57,7 @@ pub(super) fn immediate_server_send_eligible(agent: &AgentView) -> bool {
         && agent.session.pending_prompts.is_empty()
         && !matches!(agent.prompt_mode, PromptMode::EditingQueued { .. })
         && !agent.session.model_switch_pending
+        && !agent.session.provider_rebind_pending
         && !agent.session.loading_replay
 }
 
@@ -197,6 +198,10 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
     // `model_switch_pending` field doc for why a reconnect must clear it.
     if agent.session.model_switch_pending {
         log_blocked("model_switch_pending", sid);
+        return vec![];
+    }
+    if agent.session.provider_rebind_pending {
+        log_blocked("provider_rebind_pending", sid);
         return vec![];
     }
     if agent.session.loading_replay {
@@ -781,6 +786,16 @@ pub(super) fn dispatch_queue_interject_shared(
     expected_version: u64,
     new_text: Option<String>,
 ) -> Vec<Effect> {
+    if let ActiveView::Agent(agent_id) = app.active_view
+        && let Some(agent) = app.agents.get_mut(&agent_id)
+        && agent.session.provider_rebind_pending
+    {
+        // The server-owned row remains in place because no mutation effect is
+        // emitted. Do not let this force-send path bypass the fail-closed hold
+        // with a sampler that still owns an old Kimi credential.
+        agent.show_toast("Kimi service update in progress; send now is paused");
+        return vec![];
+    }
     match active_agent_session_id(app) {
         Some(session_id) => {
             with_active_agent(app, |agent| {

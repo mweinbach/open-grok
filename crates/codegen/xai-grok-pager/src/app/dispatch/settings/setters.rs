@@ -2,24 +2,150 @@
 
 use super::ui::{refresh_open_settings_modals, save_success_toast};
 use crate::app::actions::Effect;
-use crate::app::app_view::{ActiveView, AppView};
+use crate::app::app_view::{ActiveView, AppView, PrimaryProvider};
 use crate::settings::SecretInput;
 use agent_client_protocol as acp;
 
-/// Start the dedicated Kimi credential save flow. The secret remains wrapped
-/// until the async effect writes it to the provider-scoped credential store.
-pub(in crate::app::dispatch) fn set_kimi_api_key(
-    app: &mut AppView,
-    key: SecretInput,
-) -> Vec<Effect> {
-    app.show_toast("Saving Kimi API key and querying models…");
-    vec![Effect::UpdateKimiApiKey { key: Some(key) }]
+fn kimi_endpoint_label(endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint) -> &'static str {
+    match endpoint {
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Platform => "Kimi Platform",
+        xai_grok_shell::kimi_models::KimiApiEndpoint::Code => "Kimi Code",
+    }
 }
 
-/// Remove the UI-stored Kimi key and clear only Kimi's queried catalog.
-pub(in crate::app::dispatch) fn clear_kimi_api_key(app: &mut AppView) -> Vec<Effect> {
-    app.show_toast("Removing Kimi API key…");
-    vec![Effect::UpdateKimiApiKey { key: None }]
+fn remember_loaded_kimi_sessions(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models) == Some(PrimaryProvider::Kimi)
+        {
+            // This flag gates both immediate sends and queue draining while
+            // persistence/catalog work runs. `model_switch_pending` remains
+            // reserved for the eventual ACP rebind RPC itself.
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_kimi_rebind_agents.extend(targets);
+}
+
+fn next_kimi_operation_generation(app: &mut AppView) -> u64 {
+    app.kimi_operation_generation = app.kimi_operation_generation.wrapping_add(1).max(1);
+    app.kimi_operation_generation
+}
+
+fn next_active_kimi_operation_generation(app: &mut AppView) -> u64 {
+    let generation = next_kimi_operation_generation(app);
+    app.kimi_active_operation_generation = generation;
+    app.kimi_runtime_update_pending = true;
+    generation
+}
+
+/// Persist and live-apply the active Kimi service profile. Catalog refresh and
+/// active-session rebinding complete through the async effect/task-result path.
+pub(in crate::app::dispatch) fn set_kimi_api_endpoint_inner(
+    app: &mut AppView,
+    endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+) {
+    app.kimi_api_endpoint = endpoint.as_canonical().to_owned();
+    app.kimi_effective_endpoint = xai_grok_shell::kimi_models::effective_endpoint(endpoint);
+}
+
+pub(in crate::app::dispatch) fn set_kimi_api_endpoint(
+    app: &mut AppView,
+    value: String,
+) -> Vec<Effect> {
+    let Some(endpoint) = xai_grok_shell::kimi_models::KimiApiEndpoint::from_canonical(&value)
+    else {
+        tracing::error!(target: "settings", value, "invalid Kimi endpoint selection");
+        return vec![];
+    };
+    let current =
+        xai_grok_shell::kimi_models::KimiApiEndpoint::from_canonical(&app.kimi_api_endpoint)
+            .unwrap_or_default();
+    // A failed live apply deliberately leaves Kimi sessions fail-closed while
+    // rolling the selector back to the last confirmed value. Re-selecting that
+    // value is the explicit retry path. An optimistic selection that is still
+    // in flight differs from `kimi_confirmed_endpoint` and remains idempotent.
+    if endpoint == current
+        && (!app.kimi_runtime_update_pending || endpoint != app.kimi_confirmed_endpoint)
+    {
+        return vec![];
+    }
+    let previous = app.kimi_confirmed_endpoint;
+
+    remember_loaded_kimi_sessions(app);
+    let generation = next_active_kimi_operation_generation(app);
+    set_kimi_api_endpoint_inner(app, endpoint);
+    refresh_open_settings_modals(app);
+    app.show_toast(&format!("Switching to {}…", kimi_endpoint_label(endpoint)));
+    vec![Effect::UpdateKimiApiEndpoint {
+        endpoint,
+        previous,
+        generation,
+    }]
+}
+
+/// Start the dedicated Kimi credential save flow. The secret remains wrapped
+/// until the async effect writes it to the service-specific credential store.
+pub(in crate::app::dispatch) fn set_kimi_api_key(
+    app: &mut AppView,
+    endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+    key: SecretInput,
+) -> Vec<Effect> {
+    let configured_endpoint =
+        xai_grok_shell::kimi_models::KimiApiEndpoint::from_canonical(&app.kimi_api_endpoint)
+            .unwrap_or_default();
+    let active = endpoint == app.kimi_effective_endpoint;
+    if active {
+        remember_loaded_kimi_sessions(app);
+    }
+    let generation = if active {
+        next_active_kimi_operation_generation(app)
+    } else {
+        next_kimi_operation_generation(app)
+    };
+    app.show_toast(&format!(
+        "Saving {} API key{}…",
+        kimi_endpoint_label(endpoint),
+        if active { " and refreshing models" } else { "" }
+    ));
+    vec![Effect::UpdateKimiApiKey {
+        endpoint,
+        configured_endpoint,
+        active,
+        generation,
+        key: Some(key),
+    }]
+}
+
+/// Remove one UI-stored Kimi key without touching the other service.
+pub(in crate::app::dispatch) fn clear_kimi_api_key(
+    app: &mut AppView,
+    endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+) -> Vec<Effect> {
+    let configured_endpoint =
+        xai_grok_shell::kimi_models::KimiApiEndpoint::from_canonical(&app.kimi_api_endpoint)
+            .unwrap_or_default();
+    let active = endpoint == app.kimi_effective_endpoint;
+    if active {
+        remember_loaded_kimi_sessions(app);
+    }
+    let generation = if active {
+        next_active_kimi_operation_generation(app)
+    } else {
+        next_kimi_operation_generation(app)
+    };
+    app.show_toast(&format!(
+        "Removing {} API key…",
+        kimi_endpoint_label(endpoint)
+    ));
+    vec![Effect::UpdateKimiApiKey {
+        endpoint,
+        configured_endpoint,
+        active,
+        generation,
+        key: None,
+    }]
 }
 
 /// Set multiline input mode — swap Enter and Shift+Enter behavior.
@@ -1598,6 +1724,12 @@ pub(in crate::app::dispatch) fn set_default_model(
         );
         return vec![];
     };
+    if app.agents.get(&aid).is_some_and(|agent| {
+        agent.session.model_switch_pending && agent.session.provider_rebind_pending
+    }) {
+        app.show_toast("Finishing the Kimi service change before switching models…");
+        return vec![];
+    }
 
     // Snapshot previous id + display name from the active agent's
     // session (the same source `set_default_model_inner` mutates
@@ -1629,9 +1761,22 @@ pub(in crate::app::dispatch) fn set_default_model(
         return vec![];
     }
 
+    let explicit_non_kimi_override = app.agents.get(&aid).is_some_and(|agent| {
+        agent.session.provider_rebind_pending
+            && PrimaryProvider::for_model(&agent.session.models, &new_id)
+                != Some(PrimaryProvider::Kimi)
+    });
     // Idempotent: same model already active → no-op.
     if prev_id.as_ref() == Some(&new_id) {
-        return vec![];
+        return if explicit_non_kimi_override {
+            app.cancel_pending_kimi_rebind(aid);
+            app.agents
+                .get_mut(&aid)
+                .map(crate::app::dispatch::maybe_drain_queue)
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
     }
 
     let did_mutate = set_default_model_inner(app, &new_id);

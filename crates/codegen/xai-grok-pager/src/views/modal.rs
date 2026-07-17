@@ -659,9 +659,14 @@ pub fn reset_confirm_prompt(modal: &ActiveModal) -> Option<String> {
         return None;
     };
     let meta = settings_state.registry.find(key)?;
-    if meta.key == "kimi_api_key" {
+    if matches!(meta.key, "kimi_api_key" | "kimi_code_api_key") {
+        let env_key = if meta.key == "kimi_code_api_key" {
+            "KIMI_CODE_API_KEY"
+        } else {
+            "MOONSHOT_API_KEY"
+        };
         return Some(format!(
-            "Reset '{}' by clearing any UI-stored key (MOONSHOT_API_KEY, if set, remains active)?",
+            "Reset '{}' by clearing its UI-stored key ({env_key}, if set, remains active)?",
             meta.label,
         ));
     }

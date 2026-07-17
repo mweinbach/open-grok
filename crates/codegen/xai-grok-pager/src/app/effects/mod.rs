@@ -16,7 +16,10 @@ pub(crate) use helpers::{
     persist_setting, sanitize_user_error,
 };
 use helpers::*;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use agent_client_protocol as acp;
 use tokio::task::JoinSet;
 use xai_acp_lib::{AcpAgentTx, acp_send};
@@ -29,8 +32,207 @@ use actions::PermissionModePersist;
 #[cfg(test)]
 use agent::AgentId;
 use crate::unified_log as ulog;
+use xai_grok_shell::kimi_models::KimiApiEndpoint;
 use xai_grok_shell::sampling::error::http_status_from_error;
 use xai_grok_shell::session::{ExtMethodResult, SessionInfoResponse};
+
+/// Kimi endpoint, credential, and live-catalog mutations share one critical
+/// section. Latest-request tokens are tracked independently so an unrelated
+/// credential write cannot supersede an endpoint selection (or vice versa).
+static KIMI_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static KIMI_MUTATION_QUEUE: LazyLock<KimiMutationQueue> =
+    LazyLock::new(KimiMutationQueue::new);
+static NEXT_KIMI_TRANSPORT_TOKEN: AtomicU64 = AtomicU64::new(0);
+static LATEST_KIMI_ENDPOINT_SELECTION: AtomicU64 = AtomicU64::new(0);
+static LATEST_KIMI_ACTIVE_APPLY: AtomicU64 = AtomicU64::new(0);
+static LATEST_KIMI_PLATFORM_KEY: AtomicU64 = AtomicU64::new(0);
+static LATEST_KIMI_CODE_KEY: AtomicU64 = AtomicU64::new(0);
+
+/// Admission queue for Kimi mutations.
+///
+/// `tokio::sync::Mutex` is not FIFO when tasks reach it in a different order
+/// than their effects were dispatched. Each effect therefore receives a
+/// start gate synchronously, before its task is spawned. Completion is RAII:
+/// aborting or unwinding a task marks its entry complete, but only the
+/// contiguous queue head advances, so cancelling a middle waiter cannot let a
+/// later mutation bypass an earlier one.
+struct KimiMutationQueue {
+    inner: Arc<KimiMutationQueueInner>,
+}
+
+struct KimiMutationQueueInner {
+    state: Mutex<KimiMutationQueueState>,
+}
+
+#[derive(Default)]
+struct KimiMutationQueueState {
+    next_ticket: u64,
+    pending: VecDeque<KimiMutationQueueEntry>,
+}
+
+struct KimiMutationQueueEntry {
+    ticket: u64,
+    completed: bool,
+    start: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+struct KimiMutationTicket {
+    queue: Arc<KimiMutationQueueInner>,
+    ticket: u64,
+    start: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl KimiMutationQueue {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(KimiMutationQueueInner {
+                state: Mutex::new(KimiMutationQueueState::default()),
+            }),
+        }
+    }
+
+    fn enqueue(&self) -> KimiMutationTicket {
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let (ticket, start_now) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.next_ticket = state
+                .next_ticket
+                .checked_add(1)
+                .expect("Kimi mutation ticket overflow");
+            let ticket = state.next_ticket;
+            state.pending.push_back(KimiMutationQueueEntry {
+                ticket,
+                completed: false,
+                start: Some(start_tx),
+            });
+            let start_now = if state.pending.len() == 1 {
+                state.pending.front_mut().and_then(|entry| entry.start.take())
+            } else {
+                None
+            };
+            (ticket, start_now)
+        };
+        if let Some(start) = start_now {
+            let _ = start.send(());
+        }
+        KimiMutationTicket {
+            queue: Arc::clone(&self.inner),
+            ticket,
+            start: Some(start_rx),
+        }
+    }
+}
+
+impl KimiMutationTicket {
+    async fn wait_turn(&mut self) {
+        if let Some(start) = self.start.take() {
+            let _ = start.await;
+        }
+    }
+}
+
+impl Drop for KimiMutationTicket {
+    fn drop(&mut self) {
+        let start_next = {
+            let mut state = self
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(entry) = state
+                .pending
+                .iter_mut()
+                .find(|entry| entry.ticket == self.ticket)
+            else {
+                return;
+            };
+            entry.completed = true;
+            while state.pending.front().is_some_and(|entry| entry.completed) {
+                state.pending.pop_front();
+            }
+            state
+                .pending
+                .front_mut()
+                .and_then(|entry| entry.start.take())
+        };
+        if let Some(start) = start_next {
+            let _ = start.send(());
+        }
+    }
+}
+
+fn latest_kimi_key_transport_token(endpoint: KimiApiEndpoint) -> &'static AtomicU64 {
+    match endpoint {
+        KimiApiEndpoint::Platform => &LATEST_KIMI_PLATFORM_KEY,
+        KimiApiEndpoint::Code => &LATEST_KIMI_CODE_KEY,
+    }
+}
+
+fn next_kimi_transport_token() -> u64 {
+    NEXT_KIMI_TRANSPORT_TOKEN
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
+}
+
+fn publish_kimi_transport_token(latest: &AtomicU64, token: u64) {
+    latest.fetch_max(token, Ordering::SeqCst);
+}
+
+fn is_latest_kimi_transport_token(latest: &AtomicU64, token: u64) -> bool {
+    latest.load(Ordering::SeqCst) == token
+}
+
+fn is_current_kimi_endpoint_apply(transport_token: u64) -> bool {
+    is_latest_kimi_transport_token(&LATEST_KIMI_ENDPOINT_SELECTION, transport_token)
+        && is_latest_kimi_transport_token(&LATEST_KIMI_ACTIVE_APPLY, transport_token)
+}
+
+const fn kimi_key_apply_owned_at_lock(
+    active: bool,
+    key_token_is_current: bool,
+    active_token_is_current: bool,
+) -> bool {
+    !active || (key_token_is_current && active_token_is_current)
+}
+
+fn is_current_kimi_key_apply(endpoint: KimiApiEndpoint, transport_token: u64) -> bool {
+    kimi_key_apply_owned_at_lock(
+        true,
+        is_latest_kimi_transport_token(
+            latest_kimi_key_transport_token(endpoint),
+            transport_token,
+        ),
+        is_latest_kimi_transport_token(&LATEST_KIMI_ACTIVE_APPLY, transport_token),
+    )
+}
+
+/// Read the exact user-layer value that [`set_kimi_api_endpoint`] updates.
+///
+/// The pager's `previous` snapshot can lag a serialized mutation whose stale
+/// completion was intentionally ignored. Reading under `KIMI_MUTATION_LOCK`
+/// makes rollback relative to durable state immediately before this operation.
+/// Invalid or absent values have the same Platform fallback as `ModelsConfig`.
+fn persisted_kimi_endpoint(fallback: KimiApiEndpoint) -> KimiApiEndpoint {
+    let root = match xai_grok_shell::config::load_from_disk() {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to read persisted Kimi endpoint before mutation"
+            );
+            return fallback;
+        }
+    };
+    root.get("models")
+        .and_then(|models| models.get("kimi_endpoint"))
+        .and_then(toml::Value::as_str)
+        .and_then(KimiApiEndpoint::from_canonical)
+        .unwrap_or_default()
+}
 
 async fn fetch_xai_usage(tx: &AcpAgentTx) -> Result<actions::XaiUsageSnapshot, String> {
     use xai_grok_shell::extensions::billing::BillingConfigResponse;
@@ -114,39 +316,62 @@ async fn clear_codex_models(tx: &AcpAgentTx) -> Result<(), String> {
         .map_err(|error| sanitize_user_error(&format!("{error}")))
 }
 
-/// Ask the shell to query Kimi's provider-owned model endpoint after a key is
-/// saved. The key itself is never part of the ACP request.
-async fn query_kimi_models(tx: &AcpAgentTx) -> Result<Option<String>, String> {
+/// Ask the shell to live-apply a Kimi service profile and rebuild its isolated
+/// model partition. Credential material never crosses ACP.
+struct KimiEndpointApply {
+    effective_endpoint: KimiApiEndpoint,
+    warning: Option<String>,
+    models: Option<acp::SessionModelState>,
+}
+
+async fn apply_kimi_endpoint(
+    tx: &AcpAgentTx,
+    endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+) -> Result<KimiEndpointApply, String> {
     let request = acp::ExtRequest::new(
-        "open-grok/kimi/models/query",
-        serde_json::value::to_raw_value(&serde_json::json!({}))
-            .expect("serialize Kimi model query params")
+        "open-grok/kimi/endpoint/apply",
+        serde_json::value::to_raw_value(&serde_json::json!({
+            "endpoint": endpoint.as_canonical(),
+        }))
+            .expect("serialize Kimi endpoint params")
             .into(),
     );
     let response = acp_send(request, tx)
         .await
         .map_err(|error| sanitize_user_error(&format!("{error}")))?;
     let envelope: serde_json::Value = serde_json::from_str(response.0.get())
-        .map_err(|error| format!("Kimi model query returned invalid JSON: {error}"))?;
+        .map_err(|error| format!("Kimi endpoint update returned invalid JSON: {error}"))?;
     let result = envelope.get("result").unwrap_or(&envelope);
-    Ok(result
+    let effective_endpoint = match result.get("effective_endpoint") {
+        None => endpoint,
+        Some(value) => {
+            let canonical = value.as_str().ok_or_else(|| {
+                "Kimi endpoint update returned a non-string effective endpoint".to_string()
+            })?;
+            KimiApiEndpoint::from_canonical(canonical)
+                .filter(|parsed| parsed.as_canonical() == canonical)
+                .ok_or_else(|| {
+                    format!(
+                        "Kimi endpoint update returned an invalid effective endpoint: {canonical}"
+                    )
+                })?
+        }
+    };
+    let warning = result
         .get("warning")
         .and_then(serde_json::Value::as_str)
-        .map(sanitize_user_error))
-}
-
-/// Drop Kimi's queried catalog partition after its UI-stored key is removed.
-async fn clear_kimi_models(tx: &AcpAgentTx) -> Result<(), String> {
-    let request = acp::ExtRequest::new(
-        "open-grok/kimi/models/clear",
-        serde_json::value::to_raw_value(&serde_json::json!({}))
-            .expect("serialize Kimi model clear params")
-            .into(),
-    );
-    acp_send(request, tx)
-        .await
-        .map(|_| ())
-        .map_err(|error| sanitize_user_error(&format!("{error}")))
+        .map(sanitize_user_error);
+    let models = result
+        .get("models")
+        .cloned()
+        .map(serde_json::from_value::<acp::SessionModelState>)
+        .transpose()
+        .map_err(|error| format!("Kimi endpoint update returned an invalid catalog: {error}"))?;
+    Ok(KimiEndpointApply {
+        effective_endpoint,
+        warning,
+        models,
+    })
 }
 
 pub(crate) fn execute(
@@ -160,45 +385,366 @@ pub(crate) fn execute(
     let mut meta = EffectMeta::default();
     let effect_is_send_now = matches!(effect, Effect::SendPromptNow { .. });
     match effect {
-        Effect::UpdateKimiApiKey { key } => {
+        Effect::UpdateKimiApiEndpoint {
+            endpoint,
+            previous,
+            generation,
+        } => {
+            let transport_token = next_kimi_transport_token();
+            publish_kimi_transport_token(
+                &LATEST_KIMI_ENDPOINT_SELECTION,
+                transport_token,
+            );
+            publish_kimi_transport_token(&LATEST_KIMI_ACTIVE_APPLY, transport_token);
+            let mut mutation_ticket = KIMI_MUTATION_QUEUE.enqueue();
             let tx = acp_tx.clone();
             tasks.spawn(async move {
-                let grok_home = xai_grok_tools::util::grok_home::grok_home();
-                let provider = xai_grok_shell::sampling::types::ModelProvider::Kimi;
-                let configured = key.is_some();
-                let storage_result = match key.as_ref() {
-                    Some(secret) => xai_grok_shell::auth::store_provider_api_key(
-                        &grok_home,
-                        provider,
-                        secret.expose(),
-                    ),
-                    None => xai_grok_shell::auth::clear_provider_api_key(&grok_home, provider),
-                };
-                if let Err(error) = storage_result {
-                    return TaskResult::KimiApiKeyUpdated {
-                        configured,
+                mutation_ticket.wait_turn().await;
+                let _guard = KIMI_MUTATION_LOCK.lock().await;
+                if !is_latest_kimi_transport_token(
+                    &LATEST_KIMI_ENDPOINT_SELECTION,
+                    transport_token,
+                ) {
+                    return TaskResult::KimiApiEndpointUpdated {
+                        endpoint,
+                        effective_endpoint: endpoint,
+                        previous,
+                        generation,
+                        stale: true,
+                        credential_configured: false,
                         warning: None,
-                        error: Some(sanitize_user_error(&error.to_string())),
+                        error: None,
+                        models: None,
                     };
                 }
-                let environment_override = std::env::var("MOONSHOT_API_KEY")
-                    .ok()
-                    .is_some_and(|key| !key.trim().is_empty());
-                let catalog_result = if configured || environment_override {
-                    query_kimi_models(&tx).await
-                } else {
-                    clear_kimi_models(&tx).await.map(|()| None)
-                };
-                match catalog_result {
-                    Ok(warning) => TaskResult::KimiApiKeyUpdated {
+                let previous = persisted_kimi_endpoint(previous);
+                if let Err(error) =
+                    xai_grok_shell::util::config::set_kimi_api_endpoint(
+                        endpoint.as_canonical().to_owned(),
+                    )
+                    .await
+                {
+                    let mut effective_endpoint = previous;
+                    let mut surfaced_error = sanitize_user_error(&error.to_string());
+                    // A prior serialized operation may have updated disk but
+                    // had its stale completion ignored. If this latest write
+                    // fails, explicitly restore runtime from the durable value
+                    // so disk and the live sampler cannot remain split.
+                    if is_current_kimi_endpoint_apply(transport_token) {
+                        match apply_kimi_endpoint(&tx, previous).await {
+                            Ok(reconciled) => {
+                                effective_endpoint = reconciled.effective_endpoint;
+                            }
+                            Err(reconciliation_error) => {
+                                tracing::warn!(
+                                    generation,
+                                    error = %reconciliation_error,
+                                    "failed to reconcile live Kimi endpoint after persistence failure"
+                                );
+                                surfaced_error = sanitize_user_error(&format!(
+                                    "{surfaced_error}; live endpoint reconciliation also failed: {reconciliation_error}"
+                                ));
+                            }
+                        }
+                    }
+                    return TaskResult::KimiApiEndpointUpdated {
+                        endpoint,
+                        effective_endpoint,
+                        previous,
+                        generation,
+                        stale: !is_current_kimi_endpoint_apply(transport_token),
+                        credential_configured: false,
+                        warning: None,
+                        error: Some(surfaced_error),
+                        models: None,
+                    };
+                }
+                // Do not exit on a newly-published token after persistence has
+                // begun. Finish this serialized transaction; the queued newer
+                // operation will then overwrite both disk and runtime.
+                match apply_kimi_endpoint(&tx, endpoint).await {
+                    Ok(applied) => {
+                        let grok_home = xai_grok_tools::util::grok_home::grok_home();
+                        let credential_configured =
+                            xai_grok_shell::kimi_models::environment_api_key_is_configured(
+                                applied.effective_endpoint,
+                            ) || xai_grok_shell::auth::kimi_api_key_is_configured(
+                                &grok_home,
+                                applied.effective_endpoint,
+                            );
+                        TaskResult::KimiApiEndpointUpdated {
+                            endpoint,
+                            effective_endpoint: applied.effective_endpoint,
+                            previous,
+                            generation,
+                            stale: !is_current_kimi_endpoint_apply(transport_token),
+                            credential_configured,
+                            warning: applied.warning,
+                            error: None,
+                            models: applied.models,
+                        }
+                    }
+                    Err(error) => {
+                        let stale = !is_current_kimi_endpoint_apply(transport_token);
+                        let mut effective_endpoint = endpoint;
+                        let mut surfaced_error = sanitize_user_error(&error);
+                        if !stale {
+                            if is_current_kimi_endpoint_apply(transport_token) {
+                                if let Err(rollback_error) =
+                                    xai_grok_shell::util::config::set_kimi_api_endpoint(
+                                        previous.as_canonical().to_owned(),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        generation,
+                                        error = %rollback_error,
+                                        "failed to roll back persisted Kimi endpoint"
+                                    );
+                                    surfaced_error = sanitize_user_error(&format!(
+                                        "{surfaced_error}; persisted endpoint rollback also failed: {rollback_error}"
+                                    ));
+                                }
+                            }
+                            if is_latest_kimi_transport_token(
+                                &LATEST_KIMI_ACTIVE_APPLY,
+                                transport_token,
+                            ) {
+                                match apply_kimi_endpoint(&tx, previous).await {
+                                    Ok(rollback) => {
+                                        effective_endpoint = rollback.effective_endpoint;
+                                    }
+                                    Err(rollback_error) => {
+                                        tracing::warn!(
+                                            generation,
+                                            error = %rollback_error,
+                                            "failed to roll back live Kimi endpoint"
+                                        );
+                                        surfaced_error = sanitize_user_error(&format!(
+                                            "{surfaced_error}; live endpoint rollback also failed: {rollback_error}"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        TaskResult::KimiApiEndpointUpdated {
+                            endpoint,
+                            effective_endpoint,
+                            previous,
+                            generation,
+                            stale: !is_current_kimi_endpoint_apply(transport_token),
+                            credential_configured: false,
+                            warning: None,
+                            error: Some(surfaced_error),
+                            models: None,
+                        }
+                    }
+                }
+            });
+        }
+        Effect::UpdateKimiApiKey {
+            endpoint,
+            configured_endpoint,
+            active,
+            generation,
+            key,
+        } => {
+            let transport_token = next_kimi_transport_token();
+            publish_kimi_transport_token(
+                latest_kimi_key_transport_token(endpoint),
+                transport_token,
+            );
+            if active {
+                publish_kimi_transport_token(
+                    &LATEST_KIMI_ACTIVE_APPLY,
+                    transport_token,
+                );
+            }
+            let mut mutation_ticket = KIMI_MUTATION_QUEUE.enqueue();
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                mutation_ticket.wait_turn().await;
+                let configured = key.is_some();
+                let _guard = KIMI_MUTATION_LOCK.lock().await;
+                if !is_latest_kimi_transport_token(
+                    latest_kimi_key_transport_token(endpoint),
+                    transport_token,
+                ) {
+                    return TaskResult::KimiApiKeyUpdated {
+                        endpoint,
+                        effective_endpoint: endpoint,
                         configured,
-                        warning,
+                        active,
+                        generation,
+                        stale: true,
+                        warning: None,
                         error: None,
+                        models: None,
+                    };
+                }
+                // Credential writes are service-local, but selector/runtime
+                // ownership is global. Capture that ownership at lock entry:
+                // a newer active operation that already ran (or is queued)
+                // must not be overwritten, while an operation superseded only
+                // after it starts must finish for deterministic convergence.
+                let owns_active_apply_at_start = kimi_key_apply_owned_at_lock(
+                    active,
+                    is_latest_kimi_transport_token(
+                        latest_kimi_key_transport_token(endpoint),
+                        transport_token,
+                    ),
+                    is_latest_kimi_transport_token(
+                        &LATEST_KIMI_ACTIVE_APPLY,
+                        transport_token,
+                    ),
+                );
+                let grok_home = xai_grok_tools::util::grok_home::grok_home();
+                let storage_result = match key.as_ref() {
+                    Some(secret) => xai_grok_shell::auth::store_kimi_api_key(
+                        &grok_home,
+                        endpoint,
+                        secret.expose(),
+                    ),
+                    None => xai_grok_shell::auth::clear_kimi_api_key(&grok_home, endpoint),
+                };
+                if let Err(error) = storage_result {
+                    let mut effective_endpoint = endpoint;
+                    let mut surfaced_error = sanitize_user_error(&error.to_string());
+                    // An earlier stale active-key operation may have updated
+                    // credential storage before failing its live apply. The
+                    // latest active failure still reconciles the sampler from
+                    // durable selection, even though this write did not land.
+                    if active && is_current_kimi_key_apply(endpoint, transport_token) {
+                        let previous = persisted_kimi_endpoint(configured_endpoint);
+                        match apply_kimi_endpoint(&tx, previous).await {
+                            Ok(reconciled) => {
+                                effective_endpoint = reconciled.effective_endpoint;
+                            }
+                            Err(reconciliation_error) => {
+                                tracing::warn!(
+                                    generation,
+                                    error = %reconciliation_error,
+                                    "failed to reconcile live Kimi endpoint after credential storage failure"
+                                );
+                                surfaced_error = sanitize_user_error(&format!(
+                                    "{surfaced_error}; live endpoint reconciliation also failed: {reconciliation_error}"
+                                ));
+                            }
+                        }
+                    }
+                    return TaskResult::KimiApiKeyUpdated {
+                        endpoint,
+                        effective_endpoint,
+                        configured,
+                        active,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            latest_kimi_key_transport_token(endpoint),
+                            transport_token,
+                        ) || (active
+                            && !is_latest_kimi_transport_token(
+                                &LATEST_KIMI_ACTIVE_APPLY,
+                                transport_token,
+                            )),
+                        warning: None,
+                        error: Some(surfaced_error),
+                        models: None,
+                    };
+                }
+                if !active {
+                    return TaskResult::KimiApiKeyUpdated {
+                        endpoint,
+                        effective_endpoint: endpoint,
+                        configured,
+                        active,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            latest_kimi_key_transport_token(endpoint),
+                            transport_token,
+                        ),
+                        warning: None,
+                        error: None,
+                        models: None,
+                    };
+                }
+                if !owns_active_apply_at_start {
+                    return TaskResult::KimiApiKeyUpdated {
+                        endpoint,
+                        effective_endpoint: endpoint,
+                        configured,
+                        active,
+                        generation,
+                        stale: true,
+                        warning: None,
+                        error: None,
+                        models: None,
+                    };
+                }
+                let previous = persisted_kimi_endpoint(configured_endpoint);
+                if let Err(error) =
+                    xai_grok_shell::util::config::set_kimi_api_endpoint(
+                        configured_endpoint.as_canonical().to_owned(),
+                    )
+                    .await
+                {
+                    let mut effective_endpoint = previous;
+                    let mut surfaced_error = sanitize_user_error(&error.to_string());
+                    // The credential write already succeeded. If this remains
+                    // the newest active operation, rebuild from the durable
+                    // selector so the live sampler consumes that credential
+                    // even though the selector write itself failed.
+                    match apply_kimi_endpoint(&tx, previous).await {
+                        Ok(reconciled) => {
+                            effective_endpoint = reconciled.effective_endpoint;
+                        }
+                        Err(reconciliation_error) => {
+                            tracing::warn!(
+                                generation,
+                                error = %reconciliation_error,
+                                "failed to reconcile live Kimi endpoint after active key persistence failure"
+                            );
+                            surfaced_error = sanitize_user_error(&format!(
+                                "{surfaced_error}; live endpoint reconciliation also failed: {reconciliation_error}"
+                            ));
+                        }
+                    }
+                    return TaskResult::KimiApiKeyUpdated {
+                        endpoint,
+                        effective_endpoint,
+                        configured,
+                        active,
+                        generation,
+                        stale: !is_current_kimi_key_apply(endpoint, transport_token),
+                        warning: None,
+                        error: Some(surfaced_error),
+                        models: None,
+                    };
+                }
+                // Credential and selector persistence have begun; finish the
+                // live apply even if a newer token was published meanwhile.
+                // Its queued transaction will run next under the same lock.
+                match apply_kimi_endpoint(&tx, configured_endpoint).await {
+                    Ok(applied) => TaskResult::KimiApiKeyUpdated {
+                        endpoint,
+                        effective_endpoint: applied.effective_endpoint,
+                        configured,
+                        active,
+                        generation,
+                        stale: !is_current_kimi_key_apply(endpoint, transport_token),
+                        warning: applied.warning,
+                        error: None,
+                        models: applied.models,
                     },
                     Err(warning) => TaskResult::KimiApiKeyUpdated {
+                        endpoint,
+                        effective_endpoint: endpoint,
                         configured,
+                        active,
+                        generation,
+                        stale: !is_current_kimi_key_apply(endpoint, transport_token),
                         warning: Some(warning),
                         error: None,
+                        models: None,
                     },
                 }
             });
@@ -1831,6 +2377,60 @@ pub(crate) fn execute(
                     }
                     TaskResult::CancelComplete
                 });
+        }
+        Effect::RebindKimiModel {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+            effective_endpoint,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let meta = effort
+                    .map(|eff| {
+                        use xai_grok_shell::sampling::types::{
+                            REASONING_EFFORT_META_KEY, reasoning_effort_meta_value,
+                        };
+                        let mut m = acp::Meta::new();
+                        m.insert(
+                            REASONING_EFFORT_META_KEY.to_string(),
+                            reasoning_effort_meta_value(eff),
+                        );
+                        m
+                    });
+                let req = acp::SetSessionModelRequest::new(
+                        session_id.clone(),
+                        model_id.clone(),
+                    )
+                    .meta(meta);
+                let result = acp_send(req, &tx)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        use xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError;
+                        if let Some(typed) =
+                            ModelSwitchIncompatibleAgentError::from_acp_error(&error)
+                        {
+                            SwitchModelError::IncompatibleAgent {
+                                error: typed,
+                                prev_model_id: None,
+                            }
+                        } else {
+                            SwitchModelError::Other(sanitize_user_error(&error.to_string()))
+                        }
+                    });
+                TaskResult::KimiModelRebindComplete {
+                    agent_id,
+                    session_id,
+                    model_id,
+                    effort,
+                    generation,
+                    effective_endpoint,
+                    result,
+                }
+            });
         }
         Effect::SwitchModel {
             agent_id,
@@ -4499,6 +5099,145 @@ fn build_interject_params(
             .expect("serialize interject content");
     }
     params
+}
+#[cfg(test)]
+mod kimi_serialization_invariant_tests {
+    use super::{KimiMutationQueue, kimi_key_apply_owned_at_lock};
+
+    #[tokio::test]
+    async fn fifo_ticket_preserves_enqueue_order_when_successor_runs_first() {
+        let queue = KimiMutationQueue::new();
+        let mut first = queue.enqueue();
+        let mut second = queue.enqueue();
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        let second_order_tx = order_tx.clone();
+        let second_task = tokio::spawn(async move {
+            let _ = second_started_tx.send(());
+            second.wait_turn().await;
+            second_order_tx.send(2).expect("order receiver alive");
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            second_started_rx,
+        )
+        .await
+        .expect("successor task scheduled")
+        .expect("successor start sender alive");
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            order_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let first_task = tokio::spawn(async move {
+            first.wait_turn().await;
+            order_tx.send(1).expect("order receiver alive");
+        });
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                order_rx.recv(),
+            )
+            .await
+            .expect("first ticket completed"),
+            Some(1),
+        );
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                order_rx.recv(),
+            )
+            .await
+            .expect("second ticket completed"),
+            Some(2),
+        );
+        first_task.await.expect("first task joined");
+        second_task.await.expect("second task joined");
+    }
+
+    #[tokio::test]
+    async fn aborted_middle_ticket_neither_bypasses_head_nor_wedges_successor() {
+        let queue = KimiMutationQueue::new();
+        let mut first = queue.enqueue();
+        let mut second = queue.enqueue();
+        let mut third = queue.enqueue();
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first_task = tokio::spawn(async move {
+            first.wait_turn().await;
+            let _ = first_started_tx.send(());
+            let _ = release_first_rx.await;
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            first_started_rx,
+        )
+        .await
+        .expect("head ticket started")
+        .expect("head start sender alive");
+
+        let (second_scheduled_tx, second_scheduled_rx) = tokio::sync::oneshot::channel();
+        let second_task = tokio::spawn(async move {
+            let _ = second_scheduled_tx.send(());
+            second.wait_turn().await;
+            std::future::pending::<()>().await;
+        });
+        let (third_scheduled_tx, third_scheduled_rx) = tokio::sync::oneshot::channel();
+        let (third_completed_tx, mut third_completed_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let third_task = tokio::spawn(async move {
+            let _ = third_scheduled_tx.send(());
+            third.wait_turn().await;
+            third_completed_tx.send(()).expect("completion receiver alive");
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                second_scheduled_rx.await.expect("second task alive");
+                third_scheduled_rx.await.expect("third task alive");
+            },
+        )
+        .await
+        .expect("waiting tasks scheduled");
+
+        second_task.abort();
+        assert!(second_task.await.expect_err("second task aborted").is_cancelled());
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            third_completed_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let _ = release_first_tx.send(());
+        first_task.await.expect("head task joined");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            third_completed_rx.recv(),
+        )
+        .await
+        .expect("successor did not wedge")
+        .expect("successor completion sender alive");
+        third_task.await.expect("successor task joined");
+    }
+
+    #[test]
+    fn reverse_lock_acquisition_does_not_restore_a_stale_active_key_profile() {
+        // A newer endpoint operation owns the global active-apply token and
+        // can acquire/finish the lock before this older key task. The older
+        // task still owns its service-local key token, but must not rewrite
+        // the selector or runtime profile after storing that independent key.
+        assert!(!kimi_key_apply_owned_at_lock(true, true, false));
+    }
+
+    #[test]
+    fn started_active_key_apply_keeps_ownership_snapshot_until_completion() {
+        assert!(kimi_key_apply_owned_at_lock(true, true, true));
+        // Inactive credential writes never participate in the global active
+        // apply channel.
+        assert!(kimi_key_apply_owned_at_lock(false, true, false));
+    }
 }
 #[cfg(test)]
 mod tests;

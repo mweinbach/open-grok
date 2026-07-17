@@ -302,6 +302,10 @@ pub struct PagerLocalSnapshot {
     pub memory_model: Option<String>,
     /// Status-only mirror for the effective Kimi API-key source.
     pub kimi_api_key_status: SecretStatus,
+    /// Status-only mirror for the Kimi Code API-key source.
+    pub kimi_code_api_key_status: SecretStatus,
+    /// Active Kimi service profile (`platform` | `code`).
+    pub kimi_api_endpoint: String,
     /// Whether the user has opted OUT of coding data sharing.
     /// Lives in auth metadata (no `UiConfig` field). Inverted mapping:
     /// `opt_out == false` → canonical "opt-in".
@@ -347,6 +351,8 @@ impl Default for PagerLocalSnapshot {
             recap_model: None,
             memory_model: None,
             kimi_api_key_status: SecretStatus::Missing,
+            kimi_code_api_key_status: SecretStatus::Missing,
+            kimi_api_endpoint: "platform".to_owned(),
             coding_data_sharing_opt_out: false,
             plan_mode_active: false,
             show_tips: None,
@@ -372,6 +378,17 @@ pub fn canonical_voice_capture_mode(value: Option<&str>) -> &'static str {
         "toggle"
     } else {
         "hold"
+    }
+}
+
+/// Canonicalize the persisted Kimi service selector. Unknown or missing values
+/// fail back to Platform to preserve the endpoint used by older releases.
+pub fn canonical_kimi_api_endpoint(value: Option<&str>) -> &'static str {
+    let raw = value.unwrap_or_default().trim();
+    if raw.eq_ignore_ascii_case("code") {
+        "code"
+    } else {
+        "platform"
     }
 }
 
@@ -717,7 +734,11 @@ pub fn current_value_for(
         "memory_model" => Some(SettingValue::String(
             pager.memory_model.clone().unwrap_or_default(),
         )),
+        "kimi_api_endpoint" => Some(SettingValue::Enum(canonical_kimi_api_endpoint(Some(
+            &pager.kimi_api_endpoint,
+        )))),
         "kimi_api_key" => Some(SettingValue::SecretStatus(pager.kimi_api_key_status)),
+        "kimi_code_api_key" => Some(SettingValue::SecretStatus(pager.kimi_code_api_key_status)),
         // max_thoughts_width: `u16` widened to `i64`.
         "max_thoughts_width" => Some(SettingValue::Int(ui.max_thoughts_width as i64)),
         // coding_data_sharing: inverts the `_opt_out` bool.
@@ -954,8 +975,18 @@ mod tests {
                         *default, "",
                         "default_model registry default must be empty string — \
                          the live default is resolved dynamically from \
-                         cfg.models.default at session start",
+                        cfg.models.default at session start",
                     );
+                }
+                ("kimi_api_endpoint", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(
+                        *default, "platform",
+                        "Kimi service must default to the backwards-compatible Platform profile",
+                    );
+                }
+                ("kimi_api_key" | "kimi_code_api_key", SettingKind::Secret) => {
+                    // Credential presence is pager-local runtime state rather than UiConfig.
+                    // `every_setting_has_dispatch_arm` pins the SecretStatus mapping.
                 }
                 ("recap_model" | "memory_model", SettingKind::DynamicEnum { default, .. }) => {
                     assert_eq!(

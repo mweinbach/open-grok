@@ -637,7 +637,7 @@ fn dispatch_open_settings_opens_then_close_on_reentry() {
 }
 
 #[test]
-fn dispatch_open_kimi_api_key_editor_uses_secure_focused_settings_mode() {
+fn dispatch_open_kimi_api_key_editor_starts_at_service_picker() {
     use crate::views::modal::ActiveModal;
     use crate::views::settings_modal::{SettingsEntryPoint, SettingsModalMode};
 
@@ -652,17 +652,17 @@ fn dispatch_open_kimi_api_key_editor_uses_secure_focused_settings_mode() {
     assert_eq!(state.entry_point, SettingsEntryPoint::ProviderLogin);
     assert!(matches!(
         state.mode,
-        SettingsModalMode::EditingSecret {
-            key: "kimi_api_key",
-            ref buffer,
-            cursor_byte: 0,
-            validation_error: None,
-        } if buffer.is_empty()
+        SettingsModalMode::PickingEnum {
+            key: "kimi_api_endpoint",
+            choices_idx: 0,
+            supports_preview: false,
+            original_value: crate::settings::SettingValue::Enum("platform"),
+        }
     ));
 }
 
 #[test]
-fn dashboard_kimi_login_uses_secure_focused_settings_mode() {
+fn dashboard_kimi_login_starts_at_service_picker() {
     use crate::views::settings_modal::{SettingsEntryPoint, SettingsModalMode};
 
     let mut app = test_app_with_agent();
@@ -681,12 +681,117 @@ fn dashboard_kimi_login_uses_secure_focused_settings_mode() {
     assert_eq!(state.entry_point, SettingsEntryPoint::ProviderLogin);
     assert!(matches!(
         state.mode,
-        SettingsModalMode::EditingSecret {
-            key: "kimi_api_key",
-            ref buffer,
-            cursor_byte: 0,
-            validation_error: None,
-        } if buffer.is_empty()
+        SettingsModalMode::PickingEnum {
+            key: "kimi_api_endpoint",
+            choices_idx: 0,
+            supports_preview: false,
+            original_value: crate::settings::SettingValue::Enum("platform"),
+        }
+    ));
+}
+
+#[test]
+fn set_kimi_service_live_applies_optimistically_and_is_idempotent() {
+    let mut app = test_app_with_agent();
+
+    let effects = dispatch(Action::SetKimiApiEndpoint("code".to_owned()), &mut app);
+
+    assert_eq!(app.kimi_api_endpoint, "code");
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::UpdateKimiApiEndpoint {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            ..
+        }]
+    ));
+    assert!(dispatch(Action::SetKimiApiEndpoint("code".to_owned()), &mut app).is_empty());
+}
+
+#[test]
+fn reselecting_confirmed_kimi_service_retries_a_failed_live_apply() {
+    let mut app = test_app_with_agent();
+    app.kimi_runtime_update_pending = true;
+    app.kimi_api_endpoint = "platform".to_owned();
+    app.kimi_confirmed_endpoint = xai_grok_shell::kimi_models::KimiApiEndpoint::Platform;
+
+    let effects = dispatch(Action::SetKimiApiEndpoint("platform".to_owned()), &mut app);
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::UpdateKimiApiEndpoint {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            previous: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn saving_inactive_kimi_code_key_skips_catalog_refresh() {
+    let mut app = test_app_with_agent();
+    let secret = crate::settings::SecretInput::new("sk-kimi-code".to_owned());
+
+    let effects = dispatch(
+        Action::SetKimiApiKey {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            key: secret,
+        },
+        &mut app,
+    );
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::UpdateKimiApiKey {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            active: false,
+            key: Some(key),
+            ..
+        }] if key.expose() == "sk-kimi-code"
+    ));
+}
+
+#[test]
+fn kimi_secret_resets_clear_only_the_matching_service() {
+    let missing =
+        crate::settings::SettingValue::SecretStatus(crate::settings::SecretStatus::Missing);
+    assert!(matches!(
+        action_for_reset("kimi_api_key", &missing),
+        Some(Action::ClearKimiApiKey {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+        })
+    ));
+    assert!(matches!(
+        action_for_reset("kimi_code_api_key", &missing),
+        Some(Action::ClearKimiApiKey {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+        })
+    ));
+}
+
+#[test]
+fn kimi_key_activity_follows_effective_endpoint_override() {
+    let mut app = test_app_with_agent();
+    app.kimi_api_endpoint = "platform".to_owned();
+    app.kimi_confirmed_endpoint = xai_grok_shell::kimi_models::KimiApiEndpoint::Platform;
+    app.kimi_effective_endpoint = xai_grok_shell::kimi_models::KimiApiEndpoint::Code;
+
+    let effects = dispatch(
+        Action::SetKimiApiKey {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            key: crate::settings::SecretInput::new("code-key".to_owned()),
+        },
+        &mut app,
+    );
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::UpdateKimiApiKey {
+            endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Code,
+            configured_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint::Platform,
+            active: true,
+            ..
+        }]
     ));
 }
 
@@ -955,7 +1060,12 @@ fn every_setting_has_action_for_reset_arm() {
                  no-op. Add an arm to `action_for_reset` in dispatch.rs.",
             meta.key,
         );
-        if meta.key == "default_model" {
+        if meta.key == "default_model"
+            || matches!(meta.kind, crate::settings::SettingKind::Secret { .. })
+        {
+            // Secret values intentionally are not read into AppView/test
+            // fixtures. The action-arm assertion above covers reset wiring;
+            // credential storage round trips have dedicated auth tests.
             continue;
         }
         let mut app = test_app_with_agent();
@@ -980,6 +1090,9 @@ fn every_setting_has_action_for_reset_arm() {
 fn every_persisting_setting_has_rollback_arm() {
     let reg = crate::settings::SettingsRegistry::defaults();
     for meta in reg.all() {
+        if matches!(meta.kind, crate::settings::SettingKind::Secret { .. }) {
+            continue;
+        }
         let default_value = crate::settings::default_value_for(meta);
         let Some(reset_action) = action_for_reset(meta.key, &default_value) else {
             continue;
@@ -1357,6 +1470,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
                 agent.session.models.set_current(id, None);
             }
         }
+        "kimi_api_endpoint" => {
+            let _ = dispatch(Action::SetKimiApiEndpoint("code".to_owned()), app);
+        }
         "recap_model" | "memory_model" => {
             use agent_client_protocol as acp;
             use std::sync::Arc;
@@ -1571,6 +1687,7 @@ fn set_simple_mode_propagates_to_every_agent() {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),

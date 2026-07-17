@@ -355,6 +355,10 @@ impl AgentView {
             self.scrollback.remove_entry(rid);
         }
         self.session.model_switch_pending = false;
+        // A reconnect rebuilds the shell-side sampler from the current
+        // persisted provider configuration, so any pager-local rebind hold is
+        // obsolete and must not leave queued prompts jammed.
+        self.session.provider_rebind_pending = false;
         self.pending_adoption_updates.clear();
         let fresh = self.scrollback.fresh_continuation();
         self.session_reload = Some(SessionReload {

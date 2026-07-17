@@ -1162,6 +1162,13 @@ pub(crate) async fn run(
     let auxiliary_models = load_initial_auxiliary_models();
     app.recap_model = auxiliary_models.recap;
     app.memory_model = auxiliary_models.memory;
+    app.kimi_api_endpoint = auxiliary_models.kimi_api_endpoint;
+    let configured_kimi_endpoint =
+        xai_grok_shell::kimi_models::KimiApiEndpoint::from_canonical(&app.kimi_api_endpoint)
+            .unwrap_or_default();
+    app.kimi_effective_endpoint =
+        xai_grok_shell::kimi_models::effective_endpoint(configured_kimi_endpoint);
+    app.kimi_confirmed_endpoint = configured_kimi_endpoint;
     // Disk load replaces `current_ui`. Assign one policy-clamped resolved
     // launch mode unconditionally (CLI > TOML > remote > Ask) so disk Auto
     // cannot win over `--permission-mode ask`, and a policy-clamped remote
@@ -2632,10 +2639,20 @@ pub(crate) fn load_initial_ui_config() -> xai_grok_shell::agent::config::UiConfi
 
 /// Auxiliary-model pins seeded once from the effective config. Settings keeps
 /// these mirrors current after startup so modal rendering stays sans-IO.
-#[derive(Default)]
 struct InitialAuxiliaryModels {
     recap: Option<String>,
     memory: Option<String>,
+    kimi_api_endpoint: String,
+}
+
+impl Default for InitialAuxiliaryModels {
+    fn default() -> Self {
+        Self {
+            recap: None,
+            memory: None,
+            kimi_api_endpoint: "platform".to_owned(),
+        }
+    }
 }
 
 fn load_initial_auxiliary_models() -> InitialAuxiliaryModels {
@@ -2656,6 +2673,10 @@ fn load_initial_auxiliary_models() -> InitialAuxiliaryModels {
     InitialAuxiliaryModels {
         recap: read_pin("recap"),
         memory: read_pin("memory"),
+        kimi_api_endpoint: crate::settings::canonical_kimi_api_endpoint(
+            models.get("kimi_endpoint").and_then(toml::Value::as_str),
+        )
+        .to_owned(),
     }
 }
 

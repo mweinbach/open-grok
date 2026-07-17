@@ -2870,6 +2870,35 @@ fn queue_interject_shared_arms_expectation_while_running() {
     );
 }
 
+#[test]
+fn kimi_rebind_hold_blocks_server_row_send_now() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .session
+        .provider_rebind_pending = true;
+
+    let effects = dispatch(
+        Action::QueueInterjectShared {
+            id: "srv-row-held".into(),
+            expected_version: 1,
+            new_text: None,
+        },
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(app.agents[&id].expect_send_now_cancel.is_none());
+    assert!(
+        app.agents[&id]
+            .toast
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("send now is paused"))
+    );
+}
+
 /// During an active goal the shell promotes a send-now WITHOUT cancelling, so
 /// neither `SendPromptNow` nor a server-row send-now may arm the expectation —
 /// a stale arm would mute a later real cancel's marker.

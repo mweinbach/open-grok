@@ -559,11 +559,18 @@ pub enum Action {
     /// session and persists via `Effect::PersistSetting`. Does not
     /// carry effort — use `Action::SwitchModel` for that.
     SetDefaultModel(acp::ModelId),
-    /// Save a Kimi API key from the dedicated masked settings editor.
+    /// Select the active Kimi service profile (`platform` | `code`).
+    SetKimiApiEndpoint(String),
+    /// Save a service-specific Kimi API key from the dedicated masked editor.
     /// `SecretInput` redacts `Debug` and zeroizes its allocation on drop.
-    SetKimiApiKey(crate::settings::SecretInput),
-    /// Remove only the UI-stored Kimi provider credential.
-    ClearKimiApiKey,
+    SetKimiApiKey {
+        endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        key: crate::settings::SecretInput,
+    },
+    /// Remove only the selected Kimi service's UI-stored credential.
+    ClearKimiApiKey {
+        endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+    },
     /// Clear the persisted default model (`cfg.models.default = None`).
     /// Active session's model is unchanged; next session resolves
     /// via the shell's default-resolution chain.
@@ -1401,10 +1408,33 @@ pub enum Effect {
         /// process-wide mode.
         chat_kind: bool,
     },
-    /// Update the provider-scoped Kimi credential, then refresh (save) or
-    /// clear (remove) Kimi's queried model-catalog partition.
+    /// Persist and live-apply the active Kimi service profile.
+    UpdateKimiApiEndpoint {
+        endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        previous: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        generation: u64,
+    },
+    /// Update one service-specific Kimi credential, then refresh the active
+    /// Kimi model-catalog partition when that service is selected.
     UpdateKimiApiKey {
+        /// Service whose credential is written or cleared.
+        endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        /// Configured service selection to persist/apply when `endpoint` is
+        /// runtime-active. It can differ under an API-base override.
+        configured_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        active: bool,
+        generation: u64,
         key: Option<crate::settings::SecretInput>,
+    },
+    /// Rebind one loaded Kimi session to the live service profile without
+    /// changing the user's preferred model setting.
+    RebindKimiModel {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+        effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
     },
     /// Change the process working directory (project-picker selection).
     SetWorkingDir { path: std::path::PathBuf },
@@ -2149,9 +2179,39 @@ pub enum TaskResult {
     /// Completion of the dedicated Kimi credential workflow. Contains only
     /// status and scrubbed diagnostics, never credential material.
     KimiApiKeyUpdated {
+        endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
         configured: bool,
+        active: bool,
+        generation: u64,
+        stale: bool,
         warning: Option<String>,
         error: Option<String>,
+        models: Option<acp::SessionModelState>,
+    },
+    /// Completion of a Kimi service switch, including persistence and the
+    /// provider catalog refresh. Contains no credential material.
+    KimiApiEndpointUpdated {
+        endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        previous: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        generation: u64,
+        stale: bool,
+        credential_configured: bool,
+        warning: Option<String>,
+        error: Option<String>,
+        models: Option<acp::SessionModelState>,
+    },
+    /// Completion of an automatic Kimi sampler/model rebind. Kept separate
+    /// from a user model switch so dispatch never persists a preference.
+    KimiModelRebindComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+        effective_endpoint: xai_grok_shell::kimi_models::KimiApiEndpoint,
+        result: Result<(), SwitchModelError>,
     },
     /// Session was created successfully.
     SessionCreated {

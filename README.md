@@ -51,6 +51,10 @@ The public command is `open-grok`. It can be installed beside the upstream
   switch an existing conversation between provider-backed models by rebuilding
   the correct harness in place, and `/usage` reports xAI billing and Codex quota
   windows independently.
+- **Kimi Platform and Kimi Code.** Settings and `/login kimi` can select either
+  Kimi service while keeping their endpoints, credentials, and model catalogs
+  isolated. Platform supports live discovery; Code provides the membership
+  coding models through its dedicated API.
 - **Provider-aware hosted search.** xAI models receive xAI web/X search tools;
   Codex models receive OpenAI `web_search`. Open Grok does not pass one
   provider's credentials or provider-only tools to the other.
