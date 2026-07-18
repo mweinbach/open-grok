@@ -1,6 +1,6 @@
 {
     "name": "@mweinbach/open-grok",
-    "version": "0.1.220-open-grok.11",
+    "version": "0.1.220-open-grok.12",
     "description": "Open Grok: Grok Build with ChatGPT Codex optimizations",
     "license": "Apache-2.0",
     "bin": {
@@ -28,11 +28,11 @@
         "node": ">=20"
     },
     "optionalDependencies": {
-        "@mweinbach/open-grok-darwin-arm64": "0.1.220-open-grok.11",
-        "@mweinbach/open-grok-darwin-x64": "0.1.220-open-grok.11",
-        "@mweinbach/open-grok-linux-arm64": "0.1.220-open-grok.11",
-        "@mweinbach/open-grok-linux-x64": "0.1.220-open-grok.11",
-        "@mweinbach/open-grok-win32-arm64": "0.1.220-open-grok.11",
-        "@mweinbach/open-grok-win32-x64": "0.1.220-open-grok.11"
+        "@mweinbach/open-grok-darwin-arm64": "0.1.220-open-grok.12",
+        "@mweinbach/open-grok-darwin-x64": "0.1.220-open-grok.12",
+        "@mweinbach/open-grok-linux-arm64": "0.1.220-open-grok.12",
+        "@mweinbach/open-grok-linux-x64": "0.1.220-open-grok.12",
+        "@mweinbach/open-grok-win32-arm64": "0.1.220-open-grok.12",
+        "@mweinbach/open-grok-win32-x64": "0.1.220-open-grok.12"
     }
 }
