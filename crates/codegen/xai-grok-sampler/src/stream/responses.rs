@@ -16,6 +16,7 @@ use xai_grok_sampling_types::{
 
 use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
+use crate::stream::display_citations::{DisplayCitationFilter, strip_display_citations_in_items};
 use crate::types::RequestId;
 
 /// Returns whether a Responses API event reflects real model progress
@@ -160,6 +161,10 @@ pub fn stream_responses_with_client_custom_tools<'a>(
         let mut backend_output_started: BTreeSet<u32> = BTreeSet::new();
         let mut backend_tool_started: BTreeSet<String> = BTreeSet::new();
         let mut next_tool_index: u32 = 0;
+        // Hosted web/file search trains models to emit PUA display-citation
+        // widgets (`\ue200cite\ue202turnNsearchM\ue201`). Strip them from the
+        // live text stream so the TUI never paints raw citation markers.
+        let mut display_citation_filter = DisplayCitationFilter::new();
 
         let mut stream = raw_stream;
         loop {
@@ -216,21 +221,24 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                 ResponseStreamEvent::ResponseOutputTextDelta(text_delta_event) => {
                     let delta = text_delta_event.delta;
                     if !delta.is_empty() {
-                        if !first_token_emitted {
-                            first_token_emitted = true;
-                            yield SamplingEvent::FirstToken {
+                        let visible = display_citation_filter.push(&delta);
+                        if !visible.is_empty() {
+                            if !first_token_emitted {
+                                first_token_emitted = true;
+                                yield SamplingEvent::FirstToken {
+                                    request_id: request_id.clone(),
+                                };
+                            }
+                            chunk_timestamps.push(Instant::now());
+                            chunk_index += 1;
+                            message_chunk_count += 1;
+                            yield SamplingEvent::ChannelToken {
                                 request_id: request_id.clone(),
+                                channel: SamplingChannel::Text,
+                                text: visible,
+                                chunk_index,
                             };
                         }
-                        chunk_timestamps.push(Instant::now());
-                        chunk_index += 1;
-                        message_chunk_count += 1;
-                        yield SamplingEvent::ChannelToken {
-                            request_id: request_id.clone(),
-                            channel: SamplingChannel::Text,
-                            text: delta,
-                            chunk_index,
-                        };
                     }
                 }
 
@@ -657,6 +665,10 @@ pub fn stream_responses_with_client_custom_tools<'a>(
 
         let status = response.status.clone();
 
+        // Drop any mid-widget citation buffer so unfinished markers never
+        // surface via fallback reconstruction paths.
+        display_citation_filter.finish();
+
         // Convert to ConversationItem(s); patch in accumulated reasoning
         // text as a fallback when the final response lacks `content` /
         // `summary` (the streaming deltas may have arrived out of band).
@@ -666,6 +678,9 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                 response,
                 &client_custom_tool_names,
             );
+        // Final response output still carries raw display citations; strip
+        // them so chat history, resume, and next-turn context stay clean.
+        strip_display_citations_in_items(&mut items);
         let mut summaries_by_item: BTreeMap<(u32, String), Vec<(u32, String)>> = BTreeMap::new();
         for ((output_index, item_id, summary_index), text) in reasoning_summary_parts {
             if !text.is_empty() {
@@ -961,6 +976,86 @@ mod tests {
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn display_citation_widgets_are_stripped_from_stream_and_items() {
+        use crate::stream::display_citations::{CITATION_DELIMITER, CITATION_START, CITATION_STOP};
+
+        // Matches the Workouts-iOS session log shape for hosted web_search.
+        let marker = format!(
+            "{CITATION_START}cite{CITATION_DELIMITER}turn1search0\
+             {CITATION_DELIMITER}turn7search0{CITATION_STOP}"
+        );
+        let stream_text = format!("available reports. {marker}\n\n**Validation**");
+        let final_text = format!("final answer {marker} end");
+
+        let mut completed = empty_completed_response();
+        completed.output = vec![assistant_message_output("msg_1", &final_text)];
+
+        // Split on a char boundary so multi-byte PUA sentinels stay intact.
+        let split_at = marker
+            .char_indices()
+            .nth(marker.chars().count() / 2)
+            .map(|(i, _)| i)
+            .unwrap_or(marker.len());
+
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("available reports. ")),
+            // Split the widget across deltas so the stream filter must buffer.
+            Ok(text_delta_event(&marker[..split_at])),
+            Ok(text_delta_event(&marker[split_at..])),
+            Ok(text_delta_event("\n\n**Validation**")),
+            Ok(rs::ResponseStreamEvent::ResponseCompleted(
+                rs_types::ResponseCompletedEvent {
+                    response: completed,
+                    sequence_number: 1,
+                },
+            )),
+        ])
+        .boxed();
+
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Text,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, "available reports. \n\n**Validation**");
+        assert!(
+            !streamed.contains(CITATION_START)
+                && !streamed.contains("turn1search0")
+                && !streamed.contains("cite"),
+            "streamed text must not retain display citation widgets: {streamed:?}"
+        );
+        // Sanity: the unfiltered stream payload did contain the marker.
+        assert!(stream_text.contains("turn1search0"));
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let assistant = response
+                    .assistant()
+                    .expect("completed response should have assistant text");
+                assert_eq!(assistant.content.as_ref(), "final answer  end");
+                assert!(!assistant.content.contains(CITATION_START));
+                assert!(!assistant.content.contains("turn1search0"));
             }
             other => panic!("expected Completed, got {other:?}"),
         }

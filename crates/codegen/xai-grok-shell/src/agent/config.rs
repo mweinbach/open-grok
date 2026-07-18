@@ -5493,15 +5493,30 @@ pub fn supports_codex_multi_agent_v2(info: &ModelInfo) -> bool {
 
 /// Effective Responses reasoning-summary mode derived from model metadata.
 ///
-/// xAI keeps its existing typed `concise` default. Codex only forwards the
-/// catalog value when the selected model advertises parameter support; an
-/// explicit catalog `none` is represented by omission on the wire.
+/// xAI keeps its existing typed `concise` default. Codex only forwards a
+/// summary when the selected model advertises parameter support.
+///
+/// Live Codex catalogs currently advertise `default_reasoning_summary =
+/// none` for most agentic models. That disables `reasoning.summary` on the
+/// wire, so the Responses API only returns encrypted reasoning blobs — no
+/// `response.reasoning_summary_text.*` deltas, no `agent_thought_chunk`s,
+/// and empty inline thinking blocks in the TUI (even at high effort).
+///
+/// Catalog `none` is treated as "no preferred detail," not "hide thinking."
+/// For models that support the parameter we request [`ReasoningSummary::Auto`]
+/// so interactive sessions stream usable summaries. Explicit `auto` /
+/// `concise` / `detailed` catalog values are honored as-is.
 pub fn model_reasoning_summary(info: &ModelInfo) -> Option<ReasoningSummary> {
-    (info.provider.profile().responses_dialect()
-        == Some(xai_grok_sampling_types::ResponsesDialect::Codex)
-        && info.supports_reasoning_summary_parameter)
-        .then_some(info.default_reasoning_summary)
-        .filter(|summary| *summary != ReasoningSummary::None)
+    if info.provider.profile().responses_dialect()
+        != Some(xai_grok_sampling_types::ResponsesDialect::Codex)
+        || !info.supports_reasoning_summary_parameter
+    {
+        return None;
+    }
+    match info.default_reasoning_summary {
+        ReasoningSummary::None => Some(ReasoningSummary::Auto),
+        other => Some(other),
+    }
 }
 /// Fold URL-derived headers into `extra_headers`.
 ///

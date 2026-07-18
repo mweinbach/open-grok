@@ -1551,15 +1551,26 @@ mod tests {
             ReasoningSummary::Auto,
             ReasoningSummary::Concise,
             ReasoningSummary::Detailed,
-            ReasoningSummary::None,
         ] {
             let info = convert(Some(true), Some(summary));
             assert_eq!(info.default_reasoning_summary, summary);
             assert_eq!(
                 crate::agent::config::model_reasoning_summary(&info),
-                (summary != ReasoningSummary::None).then_some(summary),
+                Some(summary),
             );
         }
+
+        // Catalog `none` must still request a summary for the interactive TUI;
+        // otherwise encrypted-only reasoning leaves thinking blocks empty.
+        let catalog_none = convert(Some(true), Some(ReasoningSummary::None));
+        assert_eq!(
+            catalog_none.default_reasoning_summary,
+            ReasoningSummary::None
+        );
+        assert_eq!(
+            crate::agent::config::model_reasoning_summary(&catalog_none),
+            Some(ReasoningSummary::Auto),
+        );
 
         let unsupported = convert(Some(false), Some(ReasoningSummary::Detailed));
         assert_eq!(

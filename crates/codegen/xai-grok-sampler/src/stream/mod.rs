@@ -10,6 +10,7 @@
 
 pub mod chat_completions;
 pub mod collect;
+pub mod display_citations;
 pub mod messages;
 pub mod responses;
 
