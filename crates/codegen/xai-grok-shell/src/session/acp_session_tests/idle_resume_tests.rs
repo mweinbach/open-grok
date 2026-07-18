@@ -51,14 +51,19 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
+            let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let handler_request_count = Arc::clone(&request_count);
             let app = axum::Router::new().route(
                 "/v1/models-v2",
-                get(|| async {
-                    axum::Json(serde_json::json!(
-                        { "data" : [{ "model" : "test-model", "name" : "Test Model",
-                        "context_window" : 300_000, "max_completion_tokens" : 16384,
-                        "base_url" : "http://localhost/v1" }] }
-                    ))
+                get(move || {
+                    handler_request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async {
+                        axum::Json(serde_json::json!(
+                            { "data" : [{ "model" : "test-model", "name" : "Test Model",
+                            "context_window" : 300_000, "max_completion_tokens" : 16384,
+                            "base_url" : "http://localhost/v1" }] }
+                        ))
+                    }
                 }),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -99,7 +104,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
                 vec![],
                 xai_grok_sampling_types::SamplingConfig {
-                    base_url: mock_url,
+                    base_url: mock_url.clone(),
                     model: "test-model".to_string(),
                     max_completion_tokens: Some(8192),
                     temperature: None,
@@ -325,8 +330,27 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             );
             assert_eq!(cfg_before.max_completion_tokens, Some(8192));
             actor.maybe_refresh_model_metadata_on_resume().await;
+            assert_eq!(
+                request_count.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "the production entrypoint must reject loopback before sending credentials"
+            );
+            let cfg_after_production_entrypoint =
+                actor.chat_state_handle.get_sampling_config().await.unwrap();
+            assert_eq!(
+                cfg_after_production_entrypoint.context_window,
+                std::num::NonZeroU64::new(200_000).unwrap()
+            );
+            actor
+                .maybe_refresh_model_metadata_on_resume_from_test_endpoint(&mock_url)
+                .await;
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let cfg_after = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            assert_eq!(
+                request_count.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the exact test-only endpoint should receive one metadata request"
+            );
             assert_eq!(
                 cfg_after.context_window,
                 std::num::NonZeroU64::new(300_000).unwrap(),

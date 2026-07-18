@@ -2,6 +2,47 @@
 //! readiness, skills reload and reminders, session info, and model-metadata
 //! refresh.
 use super::*;
+
+enum IdleRefreshEndpoint {
+    Production,
+    #[cfg(test)]
+    TestLoopback(reqwest::Url),
+}
+
+impl IdleRefreshEndpoint {
+    fn allows(&self, base_url: &str) -> bool {
+        match self {
+            Self::Production => crate::util::is_cli_chat_proxy_url(base_url),
+            #[cfg(test)]
+            Self::TestLoopback(trusted_url) => reqwest::Url::parse(base_url)
+                .is_ok_and(|candidate_url| candidate_url == *trusted_url),
+        }
+    }
+
+    #[cfg(test)]
+    fn test_loopback(base_url: &str) -> Option<Self> {
+        let url = reqwest::Url::parse(base_url).ok()?;
+        let host = url.host_str()?;
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        let host = host.parse::<std::net::IpAddr>().ok()?;
+        if url.scheme() != "http"
+            || !host.is_loopback()
+            || url.port().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/v1"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        Some(Self::TestLoopback(url))
+    }
+}
+
 impl SessionActor {
     /// `true` for session-based ACP auth methods.
     fn is_session_based_auth(&self) -> bool {
@@ -328,6 +369,28 @@ impl SessionActor {
     ///
     /// Skipped for BYOK users (no remote settings, no `/models-v2`).
     pub(super) async fn maybe_refresh_model_metadata_on_resume(&self) {
+        self.maybe_refresh_model_metadata_on_resume_from(IdleRefreshEndpoint::Production)
+            .await;
+    }
+
+    /// Exercise idle-refresh HTTP behavior against one exact loopback mock.
+    ///
+    /// The production entrypoint above always retains the cli-chat-proxy trust
+    /// gate. This seam is compiled only for tests and cannot expand first-party
+    /// routing or credential attachment in release builds.
+    #[cfg(test)]
+    pub(super) async fn maybe_refresh_model_metadata_on_resume_from_test_endpoint(
+        &self,
+        base_url: &str,
+    ) {
+        let Some(endpoint) = IdleRefreshEndpoint::test_loopback(base_url) else {
+            return;
+        };
+        self.maybe_refresh_model_metadata_on_resume_from(endpoint)
+            .await;
+    }
+
+    async fn maybe_refresh_model_metadata_on_resume_from(&self, endpoint: IdleRefreshEndpoint) {
         if !self.is_session_based_auth() {
             return;
         }
@@ -347,7 +410,7 @@ impl SessionActor {
         };
         let current_model = &current_config.model;
         let base_url = &current_config.base_url;
-        if !crate::util::is_cli_chat_proxy_url(base_url) {
+        if !endpoint.allows(base_url) {
             return;
         }
         tracing::info!(
@@ -691,5 +754,33 @@ impl SessionActor {
             ));
         }
         rows
+    }
+}
+
+#[cfg(test)]
+mod idle_refresh_endpoint_tests {
+    use super::IdleRefreshEndpoint;
+
+    #[test]
+    fn test_loopback_endpoint_is_narrowly_scoped() {
+        assert!(IdleRefreshEndpoint::test_loopback("http://127.0.0.1:43123/v1").is_some());
+        assert!(IdleRefreshEndpoint::test_loopback("http://[::1]:43123/v1").is_some());
+
+        for rejected in [
+            "https://127.0.0.1:43123/v1",
+            "http://localhost:43123/v1",
+            "http://192.0.2.1:43123/v1",
+            "http://127.0.0.1/v1",
+            "http://user@127.0.0.1:43123/v1",
+            "http://127.0.0.1:43123/v11",
+            "http://127.0.0.1:43123/v1?redirect=1",
+            "http://127.0.0.1:43123/v1#fragment",
+            "http://cli-chat-proxy.grok.com.evil.example:43123/v1",
+        ] {
+            assert!(
+                IdleRefreshEndpoint::test_loopback(rejected).is_none(),
+                "unexpectedly trusted {rejected}"
+            );
+        }
     }
 }
