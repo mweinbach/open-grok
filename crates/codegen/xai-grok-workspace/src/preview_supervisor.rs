@@ -895,7 +895,11 @@ mod tests {
             rx,
         ));
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Client construction plus two real loopback scrapes (baseline, then
+        // advance) can take several seconds under macOS CI or debugger load.
+        // Keep the liveness bound generous while the pure helpers retain exact
+        // boundary coverage.
+        let deadline = Instant::now() + Duration::from_secs(15);
         while tracker.snapshot().idle_since_ms.is_some() {
             assert!(
                 Instant::now() < deadline,

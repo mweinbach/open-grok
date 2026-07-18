@@ -1717,6 +1717,9 @@ mod tests {
     /// but load returns None for each.
     #[test]
     fn discovery_with_no_settings_files() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home.path());
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
 
@@ -1824,6 +1827,9 @@ mod tests {
 
     #[test]
     fn no_claude_settings_returns_none() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home.path());
         let tmp = tempfile::tempdir().unwrap();
         assert!(
             resolve_claude_settings_inner(tmp.path(), None, UserDefaultModeLoad::Apply).is_none()
