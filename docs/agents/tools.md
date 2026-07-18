@@ -250,7 +250,7 @@ Anchor-based `hashline_read` / `hashline_edit` / `hashline_grep`. Scheme config:
 
 | Tool | Role |
 | --- | --- |
-| `apply_patch` | Freeform multi-file patch (always rejected in plan mode) |
+| `apply_patch` | Freeform multi-file patch; in plan mode, only plan-file updates may pass |
 | Codex `read_file` / `list_dir` / `grep_files` | Codex-shaped FS tools |
 
 Shared grok_build tools (bash, todo, task, scheduler, plan enter/exit, ask user, …) are mixed into the `codex` preset.
@@ -270,7 +270,7 @@ Paths under `xai-grok-tools/src/implementations/` unless noted.
 | Shell / terminal | `bash` / `run_terminal_cmd` | `grok_build/bash/` | Background tasks; shadows find/grep via local terminal |
 | Read | `read_file` | `grok_build/read_file/`, shared `read_file/` (image/pdf/pptx) | Multi-format; cursor-rules-on-read reminders |
 | Edit | `search_replace` | `grok_build/search_replace/` | **Details: [editing.md](editing.md)** |
-| Patch (Codex) | `apply_patch` | `codex/apply_patch/` | Freeform; plan-mode always reject |
+| Patch (Codex) | `apply_patch` | `codex/apply_patch/` | Freeform; plan mode permits only exact plan-file add/update hunks |
 | List / search FS | `list_dir`, `grep` | `grok_build/list_dir/`, `grok_build/grep/` | Versioned list_dir schemas |
 | Web | `web_search`, `web_fetch` | `web_search/`, `grok_build/web_fetch/` | Search supports Responses and Perplexity raw-result backends; fetch applies SSRF checks |
 

@@ -146,7 +146,9 @@ OS sandbox: `xai-grok-sandbox/` — process-wide, irreversible for the session l
 
 - Enforced **outside** permission YOLO (gate runs first).
 - Only `session_dir/plan.md` is auto-approved for edits when Active.
-- Other edits rejected; **`apply_patch` always rejected** in plan mode.
+- Other edits rejected; `apply_patch` may add or update only the exact
+  `session_dir/plan.md` path. Malformed, mixed-target, delete, and move
+  patches fail closed.
 - Bash/read/MCP not gated by plan mode (still subject to permissions).
 - Children start with **Inactive** plan trackers.
 
