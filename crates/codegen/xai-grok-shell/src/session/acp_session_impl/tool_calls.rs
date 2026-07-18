@@ -172,9 +172,11 @@ pub(super) enum PlanEditGate {
 ///   ([`PlanModeTracker::should_auto_approve_edit`]) so the gate and the
 ///   permission bypass can never disagree.
 ///
-/// `apply_patch` maps to a placeholder `AccessKind::Edit("apply_patch")` and
-/// therefore never matches the plan file: it is always rejected in plan mode
-/// (conservative — per-file targets are only known after patch parsing).
+/// `apply_patch` maps to a placeholder `AccessKind::Edit("apply_patch")`, so
+/// this gate parses it before consulting the generic access kind. A nonempty
+/// patch is allowed only when every hunk is an add/update of the exact plan
+/// file after resolving the hunk path from `cwd`. Malformed patches, mixed
+/// targets, deletes, and moves fail closed.
 /// Non-edit tools (bash, read, grep, MCP, web) are never gated here; they
 /// flow to the normal permission path, where yolo may still auto-approve
 /// them. `enter_plan_mode` / `exit_plan_mode` map to `AccessKind::Read` and
@@ -183,17 +185,69 @@ pub(super) fn plan_mode_edit_gate(
     tracker: &crate::session::plan_mode::PlanModeTracker,
     tool_input: &ToolInput,
     access_kind: &AccessKind,
+    cwd: &Path,
 ) -> PlanEditGate {
     if !tracker.is_active() {
         return PlanEditGate::Allow;
     }
-    let _ = tool_input;
+    if let ToolInput::ApplyPatch(input) = tool_input {
+        return if apply_patch_only_edits_plan_file(tracker, input, cwd) {
+            PlanEditGate::Allow
+        } else {
+            PlanEditGate::RejectNonPlanFile
+        };
+    }
     match access_kind {
         AccessKind::Edit(path) if !tracker.should_auto_approve_edit(Path::new(path)) => {
             PlanEditGate::RejectNonPlanFile
         }
         _ => PlanEditGate::Allow,
     }
+}
+
+/// Resolve a file target without requiring the file itself to exist.
+///
+/// Canonicalizing the existing parent preserves filesystem symlink semantics;
+/// lexical `..` normalization alone could make a path appear to target the
+/// plan file while the filesystem resolves it somewhere else.
+fn canonical_file_target(path: &Path) -> Option<std::path::PathBuf> {
+    let file_name = path.file_name()?;
+    let parent = dunce::canonicalize(path.parent()?).ok()?;
+    Some(parent.join(file_name))
+}
+
+fn apply_patch_only_edits_plan_file(
+    tracker: &crate::session::plan_mode::PlanModeTracker,
+    input: &xai_grok_tools::implementations::codex::apply_patch::ApplyPatchInput,
+    cwd: &Path,
+) -> bool {
+    use xai_grok_tools::implementations::codex::apply_patch::{Hunk, parse_patch};
+
+    let Ok(parsed) = parse_patch(&input.patch) else {
+        return false;
+    };
+    if parsed.hunks.is_empty() {
+        return false;
+    }
+    let Some(plan_file) = canonical_file_target(tracker.plan_file_path()) else {
+        return false;
+    };
+
+    parsed.hunks.iter().all(|hunk| {
+        let path = match hunk {
+            Hunk::AddFile { path, .. } => path,
+            Hunk::UpdateFile {
+                path,
+                move_path: None,
+                ..
+            } => path,
+            Hunk::DeleteFile { .. }
+            | Hunk::UpdateFile {
+                move_path: Some(_), ..
+            } => return false,
+        };
+        canonical_file_target(&cwd.join(path)).is_some_and(|target| target == plan_file)
+    })
 }
 /// Typed view of an `exit_plan_mode` approval decision. The wire type
 /// (`ExitPlanModeExtResponse`) carries `outcome` as a string; both the mid-turn
@@ -1181,16 +1235,19 @@ impl SessionActor {
             }
         };
         let access_kind = AccessKind::from(&tool_input);
-        let plan_gate = plan_mode_edit_gate(&self.plan_mode.lock(), &tool_input, &access_kind);
+        let plan_gate = plan_mode_edit_gate(
+            &self.plan_mode.lock(),
+            &tool_input,
+            &access_kind,
+            self.tool_context.cwd.as_path(),
+        );
         if plan_gate != PlanEditGate::Allow {
             tracing::info_span!(
                 "tool.decision", tool_name = % call.function.name, tool_use_id = % call
                 .id, decision = "deny", source = "plan_mode", wait_ms = 0_i64,
             )
             .in_scope(|| {});
-            let msg = match plan_gate {
-                _ => self.plan_mode_edit_rejected_message().await,
-            };
+            let msg = self.plan_mode_edit_rejected_message().await;
             self.handle_tool_not_executed(&call.id, &tool_call_id, msg)
                 .await?;
             return Ok(Err(ToolLoop::Continue));
@@ -3035,18 +3092,49 @@ mod exit_plan_intercept_tests {
 mod plan_mode_edit_gate_tests {
     use super::{PlanEditGate, plan_mode_edit_gate};
     use crate::session::plan_mode::PlanModeTracker;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
     use xai_grok_tools::types::ToolInput;
     use xai_grok_workspace::permission::AccessKind;
-    /// Tracker with plan mode Active and plan file at
-    /// `/tmp/gate-session/plan.md`.
-    fn active_tracker() -> PlanModeTracker {
-        let mut t = PlanModeTracker::new(std::path::PathBuf::from("/tmp/gate-session"));
-        assert!(t.enter_pending());
-        assert!(t.activate());
-        t
+
+    struct GateFixture {
+        _root: TempDir,
+        tracker: PlanModeTracker,
+        cwd: PathBuf,
     }
-    fn gate(tracker: &PlanModeTracker, input: &ToolInput) -> PlanEditGate {
-        plan_mode_edit_gate(tracker, input, &AccessKind::from(input))
+
+    /// Active plan mode with `cwd` two levels below the temporary root and the
+    /// plan file under a sibling `gate-session` directory.
+    fn active_fixture() -> GateFixture {
+        let root = tempfile::tempdir().expect("temp dir");
+        let cwd = root.path().join("workspace/project");
+        let session_dir = root.path().join("gate-session");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        let mut tracker = PlanModeTracker::new(session_dir);
+        assert!(tracker.enter_pending());
+        assert!(tracker.activate());
+        GateFixture {
+            _root: root,
+            tracker,
+            cwd,
+        }
+    }
+
+    fn gate(fixture: &GateFixture, input: &ToolInput) -> PlanEditGate {
+        plan_mode_edit_gate(
+            &fixture.tracker,
+            input,
+            &AccessKind::from(input),
+            &fixture.cwd,
+        )
+    }
+
+    fn apply_patch(patch: impl Into<String>) -> ToolInput {
+        use xai_grok_tools::implementations::codex::apply_patch::ApplyPatchInput;
+        ToolInput::ApplyPatch(ApplyPatchInput {
+            patch: patch.into(),
+        })
     }
     fn search_replace(path: &str) -> ToolInput {
         use xai_grok_tools::implementations::grok_build::search_replace::SearchReplaceInput;
@@ -3068,13 +3156,13 @@ mod plan_mode_edit_gate_tests {
     /// enforcement that makes plan mode read-only even under always-approve.
     #[test]
     fn grok_edits_outside_plan_file_rejected() {
-        let t = active_tracker();
+        let fixture = active_fixture();
         assert_eq!(
-            gate(&t, &search_replace("/tmp/src/main.rs")),
+            gate(&fixture, &search_replace("/tmp/src/main.rs")),
             PlanEditGate::RejectNonPlanFile
         );
         assert_eq!(
-            gate(&t, &write("/tmp/README.md")),
+            gate(&fixture, &write("/tmp/README.md")),
             PlanEditGate::RejectNonPlanFile,
             "grok tools get no markdown exception — plan file only"
         );
@@ -3083,31 +3171,82 @@ mod plan_mode_edit_gate_tests {
     /// so the plan file itself stays editable.
     #[test]
     fn plan_file_edit_allowed() {
-        let t = active_tracker();
+        let fixture = active_fixture();
+        let plan = fixture.tracker.plan_file_path().to_string_lossy();
+        assert_eq!(gate(&fixture, &search_replace(&plan)), PlanEditGate::Allow);
+        assert_eq!(gate(&fixture, &write(&plan)), PlanEditGate::Allow);
+    }
+
+    #[test]
+    fn apply_patch_plan_add_or_update_allowed() {
+        let fixture = active_fixture();
         assert_eq!(
-            gate(&t, &search_replace("/tmp/gate-session/plan.md")),
+            gate(
+                &fixture,
+                &apply_patch(
+                    "*** Begin Patch\n*** Add File: ../../gate-session/plan.md\n+# Plan\n*** End Patch"
+                )
+            ),
             PlanEditGate::Allow
         );
         assert_eq!(
-            gate(&t, &write("/tmp/gate-session/plan.md")),
+            gate(
+                &fixture,
+                &apply_patch(
+                    "*** Begin Patch\n*** Update File: ../../gate-session/plan.md\n@@\n-old\n+new\n*** End Patch"
+                )
+            ),
             PlanEditGate::Allow
         );
     }
-    /// `apply_patch` carries a placeholder access path, never the plan file:
-    /// always rejected in plan mode (conservative).
+
     #[test]
-    fn apply_patch_rejected_in_plan_mode() {
-        use xai_grok_tools::implementations::codex::apply_patch::ApplyPatchInput;
-        let t = active_tracker();
-        assert_eq!(
-            gate(
-                &t,
-                &ToolInput::ApplyPatch(ApplyPatchInput {
-                    patch: String::new()
-                })
+    fn apply_patch_malformed_outside_or_mixed_targets_rejected() {
+        let fixture = active_fixture();
+        for input in [
+            apply_patch(String::new()),
+            apply_patch("not a patch"),
+            apply_patch(
+                "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch",
             ),
-            PlanEditGate::RejectNonPlanFile
+            apply_patch(
+                "*** Begin Patch\n*** Update File: ../../gate-session/plan.md\n@@\n-old\n+new\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch",
+            ),
+        ] {
+            assert_eq!(gate(&fixture, &input), PlanEditGate::RejectNonPlanFile);
+        }
+    }
+
+    #[test]
+    fn apply_patch_delete_or_move_rejected() {
+        let fixture = active_fixture();
+        for input in [
+            apply_patch(
+                "*** Begin Patch\n*** Delete File: ../../gate-session/plan.md\n*** End Patch",
+            ),
+            apply_patch(
+                "*** Begin Patch\n*** Update File: ../../gate-session/plan.md\n*** Move to: ../../gate-session/other.md\n@@\n-old\n+new\n*** End Patch",
+            ),
+        ] {
+            assert_eq!(gate(&fixture, &input), PlanEditGate::RejectNonPlanFile);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_symlink_detour_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = active_fixture();
+        let elsewhere = fixture._root.path().join("elsewhere");
+        let outside = elsewhere.join("deep");
+        std::fs::create_dir_all(elsewhere.join("gate-session")).expect("detour target dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        symlink(&outside, fixture.cwd.join("detour")).expect("symlink");
+        let input = apply_patch(
+            "*** Begin Patch\n*** Add File: detour/../gate-session/plan.md\n+# Plan\n*** End Patch",
         );
+        assert_eq!(gate(&fixture, &input), PlanEditGate::RejectNonPlanFile);
     }
     /// Non-edit tools are never gated — they flow to the normal permission
     /// path (where yolo may auto-approve them). Plan mode blocks
@@ -3115,10 +3254,10 @@ mod plan_mode_edit_gate_tests {
     #[test]
     fn non_edit_tools_not_gated() {
         use xai_grok_tools::implementations::BashToolInput;
-        let t = active_tracker();
+        let fixture = active_fixture();
         assert_eq!(
             gate(
-                &t,
+                &fixture,
                 &ToolInput::Bash(BashToolInput {
                     command: "echo hi > /tmp/f".into(),
                     timeout: None,
@@ -3133,13 +3272,32 @@ mod plan_mode_edit_gate_tests {
     /// Inactive (or merely Pending) plan mode gates nothing.
     #[test]
     fn inactive_or_pending_plan_mode_allows_everything() {
-        let inactive = PlanModeTracker::new(std::path::PathBuf::from("/tmp/gate-session"));
+        let root = tempfile::tempdir().expect("temp dir");
+        let cwd = root.path().join("workspace");
+        let session = root.path().join("gate-session");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&session).expect("session");
+        let inactive = GateFixture {
+            _root: root,
+            tracker: PlanModeTracker::new(session),
+            cwd,
+        };
         assert_eq!(
             gate(&inactive, &search_replace("/tmp/src/main.rs")),
             PlanEditGate::Allow
         );
-        let mut pending = PlanModeTracker::new(std::path::PathBuf::from("/tmp/gate-session"));
-        assert!(pending.enter_pending());
+        let pending_root = tempfile::tempdir().expect("pending temp dir");
+        let pending_cwd = pending_root.path().join("workspace");
+        let pending_session = pending_root.path().join("gate-session");
+        std::fs::create_dir_all(&pending_cwd).expect("pending cwd");
+        std::fs::create_dir_all(&pending_session).expect("pending session");
+        let mut pending_tracker = PlanModeTracker::new(pending_session);
+        assert!(pending_tracker.enter_pending());
+        let pending = GateFixture {
+            _root: pending_root,
+            tracker: pending_tracker,
+            cwd: pending_cwd,
+        };
         assert_eq!(
             gate(&pending, &search_replace("/tmp/src/main.rs")),
             PlanEditGate::Allow,

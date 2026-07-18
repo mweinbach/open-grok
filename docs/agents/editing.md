@@ -45,7 +45,7 @@ Behavior highlights:
 | `tool.rs` | Tool wrapper + error mapping |
 | `errors.rs` | Structured failures |
 
-Access kind is edit-like (`AccessKind::Edit("apply_patch")`). **Always rejected in plan mode** because target files are not known until parse — plan mode only auto-approves the session plan file path.
+Access kind is edit-like (`AccessKind::Edit("apply_patch")`). While plan mode is active, the shell parses the patch before permissions: a nonempty patch may pass only when every hunk adds or updates the exact session plan file. Malformed or mixed-target patches and delete/move hunks fail closed.
 
 **When changing `apply_patch`:**
 
@@ -80,7 +80,8 @@ Implemented in shell `session/acp_session_impl/tool_calls.rs` (`plan_mode_edit_g
 | --- | --- |
 | Plan Active + edit `session_dir/plan.md` | Allow (auto-approve path) |
 | Plan Active + any other edit | Reject with plan-file-only guidance |
-| Plan Active + `apply_patch` | Always reject |
+| Plan Active + `apply_patch` add/update only targeting `session_dir/plan.md` | Allow |
+| Plan Active + malformed, mixed-target, delete, or move `apply_patch` | Reject |
 | Plan Active + bash / read / MCP | Not gated here (normal permissions) |
 | Plan Inactive | No plan gate |
 
