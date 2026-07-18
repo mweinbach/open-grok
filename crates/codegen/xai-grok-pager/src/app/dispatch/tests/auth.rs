@@ -1548,6 +1548,173 @@ fn login_with_empty_auth_methods_fails_closed() {
     assert!(app.login_method_id.is_none());
 }
 
+/// Puts the app in `Authenticating` with a live task's abort handle installed
+/// (as the event loop would), returning the task's JoinHandle and the seq.
+/// Callers assert the task actually gets aborted (`unwrap_err().is_cancelled()`),
+/// not merely that the handle slot was cleared.
+fn install_live_auth_task(
+    app: &mut AppView,
+    rt: &tokio::runtime::Runtime,
+) -> (tokio::task::JoinHandle<()>, u64) {
+    dispatch(Action::Login, app);
+    let task = rt.spawn(std::future::pending::<()>());
+    match &mut app.auth_state {
+        AuthState::Authenticating {
+            handle,
+            request_seq,
+            ..
+        } => {
+            *handle = Some(task.abort_handle());
+            (task, *request_seq)
+        }
+        other => panic!("expected Authenticating after Login, got {other:?}"),
+    }
+}
+
+fn test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+}
+
+/// A second `/login` while already authenticating must abort the prior auth
+/// task and bump the seq (single-flight: no stacked device-code mints).
+#[test]
+fn login_while_authenticating_aborts_prior_task() {
+    let rt = test_runtime();
+    let mut app = test_app_with_agent();
+    let (prior_task, first_seq) = install_live_auth_task(&mut app, &rt);
+
+    let effects = dispatch(Action::Login, &mut app);
+
+    rt.block_on(async {
+        assert!(
+            prior_task.await.unwrap_err().is_cancelled(),
+            "prior auth task must be aborted"
+        );
+    });
+    match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => {
+            assert!(
+                *request_seq > first_seq,
+                "re-login must bump request_seq for single-flight"
+            );
+        }
+        other => panic!("expected Authenticating after re-Login, got {other:?}"),
+    }
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Authenticate { .. })),
+        "re-login must emit a new Authenticate"
+    );
+}
+
+/// The URL poll is a sibling task to Authenticate and must be part of the same
+/// single-flight boundary; otherwise a stale poll can publish the prior
+/// attempt's URL after the successor has started.
+#[test]
+fn login_while_authenticating_aborts_prior_url_poll() {
+    let rt = test_runtime();
+    let mut app = test_app_with_agent();
+    dispatch(Action::Login, &mut app);
+    let request_seq = match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => *request_seq,
+        other => panic!("expected Authenticating after Login, got {other:?}"),
+    };
+    let poll_task = rt.spawn(std::future::pending::<()>());
+    app.auth_url_poll_handle = Some((request_seq, poll_task.abort_handle()));
+
+    dispatch(Action::Login, &mut app);
+
+    rt.block_on(async {
+        assert!(
+            poll_task.await.unwrap_err().is_cancelled(),
+            "prior auth URL poll must be aborted"
+        );
+    });
+    assert!(
+        app.auth_url_poll_handle.is_none(),
+        "the stale URL poll handle must be cleared"
+    );
+}
+
+/// A stale `AuthComplete` (from an attempt whose abort lost the race because
+/// the task had already finished) must not complete the new attempt: the
+/// request-seq guard is the only protection here.
+#[test]
+fn stale_auth_complete_after_relogin_is_ignored() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::Login, &mut app);
+    let first_seq = match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => *request_seq,
+        other => panic!("expected Authenticating after Login, got {other:?}"),
+    };
+    dispatch(Action::Login, &mut app); // re-login bumps to seq2
+
+    dispatch(
+        Action::TaskComplete(TaskResult::AuthComplete {
+            request_seq: first_seq,
+            meta: None,
+        }),
+        &mut app,
+    );
+
+    match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => {
+            assert!(
+                *request_seq > first_seq,
+                "stale AuthComplete must leave the new attempt authenticating"
+            );
+        }
+        other => panic!("stale AuthComplete must be ignored, got {other:?}"),
+    }
+}
+
+/// Switch-account while authenticating goes through the same single-flight
+/// abort as `/login` (sibling entry point).
+#[test]
+fn switch_account_while_authenticating_aborts_prior_task() {
+    let rt = test_runtime();
+    let mut app = test_app_with_agent();
+    let (prior_task, first_seq) = install_live_auth_task(&mut app, &rt);
+
+    dispatch(Action::SwitchAccount, &mut app);
+
+    rt.block_on(async {
+        assert!(
+            prior_task.await.unwrap_err().is_cancelled(),
+            "prior auth task must be aborted on switch-account"
+        );
+    });
+    match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => {
+            assert!(*request_seq > first_seq, "switch must bump request_seq");
+        }
+        other => panic!("expected Authenticating after SwitchAccount, got {other:?}"),
+    }
+}
+
+/// Cancelling a mid-session login aborts the in-flight auth task (not just
+/// restores the view) so a retry cannot race a still-polling prior mint.
+#[test]
+fn cancel_login_aborts_prior_task() {
+    let rt = test_runtime();
+    let mut app = test_app_with_agent();
+    // Login from a session view stashes `auth_return_view`, making CancelLogin live.
+    let (prior_task, _) = install_live_auth_task(&mut app, &rt);
+
+    dispatch(Action::CancelLogin, &mut app);
+
+    rt.block_on(async {
+        assert!(
+            prior_task.await.unwrap_err().is_cancelled(),
+            "cancel must abort the in-flight auth task"
+        );
+    });
+}
+
 /// Cancelling a mid-session login returns to the session rather than
 /// quitting the app, and clears the stashed view + auth state.
 #[test]
@@ -1555,10 +1722,20 @@ fn cancel_login_restores_view() {
     let mut app = test_app_with_agent();
     dispatch(Action::Login, &mut app);
     assert_eq!(app.active_view, ActiveView::Welcome);
+    let prior_seq = match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => *request_seq,
+        other => panic!("expected Authenticating after Login, got {other:?}"),
+    };
 
     let effects = dispatch(Action::CancelLogin, &mut app);
 
-    assert!(effects.is_empty(), "cancel is pure state, no effects");
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::CancelAuth { request_seq }] if *request_seq == prior_seq
+        ),
+        "cancel must tell the shell to stop the in-flight auth poll for this attempt"
+    );
     assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
     assert_eq!(app.auth_return_view, None);
     assert!(matches!(app.auth_state, AuthState::Done));
@@ -1573,6 +1750,40 @@ fn cancel_login_noop_without_stashed_view() {
     assert!(effects.is_empty());
     assert_eq!(app.active_view, ActiveView::Welcome);
     assert_eq!(app.auth_return_view, None);
+}
+
+/// Codex OAuth is pager-owned and never stashes an xAI auth return view, so
+/// cancelling from its startup screen must not emit `x.ai/auth/cancel` or
+/// mutate the live Codex attempt.
+#[test]
+fn cancel_login_during_codex_oauth_never_emits_xai_cancel() {
+    let mut app = test_app();
+    let request_seq = 41;
+    app.primary_provider = PrimaryProvider::Codex;
+    app.startup_provider_selection = Some(PrimaryProvider::Codex);
+    app.auth_state = AuthState::Authenticating {
+        request_seq,
+        handle: None,
+        auth_url: None,
+        mode: AuthMode::Command,
+    };
+    app.auth_return_view = None;
+    let next_auth_request_seq = app.next_auth_request_seq;
+
+    let effects = dispatch(Action::CancelLogin, &mut app);
+
+    assert!(
+        effects.is_empty(),
+        "Codex OAuth must not emit xAI auth cancel"
+    );
+    assert!(matches!(
+        app.auth_state,
+        AuthState::Authenticating {
+            request_seq: current,
+            ..
+        } if current == request_seq
+    ));
+    assert_eq!(app.next_auth_request_seq, next_auth_request_seq);
 }
 
 #[test]

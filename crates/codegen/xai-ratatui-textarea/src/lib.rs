@@ -1,9 +1,14 @@
 #![allow(clippy::new_without_default)]
 
+pub mod editor;
 pub mod render;
 pub mod textarea;
 pub mod wrapping;
 
+pub use editor::{
+    ApplyEditPlanError, EditBuffer, EditCommand, EditDelta, EditOutcome, EditPlan,
+    PostEditCursorAffinity, SingleLineViewport, WordStyle, classify_key_event,
+};
 pub use textarea::{
     ClipboardProvider, ElementId, ElementKind, InternalClipboard, MouseAction, TextArea,
     TextAreaState, TextElement, TextElementEvent, TextElementEventKind, is_undo_input,

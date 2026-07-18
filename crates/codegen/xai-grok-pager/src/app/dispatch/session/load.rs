@@ -15,7 +15,7 @@ use crate::app::dispatch::ctx::{
 };
 use crate::app::dispatch::modes::inherit_auto_mode;
 use crate::app::dispatch::prompt::{defer_to_open_reload_window, supersede_open_reload_window};
-use crate::app::dispatch::queue::maybe_drain_queue;
+use crate::app::dispatch::queue::{maybe_drain_queue, note_peek_page_flip_after_drain};
 use crate::app::dispatch::router::dispatch;
 use crate::app::dispatch::status::notify_session_ready;
 use crate::app::dispatch::transcript::extensions_modal_tab_fetches;
@@ -1006,6 +1006,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         });
         notify_session_ready(&app.notification_service, agent);
         crate::memory_release::release_retained_memory_with("session-load-replay");
+        note_peek_page_flip_after_drain(app, agent_id);
         return effects;
     }
     vec![]

@@ -24,6 +24,6 @@ fn wrap_echo_passthrough_and_exit_code() {
     assert_eq!(
         code,
         Some(7),
-        "a nonzero child exit must propagate as grok wrap's own exit\nraw:\n{raw}"
+        "a nonzero child exit must propagate as open-grok wrap's own exit\nraw:\n{raw}"
     );
 }

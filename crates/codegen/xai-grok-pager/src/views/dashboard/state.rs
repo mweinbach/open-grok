@@ -47,6 +47,49 @@ impl DashboardRowId {
     pub fn is_subagent(&self) -> bool {
         matches!(self, Self::Subagent { .. })
     }
+
+    pub(crate) fn matches_top_level_agent(&self, agent_id: AgentId) -> bool {
+        matches!(self, Self::TopLevel(id) if *id == agent_id)
+    }
+}
+
+pub(crate) struct PeekViewportLease {
+    pub row: DashboardRowId,
+    pub snapshot: crate::scrollback::state::ViewportSnapshot,
+    pub page_flip_entry: Option<usize>,
+}
+
+pub(crate) fn scrollback_mut_for_row<'a>(
+    row: &DashboardRowId,
+    agents: &'a mut indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+) -> Option<&'a mut crate::scrollback::state::ScrollbackState> {
+    match row {
+        DashboardRowId::TopLevel(id) => agents.get_mut(id).map(|a| &mut a.scrollback),
+        DashboardRowId::Subagent {
+            parent,
+            child_session_id,
+        } => agents
+            .get_mut(parent)
+            .and_then(|p| p.subagent_views.get_mut(child_session_id))
+            .map(|c| &mut c.scrollback),
+        DashboardRowId::Roster { .. } => None,
+    }
+}
+
+pub(crate) fn scrollback_available_for_row(
+    row: &DashboardRowId,
+    agents: &indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+) -> bool {
+    match row {
+        DashboardRowId::TopLevel(id) => agents.contains_key(id),
+        DashboardRowId::Subagent {
+            parent,
+            child_session_id,
+        } => agents
+            .get(parent)
+            .is_some_and(|p| p.subagent_views.contains_key(child_session_id)),
+        DashboardRowId::Roster { .. } => false,
+    }
 }
 
 /// A dispatch-input send (spawn a new session) stashed while a clipboard
@@ -408,6 +451,9 @@ pub struct DashboardState {
     pub(crate) deferred_peek_send: Option<DeferredPeekSend>,
     /// Peek panel state (Space toggles).
     pub peek: Option<PeekPanelState>,
+    /// Session-scoped guest viewport for the live-tail peek (capture once
+    /// on select; sticky while the same row is peeked; restore on leave).
+    pub(crate) peek_viewport: Option<PeekViewportLease>,
     /// The peek panel's `❯ reply` input — a full [`PromptWidget`] so
     /// the reply gets paste chips (`[Pasted: N lines]`), word
     /// navigation, undo, and text selection exactly like [`Self::dispatch`].
@@ -1260,6 +1306,7 @@ impl DashboardState {
             deferred_dispatch_send: None,
             deferred_peek_send: None,
             peek: None,
+            peek_viewport: None,
             peek_reply,
             peek_reply_rect: None,
             peek_reply_cwd: None,
@@ -1718,6 +1765,10 @@ impl DashboardState {
     /// open, or retarget). Per-frame refreshes of an open panel go
     /// through `PeekPanelState::apply_fields` (not here), so an
     /// in-progress draft survives live updates.
+    ///
+    /// Does **not** restore the live-tail viewport lease — permission
+    /// refresh may call `set_peek(None)` while the same row stays
+    /// selected and reopens next paint.
     pub fn set_peek(&mut self, peek: Option<PeekPanelState>) {
         if peek.is_none() {
             self.peek_close_rect = None;
@@ -1728,6 +1779,96 @@ impl DashboardState {
             self.clear_peek_reply();
         }
         self.peek = peek;
+    }
+
+    pub fn restore_peek_viewport(
+        &mut self,
+        agents: &mut indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+    ) {
+        let Some(lease) = self.peek_viewport.take() else {
+            return;
+        };
+        let Some(sb) = scrollback_mut_for_row(&lease.row, agents) else {
+            return;
+        };
+        let page_flip = lease.page_flip_entry;
+        let w = lease.snapshot.last_width;
+        let h = lease.snapshot.viewport_height;
+        sb.restore_viewport_snapshot(lease.snapshot);
+        if let Some(idx) = page_flip {
+            if w > 0 && h > 0 {
+                sb.prepare_layout(w, h);
+            }
+            sb.set_selected(Some(idx));
+            sb.scroll_to_entry_top(idx);
+            sb.enable_follow_with_preserve();
+        }
+    }
+
+    pub fn begin_peek_viewport(
+        &mut self,
+        row: DashboardRowId,
+        agents: &mut indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+    ) {
+        if self
+            .peek_viewport
+            .as_ref()
+            .is_some_and(|lease| lease.row == row)
+        {
+            return;
+        }
+        self.restore_peek_viewport(agents);
+        let Some(sb) = scrollback_mut_for_row(&row, agents) else {
+            return;
+        };
+        let snapshot = sb.capture_viewport_snapshot();
+        sb.set_view_mode(crate::scrollback::state::ViewMode::AllTurns);
+        sb.enable_follow_mode();
+        self.peek_viewport = Some(PeekViewportLease {
+            row,
+            snapshot,
+            page_flip_entry: None,
+        });
+    }
+
+    pub fn note_page_flip_for_lease(
+        &mut self,
+        agent_id: AgentId,
+        agents: &mut indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+    ) {
+        let Some(row) = self
+            .peek_viewport
+            .as_ref()
+            .filter(|lease| lease.row.matches_top_level_agent(agent_id))
+            .map(|lease| lease.row.clone())
+        else {
+            return;
+        };
+        let Some(sb) = scrollback_mut_for_row(&row, agents) else {
+            return;
+        };
+        let selected = sb.selected();
+        let current_turn = sb.current_turn();
+        self.note_page_flip_from_scroll(agent_id, selected, current_turn);
+    }
+
+    pub(crate) fn note_page_flip_from_scroll(
+        &mut self,
+        agent_id: AgentId,
+        selected: Option<usize>,
+        current_turn: Option<usize>,
+    ) {
+        let Some(lease) = self.peek_viewport.as_mut() else {
+            return;
+        };
+        if !lease.row.matches_top_level_agent(agent_id) {
+            return;
+        }
+        lease.page_flip_entry = selected;
+        lease.snapshot.follow_mode = true;
+        lease.snapshot.follow_preserve_scroll = true;
+        lease.snapshot.selected = selected;
+        lease.snapshot.current_turn = current_turn;
     }
 
     /// Clear the peek reply draft AND its undo history.
@@ -5536,8 +5677,6 @@ mod tests {
             time_ago: String::new(),
             response_type: response_type.to_string(),
             last_user_message: None,
-            last_agent_lines: Vec::new(),
-            last_response_truncated: false,
             question: None,
             options: Vec::new(),
             request_id: None,
@@ -6727,8 +6866,6 @@ mod tests {
             time_ago: String::new(),
             response_type: "Idle".into(),
             last_user_message: None,
-            last_agent_lines: vec![],
-            last_response_truncated: false,
             question: None,
             options: vec![],
             request_id: None,
@@ -10402,5 +10539,180 @@ mod tests {
             }
             other => panic!("expected DashboardChangeLocation, got {other:?}"),
         }
+    }
+
+    fn lease_fixture_agent() -> (
+        AgentId,
+        indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+    ) {
+        use crate::scrollback::block::RenderBlock;
+        let id = AgentId(1);
+        let mut agent = crate::test_util::make_agent_view(Some("s1"), "/tmp");
+        agent.scrollback.push_block(RenderBlock::user_prompt("one"));
+        agent
+            .scrollback
+            .push_block(RenderBlock::agent_message("long response body for wrap"));
+        agent.scrollback.push_block(RenderBlock::user_prompt("two"));
+        agent
+            .scrollback
+            .push_block(RenderBlock::agent_message("second reply"));
+        agent.scrollback.prepare_layout(80, 24);
+        agent.scrollback.set_selected(Some(0));
+        agent.scrollback.set_scroll_offset(2);
+        let mut agents = indexmap::IndexMap::new();
+        agents.insert(id, agent);
+        (id, agents)
+    }
+
+    #[test]
+    fn peek_viewport_lease_restore_without_page_flip_keeps_pre_guest_nav() {
+        let (id, mut agents) = lease_fixture_agent();
+        let pre = agents[&id].scrollback.capture_viewport_snapshot();
+        let mut dash = DashboardState::new();
+        let row = DashboardRowId::TopLevel(id);
+        dash.begin_peek_viewport(row, &mut agents);
+        assert!(dash.peek_viewport.is_some());
+        assert!(agents[&id].scrollback.is_follow_mode());
+        assert!(
+            agents
+                .get_mut(&id)
+                .unwrap()
+                .scrollback
+                .prepare_layout(40, 6),
+            "guest width change is Case 1"
+        );
+
+        dash.restore_peek_viewport(&mut agents);
+        assert!(dash.peek_viewport.is_none());
+        let sb = &mut agents.get_mut(&id).unwrap().scrollback;
+        assert_eq!(sb.scroll_offset(), pre.scroll_offset);
+        assert_eq!(sb.is_follow_mode(), pre.follow_mode);
+        assert_eq!(sb.selected(), pre.selected);
+        assert!(
+            sb.prepare_layout(80, 24),
+            "restore must invalidate so full-width prepare is Case 1"
+        );
+        let snap = sb.capture_viewport_snapshot();
+        assert_eq!(snap.last_width, 80);
+    }
+
+    #[test]
+    fn peek_viewport_lease_page_flip_re_pins_entry_on_restore() {
+        let (id, mut agents) = lease_fixture_agent();
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        {
+            let sb = &mut agents.get_mut(&id).unwrap().scrollback;
+            sb.prepare_layout(40, 6);
+            let last = sb.len().saturating_sub(1);
+            sb.set_selected(Some(last));
+            sb.scroll_to_entry_top(last);
+            sb.enable_follow_with_preserve();
+        }
+        assert!(agents[&id].scrollback.is_follow_preserve_scroll());
+        dash.note_page_flip_for_lease(id, &mut agents);
+        assert_eq!(
+            dash.peek_viewport.as_ref().and_then(|l| l.page_flip_entry),
+            Some(agents[&id].scrollback.len().saturating_sub(1))
+        );
+
+        dash.restore_peek_viewport(&mut agents);
+        let sb = &agents[&id].scrollback;
+        assert!(sb.is_follow_mode());
+        assert!(sb.is_follow_preserve_scroll());
+        assert_eq!(sb.selected(), Some(sb.len().saturating_sub(1)));
+        let snap = sb.capture_viewport_snapshot();
+        assert_eq!(snap.last_width, 80);
+    }
+
+    #[test]
+    fn set_peek_none_does_not_clear_viewport_lease() {
+        let (id, mut agents) = lease_fixture_agent();
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        assert!(dash.peek_viewport.is_some());
+        dash.set_peek(None);
+        assert!(dash.peek_viewport.is_some());
+        dash.restore_peek_viewport(&mut agents);
+        assert!(dash.peek_viewport.is_none());
+    }
+
+    #[test]
+    fn sticky_begin_peek_does_not_recapture() {
+        let (id, mut agents) = lease_fixture_agent();
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        let snap_offset = dash
+            .peek_viewport
+            .as_ref()
+            .map(|l| l.snapshot.scroll_offset)
+            .unwrap();
+        agents.get_mut(&id).unwrap().scrollback.set_scroll_offset(0);
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        assert_eq!(
+            dash.peek_viewport.as_ref().unwrap().snapshot.scroll_offset,
+            snap_offset
+        );
+    }
+
+    #[test]
+    fn note_page_flip_from_scroll_only_when_row_matches() {
+        let (id, mut agents) = lease_fixture_agent();
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        dash.note_page_flip_from_scroll(AgentId(99), Some(3), Some(1));
+        assert!(
+            dash.peek_viewport
+                .as_ref()
+                .unwrap()
+                .page_flip_entry
+                .is_none()
+        );
+        dash.note_page_flip_from_scroll(id, Some(3), Some(1));
+        let lease = dash.peek_viewport.as_ref().unwrap();
+        assert_eq!(lease.page_flip_entry, Some(3));
+        assert!(lease.snapshot.follow_preserve_scroll);
+        assert_eq!(lease.snapshot.selected, Some(3));
+    }
+
+    #[test]
+    fn note_page_flip_ignores_subagent_lease_on_parent_agent() {
+        let (id, mut agents) = lease_fixture_agent();
+        let child = crate::test_util::make_agent_view(Some("child"), "/tmp");
+        agents
+            .get_mut(&id)
+            .unwrap()
+            .subagent_views
+            .insert("child".into(), Box::new(child));
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(
+            DashboardRowId::Subagent {
+                parent: id,
+                child_session_id: "child".into(),
+            },
+            &mut agents,
+        );
+        dash.note_page_flip_from_scroll(id, Some(3), Some(1));
+        assert!(
+            dash.peek_viewport
+                .as_ref()
+                .unwrap()
+                .page_flip_entry
+                .is_none(),
+            "parent drain must not write parent indices onto a subagent lease"
+        );
+        agents
+            .get_mut(&id)
+            .unwrap()
+            .scrollback
+            .enable_follow_with_preserve();
+        dash.note_page_flip_for_lease(id, &mut agents);
+        assert!(
+            dash.peek_viewport
+                .as_ref()
+                .unwrap()
+                .page_flip_entry
+                .is_none()
+        );
     }
 }

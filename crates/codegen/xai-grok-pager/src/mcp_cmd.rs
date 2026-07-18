@@ -233,6 +233,7 @@ async fn run_add(args: AddArgs) -> Result<()> {
         transport: resolved.transport,
         enabled: true,
         oauth: None,
+        setup: None,
         startup_timeout_sec: None,
         tool_timeout_sec: None,
         tool_timeouts: None,

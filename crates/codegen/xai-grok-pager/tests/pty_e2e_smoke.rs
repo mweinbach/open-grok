@@ -1,5 +1,5 @@
 //! Basic PTY coverage: startup, input, rendering, permission-mode keys, and
-//! `grok wrap` command routing.
+//! `open-grok wrap` command routing.
 //!
 //! All cases are ignored for ordinary Cargo runs; Bazel opts in and caps this
 //! process-heavy family at four concurrent libtest workers.
@@ -39,6 +39,10 @@ mod waiting_for_model_label;
 mod welcome_screen;
 #[path = "pty_e2e/welcome_screen_braille_logo_renders_correctly.rs"]
 mod welcome_screen_braille_logo_renders_correctly;
+#[path = "pty_e2e/wrap_child_killed_with_latched_modes_restores_terminal.rs"]
+mod wrap_child_killed_with_latched_modes_restores_terminal;
+#[path = "pty_e2e/wrap_clean_exit_stays_byte_transparent.rs"]
+mod wrap_clean_exit_stays_byte_transparent;
 #[path = "pty_e2e/wrap_echo_passthrough_and_exit_code.rs"]
 mod wrap_echo_passthrough_and_exit_code;
 #[path = "pty_e2e/wrap_explicit_path_not_found_fails_fast.rs"]
@@ -47,5 +51,7 @@ mod wrap_explicit_path_not_found_fails_fast;
 mod wrap_not_found_alias_routes_via_shell_contract;
 #[path = "pty_e2e/wrap_osc52_sink_env_advertised_through_shell.rs"]
 mod wrap_osc52_sink_env_advertised_through_shell;
+#[path = "pty_e2e/wrap_sigterm_restores_terminal_and_exit_code.rs"]
+mod wrap_sigterm_restores_terminal_and_exit_code;
 #[path = "pty_e2e/wrap_single_string_routes_via_shell.rs"]
 mod wrap_single_string_routes_via_shell;

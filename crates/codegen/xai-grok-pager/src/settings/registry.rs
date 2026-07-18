@@ -594,6 +594,9 @@ pub fn current_value_for(
         "contextual_hints.word_select" => Some(SettingValue::Bool(
             ui.contextual_hints.word_select.unwrap_or(true),
         )),
+        "contextual_hints.ssh_wrap" => Some(SettingValue::Bool(
+            ui.contextual_hints.ssh_wrap.unwrap_or(true),
+        )),
         "keep_text_selection" => Some(SettingValue::Enum(
             crate::appearance::cache::load_keep_text_selection().as_canonical(),
         )),
@@ -911,6 +914,13 @@ mod tests {
                         *default,
                         ui.contextual_hints.word_select.unwrap_or(true),
                         "contextual_hints.word_select default drifts from UiConfig::default()"
+                    );
+                }
+                ("contextual_hints.ssh_wrap", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.contextual_hints.ssh_wrap.unwrap_or(true),
+                        "contextual_hints.ssh_wrap default drifts from UiConfig::default()"
                     );
                 }
                 ("show_timestamps", SettingKind::Bool { default }) => {
@@ -1713,6 +1723,7 @@ mod tests {
                 "contextual_hints.send_now",
                 "contextual_hints.small_screen",
                 "contextual_hints.word_select",
+                "contextual_hints.ssh_wrap",
             ],
         );
         for &key in *children {

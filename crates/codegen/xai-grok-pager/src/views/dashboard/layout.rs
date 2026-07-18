@@ -1,4 +1,7 @@
 //! Pure layout computation for the dashboard view.
+//!
+//! Peek vs roster vertical policy:
+//! [`docs/internal/33-dashboard-peek-responsive-layout.md`](../../../../docs/internal/33-dashboard-peek-responsive-layout.md).
 
 use ratatui::layout::Rect;
 
@@ -7,10 +10,160 @@ use ratatui::layout::Rect;
 /// view; row labels are middle-truncated.
 pub const MIN_DASHBOARD_WIDTH: u16 = 40;
 
-/// Minimum total height at which the peek panel is allowed to render.
-/// Below this we drop the peek section even when toggled on so the
-/// row list still has room to breathe.
-pub const MIN_PEEK_HEIGHT: u16 = 12;
+/// Min list-band height (terminal rows) while evaluating/opening peek.
+pub const LIST_FLOOR_ROWS: u16 = 12;
+
+/// Min whole peek box (borders + status + body + reply) for live-tail.
+pub const PEEK_MIN_BOX_LIVE_TAIL: u16 = 8;
+
+/// Min whole peek box for question/permission peeks (options need room).
+pub const PEEK_MIN_BOX_QUESTION: u16 = 10;
+
+/// Peek max = ⌊H × PEEK_MAX_FRAC_NUM / PEEK_MAX_FRAC_DEN⌋ (whole box).
+pub const PEEK_MAX_FRAC_NUM: u16 = 3;
+pub const PEEK_MAX_FRAC_DEN: u16 = 8;
+
+/// Secondary cap on live-tail body rows inside an allocated peek box.
+pub const MAX_LIVE_TAIL_ROWS: u16 = 28;
+
+/// Live-tail height budget for a no-question peek (status + optional blank + reply).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeekLiveTailBudget {
+    pub live_tail: u16,
+    pub blank_row: bool,
+    pub content_rows: u16,
+}
+
+/// Result of list-first peek allocation for height `H`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeekAllocation {
+    pub show_peek: bool,
+    /// Whole peek box height including borders; 0 if `!show_peek`.
+    pub peek_box_h: u16,
+    /// Max inner content rows for a peek at full allowed size (`peek_box_h - 2`).
+    pub max_content_rows: u16,
+}
+
+/// Shrink-to-content desired inner rows for a live-tail peek.
+///
+/// Recipe (matches dense paint): `status + [pin?] + body + [blank?] + reply`.
+/// - `body_measured`: densified **current-turn** lines (after last user).
+/// - `pin_user`: last user exists → budget one pin row (paint charges it too).
+/// - Blank when body > 0 and room remains after pin+body (paint blanks only
+///   when middle still has ≥2 rows after the blank so pin + body share).
+/// Empty body reserves 1 row for the empty/hint line. Never exceeds
+/// `max_content`; body is also capped by [`MAX_LIVE_TAIL_ROWS`].
+pub fn peek_live_tail_desired_content(
+    max_content: u16,
+    reply_rows: u16,
+    body_measured: u16,
+    pin_user: bool,
+) -> PeekLiveTailBudget {
+    let reply_rows = reply_rows.max(1);
+    let pin = u16::from(pin_user);
+    let fixed = 1u16 + reply_rows + pin; // status + reply + optional pin
+
+    if max_content < fixed {
+        return PeekLiveTailBudget {
+            live_tail: 0,
+            blank_row: false,
+            content_rows: max_content,
+        };
+    }
+
+    let room_no_blank = max_content.saturating_sub(fixed).min(MAX_LIVE_TAIL_ROWS);
+    if room_no_blank == 0 {
+        return PeekLiveTailBudget {
+            live_tail: 0,
+            blank_row: false,
+            content_rows: fixed,
+        };
+    }
+
+    // Prefer a breathing blank whenever body is non-empty and room remains.
+    let room_with_blank = max_content
+        .saturating_sub(fixed + 1)
+        .min(MAX_LIVE_TAIL_ROWS);
+    let blank = room_with_blank > 0;
+    let body_cap = if blank {
+        room_with_blank
+    } else {
+        room_no_blank
+    };
+
+    let body = if body_measured == 0 {
+        1u16.min(body_cap)
+    } else {
+        body_measured.min(body_cap)
+    };
+    // If body collapsed to 0, no blank either.
+    let blank = blank && body > 0;
+    let content_rows = fixed + u16::from(blank) + body;
+    PeekLiveTailBudget {
+        live_tail: body,
+        blank_row: blank,
+        content_rows: content_rows.min(max_content),
+    }
+}
+
+/// ⌊H × 3/8⌋ whole-box peek max.
+pub fn peek_max_box_rows(h: u16) -> u16 {
+    ((u32::from(h) * u32::from(PEEK_MAX_FRAC_NUM)) / u32::from(PEEK_MAX_FRAC_DEN)) as u16
+}
+
+/// Chrome rows (header/gaps/footer/margins) — not list, not peek.
+pub fn chrome_overhead(area: Rect) -> u16 {
+    dashboard_fixed_overhead(area).0
+}
+
+/// List-first peek allocation.
+///
+/// 1. Reserve [`LIST_FLOOR_ROWS`] for the list band (clamped to space after chrome).
+/// 2. Remainder → candidate peek, capped by [`peek_max_box_rows`].
+/// 3. If candidate &lt; `peek_min_box` → no peek.
+/// 4. Else peek height = `min(desired_content+2, max_candidate)`, at least
+///    `peek_min_box` when showing.
+///
+/// `desired_content_rows` is inner content (no borders). Reply growth should
+/// increase this; list may shrink only down to the floor (enforced by max
+/// candidate).
+pub fn allocate_peek(
+    area_h: u16,
+    fixed_overhead: u16,
+    desired_content_rows: u16,
+    peek_min_box: u16,
+) -> PeekAllocation {
+    let after = area_h.saturating_sub(fixed_overhead);
+    if after == 0 {
+        return PeekAllocation {
+            show_peek: false,
+            peek_box_h: 0,
+            max_content_rows: 0,
+        };
+    }
+    let list_floor = LIST_FLOOR_ROWS.min(after);
+    let remainder = after.saturating_sub(list_floor);
+    let peek_max = peek_max_box_rows(area_h);
+    let max_peek = remainder.min(peek_max);
+    let max_content_rows = max_peek.saturating_sub(2);
+
+    if max_peek < peek_min_box {
+        return PeekAllocation {
+            show_peek: false,
+            peek_box_h: 0,
+            max_content_rows,
+        };
+    }
+
+    let desired_box = desired_content_rows.saturating_add(2);
+    let peek_box_h = desired_box.max(peek_min_box).min(max_peek);
+
+    PeekAllocation {
+        show_peek: true,
+        peek_box_h,
+        max_content_rows,
+    }
+}
 
 /// Outer horizontal padding for the dispatch box (cols on each side).
 ///
@@ -19,9 +172,8 @@ pub const MIN_PEEK_HEIGHT: u16 = 12;
 pub const DISPATCH_OUTER_HPAD: u16 = 2;
 
 /// Outer horizontal padding for the top page header (cols on each side).
-/// Slightly less than the list to give the title and status chips a bit
-/// more horizontal real estate.
-pub const HEADER_OUTER_HPAD: u16 = 1;
+/// Matches list/dispatch so the title aligns with content below.
+pub const HEADER_OUTER_HPAD: u16 = 2;
 
 /// Outer horizontal padding for the row list (cols on each side).
 ///
@@ -80,18 +232,97 @@ pub fn compute_layout(area: Rect, peek_visible: bool) -> DashboardLayout {
     compute_layout_with_dispatch(area, peek_visible, 1)
 }
 
+fn dashboard_chrome_heights(area: Rect) -> (u16, u16, u16, u16, u16, u16, u16, bool) {
+    // Match welcome/agent top margin; drop on short terminals.
+    let top_margin_h: u16 = if area.height > 6 { 1 } else { 0 };
+    let header_h: u16 = if area.height > 4 { 1 } else { 0 };
+    // Header↔list gap; collapses with dispatch/shortcuts gaps on short terms.
+    let header_gap_h: u16 = if area.height > 10 { 1 } else { 0 };
+    let footer_h: u16 = if area.height >= 2 { 1 } else { 0 };
+    // Match agent prompt/shortcuts gaps; drop on short terminals.
+    let dispatch_gap_h: u16 = if area.height > 10 { 1 } else { 0 };
+    let shortcuts_gap_h: u16 = if area.height > 10 { 1 } else { 0 };
+    // Match agent bottom_vpad; drop when height <= 16.
+    let bottom_margin_h: u16 = if area.height > 16 { 1 } else { 0 };
+    let short_terminal = area.height <= 8;
+    (
+        top_margin_h,
+        header_h,
+        header_gap_h,
+        footer_h,
+        dispatch_gap_h,
+        shortcuts_gap_h,
+        bottom_margin_h,
+        short_terminal,
+    )
+}
+
+fn dashboard_fixed_overhead(area: Rect) -> (u16, bool) {
+    let (
+        top_margin_h,
+        header_h,
+        header_gap_h,
+        footer_h,
+        dispatch_gap_h,
+        shortcuts_gap_h,
+        bottom_margin_h,
+        short_terminal,
+    ) = dashboard_chrome_heights(area);
+    let fixed_overhead = top_margin_h
+        + header_h
+        + header_gap_h
+        + footer_h
+        + dispatch_gap_h
+        + shortcuts_gap_h
+        + bottom_margin_h;
+    (fixed_overhead, short_terminal)
+}
+
+/// Max inner content rows available for a peek under list-first allocation
+/// (list floor + peek max fraction). 0 when a peek cannot open.
+pub fn max_peek_content_rows(area: Rect) -> u16 {
+    if area.height <= 8 {
+        return 0;
+    }
+    let fixed = chrome_overhead(area);
+    let probe = allocate_peek(
+        area.height,
+        fixed,
+        // Probe with enough content that allocation uses full max candidate.
+        255,
+        PEEK_MIN_BOX_LIVE_TAIL,
+    );
+    probe.max_content_rows
+}
+
+/// Like [`compute_layout`] but with a fixed whole peek-box height
+/// (from [`allocate_peek`]). List band receives the rest after chrome.
+pub fn compute_layout_with_peek_box(area: Rect, peek_box_h: u16) -> DashboardLayout {
+    compute_layout_with_dispatch_inner(area, true, 0, Some(peek_box_h.max(3)))
+}
+
 /// Like [`compute_layout`] but lets the caller request a taller
 /// dispatch box. `dispatch_text_rows` is the number of *text* rows the
 /// dispatch input wants (≥1); the box adds 2 more for its top/bottom
 /// border chrome. Used to grow the box as the user inserts newlines
 /// (Shift+Enter) so multiline dispatch prompts are fully visible.
 ///
-/// The caller is responsible for clamping `dispatch_text_rows` so the
-/// row list keeps usable space; this function only enforces a ≥1 floor.
+/// When `peek_visible`, uses list-first [`allocate_peek`] with
+/// [`PEEK_MIN_BOX_LIVE_TAIL`]. Prefer [`compute_layout_with_peek_box`]
+/// when the caller already allocated.
 pub fn compute_layout_with_dispatch(
     area: Rect,
     peek_visible: bool,
     dispatch_text_rows: u16,
+) -> DashboardLayout {
+    compute_layout_with_dispatch_inner(area, peek_visible, dispatch_text_rows, None)
+}
+
+fn compute_layout_with_dispatch_inner(
+    area: Rect,
+    peek_visible: bool,
+    dispatch_text_rows: u16,
+    forced_peek_box_h: Option<u16>,
 ) -> DashboardLayout {
     // When `area.height == 0`, every subrect collapses
     // to zero. A footer_h = 1 default would produce a non-zero
@@ -114,63 +345,41 @@ pub fn compute_layout_with_dispatch(
             bottom_margin: z,
         };
     }
-    // Match the welcome / agent view's top margin so
-    // the dashboard's header doesn't sit flush against the alt-screen's
-    // top edge. The welcome view uses `v_margin = 1` (see
-    // `views::welcome::render_welcome`). Dropped to 0 on very short
-    // terminals so we don't starve the row list.
-    let top_margin_h: u16 = if area.height > 6 { 1 } else { 0 };
-    let header_h: u16 = if area.height > 4 { 1 } else { 0 };
-    // 1-row gap between the header and the row list so the title /
-    // status chips don't sit flush against the first row (or the
-    // first group header). Collapses on short terminals so the row
-    // list isn't starved (same threshold as the dispatch/shortcuts
-    // gaps).
-    let header_gap_h: u16 = if area.height > 10 { 1 } else { 0 };
-    let footer_h: u16 = if area.height >= 2 { 1 } else { 0 };
-    // Vertical gaps around the dispatch box, matching
-    // the agent view's `prompt_gap` and `shortcuts_gap` (both = 1) so
-    // the dispatch chrome doesn't sit flush against the list above or
-    // the footer below. Gaps drop to 0 on short terminals so the row
-    // list still gets visible space. Computed BEFORE `dispatch_h` so the
-    // content-sized peek box can leave the row list at least one row.
-    let dispatch_gap_h: u16 = if area.height > 10 { 1 } else { 0 };
-    let shortcuts_gap_h: u16 = if area.height > 10 { 1 } else { 0 };
-    // Bottom margin below the shortcuts bar, matching
-    // the agent view's `bottom_vpad` (`outer_vpad = 1` from
-    // `LayoutConfig::default` dropped to 0 when `area.height <= 16`).
-    let bottom_margin_h: u16 = if area.height > 16 { 1 } else { 0 };
+    let (
+        top_margin_h,
+        header_h,
+        header_gap_h,
+        footer_h,
+        dispatch_gap_h,
+        shortcuts_gap_h,
+        bottom_margin_h,
+        short_terminal,
+    ) = dashboard_chrome_heights(area);
+    let (fixed_overhead, _) = dashboard_fixed_overhead(area);
 
-    // The peek panel sizes to its CONTENT instead of a fixed
-    // height. Its inner rows are: status (1) + wrapped response (N) +
-    // one blank breathing row (1) + `❯ reply` (1); the caller passes
-    // that inner content count via `dispatch_text_rows` (floored at
-    // status + blank + reply = 3 when there's no response yet). Adding
-    // the 2 borders gives the box height, clamped so the row list keeps
-    // at least one visible row.
-    //
-    // Otherwise (no peek) the dispatch reserves 2 borders + N text rows
-    // so the rounded box reads as a real input field and grows for
-    // multiline (Alt+Enter) prompts. Very short terminals (height ≤ 8)
-    // fall back to a single line so the row list isn't starved.
-    let dispatch_h: u16 = if peek_visible {
-        if area.height <= 8 {
+    // Peek: list-first allocation (see `allocate_peek`). No peek → normal
+    // dispatch chrome. `forced_peek_box_h` skips re-allocation when the
+    // caller already chose a height (and peek min for question vs live-tail).
+    let dispatch_h: u16 = if let Some(h) = forced_peek_box_h {
+        let after = area.height.saturating_sub(fixed_overhead);
+        let list_floor = LIST_FLOOR_ROWS.min(after);
+        let max_peek = after
+            .saturating_sub(list_floor)
+            .min(peek_max_box_rows(area.height));
+        h.min(max_peek).max(3)
+    } else if peek_visible {
+        if short_terminal {
             1
         } else {
-            let fixed_overhead = top_margin_h
-                + header_h
-                + header_gap_h
-                + footer_h
-                + dispatch_gap_h
-                + shortcuts_gap_h
-                + bottom_margin_h;
-            let content = dispatch_text_rows.max(3);
-            let desired = content + 2;
-            // Keep ≥1 row for the list; never collapse below a 3-row box.
-            let max_box = area.height.saturating_sub(fixed_overhead + 1).max(3);
-            desired.min(max_box)
+            let alloc = allocate_peek(
+                area.height,
+                fixed_overhead,
+                dispatch_text_rows,
+                PEEK_MIN_BOX_LIVE_TAIL,
+            );
+            if alloc.show_peek { alloc.peek_box_h } else { 3 }
         }
-    } else if area.height > 8 {
+    } else if !short_terminal {
         2 + dispatch_text_rows.max(1)
     } else {
         1
@@ -202,9 +411,7 @@ pub fn compute_layout_with_dispatch(
         height: top_margin_h,
     };
     y += top_margin_h;
-    // Inset the top page header using its own (slightly smaller) padding
-    // so the title and status chips have breathing room without losing
-    // as much width as the list content.
+    // Inset the top page header to match list/dispatch content columns.
     let header_inner_pad = HEADER_OUTER_HPAD.saturating_mul(2);
     let header_width = area.width.saturating_sub(header_inner_pad);
     let header_x = if header_width > 0 {
@@ -490,12 +697,12 @@ mod tests {
         );
     }
 
-    /// The header rect is inset by HEADER_OUTER_HPAD (slightly less
-    /// than the list) for side breathing room on the title and status chips.
+    /// Header h-pad matches list so title aligns with content columns.
     #[test]
     fn layout_applies_outer_hpad_to_header() {
         let area = Rect::new(0, 0, 80, 30);
         let layout = compute_layout(area, false);
+        assert_eq!(HEADER_OUTER_HPAD, LIST_OUTER_HPAD);
         assert_eq!(
             layout.header.x,
             area.x + HEADER_OUTER_HPAD,
@@ -506,6 +713,8 @@ mod tests {
             area.width - HEADER_OUTER_HPAD * 2,
             "header width must lose HEADER_OUTER_HPAD on each side",
         );
+        assert_eq!(layout.header.x, layout.list.x);
+        assert_eq!(layout.header.width, layout.list.width);
     }
 
     /// A 1-row gap separates the list/peek from the
@@ -666,24 +875,25 @@ mod tests {
         assert_eq!(layout.footer.height, 0);
     }
 
-    /// One row below the peek minimum hides the peek.
+    /// List-first: short heights cannot open peek (remainder < peek min).
     #[test]
-    fn layout_just_below_min_peek_height_hides_peek() {
-        let area = Rect::new(0, 0, 80, MIN_PEEK_HEIGHT - 1);
-        let layout = compute_layout(area, true);
-        assert_eq!(layout.peek.height, 0);
+    fn allocate_peek_refuses_when_remainder_below_min() {
+        let area = Rect::new(0, 0, 80, 24);
+        let fixed = chrome_overhead(area);
+        let alloc = allocate_peek(area.height, fixed, 20, PEEK_MIN_BOX_LIVE_TAIL);
+        // chrome≈7, after≈17, floor=12, rem≈5 < 8 → no peek
+        assert!(
+            !alloc.show_peek,
+            "h=24 should not fit list floor + peek min"
+        );
     }
 
-    /// The standalone peek rect was retired (peek now
-    /// renders INSIDE the dispatch box). The peek rect is always
-    /// zero-height; what changes when `peek_visible == true` is
-    /// the dispatch rect, which grows from 3 to 5 rows to host
-    /// the peek's status + reply input.
+    /// Standalone peek rect is always zero; peek uses dispatch.
     #[test]
     fn layout_grows_dispatch_when_peek_visible() {
-        let area = Rect::new(0, 0, 80, 30);
+        let area = Rect::new(0, 0, 80, 40);
         let no_peek = compute_layout(area, false);
-        let with_peek = compute_layout(area, true);
+        let with_peek = compute_layout_with_dispatch(area, true, 12);
         assert_eq!(no_peek.peek.height, 0);
         assert_eq!(with_peek.peek.height, 0);
         assert!(
@@ -692,23 +902,19 @@ mod tests {
             no_peek.dispatch.height,
             with_peek.dispatch.height,
         );
+        assert!(with_peek.list.height >= LIST_FLOOR_ROWS);
     }
 
-    /// The peek box sizes to its content: 2 borders + the
-    /// inner content rows (status + response + blank + reply) the caller
-    /// passes via `dispatch_text_rows`. A bigger response → taller box.
+    /// Larger desired content → taller peek box until max fraction.
     #[test]
     fn peek_box_sizes_to_content_rows() {
         let area = Rect::new(0, 0, 80, 40);
-        // content = status(1) + blank(1) + reply(1) = 3 → box 5 (no response).
-        let empty = compute_layout_with_dispatch(area, true, 3);
-        // content = status + 3 response + blank + reply = 6 → box 8.
-        let full = compute_layout_with_dispatch(area, true, 6);
-        assert_eq!(empty.dispatch.height, 5);
-        assert_eq!(full.dispatch.height, 8);
-        assert!(full.dispatch.height > empty.dispatch.height);
-        // The list reclaims the rows the smaller box doesn't use.
-        assert!(empty.list.height > full.list.height);
+        let small = compute_layout_with_dispatch(area, true, 6);
+        let large = compute_layout_with_dispatch(area, true, 20);
+        assert!(large.dispatch.height >= small.dispatch.height);
+        assert!(large.list.height <= small.list.height);
+        assert!(large.list.height >= LIST_FLOOR_ROWS);
+        assert!(large.dispatch.height <= peek_max_box_rows(40));
     }
 
     /// Zero-width area returns valid zero-width rects.
@@ -732,5 +938,137 @@ mod tests {
             MIN_DASHBOARD_WIDTH - 1 - LIST_OUTER_HPAD * 2
         );
         assert!(layout.list.height > 0);
+    }
+
+    #[test]
+    fn max_peek_content_rows_zero_on_short_terminal() {
+        assert_eq!(max_peek_content_rows(Rect::new(0, 0, 80, 8)), 0);
+        assert_eq!(max_peek_content_rows(Rect::new(0, 0, 80, 1)), 0);
+    }
+
+    #[test]
+    fn allocate_peek_list_floor_and_max_fraction() {
+        for h in [28u16, 32, 40, 60, 80] {
+            let area = Rect::new(0, 0, 80, h);
+            let fixed = chrome_overhead(area);
+            let alloc = allocate_peek(h, fixed, 255, PEEK_MIN_BOX_LIVE_TAIL);
+            assert!(alloc.show_peek, "h={h} should open peek");
+            assert!(
+                alloc.peek_box_h <= peek_max_box_rows(h),
+                "h={h} peek {} > max {}",
+                alloc.peek_box_h,
+                peek_max_box_rows(h)
+            );
+            assert!(alloc.peek_box_h >= PEEK_MIN_BOX_LIVE_TAIL);
+            let layout = compute_layout_with_peek_box(area, alloc.peek_box_h);
+            assert!(
+                layout.list.height >= LIST_FLOOR_ROWS,
+                "h={h} list {} < floor",
+                layout.list.height
+            );
+            assert_eq!(layout.dispatch.height, alloc.peek_box_h);
+        }
+    }
+
+    #[test]
+    fn allocate_peek_respects_three_eighths_cap() {
+        assert_eq!(peek_max_box_rows(40), 15); // floor(40*3/8)
+        assert_eq!(peek_max_box_rows(60), 22);
+        assert_eq!(peek_max_box_rows(8), 3);
+    }
+
+    #[test]
+    fn reply_growth_steals_from_list_down_to_floor_then_body() {
+        let area = Rect::new(0, 0, 80, 40);
+        let fixed = chrome_overhead(area);
+        let one = allocate_peek(40, fixed, 6, PEEK_MIN_BOX_LIVE_TAIL);
+        let multi = allocate_peek(40, fixed, 14, PEEK_MIN_BOX_LIVE_TAIL);
+        assert!(one.show_peek && multi.show_peek);
+        assert!(multi.peek_box_h >= one.peek_box_h);
+        let layout_multi = compute_layout_with_peek_box(area, multi.peek_box_h);
+        assert!(layout_multi.list.height >= LIST_FLOOR_ROWS);
+        assert!(multi.peek_box_h <= peek_max_box_rows(40));
+    }
+
+    #[test]
+    fn layout_header_aligns_with_list_and_dispatch() {
+        let area = Rect::new(0, 0, 80, 30);
+        let layout = compute_layout(area, false);
+        assert_eq!(layout.header.x, layout.list.x);
+        assert_eq!(layout.header.x, layout.dispatch.x);
+        assert_eq!(layout.header.width, layout.list.width);
+        assert_eq!(layout.header.width, layout.dispatch.width);
+    }
+
+    #[test]
+    fn peek_live_tail_desired_empty_uses_one_body_row() {
+        let d = peek_live_tail_desired_content(20, 1, 0, false);
+        assert_eq!(d.live_tail, 1);
+        assert!(d.blank_row, "empty/hint body still budgets blank when room");
+        assert_eq!(d.content_rows, 1 + 1 + 1 + 1); // status+reply+blank+body
+    }
+
+    #[test]
+    fn peek_live_tail_desired_tight_pin_skips_blank() {
+        // fixed = status + reply3 + pin = 5; max_content = fixed+1 → body 1, no blank.
+        let d = peek_live_tail_desired_content(6, 3, 1, true);
+        assert!(!d.blank_row);
+        assert_eq!(d.live_tail, 1);
+        assert_eq!(d.content_rows, 1 + 3 + 1 + 1); // status+reply+pin+body
+    }
+
+    #[test]
+    fn peek_live_tail_desired_short_body_budgets_blank_and_pin() {
+        let d = peek_live_tail_desired_content(40, 1, 2, false);
+        assert_eq!(d.live_tail, 2);
+        assert!(d.blank_row);
+        assert_eq!(d.content_rows, 1 + 1 + 1 + 2);
+
+        let with_pin = peek_live_tail_desired_content(40, 1, 2, true);
+        assert_eq!(with_pin.live_tail, 2);
+        assert!(with_pin.blank_row);
+        assert_eq!(with_pin.content_rows, 1 + 1 + 1 + 1 + 2); // +pin
+        assert!(with_pin.content_rows > d.content_rows);
+    }
+
+    #[test]
+    fn peek_live_tail_desired_long_body_hits_live_tail_cap() {
+        let d = peek_live_tail_desired_content(80, 1, 200, false);
+        assert_eq!(d.live_tail, MAX_LIVE_TAIL_ROWS);
+        assert!(d.blank_row);
+        assert_eq!(d.content_rows, 1 + 1 + 1 + MAX_LIVE_TAIL_ROWS);
+    }
+
+    #[test]
+    fn peek_live_tail_desired_pin_fits_in_measured_body_budget() {
+        // body that fits without pin must not force ellipsis solely due to pin:
+        // desired grows by the pin row so paint body_budget still covers body.
+        let body = 4u16;
+        let d = peek_live_tail_desired_content(40, 1, body, true);
+        assert_eq!(d.live_tail, body);
+        assert_eq!(
+            d.content_rows,
+            1 + 1 + 1 + 1 + body,
+            "status+reply+pin+blank+body"
+        );
+    }
+
+    #[test]
+    fn peek_live_tail_desired_never_exceeds_max_content() {
+        for max_content in 0..=40u16 {
+            for reply in 1..=6u16 {
+                for body in [0u16, 1, 3, 10, 50, 200] {
+                    for pin in [false, true] {
+                        let d = peek_live_tail_desired_content(max_content, reply, body, pin);
+                        assert!(
+                            d.content_rows <= max_content,
+                            "content_rows={} > max={max_content} reply={reply} body={body} pin={pin}",
+                            d.content_rows
+                        );
+                        assert!(d.live_tail <= MAX_LIVE_TAIL_ROWS);
+                    }
+                }
+            }
+        }
     }
 }

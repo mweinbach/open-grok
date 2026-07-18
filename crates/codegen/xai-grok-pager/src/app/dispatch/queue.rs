@@ -763,6 +763,35 @@ pub(crate) fn apply_turn_start_shim(
     }
 }
 
+/// After a successful queue drain, record a preserve page-flip on a matching
+/// TopLevel dashboard peek lease (if any).
+pub(crate) fn note_peek_page_flip_after_drain(app: &mut AppView, agent_id: AgentId) {
+    let page_flipped = app
+        .agents
+        .get(&agent_id)
+        .is_some_and(|a| a.scrollback.is_follow_preserve_scroll());
+    if !page_flipped {
+        return;
+    }
+    let Some(mut dash) = app.dashboard.take() else {
+        return;
+    };
+    dash.note_page_flip_for_lease(agent_id, &mut app.agents);
+    app.dashboard = Some(dash);
+}
+
+/// Drain the next queued prompt and, when that page-flips under a lease, note it.
+pub(crate) fn maybe_drain_queue_and_note_peek(app: &mut AppView, agent_id: AgentId) -> Vec<Effect> {
+    let effects = {
+        let Some(agent) = app.agents.get_mut(&agent_id) else {
+            return vec![];
+        };
+        maybe_drain_queue(agent)
+    };
+    note_peek_page_flip_after_drain(app, agent_id);
+    effects
+}
+
 /// Try to drain the next queued prompt (triggered after editing completes).
 pub(super) fn dispatch_drain_queue(app: &mut AppView) -> Vec<Effect> {
     if app.reconnect_pending {
@@ -771,10 +800,7 @@ pub(super) fn dispatch_drain_queue(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
-    let Some(agent) = app.agents.get_mut(&id) else {
-        return vec![];
-    };
-    maybe_drain_queue(agent)
+    maybe_drain_queue_and_note_peek(app, id)
 }
 
 /// `Action::QueueInterjectShared` arm: map the (possibly edited) queue

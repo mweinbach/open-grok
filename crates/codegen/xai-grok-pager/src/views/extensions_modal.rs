@@ -1110,6 +1110,101 @@ pub enum ModalInputOutcome {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct McpSetupFormState {
+    pub server_name: String,
+    pub field: crate::views::mcps_modal::McpSetupField,
+    pub selected: usize,
+    pub error: Option<String>,
+}
+
+impl McpSetupFormState {
+    pub fn new(server: &crate::views::mcps_modal::McpServerInfo) -> Option<Self> {
+        let setup = server.setup.as_ref()?.clone();
+        Self::from_setup(server.name.clone(), setup, server.setup_values.clone())
+    }
+
+    pub fn from_setup(
+        server_name: String,
+        setup: crate::views::mcps_modal::McpSetupConfig,
+        values: std::collections::HashMap<String, String>,
+    ) -> Option<Self> {
+        if setup.fields.len() != 1 {
+            return None;
+        }
+        let field = setup.fields.into_iter().next()?;
+        if field.options.is_empty() {
+            return None;
+        }
+        let selected = values
+            .get(&field.id)
+            .or(field.default.as_ref())
+            .and_then(|value| {
+                field
+                    .options
+                    .iter()
+                    .position(|option| option.value == *value)
+            })
+            .unwrap_or(0);
+        Some(Self {
+            server_name,
+            field,
+            selected,
+            error: None,
+        })
+    }
+
+    pub fn selected_value(&self) -> Option<String> {
+        self.field
+            .options
+            .get(self.selected)
+            .map(|option| option.value.clone())
+    }
+
+    pub fn values(&self) -> Option<std::collections::HashMap<String, String>> {
+        let mut values = std::collections::HashMap::new();
+        values.insert(self.field.id.clone(), self.selected_value()?);
+        Some(values)
+    }
+
+    pub fn handle_key(&mut self, key: &KeyEvent) -> McpSetupOutcome {
+        match key.code {
+            KeyCode::Esc => McpSetupOutcome::Cancel,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.error = None;
+                if self.selected > 0 {
+                    self.selected -= 1;
+                }
+                McpSetupOutcome::Changed
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.error = None;
+                if self.selected + 1 < self.field.options.len() {
+                    self.selected += 1;
+                }
+                McpSetupOutcome::Changed
+            }
+            KeyCode::Enter => {
+                if self.selected_value().is_none() {
+                    self.error = Some("Select an option".to_string());
+                    McpSetupOutcome::Changed
+                } else {
+                    McpSetupOutcome::Submit
+                }
+            }
+            _ => McpSetupOutcome::Unchanged,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpSetupOutcome {
+    Changed,
+    Unchanged,
+    Cancel,
+    Submit,
+}
+
 /// Modal message overlay (errors, confirmations).
 #[derive(Debug, Clone)]
 pub enum ModalMessage {
@@ -1776,6 +1871,7 @@ fn parse_mcp_add_fields(name: &str, url_or_cmd: &str) -> Option<ButtonAction> {
             transport,
             enabled: true,
             oauth: None,
+            setup: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
             tool_timeouts: None,
@@ -1823,6 +1919,7 @@ pub struct ExtensionsModalState {
     /// Active inline input (when the user is typing an argument for a command).
     /// `None` = normal button mode, `Some` = input mode.
     pub input: Option<ModalInput>,
+    pub mcp_setup: Option<McpSetupFormState>,
     /// Modal message state (error, confirmation prompt, etc.).
     pub modal_message: Option<ModalMessage>,
     /// Description of an in-flight action (blocks buttons while set).
@@ -1923,6 +2020,7 @@ impl ExtensionsModalState {
             plugins_data: TabDataState::Loading,
             button_areas: Vec::new(),
             input: None,
+            mcp_setup: None,
             modal_message: None,
             pending_action: None,
             pending_entry_index: None,
@@ -1995,6 +2093,7 @@ impl ExtensionsModalState {
         self.active_tab = tab;
         // Clear modal flow state from the previous tab.
         self.input = None;
+        self.mcp_setup = None;
         self.modal_message = None;
         self.pending_action = None;
         self.pending_entry_index = None;
@@ -2653,7 +2752,7 @@ pub fn render_extensions_modal(
     };
 
     // Input mode hides the entry list (form overlay owns the content area).
-    let in_input_mode = state.input.is_some();
+    let in_input_mode = state.input.is_some() || state.mcp_setup.is_some();
 
     // Rebuild the entry list *before* footer action labels so Space
     // enable/disable can use this frame's mapping (passed as locals to
@@ -3328,12 +3427,29 @@ pub fn render_extensions_modal(
         // Modal message overlay (error/confirmation) is rendered with
         // its own dismissal hint in the footer below — leave the
         // standard shortcuts list empty.
-    } else if state.picker_state.search_active && state.input.is_none() {
+    } else if state.picker_state.search_active && state.input.is_none() && state.mcp_setup.is_none()
+    {
         // Search bar has focus — hide the shortcuts footer entirely so
         // it doesn't compete visually with the typing cursor and so
         // typed letters don't appear to map to advertised actions
         // (they're going into the query, not triggering shortcuts).
         // Input-mode is handled below; it owns its own footer.
+    } else if state.mcp_setup.is_some() {
+        shortcuts.push(Shortcut {
+            label: "Enter save and authenticate",
+            clickable: false,
+            id: 0,
+        });
+        shortcuts.push(Shortcut {
+            label: "↑/↓ select",
+            clickable: false,
+            id: 0,
+        });
+        shortcuts.push(Shortcut {
+            label: "Esc cancel",
+            clickable: false,
+            id: 0,
+        });
     } else if let Some(ref input) = state.input {
         // "Add"/input mode: surface the keys the input form actually
         // handles. Tab is either path completion (single-field) or
@@ -3621,7 +3737,14 @@ pub fn render_extensions_modal(
     state.entry_non_selectable_clickable = non_selectable_clickable;
 
     // Render input form overlay (when in input mode).
-    if let Some(ref input) = state.input {
+    if let Some(ref setup) = state.mcp_setup {
+        let form_y = entries_start_y;
+        let form_height = entries_area.height;
+        if form_height > 0 {
+            let form_area = Rect::new(content_area.x, form_y, content_area.width, form_height);
+            render_mcp_setup_form(buf, form_area, setup, &theme);
+        }
+    } else if let Some(ref input) = state.input {
         let form_y = entries_start_y;
         let form_height = entries_area.height;
         if form_height > 0 {
@@ -3776,6 +3899,61 @@ pub fn render_extensions_modal(
             clear_style,
         );
         buf.set_string(footer_area.x + 1, y, &shown, text_style);
+    }
+}
+
+fn render_mcp_setup_form(buf: &mut Buffer, area: Rect, setup: &McpSetupFormState, theme: &Theme) {
+    if area.height < 6 || area.width < 20 {
+        return;
+    }
+    let h_inset: u16 = 2;
+    let x = area.x + h_inset;
+    let w = area.width.saturating_sub(h_inset * 2);
+    let rows = (setup.field.options.len() as u16).saturating_add(4);
+    let top = area.y + area.height.saturating_sub(rows) / 2;
+    let title = format!("{} — {}", setup.server_name, setup.field.label);
+    buf.set_string(
+        x,
+        top,
+        take_by_width(&title, w as usize),
+        Style::default()
+            .fg(theme.accent_user)
+            .bg(theme.bg_base)
+            .add_modifier(Modifier::BOLD),
+    );
+    let hint = "Save and authenticate";
+    buf.set_string(
+        x,
+        top.saturating_add(1),
+        hint,
+        Style::default().fg(theme.gray).bg(theme.bg_base),
+    );
+    for (idx, option) in setup.field.options.iter().enumerate() {
+        let y = top.saturating_add(3).saturating_add(idx as u16);
+        if y >= area.y + area.height {
+            break;
+        }
+        let selected = idx == setup.selected;
+        let marker = if selected { "❯" } else { " " };
+        let label = format!("{marker} {}", option.label);
+        let style = if selected {
+            Style::default()
+                .fg(theme.text_primary)
+                .bg(theme.bg_highlight)
+        } else {
+            Style::default().fg(theme.text_primary).bg(theme.bg_base)
+        };
+        buf.set_string(x, y, " ".repeat(w as usize), style);
+        buf.set_string(x, y, take_by_width(&label, w as usize), style);
+    }
+    if let Some(ref err) = setup.error {
+        let y = area.y + area.height.saturating_sub(1);
+        buf.set_string(
+            x,
+            y,
+            take_by_width(err, w as usize),
+            Style::default().fg(theme.accent_error).bg(theme.bg_base),
+        );
     }
 }
 
@@ -4164,6 +4342,55 @@ mod tests {
     }
 
     #[test]
+    fn mcp_setup_form_defaults_and_pref_value() {
+        use crate::views::mcps_modal::{
+            McpServerDisplayStatus, McpServerInfo, McpSetupConfig, McpSetupField, McpSetupOption,
+            McpWireSource,
+        };
+
+        let mut server = McpServerInfo {
+            name: "acme".into(),
+            display_name: None,
+            status: McpServerDisplayStatus::SetupRequired,
+            tool_count: 0,
+            auth_required: false,
+            setup_required: true,
+            setup: Some(McpSetupConfig {
+                fields: vec![McpSetupField {
+                    id: "site".into(),
+                    label: "Site".into(),
+                    field_type: "select".into(),
+                    required: true,
+                    default: Some("us1".into()),
+                    options: vec![
+                        McpSetupOption {
+                            label: "US1".into(),
+                            value: "us1".into(),
+                        },
+                        McpSetupOption {
+                            label: "US5".into(),
+                            value: "us5".into(),
+                        },
+                    ],
+                }],
+            }),
+            setup_values: std::collections::HashMap::new(),
+            tools: vec![],
+            enabled: true,
+            source: "plugin: acme".into(),
+            wire_source: McpWireSource::Local,
+            plugin_name: Some("acme".into()),
+            is_managed_gateway: false,
+        };
+        let form = McpSetupFormState::new(&server).unwrap();
+        assert_eq!(form.selected_value().as_deref(), Some("us1"));
+        server.setup_values.insert("site".into(), "us5".into());
+        let form = McpSetupFormState::new(&server).unwrap();
+        assert_eq!(form.selected_value().as_deref(), Some("us5"));
+        assert_eq!(form.values().unwrap()["site"], "us5");
+    }
+
+    #[test]
     fn selected_mcp_tool_returns_none_on_server_row() {
         let mut state = fixture_with_two_servers_and_tools();
         state.picker_state.selected = 0;
@@ -4238,6 +4465,9 @@ mod tests {
             status: McpServerDisplayStatus::NeedsAuth,
             tool_count: 0,
             auth_required: true,
+            setup_required: false,
+            setup: None,
+            setup_values: std::collections::HashMap::new(),
             tools: vec![],
             enabled: true,
             source: "managed".into(),
@@ -4286,6 +4516,9 @@ mod tests {
             status: McpServerDisplayStatus::Ready,
             tool_count: tc,
             auth_required: false,
+            setup_required: false,
+            setup: None,
+            setup_values: std::collections::HashMap::new(),
             tools: tool_details,
             enabled: true,
             source: "local".into(),
@@ -4375,6 +4608,9 @@ mod tests {
                 status: McpServerDisplayStatus::Ready,
                 tool_count: 0,
                 auth_required: false,
+                setup_required: false,
+                setup: None,
+                setup_values: std::collections::HashMap::new(),
                 tools: vec![],
                 enabled: true,
                 source: "plugin: alpha".into(),
@@ -4388,6 +4624,9 @@ mod tests {
                 status: McpServerDisplayStatus::Ready,
                 tool_count: 0,
                 auth_required: false,
+                setup_required: false,
+                setup: None,
+                setup_values: std::collections::HashMap::new(),
                 tools: vec![],
                 enabled: true,
                 source: "plugin: beta".into(),
@@ -4434,6 +4673,9 @@ mod tests {
             status: McpServerDisplayStatus::Ready,
             tool_count: 0,
             auth_required: false,
+            setup_required: false,
+            setup: None,
+            setup_values: std::collections::HashMap::new(),
             tools: vec![],
             enabled: true,
             source: plugin

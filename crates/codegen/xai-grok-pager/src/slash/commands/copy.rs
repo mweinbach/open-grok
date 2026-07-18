@@ -31,12 +31,6 @@ impl SlashCommand for CopyCommand {
         Some("[N]")
     }
 
-    /// Minimal mode has no in-app copy path — native terminal selection
-    /// replaces it (K7/§6.13). Gated off with a message.
-    fn available_in_minimal(&self) -> bool {
-        false
-    }
-
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         let trimmed = args.trim();
         let n = if trimmed.is_empty() {
@@ -152,8 +146,10 @@ mod tests {
     }
 
     #[test]
-    fn not_available_in_minimal() {
-        // Native terminal selection replaces the in-app copy path in minimal.
-        assert!(!CopyCommand.available_in_minimal());
+    fn available_in_minimal_by_default() {
+        // Clipboard copy from scrollback does not need the fullscreen pane —
+        // same path as `/export` and useful when native selection is awkward
+        // for multi-page assistant messages.
+        assert!(CopyCommand.available_in_minimal());
     }
 }

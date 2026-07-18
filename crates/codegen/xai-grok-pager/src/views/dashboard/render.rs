@@ -9,7 +9,8 @@ use ratatui::text::Span;
 use super::layout::{MIN_DASHBOARD_WIDTH, compute_layout};
 use super::row::{DashboardRow, RowBadge, build_rows_with_roster};
 use super::state::{
-    DashboardState, Filter, Focusable, Grouping, LocationPickerState, RowState, SectionKey,
+    DashboardRowId, DashboardState, Filter, Focusable, Grouping, LocationPickerState, RowState,
+    SectionKey,
 };
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
@@ -31,6 +32,32 @@ const NEEDS_INPUT_BLINK_DIVISOR: u64 = 10;
 // sibling activity views (which use circles). Filled marks the non-working states that
 // need a strong visual presence (needs-input, completed, failed, blocked);
 // hollow marks idle rows.
+
+fn ensure_peek_viewport_lifecycle(
+    state: &mut DashboardState,
+    agents: &mut IndexMap<AgentId, AgentView>,
+) {
+    if state.attached_agent.is_some() {
+        return;
+    }
+    // Peek row → begin/keep lease; else restore agent viewport.
+    let Some(row) = state.peek.as_ref().map(|p| p.row.clone()) else {
+        state.restore_peek_viewport(agents);
+        return;
+    };
+    if state
+        .peek_viewport
+        .as_ref()
+        .is_some_and(|lease| lease.row == row)
+    {
+        return;
+    }
+    if super::state::scrollback_available_for_row(&row, agents) {
+        state.begin_peek_viewport(row, agents);
+    } else {
+        state.restore_peek_viewport(agents);
+    }
+}
 
 // The thin left vertical bar marking the active/selected row
 // (`crate::glyphs::selection_bar()`, with a `│` CP437 fallback on legacy
@@ -71,7 +98,7 @@ pub fn render_dashboard(
     buf: &mut Buffer,
     area: Rect,
     state: &mut DashboardState,
-    agents: &IndexMap<AgentId, AgentView>,
+    agents: &mut IndexMap<AgentId, AgentView>,
     registry: &crate::actions::ActionRegistry,
     // App-level double-press confirmation hint (e.g. "press again to
     // quit" for Ctrl+Q / Ctrl+C / Ctrl+D). Threaded to the footer so the
@@ -88,8 +115,6 @@ pub fn render_dashboard(
     // Promo upgrade CTA to paint in the header after the location label
     // (`None` = no CTA); field meanings live on [`HeaderUpgradeCta`].
     upgrade_cta: Option<HeaderUpgradeCta<'_>>,
-    // `_compact` removed in this version. Hide-chrome / shortened
-    // activity strings are a Phase 5 polish item.
 ) -> Option<(u16, u16)> {
     // Cache whether a pinned (non-dismissible) promo CTA is live so the key
     // handler can steal Ctrl+O for it; the dispatch re-resolves the gate.
@@ -168,99 +193,90 @@ pub fn render_dashboard(
         return None;
     }
 
-    // The peek panel is shown by DEFAULT whenever an agent row is
-    // selected: it replaces the new-session dispatch box, follows the
-    // selection cursor, and surfaces live status + the last response (or
-    // a pending permission / ask question). With no selection (the
-    // `[+ New Agent]` button focused, or after Esc) the peek closes and
-    // the new-session input shows instead.
-    //
-    // `apply_fields` preserves the in-progress reply draft (held by the
-    // dashboard-owned `peek_reply` widget), reporting a row change so
-    // the draft is cleared only when the peeked row changes. The panel
-    // only opens when the terminal is tall enough to render it;
-    // otherwise the dispatch box shows even with a row selected. Done
-    // BEFORE the layout so the box can size to live content.
+    // Peek: list-first allocation (see layout::allocate_peek /
+    // docs/internal/33-dashboard-peek-responsive-layout.md). Provisional
+    // layout gives dispatch width for reply wrapping before we decide
+    // whether peek fits.
+    let mut layout = compute_layout(area, false);
+    let fixed = super::layout::chrome_overhead(area);
+    let reply_text_w = layout.dispatch.width.saturating_sub(6);
+
     match state.selected.clone() {
-        Some(sel) if area.height >= super::layout::MIN_PEEK_HEIGHT => {
-            match super::peek::compute_peek_fields(&sel, agents) {
-                Some(fields) => {
-                    // Record the peeked agent's cwd so the reply's `@`
-                    // picker can lazily retarget to it on first compose
-                    // (the retarget itself is deferred — see
-                    // `DashboardState::ensure_peek_reply_cwd`).
+        Some(sel) => match super::peek::compute_peek_fields(&sel, agents) {
+            Some(fields) => {
+                let question = fields.question.is_some();
+                let peek_min = if question {
+                    super::layout::PEEK_MIN_BOX_QUESTION
+                } else {
+                    super::layout::PEEK_MIN_BOX_LIVE_TAIL
+                };
+                let content_rows = if question {
+                    1 + fields.options.len().min(9) as u16
+                } else {
+                    let reply_rows = super::peek::reply_row_count(
+                        &state.peek_reply,
+                        reply_text_w,
+                        super::peek::MAX_REPLY_ROWS,
+                    );
+                    let max_content = super::layout::max_peek_content_rows(area);
+                    // Middle content width ≈ dispatch box minus borders + insets.
+                    let middle_w = layout.dispatch.width.saturating_sub(4);
+                    let (body_measured, pin_user) =
+                        super::state::scrollback_mut_for_row(&sel, agents)
+                            .map(|sb| {
+                                (
+                                    super::peek_tail::densified_body_line_count(sb, middle_w),
+                                    super::peek_tail::scrollback_has_last_user(sb),
+                                )
+                            })
+                            .unwrap_or((0, false));
+                    super::layout::peek_live_tail_desired_content(
+                        max_content,
+                        reply_rows,
+                        body_measured,
+                        pin_user,
+                    )
+                    .content_rows
+                };
+                let alloc =
+                    super::layout::allocate_peek(area.height, fixed, content_rows, peek_min);
+                if alloc.show_peek {
                     state.set_peek_reply_target_cwd(peeked_agent_cwd(&sel, agents));
-                    // Live model + mode for the bottom-border config badge.
-                    // Read before `sel` is moved into the panel below.
                     let badge = super::peek::peek_model_and_mode(&sel, agents);
                     match state.peek.as_mut() {
                         Some(p) => {
                             if p.apply_fields(sel, fields) {
-                                // Row changed under an open panel — a
-                                // half-typed reply must not be sent to the
-                                // newly-peeked agent (clears undo history too,
-                                // so Ctrl+Z can't resurrect it onto the new row).
                                 state.clear_peek_reply();
                             }
                         }
                         None => state.set_peek(Some(super::peek::PeekPanelState::new(sel, fields))),
                     }
-                    // `apply_fields` / `new` carry only the display snapshot;
-                    // the config badge is set live here so a `/model` switch
-                    // or yolo toggle reflects immediately.
                     if let Some(p) = state.peek.as_mut() {
                         p.model_name = badge.model;
                         p.auto_approve = badge.yolo;
                         p.auto = badge.auto;
                         p.plan_mode = badge.plan;
                     }
-                }
-                // Selected agent vanished — nothing to peek.
-                None => {
+                    layout = super::layout::compute_layout_with_peek_box(area, alloc.peek_box_h);
+                } else {
                     state.set_peek_reply_target_cwd(None);
                     state.set_peek(None);
                 }
             }
-        }
-        // No selection (or too short to render) → new-session input.
-        _ => {
+            None => {
+                state.set_peek_reply_target_cwd(None);
+                state.set_peek(None);
+            }
+        },
+        None => {
             state.set_peek_reply_target_cwd(None);
             state.set_peek(None);
         }
     }
 
-    // Compute the layout. Both the dispatch box and the peek reply grow
-    // vertically for multi-line input (Shift+Enter / Alt+Enter
-    // newlines); the peek box also sizes to its wrapped response. Both
-    // keep the row list usable.
-    let mut layout = compute_layout(area, state.peek.is_some());
-    if let Some(panel) = state.peek.as_ref() {
-        // Size the peek box to its content. When a permission / ask
-        // question is pending the box holds the question (1) + its
-        // options and the `❯ reply` row is hidden; otherwise it holds
-        // status (1) + wrapped response (≤ MAX_RESPONSE_ROWS) + a blank
-        // breathing row (1) + the reply (which GROWS with multi-line
-        // drafts, ≤ MAX_REPLY_ROWS). The box width is independent of its
-        // height, so the wrap widths are read from the first layout pass:
-        // the response uses `dispatch.width − 4` (2 border + 2 inset);
-        // the reply text loses a further 2 for the `❯ ` prefix (− 6).
-        let content_rows = if panel.question.is_some() {
-            1 + panel.options.len().min(9) as u16
-        } else {
-            let inner_w = layout.dispatch.width.saturating_sub(4) as usize;
-            let resp =
-                super::peek::response_row_count(panel, inner_w, super::peek::MAX_RESPONSE_ROWS);
-            let reply_text_w = layout.dispatch.width.saturating_sub(6);
-            let reply_rows = super::peek::reply_row_count(
-                &state.peek_reply,
-                reply_text_w,
-                super::peek::MAX_REPLY_ROWS,
-            );
-            // status(1) + response(resp) + blank(1) + reply(reply_rows)
-            resp as u16 + 2 + reply_rows
-        };
-        layout = super::layout::compute_layout_with_dispatch(area, true, content_rows);
-    } else if area.height > 8 && !state.dispatch.text().is_empty() {
+    ensure_peek_viewport_lifecycle(state, agents);
+
+    if state.peek.is_none() && area.height > 8 && !state.dispatch.text().is_empty() {
         let rows = dispatch_text_rows(state, layout.dispatch.width, area.height);
         if rows > 1 {
             layout = super::layout::compute_layout_with_dispatch(area, false, rows);
@@ -314,25 +330,56 @@ pub fn render_dashboard(
         let voice_listening = state.voice_listening;
         let voice_interim = state.voice_interim.clone();
         let multiline = state.multiline_mode;
-        let DashboardState {
-            peek, peek_reply, ..
-        } = state;
-        let render = peek
-            .as_ref()
-            .map(|panel| {
-                super::peek::render_peek_panel(
-                    buf,
-                    layout.dispatch,
-                    panel,
-                    peek_reply,
-                    &theme,
-                    voice_listening,
-                    voice_interim.as_deref(),
-                    multiline,
-                    Some(layout.list).filter(|r| r.area() > 0),
-                )
-            })
-            .unwrap_or_default();
+        let peeked_row = state.peek.as_ref().map(|p| p.row.clone());
+        let question_pending = state.peek.as_ref().is_some_and(|p| p.question.is_some());
+        let (empty_hint, has_scrollback) = match peeked_row.as_ref() {
+            Some(DashboardRowId::Subagent {
+                parent,
+                child_session_id,
+            }) => {
+                let parent_ok = agents
+                    .get(parent)
+                    .is_some_and(|p| p.subagent_sessions.contains_key(child_session_id));
+                let loaded = agents
+                    .get(parent)
+                    .is_some_and(|p| p.subagent_views.contains_key(child_session_id));
+                if parent_ok && !loaded {
+                    (Some("Subagent not loaded"), false)
+                } else {
+                    (None, loaded)
+                }
+            }
+            Some(row) => (
+                None,
+                super::state::scrollback_available_for_row(row, agents),
+            ),
+            None => (None, false),
+        };
+        let render = if let Some(panel) = state.peek.as_ref() {
+            let live_tail = if !question_pending && has_scrollback {
+                peeked_row
+                    .as_ref()
+                    .and_then(|row| super::state::scrollback_mut_for_row(row, agents))
+                    .map(|scrollback| super::peek::PeekLiveTailArgs { scrollback })
+            } else {
+                None
+            };
+            super::peek::render_peek_panel(
+                buf,
+                layout.dispatch,
+                panel,
+                &mut state.peek_reply,
+                &theme,
+                voice_listening,
+                voice_interim.as_deref(),
+                multiline,
+                Some(layout.list).filter(|r| r.area() > 0),
+                live_tail,
+                empty_hint,
+            )
+        } else {
+            Default::default()
+        };
         state.peek_reply_rect = render.reply_rect;
         let cursor = render.caret;
         // The reply is a full PromptWidget, so its `@` file-context
@@ -6880,14 +6927,14 @@ mod tests {
         let seed = ratatui::style::Color::Rgb(0xFF, 0x00, 0xFF);
         buf.set_style(area, Style::default().bg(seed));
 
-        let agents: IndexMap<AgentId, AgentView> = IndexMap::new();
+        let mut agents: IndexMap<AgentId, AgentView> = IndexMap::new();
         let mut state = DashboardState::new();
         let registry = crate::actions::ActionRegistry::defaults();
         let _ = render_dashboard(
             &mut buf,
             area,
             &mut state,
-            &agents,
+            &mut agents,
             &registry,
             None,
             &[],
@@ -7645,8 +7692,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Idle".into(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: None,
                 options: Vec::new(),
                 request_id: None,
@@ -7688,8 +7733,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Idle".into(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: None,
                 options: Vec::new(),
                 request_id: None,
@@ -7740,8 +7783,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Idle".into(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: None,
                 options: Vec::new(),
                 request_id: None,
@@ -7791,8 +7832,6 @@ mod tests {
                     time_ago: String::new(),
                     response_type: "NeedsInput".into(),
                     last_user_message: None,
-                    last_agent_lines: Vec::new(),
-                    last_response_truncated: false,
                     question: Some("Allow?".into()),
                     options: vec![
                         ("allow".into(), "Allow".into()),
@@ -7875,8 +7914,6 @@ mod tests {
                     time_ago: String::new(),
                     response_type: "NeedsInput".into(),
                     last_user_message: None,
-                    last_agent_lines: Vec::new(),
-                    last_response_truncated: false,
                     question: Some("Allow?".into()),
                     options: vec![
                         ("allow".into(), "Allow".into()),
@@ -8359,8 +8396,10 @@ mod tests {
         );
         let content = buf_to_text(&buf);
         assert!(
-            content.contains("Shift+Enter:send") || content.contains("Alt+Enter:send"),
-            "multiline footer must advertise Shift/Alt+Enter as send, got: {content:?}",
+            content.contains("Shift+Enter:send")
+                || content.contains("Alt+Enter:send")
+                || content.contains("Opt+Enter:send"),
+            "multiline footer must advertise Shift/Alt/Opt+Enter as send, got: {content:?}",
         );
         // Bare Enter:send would appear as "  Enter:send" (footer pad); the
         // modified chords contain the substring "Enter:send" so avoid that.
@@ -8396,8 +8435,10 @@ mod tests {
         );
         let content = buf_to_text(&buf);
         assert!(
-            content.contains("Shift+Enter:create") || content.contains("Alt+Enter:create"),
-            "multiline empty footer must advertise Shift/Alt+Enter as create, got: {content:?}",
+            content.contains("Shift+Enter:create")
+                || content.contains("Alt+Enter:create")
+                || content.contains("Opt+Enter:create"),
+            "multiline empty footer must advertise Shift/Alt/Opt+Enter as create, got: {content:?}",
         );
         assert!(
             !content.contains("  Enter:create"),

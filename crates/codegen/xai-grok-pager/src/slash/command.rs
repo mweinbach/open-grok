@@ -226,12 +226,13 @@ pub trait SlashCommand: Send + Sync {
     /// mode (`open-grok --minimal`).
     ///
     /// Minimal mode deletes the interactive fullscreen scrollback pane, the
-    /// in-app mouse selection/copy path, and the agent dashboard, handing
-    /// scroll / search / selection back to the terminal (K7). Commands that
-    /// drive those deleted surfaces — `/find`, `/copy`, `/dashboard` — have
-    /// nothing to act on, so the central dispatch gate refuses them with a
-    /// "/<x> is not available in minimal mode" message (committed as a system
-    /// block).
+    /// in-app mouse selection path, and the agent dashboard, handing scroll /
+    /// search / selection back to the terminal (K7). Commands that drive those
+    /// deleted surfaces — `/find`, `/dashboard` — have nothing to act on, so
+    /// the central dispatch gate refuses them with a "/<x> is not available in
+    /// minimal mode" message (committed as a system block). Clipboard helpers
+    /// like `/copy` stay available: they read scrollback state and do not need
+    /// the fullscreen pane.
     ///
     /// Defaults to `true` — a **denylist, not an allowlist**: the many
     /// mode-agnostic commands keep working and new commands are available in

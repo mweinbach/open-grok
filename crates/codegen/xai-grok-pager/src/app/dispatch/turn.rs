@@ -2,7 +2,7 @@
 
 use super::ctx::find_agent_by_session_id;
 use super::permissions::drain_permission_queue;
-use super::queue::{apply_turn_start_shim, maybe_drain_queue};
+use super::queue::{apply_turn_start_shim, maybe_drain_queue, note_peek_page_flip_after_drain};
 use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::agent_view::ActivePane;
@@ -317,6 +317,7 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
 
     let mut fired = false;
     let mut effects = Vec::new();
+    let mut drained_ids = Vec::new();
     for id in overdue {
         // Take the stashed adoption before borrowing the agent (disjoint
         // `app` fields; same pattern as the PromptResponse arm).
@@ -417,6 +418,10 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
             }
         }
         effects.extend(maybe_drain_queue(agent));
+        drained_ids.push(id);
+    }
+    for id in drained_ids {
+        note_peek_page_flip_after_drain(app, id);
     }
     fired.then_some(effects)
 }

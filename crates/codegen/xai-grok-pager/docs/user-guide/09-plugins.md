@@ -132,10 +132,35 @@ The `<source>` argument accepts:
 
 - `user/repo` -- GitHub shorthand
 - `user/repo@v1.0` -- pinned to a ref
+- `user/repo@<commit-sha>` -- pinned to an exact commit (verified after fetch)
 - `user/repo#subdir` -- subdirectory within the repo
 - `https://github.com/user/repo.git` -- full URL
 - `git@github.com:user/repo.git` -- SSH
 - `./local-dir` or `/absolute/path` -- local directory
+
+### Requiring commit pins (`require_sha`)
+
+Remote plugins are not cryptographically signed: an install that tracks a
+branch or tag runs whatever that ref points at tomorrow. Operators can require
+every remote install and update to pin a full commit sha (40- or 64-hex,
+verified against the fetched checkout):
+
+```toml
+# config.toml
+[marketplace]
+require_sha = true
+```
+
+or `OPENGROK_MARKETPLACE_REQUIRE_SHA=1`. The legacy
+`GROK_MARKETPLACE_REQUIRE_SHA=1` alias is also accepted. All three controls are
+tighten-only: any one enables the policy and none can switch it back off. With the policy on, unpinned
+remote installs, marketplace installs without a published `sha`, and updates of
+branch-tracking installs are refused.
+
+Scope: the policy covers everything fetched from a remote git URL at install or
+update time. Plugins vendored inside a marketplace source itself are copied
+from that source's synced checkout and are not covered — pin your marketplace
+source's content by publishing `sha` entries in `plugin-index.json`.
 
 ### Marketplace commands
 

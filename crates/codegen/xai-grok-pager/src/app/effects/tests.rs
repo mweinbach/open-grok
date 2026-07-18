@@ -23,8 +23,8 @@ fn format_acp_error_rate_limit_is_auth_aware() {
         RATE_LIMITED_USER_MESSAGE_OAUTH,
     };
     let err = acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited").data("slow down");
-    assert_eq!(format_acp_error(& err, false), RATE_LIMITED_USER_MESSAGE_OAUTH);
-    assert_eq!(format_acp_error(& err, true), RATE_LIMITED_USER_MESSAGE_API_KEY);
+    assert_eq!(format_acp_error(&err, false), RATE_LIMITED_USER_MESSAGE_OAUTH);
+    assert_eq!(format_acp_error(&err, true), RATE_LIMITED_USER_MESSAGE_API_KEY);
 }
 /// Non-empty token ranges ride the wire block meta as `skillTokenRanges`
 /// byte pairs; the text itself is untouched.

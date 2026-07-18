@@ -1,6 +1,6 @@
 //! Subscription tier checks, credit-limit upsells, and auto-topup handling.
 
-use super::queue::maybe_drain_queue;
+use super::queue::{maybe_drain_queue, note_peek_page_flip_after_drain};
 use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
@@ -85,22 +85,17 @@ pub(crate) fn is_credit_limit_error(http_status: Option<u16>, message: &str) -> 
 
 /// Well-known error code CCP returns (HTTP 429, flat body
 /// `{"code": "...", "error": "..."}`) when a free-tier user exhausts the
-/// free usage quota. Kept in sync with the shared well-known error code
-/// `SUBSCRIPTION_FREE_USAGE_EXHAUSTED`. sampling-types' `parse_error_bytes` prepends the flat
-/// `code` to the flattened message, so the code reaches the pager embedded
-/// in `RetryState::Exhausted.reason` and the -32003 error's data string.
+/// free usage quota.
 pub(crate) const FREE_USAGE_EXHAUSTED_ERROR_CODE: &str = "subscription:free-usage-exhausted";
 
-/// Whether a rate-limit error is the free-usage-quota exhaustion (paywall)
-/// rather than transient throttling. Text-sniff on the flattened message,
-/// same precedent as [`is_credit_limit_error`].
+/// Whether a rate-limit error is free-usage-quota exhaustion rather than
+/// transient throttling.
 pub(crate) fn is_free_usage_exhausted_error(reason: &str) -> bool {
     reason.contains(FREE_USAGE_EXHAUSTED_ERROR_CODE)
 }
 
-/// Whether a rate-limited (-32003) ACP error is the free-usage exhaustion.
-/// `data` may be a bare string or the `{message, promptUsage?}` object
-/// `attach_prompt_usage` produces — always read via the shared detail helper.
+/// Whether a rate-limited (-32003) ACP error is free-usage exhaustion. The
+/// error data may be a string or the wrapped prompt-usage object.
 pub(crate) fn acp_error_is_free_usage_exhausted(err: &agent_client_protocol::Error) -> bool {
     err.data
         .as_ref()
@@ -109,10 +104,8 @@ pub(crate) fn acp_error_is_free_usage_exhausted(err: &agent_client_protocol::Err
         .is_some_and(is_free_usage_exhausted_error)
 }
 
-/// User-facing message for free-usage exhaustion. Shown by headless mode and
-/// `format_acp_error` in place of auth-aware rate-limit copy. Deliberately
-/// promises no reset duration — the quota window is backend-config-driven.
-pub(crate) const FREE_USAGE_USER_MESSAGE: &str = "You\u{2019}ve reached your free Grok Build usage limit for now. Get SuperGrok for much higher limits, or try again later: https://grok.com/supergrok?referrer=grok-build";
+/// User-facing free-usage exhaustion message for the xAI service path.
+pub(crate) const FREE_USAGE_USER_MESSAGE: &str = "You\u{2019}ve reached your free Open Grok usage limit for now. Get SuperGrok for much higher limits, or try again later: https://grok.com/supergrok?referrer=grok-build";
 
 /// Open the credit-limit upsell on the given agent.
 ///
@@ -634,6 +627,7 @@ pub(super) fn handle_credit_limit_recheck_complete(
         agent_id,
         silent: true,
     });
+    note_peek_page_flip_after_drain(app, agent_id);
     effects
 }
 
@@ -670,7 +664,6 @@ mod tests {
         let string_err = agent_client_protocol::Error::new(-32003, "Rate limited").data(free);
         assert!(acp_error_is_free_usage_exhausted(&string_err));
 
-        // attach_prompt_usage wraps string data as {"message": ..., "promptUsage": ...}.
         let wrapped =
             agent_client_protocol::Error::new(-32003, "Rate limited").data(serde_json::json!({
                 "message": free,

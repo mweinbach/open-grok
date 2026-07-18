@@ -1500,8 +1500,6 @@ pub async fn run_single_turn(
         }
         Some(Err(err)) => {
             let msg = if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
-                // The -32003 data is the flattened server message; a
-                // free-usage 429 carries the well-known code inline there.
                 if crate::app::acp_error_is_free_usage_exhausted(&err) {
                     crate::app::FREE_USAGE_USER_MESSAGE.to_string()
                 } else {

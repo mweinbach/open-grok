@@ -1885,9 +1885,10 @@ pub(super) fn seed_owner_agent_with_open_modal(app: &mut AppView) {
             vec![
                 McpServerInfo { name : "alpha".into(), display_name : None, status :
                 McpServerDisplayStatus::Initializing, tool_count : 0, auth_required :
-                false, tools : Vec::new(), enabled : true, source : "local".into(),
-                wire_source : McpWireSource::Local, plugin_name : None,
-                is_managed_gateway : false, }
+                false, setup_required : false, setup : None, setup_values :
+                std::collections::HashMap::new(), tools : Vec::new(), enabled : true,
+                source : "local".into(), wire_source : McpWireSource::Local, plugin_name
+                : None, is_managed_gateway : false, }
             ],
         ),
     );

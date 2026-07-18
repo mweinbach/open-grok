@@ -14,6 +14,7 @@ pub mod plan_nudge;
 pub mod render;
 pub mod send_now;
 pub mod small_screen;
+pub mod ssh_wrap;
 pub mod word_select;
 
 pub use ephemeral::{DEFAULT_TIP_TICKS, EphemeralTip, EphemeralTipState, tip_row_renderable};

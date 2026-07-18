@@ -49,6 +49,8 @@ pub enum WarningCategory {
     WaylandNoDataControl,
     /// Below truecolor: truecolor themes hidden. `/terminal-setup` only.
     LimitedColorSupport,
+    /// The session runs over SSH without `open-grok wrap` on the local end.
+    SshWithoutWrap,
 }
 
 /// A structured startup warning carrying category, human-readable description,
@@ -368,6 +370,33 @@ pub fn assemble_startup_warnings(
     summarized
 }
 
+/// Recommend wrapping a plain SSH session on the local machine so clipboard
+/// forwarding and terminal-mode restoration survive a dropped connection.
+pub fn ssh_wrap_hint(
+    is_ssh: bool,
+    osc52_sink_active: bool,
+    is_official_vscode_remote: bool,
+) -> Option<TerminalWarning> {
+    if !is_ssh || osc52_sink_active || is_official_vscode_remote {
+        return None;
+    }
+    let mut warning = TerminalWarning::new(
+        WarningCategory::SshWithoutWrap,
+        "Running over SSH without `open-grok wrap` -- clipboard copies depend on the \
+         terminal's escape-sequence support, and a dropped connection can leave \
+         your local terminal in a bad state",
+        Some("open-grok wrap ssh <host>"),
+        None,
+    );
+    warning.note = Some(
+        "Run it on your local machine in place of plain `ssh` -- it forwards \
+         clipboard copies to your local system and restores terminal modes if \
+         the connection drops."
+            .to_string(),
+    );
+    Some(warning)
+}
+
 /// Returns `true` if the terminal brand is known to support CSI focus-tracking
 /// events (`\x1b[?1004h` / focus-in / focus-out sequences).
 fn supports_focus_tracking(brand: TerminalName) -> bool {
@@ -560,6 +589,140 @@ pub fn diagnose_wayland_data_control_live() -> Option<TerminalWarning> {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Osc52Capability {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+impl Osc52Capability {
+    fn from_brand(brand: TerminalName) -> Self {
+        if brand.supports_osc52_clipboard() {
+            Self::Supported
+        } else if brand == TerminalName::Unknown {
+            Self::Unknown
+        } else {
+            Self::Unsupported
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClipboardDiagnosticsInput<'a> {
+    pub route_native: bool,
+    pub route_tmux: bool,
+    pub route_osc52: bool,
+    pub native_tool: &'a str,
+    pub brand: TerminalName,
+    pub host_os: crate::host::HostOs,
+    pub display_server: crate::host::DisplayServer,
+    pub is_ssh: bool,
+    pub container_no_display: bool,
+    pub osc52_sink: bool,
+    pub wayland_data_control: bool,
+    pub wl_copy_available: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ClipboardDiagnostics {
+    pub text: String,
+    pub has_issue: bool,
+}
+
+/// Format clipboard route confidence without claiming a copy already happened.
+pub fn format_clipboard_diagnostics(input: ClipboardDiagnosticsInput<'_>) -> ClipboardDiagnostics {
+    use crate::clipboard::{
+        ClipboardDelivery, NativeClipboardPreflight, expected_delivery, native_clipboard_preflight,
+    };
+
+    let capability = Osc52Capability::from_brand(input.brand);
+    let native_preflight = native_clipboard_preflight(
+        input.route_native,
+        input.host_os,
+        input.display_server,
+        input.is_ssh,
+        input.container_no_display,
+        input.wayland_data_control,
+        input.wl_copy_available,
+    );
+    let delivery = expected_delivery(
+        native_preflight,
+        input.route_tmux,
+        input.route_osc52,
+        input.brand,
+        input.is_ssh,
+        input.container_no_display,
+        input.osc52_sink,
+    );
+    let native = match native_preflight {
+        NativeClipboardPreflight::LocalAvailable => format!("local ({})", input.native_tool),
+        NativeClipboardPreflight::RemoteOnly if input.container_no_display => {
+            format!("container ({})", input.native_tool)
+        }
+        NativeClipboardPreflight::RemoteOnly => format!("remote ({})", input.native_tool),
+        NativeClipboardPreflight::Unavailable => "unavailable".to_owned(),
+        NativeClipboardPreflight::Disabled => "off".to_owned(),
+    };
+    let tmux = if input.route_tmux { "on" } else { "off" };
+    let osc52 = if !input.route_osc52 {
+        "off"
+    } else if input.osc52_sink || capability == Osc52Capability::Supported {
+        "supported"
+    } else {
+        capability.label()
+    };
+    let wrap = if input.osc52_sink { "on" } else { "off" };
+    let status = match delivery {
+        ClipboardDelivery::Confirmed => "confirmed",
+        ClipboardDelivery::Unverified => "unverified",
+        ClipboardDelivery::Failed => "unavailable",
+    };
+    let fix = match delivery {
+        ClipboardDelivery::Confirmed => None,
+        ClipboardDelivery::Unverified | ClipboardDelivery::Failed if input.is_ssh => {
+            Some("open-grok wrap <ssh command> or /minimal")
+        }
+        ClipboardDelivery::Unverified | ClipboardDelivery::Failed if input.container_no_display => {
+            Some("open-grok wrap <command> or /minimal")
+        }
+        ClipboardDelivery::Unverified => Some("open-grok wrap or /minimal"),
+        ClipboardDelivery::Failed => Some("/minimal"),
+    };
+
+    let mut out = String::from("Clipboard\n");
+    out.push_str(&format!("  native       {native}\n"));
+    out.push_str(&format!("  tmux         {tmux}\n"));
+    out.push_str(&format!("  osc 52       {osc52}\n"));
+    out.push_str(&format!("  wrap         {wrap}\n"));
+    if input.display_server == crate::host::DisplayServer::Wayland {
+        out.push_str(&format!(
+            "  data-control {}\n",
+            if input.wayland_data_control {
+                "on"
+            } else {
+                "off"
+            }
+        ));
+    }
+    out.push_str(&format!("  status       {status}\n"));
+    if let Some(fix) = fix {
+        out.push_str(&format!("  fix          {fix}\n"));
+    }
+    ClipboardDiagnostics {
+        text: out,
+        has_issue: delivery != ClipboardDelivery::Confirmed,
+    }
+}
+
 /// `/terminal-setup` Environment `color` row.
 pub fn format_color_env_line(level: ColorLevel) -> String {
     format!("  color        {}\n", level.as_str())
@@ -721,6 +884,50 @@ mod tests {
                 _ => false,
             }
         }
+    }
+
+    fn clipboard_input(brand: TerminalName) -> ClipboardDiagnosticsInput<'static> {
+        ClipboardDiagnosticsInput {
+            route_native: true,
+            route_tmux: false,
+            route_osc52: true,
+            native_tool: "arboard",
+            brand,
+            host_os: crate::host::HostOs::Linux,
+            display_server: crate::host::DisplayServer::Unknown,
+            is_ssh: true,
+            container_no_display: false,
+            osc52_sink: false,
+            wayland_data_control: false,
+            wl_copy_available: false,
+        }
+    }
+
+    #[test]
+    fn clipboard_diagnostics_distinguish_unknown_and_supported_ssh() {
+        let unknown = format_clipboard_diagnostics(clipboard_input(TerminalName::Unknown));
+        assert!(unknown.text.contains("osc 52       unknown"));
+        assert!(unknown.text.contains("status       unverified"));
+        assert!(
+            unknown
+                .text
+                .contains("fix          open-grok wrap <ssh command> or /minimal")
+        );
+        assert!(unknown.has_issue);
+
+        let supported = format_clipboard_diagnostics(clipboard_input(TerminalName::Ghostty));
+        assert!(supported.text.contains("status       confirmed"));
+        assert!(!supported.has_issue);
+    }
+
+    #[test]
+    fn ssh_wrap_hint_is_plain_ssh_only() {
+        let warning = ssh_wrap_hint(true, false, false).expect("plain SSH should suggest wrap");
+        assert_eq!(warning.category, WarningCategory::SshWithoutWrap);
+        assert_eq!(warning.fix.as_deref(), Some("open-grok wrap ssh <host>"));
+        assert!(ssh_wrap_hint(false, false, false).is_none());
+        assert!(ssh_wrap_hint(true, true, false).is_none());
+        assert!(ssh_wrap_hint(true, false, true).is_none());
     }
 
     // -- Test context builders ------------------------------------------------

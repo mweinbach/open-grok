@@ -41,9 +41,7 @@
         let update = XaiSessionUpdate::ImageDropped {
             notes: notes.clone(),
         };
-        let changed = apply_session_event(&update, &mut session, &mut scrollback,
-            false,
-        );
+        let changed = apply_session_event(&update, &mut session, &mut scrollback, false);
         assert!(changed);
         assert_eq!(scrollback.len(), before + 1);
         let entry = scrollback.entries_mut().last().expect("entry pushed");
@@ -109,9 +107,7 @@
             max_retries: 3,
             reason: "rate limited".into(),
         };
-        apply_retry_state(&retry, &mut session, &mut scrollback,
-            false,
-        );
+        apply_retry_state(&retry, &mut session, &mut scrollback, false);
         assert!(
             session.in_flight_prompt.is_none(),
             "RetryState bypasses session/update in_flight hook"
@@ -131,9 +127,7 @@
                 is_rate_limited: true,
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             session.rate_limited,
             "rate_limited flag must be set when is_rate_limited is true"
@@ -141,14 +135,35 @@
     }
 
     #[test]
-    fn retry_exhausted_rate_limited_message_is_auth_aware() {
-        use xai_grok_shell::sampling::error::{
-            RATE_LIMITED_USER_MESSAGE_API_KEY, RATE_LIMITED_USER_MESSAGE_OAUTH,
+    fn retry_exhausted_rate_limited_empty_reason_uses_oauth_fallback() {
+        use xai_grok_shell::sampling::error::RATE_LIMITED_USER_MESSAGE_OAUTH;
+
+        let empty = RetryState::Exhausted {
+            attempts: 3,
+            reason: "".into(),
+            is_rate_limited: true,
         };
 
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(&empty, &mut session, &mut scrollback, false);
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::RetryFailed { error, .. }) => {
+                assert_eq!(error, RATE_LIMITED_USER_MESSAGE_OAUTH);
+            }
+            other => panic!("expected empty-rate-limit RetryFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_exhausted_rate_limited_server_detail_stays_auth_aware() {
+        use xai_grok_shell::sampling::error::RATE_LIMITED_USER_MESSAGE_OAUTH;
+
+        let reason =
+            "The model is currently at capacity due to high demand. Please try again.".to_string();
         let exhausted = RetryState::Exhausted {
             attempts: 3,
-            reason: "rate limited".into(),
+            reason: reason.clone(),
             is_rate_limited: true,
         };
 
@@ -159,15 +174,30 @@
             Some(SessionEvent::RetryFailed { error, .. }) => {
                 assert_eq!(error, RATE_LIMITED_USER_MESSAGE_OAUTH);
             }
-            other => panic!("expected OAuth rate-limit RetryFailed, got {other:?}"),
+            other => panic!("expected auth-aware RetryFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn retry_exhausted_api_key_rewrites_consumer_subscription_upsell() {
+        use xai_grok_shell::sampling::error::RATE_LIMITED_USER_MESSAGE_API_KEY;
+
+        let rpm = RetryState::Exhausted {
+            attempts: 2,
+            reason: "Some resource has been exhausted: You are sending requests too quickly. \
+                     Please slow down, or upgrade to a Grok subscription for higher limits: \
+                     https://grok.com/supergrok"
+                .into(),
+            is_rate_limited: true,
+        };
 
         let mut session = make_session(Some("s1"));
         let mut scrollback = ScrollbackState::new();
-        apply_retry_state(&exhausted, &mut session, &mut scrollback, true);
+        apply_retry_state(&rpm, &mut session, &mut scrollback, true);
         match last_session_event(&scrollback) {
             Some(SessionEvent::RetryFailed { error, .. }) => {
                 assert_eq!(error, RATE_LIMITED_USER_MESSAGE_API_KEY);
+                assert!(!error.contains("grok.com/supergrok"));
             }
             other => panic!("expected API-key rate-limit RetryFailed, got {other:?}"),
         }
@@ -185,9 +215,7 @@
                 is_rate_limited: false,
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             !session.rate_limited,
             "rate_limited flag must not be set when is_rate_limited is false"
@@ -218,9 +246,7 @@
                 is_rate_limited: true,
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             session.rate_limited,
             "free-usage keeps rate_limited (TurnFailed/toast suppression)"
@@ -254,9 +280,7 @@
                 is_rate_limited: false,
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             session.credit_limit_blocked,
             "credit_limit_blocked must be set for credit-limit 403"
@@ -284,9 +308,7 @@
                 message: "status 403: run out of credits".into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             session.credit_limit_blocked,
             "credit_limit_blocked must be set for credit-limit 403"
@@ -316,9 +338,7 @@
                         .into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             session.credit_limit_blocked,
             "credit_limit_blocked must be set for pool 402 balance exhausted"
@@ -342,9 +362,7 @@
                 message: "internal server error".into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             !session.credit_limit_blocked,
             "credit_limit_blocked must NOT be set for non-credit-limit errors"
@@ -390,9 +408,7 @@
                     .into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             matches!(
                 last_session_event(&scrollback),
@@ -421,9 +437,7 @@
                 message: "Unauthorized (401) from https://proxy/v1/messages".into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             session.in_flight_prompt.is_some(),
             "in_flight_prompt must be preserved on a recoverable auth failure"
@@ -444,9 +458,7 @@
                     .into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(matches!(
             last_session_event(&scrollback),
             Some(SessionEvent::ReAuthRequired)
@@ -467,9 +479,7 @@
                     .into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(matches!(
             last_session_event(&scrollback),
             Some(SessionEvent::RetryFailed { .. })
@@ -487,9 +497,7 @@
                 message: "internal server error".into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(matches!(
             last_session_event(&scrollback),
             Some(SessionEvent::RetryFailed { .. })
@@ -510,9 +518,7 @@
                     .into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             matches!(
                 last_session_event(&scrollback),
@@ -537,9 +543,7 @@
                 message: "the prompt is too long for this model's context window".into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             matches!(
                 last_session_event(&scrollback),
@@ -569,7 +573,8 @@
 
         session.note_context_used(43_000);
 
-        session.finish_turn(&mut scrollback);
+        session.finish_turn(&mut scrollback,
+        );
         match last_session_event(&scrollback) {
             Some(SessionEvent::CompactionCompleted {
                 tokens_before,
@@ -597,7 +602,8 @@
             summary_preview: None,
         };
         assert!(apply_session_event(&update, &mut session, &mut scrollback, false));
-        session.finish_turn(&mut scrollback);
+        session.finish_turn(&mut scrollback,
+        );
         match last_session_event(&scrollback) {
             Some(SessionEvent::CompactionCompleted { tokens_after, .. }) => {
                 assert_eq!(
@@ -648,14 +654,13 @@
         assert!(apply_session_event(
             &update,
             &mut agent.session,
-            &mut agent.scrollback,
-            false,
-        ));
+            &mut agent.scrollback, false));
 
         refresh_context_used(&mut agent, 66_000);
         confirm_context_used(&mut agent, 43_000);
 
-        agent.session.finish_turn(&mut agent.scrollback);
+        agent.session.finish_turn(&mut agent.scrollback,
+        );
         match last_session_event(&agent.scrollback) {
             Some(SessionEvent::CompactionCompleted {
                 tokens_before,
@@ -811,9 +816,7 @@
                 message: "incompatible history".into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             session.model_incompatible,
             "encrypted_content_mismatch should set model_incompatible flag"
@@ -832,12 +835,9 @@
                 message: "bad request".into(),
             },
             &mut session,
-            &mut scrollback,
-            false,
-        );
+            &mut scrollback, false);
         assert!(
             !session.model_incompatible,
             "non-encrypted_content error types must not set model_incompatible"
         );
     }
-

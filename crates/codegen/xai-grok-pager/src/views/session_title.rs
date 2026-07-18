@@ -71,6 +71,60 @@ fn first_user_prompt_text(agent: &AgentView) -> Option<String> {
     None
 }
 
+/// First line of the most recent user prompt (`RenderBlock::UserPrompt`) in
+/// the agent's scrollback, ANSI-stripped + sanitised; `None` when the user
+/// hasn't sent any prompts yet.
+pub(crate) fn last_user_prompt_line(agent: &AgentView) -> Option<String> {
+    let len = agent.scrollback.len();
+    for idx in (0..len).rev() {
+        let entry = agent.scrollback.entry(idx)?;
+        if let RenderBlock::UserPrompt(b) = &entry.block {
+            let first = b.text.lines().next().unwrap_or("").trim();
+            if first.is_empty() {
+                continue;
+            }
+            let stripped = strip_ansi_escapes::strip_str(first);
+            let safe = sanitize_display_text(&stripped).into_owned();
+            return Some(safe.trim().to_string());
+        }
+    }
+    None
+}
+
+/// First renderable line of the newest agent message, ANSI-stripped +
+/// sanitised. Pairing guarantee: returns `None` when a `UserPrompt` is newer
+/// than every agent message (that prompt is unanswered — an older reply would
+/// misrepresent the latest exchange), or when the message has no renderable
+/// line (older messages are not scanned).
+pub(crate) fn last_agent_message_line(agent: &AgentView) -> Option<String> {
+    let len = agent.scrollback.len();
+    for idx in (0..len).rev() {
+        let entry = agent.scrollback.entry(idx)?;
+        match &entry.block {
+            RenderBlock::AgentMessage(msg) => {
+                let text = msg.text();
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let stripped = strip_ansi_escapes::strip_str(trimmed);
+                    let safe = sanitize_display_text(&stripped).into_owned();
+                    let safe = safe.trim().to_string();
+                    if !safe.is_empty() {
+                        return Some(safe);
+                    }
+                }
+                return None;
+            }
+            // The user's latest prompt marks the turn boundary — no reply yet.
+            RenderBlock::UserPrompt(_) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Take the first `MAX_TITLE_CHARS` chars and append an ellipsis when
 /// truncated. Char-based (not byte-based) so multi-byte codepoints
 /// don't get split.

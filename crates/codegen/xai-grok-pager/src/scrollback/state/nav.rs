@@ -392,15 +392,51 @@ impl ScrollbackState {
         self.bump_generation();
     }
 
+    /// Rows to advance for a full-page scroll.
+    ///
+    /// A page is the *content* area (viewport minus any sticky prompt header
+    /// pinned at the top) less a 2-row overlap for continuity. Subtracting the
+    /// header is what keeps a page-flip from skipping the lines that sit behind
+    /// the pinned prompt: without it, a page moves `viewport_height - 2` rows
+    /// but only `viewport_height - header` rows are actually on screen, so
+    /// `header - 2` lines are silently jumped over at the top border. Always
+    /// moves at least 1 row so paging never stalls on a tiny viewport.
+    fn page_scroll_rows(&self) -> u16 {
+        let header = self.current_header_screen_rows();
+        self.viewport_height
+            .saturating_sub(header)
+            .saturating_sub(2)
+            .max(1)
+    }
+
+    /// Current sticky header height in screen rows (0 when no header/cache).
+    fn current_header_screen_rows(&self) -> u16 {
+        // Mirror render_with_sticky_headers: no sticky header is drawn when disabled
+        // or in compact prompt mode, so the whole viewport is content and paging
+        // must not subtract a header height.
+        if !self.appearance.scrollback.display.sticky_headers || self.appearance.prompt.compact {
+            return 0;
+        }
+        let Some(cache) = self.layout_cache.as_ref() else {
+            return 0;
+        };
+        let range = self.visible_entry_range();
+        if range.is_empty() {
+            return 0;
+        }
+        self.current_sticky_layout(cache, &range)
+            .header_screen_rows()
+    }
+
     /// Page up: scroll viewport, then select the topmost selectable on-screen entry.
     pub fn page_up(&mut self) {
-        self.scroll_up(self.viewport_height.saturating_sub(2));
+        self.scroll_up(self.page_scroll_rows());
         self.select_viewport_edge(/* prefer_top */ true);
     }
 
     /// Page down: scroll viewport, then select the bottommost selectable on-screen entry.
     pub fn page_down(&mut self) {
-        self.scroll_down(self.viewport_height.saturating_sub(2));
+        self.scroll_down(self.page_scroll_rows());
         self.select_viewport_edge(/* prefer_top */ false);
     }
 
@@ -537,6 +573,10 @@ impl ScrollbackState {
     /// Check if follow mode is enabled.
     pub fn is_follow_mode(&self) -> bool {
         self.follow_mode
+    }
+
+    pub(crate) fn is_follow_preserve_scroll(&self) -> bool {
+        self.follow_preserve_scroll
     }
 
     /// Check if there's content below the viewport (not at the bottom).
@@ -2154,6 +2194,153 @@ mod tests {
         assert!(
             delta <= state.viewport_height as usize,
             "viewport jumped {delta} rows after select_next (page offset was {offset_after_page})"
+        );
+    }
+
+    /// Regression: a full page-down must not skip the lines that sit behind a
+    /// sticky prompt header pinned at the viewport top. The content area is
+    /// `viewport - header` rows, so a page that advances `viewport - 2` rows
+    /// jumps `header - 2` lines over the top border. The page delta has to
+    /// subtract the header height so the intended 2-row overlap is preserved.
+    #[test]
+    fn page_down_does_not_skip_lines_behind_sticky_header() {
+        let mut h = ScrollTestHarness::new(80, 20);
+        // A multi-line prompt so the pinned header is taller than the 2-row
+        // overlap (single-line prompts render as exactly 1 row + 1 gap = 2,
+        // which happens to match the overlap and would hide the bug), followed
+        // by one very tall response so there is plenty of room to page through
+        // the middle without clamping at the bottom.
+        h.push_prompt("Q1 line A\nQ1 line B\nQ1 line C");
+        let giant: String = (1..=300)
+            .map(|i| format!("answer line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        h.push_agent(&giant);
+        h.frame();
+
+        // Start at the top, then page down until the prompt scrolls above the
+        // viewport and pins as a sticky header. One extra page lands on the
+        // stable (fully collapsed) header height.
+        h.state.goto_top();
+        h.frame();
+        let mut guard = 0;
+        while h.state.current_header_screen_rows() == 0 {
+            h.state.page_down();
+            h.frame();
+            guard += 1;
+            assert!(
+                guard < 100,
+                "expected a sticky header to appear while paging"
+            );
+        }
+        h.state.page_down();
+        h.frame();
+
+        // The header must be taller than the 2-row overlap, otherwise the old
+        // `viewport - 2` delta would not have skipped anything and the test
+        // would not exercise the bug.
+        let header = h.state.current_header_screen_rows();
+        assert!(
+            header > 2,
+            "test needs a header taller than the overlap to be meaningful, got {header}"
+        );
+        // There must be a full page of room left below, so the next page-down
+        // advances a whole page instead of clamping at the bottom.
+        assert!(
+            h.state.scroll_offset + h.state.viewport_height as usize <= h.max_offset(),
+            "test needs a full page of room to page down without clamping"
+        );
+
+        let old_bottom_line = h.state.scroll_offset + h.state.viewport_height as usize - 1;
+        h.state.page_down();
+        h.frame();
+        let new_top_content = h.state.scroll_offset + h.state.current_header_screen_rows() as usize;
+
+        assert!(
+            new_top_content <= old_bottom_line + 1,
+            "page-down skipped lines behind the sticky header: new top content line \
+             {new_top_content} > old bottom line {old_bottom_line} + 1"
+        );
+    }
+
+    /// Regression: when sticky headers are disabled the renderer draws no
+    /// header (`render_with_sticky_headers` falls back to a zero-height layout
+    /// because `use_sticky` is false), so the whole viewport is content and a
+    /// page must advance `viewport - 2`. `current_header_screen_rows()` used to
+    /// measure the header unconditionally, so `page_scroll_rows()` subtracted a
+    /// header that was never on screen and PageUp/PageDown advanced short of a
+    /// full page. The header height must be gated on the same flag as the
+    /// renderer.
+    #[test]
+    fn page_delta_ignores_header_when_sticky_headers_disabled() {
+        let mut h = ScrollTestHarness::new(80, 20);
+        // Same setup as the sticky-header test: a multi-line prompt that would
+        // pin a >2-row header when enabled, plus a long response with room to
+        // page through the middle without clamping at the bottom.
+        h.push_prompt("Q1 line A\nQ1 line B\nQ1 line C");
+        let giant: String = (1..=300)
+            .map(|i| format!("answer line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        h.push_agent(&giant);
+        h.frame();
+
+        // Page down (with sticky headers on, the harness default) until the
+        // prompt pins as a header, so we land on a scroll position where a
+        // header genuinely exists.
+        h.state.goto_top();
+        h.frame();
+        let mut guard = 0;
+        while h.state.current_header_screen_rows() == 0 {
+            h.state.page_down();
+            h.frame();
+            guard += 1;
+            assert!(
+                guard < 100,
+                "expected a sticky header to appear while paging"
+            );
+        }
+        h.state.page_down();
+        h.frame();
+
+        // Sanity: with sticky headers on, a real (>2-row) header is measured
+        // here, so gating on the flag actually changes the result below.
+        let header_on = h.state.current_header_screen_rows();
+        assert!(
+            header_on > 2,
+            "test needs a real header with sticky headers on, got {header_on}"
+        );
+        // A full page of room remains below, so a page-down will not clamp.
+        assert!(
+            h.state.scroll_offset + h.state.viewport_height as usize <= h.max_offset(),
+            "test needs a full page of room to page down without clamping"
+        );
+
+        // Disable sticky headers, mirroring the renderer's `use_sticky` gate.
+        // No header is drawn now, so none must be subtracted from the page.
+        h.state.appearance.scrollback.display.sticky_headers = false;
+        h.frame();
+
+        assert_eq!(
+            h.state.current_header_screen_rows(),
+            0,
+            "no header must be measured when sticky headers are disabled"
+        );
+        let expected = h.state.viewport_height - 2;
+        assert_eq!(
+            h.state.page_scroll_rows(),
+            expected,
+            "page delta must be viewport - 2 (no header subtracted) when sticky headers are off"
+        );
+
+        // The observable scroll delta of a page-down is a full viewport - 2.
+        let before = h.state.scroll_offset;
+        h.state.page_down();
+        h.frame();
+        assert_eq!(
+            h.state.scroll_offset - before,
+            expected as usize,
+            "page-down should advance a full viewport - 2 with sticky headers off"
         );
     }
 }

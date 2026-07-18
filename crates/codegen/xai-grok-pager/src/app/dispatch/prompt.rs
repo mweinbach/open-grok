@@ -7,7 +7,8 @@ use super::interject;
 use super::permissions::drain_permission_queue;
 use super::queue::{
     apply_turn_start_shim, drain_prompt_state_to_last_queued, immediate_server_send_eligible,
-    maybe_drain_queue, push_server_queue_echo, retire_optimistic_echo,
+    maybe_drain_queue, note_peek_page_flip_after_drain, push_server_queue_echo,
+    retire_optimistic_echo,
 };
 use super::router::dispatch;
 use super::session::fork::open_project_question;
@@ -147,6 +148,36 @@ pub(in crate::app) fn show_small_screen_tip(app: &mut AppView) {
     ) {
         log_event(xai_grok_telemetry::events::ContextualTip {
             tip: xai_grok_telemetry::events::ContextualTipKind::SmallScreen,
+            action: xai_grok_telemetry::events::ContextualTipAction::Shown,
+        });
+    }
+}
+
+/// Show the one-shot "Over SSH? Run `open-grok wrap ssh <host>` locally…" hint at
+/// the first stable agent-view draw of an unwrapped SSH session (environment
+/// gates live in `AppView::maybe_trigger_ssh_wrap_tip`). Gated by the per-tip
+/// `contextual_hints.ssh_wrap` gate (default ON). Seen-gated in-memory via
+/// `app.tip_seen_counts`; nothing persists to disk.
+///
+/// Called directly from the draw-path trigger — not routed as an `Action`,
+/// so it returns `()` and "no effects from draw" holds structurally.
+pub(in crate::app) fn show_ssh_wrap_tip(app: &mut AppView) {
+    if !app.contextual_hints.ssh_wrap {
+        return;
+    }
+    let ActiveView::Agent(id) = app.active_view else {
+        return;
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return;
+    };
+    // Impression only when the tip actually takes the slot (mirrors undo/plan).
+    if agent.show_ephemeral_tip(
+        crate::tips::ssh_wrap::ssh_wrap_tip(),
+        &mut app.tip_seen_counts,
+    ) {
+        log_event(xai_grok_telemetry::events::ContextualTip {
+            tip: xai_grok_telemetry::events::ContextualTipKind::SshWrap,
             action: xai_grok_telemetry::events::ContextualTipAction::Shown,
         });
     }
@@ -469,7 +500,7 @@ pub(super) fn dispatch_send_prompt_inner(
                 if let Some(command) = command {
                     if ctx.screen_mode.is_minimal() && !command.available_in_minimal() {
                         // Central minimal gate: commands that drive the deleted
-                        // fullscreen pane / dashboard (/find, /copy, /dashboard)
+                        // fullscreen pane / dashboard (/find, /dashboard, …)
                         // have nothing to act on in scrollback-native mode.
                         // Surface a friendly system block instead of running them.
                         CommandResult::Message(format!(
@@ -798,6 +829,7 @@ pub(super) fn dispatch_send_prompt_inner(
             effects.extend(maybe_drain_queue(agent));
         }
     }
+    note_peek_page_flip_after_drain(app, id);
     effects
 }
 
@@ -891,7 +923,9 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
     agent.session.enqueue_bash_command(command.clone());
     agent.prompt.set_text("");
 
-    maybe_drain_queue(agent)
+    let effects = maybe_drain_queue(agent);
+    note_peek_page_flip_after_drain(app, id);
+    effects
 }
 
 /// Whether a load-result handler must stand down because a reconnect reload
@@ -1437,6 +1471,8 @@ pub(super) fn handle_prompt_response(
             agent_id,
             silent: true,
         });
+        // Agent borrow ends here; note needs dashboard + agents together.
+        note_peek_page_flip_after_drain(app, agent_id);
         return effects;
     }
     vec![]
@@ -1483,7 +1519,9 @@ pub(super) fn handle_compact_complete(
         if app.reconnect_pending {
             return vec![];
         }
-        return maybe_drain_queue(agent);
+        let effects = maybe_drain_queue(agent);
+        note_peek_page_flip_after_drain(app, agent_id);
+        return effects;
     }
     vec![]
 }

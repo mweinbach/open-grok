@@ -388,6 +388,153 @@ fn small_screen_trigger_suppressed_when_user_compact_on() {
     assert!(app.tip_seen_counts.is_empty(), "no count burned");
 }
 
+// ── SSH wrap tip (`show_ssh_wrap_tip` + its one-shot trigger) ──
+
+/// `show_ssh_wrap_tip` on a drawable agent shows the tip and increments the
+/// per-session seen count in memory (nothing persisted — the fn returns
+/// nothing, so it cannot raise effects).
+#[test]
+fn show_ssh_wrap_tip_shows_and_counts_in_memory() {
+    use crate::tips::ssh_wrap::{SSH_WRAP_TIP_KEY, SSH_WRAP_TIP_SEEN_KEY};
+    let mut app = test_app_with_agent();
+    app.contextual_hints.ssh_wrap = true;
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 40);
+
+    crate::app::dispatch::show_ssh_wrap_tip(&mut app);
+    assert_eq!(
+        app.agents[&id].ephemeral_tip.current_key(),
+        Some(SSH_WRAP_TIP_KEY)
+    );
+    assert_eq!(app.tip_seen_counts.get(SSH_WRAP_TIP_SEEN_KEY), Some(&1));
+}
+
+/// `show_ssh_wrap_tip` is a no-op when `contextual_hints.ssh_wrap` is off:
+/// no tip shown, no count burned — even on a drawable agent.
+#[test]
+fn show_ssh_wrap_tip_no_op_when_flag_off() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 40);
+    app.contextual_hints.ssh_wrap = false;
+
+    crate::app::dispatch::show_ssh_wrap_tip(&mut app);
+    assert!(app.tip_seen_counts.is_empty(), "no count burned");
+    assert!(!app.agents[&id].ephemeral_tip.is_active());
+}
+
+/// The seen cap holds at one show per session even if the show fn re-runs
+/// after the first tip expired or was cleared.
+#[test]
+fn show_ssh_wrap_tip_respects_once_per_session_cap() {
+    use crate::tips::ssh_wrap::SSH_WRAP_TIP_SEEN_KEY;
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 40);
+
+    crate::app::dispatch::show_ssh_wrap_tip(&mut app);
+    app.agents.get_mut(&id).unwrap().ephemeral_tip.clear_all();
+    crate::app::dispatch::show_ssh_wrap_tip(&mut app);
+    assert!(
+        !app.agents[&id].ephemeral_tip.is_active(),
+        "second show must be seen-gated"
+    );
+    assert_eq!(app.tip_seen_counts.get(SSH_WRAP_TIP_SEEN_KEY), Some(&1));
+}
+
+/// The trigger defers — WITHOUT consuming the one-shot — until the active
+/// view is an agent with a stable, draw-measured size; the first stable
+/// measure with the environment recommending wrap then shows it exactly once.
+#[test]
+fn ssh_wrap_trigger_waits_for_stable_agent_measure_then_fires_once() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+
+    // Welcome view: no evaluation, one-shot not consumed.
+    app.active_view = ActiveView::Welcome;
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.ssh_wrap_tip_evaluated);
+
+    // Agent view, but never drawn (size (0,0)): still deferred.
+    app.active_view = ActiveView::Agent(id);
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.ssh_wrap_tip_evaluated);
+
+    // Pending post-resize re-measure: still deferred.
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.last_terminal_size = (100, 40);
+        agent.terminal_size_stale = true;
+    }
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.ssh_wrap_tip_evaluated);
+
+    // Stable measure + recommending environment: evaluates once and shows.
+    app.agents.get_mut(&id).unwrap().terminal_size_stale = false;
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(app.ssh_wrap_tip_evaluated);
+    assert_eq!(
+        app.agents[&id].ephemeral_tip.current_key(),
+        Some(crate::tips::ssh_wrap::SSH_WRAP_TIP_KEY)
+    );
+
+    // One-shot: later calls are inert.
+    app.agents.get_mut(&id).unwrap().ephemeral_tip.clear_all();
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.agents[&id].ephemeral_tip.is_active());
+}
+
+/// A not-recommending environment (local session, wrap sink already active,
+/// or a VS Code remote) consumes the one-shot without showing — the shape is
+/// process-constant, so there is nothing to re-evaluate later.
+#[test]
+fn ssh_wrap_trigger_env_not_recommending_consumes_without_showing() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 40);
+
+    app.maybe_trigger_ssh_wrap_tip_inner(false);
+    assert!(app.ssh_wrap_tip_evaluated, "evaluation is consumed");
+    assert!(!app.agents[&id].ephemeral_tip.is_active());
+    assert!(app.tip_seen_counts.is_empty(), "no count burned");
+
+    // The one-shot is spent: even a recommending call stays inert.
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.agents[&id].ephemeral_tip.is_active());
+}
+
+/// A busy tip slot defers WITHOUT consuming — replacing would burn the other
+/// session-load tip's once-per-session show; once the slot frees, the next
+/// draw shows the wrap tip.
+#[test]
+fn ssh_wrap_trigger_defers_while_tip_slot_busy() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    // In the small-screen band so the other session-load tip takes the slot
+    // first (mirrors the real draw order: the small-screen trigger runs
+    // first).
+    app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 24);
+    app.maybe_trigger_small_screen_tip();
+    assert!(app.agents[&id].ephemeral_tip.is_active());
+
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(!app.ssh_wrap_tip_evaluated, "busy slot must defer");
+    assert_eq!(
+        app.agents[&id].ephemeral_tip.current_key(),
+        Some(crate::tips::small_screen::SMALL_SCREEN_TIP_KEY),
+        "the earlier tip keeps the slot"
+    );
+
+    // Slot free (the first tip expired or cleared): the next draw shows it.
+    app.agents.get_mut(&id).unwrap().ephemeral_tip.clear_all();
+    app.maybe_trigger_ssh_wrap_tip_inner(true);
+    assert!(app.ssh_wrap_tip_evaluated);
+    assert_eq!(
+        app.agents[&id].ephemeral_tip.current_key(),
+        Some(crate::tips::ssh_wrap::SSH_WRAP_TIP_KEY)
+    );
+}
+
 #[test]
 fn focus_prompt_switches_pane() {
     let mut app = test_app_with_agent();

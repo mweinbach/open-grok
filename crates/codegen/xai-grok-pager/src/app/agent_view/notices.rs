@@ -270,10 +270,10 @@ impl AgentView {
     }
 
     /// Copy text to clipboard and show the result toast.
-    pub fn copy_to_clipboard(&mut self, text: &str) -> bool {
-        let r = crate::clipboard::copy_text(text);
-        self.show_toast_ticks(r.message, r.ticks);
-        r.success
+    pub fn copy_to_clipboard(&mut self, text: &str) -> crate::clipboard::ClipboardDelivery {
+        let result = crate::clipboard::copy_text(text);
+        self.show_toast_ticks(result.message, result.ticks);
+        result.delivery
     }
 
     /// Like [`copy_to_clipboard`] but debounces the toast to prevent

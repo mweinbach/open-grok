@@ -62,6 +62,19 @@ pub enum ViewMode {
     SingleTurn,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewportSnapshot {
+    pub(crate) scroll_offset: usize,
+    pub(crate) follow_mode: bool,
+    pub(crate) follow_preserve_scroll: bool,
+    pub(crate) viewport_height: u16,
+    pub(crate) last_width: u16,
+    pub(crate) selected: Option<usize>,
+    pub(crate) current_turn: Option<usize>,
+    pub(crate) view_mode: ViewMode,
+    pub(crate) total_height: usize,
+}
+
 /// Maximum truncated header height for AllTurns sticky headers.
 /// (vpad + 3 content lines + ellipsis if needed + vpad)
 pub(super) const MAX_TRUNCATED_HEADER_HEIGHT: u16 = 6;

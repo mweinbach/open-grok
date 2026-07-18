@@ -1098,7 +1098,7 @@ pub(crate) fn quit_minimal(harness: &mut PtyHarness) {
     }
 }
 
-// ── grok wrap e2e ───────────────────────────────────────────────────────
+// ── open-grok wrap e2e ──────────────────────────────────────────────────
 
 /// `open-grok wrap` run budget. Same contention math as the requirements-version
 /// test: the child's cold exec of the huge debug binary can land its first
@@ -1116,6 +1116,18 @@ const WRAP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// before auth/network/sandbox.
 #[cfg(unix)]
 pub(crate) fn run_wrap(wrap_args: &[&str], extra_env: &[(&str, &str)]) -> (Option<u32>, String) {
+    run_wrap_driving(wrap_args, extra_env, |_| {})
+}
+
+/// Like [`run_wrap`], but hands the live harness to `drive` right after spawn
+/// so a test can interact mid-run (wait for output, deliver signals to wrap
+/// itself) before the exit-and-drain phase.
+#[cfg(unix)]
+pub(crate) fn run_wrap_driving(
+    wrap_args: &[&str],
+    extra_env: &[(&str, &str)],
+    drive: impl FnOnce(&mut PtyHarness),
+) -> (Option<u32>, String) {
     let binary = pager_binary().expect("resolve pager binary");
     let home = tempfile::tempdir().expect("home tempdir");
     let home_str = home.path().to_str().expect("utf8 home").to_owned();
@@ -1125,8 +1137,10 @@ pub(crate) fn run_wrap(wrap_args: &[&str], extra_env: &[(&str, &str)]) -> (Optio
     let mut env: Vec<(&str, &str)> = vec![("OPENGROK_HOME", &home_str), ("NO_COLOR", "1")];
     env.extend_from_slice(extra_env);
 
-    let mut harness =
-        PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &args, &env).expect("spawn grok wrap");
+    let mut harness = PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &args, &env)
+        .expect("spawn open-grok wrap");
+
+    drive(&mut harness);
 
     let code = harness
         .wait_for_exit_and_drain(WRAP_TIMEOUT, WRAP_DRAIN_TIMEOUT)

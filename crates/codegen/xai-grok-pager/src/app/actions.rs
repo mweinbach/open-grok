@@ -366,6 +366,10 @@ pub enum Action {
     McpAuthTrigger {
         server_name: String,
     },
+    McpSetupSubmit {
+        server_name: String,
+        values: std::collections::HashMap<String, String>,
+    },
     /// Reload skills list from the modal.
     ReloadSkills,
     /// Refresh MCP server list from the modal.
@@ -547,6 +551,7 @@ pub enum Action {
     SetContextualHintSendNow(bool),
     SetContextualHintSmallScreen(bool),
     SetContextualHintWordSelect(bool),
+    SetContextualHintSshWrap(bool),
     /// Commit the active theme (canonical name, e.g. `"groknight"`, `"auto"`).
     SetTheme(String),
     /// Commit the theme used when the OS is in dark mode. Only updates
@@ -1785,6 +1790,12 @@ pub enum Effect {
         session_id: acp::SessionId,
         server_name: String,
     },
+    McpSetupSubmit {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        server_name: String,
+        values: std::collections::HashMap<String, String>,
+    },
     /// Fetch hooks list from the shell (x.ai/hooks/list).
     FetchHooksList {
         agent_id: AgentId,
@@ -1990,6 +2001,9 @@ pub enum Effect {
         xai_targets: Vec<ProviderSessionTarget>,
         codex_targets: Vec<ProviderSessionTarget>,
     },
+    /// Cancel the shell-owned xAI interactive auth flow (`x.ai/auth/cancel`).
+    /// Codex OAuth is pager-owned and must never produce this effect.
+    CancelAuth { request_seq: u64 },
     /// Run the independent OpenAI Codex browser OAuth flow.
     LoginCodex {
         agent_id: Option<AgentId>,
@@ -2180,6 +2194,11 @@ pub enum SubagentKillOutcome {
     /// The cancel RPC failed; the subagent may still be running, so leave the
     /// row alone rather than show a false terminal state.
     RpcFailed,
+}
+#[derive(Debug)]
+pub enum McpAuthTriggerOutcome {
+    Authenticated,
+    SetupRequired(crate::views::mcps_modal::McpSetupConfig),
 }
 /// Result from a completed async [`Effect`].
 ///
@@ -2511,6 +2530,11 @@ pub enum TaskResult {
     McpAuthTriggerDone {
         agent_id: AgentId,
         server_name: String,
+        result: Result<McpAuthTriggerOutcome, String>,
+    },
+    McpSetupSubmitDone {
+        agent_id: AgentId,
+        server_name: String,
         result: Result<(), String>,
     },
     /// Hooks list fetched from shell.
@@ -2744,6 +2768,9 @@ pub enum TaskResult {
         codex_targets: Vec<ProviderSessionTarget>,
         codex_account: Option<xai_grok_shell::codex_auth::CodexAccountSummary>,
     },
+    /// Best-effort xAI `x.ai/auth/cancel` completed. UI state already left
+    /// `Authenticating`, so dispatch intentionally treats this as a no-op.
+    AuthCancelComplete,
     /// Independent OpenAI Codex browser OAuth finished.
     CodexLoginComplete {
         agent_id: Option<AgentId>,

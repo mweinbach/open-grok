@@ -7,7 +7,7 @@ use super::actions::{PermissionModePersist, SubagentKillOutcome, TaskResult};
 use super::agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::{
-    RATE_LIMITED_ERROR_CODE, rate_limited_user_message,
+    RATE_LIMITED_ERROR_CODE, error_detail_from_data, rate_limited_user_message,
 };
 use xai_grok_shell::session::ExtMethodResult;
 /// Typed progress message for session restore.
@@ -91,8 +91,7 @@ pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> Strin
         return rate_limited_user_message(is_api_key_auth).into();
     }
     if err.code == acp::ErrorCode::InvalidParams && let Some(data) = &err.data
-        && let Some(msg) = xai_grok_shell::sampling::error::error_detail_from_data(data)
-        && !msg.is_empty()
+        && let Some(msg) = error_detail_from_data(data) && !msg.is_empty()
     {
         return msg;
     }
@@ -339,6 +338,9 @@ pub(crate) struct EffectMeta {
     /// install this into `AppView.auth_state` if the current auth state
     /// still matches the sequence.
     pub auth_abort_handle: Option<(u64, tokio::task::AbortHandle)>,
+    /// Auth URL poll abort handle + request sequence (installed on
+    /// `AppView.auth_url_poll_handle` when the seq still matches).
+    pub auth_url_poll_handle: Option<(u64, tokio::task::AbortHandle)>,
 }
 /// Extract the first user prompt text from a session's `chat_history.jsonl`.
 ///
@@ -639,6 +641,23 @@ pub(super) async fn send_logout(tx: &AcpAgentTx) {
         tracing::warn!(error = % e, "logout failed");
     }
 }
+/// Best-effort `x.ai/auth/cancel`: stops the shell's device/loopback wait so a
+/// later login is single-flight. Errors are ignored — UI already left
+/// `Authenticating`. `request_seq` scopes the cancel to the abandoned attempt.
+pub(super) async fn send_auth_cancel(tx: &AcpAgentTx, request_seq: u64) -> TaskResult {
+    let req = acp::ExtRequest::new(
+        "x.ai/auth/cancel",
+        serde_json::value::to_raw_value(
+                &serde_json::json!({ "request_seq" : request_seq }),
+            )
+            .expect("serialize auth/cancel params")
+            .into(),
+    );
+    if let Err(e) = acp_send(req, tx).await {
+        tracing::debug!(error = % e, "auth cancel ext request failed (ignored)");
+    }
+    TaskResult::AuthCancelComplete
+}
 pub(super) async fn send_check_subscription(
     tx: &AcpAgentTx,
     verify: Option<u64>,
@@ -713,7 +732,9 @@ pub(super) async fn send_authenticate(
     use_oauth: bool,
     force_interactive: bool,
 ) -> TaskResult {
-    let mut meta = serde_json::json!({ "use_oauth" : use_oauth });
+    let mut meta = serde_json::json!(
+        { "use_oauth" : use_oauth, "request_seq" : request_seq, }
+    );
     if force_interactive {
         meta["force_interactive"] = serde_json::json!(true);
     }
@@ -836,6 +857,14 @@ pub(crate) async fn persist_setting(
                 );
             };
             xai_grok_shell::util::config::set_contextual_hint_word_select(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "contextual_hints.ssh_wrap" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("contextual_hints.ssh_wrap", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_contextual_hint_ssh_wrap(b)
                 .await
                 .map_err(|e| e.to_string())
         }

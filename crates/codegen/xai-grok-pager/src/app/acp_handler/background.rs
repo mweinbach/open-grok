@@ -435,16 +435,6 @@ pub(super) fn handle_scheduled_task_inject_prompt(
     let human_schedule = payload["humanSchedule"].as_str().unwrap_or("unknown");
     tracing::debug!(task_id, human_schedule, "Enqueuing scheduled cron prompt");
 
-    let agent = app.agents.values_mut().find(|a| {
-        a.session
-            .session_id
-            .as_ref()
-            .is_some_and(|sid| sid.0.as_ref() == session_id)
-    });
-    let Some(agent) = agent else {
-        return false;
-    };
-
     // Only the driver injects + runs the scheduled prompt. In leader mode the
     // `x.ai/scheduled_task_inject_prompt` notification is routed by the leader
     // to the SINGLE session driver (see `is_scheduled_task_inject_prompt` in
@@ -455,28 +445,41 @@ pub(super) fn handle_scheduled_task_inject_prompt(
     // suppressed cron on an attacher-driver, leaving the loop stuck with no
     // output. The other clients render the resulting turn from the broadcast
     // deltas. (The de-dup guards below still prevent a double enqueue.)
+    let agent_id = {
+        let agent = app.agents.values_mut().find(|a| {
+            a.session
+                .session_id
+                .as_ref()
+                .is_some_and(|sid| sid.0.as_ref() == session_id)
+        });
+        let Some(agent) = agent else {
+            return false;
+        };
 
-    // Skip if this specific task is already running or queued.
-    if agent.cron_task_id.as_deref() == Some(task_id) {
-        tracing::debug!(task_id, "cron prompt skipped: task already running");
-        return true;
-    }
-    let already_queued = agent
-        .session
-        .pending_prompts
-        .iter()
-        .any(|p| p.task_id.as_deref() == Some(task_id));
-    if already_queued {
-        tracing::debug!(task_id, "cron prompt already queued, skipping duplicate");
-        return true;
-    }
+        // Skip if this specific task is already running or queued.
+        if agent.cron_task_id.as_deref() == Some(task_id) {
+            tracing::debug!(task_id, "cron prompt skipped: task already running");
+            return true;
+        }
+        let already_queued = agent
+            .session
+            .pending_prompts
+            .iter()
+            .any(|p| p.task_id.as_deref() == Some(task_id));
+        if already_queued {
+            tracing::debug!(task_id, "cron prompt already queued, skipping duplicate");
+            return true;
+        }
 
-    agent.session.enqueue_cron_prompt(
-        prompt.to_string(),
-        task_id.to_string(),
-        human_schedule.to_string(),
-    );
-    let effects = super::super::dispatch::maybe_drain_queue(agent);
+        let agent_id = agent.session.id;
+        agent.session.enqueue_cron_prompt(
+            prompt.to_string(),
+            task_id.to_string(),
+            human_schedule.to_string(),
+        );
+        agent_id
+    };
+    let effects = super::super::dispatch::maybe_drain_queue_and_note_peek(app, agent_id);
     app.pending_effects.extend(effects);
 
     true

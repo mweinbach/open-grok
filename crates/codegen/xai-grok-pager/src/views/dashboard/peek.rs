@@ -14,11 +14,29 @@ use crate::app::agent_view::AgentView;
 use crate::render::line_utils::truncate_str;
 use crate::theme::Theme;
 
-/// Maximum number of wrapped response rows the peek panel shows. The
-/// layout sizes the peek box to `status + this-many-response-rows +
-/// blank + reply`, and the renderer caps the response at the same value
-/// so a long response can't crowd out the reply input.
-pub const MAX_RESPONSE_ROWS: usize = 3;
+/// Args for painting a dense bottom-pinned live tail in the peek middle.
+pub struct PeekLiveTailArgs<'a> {
+    pub scrollback: &'a crate::scrollback::state::ScrollbackState,
+}
+
+/// Exclusive bottom y of the live-tail middle band (above the reply).
+///
+/// Reserves a 1-row breathing blank above the reply only when middle still
+/// has ≥2 rows after that blank so pin + body can share. When only one row
+/// would remain (`middle_h_with_blank == 1`), expand into the blank so the
+/// current-turn body is not starved — matches measure when
+/// `blank_row=false` (e.g. max_content = fixed+1 with pin).
+fn live_tail_middle_bottom(middle_top: u16, reply_top_y: u16) -> u16 {
+    let with_blank = reply_top_y.saturating_sub(1);
+    let h_with_blank = with_blank.saturating_sub(middle_top);
+    if h_with_blank > 1 {
+        with_blank
+    } else if reply_top_y > middle_top {
+        reply_top_y
+    } else {
+        with_blank
+    }
+}
 
 /// Maximum number of rows the `❯ reply` input grows to as the user
 /// inserts newlines (Shift+Enter / Alt+Enter). Past this the reply
@@ -54,13 +72,6 @@ pub struct PeekFields {
     /// `"Response"`, `"Edit"`), shown as the header's left label.
     pub response_type: String,
     pub last_user_message: Option<String>,
-    /// Up to the last 3 lines of the most recent agent message,
-    /// top-to-bottom. Empty when the agent hasn't streamed text.
-    pub last_agent_lines: Vec<String>,
-    /// Whether the most recent agent message had MORE than 3 lines, so
-    /// the renderer appends a `…` continuation marker. (Truncation is
-    /// shown only when there are genuinely more lines than fit.)
-    pub last_response_truncated: bool,
     pub question: Option<String>,
     pub options: Vec<(String, String)>,
     pub request_id: Option<usize>,
@@ -72,22 +83,17 @@ pub struct PeekFields {
 
 /// Per-row peek panel state.
 ///
-/// The panel carries explicit slots for the things worth surfacing
-/// (rather than a raw dump of the last few scrollback lines):
+/// Peek panel display state for a selected dashboard row.
 ///
-/// - The agent's status (running tool name, awaiting, idle).
-/// - The most recent **user** message (first line).
-/// - The most recent **agent** message (up to 3 lines).
-/// - The pending permission question + options (if any).
+/// - Status (`response_type` + `time_ago`) on the header row.
+/// - Middle body: live-tail scrollback (see `PeekLiveTailArgs`) or a
+///   pending permission / ask-question UI.
+/// - `❯ reply` input backed by the dashboard-owned `peek_reply`
+///   [`PromptWidget`](crate::views::prompt_widget::PromptWidget).
 ///
-/// Reply support — the `❯ reply` line is a live input backed by the
-/// dashboard-owned `peek_reply` [`PromptWidget`](crate::views::prompt_widget::PromptWidget)
-/// (see the module note above). The display fields are refreshed
-/// every frame from the selected agent (so the panel follows the
-/// selection cursor and shows live status); the reply draft is
-/// preserved across refreshes and only cleared when the peeked row
-/// changes (handled by the render-time refresh) or the panel closes
-/// (`DashboardState::set_peek`).
+/// Display fields refresh every frame from the selected agent; the reply
+/// draft is preserved across refreshes and only cleared when the peeked
+/// row changes or the panel closes (`DashboardState::set_peek`).
 #[derive(Debug, Clone)]
 pub struct PeekPanelState {
     /// Which row is being peeked. Tracks the selection cursor; the
@@ -105,12 +111,6 @@ pub struct PeekPanelState {
     pub response_type: String,
     /// First line of the most recent user prompt, or `None`.
     pub last_user_message: Option<String>,
-    /// Up to the last 3 lines of the most recent agent message,
-    /// top-to-bottom. Empty when the agent hasn't streamed text.
-    pub last_agent_lines: Vec<String>,
-    /// Whether the most recent agent message had more than 3 lines (so
-    /// the renderer appends a `…` continuation marker).
-    pub last_response_truncated: bool,
     /// Question text from a pending `PermissionView`, when applicable.
     pub question: Option<String>,
     /// Multiple-choice options for a pending permission request. Each
@@ -167,8 +167,6 @@ impl PeekPanelState {
             time_ago: fields.time_ago,
             response_type: fields.response_type,
             last_user_message: fields.last_user_message,
-            last_agent_lines: fields.last_agent_lines,
-            last_response_truncated: fields.last_response_truncated,
             question: fields.question,
             options: fields.options,
             request_id: fields.request_id,
@@ -203,8 +201,6 @@ impl PeekPanelState {
         self.time_ago = fields.time_ago;
         self.response_type = fields.response_type;
         self.last_user_message = fields.last_user_message;
-        self.last_agent_lines = fields.last_agent_lines;
-        self.last_response_truncated = fields.last_response_truncated;
         self.question = fields.question;
         // Reset the selected option when the pending request changes
         // (a new/rotated permission); otherwise keep the user's selection.
@@ -250,7 +246,6 @@ pub fn compute_peek_fields(
             let label = sanitize_display_text(&entry_title(agent)).into_owned();
             let response_type = extract_last_response_type(agent);
             let last_user_message = extract_last_user_message(agent);
-            let (last_agent_lines, last_response_truncated) = extract_last_agent_lines(agent, 3);
             let time_ago = agent
                 .last_active_at
                 .map(|t| crate::util::format_time_ago(t.elapsed()))
@@ -338,8 +333,6 @@ pub fn compute_peek_fields(
                 time_ago,
                 response_type,
                 last_user_message,
-                last_agent_lines,
-                last_response_truncated,
                 question,
                 options,
                 request_id,
@@ -363,17 +356,12 @@ pub fn compute_peek_fields(
                 .map(|c| extract_last_response_type(c))
                 .unwrap_or_else(|| "Subagent".to_string());
             let last_user_message = child.and_then(|c| extract_last_user_message(c));
-            let (last_agent_lines, last_response_truncated) = child
-                .map(|c| extract_last_agent_lines(c, 3))
-                .unwrap_or((Vec::new(), false));
             let time_ago = crate::util::format_time_ago(info.last_progress_at.elapsed());
             Some(PeekFields {
                 label,
                 time_ago,
                 response_type,
                 last_user_message,
-                last_agent_lines,
-                last_response_truncated,
                 // Subagents are driven by their parent — no direct
                 // permission prompts surface here.
                 question: None,
@@ -580,6 +568,8 @@ pub fn render_peek_panel(
     voice_interim: Option<&str>,
     multiline: bool,
     overlay_area: Option<Rect>,
+    live_tail: Option<PeekLiveTailArgs<'_>>,
+    empty_hint: Option<&str>,
 ) -> PeekRenderResult {
     use crate::views::prompt_widget::PromptStyle;
     use ratatui::widgets::{Block, BorderType, Borders, Widget};
@@ -779,10 +769,8 @@ pub fn render_peek_panel(
         } else {
             inner.width as usize
         };
-        // While the agent is working the "Working" status reads as
-        // secondary (a touch brighter than the dim chrome) and the previous
-        // response is hidden entirely (below), so the panel signals "still
-        // running" without dwelling on a now-stale answer.
+        // While Working, the status label is secondary (a touch brighter than
+        // dim chrome). Live-tail keeps painting the middle regardless.
         let working = panel.response_type == "Working";
         let label_fg = if working {
             theme.text_secondary
@@ -806,50 +794,43 @@ pub fn render_peek_panel(
             );
         }
 
-        // The most recent agent response on the rows between the status
-        // and the reply input. Long lines WRAP (word-wrapped to the inner
-        // width) instead of being truncated. The box is sized (by the
-        // layout) to status + response + one blank breathing row + reply,
-        // so capping the response at `MAX_RESPONSE_ROWS` leaves that row
-        // above the reply blank. A `…` continuation marker is appended to
-        // the last visible row only when there's more content than fits.
-        // Suppress the previous response while working — it's stale and the
-        // "Working" status already conveys the state (the box is sized without
-        // these rows, see `response_row_count`).
-        let middle = (reply_top_y.saturating_sub(inner.y + 1)) as usize;
-        let capacity = middle.min(MAX_RESPONSE_ROWS);
-        if capacity > 0 && !working {
-            // Flatten the response lines into wrapped visual rows, taking
-            // one more than `capacity` so we can detect overflow without
-            // wrapping an arbitrarily long response in full.
-            let mut rows: Vec<String> = Vec::new();
-            'outer: for line in &panel.last_agent_lines {
-                for vis in wrap_to_width(line, inner.width as usize) {
-                    rows.push(vis);
-                    if rows.len() > capacity {
-                        break 'outer;
+        let middle_top = inner.y + 1;
+        // Match `peek_live_tail_desired_content`: blank only when middle still
+        // has ≥2 rows after it (pin + body). When only 1 row remains, keep it.
+        let middle_bottom = live_tail_middle_bottom(middle_top, reply_top_y);
+        let middle_h = middle_bottom.saturating_sub(middle_top);
+        let middle_area = Rect {
+            x: inner.x,
+            y: middle_top,
+            width: inner.width,
+            height: middle_h,
+        };
+        if let Some(PeekLiveTailArgs { scrollback }) = live_tail {
+            if middle_h > 0 {
+                if scrollback.is_empty() {
+                    if let Some(hint) = empty_hint.or(Some("No activity yet")) {
+                        let trunc = truncate_str(hint, inner.width as usize);
+                        buf.set_string(
+                            inner.x,
+                            middle_top,
+                            trunc,
+                            Style::default().fg(theme.gray_dim).bg(theme.bg_base),
+                        );
                     }
+                } else {
+                    super::peek_tail::paint_peek_live_tail(scrollback, middle_area, buf);
                 }
             }
-            let overflow = rows.len() > capacity || panel.last_response_truncated;
-            let n = capacity.min(rows.len());
-            for (i, row) in rows.iter().take(n).enumerate() {
-                let y = inner.y + 1 + i as u16;
-                let is_last_shown = i + 1 == n;
-                let text = if is_last_shown && overflow {
-                    // Reserve 2 cols for " …" so the marker stays visible.
-                    let body = truncate_str(row, (inner.width as usize).saturating_sub(2));
-                    format!("{body} \u{2026}")
-                } else {
-                    row.clone()
-                };
-                buf.set_string(
-                    inner.x,
-                    y,
-                    text,
-                    Style::default().fg(theme.text_primary).bg(theme.bg_base),
-                );
-            }
+        } else if let Some(hint) = empty_hint
+            && middle_h > 0
+        {
+            let trunc = truncate_str(hint, inner.width as usize);
+            buf.set_string(
+                inner.x,
+                middle_top,
+                trunc,
+                Style::default().fg(theme.gray_dim).bg(theme.bg_base),
+            );
         }
     }
 
@@ -928,28 +909,6 @@ pub fn render_peek_panel(
     PeekRenderResult { caret, reply_rect }
 }
 
-/// Number of visual rows the response wraps to at `width` columns,
-/// capped at `cap`. The dashboard layout uses this to size the peek box
-/// to its content (status + response + blank + reply) rather than a
-/// fixed height. Returns 0 when there's no response or `width` is 0.
-///
-/// Returns 0 while the agent is working: the previous response is hidden in
-/// that state (see `render_peek_panel`), so the box shouldn't reserve rows
-/// for it.
-pub fn response_row_count(panel: &PeekPanelState, width: usize, cap: usize) -> usize {
-    if width == 0 || cap == 0 || panel.response_type == "Working" {
-        return 0;
-    }
-    let mut rows = 0usize;
-    for line in &panel.last_agent_lines {
-        rows += wrap_to_width(line, width).len();
-        if rows >= cap {
-            return cap;
-        }
-    }
-    rows.min(cap)
-}
-
 /// Number of rows the `❯ reply` input wants at the given reply TEXT
 /// width (the inner box width minus the `❯ ` prefix), capped at `cap`.
 /// Used both by the dashboard layout to size the peek box and by
@@ -975,76 +934,6 @@ pub fn reply_row_count(
     reply
         .desired_height(reply_text_width, &style, false, cap.max(1))
         .max(1)
-}
-
-/// Word-wrap a single logical line into visual rows of at most `width`
-/// display columns, so the peek's response WRAPS instead of truncating.
-///
-/// Width is measured in terminal columns (`UnicodeWidthStr` /
-/// `UnicodeWidthChar`) so CJK / wide chars and emoji don't overflow the
-/// box. Words longer than the row are hard-split. A `width` of 0/1
-/// returns the line unsplit (degenerate widths). Empty input yields a
-/// single empty row.
-fn wrap_to_width(line: &str, width: usize) -> Vec<String> {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if width <= 1 {
-        return vec![line.to_owned()];
-    }
-    let mut out: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for word in line.split_whitespace() {
-        if UnicodeWidthStr::width(word) > width {
-            // Hard-split an overlong token (path/URL) so no row exceeds
-            // `width`, accumulating chars until the next would overflow.
-            if !current.is_empty() {
-                out.push(std::mem::take(&mut current));
-            }
-            let mut chunk = String::new();
-            let mut chunk_w = 0usize;
-            for ch in word.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if cw > width {
-                    if !chunk.is_empty() {
-                        out.push(std::mem::take(&mut chunk));
-                        chunk_w = 0;
-                    }
-                    out.push(ch.to_string());
-                    continue;
-                }
-                if chunk_w + cw > width {
-                    out.push(std::mem::take(&mut chunk));
-                    chunk_w = 0;
-                }
-                chunk.push(ch);
-                chunk_w += cw;
-            }
-            if !chunk.is_empty() {
-                out.push(chunk);
-            }
-            continue;
-        }
-        let need = if current.is_empty() {
-            UnicodeWidthStr::width(word)
-        } else {
-            UnicodeWidthStr::width(current.as_str()) + 1 + UnicodeWidthStr::width(word)
-        };
-        if need > width {
-            out.push(std::mem::take(&mut current));
-            current.push_str(word);
-        } else {
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(word);
-        }
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }
 
 /// The header label for the peek panel, e.g. `"Thinking"` / `"Thought"`,
@@ -1155,22 +1044,7 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
 /// agent's scrollback. Sanitised + ANSI-stripped. Returns
 /// `None` when the user hasn't sent any prompts yet.
 pub fn extract_last_user_message(agent: &AgentView) -> Option<String> {
-    use crate::scrollback::block::RenderBlock;
-    use crate::views::session_title::sanitize_display_text;
-    let len = agent.scrollback.len();
-    for idx in (0..len).rev() {
-        let entry = agent.scrollback.entry(idx)?;
-        if let RenderBlock::UserPrompt(b) = &entry.block {
-            let first = b.text.lines().next().unwrap_or("").trim();
-            if first.is_empty() {
-                continue;
-            }
-            let stripped = strip_ansi_escapes::strip_str(first);
-            let safe = sanitize_display_text(&stripped).into_owned();
-            return Some(safe.trim().to_string());
-        }
-    }
-    None
+    crate::views::session_title::last_user_prompt_line(agent)
 }
 
 /// Pull the first line of the FIRST user prompt (`RenderBlock::UserPrompt`)
@@ -1198,62 +1072,6 @@ pub fn extract_first_user_message(agent: &AgentView) -> Option<String> {
         }
     }
     None
-}
-
-/// Pull up to `count` leading non-empty lines of the most recent
-/// agent message (`RenderBlock::AgentMessage`) from the agent's
-/// scrollback, in natural top-to-bottom order. Each line is
-/// ANSI-stripped + sanitised.
-///
-/// Returns `(lines, truncated)` where `truncated` is `true` when the
-/// message had MORE than `count` non-empty lines — so the renderer can
-/// show a `…` continuation marker only when there's genuinely more.
-/// Returns `(vec![], false)` when the agent hasn't streamed any text.
-///
-/// This is the multi-line successor to the old single-line
-/// `extract_last_agent_message`: the peek panel now surfaces up to 3
-/// lines of the last response instead of just the first.
-pub fn extract_last_agent_lines(agent: &AgentView, count: usize) -> (Vec<String>, bool) {
-    use crate::scrollback::block::RenderBlock;
-    use crate::views::session_title::sanitize_display_text;
-    if count == 0 {
-        return (Vec::new(), false);
-    }
-    let len = agent.scrollback.len();
-    for idx in (0..len).rev() {
-        let Some(entry) = agent.scrollback.entry(idx) else {
-            return (Vec::new(), false);
-        };
-        if let RenderBlock::AgentMessage(msg) = &entry.block {
-            let text = msg.text();
-            let mut out = Vec::new();
-            let mut truncated = false;
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let stripped = strip_ansi_escapes::strip_str(trimmed);
-                let safe = sanitize_display_text(&stripped).into_owned();
-                let safe = safe.trim().to_string();
-                if safe.is_empty() {
-                    continue;
-                }
-                if out.len() >= count {
-                    // There's at least one more renderable line beyond
-                    // `count` — mark truncated and stop.
-                    truncated = true;
-                    break;
-                }
-                out.push(safe);
-            }
-            // Only the most recent agent message is considered; if it
-            // has no renderable lines, fall through to an empty result
-            // rather than scanning older messages.
-            return (out, truncated);
-        }
-    }
-    (Vec::new(), false)
 }
 
 /// Extract the last `count` short text descriptions from the given
@@ -1399,14 +1217,12 @@ mod tests {
     use crate::views::dashboard::state::DashboardState;
 
     /// Build a `PeekFields` for tests with sensible defaults.
-    fn fields(response_type: &str, agent_lines: &[&str]) -> PeekFields {
+    fn fields(response_type: &str) -> PeekFields {
         PeekFields {
             label: "label".to_string(),
             time_ago: "2m".to_string(),
             response_type: response_type.to_string(),
             last_user_message: None,
-            last_agent_lines: agent_lines.iter().map(|s| s.to_string()).collect(),
-            last_response_truncated: false,
             question: None,
             options: Vec::new(),
             request_id: None,
@@ -1420,21 +1236,77 @@ mod tests {
         crate::views::prompt_widget::PromptWidget::new()
     }
 
-    /// While the agent is working the "Working" status label renders in the
-    /// secondary colour and the previous response is HIDDEN entirely (so the
-    /// peek doesn't dwell on a stale answer); a non-working panel shows the
-    /// bright `text_primary` response body.
     #[test]
-    fn render_peek_working_hides_response_and_secondary_status() {
+    fn live_tail_middle_bottom_skips_blank_when_only_one_content_row() {
+        // status@0, middle from 1, 3-line reply starts at 3 → span 2.
+        // blank would leave middle_h=1 (pin-only); expand so pin+body fit.
+        assert_eq!(live_tail_middle_bottom(1, 3), 3);
+        // Generous middle (span 4) keeps blank above reply.
+        assert_eq!(live_tail_middle_bottom(1, 5), 4);
+        // Zero middle span stays empty.
+        assert_eq!(live_tail_middle_bottom(3, 3), 2);
+    }
+
+    /// Tight box: status + pin + body + 3-line reply, no blank budget.
+    /// Paint must not steal the body row for a breathing blank.
+    #[test]
+    fn render_peek_tight_pin_shows_current_turn_body() {
+        use crate::scrollback::block::RenderBlock;
+        use crate::scrollback::entry::ScrollbackEntry;
+        use crate::scrollback::state::ScrollbackState;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        // borders(2) + inner content_rows(6) = 8.
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::current();
+        let panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Response"));
+        let mut reply = test_reply();
+        reply.set_text("r1\nr2\nr3");
+        let mut sb = ScrollbackState::new();
+        sb.push(ScrollbackEntry::new(RenderBlock::user_prompt("user pin")));
+        sb.push(ScrollbackEntry::new(RenderBlock::agent_message(
+            "current turn line",
+        )));
+        let _ = render_peek_panel(
+            &mut buf,
+            area,
+            &panel,
+            &mut reply,
+            &theme,
+            false,
+            None,
+            false,
+            None,
+            Some(PeekLiveTailArgs { scrollback: &sb }),
+            None,
+        );
+        let mut content = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                content.push_str(buf[(x, y)].symbol());
+            }
+            content.push('\n');
+        }
+        assert!(content.contains("user pin"), "pin must paint: {content:?}");
+        assert!(
+            content.contains("current turn line"),
+            "body must not be eaten by blank: {content:?}"
+        );
+    }
+
+    /// While the agent is working the "Working" status label renders in the
+    /// secondary colour; other status labels stay dim chrome.
+    #[test]
+    fn render_peek_working_status_uses_secondary_colour() {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
         let theme = Theme::current();
         let render = |response_type: &str| {
             let mut buf = Buffer::empty(Rect::new(0, 0, 80, 6));
-            let panel = PeekPanelState::new(
-                DashboardRowId::TopLevel(AgentId(0)),
-                fields(response_type, &["hello world"]),
-            );
+            let panel =
+                PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields(response_type));
             let mut reply = test_reply();
             let _ = render_peek_panel(
                 &mut buf,
@@ -1446,11 +1318,12 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
+                None,
             );
             buf
         };
-        // Inner content sits two cells in (1 border + 1 pad inset): status
-        // at (2,1), response body (when shown) at (2,2).
+        // Inner content sits two cells in (1 border + 1 pad inset): status at (2,1).
         let working = render("Working");
         assert_eq!(working[(2, 1)].symbol(), "W", "status label is `Working`");
         assert_eq!(
@@ -1458,20 +1331,13 @@ mod tests {
             theme.text_secondary,
             "the `Working` status must render in the secondary colour",
         );
-        // The response row must be blank — the previous response is hidden.
-        let working_body: String = (0..80).map(|x| working[(x, 2)].symbol()).collect();
-        assert!(
-            !working_body.contains("hello"),
-            "the previous response must be hidden while working, got: {working_body:?}",
-        );
 
-        // A non-working panel shows the bright response body.
         let idle = render("Response");
-        assert_eq!(idle[(2, 2)].symbol(), "h", "response body starts with `h`");
+        assert_eq!(idle[(2, 1)].symbol(), "R", "status label is `Response`");
         assert_eq!(
-            idle[(2, 2)].fg,
-            theme.text_primary,
-            "a non-working response keeps the bright primary colour",
+            idle[(2, 1)].fg,
+            theme.gray_dim,
+            "a non-working status stays dim chrome",
         );
     }
 
@@ -1497,6 +1363,8 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
+                None,
             );
             (0..80)
                 .map(|x| buf[(x, h - 1)].symbol().to_string())
@@ -1504,10 +1372,8 @@ mod tests {
         };
 
         // Summary mode → model + always-approve on the bottom border.
-        let mut panel = PeekPanelState::new(
-            DashboardRowId::TopLevel(AgentId(0)),
-            fields("Response", &["hello"]),
-        );
+        let mut panel =
+            PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Response"));
         panel.model_name = Some("Grok 4 Fast".to_string());
         panel.auto_approve = true;
         let bottom = badge_row(&panel, 6);
@@ -1521,7 +1387,7 @@ mod tests {
         );
 
         // Pending-question (approval) mode → badge still painted.
-        let mut q = fields("Response", &[]);
+        let mut q = fields("Response");
         q.question = Some("Allow write?".to_string());
         q.options = vec![
             ("allow".into(), "Allow".into()),
@@ -1537,10 +1403,8 @@ mod tests {
         );
 
         // No always-approve flag when the agent isn't in yolo mode.
-        let mut plain = PeekPanelState::new(
-            DashboardRowId::TopLevel(AgentId(0)),
-            fields("Response", &["hi"]),
-        );
+        let mut plain =
+            PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Response"));
         plain.model_name = Some("Grok 4 Fast".to_string());
         plain.auto_approve = false;
         let plain_bottom = badge_row(&plain, 6);
@@ -1551,10 +1415,8 @@ mod tests {
 
         // Plan mode → a `plan` flag (so all three Shift+Tab cycle states
         // are visible on the badge).
-        let mut planp = PeekPanelState::new(
-            DashboardRowId::TopLevel(AgentId(0)),
-            fields("Response", &["hi"]),
-        );
+        let mut planp =
+            PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Response"));
         planp.model_name = Some("Grok 4 Fast".to_string());
         planp.plan_mode = true;
         let plan_bottom = badge_row(&planp, 6);
@@ -1596,10 +1458,7 @@ mod tests {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
         let theme = Theme::current();
-        let panel = PeekPanelState::new(
-            DashboardRowId::TopLevel(AgentId(0)),
-            fields("Response", &["hi"]),
-        );
+        let panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Response"));
         let mut reply = test_reply();
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 6));
         let _ = render_peek_panel(
@@ -1611,6 +1470,8 @@ mod tests {
             true,
             Some("hello there"),
             false,
+            None,
+            None,
             None,
         );
         // Badge `" ● rec "` starts at x = area.x + 2, so the dot is at x = 3.
@@ -1632,15 +1493,11 @@ mod tests {
 
     #[test]
     fn peek_handles_missing_question() {
-        let mut f = fields("Idle", &["Working on it", "second line"]);
+        let mut f = fields("Idle");
         f.last_user_message = Some("hello?".to_string());
         let state = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), f);
         assert!(state.question.is_none());
         assert_eq!(state.last_user_message.as_deref(), Some("hello?"));
-        assert_eq!(
-            state.last_agent_lines,
-            vec!["Working on it".to_string(), "second line".to_string()]
-        );
     }
 
     /// `apply_fields` reports whether the peeked row CHANGED so the
@@ -1649,17 +1506,16 @@ mod tests {
     /// wrong agent after the selection cursor moves.
     #[test]
     fn apply_fields_reports_row_change() {
-        let mut state =
-            PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle", &[]));
+        let mut state = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle"));
         // Same row → no change reported (caller preserves the draft).
         let changed = state.apply_fields(
             DashboardRowId::TopLevel(AgentId(0)),
-            fields("Running\u{2026}", &["new line"]),
+            fields("Running\u{2026}"),
         );
         assert!(!changed, "same row must not report a change");
-        assert_eq!(state.last_agent_lines, vec!["new line".to_string()]);
+        assert_eq!(state.response_type, "Running\u{2026}");
         // Different row → change reported (caller clears the draft).
-        let changed = state.apply_fields(DashboardRowId::TopLevel(AgentId(1)), fields("Idle", &[]));
+        let changed = state.apply_fields(DashboardRowId::TopLevel(AgentId(1)), fields("Idle"));
         assert!(changed, "row change must be reported");
         assert_eq!(state.row, DashboardRowId::TopLevel(AgentId(1)));
     }
@@ -1677,10 +1533,11 @@ mod tests {
         use ratatui::layout::Rect;
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 5));
         let theme = Theme::current();
-        let mut f = fields("Edit", &["working on the fix now"]);
+        let mut f = fields("Edit");
         f.label = "Add responsiveness to /context".to_string();
         f.last_user_message = Some("hello, can you help?".to_string());
-        let panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), f);
+        let mut panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), f);
+        panel.focused = true;
         let mut reply = test_reply();
         let _ = render_peek_panel(
             &mut buf,
@@ -1691,6 +1548,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut content = String::new();
@@ -1734,45 +1593,6 @@ mod tests {
         );
     }
 
-    /// The peek surfaces up to 3 lines of the last
-    /// response (was a single line). A taller box renders the first
-    /// three lines and drops the rest.
-    #[test]
-    fn render_peek_shows_up_to_three_response_lines() {
-        use ratatui::buffer::Buffer;
-        use ratatui::layout::Rect;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 7));
-        let theme = Theme::current();
-        let panel = PeekPanelState::new(
-            DashboardRowId::TopLevel(AgentId(0)),
-            fields("Idle", &["line one", "line two", "line three", "line four"]),
-        );
-        let mut reply = test_reply();
-        let _ = render_peek_panel(
-            &mut buf,
-            Rect::new(0, 0, 80, 7),
-            &panel,
-            &mut reply,
-            &theme,
-            false,
-            None,
-            false,
-            None,
-        );
-        let mut content = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
-            }
-            content.push('\n');
-        }
-        assert!(content.contains("line one"), "got: {content:?}");
-        assert!(content.contains("line two"), "got: {content:?}");
-        assert!(content.contains("line three"), "got: {content:?}");
-        // Capped at 3 — the 4th line is dropped.
-        assert!(!content.contains("line four"), "got: {content:?}");
-    }
-
     /// The reply input renders the typed draft (not the dim
     /// placeholder) and reports a caret position.
     #[test]
@@ -1781,7 +1601,8 @@ mod tests {
         use ratatui::layout::Rect;
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 5));
         let theme = Theme::current();
-        let panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle", &[]));
+        let mut panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle"));
+        panel.focused = true;
         let mut reply = test_reply();
         reply.set_text("ship it");
         let res = render_peek_panel(
@@ -1793,6 +1614,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut content = String::new();
@@ -1817,8 +1640,7 @@ mod tests {
         use ratatui::layout::Rect;
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 5));
         let theme = Theme::current();
-        let mut panel =
-            PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle", &[]));
+        let mut panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle"));
         let mut reply = test_reply();
         reply.set_text("draft");
         panel.focused = false;
@@ -1831,6 +1653,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         assert!(
@@ -1857,8 +1681,7 @@ mod tests {
         use ratatui::layout::Rect;
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 5));
         let theme = Theme::current();
-        let mut panel =
-            PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle", &[]));
+        let mut panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle"));
         panel.focused = false;
         let mut reply = test_reply();
         let res = render_peek_panel(
@@ -1870,6 +1693,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         assert!(
@@ -1899,10 +1724,8 @@ mod tests {
         let theme = Theme::current();
         let render = |focused: bool| {
             let mut buf = Buffer::empty(Rect::new(0, 0, 80, 6));
-            let mut panel = PeekPanelState::new(
-                DashboardRowId::TopLevel(AgentId(0)),
-                fields("Idle", &["hello world"]),
-            );
+            let mut panel =
+                PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle"));
             let mut reply = test_reply();
             reply.set_text("draft");
             panel.focused = focused;
@@ -1915,6 +1738,8 @@ mod tests {
                 false,
                 None,
                 false,
+                None,
+                None,
                 None,
             );
             buf
@@ -1945,119 +1770,6 @@ mod tests {
         }
     }
 
-    /// The `…` continuation marker appears only when the response has
-    /// more lines than are shown — `last_response_truncated` drives it.
-    #[test]
-    fn render_peek_marks_truncated_response() {
-        use ratatui::buffer::Buffer;
-        use ratatui::layout::Rect;
-        let theme = Theme::current();
-        let render = |truncated: bool| -> String {
-            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 7));
-            let mut f = fields("Idle", &["alpha", "bravo", "charlie"]);
-            f.last_response_truncated = truncated;
-            let panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), f);
-            // Non-empty reply so the dim `reply…` placeholder (which also
-            // contains `…`) doesn't pollute the marker assertion.
-            let mut reply = test_reply();
-            reply.set_text("x");
-            let _ = render_peek_panel(
-                &mut buf,
-                Rect::new(0, 0, 80, 7),
-                &panel,
-                &mut reply,
-                &theme,
-                false,
-                None,
-                false,
-                None,
-            );
-            let mut content = String::new();
-            for y in 0..buf.area.height {
-                for x in 0..buf.area.width {
-                    content.push_str(buf[(x, y)].symbol());
-                }
-                content.push('\n');
-            }
-            content
-        };
-        // 3 lines, NOT truncated → all three shown, no marker.
-        let exact = render(false);
-        assert!(exact.contains("charlie"), "got: {exact:?}");
-        assert!(
-            !exact.contains('\u{2026}'),
-            "no marker expected, got: {exact:?}"
-        );
-        // 3 lines shown but the response had more → marker appended.
-        let more = render(true);
-        assert!(
-            more.contains('\u{2026}'),
-            "expected `…` marker, got: {more:?}"
-        );
-    }
-
-    /// `wrap_to_width` word-wraps to display columns and hard-splits
-    /// overlong tokens.
-    #[test]
-    fn wrap_to_width_wraps_words_and_splits_long_tokens() {
-        let rows = wrap_to_width("the quick brown fox", 9);
-        assert!(rows.len() >= 2, "should wrap, got: {rows:?}");
-        for r in &rows {
-            assert!(
-                unicode_width::UnicodeWidthStr::width(r.as_str()) <= 9,
-                "row exceeds width: {r:?}"
-            );
-        }
-        // An overlong token is hard-split rather than dropped.
-        let split = wrap_to_width("abcdefghijklmnop", 5);
-        assert!(
-            split.len() >= 4,
-            "long token must hard-split, got: {split:?}"
-        );
-        assert_eq!(split.concat(), "abcdefghijklmnop");
-    }
-
-    /// A long response line WRAPS across rows instead of being
-    /// truncated — words past the first row's width still appear.
-    #[test]
-    fn render_peek_wraps_long_response_line() {
-        use ratatui::buffer::Buffer;
-        use ratatui::layout::Rect;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 32, 7));
-        let theme = Theme::current();
-        // One logical line, long enough to need multiple ~26-col rows.
-        let panel = PeekPanelState::new(
-            DashboardRowId::TopLevel(AgentId(0)),
-            fields("Idle", &["the quick brown fox jumps over the lazy dog"]),
-        );
-        let mut reply = test_reply();
-        let _ = render_peek_panel(
-            &mut buf,
-            Rect::new(0, 0, 32, 7),
-            &panel,
-            &mut reply,
-            &theme,
-            false,
-            None,
-            false,
-            None,
-        );
-        let mut content = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
-            }
-            content.push('\n');
-        }
-        // An early AND a late word both appear — impossible on a single
-        // ~26-col row, so the line must have wrapped.
-        assert!(content.contains("quick"), "got: {content:?}");
-        assert!(
-            content.contains("lazy"),
-            "wrap must surface later words, got: {content:?}"
-        );
-    }
-
     /// When a permission is pending, the peek paints
     /// the question + numbered options at the top and still
     /// shows the reply slot on the last inner row. The 1-9
@@ -2075,8 +1787,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Awaiting your input".to_string(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: Some("Allow Edit?".to_string()),
                 options: vec![
                     ("allow_once".into(), "Allow once".into()),
@@ -2097,6 +1807,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut content = String::new();
@@ -2129,8 +1841,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Awaiting your input".to_string(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: Some("Allow Edit?".to_string()),
                 options: vec![
                     ("allow".into(), "Allow".into()),
@@ -2141,6 +1851,7 @@ mod tests {
             },
         );
         panel.selected_option = Some(1); // highlight the 2nd option
+        panel.focused = true;
         let mut reply = test_reply();
         let _ = render_peek_panel(
             &mut buf,
@@ -2151,6 +1862,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut content = String::new();
@@ -2181,8 +1894,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Awaiting your input".to_string(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: Some("Allow Edit?".to_string()),
                 options: vec![
                     ("allow".into(), "Allow".into()),
@@ -2204,6 +1915,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut content = String::new();
@@ -2238,8 +1951,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Awaiting your input".to_string(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: Some("Allow Edit?".to_string()),
                 options: vec![
                     ("allow".into(), "Allow".into()),
@@ -2250,6 +1961,7 @@ mod tests {
             },
         );
         panel.selected_option = Some(1); // highlight the reject option
+        panel.focused = true;
         let mut reply = test_reply();
         reply.set_text("do it differently");
         let res = render_peek_panel(
@@ -2261,6 +1973,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut content = String::new();
@@ -2301,8 +2015,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Awaiting your input".to_string(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: Some("Which approach?".to_string()),
                 options: vec![
                     ("Redis".into(), "Redis".into()),
@@ -2324,6 +2036,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut content = String::new();
@@ -2357,8 +2071,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Awaiting your input".to_string(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: Some("Allow Edit?".to_string()),
                 options: vec![
                     ("allow".into(), "Allow".into()),
@@ -2379,6 +2091,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut content = String::new();
@@ -2404,7 +2118,7 @@ mod tests {
         use ratatui::layout::Rect;
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 5));
         let theme = Theme::current();
-        let panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle", &[]));
+        let panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle"));
         let mut reply = test_reply();
         reply.set_compact(true);
         let pasted = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven";
@@ -2419,6 +2133,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut content = String::new();
@@ -2443,8 +2159,7 @@ mod tests {
         use ratatui::layout::Rect;
         crate::appearance::cache::set_vim_mode(false);
         let theme = Theme::current();
-        let mut panel =
-            PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle", &[]));
+        let mut panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle"));
         panel.focused = true;
         let mut reply = test_reply();
         reply.set_compact(true);
@@ -2465,6 +2180,8 @@ mod tests {
             None,
             false,
             Some(overlay),
+            None,
+            None,
         );
         let mut content = String::new();
         for y in 0..buf.area.height {
@@ -2520,11 +2237,11 @@ mod tests {
         let area = Rect::new(0, 0, 80, 14);
         let mut buf = Buffer::empty(area);
         let theme = Theme::current();
-        let panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle", &[]));
+        let panel = PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Idle"));
         let mut reply = test_reply();
         reply.set_text("alpha\nbravo\ncharlie");
         let res = render_peek_panel(
-            &mut buf, area, &panel, &mut reply, &theme, false, None, false, None,
+            &mut buf, area, &panel, &mut reply, &theme, false, None, false, None, None, None,
         );
         let rect = res.reply_rect.expect("reply rect must be reported");
         assert!(
@@ -2560,8 +2277,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Idle".to_string(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question,
                 options,
                 request_id,

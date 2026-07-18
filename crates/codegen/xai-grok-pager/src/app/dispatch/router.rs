@@ -79,16 +79,16 @@ use super::settings::setters::{
     preview_theme, set_ask_user_question_timeout_enabled, set_auto_dark_theme,
     set_auto_light_theme, set_auto_update, set_code_mode, set_collapsed_edit_blocks,
     set_compact_mode, set_contextual_hint_image_input, set_contextual_hint_plan_mode,
-    set_contextual_hint_send_now, set_contextual_hint_small_screen, set_contextual_hint_undo,
-    set_contextual_hint_word_select, set_default_model, set_default_selected_permission,
-    set_display_refresh_auto_cadence, set_fork_secondary_model, set_group_tool_verbs,
-    set_hunk_tracker_mode, set_invert_scroll, set_keep_text_selection, set_kimi_api_endpoint,
-    set_kimi_api_key, set_max_thoughts_width, set_memory_model, set_multiline_mode,
-    set_perplexity_api_key, set_perplexity_web_search, set_prompt_suggestions, set_recap_model,
-    set_remember_tool_approvals, set_render_mermaid, set_respect_manual_folds, set_screen_mode,
-    set_scroll_lines, set_scroll_mode, set_scroll_speed, set_show_thinking_blocks, set_show_tips,
-    set_simple_mode, set_theme, set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode,
-    set_voice_stt_language,
+    set_contextual_hint_send_now, set_contextual_hint_small_screen, set_contextual_hint_ssh_wrap,
+    set_contextual_hint_undo, set_contextual_hint_word_select, set_default_model,
+    set_default_selected_permission, set_display_refresh_auto_cadence, set_fork_secondary_model,
+    set_group_tool_verbs, set_hunk_tracker_mode, set_invert_scroll, set_keep_text_selection,
+    set_kimi_api_endpoint, set_kimi_api_key, set_max_thoughts_width, set_memory_model,
+    set_multiline_mode, set_perplexity_api_key, set_perplexity_web_search, set_prompt_suggestions,
+    set_recap_model, set_remember_tool_approvals, set_render_mermaid, set_respect_manual_folds,
+    set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed, set_show_thinking_blocks,
+    set_show_tips, set_simple_mode, set_theme, set_timeline, set_timestamps, set_vim_mode,
+    set_voice_capture_mode, set_voice_stt_language,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette, dispatch_open_howto_guides,
@@ -120,6 +120,11 @@ use crate::app::app_view::{ActiveView, AppView, AuthState};
 use crate::scrollback::types::DisplayMode;
 use crate::views::session_picker::CONTENT_EXPAND_OFFSET;
 use xai_grok_telemetry::session_ctx::log_event;
+
+pub(super) fn auth_copy_was_confirmed(delivery: crate::clipboard::ClipboardDelivery) -> bool {
+    delivery == crate::clipboard::ClipboardDelivery::Confirmed
+}
+
 /// Dispatch an action: mutate state, return effects to execute.
 ///
 /// The returned `Vec<Effect>` may be empty (pure state mutation) or contain
@@ -616,6 +621,26 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 server_name,
             }]
         }
+        Action::McpSetupSubmit {
+            server_name,
+            values,
+        } => {
+            let ActiveView::Agent(id) = app.active_view else {
+                return vec![];
+            };
+            let Some(agent) = app.agents.get_mut(&id) else {
+                return vec![];
+            };
+            let Some(session_id) = agent.session.session_id.clone() else {
+                return vec![];
+            };
+            vec![Effect::McpSetupSubmit {
+                agent_id: id,
+                session_id,
+                server_name,
+                values,
+            }]
+        }
         Action::ReloadSkills => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
@@ -941,6 +966,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetContextualHintSendNow(v) => set_contextual_hint_send_now(app, v),
         Action::SetContextualHintSmallScreen(v) => set_contextual_hint_small_screen(app, v),
         Action::SetContextualHintWordSelect(v) => set_contextual_hint_word_select(app, v),
+        Action::SetContextualHintSshWrap(v) => set_contextual_hint_ssh_wrap(app, v),
         Action::SetTheme(v) => set_theme(app, v),
         Action::SetAutoDarkTheme(v) => set_auto_dark_theme(app, v),
         Action::SetAutoLightTheme(v) => set_auto_light_theme(app, v),
@@ -1040,7 +1066,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 ..
             } = &app.auth_state
             {
-                app.auth_clipboard_copied = crate::clipboard::SystemClipboard::try_set(url);
+                app.auth_clipboard_copied =
+                    auth_copy_was_confirmed(crate::clipboard::SystemClipboard::try_set(url));
             }
             if app.auth_clipboard_copied {
                 vec![Effect::ScheduleClearAuthCopied]

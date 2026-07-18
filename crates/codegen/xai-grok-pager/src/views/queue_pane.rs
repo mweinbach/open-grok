@@ -330,6 +330,10 @@ impl ListItem for QueuedPromptEntry {
     fn search_text(&self) -> &str {
         &self.text
     }
+
+    fn copy_text(&self) -> String {
+        self.text.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,6 +1313,75 @@ mod tests {
         let text: String = styled.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("first line"));
         assert!(text.contains("(+4 lines)"));
+    }
+
+    /// GB-4151: `y` on a multiline queue row must copy the full prompt text,
+    /// not the display line that ends with `(+N lines)`.
+    #[test]
+    fn copy_text_returns_full_prompt_not_display_suffix() {
+        let full = "line one\nline two\nline three\nline four";
+        let entry = QueuedPromptEntry::new(&local_prompt(1, full), 1);
+
+        // Precondition: display path still shows the collapsed row indicator.
+        let display: String = entry
+            .content()
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            display.contains("(+3 lines)"),
+            "display should keep (+N lines) indicator, got: {display}"
+        );
+
+        let copied = entry.copy_text();
+        assert_eq!(copied, full);
+        assert!(
+            !copied.contains("(+"),
+            "copied text must not include the (+N lines) display suffix"
+        );
+    }
+
+    /// End-to-end: `ListPaneState::copy_selected` (the `y` path) uses
+    /// `copy_text`, so multiline rows paste the full prompt.
+    #[test]
+    fn yank_selected_multiline_copies_full_text() {
+        use std::sync::{Arc, Mutex};
+
+        use xai_ratatui_textarea::ClipboardProvider;
+
+        #[derive(Debug, Clone)]
+        struct RecordingClip {
+            last: Arc<Mutex<Option<String>>>,
+        }
+        impl ClipboardProvider for RecordingClip {
+            fn get(&mut self) -> Option<String> {
+                self.last.lock().unwrap().clone()
+            }
+            fn set(&mut self, text: &str) {
+                *self.last.lock().unwrap() = Some(text.to_string());
+            }
+        }
+
+        let full = "first line of prompt\nsecond line\nthird line";
+        let mut pane = QueuePane::new();
+        let mut local = std::collections::VecDeque::new();
+        local.push_back(local_prompt(1, full));
+        pane.sync_from_merged(&local, &[], None, None, &Default::default());
+        // `select_by_id` is resolved into `selected_index` by prepare_layout.
+        pane.list_state.select_by_id(1);
+        pane.list_state.prepare_layout(&pane.entries, 80, 10);
+
+        let clip = Arc::new(Mutex::new(None));
+        pane.list_state
+            .set_clipboard_provider(Box::new(RecordingClip { last: clip.clone() }));
+
+        assert!(
+            pane.list_state.copy_selected(&pane.entries),
+            "y/copy_selected must succeed for a selected queue row"
+        );
+        let copied = clip.lock().unwrap().clone();
+        assert_eq!(copied.as_deref(), Some(full));
     }
 
     #[test]

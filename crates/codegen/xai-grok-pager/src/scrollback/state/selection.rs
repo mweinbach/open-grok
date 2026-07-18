@@ -22,6 +22,10 @@ impl ScrollbackState {
         self.view_mode
     }
 
+    pub(crate) fn set_view_mode(&mut self, mode: ViewMode) {
+        self.view_mode = mode;
+    }
+
     /// Get the range of entry indices visible in the current view mode.
     pub fn visible_entry_range(&self) -> Range<usize> {
         match self.view_mode {

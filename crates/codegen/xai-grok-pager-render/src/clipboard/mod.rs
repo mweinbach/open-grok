@@ -3,10 +3,13 @@
 //! Re-exports [`ClipboardProvider`] and [`InternalClipboard`] from
 //! `xai-ratatui-textarea`, and adds [`SystemClipboard`] backed by `arboard`.
 //!
-//! Multi-fire writes (native / tmux / OSC 52); user-facing success is [`trust`].
+//! Multi-fire writes (native / tmux / OSC 52); delivery evidence is [`ClipboardDelivery`].
 
 mod trust;
 
+pub use trust::{
+    ClipboardDelivery, NativeClipboardPreflight, expected_delivery, native_clipboard_preflight,
+};
 pub use xai_ratatui_textarea::{ClipboardProvider, InternalClipboard};
 
 use std::sync::OnceLock;
@@ -31,14 +34,14 @@ fn is_container_no_display() -> bool {
 /// clipboard sequences, and writes their payload to the *real* (local) system
 /// clipboard (see `xai-grok-pager`'s `pty_wrap` module). It advertises this to
 /// the wrapped program via an environment variable so the
-/// inner `grok` knows its OSC 52 writes are reliably intercepted and copied,
+/// inner `open-grok` knows its OSC 52 writes are reliably intercepted and copied,
 /// even when the inner terminal brand is misdetected (e.g. over SSH, where only
 /// `TERM` propagates and Apple Terminal / unknown brands look OSC-52-incapable).
 ///
 /// Two names are accepted: the canonical `GROK_OSC52_SINK` (inherited by local
 /// children) and the `LC_`-prefixed `LC_GROK_OSC52_SINK`, which the default
 /// OpenSSH client/server configs forward (`SendEnv LANG LC_*` /
-/// `AcceptEnv LANG LC_*`) so the signal survives the hop into a remote `grok`.
+/// `AcceptEnv LANG LC_*`) so the signal survives the hop into a remote `open-grok`.
 pub fn osc52_sink_active() -> bool {
     static SINK: OnceLock<bool> = OnceLock::new();
     *SINK.get_or_init(|| {
@@ -182,10 +185,10 @@ fn write_tmux_buffer(text: &str) -> bool {
 pub struct SystemClipboard;
 
 impl SystemClipboard {
-    /// Full write route; `true` when a trusted leg succeeded ([`trust`]).
-    pub fn try_set(text: &str) -> bool {
+    /// Full write route classified by the environment-based delivery policy.
+    pub fn try_set(text: &str) -> ClipboardDelivery {
         let legs = clipboard_write_with_route(text, clipboard_route());
-        toast_for_legs(&legs, text).reported_success()
+        decision_for_legs(&legs, text).delivery
     }
 }
 
@@ -266,16 +269,17 @@ pub struct CopyResult {
     pub message: &'static str,
     /// Toast duration in ticks (30fps: 30 = ~1s, 120 = ~4s).
     pub ticks: u8,
-    pub success: bool,
+    /// Evidence that the write reached the destination named by the UI.
+    pub delivery: ClipboardDelivery,
 }
 
-/// Kind of clipboard copy toast (success route or failure).
+/// Kind of clipboard feedback (success route, unverified send, or failure).
 ///
 /// Telemetry labels come from `IntoStaticStr` (`snake_case`); user-facing copy
-/// lives in [`ClipboardToastKind::message`] (intentionally different).
+/// lives in [`ClipboardFeedback::message`] (intentionally different).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum ClipboardToastKind {
+pub(crate) enum ClipboardFeedback {
     /// Plain successful copy (native clipboard).
     Copied,
     /// Successful copy mirrored into the tmux paste buffer.
@@ -284,28 +288,33 @@ pub(crate) enum ClipboardToastKind {
     CopiedOscContainer,
     /// Successful copy via OSC 52 over SSH/remote.
     CopiedOscRemote,
-    /// VS Code over SSH/remote + non-ASCII: OSC 52 may mojibake; prefer Shift+select.
+    /// OSC 52 emitted over SSH, but the outer terminal's support is unknown.
+    UnverifiedOscRemote,
+    /// OSC 52 emitted from a displayless container with unknown outer support.
+    UnverifiedOscContainer,
+    /// VS Code over SSH/remote + non-ASCII: OSC 52 may mojibake.
     VsCodeSshNonAscii,
-    /// All trusted clipboard backends failed.
+    /// No route reached the user's local clipboard from a remote/container topology.
+    FailedRemote,
+    /// All trusted clipboard backends failed in a local topology.
     Failed,
 }
 
-impl ClipboardToastKind {
+impl ClipboardFeedback {
     /// User-facing toast message for this kind.
     fn message(self) -> &'static str {
         match self {
             Self::Copied => "Copied!",
             Self::CopiedTmux => "Copied to tmux buffer, paste with prefix + ]",
-            Self::CopiedOscContainer => {
-                "Copied via OSC 52 (container). If paste fails, hold Shift (or Fn) and drag to select & copy natively."
-            }
-            Self::CopiedOscRemote => {
-                "Copied via OSC 52. If paste fails, hold Shift (or Fn) and drag to select & copy natively."
+            Self::CopiedOscContainer => "Copied via OSC 52 from the container.",
+            Self::CopiedOscRemote => "Copied via OSC 52.",
+            Self::UnverifiedOscRemote | Self::UnverifiedOscContainer => {
+                "Copy sent. If paste fails, use open-grok wrap or /minimal."
             }
             Self::VsCodeSshNonAscii => {
-                "Copied. In case VSCode via SSH garbles non-ASCII text, use native copy (shift+select)."
+                "Copied. VS Code over SSH may garble non-ASCII; use /minimal if needed."
             }
-            Self::Failed => "Copy failed. Try /minimal for terminal native rendering",
+            Self::FailedRemote | Self::Failed => "Copy failed. Try /terminal-setup or /minimal.",
         }
     }
 
@@ -316,35 +325,40 @@ impl ClipboardToastKind {
             Self::CopiedTmux
             | Self::CopiedOscContainer
             | Self::CopiedOscRemote
+            | Self::UnverifiedOscRemote
+            | Self::UnverifiedOscContainer
             | Self::VsCodeSshNonAscii
+            | Self::FailedRemote
             | Self::Failed => 120,
         }
     }
 
-    pub(crate) fn reported_success(self) -> bool {
-        !matches!(self, Self::Failed)
-    }
-
-    fn to_result(self) -> CopyResult {
+    fn to_result(self, delivery: ClipboardDelivery) -> CopyResult {
         CopyResult {
             message: self.message(),
             ticks: self.ticks(),
-            success: self.reported_success(),
+            delivery,
         }
     }
 }
 
-fn toast_for_legs(legs: &ClipboardWriteLegs, text: &str) -> ClipboardToastKind {
-    trust::resolve_copy_toast(
+fn decision_for_legs(legs: &ClipboardWriteLegs, text: &str) -> trust::ClipboardDecision {
+    let remote = is_remote();
+    let container = is_container_no_display();
+    let mut decision = trust::resolve_copy_decision(
         legs,
         text,
         crate::terminal::terminal_context().brand,
         crate::host::HostOs::current(),
         crate::host::DisplayServer::current(),
-        is_remote(),
-        is_container_no_display(),
+        remote,
+        container,
         osc52_sink_active(),
-    )
+    );
+    if decision.delivery == ClipboardDelivery::Failed && (remote || container) {
+        decision.feedback = ClipboardFeedback::FailedRemote;
+    }
+    decision
 }
 
 /// Write text and return a toast; emits `grok-shell-clipboard_copy` when enabled.
@@ -352,18 +366,17 @@ pub fn copy_text(text: &str) -> CopyResult {
     let started = std::time::Instant::now();
     let route = clipboard_route();
     let legs = clipboard_write_with_route(text, route);
-    let kind = toast_for_legs(&legs, text);
-    let success = kind.reported_success();
-    if !success {
+    let decision = decision_for_legs(&legs, text);
+    if decision.delivery.is_failed() {
         tracing::warn!(
             len = text.len(),
             display_server = %crate::host::DisplayServer::current(),
             "clipboard write failed on all trusted backends"
         );
     }
-    let result = kind.to_result();
-    let toast_kind: &'static str = kind.into();
-    log_clipboard_copy_event(text, route, &legs, success, toast_kind, started);
+    let result = decision.feedback.to_result(decision.delivery);
+    let toast_kind: &'static str = decision.feedback.into();
+    log_clipboard_copy_event(text, route, &legs, decision, toast_kind, started);
     result
 }
 
@@ -371,7 +384,7 @@ fn log_clipboard_copy_event(
     text: &str,
     route: &ClipboardRoute,
     legs: &ClipboardWriteLegs,
-    reported_success: bool,
+    decision: trust::ClipboardDecision,
     toast_kind: &'static str,
     started: std::time::Instant,
 ) {
@@ -393,7 +406,10 @@ fn log_clipboard_copy_event(
         data_control: legs.data_control,
         tmux_ok: legs.tmux_ok,
         osc52_ok: legs.osc52_ok,
-        reported_success,
+        delivery: decision.delivery.telemetry_label(),
+        osc52_sink: osc52_sink_active(),
+        container_no_display: is_container_no_display(),
+        reported_success: decision.delivery.reported_success(),
         toast_kind,
         duration_ms: started.elapsed().as_millis() as u64,
     });
@@ -1672,49 +1688,99 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_toast_kind_messages_and_telemetry_match_legacy() {
-        let cases: [(ClipboardToastKind, &str, &str, u8); 6] = [
-            (ClipboardToastKind::Copied, "Copied!", "copied", 30),
+    fn clipboard_feedback_contract() {
+        let cases: [(ClipboardFeedback, ClipboardDelivery, &str, &str, u8); 9] = [
             (
-                ClipboardToastKind::CopiedTmux,
+                ClipboardFeedback::Copied,
+                ClipboardDelivery::Confirmed,
+                "Copied!",
+                "copied",
+                30,
+            ),
+            (
+                ClipboardFeedback::CopiedTmux,
+                ClipboardDelivery::Confirmed,
                 "Copied to tmux buffer, paste with prefix + ]",
                 "copied_tmux",
                 120,
             ),
             (
-                ClipboardToastKind::CopiedOscContainer,
-                "Copied via OSC 52 (container). If paste fails, hold Shift (or Fn) and drag to select & copy natively.",
+                ClipboardFeedback::CopiedOscContainer,
+                ClipboardDelivery::Confirmed,
+                "Copied via OSC 52 from the container.",
                 "copied_osc_container",
                 120,
             ),
             (
-                ClipboardToastKind::CopiedOscRemote,
-                "Copied via OSC 52. If paste fails, hold Shift (or Fn) and drag to select & copy natively.",
+                ClipboardFeedback::CopiedOscRemote,
+                ClipboardDelivery::Confirmed,
+                "Copied via OSC 52.",
                 "copied_osc_remote",
                 120,
             ),
             (
-                ClipboardToastKind::VsCodeSshNonAscii,
-                "Copied. In case VSCode via SSH garbles non-ASCII text, use native copy (shift+select).",
+                ClipboardFeedback::UnverifiedOscRemote,
+                ClipboardDelivery::Unverified,
+                "Copy sent. If paste fails, use open-grok wrap or /minimal.",
+                "unverified_osc_remote",
+                120,
+            ),
+            (
+                ClipboardFeedback::UnverifiedOscContainer,
+                ClipboardDelivery::Unverified,
+                "Copy sent. If paste fails, use open-grok wrap or /minimal.",
+                "unverified_osc_container",
+                120,
+            ),
+            (
+                ClipboardFeedback::VsCodeSshNonAscii,
+                ClipboardDelivery::Confirmed,
+                "Copied. VS Code over SSH may garble non-ASCII; use /minimal if needed.",
                 "vs_code_ssh_non_ascii",
                 120,
             ),
             (
-                ClipboardToastKind::Failed,
-                "Copy failed. Try /minimal for terminal native rendering",
+                ClipboardFeedback::FailedRemote,
+                ClipboardDelivery::Failed,
+                "Copy failed. Try /terminal-setup or /minimal.",
+                "failed_remote",
+                120,
+            ),
+            (
+                ClipboardFeedback::Failed,
+                ClipboardDelivery::Failed,
+                "Copy failed. Try /terminal-setup or /minimal.",
                 "failed",
                 120,
             ),
         ];
-        for (kind, message, telemetry, ticks) in cases {
-            let label: &'static str = kind.into();
-            assert_eq!(kind.message(), message, "message for {kind:?}");
-            assert_eq!(label, telemetry, "telemetry for {kind:?}");
-            assert_eq!(kind.ticks(), ticks, "ticks for {kind:?}");
-            let result = kind.to_result();
+        for (feedback, delivery, message, telemetry, ticks) in cases {
+            let result = feedback.to_result(delivery);
+            assert_eq!(feedback.message(), message);
+            assert_eq!(Into::<&'static str>::into(feedback), telemetry);
             assert_eq!(result.message, message);
             assert_eq!(result.ticks, ticks);
-            assert_eq!(result.success, kind.reported_success());
+            assert_eq!(result.delivery, delivery);
         }
+    }
+
+    #[test]
+    fn clipboard_fallbacks_are_short_and_actionable() {
+        for feedback in [
+            ClipboardFeedback::UnverifiedOscRemote,
+            ClipboardFeedback::UnverifiedOscContainer,
+            ClipboardFeedback::FailedRemote,
+            ClipboardFeedback::Failed,
+        ] {
+            assert!(feedback.message().chars().count() + 4 < 80, "{feedback:?}");
+            assert!(!feedback.message().contains("Shift"), "{feedback:?}");
+            assert!(!feedback.message().contains("Fn"), "{feedback:?}");
+            assert!(feedback.message().contains("/minimal"), "{feedback:?}");
+        }
+        assert!(
+            ClipboardFeedback::UnverifiedOscRemote
+                .message()
+                .contains("open-grok wrap")
+        );
     }
 }

@@ -1722,6 +1722,32 @@ impl ScrollbackState {
         self.scroll_offset
     }
 
+    pub fn capture_viewport_snapshot(&self) -> ViewportSnapshot {
+        ViewportSnapshot {
+            scroll_offset: self.scroll_offset,
+            follow_mode: self.follow_mode,
+            follow_preserve_scroll: self.follow_preserve_scroll,
+            viewport_height: self.viewport_height,
+            last_width: self.last_width,
+            selected: self.selected,
+            current_turn: self.current_turn,
+            view_mode: self.view_mode,
+            total_height: self.total_height,
+        }
+    }
+
+    pub fn restore_viewport_snapshot(&mut self, snap: ViewportSnapshot) {
+        self.scroll_offset = snap.scroll_offset;
+        self.follow_mode = snap.follow_mode;
+        self.follow_preserve_scroll = snap.follow_preserve_scroll;
+        self.viewport_height = snap.viewport_height;
+        self.last_width = snap.last_width;
+        self.selected = snap.selected;
+        self.current_turn = snap.current_turn;
+        self.view_mode = snap.view_mode;
+        self.invalidate_layout_cache();
+    }
+
     /// Set viewport height.
     pub fn set_viewport_height(&mut self, height: u16) {
         self.viewport_height = height;
@@ -3347,5 +3373,150 @@ mod tests {
             state.get_by_id(id).unwrap().display_mode,
             DisplayMode::Expanded
         );
+    }
+
+    fn long_wrap_text() -> String {
+        "word ".repeat(80)
+    }
+
+    fn snapshot_fixture() -> ScrollbackState {
+        let mut state = ScrollbackState::new();
+        state.push_block(user_block("Q1"));
+        state.push_block(agent_block(&long_wrap_text()));
+        state.push_block(user_block("Q2"));
+        state.push_block(agent_block(&long_wrap_text()));
+        state
+    }
+
+    #[test]
+    fn viewport_snapshot_restore_roundtrip_after_guest_mutate() {
+        let mut state = snapshot_fixture();
+        const W0: u16 = 80;
+        const H0: u16 = 20;
+        state.prepare_layout(W0, H0);
+        state.follow_mode = false;
+        state.follow_preserve_scroll = true;
+        state.set_selected(Some(0));
+        state.set_scroll_offset(3);
+        state.view_mode = ViewMode::SingleTurn;
+        state.current_turn = Some(0);
+        state.prepare_layout(W0, H0);
+
+        let snap = state.capture_viewport_snapshot();
+        let expected_offset = snap.scroll_offset;
+        let expected_follow = snap.follow_mode;
+        let expected_preserve = snap.follow_preserve_scroll;
+        let expected_vh = snap.viewport_height;
+        let expected_lw = snap.last_width;
+        let expected_sel = snap.selected;
+        let expected_turn = snap.current_turn;
+        let expected_mode = snap.view_mode;
+
+        state.enable_follow_mode();
+        state.view_mode = ViewMode::AllTurns;
+        assert!(state.prepare_layout(40, 8));
+        assert!(state.layout_cache.is_some());
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, 40);
+
+        state.restore_viewport_snapshot(snap);
+
+        assert_eq!(state.scroll_offset, expected_offset);
+        assert_eq!(state.follow_mode, expected_follow);
+        assert_eq!(state.follow_preserve_scroll, expected_preserve);
+        assert_eq!(state.viewport_height, expected_vh);
+        assert_eq!(state.last_width, expected_lw);
+        assert_eq!(state.selected, expected_sel);
+        assert_eq!(state.current_turn, expected_turn);
+        assert_eq!(state.view_mode, expected_mode);
+        assert!(state.layout_cache.is_none());
+
+        assert!(state.prepare_layout(W0, H0));
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, W0);
+    }
+
+    #[test]
+    fn restore_invalidates_stale_peek_width_cache_before_full_prepare() {
+        let mut state = snapshot_fixture();
+        const W0: u16 = 80;
+        const W1: u16 = 40;
+        const H: u16 = 20;
+
+        assert!(state.prepare_layout(W0, H));
+        assert_eq!(state.last_width, W0);
+        let snap = state.capture_viewport_snapshot();
+        assert_eq!(snap.last_width, W0);
+
+        assert!(state.prepare_layout(W1, H));
+        assert_eq!(state.last_width, W1);
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, W1);
+        let peek_height = state.layout_cache.as_ref().unwrap().entries[1].height;
+
+        state.restore_viewport_snapshot(snap);
+        assert_eq!(state.last_width, W0);
+        assert!(state.layout_cache.is_none());
+
+        assert!(
+            state.prepare_layout(W0, H),
+            "restore must force Case 1 full rebuild at restored width"
+        );
+        let cache = state.layout_cache.as_ref().unwrap();
+        assert_eq!(cache.width, W0);
+        assert_ne!(
+            cache.entries[1].height, peek_height,
+            "heights must be recomputed for W0, not left at W1 wrap"
+        );
+    }
+
+    #[test]
+    fn prepare_layout_width_change_is_case1_height_only_is_not() {
+        let mut state = snapshot_fixture();
+        assert!(state.prepare_layout(80, 20));
+        assert!(
+            !state.prepare_layout(80, 20),
+            "stable WxH with clean cache is Case 3"
+        );
+        assert!(
+            !state.prepare_layout(80, 12),
+            "height-only change is not Case 1"
+        );
+        assert_eq!(state.last_width, 80);
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, 80);
+        assert!(
+            !state.prepare_layout(80, 12),
+            "stable width after height-only stays Case 3"
+        );
+        assert!(state.prepare_layout(50, 12), "width change is Case 1");
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, 50);
+        assert!(
+            !state.prepare_layout(50, 12),
+            "stable width after Case 1 is Case 3"
+        );
+    }
+
+    #[test]
+    fn restore_reverts_follow_autoselect_and_current_turn() {
+        let mut state = snapshot_fixture();
+        state.prepare_layout(80, 20);
+        state.follow_mode = false;
+        state.set_selected(Some(0));
+        assert_eq!(state.current_turn(), Some(0));
+        state.set_scroll_offset(2);
+
+        let snap = state.capture_viewport_snapshot();
+        assert_eq!(snap.selected, Some(0));
+        assert_eq!(snap.current_turn, Some(0));
+        assert!(!snap.follow_mode);
+
+        state.enable_follow_mode();
+        state.prepare_layout(80, 20);
+        assert!(state.is_follow_mode());
+        assert_ne!(state.selected(), Some(0));
+        assert_eq!(state.current_turn(), Some(1));
+
+        state.restore_viewport_snapshot(snap);
+        assert!(!state.is_follow_mode());
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.current_turn(), Some(0));
+        assert_eq!(state.scroll_offset(), 2);
     }
 }

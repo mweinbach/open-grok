@@ -1,5 +1,18 @@
 //! Tests for the action router, model switching, slash commands, and other cross-cutting dispatch behavior.
 use super::*;
+#[test]
+fn auth_copy_success_requires_confirmed_delivery() {
+    use crate::clipboard::ClipboardDelivery;
+    assert!(crate::app::dispatch::router::auth_copy_was_confirmed(
+        ClipboardDelivery::Confirmed
+    ));
+    assert!(!crate::app::dispatch::router::auth_copy_was_confirmed(
+        ClipboardDelivery::Unverified
+    ));
+    assert!(!crate::app::dispatch::router::auth_copy_was_confirmed(
+        ClipboardDelivery::Failed
+    ));
+}
 fn seed_foreign_resume_hint(
     app: &mut AppView,
     tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool,
@@ -2104,8 +2117,6 @@ fn mouse_click_on_peek_close_rect_clears_peek() {
             time_ago: String::new(),
             response_type: "Idle".into(),
             last_user_message: None,
-            last_agent_lines: Vec::new(),
-            last_response_truncated: false,
             question: None,
             options: Vec::new(),
             request_id: None,

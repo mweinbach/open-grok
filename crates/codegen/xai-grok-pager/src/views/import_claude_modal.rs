@@ -1164,6 +1164,7 @@ mod tests {
                 },
                 enabled: true,
                 oauth: None,
+                setup: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 tool_timeouts: None,

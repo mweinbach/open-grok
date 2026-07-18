@@ -1448,6 +1448,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "contextual_hints.word_select" => {
             let _ = dispatch(Action::SetContextualHintWordSelect(false), app);
         }
+        "contextual_hints.ssh_wrap" => {
+            let _ = dispatch(Action::SetContextualHintSshWrap(false), app);
+        }
         "multiline_mode" => {
             let _ = dispatch(Action::SetMultilineMode(true), app);
         }

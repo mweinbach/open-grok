@@ -382,7 +382,14 @@ impl AgentView {
             };
         }
 
-        // If in input mode, route to input handler.
+        // If in setup or input mode, route to the form handler.
+        if self
+            .extensions_modal
+            .as_ref()
+            .is_some_and(|s| s.mcp_setup.is_some())
+        {
+            return self.handle_mcp_setup_key(key);
+        }
         if self
             .extensions_modal
             .as_ref()
@@ -735,6 +742,40 @@ impl AgentView {
             crate::views::picker::PickerOutcome::SubmitQuery => InputOutcome::Changed,
             crate::views::picker::PickerOutcome::Changed => InputOutcome::Changed,
             crate::views::picker::PickerOutcome::Unchanged => InputOutcome::Unchanged,
+        }
+    }
+
+    fn handle_mcp_setup_key(&mut self, key: &KeyEvent) -> InputOutcome {
+        use crate::views::extensions_modal::McpSetupOutcome;
+
+        let Some(ref mut state) = self.extensions_modal else {
+            return InputOutcome::Unchanged;
+        };
+        let Some(ref mut setup) = state.mcp_setup else {
+            return InputOutcome::Unchanged;
+        };
+
+        match setup.handle_key(key) {
+            McpSetupOutcome::Changed => InputOutcome::Changed,
+            McpSetupOutcome::Unchanged => InputOutcome::Unchanged,
+            McpSetupOutcome::Cancel => {
+                state.mcp_setup = None;
+                InputOutcome::Changed
+            }
+            McpSetupOutcome::Submit => {
+                let Some(values) = setup.values() else {
+                    setup.error = Some("Select an option".to_string());
+                    return InputOutcome::Changed;
+                };
+                let server_name = setup.server_name.clone();
+                state.mcp_setup = None;
+                state.pending_action = Some(format!("Authenticating {server_name}..."));
+                state.pending_entry_index = None;
+                InputOutcome::Action(Action::McpSetupSubmit {
+                    server_name,
+                    values,
+                })
+            }
         }
     }
 
@@ -1408,6 +1449,14 @@ impl AgentView {
                         if server.is_managed_gateway {
                             return InputOutcome::Action(Action::OpenManagedConnectors);
                         }
+                        if server.setup_required
+                            && let Some(form) =
+                                crate::views::extensions_modal::McpSetupFormState::new(server)
+                        {
+                            state.mcp_setup = Some(form);
+                            state.picker_state.search_active = false;
+                            return InputOutcome::Changed;
+                        }
                         // Drop repeats while an action is in flight on the same
                         // row to avoid double-spawning the OAuth browser flow.
                         let sel = state.picker_state.selected;
@@ -2067,6 +2116,9 @@ mod extensions_action_target_tests {
             status: crate::views::mcps_modal::McpServerDisplayStatus::Initializing,
             tool_count: 0,
             auth_required: false,
+            setup_required: false,
+            setup: None,
+            setup_values: std::collections::HashMap::new(),
             tools: Vec::new(),
             enabled,
             source: "local".into(),
@@ -2576,6 +2628,9 @@ mod connectors_url_click_tests {
             status: McpServerDisplayStatus::Ready,
             tool_count: 0,
             auth_required: false,
+            setup_required: false,
+            setup: None,
+            setup_values: std::collections::HashMap::new(),
             tools: vec![],
             enabled: true,
             source: "managed".into(),
