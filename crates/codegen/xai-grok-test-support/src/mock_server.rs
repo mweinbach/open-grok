@@ -99,6 +99,8 @@ pub struct MockModelEntry {
     /// Optional API backend (e.g. `"messages"`). Emitted as `apiBackend`
     /// when set; absent means the shell's default backend.
     pub api_backend: Option<String>,
+    /// Optional first-party provider identity. Emitted as `provider` when set.
+    pub provider: Option<String>,
     /// Emitted as `supportsBackendSearch` when true.
     pub supports_backend_search: bool,
     /// Emitted as `supportsReasoningEffort` (top-level) when true.
@@ -117,6 +119,7 @@ impl MockModelEntry {
             id: id.into(),
             agent_type: None,
             api_backend: None,
+            provider: None,
             supports_backend_search: false,
             supports_reasoning_effort: false,
             reasoning_effort: None,
@@ -133,6 +136,11 @@ impl MockModelEntry {
 
     pub fn with_api_backend(mut self, api_backend: impl Into<String>) -> Self {
         self.api_backend = Some(api_backend.into());
+        self
+    }
+
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
         self
     }
 
@@ -168,6 +176,9 @@ impl MockModelEntry {
         }
         if let Some(ref backend) = self.api_backend {
             obj["apiBackend"] = json!(backend);
+        }
+        if let Some(ref provider) = self.provider {
+            obj["provider"] = json!(provider);
         }
         if self.supports_backend_search {
             obj["supportsBackendSearch"] = json!(true);
@@ -1226,6 +1237,14 @@ mod tests {
             .send()
             .await
             .expect("POST /v1/chat/completions")
+    }
+
+    #[test]
+    fn model_entry_emits_explicit_provider_metadata() {
+        let value = MockModelEntry::new("test-model")
+            .with_provider("xai")
+            .to_json();
+        assert_eq!(value.get("provider"), Some(&json!("xai")));
     }
 
     #[tokio::test]

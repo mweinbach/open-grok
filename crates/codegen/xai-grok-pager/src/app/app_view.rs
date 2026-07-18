@@ -7107,7 +7107,23 @@ pub(crate) mod tests {
         assert!(app.is_api_key_auth);
         assert!(!app.usage_visible);
         assert!(app.tier_restricted_commands.is_empty());
-        assert_tier_restricted_commands_present(&app);
+        {
+            let registry = app.welcome_prompt.slash_controller.registry();
+            assert!(
+                registry.get("usage").is_none(),
+                "/usage stays hidden when xAI API-key auth has no billing surface"
+            );
+            for name in TIER_RESTRICTED_COMMANDS
+                .iter()
+                .copied()
+                .filter(|name| *name != "usage")
+            {
+                assert!(
+                    registry.get(name).is_some(),
+                    "/{name} must be available when the tier gate is bypassed"
+                );
+            }
+        }
         assert!(!app.is_voice_tier_restricted());
         assert!(app.voice_mode_enabled);
         let mut app = test_app();

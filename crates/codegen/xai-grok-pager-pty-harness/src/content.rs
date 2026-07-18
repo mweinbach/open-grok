@@ -39,7 +39,7 @@ impl ContentController {
     ///
     /// Must be called from within a tokio runtime.
     pub async fn start() -> Result<Self> {
-        Self::start_with_models(vec![MockModel::new("test-model")]).await
+        Self::start_with_models(vec![MockModel::new("test-model").with_provider("xai")]).await
     }
 
     /// Start the mock server with a custom set of models returned by
@@ -92,6 +92,7 @@ impl ContentController {
             ("OPENGROK_HOME".into(), grok_home),
             ("GROK_CLI_CHAT_PROXY_BASE_URL".into(), self.url()),
             ("GROK_XAI_API_BASE_URL".into(), self.url()),
+            ("GROK_DEFAULT_MODEL".into(), "test-model".into()),
             ("XAI_API_KEY".into(), "test-key-for-ci".into()),
             ("GROK_TELEMETRY_ENABLED".into(), "false".into()),
             ("GROK_FEEDBACK_ENABLED".into(), "false".into()),
@@ -280,12 +281,13 @@ mod tests {
         );
         assert_eq!(get("GROK_CLI_CHAT_PROXY_BASE_URL"), Some(content.url()));
         assert_eq!(get("GROK_XAI_API_BASE_URL"), Some(content.url()));
+        assert_eq!(get("GROK_DEFAULT_MODEL").as_deref(), Some("test-model"));
         assert_eq!(get("XAI_API_KEY").as_deref(), Some("test-key-for-ci"));
         assert_eq!(get("GROK_TELEMETRY_ENABLED").as_deref(), Some("false"));
         assert_eq!(get("GROK_FEEDBACK_ENABLED").as_deref(), Some("false"));
         assert_eq!(get("GROK_TRACE_UPLOAD").as_deref(), Some("false"));
         assert_eq!(get("GROK_PROMPT_SUGGESTIONS").as_deref(), Some("false"));
         assert_eq!(get("GROK_MAX_RETRIES").as_deref(), Some("0"));
-        assert_eq!(env.len(), 10, "env list must not silently grow or shrink");
+        assert_eq!(env.len(), 11, "env list must not silently grow or shrink");
     }
 }

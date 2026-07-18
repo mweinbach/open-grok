@@ -1502,7 +1502,7 @@ mod tests {
         let rendered = renderer
             .render(&task_model_guidance(&["alpha".to_string()]))
             .expect("model guidance should render");
-        assert!(rendered.contains("omit `child_model` to inherit the parent model"));
+        assert!(rendered.contains("Omit `child_model` to inherit the parent model"));
         assert!(!rendered.contains("params.task.model"));
     }
     #[test]

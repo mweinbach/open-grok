@@ -1645,6 +1645,10 @@ mod tests {
     fn gate_load_claude_env_returns_empty_when_marker_set() {
         let _g = MarkerGuard;
         refresh_marker_cache(true);
+        // The loader lives in xai-grok-workspace and cannot see the shell's
+        // process-local marker cache. Mirror the runtime marker through the
+        // test-only cross-crate override.
+        unsafe { std::env::set_var("_GROK_CLAUDE_MARKER_OVERRIDE", "1") };
         let dir = tempfile::tempdir().unwrap();
         let env = xai_grok_workspace::permission::claude_settings::load_claude_env_with_project(
             dir.path(),

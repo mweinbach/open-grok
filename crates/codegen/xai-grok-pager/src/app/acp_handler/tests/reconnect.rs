@@ -831,10 +831,10 @@
                 .push_block(RenderBlock::system("pre-outage content"));
             agent.begin_session_reload(1);
         }
-        assert!(handle_ext_notification(
-            &model_switch_notif(Some(replay_meta)),
-            &mut app
-        ));
+        assert!(
+            !handle_ext_notification(&model_switch_notif(Some(replay_meta)), &mut app),
+            "reload replay mutates staged state without requesting an intermediate redraw"
+        );
         let agent = app.agents.get_mut(&id).unwrap();
         assert_eq!(
             agent.last_seen_event_id.as_deref(),
@@ -885,7 +885,10 @@
             "x.ai/session_notification",
             serde_json::value::to_raw_value(&payload).unwrap().into(),
         );
-        assert!(handle_ext_notification(&notif, &mut app));
+        assert!(
+            !handle_ext_notification(&notif, &mut app),
+            "reload replay mutates staged state without requesting an intermediate redraw"
+        );
 
         let agent = app.agents.get_mut(&id).unwrap();
         assert!(agent.finish_session_reload(1, true));
@@ -1053,4 +1056,3 @@
         );
         assert_eq!(app.agents[&id].last_applied_event_seq, Some(8));
     }
-

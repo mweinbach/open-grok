@@ -2818,7 +2818,11 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
         }
     }
     let agent = build_minimal_agent_for_tests();
-    agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
+    {
+        let mut sampling_config = agent.sampling_config.borrow_mut();
+        sampling_config.provider = xai_grok_sampling_types::ModelProvider::Xai;
+        sampling_config.api_key = Some("test-key".to_string());
+    }
     assert!(matches!(
         agent.prepare_video_gen_config(),
         VideoGenConfig::Enabled { .. }
@@ -2859,7 +2863,11 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
 async fn prepare_image_gen_config_fails_open_without_auth() {
     use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
     let agent = build_minimal_agent_for_tests();
-    agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
+    {
+        let mut sampling_config = agent.sampling_config.borrow_mut();
+        sampling_config.provider = xai_grok_sampling_types::ModelProvider::Xai;
+        sampling_config.api_key = Some("test-key".to_string());
+    }
     let ImageGenConfig::Enabled {
         tier_restricted, ..
     } = agent.prepare_image_gen_config()
