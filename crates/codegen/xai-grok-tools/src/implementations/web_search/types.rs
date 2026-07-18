@@ -1,10 +1,13 @@
 use indexmap::IndexMap;
+use std::fmt;
+
+pub const PERPLEXITY_SEARCH_API_BASE_URL: &str = "https://api.perplexity.ai";
 
 /// Configuration for the web search tool.
 ///
 /// Use `Disabled` when no API key is available or web search should be turned off.
 /// Use `Enabled { … }` to provide credentials and endpoint configuration.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum WebSearchConfig {
     #[default]
@@ -18,12 +21,55 @@ pub enum WebSearchConfig {
         #[serde(skip_serializing_if = "Option::is_none")]
         alpha_test_key: Option<String>,
     },
+    Perplexity {
+        api_key: String,
+        #[serde(default = "default_perplexity_base_url")]
+        base_url: String,
+    },
+}
+
+fn default_perplexity_base_url() -> String {
+    PERPLEXITY_SEARCH_API_BASE_URL.to_owned()
+}
+
+impl fmt::Debug for WebSearchConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => formatter.write_str("WebSearchConfig::Disabled"),
+            Self::Enabled {
+                base_url,
+                model,
+                extra_headers,
+                alpha_test_key,
+                ..
+            } => formatter
+                .debug_struct("WebSearchConfig::Enabled")
+                .field("api_key", &"***REDACTED***")
+                .field("base_url", base_url)
+                .field("model", model)
+                .field("extra_headers", extra_headers)
+                .field(
+                    "alpha_test_key",
+                    &alpha_test_key.as_ref().map(|_| "***REDACTED***"),
+                )
+                .finish(),
+            Self::Perplexity { base_url, .. } => formatter
+                .debug_struct("WebSearchConfig::Perplexity")
+                .field("api_key", &"***REDACTED***")
+                .field("base_url", base_url)
+                .finish(),
+        }
+    }
 }
 
 impl WebSearchConfig {
     /// Returns `true` when the config is the `Enabled` variant.
     pub fn is_enabled(&self) -> bool {
-        matches!(self, Self::Enabled { .. })
+        !matches!(self, Self::Disabled)
+    }
+
+    pub fn is_perplexity(&self) -> bool {
+        matches!(self, Self::Perplexity { .. })
     }
 
     /// Return a copy safe for returning to clients.
@@ -44,6 +90,10 @@ impl WebSearchConfig {
                 model: model.clone(),
                 extra_headers: extra_headers.clone(),
                 alpha_test_key: None,
+            },
+            Self::Perplexity { base_url, .. } => Self::Perplexity {
+                api_key: "***REDACTED***".to_string(),
+                base_url: base_url.clone(),
             },
         }
     }
@@ -69,6 +119,24 @@ mod tests {
             alpha_test_key: None,
         };
         assert!(config.is_enabled());
+        assert!(!config.is_perplexity());
+    }
+
+    #[test]
+    fn test_config_perplexity_is_enabled_and_redacted() {
+        let config = WebSearchConfig::Perplexity {
+            api_key: "pplx-secret".to_owned(),
+            base_url: PERPLEXITY_SEARCH_API_BASE_URL.to_owned(),
+        };
+
+        assert!(config.is_enabled());
+        assert!(config.is_perplexity());
+        assert!(!format!("{config:?}").contains("pplx-secret"));
+        assert!(
+            !serde_json::to_string(&config.redacted())
+                .unwrap()
+                .contains("pplx-secret")
+        );
     }
 
     #[test]

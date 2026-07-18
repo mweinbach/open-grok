@@ -3,6 +3,16 @@ use crate::attribution::{SharedAttributionCallback, ToolConsumer};
 use crate::types::SharedApiKeyProvider;
 use async_openai::types::responses as rs;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
+
+const PERPLEXITY_MAX_RESULTS: u8 = 10;
+const PERPLEXITY_MEDIUM_CONTEXT_TOKENS_PER_PAGE: u32 = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebSearchBackend {
+    Responses,
+    Perplexity,
+}
 /// A minimal, purpose-built HTTP client for calling the Responses API
 /// with web search capability.
 #[derive(Clone)]
@@ -10,6 +20,7 @@ pub struct WebSearchClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    backend: WebSearchBackend,
     api_key_provider: Option<SharedApiKeyProvider>,
     /// Optional 401-attribution hook. Callers can wire this so a 401
     /// from the Responses API emits an `auth_401_attribution` event
@@ -24,59 +35,58 @@ impl WebSearchClient {
         config: &WebSearchConfig,
         api_key_provider: Option<SharedApiKeyProvider>,
     ) -> Result<Self, xai_tool_runtime::ToolError> {
-        let WebSearchConfig::Enabled {
-            api_key,
-            base_url,
-            model,
-            extra_headers,
-            alpha_test_key,
-        } = config
-        else {
-            return Err(xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                "Cannot create WebSearchClient from disabled config".to_string(),
-            ));
-        };
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Invalid API key for header: {e}"),
+        let (base_url, model, backend, api_key_provider) = match config {
+            WebSearchConfig::Disabled => {
+                return Err(web_search_error(
+                    "Cannot create WebSearchClient from disabled config",
+                ));
+            }
+            WebSearchConfig::Enabled {
+                api_key,
+                base_url,
+                model,
+                extra_headers,
+                alpha_test_key,
+            } => {
+                insert_bearer_header(&mut headers, api_key)?;
+                for (key, value) in extra_headers {
+                    let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
+                        web_search_error("Invalid extra header name for web search")
+                    })?;
+                    let header_value = HeaderValue::from_str(value).map_err(|_| {
+                        web_search_error("Invalid extra header value for web search")
+                    })?;
+                    headers.insert(header_name, header_value);
+                }
+                let _ = alpha_test_key;
+                (
+                    base_url.clone(),
+                    model.clone(),
+                    WebSearchBackend::Responses,
+                    api_key_provider,
                 )
-            })?,
-        );
-        for (key, value) in extra_headers {
-            let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Invalid header name '{key}': {e}"),
+            }
+            WebSearchConfig::Perplexity { api_key, base_url } => {
+                insert_bearer_header(&mut headers, api_key)?;
+                (
+                    base_url.clone(),
+                    String::new(),
+                    WebSearchBackend::Perplexity,
+                    None,
                 )
-            })?;
-            let header_value = HeaderValue::from_str(value).map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Invalid header value for '{key}': {e}"),
-                )
-            })?;
-            headers.insert(header_name, header_value);
-        }
-        let _ = alpha_test_key;
+            }
+        };
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .build()
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Failed to build HTTP client: {e}"),
-                )
-            })?;
+            .map_err(|_| web_search_error("Failed to initialize web search client"))?;
         Ok(Self {
             http,
-            base_url: base_url.clone(),
-            model: model.clone(),
+            base_url,
+            model,
+            backend,
             api_key_provider,
             attribution_callback: None,
         })
@@ -109,6 +119,10 @@ impl WebSearchClient {
         query: &str,
         allowed_domains: Option<Vec<String>>,
     ) -> Result<(String, Vec<String>), xai_tool_runtime::ToolError> {
+        if self.backend == WebSearchBackend::Perplexity {
+            let result = self.search_perplexity(query, allowed_domains).await?;
+            return Ok((result.content, result.citations));
+        }
         let web_search = rs::WebSearchToolArgs::default()
             .filters(rs::WebSearchToolFilters { allowed_domains })
             .build()
@@ -197,6 +211,10 @@ impl WebSearchClient {
         query: &str,
         allowed_domains: Option<Vec<String>>,
     ) -> Result<(String, Vec<(String, String)>), xai_tool_runtime::ToolError> {
+        if self.backend == WebSearchBackend::Perplexity {
+            let result = self.search_perplexity(query, allowed_domains).await?;
+            return Ok((result.content, result.citation_pairs));
+        }
         let web_search = rs::WebSearchToolArgs::default()
             .filters(rs::WebSearchToolFilters { allowed_domains })
             .build()
@@ -273,6 +291,159 @@ impl WebSearchClient {
         let pairs = extract_citation_pairs(&response_obj);
         Ok((content, pairs))
     }
+
+    async fn search_perplexity(
+        &self,
+        query: &str,
+        allowed_domains: Option<Vec<String>>,
+    ) -> Result<PerplexityFormattedResults, xai_tool_runtime::ToolError> {
+        let request = PerplexitySearchRequest {
+            query,
+            max_results: PERPLEXITY_MAX_RESULTS,
+            max_tokens_per_page: PERPLEXITY_MEDIUM_CONTEXT_TOKENS_PER_PAGE,
+            search_domain_filter: allowed_domains.as_deref(),
+        };
+        let url = format!("{}/search", self.base_url.trim_end_matches('/'));
+        let response = self
+            .http
+            .post(url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|_| web_search_error("Perplexity web search request failed. Try again."))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(perplexity_status_error(status, allowed_domains.is_some()));
+        }
+        let bytes = response.bytes().await.map_err(|_| {
+            web_search_error("Perplexity web search returned an unreadable response.")
+        })?;
+        let response: PerplexitySearchResponse = serde_json::from_slice(&bytes).map_err(|_| {
+            web_search_error("Perplexity web search returned a malformed response.")
+        })?;
+        format_perplexity_results(response.results)
+    }
+}
+
+fn insert_bearer_header(
+    headers: &mut HeaderMap,
+    api_key: &str,
+) -> Result<(), xai_tool_runtime::ToolError> {
+    let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+        .map_err(|_| web_search_error("Invalid API key for web search"))?;
+    headers.insert(AUTHORIZATION, value);
+    Ok(())
+}
+
+fn web_search_error(message: impl Into<String>) -> xai_tool_runtime::ToolError {
+    xai_tool_runtime::ToolError::execution(
+        xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+        message.into(),
+    )
+}
+
+fn perplexity_status_error(
+    status: reqwest::StatusCode,
+    had_domain_filter: bool,
+) -> xai_tool_runtime::ToolError {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            xai_tool_runtime::ToolError::unauthorized(
+                "Perplexity web search authentication failed. Check the API key.",
+            )
+            .with_details(serde_json::json!({
+                "tool_id": "web_search",
+                "status": status.as_u16(),
+            }))
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            web_search_error("Perplexity web search is rate limited. Try again later.")
+        }
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            if had_domain_filter =>
+        {
+            web_search_error("Perplexity web search rejected the allowed_domains filter.")
+        }
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+            web_search_error("Perplexity web search rejected the request.")
+        }
+        status if status.is_server_error() => {
+            web_search_error("Perplexity web search is temporarily unavailable.")
+        }
+        _ => web_search_error(format!(
+            "Perplexity web search failed with status {}.",
+            status.as_u16()
+        )),
+    }
+}
+
+#[derive(Serialize)]
+struct PerplexitySearchRequest<'a> {
+    query: &'a str,
+    max_results: u8,
+    max_tokens_per_page: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_domain_filter: Option<&'a [String]>,
+}
+
+#[derive(Deserialize)]
+struct PerplexitySearchResponse {
+    results: Vec<PerplexitySearchResult>,
+}
+
+#[derive(Deserialize)]
+struct PerplexitySearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    last_updated: Option<String>,
+}
+
+struct PerplexityFormattedResults {
+    content: String,
+    citations: Vec<String>,
+    citation_pairs: Vec<(String, String)>,
+}
+
+fn format_perplexity_results(
+    results: Vec<PerplexitySearchResult>,
+) -> Result<PerplexityFormattedResults, xai_tool_runtime::ToolError> {
+    if results.is_empty() {
+        return Err(web_search_error(
+            "Perplexity web search returned no results.",
+        ));
+    }
+    let mut content = String::from("Ranked web search results:\n");
+    let mut citations = Vec::new();
+    let mut citation_pairs = Vec::new();
+    let mut seen_urls = std::collections::HashSet::new();
+    for (index, result) in results.into_iter().enumerate() {
+        let date = result
+            .date
+            .as_deref()
+            .or(result.last_updated.as_deref())
+            .unwrap_or("Unavailable");
+        content.push_str(&format!(
+            "\n{}. {}\nURL: {}\nDate: {}\nSnippet: {}\n",
+            index + 1,
+            result.title,
+            result.url,
+            date,
+            result.snippet
+        ));
+        if seen_urls.insert(result.url.clone()) {
+            citations.push(result.url.clone());
+            citation_pairs.push((result.title, result.url));
+        }
+    }
+    Ok(PerplexityFormattedResults {
+        content,
+        citations,
+        citation_pairs,
+    })
 }
 /// Extract citation URLs from the Response output items.
 /// The async-openai crate doesn't provide a helper for this, and the `url` field
@@ -575,6 +746,189 @@ mod tests {
             .expect("search must succeed with provider key");
         assert_eq!(content, "fresh result");
     }
+
+    fn perplexity_config(base_url: String) -> WebSearchConfig {
+        WebSearchConfig::Perplexity {
+            api_key: "pplx-test-key".to_owned(),
+            base_url,
+        }
+    }
+
+    #[tokio::test]
+    async fn perplexity_request_forwards_domains_and_formats_ranked_results() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(header("Authorization", "Bearer pplx-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "search-1",
+                "results": [
+                    {
+                        "title": "Rust Language",
+                        "url": "https://www.rust-lang.org/",
+                        "snippet": "A language empowering everyone.",
+                        "date": "2026-07-01"
+                    },
+                    {
+                        "title": "Docs.rs",
+                        "url": "https://docs.rs/",
+                        "snippet": "Rust crate documentation.",
+                        "last_updated": "2026-07-02"
+                    },
+                    {
+                        "title": "Rust Duplicate",
+                        "url": "https://www.rust-lang.org/",
+                        "snippet": "Duplicate URL for citation testing."
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = WebSearchClient::new(&perplexity_config(server.uri()), None)
+            .expect("Perplexity client should build");
+        let domains = vec!["rust-lang.org".to_owned(), "docs.rs".to_owned()];
+        let (content, citations) = client
+            .search("Rust documentation", Some(domains.clone()))
+            .await
+            .expect("Perplexity search should succeed");
+
+        assert!(content.contains("1. Rust Language"));
+        assert!(content.contains("URL: https://www.rust-lang.org/"));
+        assert!(content.contains("Date: 2026-07-01"));
+        assert!(content.contains("Snippet: A language empowering everyone."));
+        assert!(content.contains("2. Docs.rs"));
+        assert!(content.contains("Date: 2026-07-02"));
+        assert!(content.contains("3. Rust Duplicate"));
+        assert_eq!(
+            citations,
+            vec![
+                "https://www.rust-lang.org/".to_owned(),
+                "https://docs.rs/".to_owned()
+            ]
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording should be available");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body should be JSON");
+        assert_eq!(body["query"], "Rust documentation");
+        assert_eq!(body["max_results"], PERPLEXITY_MAX_RESULTS);
+        assert_eq!(
+            body["max_tokens_per_page"],
+            PERPLEXITY_MEDIUM_CONTEXT_TOKENS_PER_PAGE
+        );
+        assert_eq!(body["search_domain_filter"], serde_json::json!(domains));
+    }
+
+    #[tokio::test]
+    async fn perplexity_empty_results_are_reported_without_raw_response_data() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": []
+            })))
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&perplexity_config(server.uri()), None).unwrap();
+
+        let error = client.search("no matches", None).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Perplexity web search returned no results")
+        );
+    }
+
+    #[tokio::test]
+    async fn perplexity_malformed_json_is_sanitized() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{not-json", "application/json"))
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&perplexity_config(server.uri()), None).unwrap();
+
+        let error = client.search("malformed", None).await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("Perplexity web search returned a malformed response"));
+        assert!(!message.contains("not-json"));
+    }
+
+    async fn perplexity_status_error_message(
+        status: u16,
+        allowed_domains: Option<Vec<String>>,
+    ) -> String {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_string("upstream-secret-error-details"),
+            )
+            .mount(&server)
+            .await;
+        let client = WebSearchClient::new(&perplexity_config(server.uri()), None).unwrap();
+
+        client
+            .search("status failure", allowed_domains)
+            .await
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn perplexity_auth_rate_filter_and_server_errors_are_sanitized() {
+        for status in [401, 403] {
+            let message = perplexity_status_error_message(status, None).await;
+            assert!(message.contains("Perplexity web search authentication failed"));
+            assert!(!message.contains("upstream-secret-error-details"));
+        }
+
+        let rate_limit = perplexity_status_error_message(429, None).await;
+        assert!(rate_limit.contains("Perplexity web search is rate limited"));
+
+        let invalid_filter =
+            perplexity_status_error_message(400, Some(vec!["bad filter".to_owned()])).await;
+        assert!(invalid_filter.contains("rejected the allowed_domains filter"));
+
+        let server_failure = perplexity_status_error_message(503, None).await;
+        assert!(server_failure.contains("temporarily unavailable"));
+        assert!(!server_failure.contains("upstream-secret-error-details"));
+    }
+
+    #[tokio::test]
+    async fn perplexity_network_failure_is_sanitized() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let client = WebSearchClient::new(&perplexity_config(base_url), None).unwrap();
+
+        let error = client.search("network failure", None).await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("Perplexity web search request failed"));
+        assert!(!message.contains("127.0.0.1"));
+    }
+
     #[test]
     fn test_extract_citations_no_annotations() {
         let response = response_from_json(serde_json::json!(
