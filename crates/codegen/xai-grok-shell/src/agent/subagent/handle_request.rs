@@ -1699,6 +1699,9 @@ pub(crate) async fn handle_subagent_request(
                     }
                 }
                 Ok(Err(e)) => {
+                    // A terminal error does not erase the child's work: keep
+                    // any assistant text produced before the failure so the
+                    // parent sees partial results instead of an empty output.
                     SubagentResult {
                         success: false,
                         cancelled: was_cancelled,
@@ -1709,11 +1712,13 @@ pub(crate) async fn handle_subagent_request(
                                 format!("Session error: {e}")
                             },
                         ),
+                        output: std::sync::Arc::from(final_text),
                         subagent_id: request.id.clone(),
                         child_session_id: child_session_id.0.to_string(),
                         tool_calls,
                         turns,
                         duration_ms,
+                        tokens_used: result_tokens,
                         worktree_path: worktree_path
                             .as_ref()
                             .map(|p| p.to_string_lossy().to_string()),
@@ -1731,11 +1736,13 @@ pub(crate) async fn handle_subagent_request(
                                 "Child session dropped unexpectedly".to_string()
                             },
                         ),
+                        output: std::sync::Arc::from(final_text),
                         subagent_id: request.id.clone(),
                         child_session_id: child_session_id.0.to_string(),
                         tool_calls,
                         turns,
                         duration_ms,
+                        tokens_used: result_tokens,
                         worktree_path: worktree_path
                             .as_ref()
                             .map(|p| p.to_string_lossy().to_string()),

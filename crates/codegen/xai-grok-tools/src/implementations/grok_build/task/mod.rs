@@ -418,11 +418,38 @@ impl xai_tool_runtime::Tool for TaskTool {
                 persona_hint,
             }))
         } else {
-            Err(xai_tool_runtime::ToolError::invalid_arguments(
-                result
-                    .error
-                    .unwrap_or_else(|| "Unknown subagent error".to_string()),
-            ))
+            let mut message = result
+                .error
+                .unwrap_or_else(|| "Unknown subagent error".to_string());
+            // A terminal error mid-run leaves the child session — and any
+            // assistant text it produced — intact. Surface both so the parent
+            // can build on partial work and resume instead of restarting from
+            // zero. Spawn rejections have no child session and get neither.
+            if !result.cancelled && !result.child_session_id.is_empty() {
+                let partial = result.output.trim();
+                if !partial.is_empty() {
+                    const MAX_PARTIAL_CHARS: usize = 4000;
+                    let cut = partial
+                        .char_indices()
+                        .nth(MAX_PARTIAL_CHARS)
+                        .map(|(byte_idx, _)| byte_idx);
+                    message.push_str("\n\nPartial output before the failure");
+                    if cut.is_some() {
+                        message.push_str(" (truncated)");
+                    }
+                    message.push_str(":\n");
+                    message.push_str(match cut {
+                        Some(byte_idx) => &partial[..byte_idx],
+                        None => partial,
+                    });
+                }
+                message.push_str(&format!(
+                    "\n\nThe subagent's session was preserved ({} tool calls, {} turns). \
+                     To retry or continue it, call this tool again with resume_from: \"{}\".",
+                    result.tool_calls, result.turns, result.subagent_id,
+                ));
+            }
+            Err(xai_tool_runtime::ToolError::invalid_arguments(message))
         }
     }
 }
@@ -708,6 +735,127 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Child session crashed"), "error: {err}");
+        // No child session ⇒ nothing to salvage or resume.
+        assert!(!err.contains("resume_from"), "error: {err}");
+    }
+
+    /// A terminal error after real work must hand the parent the partial
+    /// output and a resume handle, not just the error string.
+    #[tokio::test]
+    async fn failed_subagent_surfaces_partial_output_and_resume_hint() {
+        let (backend, mut rx) = make_backend();
+        let mut resources = Resources::new();
+        resources.insert(backend);
+        resources.insert(SubagentDepthCounter(0));
+        resources.insert(SessionIdResource("parent-session".to_string()));
+        resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
+
+        let tool = TaskTool;
+        let shared = resources.into_shared();
+
+        let handle = tokio::spawn(async move {
+            let request = unwrap_spawn(rx.recv().await.unwrap());
+            request
+                .result_tx
+                .send(SubagentResult {
+                    success: false,
+                    error: Some(
+                        "Session error: serialization error: missing field `action`".to_string(),
+                    ),
+                    output: Arc::from("Traced the failure to client.rs so far."),
+                    subagent_id: "sub-partial".to_string(),
+                    child_session_id: "child-session-1".to_string(),
+                    tool_calls: 54,
+                    turns: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+
+        let result = xai_tool_runtime::Tool::run(
+            &tool,
+            test_ctx(shared),
+            TaskToolInput {
+                description: "test task".into(),
+                prompt: "do something".into(),
+                subagent_type: "general-purpose".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+            },
+        )
+        .await;
+
+        handle.await.unwrap();
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("missing field `action`"), "error: {err}");
+        assert!(err.contains("Partial output before the failure"), "error: {err}");
+        assert!(
+            err.contains("Traced the failure to client.rs so far."),
+            "error: {err}"
+        );
+        assert!(err.contains("resume_from: \"sub-partial\""), "error: {err}");
+    }
+
+    /// Cancellation is intentional — the parent gets the bare error with no
+    /// salvage block or resume nudge.
+    #[tokio::test]
+    async fn cancelled_subagent_error_stays_bare() {
+        let (backend, mut rx) = make_backend();
+        let mut resources = Resources::new();
+        resources.insert(backend);
+        resources.insert(SubagentDepthCounter(0));
+        resources.insert(SessionIdResource("parent-session".to_string()));
+        resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
+
+        let tool = TaskTool;
+        let shared = resources.into_shared();
+
+        let handle = tokio::spawn(async move {
+            let request = unwrap_spawn(rx.recv().await.unwrap());
+            request
+                .result_tx
+                .send(SubagentResult {
+                    success: false,
+                    cancelled: true,
+                    error: Some("Subagent was cancelled".to_string()),
+                    output: Arc::from("half-finished notes"),
+                    subagent_id: "sub-cancelled".to_string(),
+                    child_session_id: "child-session-2".to_string(),
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+
+        let result = xai_tool_runtime::Tool::run(
+            &tool,
+            test_ctx(shared),
+            TaskToolInput {
+                description: "test task".into(),
+                prompt: "do something".into(),
+                subagent_type: "general-purpose".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+            },
+        )
+        .await;
+
+        handle.await.unwrap();
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Subagent was cancelled"), "error: {err}");
+        assert!(!err.contains("Partial output"), "error: {err}");
+        assert!(!err.contains("resume_from"), "error: {err}");
     }
 
     #[tokio::test]
