@@ -197,7 +197,11 @@ fn plan_reconnect_load(
     // this agent's own `auto_mode` so a background tab reconnects with ITS mode,
     // not the active tab's global `current_ui` mirror.
     let auto = super::dispatch::effective_auto(yolo, agent.session.is_auto());
-    let mut meta = serde_json::json!({ "yoloMode": yolo, "autoMode": auto });
+    let mut meta = serde_json::json!({
+        "yoloMode": yolo,
+        "autoMode": auto,
+        "swarmMode": agent.swarm_mode_active,
+    });
     if let Some(ref cursor) = agent.last_seen_event_id {
         meta["cursor"] = serde_json::Value::String(cursor.clone());
     }
@@ -3486,6 +3490,7 @@ fn process_effects(
             app.default_yolo,
             matches!(app.current_ui.permission_mode.as_deref(), Some("auto")),
         ),
+        swarm_mode: app.current_ui.swarm_mode.unwrap_or(false),
         chat_mode: app.chat_mode,
         screen_mode_label: Some(app.screen_mode.meta_label()),
         is_api_key_auth: app.is_api_key_auth,

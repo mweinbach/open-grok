@@ -195,6 +195,59 @@ fn plan_mode_toast(kind: crate::app::actions::PlanModeKind) -> String {
     save_success_toast("Plan mode", kind.to_bool())
 }
 
+/// Update the persisted swarm preference (when requested) and notify the
+/// active session. This deliberately does not change permission/YOLO mode.
+pub(super) fn set_swarm_mode(
+    app: &mut AppView,
+    enabled: bool,
+    trigger: &'static str,
+    persist: bool,
+) -> Vec<Effect> {
+    let session_id = match app.active_view {
+        ActiveView::Agent(id) => app
+            .agents
+            .get(&id)
+            .and_then(|a| a.session.session_id.clone()),
+        _ => None,
+    };
+    if trigger != "task"
+        && let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get_mut(&id)
+    {
+        agent.swarm_mode_active = enabled;
+        agent.pending_swarm_mode_rollback = None;
+    }
+    if persist {
+        let previous = app.current_ui.swarm_mode.unwrap_or(false);
+        app.current_ui.swarm_mode = Some(enabled);
+        refresh_open_settings_modals(app);
+        app.show_toast(&save_success_toast("Swarm mode", enabled));
+        let mut effects = vec![Effect::PersistSetting {
+            key: "swarm_mode",
+            value: crate::settings::SettingValue::Bool(enabled),
+            rollback_value: crate::settings::SettingValue::Bool(previous),
+        }];
+        if let Some(session_id) = session_id {
+            effects.push(Effect::NotifySwarmMode {
+                session_id,
+                enabled,
+                trigger,
+            });
+        }
+        effects
+    } else {
+        app.show_toast("Swarm task started; manual approvals may slow the swarm.");
+        session_id
+            .into_iter()
+            .map(|session_id| Effect::NotifySwarmMode {
+                session_id,
+                enabled,
+                trigger,
+            })
+            .collect()
+    }
+}
+
 /// The single gate for client paths that ENABLE always-approve: `Some(reason)`
 /// iff `enabling` and the pin (`app.yolo_policy_block`) is set. Every enabling
 /// path routes through here (or [`refuse_if_yolo_locked`]) so new paths stay

@@ -725,6 +725,15 @@ pub enum Action {
     /// to config.toml). `/plan <desc>` uses `EnterPlanMode` instead
     /// because it also starts a turn.
     SetPlanMode(PlanModeKind),
+    /// Set swarm mode and notify the active shell session. `persist` controls
+    /// whether this becomes the user's default; one-shot swarm tasks do not.
+    SetSwarmMode {
+        enabled: bool,
+        trigger: &'static str,
+        persist: bool,
+    },
+    /// Enable swarm mode for exactly this prompt, then submit it normally.
+    StartSwarmTask(String),
     /// Enter feedback mode (visual prompt change, not a send).
     EnterFeedbackMode,
     /// Send feedback text collected in feedback mode.
@@ -1741,6 +1750,25 @@ pub enum Effect {
         session_id: acp::SessionId,
         mode_id: acp::SessionModeId,
     },
+    /// Fire-and-forget swarm state notification to the shell.
+    NotifySwarmMode {
+        session_id: acp::SessionId,
+        enabled: bool,
+        trigger: &'static str,
+    },
+    /// Notify shell swarm mode then send a prompt, sequentially in one task.
+    /// `rollback_enabled` restores the preceding mode if the prompt is not
+    /// accepted; failed false rollbacks are retained for the next prompt.
+    SwarmModeThenPrompt {
+        session_id: acp::SessionId,
+        agent_id: AgentId,
+        text: String,
+        prompt_id: String,
+        skill_token_ranges: Vec<std::ops::Range<usize>>,
+        enabled: bool,
+        trigger: &'static str,
+        rollback_enabled: Option<bool>,
+    },
     /// Set session mode then send a prompt, sequentially in one task.
     /// Used by `/plan <desc>` to guarantee the mode switch ACP call
     /// completes before the prompt is dispatched.
@@ -2424,6 +2452,17 @@ pub enum TaskResult {
         /// painting them onto the running turn. `None` for synthetic/test
         /// constructions that don't need gating.
         prompt_id: Option<String>,
+    },
+    /// A one-shot swarm task or pending rollback retry failed before the prompt
+    /// was accepted. Dispatch rolls back the optimistic local turn and restores
+    /// the stashed composer payload instead of treating this as a model turn
+    /// failure. A failed false rollback is retained for the next prompt.
+    SwarmPromptSetupFailed {
+        agent_id: AgentId,
+        prompt_id: String,
+        text: String,
+        error: String,
+        pending_rollback_enabled: Option<bool>,
     },
     /// A send-now `session/prompt` RPC failed at the transport/RPC layer —
     /// the prompt never reached the shell's queue. Carries the payload so

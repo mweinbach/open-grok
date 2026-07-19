@@ -597,6 +597,16 @@ pub(super) fn dispatch_rewind_success(
         let target_idx = find_user_prompt_entry_for_shell_index(&agent.scrollback, target);
         if let Some(anchor_idx) = target_idx {
             let removed = agent.scrollback.remove_from(anchor_idx);
+            // Rewind discards old scrollback blocks. If any of them were
+            // grouped swarm cards, prune their `swarm_blocks` references so
+            // future subagent updates cannot resolve stale IDs to removed rows.
+            if !removed.is_empty() {
+                let removed_ids: std::collections::HashSet<_> =
+                    removed.iter().map(|entry| entry.id).collect();
+                agent
+                    .swarm_blocks
+                    .retain(|_, entry_id| !removed_ids.contains(entry_id));
+            }
             // Explicit drop BEFORE the purge: the rewound tail (entries +
             // their render caches — potentially most of a long transcript)
             // must be freed for the release below to return its pages.

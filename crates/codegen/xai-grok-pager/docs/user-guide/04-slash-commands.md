@@ -229,6 +229,19 @@ Enter plan mode.
 /plan [description]
 ```
 
+### `/swarm`
+
+Control agent swarm mode or run a one-shot swarm task.
+
+```text
+/swarm
+/swarm on
+/swarm off
+/swarm review the API modules in parallel
+```
+
+The bare command toggles persistent manual mode. A task argument enables swarm mode for that turn only; an existing manual mode remains enabled afterward. The current state is also available in `/settings` as **Swarm mode**.
+
 ### `/view-plan`
 
 Open the current saved plan preview. Aliases: `/show-plan`, `/plan-view`.

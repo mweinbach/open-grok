@@ -28,6 +28,8 @@ pub struct SubagentInfo {
     /// Whether the context was normalized into `<background_context>`.
     pub context_normalized: bool,
     pub parent_prompt_id: Option<Arc<str>>,
+    /// Present only for coordinated swarm members; ordinary subagents remain ungrouped.
+    pub swarm_id: Option<Arc<str>>,
     pub started_at: Instant,
     /// Wall-clock time of the most recent `SubagentProgress` /
     /// `SubagentFinished` update. For
@@ -514,6 +516,7 @@ mod tests {
             capability_mode: None,
             context_normalized: false,
             parent_prompt_id: None,
+            swarm_id: None,
             started_at: Instant::now(),
             last_progress_at: Instant::now(),
             finished: false,

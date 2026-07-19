@@ -1704,6 +1704,7 @@ mod tests {
             capability_mode: None,
             context_normalized: false,
             parent_prompt_id: None,
+            swarm_id: None,
             started_at: Instant::now(),
             last_progress_at: Instant::now(),
             finished: false,

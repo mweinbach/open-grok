@@ -86,6 +86,7 @@ pub(super) fn make_subagent_info(child_sid: &str) -> SubagentInfo {
         capability_mode: None,
         context_normalized: false,
         parent_prompt_id: None,
+        swarm_id: None,
         started_at: Instant::now(),
         last_progress_at: Instant::now(),
         finished: false,
@@ -1199,6 +1200,11 @@ pub(super) fn test_subagent_spawned(
         role: None,
         model: None,
         resumed_from: None,
+        swarm_id: None,
+        swarm_description: None,
+        swarm_index: None,
+        swarm_item: None,
+        swarm_expected_members: None,
     }
 }
 pub(super) fn test_subagent_finished(child_sid: &str) -> XaiSessionUpdate {

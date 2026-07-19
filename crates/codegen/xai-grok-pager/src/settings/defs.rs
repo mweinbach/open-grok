@@ -663,6 +663,19 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
+        SettingMeta {
+            key: "swarm_mode",
+            category: SettingCategory::Agent,
+            owner: SettingOwner::Shared,
+            label: "Swarm mode",
+            description: "Enable coordinated subagent swarms by default. Active sessions update immediately; manual approvals can slow a swarm.",
+            keywords: &["swarm", "subagent", "parallel", "agents", "orchestration"],
+            kind: SettingKind::Bool {
+                default: ui_default.swarm_mode.unwrap_or(false),
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned, persisted to `[ui].vim_mode` in config.toml.
         // Defaults to the same value main's `appearance::persist::VIM_MODE_DEFAULT`
         // shipped with. Bundled next to `simple_mode` because they pair up:

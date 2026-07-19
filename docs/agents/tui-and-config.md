@@ -108,6 +108,18 @@ User-facing effective precedence also includes CLI flags and environment variabl
 
 `UiConfig` serde shape: `xai-grok-shared/src/ui_config.rs`.
 
+### Swarm controls
+
+```toml
+[ui]
+swarm_mode = false
+```
+
+- **Settings:** the Swarm mode row persists this default and updates the active shell session immediately.
+- **Slash:** `/swarm` toggles manual mode, `/swarm on` and `/swarm off` set it explicitly, and `/swarm <task>` enables a one-turn swarm prompt that auto-exits afterward. If manual mode was already active, it remains active.
+- **Live UI:** an active session shows a bold `swarm` footer badge. Swarm children render in one foldable scrollback card with fixed input-order slots, running/queued/completed/failed/cancelled counts, elapsed time, tool/turn counts, and context usage. Ordinary child tracking remains available through the tasks pane and framed transcript view.
+- **Dispatch contract:** pager one-shot submission uses one ordered effect (`swarm_mode_changed` before `session/prompt`). If either send fails before the prompt is accepted, the optimistic turn is rolled back and the draft is restored.
+
 ### Notable env vars
 
 | Var | Role |

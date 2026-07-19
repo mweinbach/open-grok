@@ -55,6 +55,7 @@ pub mod scroll_debug;
 pub mod session_info;
 pub mod settings_cmd;
 pub mod share;
+pub mod swarm;
 pub mod tasks;
 pub mod terminal_setup;
 pub mod theme;
@@ -111,6 +112,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(announcements::AnnouncementsCommand),
         Arc::new(remember::RememberCommand),
         Arc::new(plan::PlanCommand),
+        Arc::new(swarm::SwarmCommand),
         Arc::new(view_plan::ViewPlanCommand),
         Arc::new(resume::ResumeCommand),
         Arc::new(mcps::McpsCommand),

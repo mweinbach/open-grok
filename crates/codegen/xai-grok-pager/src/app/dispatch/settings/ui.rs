@@ -136,6 +136,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 // Prefer optimistic pending over confirmed active.
                 plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
+                swarm_mode: ui_snapshot.swarm_mode.unwrap_or(false),
                 show_tips: show_tips_from_app,
                 auto_update: auto_update_from_app,
                 vim_mode: crate::appearance::cache::load_vim_mode(),
@@ -270,6 +271,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
         // Prefer optimistic pending over confirmed active.
         plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
+        swarm_mode: agent.swarm_mode_active,
         show_tips: show_tips_from_app,
         auto_update: auto_update_from_app,
         vim_mode: crate::appearance::cache::load_vim_mode(),
@@ -805,6 +807,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         kimi_api_endpoint: app.kimi_api_endpoint.clone(),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         plan_mode_active: agent_plan_mode(app),
+        swarm_mode: app.current_ui.swarm_mode.unwrap_or(false),
         show_tips: app.show_tips,
         auto_update: app.auto_update,
         vim_mode: crate::appearance::cache::load_vim_mode(),
@@ -830,6 +833,11 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("show_timestamps", SettingValue::Bool(b)) => Some(Action::SetTimestamps(*b)),
         ("show_timeline", SettingValue::Bool(b)) => Some(Action::SetTimeline(*b)),
         ("simple_mode", SettingValue::Bool(b)) => Some(Action::SetSimpleMode(*b)),
+        ("swarm_mode", SettingValue::Bool(b)) => Some(Action::SetSwarmMode {
+            enabled: *b,
+            trigger: "manual",
+            persist: true,
+        }),
         ("contextual_hints.undo", SettingValue::Bool(b)) => Some(Action::SetContextualHintUndo(*b)),
         ("contextual_hints.plan_mode", SettingValue::Bool(b)) => {
             Some(Action::SetContextualHintPlanMode(*b))
@@ -1238,6 +1246,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("scroll_lines", SettingValue::Int(i)) => set_scroll_lines_inner(app, *i as u8),
         // vim_mode: direct inner call.
         ("vim_mode", SettingValue::Bool(b)) => set_vim_mode_inner(app, *b),
+        ("swarm_mode", SettingValue::Bool(b)) => app.current_ui.swarm_mode = Some(*b),
         ("remember_tool_approvals", SettingValue::Bool(b)) => {
             set_remember_tool_approvals_inner(app, *b)
         }

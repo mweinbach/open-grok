@@ -13,6 +13,7 @@ mod router;
 mod session;
 mod settings;
 mod status;
+mod swarm;
 mod task_result;
 mod transcript;
 mod turn;
@@ -374,6 +375,7 @@ fn make_test_subagent(child_sid: &str, sa_id: &str) -> crate::app::subagent::Sub
         capability_mode: None,
         context_normalized: false,
         parent_prompt_id: None,
+        swarm_id: None,
         started_at: std::time::Instant::now(),
         last_progress_at: std::time::Instant::now(),
         finished: false,

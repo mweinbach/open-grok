@@ -316,6 +316,9 @@ pub struct PagerLocalSnapshot {
     /// (`pending.unwrap_or(active)`) so rapid toggles don't double-send.
     /// Refreshed on all mutation paths including ACP `CurrentModeUpdate`.
     pub plan_mode_active: bool,
+    /// Effective persisted swarm default. Live session changes are reflected by
+    /// `SwarmModeChanged` in the agent view; this is the settings-modal source.
+    pub swarm_mode: bool,
     /// `[cli].show_tips` mirror. `None` = no TOML override → default `true`.
     pub show_tips: Option<bool>,
     /// `[cli].auto_update` mirror. `None` = no TOML override → default `true`.
@@ -359,6 +362,7 @@ impl Default for PagerLocalSnapshot {
             kimi_api_endpoint: "platform".to_owned(),
             coding_data_sharing_opt_out: false,
             plan_mode_active: false,
+            swarm_mode: false,
             show_tips: None,
             auto_update: None,
             vim_mode: false,
@@ -575,6 +579,7 @@ pub fn current_value_for(
         "show_timestamps" => Some(SettingValue::Bool(ui.show_timestamps.unwrap_or(true))),
         "show_timeline" => Some(SettingValue::Bool(ui.show_timeline_enabled())),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
+        "swarm_mode" => Some(SettingValue::Bool(ui.swarm_mode.unwrap_or(false))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
         "contextual_hints.undo" => {
             Some(SettingValue::Bool(ui.contextual_hints.undo.unwrap_or(true)))
@@ -944,6 +949,13 @@ mod tests {
                         *default,
                         ui.simple_mode.unwrap_or(true),
                         "simple_mode default drifts from UiConfig::default()"
+                    );
+                }
+                ("swarm_mode", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.swarm_mode.unwrap_or(false),
+                        "swarm_mode default drifts from UiConfig::default()"
                     );
                 }
                 ("theme", SettingKind::Enum { default, .. }) => {

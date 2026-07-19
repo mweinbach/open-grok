@@ -1087,6 +1087,7 @@ mod tests {
             context_normalized: false,
             child_updates_replayed: false,
             parent_prompt_id: None,
+            swarm_id: None,
             started_at: now,
             last_progress_at: now,
             finished,

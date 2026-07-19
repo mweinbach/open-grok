@@ -867,3 +867,83 @@
         );
     }
 
+    #[test]
+    fn swarm_rate_limit_status_updates_group_and_survives_progress_heartbeat() {
+        let mut app = make_app_with_agent("sess-parent");
+        let child_sid = "child-swarm-rate";
+        let mut spawned = test_subagent_spawned("sess-parent", child_sid);
+        if let XaiSessionUpdate::SubagentSpawned {
+            swarm_id,
+            swarm_description,
+            swarm_index,
+            swarm_item,
+            swarm_expected_members,
+            ..
+        } = &mut spawned
+        {
+            *swarm_id = Some("swarm-1".into());
+            *swarm_description = Some("parallel review".into());
+            *swarm_index = Some(0);
+            *swarm_item = Some("src".into());
+            *swarm_expected_members = Some(1);
+        }
+        let _ = handle(
+            make_ext_session_notification("sess-parent", spawned),
+            &mut app,
+        );
+
+        let waiting = XaiSessionUpdate::SubagentStatus {
+            subagent_id: child_sid.into(),
+            parent_session_id: "sess-parent".into(),
+            child_session_id: child_sid.into(),
+            status: "rate_limit_waiting".into(),
+            attempt: 1,
+            retry_after_ms: Some(3_000),
+        };
+        let _ = handle(
+            make_ext_session_notification("sess-parent", waiting),
+            &mut app,
+        );
+        let _ = handle(
+            make_ext_session_notification(
+                "sess-parent",
+                test_subagent_progress("sess-parent", child_sid),
+            ),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let info = agent.subagent_sessions.get(child_sid).unwrap();
+        assert!(info.activity_label.as_deref().unwrap().contains("3s"));
+        let entry_id = agent.swarm_blocks["swarm-1"];
+        let entry = agent.scrollback.get_by_id(entry_id).unwrap();
+        let RenderBlock::Swarm(block) = &entry.block else {
+            panic!("expected Swarm block");
+        };
+        assert_eq!(
+            block.members[0].status,
+            crate::scrollback::blocks::SwarmMemberStatus::Waiting
+        );
+
+        let retrying = XaiSessionUpdate::SubagentStatus {
+            subagent_id: child_sid.into(),
+            parent_session_id: "sess-parent".into(),
+            child_session_id: child_sid.into(),
+            status: "rate_limit_retrying".into(),
+            attempt: 1,
+            retry_after_ms: None,
+        };
+        let _ = handle(
+            make_ext_session_notification("sess-parent", retrying),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let entry = agent.scrollback.get_by_id(entry_id).unwrap();
+        let RenderBlock::Swarm(block) = &entry.block else {
+            panic!("expected Swarm block");
+        };
+        assert_eq!(
+            block.members[0].status,
+            crate::scrollback::blocks::SwarmMemberStatus::Running
+        );
+    }

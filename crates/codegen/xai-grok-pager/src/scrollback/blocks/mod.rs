@@ -12,6 +12,7 @@ pub mod mermaid_content;
 mod quote_bar;
 mod session_event;
 mod subagent;
+mod swarm;
 mod system;
 mod thinking;
 pub mod tool;
@@ -24,6 +25,7 @@ pub use context_info::ContextInfoBlock;
 pub use credit_limit::{CreditLimitBlock, CreditLimitCardAction};
 pub use session_event::{EndWork, SessionEvent, SessionEventBlock};
 pub use subagent::{SubagentBlock, SubagentBlockKind};
+pub use swarm::{SwarmBlock, SwarmMemberStatus};
 pub use system::SystemMessageBlock;
 pub use thinking::ThinkingBlock;
 pub use tool::{

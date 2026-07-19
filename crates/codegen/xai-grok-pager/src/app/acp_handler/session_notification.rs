@@ -193,6 +193,23 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     let mut cancel_pending_kimi_rebind = false;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
     let changed = match session_notif.update {
+        XaiSessionUpdate::SwarmModeChanged { enabled, trigger } => {
+            agent.swarm_mode_active = enabled;
+            if !enabled {
+                agent.pending_swarm_mode_rollback = None;
+            }
+            let suffix = trigger
+                .as_deref()
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default();
+            agent.scrollback.push_block(RenderBlock::System(
+                crate::scrollback::blocks::SystemMessageBlock::new(format!(
+                    "Swarm mode {}{suffix}",
+                    if enabled { "enabled" } else { "disabled" }
+                )),
+            ));
+            true
+        }
         ref update @ (XaiSessionUpdate::AutoCompactStarted { .. }
         | XaiSessionUpdate::AutoCompactCompleted { .. }
         | XaiSessionUpdate::AutoCompactFailed { .. }
@@ -268,6 +285,11 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             capability_mode,
             context_normalized,
             parent_prompt_id,
+            swarm_id,
+            swarm_description,
+            swarm_index,
+            swarm_item,
+            swarm_expected_members,
             ..
         } => {
             tracing::info!(
@@ -298,6 +320,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     capability_mode: capability_mode.map(Arc::from),
                     context_normalized,
                     parent_prompt_id: parent_prompt_id.map(Arc::from),
+                    swarm_id: swarm_id.as_deref().map(Arc::from),
                     started_at: std::time::Instant::now(),
                     last_progress_at: std::time::Instant::now(),
                     finished: false,
@@ -454,20 +477,50 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     .push_block(RenderBlock::user_prompt(prompt));
                 child_view.session.tracker.expect_user_echo();
             }
-            let block = crate::scrollback::blocks::SubagentBlock::started(
-                &description,
-                &child_session_id,
-                &subagent_type,
-                persona_display,
-                role_display,
-                model_display,
-                is_background,
-            );
-            let entry_id = agent.scrollback.push_block(RenderBlock::Subagent(block));
-            agent.scrollback.set_last_running(true);
-            if let Some(info) = agent.subagent_sessions.get_mut(&child_session_id) {
-                info.scrollback_entry_id = Some(entry_id);
-                info.is_background = is_background;
+            if let Some(swarm_id) = swarm_id {
+                let entry_id = if let Some(entry_id) = agent.swarm_blocks.get(&swarm_id).copied() {
+                    entry_id
+                } else {
+                    let block = crate::scrollback::blocks::SwarmBlock::new(
+                        swarm_id.clone(),
+                        swarm_description
+                            .clone()
+                            .unwrap_or_else(|| description.clone()),
+                        swarm_expected_members,
+                    );
+                    let entry_id = agent.scrollback.push_block(RenderBlock::Swarm(block));
+                    agent.swarm_blocks.insert(swarm_id.clone(), entry_id);
+                    entry_id
+                };
+                if let Some(entry) = agent.scrollback.get_by_id_mut(entry_id) {
+                    if let RenderBlock::Swarm(block) = &mut entry.block {
+                        block.spawn(
+                            swarm_index,
+                            swarm_item,
+                            description.clone(),
+                            child_session_id.clone(),
+                            swarm_expected_members,
+                        );
+                    }
+                    entry.invalidate_cache();
+                }
+                agent.scrollback.set_last_running(true);
+            } else {
+                let block = crate::scrollback::blocks::SubagentBlock::started(
+                    &description,
+                    &child_session_id,
+                    &subagent_type,
+                    persona_display,
+                    role_display,
+                    model_display,
+                    is_background,
+                );
+                let entry_id = agent.scrollback.push_block(RenderBlock::Subagent(block));
+                agent.scrollback.set_last_running(true);
+                if let Some(info) = agent.subagent_sessions.get_mut(&child_session_id) {
+                    info.scrollback_entry_id = Some(entry_id);
+                    info.is_background = is_background;
+                }
             }
             agent.maybe_push_parked_marker();
             true
@@ -495,6 +548,25 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 info.error_count = Some(error_count);
                 info.last_progress_at = std::time::Instant::now();
             }
+            let swarm_entry = agent
+                .subagent_sessions
+                .get(&child_session_id)
+                .and_then(|info| info.swarm_id.as_deref())
+                .and_then(|id| agent.swarm_blocks.get(id).copied());
+            if let Some(entry_id) = swarm_entry
+                && let Some(entry) = agent.scrollback.get_by_id_mut(entry_id)
+            {
+                if let RenderBlock::Swarm(block) = &mut entry.block {
+                    block.progress(
+                        &child_session_id,
+                        turn_count,
+                        tool_call_count,
+                        duration_ms,
+                        context_usage_pct,
+                    );
+                }
+                entry.invalidate_cache();
+            }
             if let Some(child_view) = agent.subagent_views.get_mut(&child_session_id)
                 && context_window_tokens > 0
             {
@@ -507,7 +579,61 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 .subagent_views
                 .get(&child_session_id)
                 .and_then(|cv| subagent_activity_label(cv));
-            sync_subagent_activity(agent, &child_session_id, activity_label);
+            let swarm_waiting = swarm_entry.is_some_and(|entry_id| {
+                agent
+                    .scrollback
+                    .get_by_id(entry_id)
+                    .is_some_and(|entry| match &entry.block {
+                        RenderBlock::Swarm(block) => block.is_waiting(&child_session_id),
+                        _ => false,
+                    })
+            });
+            if !swarm_waiting {
+                sync_subagent_activity(agent, &child_session_id, activity_label);
+            }
+            true
+        }
+        XaiSessionUpdate::SubagentStatus {
+            child_session_id,
+            status,
+            attempt,
+            retry_after_ms,
+            ..
+        } => {
+            let activity_label = match status.as_str() {
+                "rate_limit_waiting" => {
+                    let retry_after = retry_after_ms.unwrap_or_default();
+                    let retry_after = std::time::Duration::from_millis(retry_after);
+                    let retry_after_label =
+                        if retry_after.as_secs() < 10 && retry_after.subsec_millis() == 0 {
+                            format!("{}s", retry_after.as_secs())
+                        } else {
+                            crate::util::format_duration(retry_after)
+                        };
+                    format!(
+                        "Rate limited · retrying in {} · attempt {attempt}",
+                        retry_after_label
+                    )
+                }
+                _ => format!("Retrying after rate limit · attempt {attempt}"),
+            };
+            if let Some(info) = agent.subagent_sessions.get_mut(&child_session_id) {
+                info.last_progress_at = std::time::Instant::now();
+            }
+            let swarm_entry = agent
+                .subagent_sessions
+                .get(&child_session_id)
+                .and_then(|info| info.swarm_id.as_deref())
+                .and_then(|id| agent.swarm_blocks.get(id).copied());
+            sync_subagent_activity(agent, &child_session_id, Some(activity_label.clone()));
+            if let Some(entry_id) = swarm_entry
+                && let Some(entry) = agent.scrollback.get_by_id_mut(entry_id)
+            {
+                if let RenderBlock::Swarm(block) = &mut entry.block {
+                    block.status(&child_session_id, &status, activity_label);
+                }
+                entry.invalidate_cache();
+            }
             true
         }
         XaiSessionUpdate::SubagentFinished {
@@ -529,12 +655,23 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             let info_ref = agent.subagent_sessions.get(&child_session_id);
             let entry_id = info_ref.and_then(|s| s.scrollback_entry_id);
             let is_background = info_ref.is_some_and(|s| s.is_background);
+            let swarm_entry = info_ref
+                .and_then(|s| s.swarm_id.as_deref())
+                .and_then(|id| agent.swarm_blocks.get(id).copied());
             let description = info_ref.map(|s| s.description.clone()).unwrap_or_default();
             if let Some(eid) = entry_id {
                 agent.scrollback.finish_running(eid);
             }
             sync_subagent_activity(agent, &child_session_id, None);
-            if is_background {
+            if let Some(entry_id) = swarm_entry
+                && let Some(entry) = agent.scrollback.get_by_id_mut(entry_id)
+            {
+                if let RenderBlock::Swarm(block) = &mut entry.block {
+                    block.finish(&child_session_id, &status, turns, tool_calls, duration_ms);
+                }
+                entry.invalidate_cache();
+            }
+            if swarm_entry.is_none() && is_background {
                 let block = match status.as_str() {
                     "completed" => {
                         RenderBlock::Subagent(crate::scrollback::blocks::SubagentBlock::completed(

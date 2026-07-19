@@ -81,6 +81,9 @@ pub struct UiConfig {
     /// Simple mode. Read by pager, declared here for `serde_ignored`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub simple_mode: Option<bool>,
+    /// Whether swarm orchestration is the persistent default. `None`/`false` is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_mode: Option<bool>,
     /// Read by `load_permission_mode()`. Declared for `serde_ignored`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
@@ -304,6 +307,7 @@ impl Default for UiConfig {
             ui_theme: None,
             compact_mode: false,
             simple_mode: None,
+            swarm_mode: None,
             permission_mode: None,
             approval_mode: None,
             default_selected_permission: None,
@@ -371,6 +375,15 @@ impl UiConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swarm_mode_is_optional_and_defaults_off() {
+        assert_eq!(UiConfig::default().swarm_mode, None);
+        let enabled: UiConfig = serde_json::from_str(r#"{"swarm_mode":true}"#).unwrap();
+        assert_eq!(enabled.swarm_mode, Some(true));
+        let disabled: UiConfig = serde_json::from_str(r#"{"swarm_mode":false}"#).unwrap();
+        assert_eq!(disabled.swarm_mode, Some(false));
+    }
 
     #[test]
     fn code_mode_defaults_direct_and_migrates_legacy_booleans() {

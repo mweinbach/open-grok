@@ -31,7 +31,7 @@ use super::interject::dispatch_interject;
 use super::jump::{dispatch_jump_dismiss, dispatch_jump_picker_select, dispatch_jump_show_picker};
 use super::modes::{
     dispatch_cycle_mode, dispatch_enter_plan_mode, dispatch_show_plan, dispatch_toggle_yolo,
-    set_permission_mode, set_plan_mode, set_yolo_mode,
+    set_permission_mode, set_plan_mode, set_swarm_mode, set_yolo_mode,
 };
 use super::notes::{
     dispatch_enter_feedback_mode, dispatch_enter_remember_mode,
@@ -44,7 +44,8 @@ use super::permissions::{
 use super::prompt::{
     dispatch_accept_word_select_tip, dispatch_clear_prompt, dispatch_open_history_search,
     dispatch_send_bash_command, dispatch_send_prompt, dispatch_send_prompt_inner,
-    dispatch_show_plan_nudge, dispatch_show_undo_tip, dispatch_show_word_select_tip,
+    dispatch_send_swarm_task, dispatch_show_plan_nudge, dispatch_show_undo_tip,
+    dispatch_show_word_select_tip,
 };
 use super::queue;
 use super::queue::dispatch_drain_queue;
@@ -917,6 +918,53 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ShowPlan => dispatch_show_plan(app),
         Action::EnterPlanMode { description } => dispatch_enter_plan_mode(app, description),
         Action::SetPlanMode(kind) => set_plan_mode(app, kind),
+        Action::SetSwarmMode {
+            enabled,
+            trigger,
+            persist,
+        } => set_swarm_mode(app, enabled, trigger, persist),
+        Action::StartSwarmTask(text) => {
+            // The one-shot task does not mutate the manual-mode UI flag. Replace
+            // the prompt send with one ordered ACP task so the shell observes
+            // swarm mode before it receives the prompt.
+            let rollback_enabled = match app.active_view {
+                ActiveView::Agent(id) => app
+                    .agents
+                    .get(&id)
+                    .map(|agent| agent.swarm_mode_active)
+                    .unwrap_or(false),
+                _ => false,
+            };
+            let effects: Vec<_> = dispatch_send_swarm_task(app, text)
+                .into_iter()
+                .map(|effect| match effect {
+                    Effect::SendPrompt {
+                        agent_id,
+                        session_id,
+                        text,
+                        prompt_id,
+                        skill_token_ranges,
+                    } => Effect::SwarmModeThenPrompt {
+                        session_id,
+                        agent_id,
+                        text,
+                        prompt_id,
+                        skill_token_ranges,
+                        enabled: true,
+                        trigger: "task",
+                        rollback_enabled: Some(rollback_enabled),
+                    },
+                    other => other,
+                })
+                .collect();
+            if effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SwarmModeThenPrompt { .. }))
+            {
+                app.show_toast("Starting swarm task...");
+            }
+            effects
+        }
         Action::EnterFeedbackMode => dispatch_enter_feedback_mode(app),
         Action::SendFeedback(text) => dispatch_send_feedback(app, text),
         Action::EnterRememberMode => dispatch_enter_remember_mode(app),

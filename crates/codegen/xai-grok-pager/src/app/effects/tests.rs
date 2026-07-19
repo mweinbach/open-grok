@@ -1597,6 +1597,17 @@ fn runtime_default_flags_produce_plan_meta() {
     assert_eq!(meta["agentProfile"], "grok-build-plan");
     assert!(meta.get("askUserQuestion").is_none());
     assert_eq!(meta["yoloMode"], false);
+    assert_eq!(meta["swarmMode"], false);
+}
+
+#[test]
+fn swarm_default_is_seeded_in_session_meta() {
+    let flags = SessionFlags {
+        swarm_mode: true,
+        ..Default::default()
+    };
+    let meta = flags.to_meta().unwrap();
+    assert_eq!(meta["swarmMode"], true);
 }
 /// --plan alone produces meta with `agentProfile` only and a
 /// `askUserQuestion: false` since `ask_user` is off here.

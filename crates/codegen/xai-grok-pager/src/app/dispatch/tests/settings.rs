@@ -1081,6 +1081,18 @@ fn every_setting_has_action_for_reset_arm() {
         );
     }
 }
+
+#[test]
+fn swarm_setting_uses_manual_trigger_for_live_session_updates() {
+    assert!(matches!(
+        action_for_reset("swarm_mode", &crate::settings::SettingValue::Bool(true)),
+        Some(Action::SetSwarmMode {
+            enabled: true,
+            trigger: "manual",
+            persist: true,
+        })
+    ));
+}
 /// Every setting whose setter emits `Effect::PersistSetting` MUST have an
 /// `apply_setting_rollback` arm: a failed disk write rolls back through it,
 /// and a missing arm silently diverges in-memory state from `config.toml`.

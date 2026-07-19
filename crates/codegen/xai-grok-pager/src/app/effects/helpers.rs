@@ -238,6 +238,8 @@ pub(crate) struct SessionFlags {
     /// Auto (classifier) permission mode (`_meta.autoMode`). Mutually exclusive
     /// with `yolo_mode` on the agent; both may be set only if yolo wins at spawn.
     pub auto_mode: bool,
+    /// Persistent swarm default for new/loaded sessions (`_meta.swarmMode`).
+    pub swarm_mode: bool,
     /// Gateway light-frontend (`kind: "chat"`) — `--chat` / `/chat`.
     /// Mutual exclusivity with Build plan profiles: profiles are omitted and a
     /// warn is logged when plan flags are also set (K12).
@@ -305,6 +307,7 @@ impl SessionFlags {
                 super::dispatch::effective_auto(self.yolo_mode, self.auto_mode)
             ),
         );
+        meta.insert("swarmMode".into(), serde_json::json!(self.swarm_mode));
         if meta.is_empty() { None } else { Some(meta) }
     }
 }

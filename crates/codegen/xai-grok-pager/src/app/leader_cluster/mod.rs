@@ -149,6 +149,7 @@ impl ClusterClient {
                 self.app.default_yolo,
                 matches!(self.app.current_ui.permission_mode.as_deref(), Some("auto")),
             ),
+            swarm_mode: self.app.current_ui.swarm_mode.unwrap_or(false),
             chat_mode: self.app.chat_mode,
             screen_mode_label: Some(self.app.screen_mode.meta_label()),
             is_api_key_auth: self.app.is_api_key_auth,

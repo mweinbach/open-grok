@@ -1390,6 +1390,7 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 memory_model: app.memory_model.clone(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                 plan_mode_active: false,
+                swarm_mode: app.current_ui.swarm_mode.unwrap_or(false),
                 show_tips: show_tips_from_app,
                 auto_update: auto_update_from_app,
                 vim_mode: crate::appearance::cache::load_vim_mode(),

@@ -157,6 +157,44 @@ When you run a subagent in the background, retrieve its result later with `get_c
 
 ---
 
+## Agent Swarms
+
+Swarm mode asks the main agent to split suitable independent work into one coordinated `agent_swarm` call. All members run in the foreground and their results return together in the original input order.
+
+Use the slash controls:
+
+```text
+/swarm                    # toggle persistent manual mode
+/swarm on
+/swarm off
+/swarm review each API module for auth bugs
+```
+
+`/swarm <task>` applies to that task for one turn and then turns itself off. If manual swarm mode was already on, it stays on. You can also enable the default from **Settings → Swarm mode** or in config:
+
+```toml
+[ui]
+swarm_mode = true
+```
+
+When active, the footer shows a `swarm` badge. A swarm appears in scrollback as one expandable card with a row for every member, kept in input order. The card summarizes queued, running, completed, failed, and cancelled members and shows live turn/tool counts, duration, and context usage when available. Child transcripts are still available from the tasks pane.
+
+The model-facing `agent_swarm` tool supports:
+
+| Parameter | Description |
+| --- | --- |
+| `description` | Shared short label for the swarm. |
+| `subagent_type` | Type for new members; defaults to `general-purpose`. |
+| `items` | Ordered work items. At least two are required unless resuming; total members are capped at 128. |
+| `prompt_template` | Required with `items`; must contain literal `{{item}}`. |
+| `resume_agent_ids` | Ordered object mapping completed subagent IDs to continuation prompts. Resumed members run first and keep their original profile. |
+
+Open Grok validates the full swarm before starting any child. It launches up to five members immediately, then ramps additional members every 700 ms. If the provider rate-limits a member, the swarm card shows that live child as waiting while the scheduler retries the same session after 3 s, 6 s, 12 s, and progressively longer delays. Waiting retries take priority over resumes and new members; concurrency shrinks during repeated rate limits and recovers after a quiet period. A rate-limited member fails normally when it is the only unfinished member, so the swarm cannot remain suspended forever.
+
+Swarms use the same flat subagent tree: swarm members cannot spawn `task` or another `agent_swarm`.
+
+---
+
 ## Capability Modes
 
 A capability mode is an optional, coarse filter on a subagent's tools:

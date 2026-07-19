@@ -1262,6 +1262,13 @@ impl AgentView {
             }
             status.push("plan", Line::from(Span::styled("plan", plan_style)));
         }
+        if self.swarm_mode_active {
+            let swarm_style = Style::default()
+                .fg(theme.accent_running)
+                .bg(theme.bg_base)
+                .add_modifier(ratatui::style::Modifier::BOLD);
+            status.push("swarm", Line::from(Span::styled("swarm", swarm_style)));
+        }
         if let Some(ref goal) = self.goal_state {
             let tick = self.tasks.tick_count() as usize;
             let active_subagent_tokens: u64 = self

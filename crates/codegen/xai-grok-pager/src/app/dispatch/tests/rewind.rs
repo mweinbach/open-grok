@@ -1089,3 +1089,101 @@ fn fallback_path_returns_correct_idx_when_prompt_index_is_none() {
         Some(charlie_idx)
     );
 }
+
+fn make_session_notification_for_rewind_test(
+    session_id: &str,
+    update: xai_grok_shell::extensions::notification::SessionUpdate,
+) -> xai_acp_lib::AcpClientMessage {
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let payload = xai_grok_shell::extensions::notification::SessionNotification {
+        session_id: acp::SessionId::new(session_id),
+        update,
+        meta: None,
+    };
+    let raw = serde_json::value::to_raw_value(&payload).unwrap();
+    let request = acp::ExtNotification::new("x.ai/session_notification", raw.into());
+    xai_acp_lib::AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+        request,
+        response_tx: tx,
+    })
+}
+
+#[test]
+fn rewind_grouped_swarm_card_prunes_stale_swarm_refs_and_keeps_future_progress_updates_targeted_to_session()
+ {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let swarm_id = "swarm-group-1";
+    let child_sid = "child-1";
+
+    let swarm_entry_id = {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.scrollback.push_block(user_block("alpha", Some(0)));
+        let entry = agent.scrollback.push_block(RenderBlock::Swarm(
+            crate::scrollback::blocks::SwarmBlock::new(swarm_id, "Grouped sweep", Some(2)),
+        ));
+
+        let mut info = make_test_subagent(child_sid, "sa-1");
+        info.swarm_id = Some(std::sync::Arc::from(swarm_id));
+        agent.subagent_sessions.insert(child_sid.to_string(), info);
+        agent.swarm_blocks.insert(swarm_id.to_string(), entry);
+
+        entry
+    };
+
+    {
+        let agent = app.agents.get(&id).unwrap();
+        assert_eq!(agent.scrollback.len(), 2);
+        assert!(agent.subagent_sessions.contains_key(child_sid));
+        assert_eq!(
+            agent.swarm_blocks.get(swarm_id).copied(),
+            Some(swarm_entry_id)
+        );
+    }
+
+    dispatch(
+        Action::TaskComplete(TaskResult::RewindExecuteComplete {
+            agent_id: id,
+            response: rewind_success(0, "all", "alpha"),
+        }),
+        &mut app,
+    );
+
+    let agent = app.agents.get(&id).unwrap();
+    assert_eq!(agent.scrollback.len(), 0);
+    assert!(
+        !agent.swarm_blocks.contains_key(swarm_id),
+        "rewind must prune stale swarm block references"
+    );
+
+    let progress = xai_grok_shell::extensions::notification::SessionUpdate::SubagentProgress {
+        subagent_id: child_sid.into(),
+        parent_session_id: "test-session".into(),
+        child_session_id: child_sid.into(),
+        duration_ms: 100,
+        turn_count: 1,
+        tool_call_count: 0,
+        tokens_used: 0,
+        context_window_tokens: 0,
+        context_usage_pct: 0,
+        tools_used: vec![],
+        error_count: 0,
+    };
+
+    let msg = make_session_notification_for_rewind_test("test-session", progress);
+    crate::app::acp_handler::handle(msg, &mut app);
+
+    let agent = app.agents.get(&id).unwrap();
+    assert_eq!(agent.scrollback.len(), 0);
+    assert_eq!(
+        agent
+            .subagent_sessions
+            .get(child_sid)
+            .and_then(|i| i.turn_count),
+        Some(1)
+    );
+    assert!(
+        agent.swarm_blocks.is_empty(),
+        "stale swarm refs must stay pruned after follow-up updates"
+    );
+}

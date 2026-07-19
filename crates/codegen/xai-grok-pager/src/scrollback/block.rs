@@ -379,6 +379,8 @@ pub enum RenderBlock {
     BgTask(BgTaskBlock),
     /// Subagent lifecycle (started / completed / failed).
     Subagent(SubagentBlock),
+    /// Grouped coordinated subagent swarm.
+    Swarm(crate::scrollback::blocks::SwarmBlock),
     /// /btw side-question response (golden accent).
     Btw(BtwBlock),
     /// `/context` snapshot with categorical bar + breakdown.
@@ -400,6 +402,7 @@ macro_rules! delegate_block {
             RenderBlock::SessionEvent(b) => b.$method($($arg),*),
             RenderBlock::BgTask(b) => b.$method($($arg),*),
             RenderBlock::Subagent(b) => b.$method($($arg),*),
+            RenderBlock::Swarm(b) => b.$method($($arg),*),
             RenderBlock::Btw(b) => b.$method($($arg),*),
             RenderBlock::ContextInfo(b) => b.$method($($arg),*),
             RenderBlock::CreditLimit(b) => b.$method($($arg),*),
@@ -1014,6 +1017,7 @@ impl RenderBlock {
                     None
                 }
             }
+            RenderBlock::Swarm(_) => Some(theme.accent_running),
             RenderBlock::System(_)
             | RenderBlock::SessionEvent(_)
             | RenderBlock::ContextInfo(_)
@@ -1138,6 +1142,16 @@ impl RenderBlock {
             RenderBlock::BgTask(b) => {
                 join_searchable([Some(b.command.clone()), b.description.clone()])
             }
+            RenderBlock::Swarm(b) => join_searchable([
+                Some(b.description.clone()),
+                Some(
+                    b.members
+                        .iter()
+                        .map(|m| format!("{} {}", m.item, m.description))
+                        .collect::<Vec<_>>()
+                        .join("\\n"),
+                ),
+            ]),
             RenderBlock::Subagent(b) => {
                 // Only the failed variant carries an error string worth indexing.
                 let error = match &b.kind {

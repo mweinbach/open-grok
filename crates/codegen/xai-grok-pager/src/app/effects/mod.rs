@@ -2294,6 +2294,26 @@ pub(crate) fn execute(
                     TaskResult::CancelComplete
                 });
         }
+        Effect::NotifySwarmMode { session_id, enabled, trigger } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let params = serde_json::json!({
+                    "sessionId": session_id.0.to_string(),
+                    "enabled": enabled,
+                    "trigger": trigger,
+                });
+                let notification = acp::ExtNotification::new(
+                    "x.ai/swarm_mode_changed",
+                    serde_json::value::to_raw_value(&params)
+                        .expect("serialize swarm_mode_changed params")
+                        .into(),
+                );
+                if let Err(e) = acp_send(notification, &tx).await {
+                    tracing::warn!("Failed to send swarm_mode_changed notification: {e}");
+                }
+                TaskResult::CancelComplete
+            });
+        }
         Effect::SetSessionMode { session_id, mode_id } => {
             let tx = acp_tx.clone();
             tasks
@@ -2304,6 +2324,90 @@ pub(crate) fn execute(
                     }
                     TaskResult::CancelComplete
                 });
+        }
+        Effect::SwarmModeThenPrompt {
+            session_id,
+            agent_id,
+            text,
+            prompt_id,
+            skill_token_ranges,
+            enabled,
+            trigger,
+            rollback_enabled,
+        } => {
+            let tx = acp_tx.clone();
+            let screen_mode = session_flags.screen_mode_label;
+            let is_api_key_auth = session_flags.is_api_key_auth;
+            tasks.spawn(async move {
+                let params = serde_json::json!({
+                    "sessionId": session_id.0.to_string(),
+                    "enabled": enabled,
+                    "trigger": trigger,
+                });
+                let notification = acp::ExtNotification::new(
+                    "x.ai/swarm_mode_changed",
+                    serde_json::value::to_raw_value(&params)
+                        .expect("serialize swarm_mode_changed params")
+                        .into(),
+                );
+                if let Err(error) = acp_send(notification, &tx).await {
+                    tracing::warn!("Failed to send swarm_mode_changed notification: {error}");
+                    return TaskResult::SwarmPromptSetupFailed {
+                        agent_id,
+                        prompt_id,
+                        text,
+                        error: format_acp_error(&error, is_api_key_auth),
+                        pending_rollback_enabled: None,
+                    };
+                }
+                ulog::info("prompt submitted", Some(&session_id.0), Some(serde_json::json!({ "len": text.len() })));
+                let prompt = vec![plain_prompt_content_block(text.clone(), &skill_token_ranges)];
+                let req = acp::PromptRequest::new(session_id.clone(), prompt).meta(
+                    prompt_request_meta(&prompt_id, screen_mode).as_object().cloned(),
+                );
+                let result = acp_send(req, &tx).await;
+                log_prompt_result(&session_id, &result);
+                match result {
+                    Ok(response) => TaskResult::PromptResponse {
+                        agent_id,
+                        result: Ok(response),
+                        http_status: None,
+                        prompt_id: Some(prompt_id),
+                    },
+                    Err(error) => {
+                        let pending_rollback_enabled = if let Some(rollback_enabled) = rollback_enabled {
+                            let rollback_params = serde_json::json!({
+                                "sessionId": session_id.0.to_string(),
+                                "enabled": rollback_enabled,
+                                "trigger": trigger,
+                            });
+                            let rollback = acp::ExtNotification::new(
+                                "x.ai/swarm_mode_changed",
+                                serde_json::value::to_raw_value(&rollback_params)
+                                    .expect("serialize swarm mode rollback params")
+                                    .into(),
+                            );
+                            if let Err(rollback_error) = acp_send(rollback, &tx).await {
+                                tracing::warn!(
+                                    "Failed to roll back swarm mode after prompt send failure: {rollback_error}"
+                                );
+                                (!rollback_enabled).then_some(rollback_enabled)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        TaskResult::SwarmPromptSetupFailed {
+                            agent_id,
+                            prompt_id,
+                            text,
+                            error: format_acp_error(&error, is_api_key_auth),
+                            pending_rollback_enabled,
+                        }
+                    }
+                }
+            });
         }
         Effect::SetModeThenPrompt {
             session_id,

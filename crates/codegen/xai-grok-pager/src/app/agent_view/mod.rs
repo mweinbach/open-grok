@@ -1331,6 +1331,14 @@ pub struct AgentView {
     /// `SubagentSpawned` notifications, used for permission routing
     /// (which agent owns a session) and provenance display.
     pub subagent_sessions: HashMap<String, SubagentInfo>,
+    /// Swarm scrollback card by shell swarm ID; child tracking stays in `subagent_sessions`.
+    pub swarm_blocks: HashMap<String, EntryId>,
+    /// Live per-session shell-authoritative swarm state, distinct from the persisted default.
+    pub swarm_mode_active: bool,
+    /// A one-shot task failed after enabling swarm mode and its rollback did
+    /// not reach the shell. The next ordinary prompt retries this mode before
+    /// it is sent, so it cannot inherit the one-shot task's swarm state.
+    pub pending_swarm_mode_rollback: Option<bool>,
     /// Child subagent views. Keyed by child_session_id.
     /// Created eagerly on SubagentSpawned so updates are tracked from the start.
     pub subagent_views: HashMap<String, Box<AgentView>>,
@@ -2312,6 +2320,7 @@ pub(super) mod test_fixtures {
             capability_mode: None,
             context_normalized: false,
             parent_prompt_id: None,
+            swarm_id: None,
             started_at: Instant::now(),
             last_progress_at: Instant::now(),
             finished: false,

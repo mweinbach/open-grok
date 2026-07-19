@@ -606,6 +606,52 @@ fn kimi_credential_configured(endpoint: xai_grok_shell::kimi_models::KimiApiEndp
         )
 }
 
+fn handle_swarm_prompt_setup_failed(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    prompt_id: String,
+    text: String,
+    error: String,
+    pending_rollback_enabled: Option<bool>,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    if agent.session.current_prompt_id.as_deref() != Some(prompt_id.as_str()) {
+        tracing::debug!(
+            agent = ?agent_id,
+            prompt_id,
+            current_prompt_id = ?agent.session.current_prompt_id,
+            "Ignoring stale swarm prompt setup failure"
+        );
+        return vec![];
+    }
+
+    if let Some(enabled) = pending_rollback_enabled {
+        agent.pending_swarm_mode_rollback = Some(enabled);
+    }
+
+    if let Some(stashed) = agent.session.in_flight_prompt.take() {
+        let cursor = stashed.text.len();
+        agent.prompt.set_text(&stashed.text);
+        agent.prompt.restore_chip_elements(&stashed.chip_elements);
+        agent.prompt.set_images(stashed.images);
+        agent.prompt.set_cursor(cursor);
+        agent.scrollback.remove_entry(stashed.scrollback_entry);
+    } else {
+        let cursor = text.len();
+        agent.prompt.set_text(&text);
+        agent.prompt.set_cursor(cursor);
+    }
+
+    agent.session.finish_turn(&mut agent.scrollback);
+    agent.mark_turn_finished();
+    agent.activity_started_at = None;
+    agent.last_activity = None;
+    agent.show_toast(&format!("Swarm setup failed — prompt restored: {error}"));
+    vec![]
+}
+
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
     match result {
         TaskResult::PerplexityWebSearchUpdated {
@@ -1064,6 +1110,20 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             http_status,
             prompt_id,
         } => handle_prompt_response(app, agent_id, result, http_status, prompt_id),
+        TaskResult::SwarmPromptSetupFailed {
+            agent_id,
+            prompt_id,
+            text,
+            error,
+            pending_rollback_enabled,
+        } => handle_swarm_prompt_setup_failed(
+            app,
+            agent_id,
+            prompt_id,
+            text,
+            error,
+            pending_rollback_enabled,
+        ),
         TaskResult::SendPromptNowFailed {
             agent_id,
             session_id,

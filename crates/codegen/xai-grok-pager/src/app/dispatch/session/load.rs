@@ -141,7 +141,7 @@ fn dispatch_load_session_ungated(
         format!("Loading session {}...", &session_id)
     };
     let loading_placeholder_id = scrollback.push_block(RenderBlock::system(loading_msg));
-    let agent = AgentView::new(
+    let mut agent = AgentView::new(
         AgentSession {
             id: agent_id,
             acp_tx: app.acp_tx.clone(),
@@ -180,6 +180,7 @@ fn dispatch_load_session_ungated(
         },
         scrollback,
     );
+    agent.swarm_mode_active = app.current_ui.swarm_mode.unwrap_or(false);
     app.agents.insert(agent_id, agent);
     let usage_command_visible = app.usage_command_visible();
     let agent_mut = app.agents.get_mut(&agent_id).unwrap();
@@ -793,7 +794,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
     scrollback.push_block(RenderBlock::system(format!(
         "Restoring session {session_id} from remote..."
     )));
-    let agent = AgentView::new(
+    let mut agent = AgentView::new(
         AgentSession {
             id: agent_id,
             acp_tx: app.acp_tx.clone(),
@@ -832,6 +833,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
         },
         scrollback,
     );
+    agent.swarm_mode_active = app.current_ui.swarm_mode.unwrap_or(false);
     app.agents.insert(agent_id, agent);
     let usage_command_visible = app.usage_command_visible();
     {

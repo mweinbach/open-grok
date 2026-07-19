@@ -61,10 +61,64 @@ pub(super) fn dispatch_send_prompt(app: &mut AppView, text: String) -> Vec<Effec
         None,
         Some(serde_json::json!({"len": text.len()})),
     );
+    let effects = dispatch_send_prompt_inner(
+        app, text, /* consume_input */ true, /* literal */ false,
+        /* is_follow_up */ false,
+    );
+    retry_pending_swarm_mode_rollback(app, effects)
+}
+
+/// Submit a one-shot swarm task without preempting its deliberate enable with
+/// a pending false rollback. Its own ordered effect restores the manual mode
+/// if the task prompt is not accepted.
+pub(super) fn dispatch_send_swarm_task(app: &mut AppView, text: String) -> Vec<Effect> {
+    crate::unified_log::info(
+        "prompt.enqueue",
+        None,
+        Some(serde_json::json!({"len": text.len()})),
+    );
     dispatch_send_prompt_inner(
         app, text, /* consume_input */ true, /* literal */ false,
         /* is_follow_up */ false,
     )
+}
+
+fn retry_pending_swarm_mode_rollback(app: &AppView, effects: Vec<Effect>) -> Vec<Effect> {
+    effects
+        .into_iter()
+        .map(|effect| match effect {
+            Effect::SendPrompt {
+                session_id,
+                agent_id,
+                text,
+                prompt_id,
+                skill_token_ranges,
+            } => match app
+                .agents
+                .get(&agent_id)
+                .and_then(|agent| agent.pending_swarm_mode_rollback)
+            {
+                Some(enabled) => Effect::SwarmModeThenPrompt {
+                    session_id,
+                    agent_id,
+                    text,
+                    prompt_id,
+                    skill_token_ranges,
+                    enabled,
+                    trigger: "task_rollback",
+                    rollback_enabled: None,
+                },
+                None => Effect::SendPrompt {
+                    session_id,
+                    agent_id,
+                    text,
+                    prompt_id,
+                    skill_token_ranges,
+                },
+            },
+            other => other,
+        })
+        .collect()
 }
 
 /// Clear the active prompt and record non-empty text in prompt history (Esc Esc).
@@ -464,6 +518,7 @@ pub(super) fn dispatch_send_prompt_inner(
                     coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
                     // Prefer optimistic pending over confirmed active.
                     plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
+                    swarm_mode: agent.swarm_mode_active,
                     show_tips: show_tips_from_app,
                     auto_update: auto_update_from_app,
                     vim_mode: crate::appearance::cache::load_vim_mode(),

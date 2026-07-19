@@ -291,7 +291,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
     app.next_agent_id += 1;
     let mut scrollback = ScrollbackState::new();
     scrollback.set_appearance(app.appearance.clone());
-    let agent = AgentView::new(
+    let mut agent = AgentView::new(
         AgentSession {
             id: agent_id,
             acp_tx: app.acp_tx.clone(),
@@ -330,6 +330,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         },
         scrollback,
     );
+    agent.swarm_mode_active = app.current_ui.swarm_mode.unwrap_or(false);
     app.agents.insert(agent_id, agent);
     let usage_command_visible = app.usage_command_visible();
     {
@@ -664,6 +665,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         },
         scrollback,
     );
+    agent.swarm_mode_active = app.current_ui.swarm_mode.unwrap_or(false);
     let cmd = if load_session_id.is_some() {
         AgentCommand::RestoreWorktree
     } else {
