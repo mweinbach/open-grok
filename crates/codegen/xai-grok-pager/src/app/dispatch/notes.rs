@@ -285,25 +285,46 @@ pub(super) fn dispatch_send_btw(app: &mut AppView, question: String) -> Vec<Effe
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
-    let Some(agent) = app.agents.get_mut(&id) else {
-        return vec![];
-    };
-    let Some(session_id) = agent.session.session_id.clone() else {
-        agent.show_toast("No active session");
-        return vec![];
-    };
+    let minimal = app.screen_mode.is_minimal();
+    let (session_id, minimal_request_id) = {
+        let Some(agent) = app.agents.get_mut(&id) else {
+            return vec![];
+        };
+        let Some(session_id) = agent.session.session_id.clone() else {
+            if minimal {
+                agent
+                    .scrollback
+                    .push_block(crate::scrollback::block::RenderBlock::system(
+                        "No active session",
+                    ));
+            } else {
+                agent.show_toast("No active session");
+            }
+            return vec![];
+        };
 
-    agent.prompt.set_text("");
-    agent.btw_state = Some(crate::views::btw_overlay::BtwOverlayState::Loading {
-        question: question.clone(),
-    });
-    // Prompt keeps focus while the answer is in flight (panel focuses on Done).
-    agent.btw_focused = false;
+        agent.prompt.set_text("");
+        let minimal_request_id = if minimal {
+            Some(crate::minimal_api::start_minimal_btw(
+                agent,
+                question.clone(),
+            ))
+        } else {
+            agent.btw_state = Some(crate::views::btw_overlay::BtwOverlayState::Loading {
+                question: question.clone(),
+            });
+            // Prompt keeps focus while the answer is in flight (panel focuses on Done).
+            agent.btw_focused = false;
+            None
+        };
+        (session_id, minimal_request_id)
+    };
 
     vec![Effect::SendBtw {
         agent_id: id,
         session_id,
         question,
+        minimal_request_id,
     }]
 }
 
@@ -443,9 +464,14 @@ pub(super) fn handle_btw_response(
     app: &mut AppView,
     agent_id: AgentId,
     result: Result<String, String>,
+    minimal_request_id: Option<uuid::Uuid>,
 ) -> Vec<Effect> {
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         use crate::views::btw_overlay::BtwOverlayState;
+        if let Some(request_id) = minimal_request_id {
+            crate::minimal_api::finish_minimal_btw(agent, request_id, result);
+            return vec![];
+        }
         let question = match &agent.btw_state {
             Some(BtwOverlayState::Loading { question }) => question.clone(),
             _ => String::new(),

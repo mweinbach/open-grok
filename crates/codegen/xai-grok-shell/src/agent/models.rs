@@ -2117,6 +2117,12 @@ fn resolve_default_model_with_provider_auth(
     let model_pref = resolved_default_model_preference(cfg);
 
     let first_or_fallback = || -> (String, ModelEntry) {
+        let bundled_default = acp::ModelId::new(crate::models::default_model());
+        if let Some(key) = resolve_catalog_key(&visible, &bundled_default)
+            && let Some(entry) = visible.get(key.0.as_ref())
+        {
+            return (key.0.to_string(), entry.clone());
+        }
         if let Some((key, first)) = visible.first() {
             return (key.clone(), first.clone());
         }
@@ -3004,6 +3010,29 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn bundled_default_wins_over_earlier_provider_without_explicit_preference() {
+        let mut kimi = make_model_entry("kimi-k3");
+        kimi.info.provider = xai_grok_sampling_types::ModelProvider::Kimi;
+        let catalog = IndexMap::from([
+            ("kimi-k3".to_string(), kimi),
+            (
+                crate::models::default_model().to_string(),
+                make_model_entry(crate::models::default_model()),
+            ),
+        ]);
+
+        let (key, _, source) = resolve_default_model_with_provider_auth(
+            &config::Config::default(),
+            &catalog,
+            false,
+            false,
+        );
+
+        assert_eq!(key, crate::models::default_model());
+        assert_eq!(source, config::ConfigSource::Default);
+    }
+
     // ── auth-change refresh: has_fetched_real_catalog flag ─────────────
 
     #[test]
@@ -3483,10 +3512,10 @@ mod tests {
         // New identity fetch — resolves default via reselect_default_model.
         let prefetched = make_prefetched(&["grok-4.5", "grok-4.3"]);
         mgr.apply_refresh_result(&cfg, Some(prefetched), None);
-        let first_available = mgr.available().keys().next().unwrap().clone();
         assert_eq!(
             mgr.current_model_id().0.as_ref(),
-            first_available.0.as_ref()
+            crate::models::default_model(),
+            "identity reset should restore the bundled default, not provider catalog order"
         );
     }
 

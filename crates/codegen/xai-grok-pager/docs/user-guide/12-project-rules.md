@@ -35,7 +35,15 @@ In addition to AGENTS.md files, Grok scans for `*.md` files in rules directories
 | `<dir>/.claude/rules/` | Claude compatibility (configurable) |
 | `<dir>/.cursor/rules/` | Cursor compatibility (configurable) |
 
-Grok scans the Claude and Cursor rules directories by default. To disable scanning for a specific vendor, set its cell in the `[compat]` config section or the corresponding environment variable. See [Configuration](05-configuration.md#harness-compatibility) for details.
+Grok also scans home-level rules, regardless of where it starts. These roots are already vendor-specific, so rules live directly under `rules/`:
+
+| Location | Notes |
+|----------|-------|
+| `$OPENGROK_HOME/rules/` (default `~/.opengrok/rules/`) | Always scanned; applies to all projects |
+| `~/.claude/rules/` | Controlled by `compat.claude.rules` |
+| `~/.cursor/rules/` | Controlled by `compat.cursor.rules` |
+
+Home rules load first, in the table order, followed by project files from repo root to the current directory. Files are alphabetical within each rules directory. The vendor `rules` cells control both home and project rules independently of the corresponding `agents` cells. Claude's `agents` cell controls named files under `~/.claude/` and project `<dir>/.claude/CLAUDE*.md`; generic top-level names such as `Claude.md`, `CLAUDE.md`, and `CLAUDE.local.md` remain recognized. See [Configuration](05-configuration.md#harness-compatibility).
 
 ---
 
@@ -43,7 +51,7 @@ Grok scans the Claude and Cursor rules directories by default. To disable scanni
 
 Grok scans for project rules in this order:
 
-1. **Global rules**: `~/.opengrok/` (applies to all projects)
+1. **Home rules**: `$OPENGROK_HOME` or `~/.opengrok/`, then enabled `~/.claude/` and `~/.cursor/` sources
 2. **Repo rules**: If inside a git repo, every directory from the repo root down to the current working directory (inclusive)
 3. **CWD-only**: If not inside a git repo, only the current working directory
 

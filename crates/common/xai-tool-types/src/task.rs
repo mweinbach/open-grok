@@ -987,10 +987,15 @@ fn lifecycle_target_suffix(monitor_present: bool, subagent_present: bool) -> &'s
     }
 }
 
-/// Optional "(a monitor's task_id is returned by {monitor})" clause.
-fn monitor_task_id_note(monitor_tool: Option<&str>) -> String {
+/// Optional "(a monitor's {id_name} is returned by {monitor})" clause.
+///
+/// `id_name` is the model-facing singular id name — kill_task's `task_id`
+/// input (tracks renames). get_task_output's `task_ids` array is plural and
+/// must not be used here; both tools share this wording so randomization
+/// cannot disagree across kill vs get-output docs.
+fn monitor_task_id_note(monitor_tool: Option<&str>, id_name: &str) -> String {
     match monitor_tool {
-        Some(m) => format!(" (a monitor's task_id is returned by {m})"),
+        Some(m) => format!(" (a monitor's {id_name} is returned by {m})"),
         None => String::new(),
     }
 }
@@ -1006,6 +1011,8 @@ pub struct KillTaskToolNaming<'a> {
     pub bash_present: bool,
     /// Whether termination uses a Windows Job Object (vs POSIX signals).
     pub is_windows: bool,
+    /// Model-facing name of the `task_id` input (tracks param renames).
+    pub task_id_param: &'a str,
 }
 
 /// Build the shared `kill_task` tool description.
@@ -1015,11 +1022,12 @@ pub fn build_kill_task_description(naming: &KillTaskToolNaming) -> String {
         subagent_present,
         bash_present,
         is_windows,
+        task_id_param,
     } = *naming;
     let monitor_present = monitor_tool.is_some();
 
     let target_suffix = lifecycle_target_suffix(monitor_present, subagent_present);
-    let monitor_note = monitor_task_id_note(monitor_tool);
+    let monitor_note = monitor_task_id_note(monitor_tool, task_id_param);
 
     let verb = if is_windows {
         "Terminates the Job Object of"
@@ -1046,7 +1054,7 @@ pub fn build_kill_task_description(naming: &KillTaskToolNaming) -> String {
     format!(
         "Terminate a running background task{target_suffix}.\n\n\
          Usage notes:\n\
-         - Pass its task_id{monitor_note}.\n\
+         - Pass its {task_id_param}{monitor_note}.\n\
          - {action}.\n\
          - Returns success if the task was killed or had already exited."
     )
@@ -1063,6 +1071,13 @@ pub struct TaskOutputToolNaming<'a> {
     pub bash_background_param: Option<&'a str>,
     /// The subagent `run_in_background` param name, when a `task` tool is present.
     pub subagent_background_param: Option<&'a str>,
+    /// Model-facing name of the `task_ids` input (tracks param renames).
+    pub task_ids_param: &'a str,
+    /// Model-facing name of the `timeout_ms` input (tracks param renames).
+    pub timeout_ms_param: &'a str,
+    /// Singular monitor-id name for the monitor aside — kill_task's `task_id`
+    /// (tracks renames). Not get_task_output's plural `task_ids`.
+    pub task_id_param: &'a str,
 }
 
 /// Build the shared `get_task_output` tool description.
@@ -1072,6 +1087,9 @@ pub fn build_task_output_description(naming: &TaskOutputToolNaming) -> String {
         read_tool,
         bash_background_param,
         subagent_background_param,
+        task_ids_param,
+        timeout_ms_param,
+        task_id_param,
     } = *naming;
     let monitor_present = monitor_tool.is_some();
     let subagent_present = subagent_background_param.is_some();
@@ -1087,7 +1105,7 @@ pub fn build_task_output_description(naming: &TaskOutputToolNaming) -> String {
     }
     let sources = sources.join(" or ");
 
-    let monitor_note = monitor_task_id_note(monitor_tool);
+    let monitor_note = monitor_task_id_note(monitor_tool, task_id_param);
     let read_note = match read_tool {
         Some(r) => format!("\n- If output is large, use {r} on the output_file path"),
         None => String::new(),
@@ -1096,8 +1114,8 @@ pub fn build_task_output_description(naming: &TaskOutputToolNaming) -> String {
     format!(
         "Get output and status from a background task{target_suffix}.\n\n\
          Usage notes:\n\
-         - Pass task_ids with one or more ids from {sources}{monitor_note}; for a single task use a one-element array. Multiple ids with a positive timeout_ms wait until all complete\n\
-         - Omit timeout_ms or pass 0 for a non-blocking status snapshot; set a positive timeout_ms to wait up to that many milliseconds, capped at ~10 min\n\
+         - Pass {task_ids_param} with one or more ids from {sources}{monitor_note}; for a single task use a one-element array. Multiple ids with a positive {timeout_ms_param} wait until all complete\n\
+         - Omit {timeout_ms_param} or pass 0 for a non-blocking status snapshot; set a positive {timeout_ms_param} to wait up to that many milliseconds, capped at ~10 min\n\
          - Returns current output, status, and exit code if completed{read_note}"
     )
 }
@@ -1485,6 +1503,7 @@ mod tests {
             subagent_present: true,
             bash_present: true,
             is_windows: false,
+            task_id_param: "task_id",
         });
         assert_eq!(
             desc,
@@ -1503,6 +1522,7 @@ mod tests {
             subagent_present: true,
             bash_present: true,
             is_windows: true,
+            task_id_param: "task_id",
         });
         assert!(desc.contains(
             "- Terminates the Job Object of a bash task or monitor; sends Cancel+Shutdown to a subagent."
@@ -1516,6 +1536,7 @@ mod tests {
             subagent_present: true,
             bash_present: false,
             is_windows: false,
+            task_id_param: "task_id",
         });
         assert_eq!(
             desc,
@@ -1528,12 +1549,63 @@ mod tests {
     }
 
     #[test]
+    fn kill_task_description_tracks_renamed_task_id() {
+        let desc = build_kill_task_description(&KillTaskToolNaming {
+            monitor_tool: Some("monitor"),
+            subagent_present: false,
+            bash_present: true,
+            is_windows: false,
+            task_id_param: "id",
+        });
+        assert!(
+            desc.contains("Pass its id (a monitor's id is returned by monitor)"),
+            "renamed task_id must appear in pass-line and monitor aside: {desc}"
+        );
+        assert!(
+            !desc.contains("task_id"),
+            "canonical task_id must not remain after rename: {desc}"
+        );
+    }
+
+    #[test]
+    fn task_output_description_tracks_renamed_params() {
+        let desc = build_task_output_description(&TaskOutputToolNaming {
+            monitor_tool: Some("monitor"),
+            read_tool: None,
+            bash_background_param: Some("is_background"),
+            subagent_background_param: None,
+            task_ids_param: "process_ids",
+            timeout_ms_param: "max_wait",
+            task_id_param: "id",
+        });
+        assert!(
+            desc.contains("Pass process_ids with"),
+            "renamed task_ids must appear: {desc}"
+        );
+        assert!(
+            desc.contains("positive max_wait wait") && desc.contains("Omit max_wait or pass 0"),
+            "renamed timeout_ms must appear: {desc}"
+        );
+        assert!(
+            desc.contains("a monitor's id is returned by monitor"),
+            "renamed kill_task task_id must appear in monitor aside: {desc}"
+        );
+        assert!(
+            !desc.contains("task_ids") && !desc.contains("timeout_ms") && !desc.contains("task_id"),
+            "canonical param names must not remain after rename: {desc}"
+        );
+    }
+
+    #[test]
     fn task_output_matches_cli_default() {
         let desc = build_task_output_description(&TaskOutputToolNaming {
             monitor_tool: Some("monitor"),
             read_tool: Some("read_file"),
             bash_background_param: Some("background"),
             subagent_background_param: Some("background"),
+            task_ids_param: "task_ids",
+            timeout_ms_param: "timeout_ms",
+            task_id_param: "task_id",
         });
         assert_eq!(
             desc,
@@ -1553,6 +1625,9 @@ mod tests {
             read_tool: Some("read_file"),
             bash_background_param: None,
             subagent_background_param: Some("run_in_background"),
+            task_ids_param: "task_ids",
+            timeout_ms_param: "timeout_ms",
+            task_id_param: "task_id",
         });
         assert_eq!(
             desc,

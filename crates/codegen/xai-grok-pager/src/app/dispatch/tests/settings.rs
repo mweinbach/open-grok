@@ -595,6 +595,32 @@ fn set_timeline_toggles_displayed_state_when_current_ui_diverges() {
     assert_eq!(app.current_ui.show_timeline, Some(false));
 }
 #[test]
+fn set_page_flip_on_send_emits_persist_setting_with_correct_payload() {
+    use crate::settings::SettingValue;
+    let mut app = test_app_with_agent();
+    let default_on = app.current_ui.page_flip_on_send_enabled();
+    crate::appearance::cache::set_page_flip_on_send(default_on);
+    let effects = dispatch(Action::SetPageFlipOnSend(!default_on), &mut app);
+    assert_eq!(effects.len(), 1);
+    match &effects[0] {
+        Effect::PersistSetting {
+            key,
+            value,
+            rollback_value,
+        } => {
+            assert_eq!(*key, "page_flip_on_send");
+            assert_eq!(value, &SettingValue::Bool(!default_on));
+            assert_eq!(rollback_value, &SettingValue::Bool(default_on));
+        }
+        other => panic!("expected PersistSetting, got {other:?}"),
+    }
+    assert_eq!(app.current_ui.page_flip_on_send, Some(!default_on));
+    assert_eq!(
+        crate::appearance::cache::load_page_flip_on_send(),
+        !default_on
+    );
+}
+#[test]
 fn set_simple_mode_emits_persist_setting_with_correct_payload() {
     use crate::settings::SettingValue;
     let mut app = test_app_with_agent();
@@ -651,7 +677,7 @@ fn dispatch_open_kimi_api_key_editor_starts_at_service_picker() {
     };
     assert_eq!(state.entry_point, SettingsEntryPoint::ProviderLogin);
     assert!(matches!(
-        state.mode,
+        state.mode(),
         SettingsModalMode::PickingEnum {
             key: "kimi_api_endpoint",
             choices_idx: 0,
@@ -680,7 +706,7 @@ fn dashboard_kimi_login_starts_at_service_picker() {
         .expect("dashboard /login kimi should open the Settings credential editor");
     assert_eq!(state.entry_point, SettingsEntryPoint::ProviderLogin);
     assert!(matches!(
-        state.mode,
+        state.mode(),
         SettingsModalMode::PickingEnum {
             key: "kimi_api_endpoint",
             choices_idx: 0,
@@ -863,10 +889,10 @@ fn dispatch_confirm_reset_setting_cancel_preserves_modal_state() {
     {
         let agent = app.agents.get_mut(&AgentId(0)).expect("agent must exist");
         if let Some(ActiveModal::Settings { state }) = &mut agent.active_modal {
-            state.query.push_str("stamp");
+            state.set_query("stamp");
             state.selected = 3;
             state.scroll_offset = 1;
-            state.mode = SettingsModalMode::FilterFocused;
+            state.focus_filter();
         } else {
             panic!("expected Settings modal");
         }
@@ -895,11 +921,11 @@ fn dispatch_confirm_reset_setting_cancel_preserves_modal_state() {
     match &agent.active_modal {
         Some(ActiveModal::Settings { state }) => {
             assert!(state.ui_snapshot.compact_mode, "ui_snapshot.compact_mode");
-            assert_eq!(state.query, "stamp", "query preserved");
+            assert_eq!(state.query(), "stamp", "query preserved");
             assert_eq!(state.selected, 3, "selected preserved");
             assert_eq!(state.scroll_offset, 1, "scroll_offset preserved");
             assert!(
-                matches!(state.mode, SettingsModalMode::FilterFocused),
+                matches!(state.mode(), SettingsModalMode::FilterFocused),
                 "mode preserved (FilterFocused)"
             );
         }
@@ -1439,6 +1465,10 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
             let away = !app.current_ui.show_timeline_enabled();
             let _ = dispatch(Action::SetTimeline(away), app);
         }
+        "page_flip_on_send" => {
+            let away = !crate::appearance::cache::load_page_flip_on_send();
+            let _ = dispatch(Action::SetPageFlipOnSend(away), app);
+        }
         "simple_mode" => {
             let _ = dispatch(Action::SetSimpleMode(false), app);
         }
@@ -1520,7 +1550,7 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
             let _ = dispatch(Action::SetMaxThoughtsWidth(200), app);
         }
         "coding_data_sharing" => {
-            let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, app);
+            let _ = dispatch(Action::SetCodingDataSharing { opted_in: true }, app);
         }
         "plan_mode" => {
             let _ = dispatch(
@@ -1587,6 +1617,16 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "prompt_suggestions" => {
             let _ = dispatch(Action::SetPromptSuggestions(false), app);
+        }
+        "swarm_mode" => {
+            let _ = dispatch(
+                Action::SetSwarmMode {
+                    enabled: true,
+                    trigger: "manual",
+                    persist: true,
+                },
+                app,
+            );
         }
         "respect_manual_folds" => {
             let _ = dispatch(

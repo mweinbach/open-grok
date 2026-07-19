@@ -14,6 +14,14 @@ open-grok
 
 Grok stores credentials in `~/.opengrok/auth.json` and reuses them across sessions. Grok refreshes access tokens automatically in the background. When a token can't be refreshed, Grok prompts you to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
 
+### Credential storage
+
+Tokens in `~/.opengrok/auth.json` (and MCP OAuth tokens in `~/.opengrok/mcp_credentials.json`) are written with owner-only permissions (`0600` on Unix). Anyone with filesystem access to those paths can use the credentials, so:
+
+- Prefer full-disk encryption (FileVault, BitLocker, LUKS, or equivalent).
+- Do not copy `auth.json` or `mcp_credentials.json` into shared directories, tickets, or chat.
+- On multi-user hosts, keep `$HOME` / `$OPENGROK_HOME` private to your account.
+
 ### Re-authenticate
 
 To switch accounts or resolve an authentication problem, run:
@@ -275,6 +283,25 @@ When more than one login flow is configured, Grok populates the session token fr
 3. **SpaceXAI OAuth2 browser login** -- the default
 
 During a session, the active method handles all mid-session refreshes.
+
+---
+
+## Related settings
+
+`/privacy` does not change these config knobs:
+
+| Setting | How to set it |
+|---------|---------------|
+| `[features] telemetry` | `config.toml` or `GROK_TELEMETRY_ENABLED` |
+| `[telemetry] trace_upload` | `config.toml` or `GROK_TELEMETRY_TRACE_UPLOAD` |
+| External OpenTelemetry | `GROK_EXTERNAL_OTEL` / `[telemetry] otel_*`. See [Monitoring Usage](24-monitoring-usage.md). |
+
+On team accounts, only a team admin can toggle privacy with `/privacy`.
+Team admins can also enable or disable Zero Data Retention (ZDR) for their team.
+See [How to enable ZDR](https://docs.x.ai/developers/faq/security#how-to-enable-zdr).
+When ZDR is on, `/privacy` cannot change coding-data sharing.
+
+See [Monitoring Usage](24-monitoring-usage.md#related-settings) and [Configuration](05-configuration.md#telemetry).
 
 ---
 

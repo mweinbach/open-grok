@@ -10,6 +10,7 @@ dunce = { workspace = true }
 xai-grok-hooks = { path = "../xai-grok-hooks" }
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
 xai-grok-tools = { path = "../xai-grok-tools" }
+xai-tty-utils = { workspace = true }
 xai-token-estimation = { workspace = true }
 minijinja = { version = "2", features = ["custom_syntax"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }

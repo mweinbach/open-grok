@@ -2,7 +2,7 @@
 
 use super::ctx::find_agent_by_session_id;
 use super::permissions::drain_permission_queue;
-use super::queue::{apply_turn_start_shim, maybe_drain_queue, note_peek_page_flip_after_drain};
+use super::queue::{apply_turn_start_shim, maybe_drain_queue, note_peek_page_flip};
 use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::agent_view::ActivePane;
@@ -391,7 +391,6 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
             agent,
             event,
             Some(pending.prompt_id.as_str()),
-            false,
         );
 
         agent.mark_turn_finished();
@@ -408,20 +407,24 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
 
         // FIFO handoff (mirrors the PromptResponse arm): adopt the next
         // server-authoritative running prompt now that the slot is free.
-        if let Some(p) = pending_adoption
+        let adopted_page_flip = if let Some(p) = pending_adoption
             && agent.session.current_prompt_id.is_none()
         {
             if p.prompt_id != pending.prompt_id && agent.should_adopt_running_prompt(&p.prompt_id) {
-                apply_turn_start_shim(agent, p.prompt_id, p.text, &p.kind);
+                apply_turn_start_shim(agent, p.prompt_id, p.text, &p.kind)
             } else {
                 agent.discard_pending_adoption_updates(&p.prompt_id);
+                None
             }
-        }
-        effects.extend(maybe_drain_queue(agent));
-        drained_ids.push(id);
+        } else {
+            None
+        };
+        let drain = maybe_drain_queue(agent);
+        effects.extend(drain.effects);
+        drained_ids.push((id, adopted_page_flip.or(drain.page_flip_entry)));
     }
-    for id in drained_ids {
-        note_peek_page_flip_after_drain(app, id);
+    for (id, page_flip_entry) in drained_ids {
+        note_peek_page_flip(app, id, page_flip_entry);
     }
     fired.then_some(effects)
 }

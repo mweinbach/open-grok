@@ -1,6 +1,6 @@
 //! Subscription tier checks, credit-limit upsells, and auto-topup handling.
 
-use super::queue::{maybe_drain_queue, note_peek_page_flip_after_drain};
+use super::queue::{maybe_drain_queue, note_peek_page_flip};
 use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
@@ -86,16 +86,19 @@ pub(crate) fn is_credit_limit_error(http_status: Option<u16>, message: &str) -> 
 /// Well-known error code CCP returns (HTTP 429, flat body
 /// `{"code": "...", "error": "..."}`) when a free-tier user exhausts the
 /// free usage quota.
+#[cfg(test)]
 pub(crate) const FREE_USAGE_EXHAUSTED_ERROR_CODE: &str = "subscription:free-usage-exhausted";
 
 /// Whether a rate-limit error is free-usage-quota exhaustion rather than
 /// transient throttling.
+#[cfg(test)]
 pub(crate) fn is_free_usage_exhausted_error(reason: &str) -> bool {
     reason.contains(FREE_USAGE_EXHAUSTED_ERROR_CODE)
 }
 
 /// Whether a rate-limited (-32003) ACP error is free-usage exhaustion. The
 /// error data may be a string or the wrapped prompt-usage object.
+#[cfg(test)]
 pub(crate) fn acp_error_is_free_usage_exhausted(err: &agent_client_protocol::Error) -> bool {
     err.data
         .as_ref()
@@ -103,9 +106,6 @@ pub(crate) fn acp_error_is_free_usage_exhausted(err: &agent_client_protocol::Err
         .as_deref()
         .is_some_and(is_free_usage_exhausted_error)
 }
-
-/// User-facing free-usage exhaustion message for the xAI service path.
-pub(crate) const FREE_USAGE_USER_MESSAGE: &str = "You\u{2019}ve reached your free Open Grok usage limit for now. Get SuperGrok for much higher limits, or try again later: https://grok.com/supergrok?referrer=grok-build";
 
 /// Open the credit-limit upsell on the given agent.
 ///
@@ -622,13 +622,13 @@ pub(super) fn handle_credit_limit_recheck_complete(
     // Either way, drop the stashed prompt.
     agent.credit_limit_stashed_prompt = None;
 
-    let mut effects = maybe_drain_queue(agent);
-    effects.push(Effect::FetchBilling {
+    let mut drain = maybe_drain_queue(agent);
+    drain.effects.push(Effect::FetchBilling {
         agent_id,
         silent: true,
     });
-    note_peek_page_flip_after_drain(app, agent_id);
-    effects
+    note_peek_page_flip(app, agent_id, drain.page_flip_entry);
+    drain.effects
 }
 
 // Action handlers.

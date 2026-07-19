@@ -38,6 +38,8 @@ mod mouse_reporting_toggle_inactive_without_config_pty;
 mod mouse_reporting_toggle_sticky_persists_pty;
 #[path = "pty_e2e/nested_quote_drag_copy_excludes_bars_pty.rs"]
 mod nested_quote_drag_copy_excludes_bars_pty;
+#[path = "pty_e2e/page_flip_on_send_pty.rs"]
+mod page_flip_on_send_pty;
 #[path = "pty_e2e/quote_block_drag_copy_excludes_bars_pty.rs"]
 mod quote_block_drag_copy_excludes_bars_pty;
 #[path = "pty_e2e/quote_block_raw_mode_copy_keeps_source_pty.rs"]

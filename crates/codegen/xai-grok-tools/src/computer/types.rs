@@ -292,6 +292,8 @@ pub trait TerminalBackend: Send + Sync {
     /// only the subagent's own tasks are killed — not the parent's.
     async fn kill_all_background_tasks_by_owner(&self, _owner_session_id: &str) {}
 
+    async fn warm_shell(&self, _cwd: &std::path::Path) {}
+
     /// Reparent notification handles for all tasks owned by `old_owner_session_id`.
     /// Swaps the dead child session's notification handle with the parent's
     /// live handle so events from surviving processes route correctly.

@@ -4,12 +4,13 @@
 //! chrome, opened by the `/hooks` and `/plugins` slash commands.
 //! Blocks all input until closed with `Esc`.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
+use crate::input::line_editor::{LineEditOutcome, LineEditor};
 use crate::theme::Theme;
 use crate::views::modal_window::{
     self, ModalContentArea, ModalSizing, ModalWindowConfig, ModalWindowState, Shortcut,
@@ -673,10 +674,10 @@ pub struct ModalInput {
     /// Command prefix used to build the typed action on submit.
     pub command_prefix: String,
     /// Input fields.
-    pub fields: Vec<ModalInputField>,
+    fields: Vec<ModalInputField>,
     /// Index of the currently focused field.
-    pub focused: usize,
-    /// Inline error message shown below the form. Cleared on next keystroke.
+    focused: usize,
+    /// Inline error cleared by text edits, completion, or field navigation.
     pub error: Option<String>,
 }
 
@@ -684,37 +685,63 @@ pub struct ModalInput {
 #[derive(Debug, Clone)]
 pub struct ModalInputField {
     /// Human-readable label shown before the input field.
-    pub label: String,
-    /// Current text in the input field.
-    pub text: String,
-    /// Cursor position (byte offset into `text`).
-    pub cursor: usize,
+    label: String,
+    editor: LineEditor,
     /// Whether the field must be non-empty to submit.
-    pub required: bool,
+    required: bool,
     /// Placeholder text shown when the field is empty.
-    pub placeholder: Option<String>,
+    placeholder: Option<String>,
 }
 
 impl ModalInputField {
-    /// Sanitize pasted text and insert at cursor. Strips `\n` and `\r`.
-    /// Returns `true` if text was inserted.
-    pub fn insert_paste(&mut self, text: &str) -> bool {
-        let cleaned: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-        if cleaned.is_empty() {
-            return false;
+    fn new(spec: FieldSpec) -> Self {
+        Self {
+            label: spec.label,
+            editor: LineEditor::default(),
+            required: spec.required,
+            placeholder: spec.placeholder,
         }
-        self.text.insert_str(self.cursor, &cleaned);
-        self.cursor += cleaned.len();
-        true
     }
 
-    /// Delete the word before the cursor (readline backward-kill-word).
-    pub fn delete_word_backward(&mut self) {
-        if self.cursor > 0 {
-            let boundary = prev_word_boundary(&self.text, self.cursor);
-            self.text.drain(boundary..self.cursor);
-            self.cursor = boundary;
-        }
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn text(&self) -> &str {
+        self.editor.text()
+    }
+
+    pub fn cursor_byte(&self) -> usize {
+        self.editor.cursor_byte()
+    }
+
+    pub fn required(&self) -> bool {
+        self.required
+    }
+
+    pub fn placeholder(&self) -> Option<&str> {
+        self.placeholder.as_deref()
+    }
+
+    pub(crate) fn set_text(&mut self, text: impl Into<String>) {
+        self.editor.set_text(text);
+    }
+
+    #[cfg(test)]
+    fn set_cursor_byte(&mut self, cursor_byte: usize) -> LineEditOutcome {
+        self.editor.set_cursor_byte(cursor_byte)
+    }
+
+    fn insert_paste(&mut self, text: &str) -> LineEditOutcome {
+        self.editor.insert_paste(text)
+    }
+
+    fn handle_key(&mut self, key: &KeyEvent) -> LineEditOutcome {
+        self.editor.handle_key(key)
+    }
+
+    pub(crate) fn viewport(&self, width: usize) -> xai_ratatui_textarea::SingleLineViewport {
+        self.editor.viewport(width)
     }
 }
 
@@ -722,16 +749,7 @@ impl ModalInput {
     /// Build from a command prefix and field specs.
     pub fn from_specs(command_prefix: String, specs: Vec<FieldSpec>) -> Self {
         debug_assert!(!specs.is_empty(), "ModalInput needs at least one field");
-        let fields = specs
-            .into_iter()
-            .map(|s| ModalInputField {
-                label: s.label,
-                text: String::new(),
-                cursor: 0,
-                required: s.required,
-                placeholder: s.placeholder,
-            })
-            .collect();
+        let fields = specs.into_iter().map(ModalInputField::new).collect();
         Self {
             command_prefix,
             fields,
@@ -740,8 +758,24 @@ impl ModalInput {
         }
     }
 
-    /// The currently focused field (mutable).
-    pub fn focused_field_mut(&mut self) -> Option<&mut ModalInputField> {
+    pub fn fields(&self) -> &[ModalInputField] {
+        &self.fields
+    }
+
+    pub fn field(&self, index: usize) -> Option<&ModalInputField> {
+        self.fields.get(index)
+    }
+
+    #[cfg(test)]
+    fn field_mut(&mut self, index: usize) -> Option<&mut ModalInputField> {
+        self.fields.get_mut(index)
+    }
+
+    pub fn focused_index(&self) -> usize {
+        self.focused
+    }
+
+    fn focused_field_mut(&mut self) -> Option<&mut ModalInputField> {
         self.fields.get_mut(self.focused)
     }
 
@@ -752,18 +786,16 @@ impl ModalInput {
 
     /// Collect all field texts into a Vec for submission.
     pub fn field_texts(&self) -> Vec<String> {
-        self.fields.iter().map(|f| f.text.clone()).collect()
+        self.fields
+            .iter()
+            .map(|field| field.text().to_owned())
+            .collect()
     }
 
     /// Process a key event on the input form. Returns what the caller
     /// should do (submit, cancel, nothing, etc.) without coupling to
     /// `AgentView` or `InputOutcome`.
     pub fn handle_key(&mut self, key: &KeyEvent) -> ModalInputOutcome {
-        // Clear inline error on any keystroke except Esc.
-        if key.code != KeyCode::Esc {
-            self.error = None;
-        }
-
         match key {
             KeyEvent {
                 code: KeyCode::Esc, ..
@@ -779,9 +811,9 @@ impl ModalInput {
                     .iter()
                     .enumerate()
                     .filter(|(i, f)| {
-                        f.required && field_texts.get(*i).is_none_or(|t| t.trim().is_empty())
+                        f.required() && field_texts.get(*i).is_none_or(|t| t.trim().is_empty())
                     })
-                    .map(|(_, f)| f.label.as_str())
+                    .map(|(_, f)| f.label())
                     .collect();
                 if !empty_required.is_empty() {
                     self.error = Some(format!("Required: {}", empty_required.join(", ")));
@@ -793,19 +825,11 @@ impl ModalInput {
                 }
             }
 
-            // Field navigation (multi-field forms).
-            KeyEvent {
-                code: KeyCode::Tab,
-                modifiers,
-                ..
-            } if !modifiers.contains(KeyModifiers::SHIFT) && self.is_multi_field() => {
-                self.focused = (self.focused + 1) % self.fields.len();
-                ModalInputOutcome::Changed
-            }
-            KeyEvent {
-                code: KeyCode::BackTab,
-                ..
-            } if self.is_multi_field() => {
+            _ if crate::input::key::is_shift_tab(key) => {
+                if !self.is_multi_field() {
+                    return ModalInputOutcome::Unchanged;
+                }
+                self.error = None;
                 self.focused = if self.focused == 0 {
                     self.fields.len() - 1
                 } else {
@@ -813,283 +837,74 @@ impl ModalInput {
                 };
                 ModalInputOutcome::Changed
             }
-            // Tab in single-field forms: path completion.
-            KeyEvent {
-                code: KeyCode::Tab, ..
-            } => {
-                if let Some(field) = self.focused_field_mut() {
-                    let partial = field.text[..field.cursor].to_string();
-                    if let Some(completed) = tab_complete_path(&partial) {
-                        let len = completed.len();
-                        field.text = completed;
-                        field.cursor = len;
-                        return ModalInputOutcome::Changed;
+            _ if crate::input::key::KeyShortcut::key(KeyCode::Tab).matches(key) => {
+                if self.is_multi_field() {
+                    self.error = None;
+                    self.focused = (self.focused + 1) % self.fields.len();
+                    return ModalInputOutcome::Changed;
+                }
+                let completed = self.focused_field_mut().and_then(|field| {
+                    let partial = field.text()[..field.cursor_byte()].to_owned();
+                    tab_complete_path(&partial)
+                });
+                if let Some(completed) = completed {
+                    if let Some(field) = self.focused_field_mut() {
+                        field.set_text(completed);
                     }
-                }
-                ModalInputOutcome::Unchanged
-            }
-
-            // Single-char backspace.
-            KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut()
-                    && field.cursor > 0
-                {
-                    let prev = field.text[..field.cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    field.text.remove(prev);
-                    field.cursor = prev;
+                    self.error = None;
                     return ModalInputOutcome::Changed;
                 }
                 ModalInputOutcome::Unchanged
             }
 
-            // Forward-delete: Delete key, Ctrl+D.
-            KeyEvent {
-                code: KeyCode::Delete,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut()
-                    && field.cursor < field.text.len()
-                {
-                    field.text.remove(field.cursor);
-                    return ModalInputOutcome::Changed;
-                }
-                ModalInputOutcome::Unchanged
-            }
-
-            // Word-delete backward: Alt+Backspace, Ctrl+Backspace, Ctrl+W.
-            KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers: KeyModifiers::ALT,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('w'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut() {
-                    field.delete_word_backward();
-                }
-                ModalInputOutcome::Changed
-            }
-            // Word-delete backward: Ctrl+Alt+H.
-            KeyEvent {
-                code: KeyCode::Char('h'),
-                modifiers,
-                ..
-            } if *modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-                if let Some(field) = self.focused_field_mut() {
-                    field.delete_word_backward();
-                }
-                ModalInputOutcome::Changed
-            }
-
-            // Delete to start of line: Cmd+Backspace (Super), Ctrl+U.
-            KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers: KeyModifiers::SUPER,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('u'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut()
-                    && field.cursor > 0
-                {
-                    field.text.drain(..field.cursor);
-                    field.cursor = 0;
-                }
-                ModalInputOutcome::Changed
-            }
-
-            // Delete to end of line: Ctrl+K.
-            KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut()
-                    && field.cursor < field.text.len()
-                {
-                    field.text.truncate(field.cursor);
-                }
-                ModalInputOutcome::Changed
-            }
-
-            // Word movement: Alt+Left/Right, Ctrl+Left/Right.
-            KeyEvent {
-                code: KeyCode::Left,
-                modifiers,
-                ..
-            } if modifiers.contains(KeyModifiers::ALT)
-                || modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                if let Some(field) = self.focused_field_mut() {
-                    field.cursor = prev_word_boundary(&field.text, field.cursor);
-                }
-                ModalInputOutcome::Changed
-            }
-            KeyEvent {
-                code: KeyCode::Right,
-                modifiers,
-                ..
-            } if modifiers.contains(KeyModifiers::ALT)
-                || modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                if let Some(field) = self.focused_field_mut() {
-                    field.cursor = next_word_boundary(&field.text, field.cursor);
-                }
-                ModalInputOutcome::Changed
-            }
-
-            // Alt+B / Alt+F (readline word movement).
-            KeyEvent {
-                code: KeyCode::Char('b'),
-                modifiers: KeyModifiers::ALT,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut() {
-                    field.cursor = prev_word_boundary(&field.text, field.cursor);
-                }
-                ModalInputOutcome::Changed
-            }
-            KeyEvent {
-                code: KeyCode::Char('f'),
-                modifiers: KeyModifiers::ALT,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut() {
-                    field.cursor = next_word_boundary(&field.text, field.cursor);
-                }
-                ModalInputOutcome::Changed
-            }
-
-            // Line start/end: Cmd+Left/Right (Super), Home/End, Ctrl+A/E.
-            KeyEvent {
-                code: KeyCode::Left,
-                modifiers: KeyModifiers::SUPER,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Home,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('a'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut() {
-                    field.cursor = 0;
-                }
-                ModalInputOutcome::Changed
-            }
-            KeyEvent {
-                code: KeyCode::Right,
-                modifiers: KeyModifiers::SUPER,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::End, ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('e'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut() {
-                    field.cursor = field.text.len();
-                }
-                ModalInputOutcome::Changed
-            }
-
-            // Single-char cursor movement.
-            KeyEvent {
-                code: KeyCode::Left,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut()
-                    && field.cursor > 0
-                {
-                    let prev = field.text[..field.cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    field.cursor = prev;
-                }
-                ModalInputOutcome::Changed
-            }
-            KeyEvent {
-                code: KeyCode::Right,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut()
-                    && field.cursor < field.text.len()
-                {
-                    let next = field.text[field.cursor..]
-                        .char_indices()
-                        .nth(1)
-                        .map(|(i, _)| field.cursor + i)
-                        .unwrap_or(field.text.len());
-                    field.cursor = next;
-                }
-                ModalInputOutcome::Changed
-            }
-
-            // Clipboard paste (Ctrl+V fallback).
-            KeyEvent {
-                code: KeyCode::Char('v'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                if let Some(field) = self.focused_field_mut()
-                    && let Some(clip) = crate::clipboard::system_clipboard_get()
-                    && field.insert_paste(&clip)
-                {
+            _ if crate::input::key::is_paste_key(key) => {
+                let Some(clip) = crate::clipboard::system_clipboard_get() else {
+                    return ModalInputOutcome::Unchanged;
+                };
+                let outcome = self
+                    .focused_field_mut()
+                    .map_or(LineEditOutcome::Unhandled, |field| {
+                        field.insert_paste(&clip)
+                    });
+                if outcome == LineEditOutcome::TextChanged {
+                    self.error = None;
                     ModalInputOutcome::Changed
                 } else {
                     ModalInputOutcome::Unchanged
                 }
             }
 
-            // Plain character insertion (no CONTROL/ALT/SUPER modifier).
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            } if !modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-                || crate::input::key::is_altgr(*modifiers) =>
-            {
-                if let Some(field) = self.focused_field_mut() {
-                    field.text.insert(field.cursor, *c);
-                    field.cursor += c.len_utf8();
-                }
+            _ => {
+                let outcome = self
+                    .focused_field_mut()
+                    .map_or(LineEditOutcome::Unhandled, |field| field.handle_key(key));
+                self.finish_line_edit(outcome)
+            }
+        }
+    }
+
+    fn finish_line_edit(&mut self, outcome: LineEditOutcome) -> ModalInputOutcome {
+        match outcome {
+            LineEditOutcome::TextChanged => {
+                self.error = None;
                 ModalInputOutcome::Changed
             }
+            LineEditOutcome::HandledNoChange | LineEditOutcome::CursorChanged => {
+                ModalInputOutcome::Changed
+            }
+            LineEditOutcome::Unhandled => ModalInputOutcome::Unchanged,
+        }
+    }
 
-            _ => ModalInputOutcome::Unchanged,
+    fn insert_paste(&mut self, text: &str) -> bool {
+        let outcome = self
+            .focused_field_mut()
+            .map_or(LineEditOutcome::Unhandled, |field| field.insert_paste(text));
+        if outcome == LineEditOutcome::TextChanged {
+            self.error = None;
+            true
+        } else {
+            false
         }
     }
 }
@@ -1097,7 +912,7 @@ impl ModalInput {
 /// Result of processing a key event on the modal input form.
 #[derive(Debug)]
 pub enum ModalInputOutcome {
-    /// State was modified, redraw needed.
+    /// Event was consumed and a redraw is needed.
     Changed,
     /// No state change, skip redraw.
     Unchanged,
@@ -1678,66 +1493,6 @@ fn longest_common_prefix(strings: &[String]) -> String {
         .map(|(a, _)| a)
         .collect()
 }
-// ---------------------------------------------------------------------------
-// Word boundary helpers (for readline-style editing in modal input fields)
-// ---------------------------------------------------------------------------
-
-/// Byte offset of the start of the previous word.
-///
-/// Skips whitespace backward from `cursor`, then skips non-whitespace backward.
-/// Returns 0 if already at the beginning.
-pub fn prev_word_boundary(text: &str, cursor: usize) -> usize {
-    let before = &text[..cursor];
-    let mut iter = before.char_indices().rev();
-    // Phase 1: skip whitespace.
-    let mut pos = cursor;
-    for (i, c) in iter.by_ref() {
-        if !c.is_whitespace() {
-            pos = i;
-            break;
-        }
-        pos = i;
-    }
-    if pos == cursor && cursor > 0 {
-        // Entire prefix was whitespace (or empty).
-        return 0;
-    }
-    // Phase 2: skip non-whitespace.
-    for (i, c) in iter {
-        if c.is_whitespace() {
-            return i + c.len_utf8();
-        }
-    }
-    0
-}
-
-/// Byte offset of the end of the next word.
-///
-/// Skips whitespace forward from `cursor`, then skips non-whitespace forward.
-/// Returns `text.len()` if already at the end.
-pub fn next_word_boundary(text: &str, cursor: usize) -> usize {
-    let after = &text[cursor..];
-    let mut iter = after.char_indices();
-    // Phase 1: skip whitespace.
-    let mut offset = after.len();
-    for (i, c) in iter.by_ref() {
-        if !c.is_whitespace() {
-            offset = i;
-            break;
-        }
-    }
-    if offset == after.len() {
-        return text.len();
-    }
-    // Phase 2: skip non-whitespace.
-    for (i, c) in iter {
-        if c.is_whitespace() {
-            return cursor + i;
-        }
-    }
-    text.len()
-}
-
 /// Collect characters from `text` until the accumulated display width
 /// reaches `max_w`. Prevents wide characters (CJK, emoji) from
 /// overflowing a fixed-width column.
@@ -2087,7 +1842,7 @@ impl ExtensionsModalState {
     /// (the Add form, an error/confirmation overlay, an in-flight
     /// `[processing]` badge, the picker selection / scroll / expansion
     /// state) is cleared so the new tab opens in a clean browse view.
-    /// The user's search query (`picker_state.query`) is intentionally
+    /// The user's search query (`picker_state.query()`) is intentionally
     /// preserved across tabs — current behavior elsewhere in the modal.
     pub fn switch_tab(&mut self, tab: ExtensionsTab) {
         self.active_tab = tab;
@@ -2130,7 +1885,7 @@ impl ExtensionsModalState {
     /// `marketplace_collapsed_sources` (or `picker_state.expanded` for
     /// error-source headers), and other tabs use `picker_state.expanded`.
     pub fn is_group_expanded(&self, sel: usize, group_key: &str) -> bool {
-        let searching = !self.picker_state.query.is_empty();
+        let searching = !self.picker_state.query().is_empty();
 
         match self.active_tab {
             // During active search we force all hook groups open so matches
@@ -2182,20 +1937,12 @@ impl ExtensionsModalState {
     /// Strips `\n` and `\r`. Returns `true` if any state was modified.
     pub fn apply_paste(&mut self, text: &str) -> bool {
         if let Some(ref mut input) = self.input {
-            let Some(field) = input.fields.get_mut(input.focused) else {
-                return false;
-            };
-            field.insert_paste(text)
+            input.insert_paste(text)
         } else if self.picker_state.search_active {
-            let cleaned: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-            if cleaned.is_empty() {
-                return false;
-            }
-            self.picker_state
-                .query
-                .insert_str(self.picker_state.query_cursor, &cleaned);
-            self.picker_state.query_cursor += cleaned.len();
-            true
+            matches!(
+                self.picker_state.paste_query(text),
+                crate::input::line_editor::LineEditOutcome::TextChanged
+            )
         } else {
             false
         }
@@ -2713,7 +2460,7 @@ pub fn render_extensions_modal(
     // force-expand all items of that tab. This ensures search filtering shows
     // every match explicitly, even inside groups that were collapsed before
     // the user switched tabs.
-    if !state.picker_state.query.is_empty() {
+    if !state.picker_state.query().is_empty() {
         state.picker_state.expand_all_for_search(8192);
     }
 
@@ -2779,7 +2526,7 @@ pub fn render_extensions_modal(
             ExtensionsTab::Skills => {
                 if let TabDataState::Loaded(ref skills) = state.skills_data {
                     let filtered =
-                        filter_and_sort_skills(skills, &state.picker_state.query, filter);
+                        filter_and_sort_skills(skills, state.picker_state.query(), filter);
                     for &(si, _) in &filtered.matches {
                         let skill = &skills[si];
                         let source = skill_source_str(skill);
@@ -2846,7 +2593,7 @@ pub fn render_extensions_modal(
                     // Group plugins by source.
                     let mut groups = GroupedPlugins::new();
                     for (pi, plugin) in response.plugins.iter().enumerate() {
-                        if !fuzzy_matches(&plugin.name, &state.picker_state.query) {
+                        if !fuzzy_matches(&plugin.name, state.picker_state.query()) {
                             continue;
                         }
                         if !filter.matches(plugin.enabled) {
@@ -2861,7 +2608,7 @@ pub fn render_extensions_modal(
                     for ((_, label, group_key), plugins) in &groups {
                         // While searching we ignore previous collapse state so
                         // every plugin inside the group can be seen and matched.
-                        let searching = !state.picker_state.query.is_empty();
+                        let searching = !state.picker_state.query().is_empty();
                         let collapsed =
                             !searching && state.plugins_collapsed_groups.contains(group_key);
                         entry_labels.push(format!(
@@ -2948,7 +2695,7 @@ pub fn render_extensions_modal(
                         Vec<(usize, &xai_hooks_plugins_types::HookInfo)>,
                     > = std::collections::BTreeMap::new();
                     for (i, hook) in data.hooks.iter().enumerate() {
-                        if !fuzzy_matches_hook(hook, &state.picker_state.query) {
+                        if !fuzzy_matches_hook(hook, state.picker_state.query()) {
                             continue;
                         }
                         if !state.hooks_filter.matches(!hook.disabled) {
@@ -2963,7 +2710,7 @@ pub fn render_extensions_modal(
                         let (label, _is_custom) = derive_source_label(source_dir);
                         // While searching we ignore previous collapse state so
                         // every hook inside the group can be seen and matched.
-                        let searching = !state.picker_state.query.is_empty();
+                        let searching = !state.picker_state.query().is_empty();
                         let collapsed =
                             !searching && state.hooks_collapsed_groups.contains(source_dir);
                         entry_labels.push(format!("{} ({} hooks)", label, hooks.len()));
@@ -3034,7 +2781,7 @@ pub fn render_extensions_modal(
                     for (si, source) in data.sources.iter().enumerate() {
                         // Force all marketplace sources open while searching so their
                         // plugins are considered for matching and displayed.
-                        let searching = !state.picker_state.query.is_empty();
+                        let searching = !state.picker_state.query().is_empty();
                         let collapsed =
                             !searching && state.marketplace_collapsed_sources.contains(&si);
                         entry_labels.push(format!(
@@ -3066,7 +2813,7 @@ pub fn render_extensions_modal(
                             continue;
                         }
                         for plugin in &source.plugins {
-                            if !fuzzy_matches(&plugin.name, &state.picker_state.query) {
+                            if !fuzzy_matches(&plugin.name, state.picker_state.query()) {
                                 continue;
                             }
                             let status_label = match plugin.install_status.as_str() {
@@ -3174,14 +2921,14 @@ pub fn render_extensions_modal(
                         servers,
                     );
 
-                    let searching = !state.picker_state.query.is_empty();
+                    let searching = !state.picker_state.query().is_empty();
                     let mut sections: std::collections::BTreeMap<
                         McpSectionId,
                         Vec<(usize, &crate::views::mcps_modal::McpServerInfo)>,
                     > = std::collections::BTreeMap::new();
                     for (si, server) in servers.iter().enumerate() {
                         let display_name = server.display_name.as_deref().unwrap_or(&server.name);
-                        if !fuzzy_matches(display_name, &state.picker_state.query) {
+                        if !fuzzy_matches(display_name, state.picker_state.query()) {
                             continue;
                         }
                         if !state.mcps_filter.matches(server.enabled) {
@@ -3568,16 +3315,15 @@ pub fn render_extensions_modal(
     if !in_input_mode {
         // Search bar at top of content area.
         let search_active_render = state.picker_state.search_active;
-        picker::render_search_bar(
+        picker::render_picker_search_bar(
             buf,
             content_area.x,
             content_area.y,
             search_width,
             &theme,
-            &state.picker_state.query,
+            &state.picker_state,
             search_active_render,
             true, // show_search_hint
-            state.picker_state.query_cursor,
             Some(theme.bg_base),
         );
     }
@@ -4036,7 +3782,7 @@ fn render_input_form(buf: &mut Buffer, area: Rect, input: &ModalInput, theme: &T
 
     // Per field: 1 label row + 3 rows for the bordered input
     // (top border + content + bottom border).
-    let field_count = input.fields.len() as u16;
+    let field_count = input.fields().len() as u16;
     const ROWS_PER_FIELD: u16 = 4;
     let separators = field_count.saturating_sub(1); // 1 blank row between fields
     let form_rows = field_count * ROWS_PER_FIELD + separators;
@@ -4071,12 +3817,12 @@ fn render_input_form(buf: &mut Buffer, area: Rect, input: &ModalInput, theme: &T
     let prompt_w = prompt_prefix.width() as u16;
 
     let mut cur_y = form_top;
-    for (fi, field) in input.fields.iter().enumerate() {
+    for (fi, field) in input.fields().iter().enumerate() {
         if cur_y >= area.y + area.height {
             break;
         }
 
-        let is_focused = fi == input.focused;
+        let is_focused = fi == input.focused_index();
 
         // Row 1: Label (sits above the bordered input, not inside).
         let ls = if is_focused {
@@ -4084,7 +3830,7 @@ fn render_input_form(buf: &mut Buffer, area: Rect, input: &ModalInput, theme: &T
         } else {
             label_dim_style
         };
-        buf.set_string(label_x, cur_y, &field.label, ls);
+        buf.set_string(label_x, cur_y, field.label(), ls);
         cur_y += 1;
 
         // Rows 2-4: Rounded border around the single-line input.
@@ -4118,11 +3864,11 @@ fn render_input_form(buf: &mut Buffer, area: Rect, input: &ModalInput, theme: &T
         buf.set_string(content_x, content_y, prompt_prefix, prompt_style);
         let text_x = content_x + prompt_w;
 
-        if field.text.is_empty() {
+        if field.text().is_empty() {
             // Placeholder only renders when the field is NOT focused —
             // matches the prompt widget convention so the cursor isn't
             // overlapping placeholder text on the active row.
-            if !is_focused && let Some(ref ph) = field.placeholder {
+            if !is_focused && let Some(ph) = field.placeholder() {
                 let display: String = take_by_width(ph, max_text_w);
                 buf.set_string(text_x, content_y, &display, placeholder_style);
             }
@@ -4130,31 +3876,12 @@ fn render_input_form(buf: &mut Buffer, area: Rect, input: &ModalInput, theme: &T
                 cell.set_style(Style::default().fg(theme.bg_base).bg(theme.text_primary));
             }
         } else {
-            // Compute scroll offset once, tracking actual display widths
-            // so wide characters (CJK, emoji) don't misalign the cursor.
-            let cursor_col = field.text[..field.cursor].width();
-            let scroll = cursor_col.saturating_sub(max_text_w.saturating_sub(1));
-
-            // Skip `scroll` display-width columns, tracking the actual
-            // width skipped (may differ from `scroll` when a wide char
-            // straddles the boundary).
-            let mut skipped_w = 0;
-            let visible: String = field
-                .text
-                .chars()
-                .skip_while(|c| {
-                    if skipped_w >= scroll {
-                        return false;
-                    }
-                    skipped_w += unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0);
-                    true
-                })
-                .collect();
-            let visible = take_by_width(&visible, max_text_w);
-            buf.set_string(text_x, content_y, &visible, text_style);
+            let viewport = field.viewport(max_text_w);
+            let visible = &field.text()[viewport.visible_byte_range];
+            buf.set_string(text_x, content_y, visible, text_style);
 
             if is_focused {
-                let cx = text_x + (cursor_col.saturating_sub(skipped_w)) as u16;
+                let cx = text_x + viewport.cursor_display_column as u16;
                 if cx < inner.x + inner.width
                     && let Some(cell) = buf.cell_mut((cx, content_y))
                 {
@@ -4166,7 +3893,7 @@ fn render_input_form(buf: &mut Buffer, area: Rect, input: &ModalInput, theme: &T
         cur_y += 3; // top border + content + bottom border
 
         // Blank separator between fields (skip after last field).
-        if fi + 1 < input.fields.len() {
+        if fi + 1 < input.fields().len() {
             cur_y += 1;
         }
     }
@@ -4185,6 +3912,7 @@ fn render_input_form(buf: &mut Buffer, area: Rect, input: &ModalInput, theme: &T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
 
     #[test]
     fn derive_source_label_detects_project_scoped_plugins() {
@@ -4440,7 +4168,7 @@ mod tests {
         state
             .mcps_collapsed_sections
             .insert("mcp-section:managed".to_string());
-        state.picker_state.query = "linear".into();
+        state.picker_state.set_query("linear");
         assert!(state.is_group_expanded(0, "mcp-section:managed"));
     }
 
@@ -5243,34 +4971,37 @@ mod tests {
     #[test]
     fn apply_paste_inserts_url_into_focused_field_and_strips_newline() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::McpServers);
-        let mut input = single_field_input("test");
-        input.focused = 0;
-        state.input = Some(input);
+        state.input = Some(single_field_input("test"));
         assert!(state.apply_paste("https://mcp.linear.app/mcp\n"));
-        let field = &state.input.as_ref().unwrap().fields[0];
-        assert_eq!(field.text, "https://mcp.linear.app/mcp");
-        assert_eq!(field.cursor, "https://mcp.linear.app/mcp".len());
+        let field = state.input.as_ref().unwrap().field(0).unwrap();
+        assert_eq!(field.text(), "https://mcp.linear.app/mcp");
+        assert_eq!(field.cursor_byte(), "https://mcp.linear.app/mcp".len());
     }
 
     #[test]
     fn apply_paste_inserts_at_cursor_position() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::McpServers);
         let mut input = single_field_input("test");
-        input.fields[0].text = "AB".into();
-        input.fields[0].cursor = 1;
+        input.field_mut(0).unwrap().set_text("AB");
+        let _ = input.field_mut(0).unwrap().set_cursor_byte(1);
         state.input = Some(input);
         assert!(state.apply_paste("XY"));
-        let field = &state.input.as_ref().unwrap().fields[0];
-        assert_eq!(field.text, "AXYB");
-        assert_eq!(field.cursor, 3);
+        let field = state.input.as_ref().unwrap().field(0).unwrap();
+        assert_eq!(field.text(), "AXYB");
+        assert_eq!(field.cursor_byte(), 3);
     }
 
     #[test]
     fn apply_paste_strips_crlf() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::McpServers);
         state.input = Some(single_field_input("test"));
+        state.input.as_mut().unwrap().error = Some("Required: URL".to_owned());
         assert!(state.apply_paste("foo\r\nbar"));
-        assert_eq!(state.input.as_ref().unwrap().fields[0].text, "foobar");
+        assert_eq!(
+            state.input.as_ref().unwrap().field(0).unwrap().text(),
+            "foobar"
+        );
+        assert!(state.input.as_ref().unwrap().error.is_none());
     }
 
     #[test]
@@ -5278,8 +5009,9 @@ mod tests {
         let mut state = ExtensionsModalState::new(ExtensionsTab::McpServers);
         state.input = Some(single_field_input("test"));
         assert!(!state.apply_paste("\n\r"));
-        assert_eq!(state.input.as_ref().unwrap().fields[0].text, "");
-        assert_eq!(state.input.as_ref().unwrap().fields[0].cursor, 0);
+        let field = state.input.as_ref().unwrap().field(0).unwrap();
+        assert_eq!(field.text(), "");
+        assert_eq!(field.cursor_byte(), 0);
     }
 
     #[test]
@@ -5287,14 +5019,14 @@ mod tests {
         let mut state = ExtensionsModalState::new(ExtensionsTab::Plugins);
         state.picker_state.search_active = true;
         assert!(state.apply_paste("query"));
-        assert_eq!(state.picker_state.query, "query");
+        assert_eq!(state.picker_state.query(), "query");
     }
 
     #[test]
     fn apply_paste_ignored_when_idle() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::Plugins);
         assert!(!state.apply_paste("hello"));
-        assert_eq!(state.picker_state.query, "");
+        assert_eq!(state.picker_state.query(), "");
         assert!(state.input.is_none());
     }
 
@@ -5304,28 +5036,30 @@ mod tests {
         state.input = Some(single_field_input("test"));
         state.picker_state.search_active = true;
         assert!(state.apply_paste("url"));
-        assert_eq!(state.input.as_ref().unwrap().fields[0].text, "url");
-        assert_eq!(state.picker_state.query, "");
+        assert_eq!(
+            state.input.as_ref().unwrap().field(0).unwrap().text(),
+            "url"
+        );
+        assert_eq!(state.picker_state.query(), "");
     }
 
     #[test]
     fn apply_paste_targets_focused_field_in_multi_field() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::McpServers);
         let mut input = mcp_add_input();
-        input.focused = 0; // URL field (first in the new order)
+        let _ = input.handle_key(&key_event(KeyCode::Tab, KeyModifiers::NONE));
         state.input = Some(input);
-        assert!(state.apply_paste("https://example.com"));
-        let fields = &state.input.as_ref().unwrap().fields;
-        assert_eq!(fields[0].text, "https://example.com");
-        assert_eq!(fields[1].text, "");
+        assert!(state.apply_paste("my-server"));
+        let input = state.input.as_ref().unwrap();
+        assert_eq!(input.field(0).unwrap().text(), "");
+        assert_eq!(input.field(1).unwrap().text(), "my-server");
     }
 
     #[test]
     fn multi_field_form_field_texts() {
         let mut input = mcp_add_input();
-        // Field order: [URL, Name].
-        input.fields[0].text = "https://example.com".into();
-        input.fields[1].text = "my-server".into();
+        input.field_mut(0).unwrap().set_text("https://example.com");
+        input.field_mut(1).unwrap().set_text("my-server");
         let texts = input.field_texts();
         assert_eq!(texts, vec!["https://example.com", "my-server"]);
     }
@@ -5333,108 +5067,12 @@ mod tests {
     #[test]
     fn from_specs_creates_empty_fields() {
         let input = mcp_add_input();
-        assert_eq!(input.fields.len(), 2);
-        assert!(input.fields[0].text.is_empty());
-        assert!(input.fields[1].text.is_empty());
-        // New order: [URL (required), Name (optional)].
-        assert!(input.fields[0].required);
-        assert!(!input.fields[1].required);
-        assert_eq!(input.focused, 0);
-    }
-
-    // ── Word boundary helpers ───────────────────────────────────────
-
-    #[test]
-    fn prev_word_boundary_basic() {
-        assert_eq!(prev_word_boundary("hello world", 11), 6);
-        assert_eq!(prev_word_boundary("hello world", 6), 0);
-        assert_eq!(prev_word_boundary("hello world", 5), 0);
-        assert_eq!(prev_word_boundary("hello world", 0), 0);
-    }
-
-    #[test]
-    fn prev_word_boundary_multiple_spaces() {
-        assert_eq!(prev_word_boundary("a  b  c", 7), 6);
-        assert_eq!(prev_word_boundary("a  b  c", 6), 3);
-        assert_eq!(prev_word_boundary("a  b  c", 3), 0);
-    }
-
-    #[test]
-    fn prev_word_boundary_url() {
-        let url = "https://mcp.linear.app/mcp";
-        assert_eq!(prev_word_boundary(url, url.len()), 0);
-    }
-
-    #[test]
-    fn next_word_boundary_basic() {
-        assert_eq!(next_word_boundary("hello world", 0), 5);
-        assert_eq!(next_word_boundary("hello world", 5), 11);
-        assert_eq!(next_word_boundary("hello world", 6), 11);
-        assert_eq!(next_word_boundary("hello world", 11), 11);
-    }
-
-    #[test]
-    fn next_word_boundary_multiple_spaces() {
-        assert_eq!(next_word_boundary("a  b  c", 0), 1);
-        assert_eq!(next_word_boundary("a  b  c", 1), 4);
-        assert_eq!(next_word_boundary("a  b  c", 4), 7);
-    }
-
-    #[test]
-    fn next_word_boundary_url() {
-        let url = "https://mcp.linear.app/mcp";
-        assert_eq!(next_word_boundary(url, 0), url.len());
-    }
-
-    #[test]
-    fn prev_word_boundary_mid_word() {
-        assert_eq!(prev_word_boundary("hello world", 3), 0);
-    }
-
-    #[test]
-    fn next_word_boundary_mid_word() {
-        assert_eq!(next_word_boundary("hello world", 3), 5);
-    }
-
-    #[test]
-    fn prev_word_boundary_in_whitespace_run() {
-        assert_eq!(prev_word_boundary("a   b", 3), 0);
-    }
-
-    // ── delete_word_backward ────────────────────────────────────────
-
-    fn make_field(text: &str, cursor: usize) -> ModalInputField {
-        ModalInputField {
-            label: String::new(),
-            text: text.into(),
-            cursor,
-            required: false,
-            placeholder: None,
-        }
-    }
-
-    #[test]
-    fn delete_word_backward_at_end() {
-        let mut f = make_field("hello world", 11);
-        f.delete_word_backward();
-        assert_eq!(f.text, "hello ");
-        assert_eq!(f.cursor, 6);
-    }
-
-    #[test]
-    fn delete_word_backward_mid_word() {
-        let mut f = make_field("hello world", 8);
-        f.delete_word_backward();
-        assert_eq!(f.text, "hello rld");
-        assert_eq!(f.cursor, 6);
-    }
-
-    #[test]
-    fn delete_word_backward_at_start_is_noop() {
-        let mut f = make_field("hello", 0);
-        f.delete_word_backward();
-        assert_eq!(f.text, "hello");
-        assert_eq!(f.cursor, 0);
+        assert_eq!(input.fields().len(), 2);
+        assert!(input.field(0).unwrap().text().is_empty());
+        assert!(input.field(1).unwrap().text().is_empty());
+        assert!(input.field(0).unwrap().required());
+        assert!(!input.field(1).unwrap().required());
+        assert_eq!(input.focused_index(), 0);
     }
 
     // ── build_action_from_input / parse_mcp_add_fields ──────────────
@@ -5525,7 +5163,7 @@ mod tests {
     #[test]
     fn handle_key_esc_cancels() {
         let mut input = single_field_input("test");
-        input.fields[0].text = "some text".into();
+        input.field_mut(0).unwrap().set_text("some text");
         assert!(matches!(
             input.handle_key(&key_event(KeyCode::Esc, KeyModifiers::NONE)),
             ModalInputOutcome::Cancel
@@ -5536,8 +5174,8 @@ mod tests {
     fn handle_key_char_inserts() {
         let mut input = single_field_input("test");
         input.handle_key(&key_event(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert_eq!(input.fields[0].text, "a");
-        assert_eq!(input.fields[0].cursor, 1);
+        assert_eq!(input.field(0).unwrap().text(), "a");
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 1);
     }
 
     #[test]
@@ -5545,57 +5183,72 @@ mod tests {
         let mut input = single_field_input("test");
         let result = input.handle_key(&key_event(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert!(matches!(result, ModalInputOutcome::Unchanged));
-        assert!(input.fields[0].text.is_empty());
+        assert!(input.field(0).unwrap().text().is_empty());
     }
 
     #[test]
     fn handle_key_backspace_deletes() {
         let mut input = single_field_input("test");
-        input.fields[0].text = "ab".into();
-        input.fields[0].cursor = 2;
+        input.field_mut(0).unwrap().set_text("ab");
         input.handle_key(&key_event(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(input.fields[0].text, "a");
-        assert_eq!(input.fields[0].cursor, 1);
+        assert_eq!(input.field(0).unwrap().text(), "a");
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 1);
     }
 
     #[test]
     fn handle_key_delete_forward() {
         let mut input = single_field_input("test");
-        input.fields[0].text = "ab".into();
-        input.fields[0].cursor = 0;
+        input.field_mut(0).unwrap().set_text("ab");
+        let _ = input.field_mut(0).unwrap().set_cursor_byte(0);
         input.handle_key(&key_event(KeyCode::Delete, KeyModifiers::NONE));
-        assert_eq!(input.fields[0].text, "b");
-        assert_eq!(input.fields[0].cursor, 0);
+        assert_eq!(input.field(0).unwrap().text(), "b");
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 0);
     }
 
     #[test]
     fn handle_key_ctrl_u_kills_to_start() {
         let mut input = single_field_input("test");
-        input.fields[0].text = "hello world".into();
-        input.fields[0].cursor = 5;
+        input.field_mut(0).unwrap().set_text("hello world");
+        let _ = input.field_mut(0).unwrap().set_cursor_byte(5);
         input.handle_key(&key_event(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(input.fields[0].text, " world");
-        assert_eq!(input.fields[0].cursor, 0);
+        assert_eq!(input.field(0).unwrap().text(), " world");
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 0);
     }
 
     #[test]
     fn handle_key_ctrl_k_kills_to_end() {
         let mut input = single_field_input("test");
-        input.fields[0].text = "hello world".into();
-        input.fields[0].cursor = 5;
+        input.field_mut(0).unwrap().set_text("hello world");
+        let _ = input.field_mut(0).unwrap().set_cursor_byte(5);
         input.handle_key(&key_event(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        assert_eq!(input.fields[0].text, "hello");
-        assert_eq!(input.fields[0].cursor, 5);
+        assert_eq!(input.field(0).unwrap().text(), "hello");
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 5);
     }
 
     #[test]
     fn handle_key_tab_navigates_multi_field() {
         let mut input = mcp_add_input();
-        assert_eq!(input.focused, 0);
+        assert_eq!(input.focused_index(), 0);
         input.handle_key(&key_event(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(input.focused, 1);
-        input.handle_key(&key_event(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(input.focused, 0);
+        assert_eq!(input.focused_index(), 1);
+        input.handle_key(&key_event(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(input.focused_index(), 0);
+        input.handle_key(&key_event(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(input.focused_index(), 1);
+    }
+
+    #[test]
+    fn modified_tab_chords_do_not_navigate_multi_field() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            let mut input = mcp_add_input();
+            let outcome = input.handle_key(&key_event(KeyCode::Tab, modifiers));
+            assert!(matches!(outcome, ModalInputOutcome::Unchanged));
+            assert_eq!(input.focused_index(), 0);
+        }
     }
 
     #[test]
@@ -5610,8 +5263,7 @@ mod tests {
     #[test]
     fn handle_key_submit_succeeds() {
         let mut input = mcp_add_input();
-        // URL is the first (required) field in the new order.
-        input.fields[0].text = "https://example.com".into();
+        input.field_mut(0).unwrap().set_text("https://example.com");
         let result = input.handle_key(&key_event(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(result, ModalInputOutcome::Submit { .. }));
     }
@@ -5619,12 +5271,211 @@ mod tests {
     #[test]
     fn handle_key_home_end() {
         let mut input = single_field_input("test");
-        input.fields[0].text = "hello".into();
-        input.fields[0].cursor = 3;
+        input.field_mut(0).unwrap().set_text("hello");
+        let _ = input.field_mut(0).unwrap().set_cursor_byte(3);
         input.handle_key(&key_event(KeyCode::Home, KeyModifiers::NONE));
-        assert_eq!(input.fields[0].cursor, 0);
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 0);
         input.handle_key(&key_event(KeyCode::End, KeyModifiers::NONE));
-        assert_eq!(input.fields[0].cursor, 5);
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 5);
+    }
+
+    #[test]
+    fn handle_key_tab_completes_single_field_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let completed = directory.path().join("plugin-source");
+        std::fs::write(&completed, "").unwrap();
+        let partial = directory.path().join("plugin-s");
+
+        let mut input = single_field_input("test");
+        input
+            .field_mut(0)
+            .unwrap()
+            .set_text(partial.to_string_lossy());
+        let outcome = input.handle_key(&key_event(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(matches!(outcome, ModalInputOutcome::Changed));
+        let field = input.field(0).unwrap();
+        assert_eq!(field.text(), completed.to_string_lossy().as_ref());
+        assert_eq!(field.cursor_byte(), field.text().len());
+    }
+
+    #[test]
+    fn modified_tab_chords_do_not_complete_single_field_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let completed = directory.path().join("plugin-source");
+        std::fs::write(&completed, "").unwrap();
+        let partial = directory
+            .path()
+            .join("plugin-s")
+            .to_string_lossy()
+            .into_owned();
+
+        for key in [
+            key_event(KeyCode::Tab, KeyModifiers::SHIFT),
+            key_event(KeyCode::BackTab, KeyModifiers::NONE),
+            key_event(KeyCode::Tab, KeyModifiers::CONTROL),
+            key_event(KeyCode::Tab, KeyModifiers::ALT),
+            key_event(KeyCode::Tab, KeyModifiers::SUPER),
+        ] {
+            let mut input = single_field_input("test");
+            input.field_mut(0).unwrap().set_text(&partial);
+            let outcome = input.handle_key(&key);
+            assert!(matches!(outcome, ModalInputOutcome::Unchanged));
+            assert_eq!(input.field(0).unwrap().text(), partial);
+            assert_eq!(input.focused_index(), 0);
+        }
+    }
+
+    #[test]
+    fn canonical_paste_shortcuts_include_super_and_exclude_altgr() {
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::no_raster(Some("foo\r\nbar")),
+        );
+        let mut super_paste = single_field_input("test");
+        let outcome = super_paste.handle_key(&key_event(KeyCode::Char('v'), KeyModifiers::SUPER));
+        crate::clipboard::clear_clipboard_probe_hook();
+        assert!(matches!(outcome, ModalInputOutcome::Changed));
+        assert_eq!(super_paste.field(0).unwrap().text(), "foobar");
+
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::no_raster(Some("clipboard")),
+        );
+        let mut altgr = single_field_input("test");
+        let _ = altgr.handle_key(&key_event(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        crate::clipboard::clear_clipboard_probe_hook();
+        assert_eq!(
+            altgr.field(0).unwrap().text(),
+            if cfg!(target_os = "windows") { "v" } else { "" }
+        );
+    }
+
+    #[test]
+    fn canonical_small_word_delete_differs_from_ctrl_w() {
+        const URL: &str = "https://mcp.linear.app/mcp";
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let mut input = single_field_input("test");
+            input.field_mut(0).unwrap().set_text(URL);
+            let outcome = input.handle_key(&key_event(KeyCode::Backspace, modifiers));
+            assert!(matches!(outcome, ModalInputOutcome::Changed));
+            assert_eq!(input.field(0).unwrap().text(), "https://mcp.linear.app/");
+        }
+
+        let mut input = single_field_input("test");
+        input.field_mut(0).unwrap().set_text(URL);
+        let outcome = input.handle_key(&key_event(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, ModalInputOutcome::Changed));
+        assert_eq!(input.field(0).unwrap().text(), "");
+    }
+
+    #[test]
+    fn alt_word_arrows_and_readline_bindings_are_equivalent() {
+        for key in [
+            key_event(KeyCode::Left, KeyModifiers::ALT),
+            key_event(KeyCode::Char('b'), KeyModifiers::ALT),
+            key_event(KeyCode::Left, KeyModifiers::CONTROL),
+        ] {
+            let mut input = single_field_input("test");
+            input.field_mut(0).unwrap().set_text("hello-world");
+            assert!(matches!(input.handle_key(&key), ModalInputOutcome::Changed));
+            assert_eq!(input.field(0).unwrap().cursor_byte(), "hello-".len());
+        }
+
+        for key in [
+            key_event(KeyCode::Right, KeyModifiers::ALT),
+            key_event(KeyCode::Char('f'), KeyModifiers::ALT),
+            key_event(KeyCode::Right, KeyModifiers::CONTROL),
+        ] {
+            let mut input = single_field_input("test");
+            input.field_mut(0).unwrap().set_text("hello-world");
+            let _ = input.field_mut(0).unwrap().set_cursor_byte(0);
+            assert!(matches!(input.handle_key(&key), ModalInputOutcome::Changed));
+            assert_eq!(input.field(0).unwrap().cursor_byte(), "hello".len());
+        }
+    }
+
+    #[test]
+    fn grapheme_delete_and_middle_insert_are_atomic() {
+        let grapheme = "👩🏽\u{200d}💻";
+        let mut input = single_field_input("test");
+        input
+            .field_mut(0)
+            .unwrap()
+            .set_text(format!("a{grapheme}b"));
+        let _ = input.field_mut(0).unwrap().set_cursor_byte(1);
+
+        assert!(matches!(
+            input.handle_key(&key_event(KeyCode::Delete, KeyModifiers::NONE)),
+            ModalInputOutcome::Changed
+        ));
+        assert_eq!(input.field(0).unwrap().text(), "ab");
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 1);
+
+        assert!(matches!(
+            input.handle_key(&key_event(KeyCode::Char('X'), KeyModifiers::NONE)),
+            ModalInputOutcome::Changed
+        ));
+        assert_eq!(input.field(0).unwrap().text(), "aXb");
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 2);
+    }
+
+    #[test]
+    fn cursor_and_handled_noop_edits_redraw_without_validation_changes() {
+        let mut input = single_field_input("test");
+        input.field_mut(0).unwrap().set_text("abc");
+        input.error = Some("Required: URL".to_owned());
+
+        let outcome = input.handle_key(&key_event(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(outcome, ModalInputOutcome::Changed));
+        assert_eq!(input.field(0).unwrap().text(), "abc");
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 2);
+        assert_eq!(input.focused_index(), 0);
+        assert_eq!(input.error.as_deref(), Some("Required: URL"));
+
+        let _ = input.handle_key(&key_event(KeyCode::Home, KeyModifiers::NONE));
+        let outcome = input.handle_key(&key_event(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(outcome, ModalInputOutcome::Changed));
+        assert_eq!(input.field(0).unwrap().cursor_byte(), 0);
+        assert_eq!(input.error.as_deref(), Some("Required: URL"));
+
+        let outcome = input.handle_key(&key_event(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(outcome, ModalInputOutcome::Changed));
+        assert_eq!(input.field(0).unwrap().text(), "xabc");
+        assert!(input.error.is_none());
+    }
+
+    #[test]
+    fn narrow_form_viewport_keeps_unicode_and_cursor_visible() {
+        let grapheme = "👩🏽\u{200d}💻";
+        let text = format!("1234567中e\u{301}{grapheme}b");
+        let mut input = single_field_input("test");
+        input.field_mut(0).unwrap().set_text(&text);
+        let _ = input.field_mut(0).unwrap().set_cursor_byte(text.len() - 1);
+
+        let area = Rect::new(0, 0, 20, 4);
+        let theme = Theme::current();
+        let mut buffer = Buffer::empty(area);
+        let prompt_width = crate::glyphs::prompt_arrow().width();
+        let editor_width = (area.width as usize - 8 - prompt_width).max(1);
+        let viewport = input.field(0).unwrap().viewport(editor_width);
+        let visible = &input.field(0).unwrap().text()[viewport.visible_byte_range.clone()];
+        assert!(visible.contains('中'));
+        assert!(visible.contains("e\u{301}"));
+        assert!(visible.contains(grapheme));
+
+        render_input_form(&mut buffer, area, &input, &theme);
+        let rendered = (0..area.width).fold(String::new(), |mut line, x| {
+            line.push_str(buffer[(x, 2)].symbol());
+            line
+        });
+        assert!(rendered.contains('中'));
+        assert!(rendered.contains("e\u{301}"));
+        assert!(rendered.contains(grapheme));
+        let text_x = 4 + prompt_width as u16;
+        let cursor_x = text_x + viewport.cursor_display_column as u16;
+        assert_eq!(buffer[(cursor_x, 2)].bg, theme.text_primary);
     }
 
     // ── Hook helpers with StatusFilter ───────────────────────────────
@@ -6394,7 +6245,7 @@ mod tests {
     fn marketplace_is_group_expanded_forced_open_during_search() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
         state.marketplace_collapsed_sources.insert(0);
-        state.picker_state.query = "debug".into();
+        state.picker_state.set_query("debug");
         // During search, collapsed sources are forced open.
         assert!(state.is_group_expanded(0, "0"));
     }
@@ -6937,7 +6788,7 @@ mod tests {
         assert_eq!(buffer_count(&buf, "User (1 plugin)"), 1);
         assert_eq!(buffer_count(&buf, "user-tool"), 0);
 
-        state.picker_state.query = "user".into();
+        state.picker_state.set_query("user");
         let buf = render_plugins_into_buffer(&mut state, 100, 40);
         assert_eq!(
             buffer_count(&buf, "user-tool"),

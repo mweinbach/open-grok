@@ -22,6 +22,12 @@ use super::common::*;
 #[cfg(unix)]
 const CLARIFY_MARKER: &str = "CLARIFY_MARKER_XYZ";
 
+#[cfg(unix)]
+const POST_CANCEL_MARKER: &str = "POST_CANCEL_MARKER_XYZ";
+
+#[cfg(unix)]
+const UNWANTED_AUTO_WAKE_SENTINEL: &str = "UNWANTED_AUTO_WAKE_SENTINEL_XYZ";
+
 /// Background sleep that triggers the auto-wake on completion. Long enough
 /// that turn 1 settles and the auto-wake scripts are enqueued before it fires,
 /// even on a loaded CI host.
@@ -258,5 +264,205 @@ async fn auto_wake_cancel_preserves_queued_user_prompt() {
         marker_in_replay,
         "queued user prompt missing from --continue replay (lost from history)\n\
          full contents:\n{resumed_full_text}"
+    );
+}
+
+#[cfg(unix)]
+fn unified_log_diagnostics(content: &ContentController) -> String {
+    let path = content.home().join(".opengrok/logs/unified.jsonl");
+    let log = std::fs::read_to_string(path).unwrap_or_default();
+    let mut tail: Vec<&str> = log.lines().rev().take(80).collect();
+    tail.reverse();
+    let relevant = log
+        .lines()
+        .filter(|line| line.contains("task_wake") || line.contains("shell.cancel"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\n--- all task_wake / shell.cancel lines ---\n{relevant}",
+        tail.join("\n")
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
+async fn cancel_before_task_completion_defers_auto_wake_until_user_prompt() {
+    let content = ContentController::start().await.expect("start content");
+
+    let bg_done_flag = content.home().join("post_cancel_bg_done");
+    let bg_command = format!(
+        "while [ ! -e {} ]; do /bin/sleep 0.2; done",
+        bg_done_flag.display()
+    );
+    let bg_args = json!({
+        "command": bg_command,
+        "description": "post-cancel completion",
+        "is_background": true
+    })
+    .to_string();
+    content.enqueue_response(
+        "/v1/responses",
+        ScriptedResponse::sse(responses_api_tool_call_events(
+            "call_bg_after_cancel",
+            "run_terminal_command",
+            &bg_args,
+        )),
+    );
+    content.enqueue_response(
+        "/v1/chat/completions",
+        ScriptedResponse::sse(chat_completions_tool_call_events_with_id(
+            "call_bg_after_cancel",
+            "run_terminal_command",
+            &bg_args,
+        )),
+    );
+
+    let hold_started_flag = content.home().join("post_cancel_hold_started");
+    let hold_command = format!(
+        ": > {}; while true; do /bin/sleep 0.2; done",
+        hold_started_flag.display()
+    );
+    let hold_args = json!({
+        "command": hold_command,
+        "description": "ordinary turn hold"
+    })
+    .to_string();
+    content.enqueue_response(
+        "/v1/responses",
+        ScriptedResponse::sse(responses_api_tool_call_events(
+            "call_hold_after_bg",
+            "run_terminal_command",
+            &hold_args,
+        )),
+    );
+    content.enqueue_response(
+        "/v1/chat/completions",
+        ScriptedResponse::sse(chat_completions_tool_call_events_with_id(
+            "call_hold_after_bg",
+            "run_terminal_command",
+            &hold_args,
+        )),
+    );
+    content.set_response(UNWANTED_AUTO_WAKE_SENTINEL);
+
+    let binary = pager_binary().expect("resolve pager binary");
+    let mut harness = PtyHarness::spawn_with_content_in_dir(
+        &binary,
+        DEFAULT_ROWS,
+        DEFAULT_COLS,
+        &content,
+        &["--yolo", "--trust"],
+        Some(content.home()),
+    )
+    .expect("spawn pager");
+
+    harness
+        .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)
+        .expect("welcome");
+    harness
+        .inject_keys(format!("{PROMPT}\r").as_bytes())
+        .expect("submit prompt");
+
+    let task_id = poll_for(Duration::from_secs(30), || {
+        content
+            .request_bodies()
+            .iter()
+            .find_map(|body| extract_task_id(&body.to_string()))
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "background task never started\n--- non-system messages ---\n{}",
+            dump_non_system_messages(&content.request_bodies())
+        )
+    });
+    let follow_up_started = poll_for(Duration::from_secs(15), || {
+        hold_started_flag.exists().then_some(())
+    })
+    .is_some();
+    assert!(
+        follow_up_started,
+        "foreground hold never started\n--- non-system messages ---\n{}",
+        dump_non_system_messages(&content.request_bodies())
+    );
+
+    harness.inject_keys(keys::CTRL_C).expect("press ctrl+c");
+    harness
+        .wait_for_text("Turn cancelled by user", Duration::from_secs(15))
+        .expect("ordinary turn cancelled");
+    harness
+        .wait_for_turn_idle(Duration::from_secs(15))
+        .expect("cancelled turn idle");
+    assert!(
+        !harness.contains_full_text("Task completed in"),
+        "background task completed before release"
+    );
+    std::fs::write(&bg_done_flag, b"done").expect("complete background task");
+    harness
+        .wait_for_full_text("Task completed in", Duration::from_secs(15))
+        .expect("background completion chip");
+    harness
+        .wait_until_stable(
+            "no auto-wake response after background completion",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            |h| !h.contains_full_text(UNWANTED_AUTO_WAKE_SENTINEL),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}\n--- unified diagnostics ---\n{}",
+                unified_log_diagnostics(&content)
+            )
+        });
+
+    harness
+        .inject_keys(POST_CANCEL_MARKER.as_bytes())
+        .expect("type post-cancel prompt");
+    harness.update(Duration::from_millis(300));
+    harness
+        .inject_keys(b"\r")
+        .expect("submit post-cancel prompt");
+
+    let reminder_on_wire = poll_for(Duration::from_secs(30), || {
+        content.request_bodies().iter().find_map(|body| {
+            let serialized = body.to_string();
+            (serialized.contains(POST_CANCEL_MARKER)
+                && serialized.contains("Background task")
+                && serialized.contains("completed")
+                && serialized.contains(&task_id))
+            .then_some(())
+        })
+    })
+    .is_some();
+    harness
+        .wait_for_full_text(UNWANTED_AUTO_WAKE_SENTINEL, Duration::from_secs(15))
+        .expect("genuine user turn response");
+    harness
+        .wait_for_turn_idle(Duration::from_secs(15))
+        .expect("genuine user turn idle");
+    harness
+        .wait_until_stable(
+            "no second completion request after the user turn",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            |_| {
+                content
+                    .request_bodies()
+                    .iter()
+                    .filter(|body| body.to_string().contains(POST_CANCEL_MARKER))
+                    .count()
+                    == 1
+            },
+        )
+        .expect("deferred completion consumed atomically");
+    write_cast_if_requested(&harness, "auto_wake_cancel_before_completion.cast");
+    harness.quit().expect("quit pager");
+
+    assert!(
+        reminder_on_wire,
+        "the next genuine user request must include the deferred task-completion reminder\n\
+         --- non-system messages ---\n{}\n--- unified diagnostics ---\n{}",
+        dump_non_system_messages(&content.request_bodies()),
+        unified_log_diagnostics(&content)
     );
 }

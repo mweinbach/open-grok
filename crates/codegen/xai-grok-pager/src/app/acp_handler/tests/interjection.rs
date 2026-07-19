@@ -41,12 +41,13 @@
         );
     }
 
+
     /// Regression: a Forgone slot (interjection continued
-    /// the parked turn, no marker on screen) must also silence the countdown
-    /// — a full "Worked for …" tick under the interjected message would
-    /// recreate the flipped transcript. Rendered slots keep ticking.
+    /// the parked turn, no marker on screen) must silence later marker pushes
+    /// — a full "Worked for …" line under the interjected message would
+    /// recreate the flipped transcript.
     #[test]
-    fn forgone_slot_suppresses_countdown_ticks() {
+    fn forgone_slot_suppresses_later_marker_pushes() {
         use crate::app::agent_view::test_fixtures::{count_parked, simulate_task_output_wait};
 
         let mut app = make_app_with_agent("sess-park");
@@ -77,15 +78,11 @@
         );
     }
 
-    /// Feature: "sleep 10, 15, 20 in the background" — while the turn is
-    /// parked, each task completion appends a fresh FULL marker with the
-    /// remaining count, so the user watches it tick down (3 → 2 → 1), each
-    /// line a complete "Worked for X. N commands still running.".
-    /// The last completion pushes nothing (0/0): the wait returns and the
-    /// real completion marker narrates the end. (Elapsed renders as "0.0s":
-    /// `turn_started_at` is unset in this fixture.)
+    /// "sleep 10, 15, 20 in the background": completions within one park
+    /// episode push chips only — the marker never re-pushes. (Elapsed
+    /// renders as "0.0s": `turn_started_at` is unset in this fixture.)
     #[test]
-    fn parked_countdown_ticks_down_as_tasks_complete() {
+    fn parked_completions_push_chips_without_marker_repush() {
         use crate::app::agent_view::test_fixtures::simulate_task_output_wait;
 
         let mut app = make_app_with_agent("sess-park");
@@ -101,7 +98,8 @@
             assert!(agent.renders_parked());
         }
 
-        // sleep 10 exits → full marker with "2 commands still running."
+        // Each completion lands as a chip; no marker re-push, no "N commands
+        // still running." lines.
         handle_ext_notification(
             &make_task_completed_notif("sess-park", "t10", "sleep 10", Some(0)),
             &mut app,
@@ -111,12 +109,10 @@
             &make_task_completed_notif("sess-park", "t10", "sleep 10", Some(0)),
             &mut app,
         );
-        // sleep 15 exits → full marker with "1 command still running."
         handle_ext_notification(
             &make_task_completed_notif("sess-park", "t15", "sleep 15", Some(0)),
             &mut app,
         );
-        // sleep 20 exits → nothing left; no "0 commands" line.
         handle_ext_notification(
             &make_task_completed_notif("sess-park", "t20", "sleep 20", Some(0)),
             &mut app,
@@ -125,63 +121,88 @@
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         assert_eq!(
             parked_marker_messages(agent),
-            vec![
-                "Worked for 0.0s. 3 commands still running.".to_string(),
-                "Worked for 0.0s. 2 commands still running.".to_string(),
-                "Worked for 0.0s. 1 command still running.".to_string(),
-            ],
+            vec!["Worked for 0.0s".to_string()],
+            "one plain marker per park episode — completions never re-push"
+        );
+        assert!(
+            work_status_lines(&agent.scrollback).is_empty(),
+            "no work-only status lines in the transcript"
+        );
+    }
+
+    /// Parity with the bg-command completion rail: a park withheld at park
+    /// time (held queue) gets re-evaluated by a subagent completion once the
+    /// blocker cleared, so the boundary marker isn't deferred to whenever the
+    /// next unrelated notification happens to arrive.
+    #[test]
+    fn subagent_finish_reevaluates_withheld_parked_marker() {
+        use crate::app::agent_view::test_fixtures::{count_parked, simulate_wait_all};
+
+        let mut app = make_app_with_agent("sess-park");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.session.state = AgentState::TurnRunning;
+            agent.session.current_prompt_id = Some("p1".into());
+            for child_id in ["child-1", "child-2"] {
+                agent
+                    .subagent_sessions
+                    .insert(child_id.into(), make_subagent_info(child_id));
+            }
+            simulate_wait_all(agent);
+            // Held queue at park time: the marker is withheld.
+            agent.session.enqueue_prompt("queued follow-up".into());
+            agent.maybe_push_parked_marker();
+            assert_eq!(count_parked(agent), 0, "held queue withholds the marker");
+            // The queue drains; nothing has re-evaluated the marker yet.
+            agent.session.pending_prompts.clear();
+        }
+
+        handle(
+            make_ext_session_notification("sess-park", test_subagent_finished("child-1")),
+            &mut app,
+        );
+
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        assert_eq!(
+            count_parked(agent),
+            1,
+            "the completion re-evaluates the withheld park"
+        );
+        assert_eq!(
+            parked_marker_messages(agent),
+            vec!["Worked for 0.0s".to_string()],
         );
     }
 
     #[test]
-    fn consecutive_subagent_finishes_refresh_one_uncommitted_marker() {
+    fn consecutive_subagent_finishes_leave_single_parked_marker() {
         let mut app = make_app_with_agent("sess-park");
         let marker_id = {
             let agent = app.agents.get_mut(&AgentId(0)).unwrap();
             park_on_subagents(agent, &["child-1", "child-2", "child-3"])
         };
 
-        handle(
-            make_ext_session_notification("sess-park", test_subagent_finished("child-1")),
-            &mut app,
-        );
+        for child in ["child-1", "child-1", "child-2", "child-3"] {
+            handle(
+                make_ext_session_notification("sess-park", test_subagent_finished(child)),
+                &mut app,
+            );
+        }
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         assert_eq!(
             parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 2 subagents still running.".to_string()],
-        );
-        assert_eq!(parked_marker_ids(agent), vec![marker_id]);
-
-        // Re-delivered finish for an already-finished subagent: not an edge.
-        handle(
-            make_ext_session_notification("sess-park", test_subagent_finished("child-1")),
-            &mut app,
-        );
-        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        assert_eq!(
-            parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 2 subagents still running.".to_string()],
-        );
-        assert_eq!(parked_marker_ids(agent), vec![marker_id]);
-
-        handle(
-            make_ext_session_notification("sess-park", test_subagent_finished("child-2")),
-            &mut app,
-        );
-        handle(
-            make_ext_session_notification("sess-park", test_subagent_finished("child-3")),
-            &mut app,
-        );
-        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        assert_eq!(
-            parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 1 subagent still running.".to_string()],
+            vec!["Worked for 0.0s".to_string()],
+            "subagent finishes never re-push or mutate the park marker"
         );
         assert_eq!(parked_marker_ids(agent), vec![marker_id]);
     }
 
+    /// A re-park after new parent output (text / thought / tool) is a new
+    /// park episode: the wait-state update that creates the second wait
+    /// pushes a fresh marker (epoch mismatch), while completions within one
+    /// episode never re-push.
     #[test]
-    fn parent_text_thought_and_tool_output_start_new_subagent_segments() {
+    fn parent_text_thought_and_tool_output_start_new_park_episodes() {
         use crate::acp::meta::NotificationMeta;
         use crate::app::agent_view::test_fixtures::simulate_task_output_wait_call;
 
@@ -224,6 +245,11 @@
             );
             {
                 let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+                // Same episode: a repeated push attempt (e.g. another wait
+                // update restating the same wait) is deduped by epoch.
+                agent.maybe_push_parked_marker();
+                assert_eq!(parked_marker_ids(agent).len(), 1);
+
                 let output = match output_kind {
                     "text" => acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
                         acp::ContentBlock::Text(acp::TextContent::new("parent text")),
@@ -244,20 +270,17 @@
                     &mut agent.scrollback,
                 ));
                 simulate_task_output_wait_call(agent, "wait-2", "not-ours", 30_000);
+                // The wait-state notification path re-evaluates the marker on
+                // every wait update (`maybe_push_parked_marker` from the ACP
+                // handler); mirror it for the fixture-driven second wait.
+                agent.maybe_push_parked_marker();
             }
-            handle(
-                make_ext_session_notification("sess-park", test_subagent_finished("child-2")),
-                &mut app,
-            );
 
             let agent = app.agents.get_mut(&AgentId(0)).unwrap();
             assert_eq!(
                 parked_marker_messages(agent),
-                vec![
-                    "Worked for 0.0s. 2 subagents still running.".to_string(),
-                    "Worked for 0.0s. 1 subagent still running.".to_string(),
-                ],
-                "{output_kind} output must start a new segment",
+                vec!["Worked for 0.0s".to_string(), "Worked for 0.0s".to_string()],
+                "{output_kind} output must start a new park episode",
             );
             let marker_ids = parked_marker_ids(agent);
             assert_eq!(marker_ids.len(), 2);
@@ -267,68 +290,7 @@
     }
 
     #[test]
-    fn committed_subagent_marker_appends_fallback() {
-        let mut app = make_app_with_agent("sess-park");
-        let first_marker_id = {
-            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-            let marker_id = park_on_subagents(agent, &["child-1", "child-2"]);
-            let marker_index = (0..agent.scrollback.len())
-                .find(|&index| agent.scrollback.get(index).is_some_and(|entry| entry.id == marker_id))
-                .unwrap();
-            agent.scrollback.mark_committed(marker_index);
-            marker_id
-        };
-
-        handle(
-            make_ext_session_notification("sess-park", test_subagent_finished("child-1")),
-            &mut app,
-        );
-
-        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        assert_eq!(
-            parked_marker_messages(agent),
-            vec![
-                "Worked for 0.0s. 2 subagents still running.".to_string(),
-                "Worked for 0.0s. 1 subagent still running.".to_string(),
-            ],
-        );
-        let marker_ids = parked_marker_ids(agent);
-        assert_eq!(marker_ids.len(), 2);
-        assert_eq!(marker_ids[0], first_marker_id);
-        assert_ne!(marker_ids[0], marker_ids[1]);
-    }
-
-    #[test]
-    fn stale_subagent_marker_handle_appends_fallback() {
-        let mut app = make_app_with_agent("sess-park");
-        let old_marker_id = {
-            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-            park_on_subagents(agent, &["child-1", "child-2"])
-        };
-        assert!(app
-            .agents
-            .get_mut(&AgentId(0))
-            .unwrap()
-            .scrollback
-            .remove_entry(old_marker_id));
-
-        handle(
-            make_ext_session_notification("sess-park", test_subagent_finished("child-1")),
-            &mut app,
-        );
-
-        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        assert_eq!(
-            parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 1 subagent still running.".to_string()],
-        );
-        let marker_ids = parked_marker_ids(agent);
-        assert_eq!(marker_ids.len(), 1);
-        assert_ne!(marker_ids[0], old_marker_id);
-    }
-
-    #[test]
-    fn interjection_suppresses_later_subagent_refresh() {
+    fn interjection_suppresses_later_marker_push() {
         let mut app = make_app_with_agent("sess-park");
         let marker_id = {
             let agent = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -350,13 +312,13 @@
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         assert_eq!(
             parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 2 subagents still running.".to_string()],
+            vec!["Worked for 0.0s".to_string()],
         );
         assert_eq!(parked_marker_ids(agent), vec![marker_id]);
     }
 
     #[test]
-    fn replayed_subagent_finish_does_not_refresh_marker() {
+    fn replayed_subagent_finish_does_not_touch_marker() {
         let mut app = make_app_with_agent("sess-park");
         let marker_id = {
             let agent = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -373,13 +335,13 @@
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         assert_eq!(
             parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 2 subagents still running.".to_string()],
+            vec!["Worked for 0.0s".to_string()],
         );
         assert_eq!(parked_marker_ids(agent), vec![marker_id]);
     }
 
     #[test]
-    fn imminent_subagent_wait_does_not_refresh_marker() {
+    fn imminent_subagent_wait_keeps_single_marker() {
         use crate::app::agent_view::test_fixtures::simulate_task_output_wait;
 
         let mut app = make_app_with_agent("sess-park");
@@ -405,7 +367,7 @@
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         assert_eq!(
             parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 2 subagents still running.".to_string()],
+            vec!["Worked for 0.0s".to_string()],
         );
         assert_eq!(parked_marker_ids(agent), vec![marker_id]);
     }
@@ -517,7 +479,7 @@
         assert_eq!(count_parked(agent), 1, "genuine park still renders");
         assert_eq!(
             parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 1 command still running.".to_string()],
+            vec!["Worked for 0.0s".to_string()],
         );
     }
 
@@ -644,7 +606,7 @@
         assert_eq!(count_parked(agent), 1, "wait-all on live work parks");
         assert_eq!(
             parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 1 command still running.".to_string()],
+            vec!["Worked for 0.0s".to_string()],
         );
     }
 
@@ -676,7 +638,7 @@
         assert_eq!(count_parked(agent), 1, "spawn re-evaluates the skipped park");
         assert_eq!(
             parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 1 subagent still running.".to_string()],
+            vec!["Worked for 0.0s".to_string()],
         );
     }
 
@@ -709,7 +671,7 @@
         );
         assert_eq!(
             parked_marker_messages(agent),
-            vec!["Worked for 0.0s. 1 command still running.".to_string()],
+            vec!["Worked for 0.0s".to_string()],
         );
     }
 
@@ -809,4 +771,3 @@
             "an interjection from another pane must render"
         );
     }
-

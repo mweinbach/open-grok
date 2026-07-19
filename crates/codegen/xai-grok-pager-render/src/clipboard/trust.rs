@@ -21,16 +21,67 @@ pub enum ClipboardDelivery {
 }
 
 impl ClipboardDelivery {
+    pub fn is_confirmed(self) -> bool {
+        self == Self::Confirmed
+    }
+
     pub fn is_failed(self) -> bool {
         self == Self::Failed
     }
 
     pub fn reported_success(self) -> bool {
-        !self.is_failed()
+        matches!(self, Self::Confirmed | Self::Unverified)
     }
 
     pub fn telemetry_label(self) -> &'static str {
         self.into()
+    }
+}
+
+/// Clipboard-relevant facts about the terminal and host environment.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct ClipboardEnvironment {
+    pub brand: TerminalName,
+    pub host_os: HostOs,
+    pub display_server: DisplayServer,
+    pub remote: bool,
+    pub container: bool,
+    pub osc52_sink: bool,
+    pub wayland_data_control: bool,
+    pub wl_copy_available: bool,
+}
+
+/// The terminal's advertised OSC 52 clipboard capability.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum Osc52Capability {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+impl Osc52Capability {
+    #[doc(hidden)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl ClipboardEnvironment {
+    #[doc(hidden)]
+    pub fn osc52_capability(self) -> Osc52Capability {
+        if self.osc52_sink || self.brand.supports_osc52_clipboard() {
+            Osc52Capability::Supported
+        } else if self.brand == TerminalName::Unknown {
+            Osc52Capability::Unknown
+        } else {
+            Osc52Capability::Unsupported
+        }
     }
 }
 
@@ -50,23 +101,18 @@ fn trusted_wayland_native(wl_copy: bool, arboard: bool, data_control: bool) -> b
 /// Classify the configured native route without claiming that a write succeeded.
 pub fn native_clipboard_preflight(
     route_native: bool,
-    host_os: HostOs,
-    display_server: DisplayServer,
-    remote: bool,
-    container: bool,
-    wayland_data_control: bool,
-    wl_copy_available: bool,
+    environment: ClipboardEnvironment,
 ) -> NativeClipboardPreflight {
     if !route_native {
         return NativeClipboardPreflight::Disabled;
     }
-    if remote || container {
+    if environment.remote || environment.container {
         return NativeClipboardPreflight::RemoteOnly;
     }
-    match host_os {
-        HostOs::Linux => match display_server {
+    match environment.host_os {
+        HostOs::Linux => match environment.display_server {
             DisplayServer::Wayland
-                if trusted_wayland_native(wl_copy_available, true, wayland_data_control) =>
+                if environment.wl_copy_available || environment.wayland_data_control =>
             {
                 NativeClipboardPreflight::LocalAvailable
             }
@@ -81,25 +127,15 @@ pub fn native_clipboard_preflight(
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct ClipboardDecision {
-    pub(crate) delivery: ClipboardDelivery,
-    pub(crate) feedback: ClipboardFeedback,
-}
-
-/// Classify one emitted OSC 52 write using the existing environment policy.
-pub(crate) fn osc52_delivery(
-    brand: TerminalName,
-    remote: bool,
-    container: bool,
-    osc52_sink: bool,
-) -> ClipboardDelivery {
-    if osc52_sink || brand.supports_osc52_clipboard() {
-        ClipboardDelivery::Confirmed
-    } else if brand == TerminalName::Unknown && (remote || container) {
-        ClipboardDelivery::Unverified
-    } else {
-        ClipboardDelivery::Failed
+/// Classify one emitted OSC 52 write.
+/// Unknown SSH/container boundaries strip brand markers, so missing capability evidence is Unverified rather than Failed.
+pub(crate) fn osc52_delivery(environment: ClipboardEnvironment) -> ClipboardDelivery {
+    match environment.osc52_capability() {
+        Osc52Capability::Supported => ClipboardDelivery::Confirmed,
+        Osc52Capability::Unknown if environment.remote || environment.container => {
+            ClipboardDelivery::Unverified
+        }
+        Osc52Capability::Unknown | Osc52Capability::Unsupported => ClipboardDelivery::Failed,
     }
 }
 
@@ -108,15 +144,12 @@ pub fn expected_delivery(
     native: NativeClipboardPreflight,
     route_tmux: bool,
     route_osc52: bool,
-    brand: TerminalName,
-    remote: bool,
-    container: bool,
-    osc52_sink: bool,
+    environment: ClipboardEnvironment,
 ) -> ClipboardDelivery {
     if native == NativeClipboardPreflight::LocalAvailable {
         return ClipboardDelivery::Confirmed;
     }
-    let osc52 = route_osc52.then(|| osc52_delivery(brand, remote, container, osc52_sink));
+    let osc52 = route_osc52.then(|| osc52_delivery(environment));
     if osc52 == Some(ClipboardDelivery::Confirmed) || route_tmux {
         return ClipboardDelivery::Confirmed;
     }
@@ -127,18 +160,12 @@ pub fn expected_delivery(
 }
 
 /// True when native legs wrote the local OS clipboard rather than a remote host.
-pub(crate) fn trusted_native(
-    legs: &ClipboardWriteLegs,
-    host_os: HostOs,
-    display_server: DisplayServer,
-    remote: bool,
-    container: bool,
-) -> bool {
-    if remote || container || !legs.route_native {
+pub(crate) fn trusted_native(legs: &ClipboardWriteLegs, environment: ClipboardEnvironment) -> bool {
+    if environment.remote || environment.container || !legs.route_native {
         return false;
     }
-    match host_os {
-        HostOs::Linux => match display_server {
+    match environment.host_os {
+        HostOs::Linux => match environment.display_server {
             DisplayServer::Wayland => {
                 trusted_wayland_native(legs.wl_copy_ok, legs.arboard_ok, legs.data_control)
             }
@@ -148,51 +175,46 @@ pub(crate) fn trusted_native(
     }
 }
 
-/// Resolve the user-visible branch and delivery classification together.
-#[allow(clippy::too_many_arguments)]
+/// Resolve the user-visible feedback; each feedback variant owns its delivery state.
 pub(crate) fn resolve_copy_decision(
     legs: &ClipboardWriteLegs,
     text: &str,
-    brand: TerminalName,
-    host_os: HostOs,
-    display_server: DisplayServer,
-    remote: bool,
-    container: bool,
-    osc52_sink: bool,
-) -> ClipboardDecision {
-    let decision = |delivery, feedback| ClipboardDecision { delivery, feedback };
-    if trusted_native(legs, host_os, display_server, remote, container) {
-        return decision(ClipboardDelivery::Confirmed, ClipboardFeedback::Copied);
+    environment: ClipboardEnvironment,
+) -> ClipboardFeedback {
+    if trusted_native(legs, environment) {
+        return ClipboardFeedback::Copied;
     }
     if legs.osc52_ok {
-        match osc52_delivery(brand, remote, container, osc52_sink) {
+        match osc52_delivery(environment) {
             ClipboardDelivery::Confirmed => {
-                let feedback = if remote && brand.is_vscode_family() && !text.is_ascii() {
-                    ClipboardFeedback::VsCodeSshNonAscii
-                } else if container {
-                    ClipboardFeedback::CopiedOscContainer
-                } else if remote {
-                    ClipboardFeedback::CopiedOscRemote
-                } else {
-                    ClipboardFeedback::Copied
-                };
-                return decision(ClipboardDelivery::Confirmed, feedback);
+                if environment.container {
+                    return ClipboardFeedback::CopiedOscContainer;
+                }
+                if environment.remote && environment.brand.is_vscode_family() && !text.is_ascii() {
+                    return ClipboardFeedback::VsCodeSshNonAscii;
+                }
+                if environment.remote {
+                    return ClipboardFeedback::CopiedOscRemote;
+                }
+                return ClipboardFeedback::Copied;
             }
             ClipboardDelivery::Unverified if !legs.tmux_ok => {
-                let feedback = if remote {
-                    ClipboardFeedback::UnverifiedOscRemote
-                } else {
-                    ClipboardFeedback::UnverifiedOscContainer
-                };
-                return decision(ClipboardDelivery::Unverified, feedback);
+                if environment.container {
+                    return ClipboardFeedback::UnverifiedOscContainer;
+                }
+                return ClipboardFeedback::UnverifiedOscRemote;
             }
             ClipboardDelivery::Unverified | ClipboardDelivery::Failed => {}
         }
     }
     if legs.tmux_ok {
-        return decision(ClipboardDelivery::Confirmed, ClipboardFeedback::CopiedTmux);
+        return ClipboardFeedback::CopiedTmux;
     }
-    decision(ClipboardDelivery::Failed, ClipboardFeedback::Failed)
+    if environment.remote || environment.container {
+        ClipboardFeedback::FailedRemote
+    } else {
+        ClipboardFeedback::Failed
+    }
 }
 
 #[cfg(test)]
@@ -221,243 +243,260 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn resolve(
-        legs: &ClipboardWriteLegs,
-        text: &str,
-        brand: TerminalName,
-        host_os: HostOs,
-        display_server: DisplayServer,
-        remote: bool,
-        container: bool,
-        osc52_sink: bool,
-    ) -> ClipboardDecision {
-        resolve_copy_decision(
-            legs,
-            text,
+    fn environment(brand: TerminalName) -> ClipboardEnvironment {
+        ClipboardEnvironment {
             brand,
-            host_os,
-            display_server,
-            remote,
-            container,
-            osc52_sink,
-        )
+            host_os: HostOs::Linux,
+            display_server: DisplayServer::Unknown,
+            remote: false,
+            container: false,
+            osc52_sink: false,
+            wayland_data_control: false,
+            wl_copy_available: false,
+        }
     }
 
     #[test]
     fn telemetry_projection_labels_and_historical_boolean_are_pinned() {
-        for (delivery, label, reported_success) in [
-            (ClipboardDelivery::Confirmed, "confirmed", true),
-            (ClipboardDelivery::Unverified, "unverified", true),
-            (ClipboardDelivery::Failed, "failed", false),
+        for (delivery, label, confirmed, failed, reported_success) in [
+            (ClipboardDelivery::Confirmed, "confirmed", true, false, true),
+            (
+                ClipboardDelivery::Unverified,
+                "unverified",
+                false,
+                false,
+                true,
+            ),
+            (ClipboardDelivery::Failed, "failed", false, true, false),
         ] {
             assert_eq!(delivery.telemetry_label(), label);
+            assert_eq!(delivery.is_confirmed(), confirmed);
+            assert_eq!(delivery.is_failed(), failed);
             assert_eq!(delivery.reported_success(), reported_success);
         }
     }
 
     #[test]
     fn local_trusted_native_is_confirmed() {
-        let decision = resolve(
+        let feedback = resolve_copy_decision(
             &legs(true, false, false, false, false, "pbcopy"),
             "hello",
-            TerminalName::Ghostty,
-            HostOs::Macos,
-            DisplayServer::Quartz,
-            false,
-            false,
-            false,
+            ClipboardEnvironment {
+                host_os: HostOs::Macos,
+                display_server: DisplayServer::Quartz,
+                ..environment(TerminalName::Ghostty)
+            },
         );
-        assert_eq!(decision.delivery, ClipboardDelivery::Confirmed);
-        assert_eq!(decision.feedback, ClipboardFeedback::Copied);
+        assert_eq!(feedback, ClipboardFeedback::Copied);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Confirmed);
     }
 
     #[test]
     fn wayland_native_requires_verified_destination() {
+        let environment = ClipboardEnvironment {
+            display_server: DisplayServer::Wayland,
+            ..environment(TerminalName::Vte)
+        };
         let unverified = legs(false, true, false, false, false, "");
-        assert!(!trusted_native(
-            &unverified,
-            HostOs::Linux,
-            DisplayServer::Wayland,
-            false,
-            false
-        ));
+        assert!(!trusted_native(&unverified, environment));
         let data_control = legs(false, true, true, false, false, "");
-        assert!(trusted_native(
-            &data_control,
-            HostOs::Linux,
-            DisplayServer::Wayland,
-            false,
-            false
-        ));
+        assert!(trusted_native(&data_control, environment));
         let wl_copy = legs(true, false, false, false, false, "wl-copy");
-        assert!(trusted_native(
-            &wl_copy,
-            HostOs::Linux,
-            DisplayServer::Wayland,
-            false,
-            false
-        ));
+        assert!(trusted_native(&wl_copy, environment));
     }
 
     #[test]
-    fn remote_native_write_only_is_failed() {
-        let decision = resolve(
+    fn remote_native_write_only_uses_failed_remote() {
+        let feedback = resolve_copy_decision(
             &legs(true, true, false, false, false, "xclip"),
             "hello",
-            TerminalName::Ghostty,
-            HostOs::Linux,
-            DisplayServer::X11,
-            true,
-            false,
-            false,
+            ClipboardEnvironment {
+                display_server: DisplayServer::X11,
+                remote: true,
+                ..environment(TerminalName::Ghostty)
+            },
         );
-        assert_eq!(decision.delivery, ClipboardDelivery::Failed);
+        assert_eq!(feedback, ClipboardFeedback::FailedRemote);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Failed);
     }
 
     #[test]
     fn known_osc_capable_terminal_is_confirmed() {
-        let decision = resolve(
+        let feedback = resolve_copy_decision(
             &legs(false, false, false, false, true, ""),
             "hello",
-            TerminalName::Ghostty,
-            HostOs::Linux,
-            DisplayServer::Unknown,
-            true,
-            false,
-            false,
+            ClipboardEnvironment {
+                remote: true,
+                ..environment(TerminalName::Ghostty)
+            },
         );
-        assert_eq!(decision.delivery, ClipboardDelivery::Confirmed);
-        assert_eq!(decision.feedback, ClipboardFeedback::CopiedOscRemote);
+        assert_eq!(feedback, ClipboardFeedback::CopiedOscRemote);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Confirmed);
     }
 
     #[test]
     fn ssh_unknown_brand_osc_is_unverified() {
-        let decision = resolve(
+        let feedback = resolve_copy_decision(
             &legs(false, false, false, false, true, ""),
             "hello",
-            TerminalName::Unknown,
-            HostOs::Linux,
-            DisplayServer::Unknown,
-            true,
-            false,
-            false,
+            ClipboardEnvironment {
+                remote: true,
+                ..environment(TerminalName::Unknown)
+            },
         );
-        assert_eq!(decision.delivery, ClipboardDelivery::Unverified);
-        assert_eq!(decision.feedback, ClipboardFeedback::UnverifiedOscRemote);
+        assert_eq!(feedback, ClipboardFeedback::UnverifiedOscRemote);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Unverified);
     }
 
     #[test]
     fn container_unknown_brand_osc_is_unverified() {
-        let decision = resolve(
+        let feedback = resolve_copy_decision(
             &legs(false, false, false, false, true, ""),
             "hello",
-            TerminalName::Unknown,
-            HostOs::Linux,
-            DisplayServer::Unknown,
-            false,
-            true,
-            false,
+            ClipboardEnvironment {
+                container: true,
+                ..environment(TerminalName::Unknown)
+            },
         );
-        assert_eq!(decision.delivery, ClipboardDelivery::Unverified);
-        assert_eq!(decision.feedback, ClipboardFeedback::UnverifiedOscContainer);
+        assert_eq!(feedback, ClipboardFeedback::UnverifiedOscContainer);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Unverified);
     }
 
     #[test]
-    fn known_unsupported_terminal_osc_is_failed() {
-        for brand in [TerminalName::AppleTerminal, TerminalName::Vte] {
-            let decision = resolve(
+    fn known_unsupported_terminal_osc_is_failed_remote() {
+        for (brand, remote, container) in [
+            (TerminalName::AppleTerminal, true, false),
+            (TerminalName::Vte, true, false),
+            (TerminalName::AppleTerminal, true, true),
+        ] {
+            let feedback = resolve_copy_decision(
                 &legs(false, false, false, false, true, ""),
                 "hello",
-                brand,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false,
-                false,
+                ClipboardEnvironment {
+                    remote,
+                    container,
+                    ..environment(brand)
+                },
             );
-            assert_eq!(decision.delivery, ClipboardDelivery::Failed, "{brand:?}");
+            assert_eq!(feedback, ClipboardFeedback::FailedRemote, "{brand:?}");
+            assert_eq!(feedback.delivery(), ClipboardDelivery::Failed, "{brand:?}");
         }
+    }
+
+    #[test]
+    fn container_with_detected_unsupported_brand_is_failed_remote() {
+        let feedback = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                container: true,
+                ..environment(TerminalName::AppleTerminal)
+            },
+        );
+        assert_eq!(feedback, ClipboardFeedback::FailedRemote);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Failed);
     }
 
     #[test]
     fn active_wrap_sink_with_osc_is_confirmed_for_any_brand() {
         for brand in [TerminalName::Unknown, TerminalName::AppleTerminal] {
-            let decision = resolve(
+            let feedback = resolve_copy_decision(
                 &legs(false, false, false, false, true, ""),
                 "hello",
-                brand,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false,
-                true,
+                ClipboardEnvironment {
+                    remote: true,
+                    osc52_sink: true,
+                    ..environment(brand)
+                },
             );
-            assert_eq!(decision.delivery, ClipboardDelivery::Confirmed, "{brand:?}");
+            assert!(feedback.delivery().is_confirmed(), "{brand:?}");
         }
     }
 
     #[test]
-    fn wrap_sink_without_osc_write_is_failed() {
-        let decision = resolve(
+    fn wrap_sink_without_osc_write_is_failed_remote() {
+        let feedback = resolve_copy_decision(
             &legs(false, false, false, false, false, ""),
             "hello",
-            TerminalName::Unknown,
-            HostOs::Linux,
-            DisplayServer::Unknown,
-            true,
-            false,
-            true,
+            ClipboardEnvironment {
+                remote: true,
+                osc52_sink: true,
+                ..environment(TerminalName::Unknown)
+            },
         );
-        assert_eq!(decision.delivery, ClipboardDelivery::Failed);
+        assert_eq!(feedback, ClipboardFeedback::FailedRemote);
     }
 
     #[test]
     fn tmux_success_wins_over_unverified_osc() {
-        let decision = resolve(
+        let feedback = resolve_copy_decision(
             &legs(false, false, false, true, true, ""),
             "hello",
-            TerminalName::Unknown,
-            HostOs::Linux,
-            DisplayServer::Unknown,
-            true,
-            false,
-            false,
+            ClipboardEnvironment {
+                remote: true,
+                ..environment(TerminalName::Unknown)
+            },
         );
-        assert_eq!(decision.delivery, ClipboardDelivery::Confirmed);
-        assert_eq!(decision.feedback, ClipboardFeedback::CopiedTmux);
+        assert_eq!(feedback, ClipboardFeedback::CopiedTmux);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Confirmed);
     }
 
     #[test]
-    fn no_successful_leg_is_failed() {
-        let decision = resolve(
+    fn no_successful_local_leg_is_failed() {
+        let feedback = resolve_copy_decision(
             &legs(false, false, false, false, false, ""),
             "hello",
-            TerminalName::Ghostty,
-            HostOs::Linux,
-            DisplayServer::Unknown,
-            true,
-            false,
-            false,
+            environment(TerminalName::Ghostty),
         );
-        assert_eq!(decision.delivery, ClipboardDelivery::Failed);
-        assert_eq!(decision.feedback, ClipboardFeedback::Failed);
+        assert_eq!(feedback, ClipboardFeedback::Failed);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Failed);
+    }
+
+    #[test]
+    fn remote_and_container_prefer_container_feedback_and_telemetry_branch() {
+        let confirmed = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                remote: true,
+                container: true,
+                ..environment(TerminalName::Ghostty)
+            },
+        );
+        assert_eq!(confirmed, ClipboardFeedback::CopiedOscContainer);
+        assert_eq!(
+            Into::<&'static str>::into(confirmed),
+            "copied_osc_container"
+        );
+
+        let unverified = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                remote: true,
+                container: true,
+                ..environment(TerminalName::Unknown)
+            },
+        );
+        assert_eq!(unverified, ClipboardFeedback::UnverifiedOscContainer);
+        assert_eq!(
+            Into::<&'static str>::into(unverified),
+            "unverified_osc_container"
+        );
     }
 
     #[test]
     fn vscode_ssh_non_ascii_stays_confirmed_with_warning_toast() {
-        let decision = resolve(
+        let feedback = resolve_copy_decision(
             &legs(false, false, false, false, true, ""),
             "café",
-            TerminalName::VsCode,
-            HostOs::Linux,
-            DisplayServer::Unknown,
-            true,
-            false,
-            false,
+            ClipboardEnvironment {
+                remote: true,
+                ..environment(TerminalName::VsCode)
+            },
         );
-        assert_eq!(decision.delivery, ClipboardDelivery::Confirmed);
-        assert_eq!(decision.feedback, ClipboardFeedback::VsCodeSshNonAscii);
+        assert_eq!(feedback, ClipboardFeedback::VsCodeSshNonAscii);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Confirmed);
     }
 
     #[test]
@@ -471,42 +510,48 @@ mod tests {
             assert_eq!(
                 native_clipboard_preflight(
                     true,
-                    HostOs::Linux,
-                    DisplayServer::Wayland,
-                    false,
-                    false,
-                    data_control,
-                    wl_copy,
+                    ClipboardEnvironment {
+                        display_server: DisplayServer::Wayland,
+                        wayland_data_control: data_control,
+                        wl_copy_available: wl_copy,
+                        ..environment(TerminalName::Vte)
+                    },
                 ),
                 expected,
                 "data_control={data_control} wl_copy={wl_copy}"
             );
         }
-        assert_eq!(
-            native_clipboard_preflight(
-                true,
-                HostOs::Linux,
-                DisplayServer::Wayland,
-                true,
-                false,
-                true,
-                true,
-            ),
-            NativeClipboardPreflight::RemoteOnly
-        );
+        for (remote, container) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                native_clipboard_preflight(
+                    true,
+                    ClipboardEnvironment {
+                        display_server: DisplayServer::Wayland,
+                        remote,
+                        container,
+                        wayland_data_control: true,
+                        wl_copy_available: true,
+                        ..environment(TerminalName::Vte)
+                    },
+                ),
+                NativeClipboardPreflight::RemoteOnly,
+                "remote={remote} container={container}"
+            );
+        }
     }
 
     #[test]
     fn expected_delivery_matches_preflight_routes() {
+        let unknown_remote = ClipboardEnvironment {
+            remote: true,
+            ..environment(TerminalName::Unknown)
+        };
         assert_eq!(
             expected_delivery(
                 NativeClipboardPreflight::RemoteOnly,
                 false,
                 true,
-                TerminalName::Unknown,
-                true,
-                false,
-                false,
+                unknown_remote,
             ),
             ClipboardDelivery::Unverified
         );
@@ -515,10 +560,10 @@ mod tests {
                 NativeClipboardPreflight::RemoteOnly,
                 false,
                 true,
-                TerminalName::Vte,
-                true,
-                false,
-                false,
+                ClipboardEnvironment {
+                    remote: true,
+                    ..environment(TerminalName::Vte)
+                },
             ),
             ClipboardDelivery::Failed
         );
@@ -527,10 +572,11 @@ mod tests {
                 NativeClipboardPreflight::RemoteOnly,
                 false,
                 true,
-                TerminalName::Vte,
-                true,
-                false,
-                true,
+                ClipboardEnvironment {
+                    remote: true,
+                    osc52_sink: true,
+                    ..environment(TerminalName::Vte)
+                },
             ),
             ClipboardDelivery::Confirmed
         );
@@ -539,10 +585,7 @@ mod tests {
                 NativeClipboardPreflight::RemoteOnly,
                 true,
                 false,
-                TerminalName::Unknown,
-                true,
-                false,
-                false,
+                unknown_remote,
             ),
             ClipboardDelivery::Confirmed
         );
@@ -551,10 +594,7 @@ mod tests {
                 NativeClipboardPreflight::Unavailable,
                 false,
                 false,
-                TerminalName::Vte,
-                false,
-                false,
-                false,
+                environment(TerminalName::Vte),
             ),
             ClipboardDelivery::Failed
         );

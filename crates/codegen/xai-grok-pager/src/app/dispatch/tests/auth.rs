@@ -268,7 +268,7 @@ fn failed_kimi_service_write_returns_focused_login_to_service_picker() {
         panic!("focused Kimi login should remain open");
     };
     assert!(matches!(
-        state.mode,
+        state.mode(),
         SettingsModalMode::PickingEnum {
             key: "kimi_api_endpoint",
             original_value: crate::settings::SettingValue::Enum("platform"),

@@ -682,6 +682,9 @@ impl crate::types::tool_metadata::ToolMetadata for TaskOutputTool {
                 read_tool: Some("read_file"),
                 bash_background_param: Some("is_background"),
                 subagent_background_param: Some("run_in_background"),
+                task_ids_param: "task_ids",
+                timeout_ms_param: "timeout_ms",
+                task_id_param: "task_id",
             })
         });
         &DESC
@@ -739,6 +742,16 @@ fn task_output_description(
         read_tool: renderer.tool_for_kind(ToolKind::Read),
         bash_background_param: renderer.param_for_kind(ToolKind::Execute, "is_background"),
         subagent_background_param: renderer.param_for_kind(ToolKind::Task, "run_in_background"),
+        task_ids_param: renderer
+            .param_for_kind(ToolKind::BackgroundTaskAction, "task_ids")
+            .unwrap_or("task_ids"),
+        timeout_ms_param: renderer
+            .param_for_kind(ToolKind::BackgroundTaskAction, "timeout_ms")
+            .unwrap_or("timeout_ms"),
+        // Same singular id name kill_task uses in its monitor aside.
+        task_id_param: renderer
+            .param_for_kind(ToolKind::KillTaskAction, "task_id")
+            .unwrap_or("task_id"),
     })
 }
 
@@ -1068,6 +1081,59 @@ mod tests {
                 "[{label}] read-file hint must match read-tool presence:\n{rendered}"
             );
         }
+    }
+
+    #[test]
+    fn description_tracks_renamed_task_ids_and_timeout_ms() {
+        use crate::types::template_renderer::TemplateRenderer;
+        use std::collections::HashMap;
+
+        let tools = HashMap::from([
+            (ToolKind::Execute, "run_terminal_command".to_string()),
+            (ToolKind::Monitor, "monitor".to_string()),
+            (
+                ToolKind::BackgroundTaskAction,
+                "get_task_output".to_string(),
+            ),
+            (ToolKind::KillTaskAction, "kill_task".to_string()),
+        ]);
+        let params = HashMap::from([
+            (
+                ToolKind::Execute,
+                HashMap::from([("is_background".to_string(), "is_background".to_string())]),
+            ),
+            (
+                ToolKind::BackgroundTaskAction,
+                HashMap::from([
+                    ("task_ids".to_string(), "process_ids".to_string()),
+                    ("timeout_ms".to_string(), "max_wait".to_string()),
+                ]),
+            ),
+            (
+                ToolKind::KillTaskAction,
+                HashMap::from([("task_id".to_string(), "id".to_string())]),
+            ),
+        ]);
+        let rendered = task_output_description(&TemplateRenderer::new(tools, params), None);
+        assert!(
+            rendered.contains("Pass process_ids with"),
+            "renamed task_ids must appear:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Omit max_wait or pass 0")
+                && rendered.contains("positive max_wait wait"),
+            "renamed timeout_ms must appear:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("a monitor's id is returned by monitor"),
+            "renamed kill_task task_id must appear in monitor aside:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("task_ids")
+                && !rendered.contains("timeout_ms")
+                && !rendered.contains("task_id"),
+            "canonical param names must not remain after rename:\n{rendered}"
+        );
     }
 
     #[tokio::test]

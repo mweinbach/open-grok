@@ -571,7 +571,7 @@ fn modal_external_filter_clears_native_content_and_blocks_forced_search() {
         *source_filter = SourceFilter::Remote;
         *content_results = Some(vec![content_hit("native-hit")]);
         *content_loading = true;
-        state.query = "native".into();
+        state.set_query("native");
         state.expanded.insert(0);
     }
 

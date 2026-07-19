@@ -61,6 +61,9 @@ impl TokenRefresher for ExternalBinaryRefresher {
         .await
         {
             Err(_elapsed) => {
+                // Transient: a hard-expired access token after idle must still
+                // allow 401 / pre-flight retry. Mapping timeout to permanent
+                // failure poisoned recovery for PERMANENT_FAILURE_TTL.
                 tracing::warn!(
                     timeout_ms,
                     "auth: external binary refresh timed out (thread leaked)"
@@ -70,7 +73,7 @@ impl TokenRefresher for ExternalBinaryRefresher {
                     None,
                     Some(serde_json::json!({ "timeout_ms": timeout_ms })),
                 );
-                self.record_failure(format!("external binary timed out after {timeout_ms}ms"))
+                RefreshOutcome::transient(format!("external binary timed out after {timeout_ms}ms"))
             }
             Ok(Ok(Some(auth))) => {
                 crate::unified_log::info("auth: external binary refresh succeeded", None, None);
@@ -131,10 +134,8 @@ mod tests {
         }
     }
 
-    /// A binary that outlives the (test-shortened) timeout hits the `Elapsed`
-    /// arm and maps to the same non-sticky `Other` permanent failure.
     #[tokio::test]
-    async fn external_binary_timeout_is_non_sticky_permanent() {
+    async fn external_binary_timeout_is_transient() {
         struct SlowRunner;
         impl ExternalCommandRunner for SlowRunner {
             fn run_external_command(&self, _command: &str) -> Option<GrokAuth> {
@@ -145,14 +146,13 @@ mod tests {
         let refresher = ExternalBinaryRefresher::new(Arc::new(SlowRunner), "auth-binary".into())
             .with_timeout(std::time::Duration::from_millis(5));
         match refresher.refresh(RefreshReason::ServerRejected).await {
-            RefreshOutcome::PermanentFailure { error, .. } => {
-                assert_eq!(error.reason, RefreshTokenFailedReason::Other);
+            RefreshOutcome::TransientFailure { message } => {
                 assert!(
-                    !error.reason.is_sticky(),
-                    "timeout must age out, not strand"
+                    message.contains("timed out"),
+                    "timeout message must be greppable, got {message}"
                 );
             }
-            other => panic!("a timed-out binary must be a permanent Other failure, got {other:?}"),
+            other => panic!("a timed-out binary must be TransientFailure, got {other:?}"),
         }
     }
 

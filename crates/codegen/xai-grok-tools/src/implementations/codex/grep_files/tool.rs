@@ -27,8 +27,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ─── Description ────────────────────────────────────────────────────
 
-const DESCRIPTION: &str =
-    "Finds files whose contents match the pattern and lists them by modification time.";
+const DESCRIPTION: &str = "Finds files whose contents match the ${{ params.search.pattern }} and lists them by modification time.";
 
 // ─── Input ──────────────────────────────────────────────────────────
 

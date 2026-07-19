@@ -850,7 +850,6 @@ impl MvpAgent {
         auth: &crate::auth::GrokAuth,
     ) {
         self.refresh_remote_settings(auth).await;
-        let cwd = std::env::current_dir().ok();
         {
             let mut cfg = self.cfg.borrow_mut();
             crate::util::config::sync_campaign_fields(&mut cfg);
@@ -861,7 +860,7 @@ impl MvpAgent {
                     );
                     toml::Value::Table(toml::map::Map::new())
                 });
-            cfg.re_resolve_runtime_fields(&raw_config, cwd.as_deref());
+            cfg.re_resolve_runtime_fields(&raw_config);
         }
         self.sync_collection_config_gate();
         self.emit_settings_update_notification();
@@ -1439,6 +1438,7 @@ impl MvpAgent {
     /// Params resolution (TOML > env > remote settings > default):
     /// - `proxy_endpoint`: `[toolset.web_fetch] proxy_endpoint` > `GROK_WEB_FETCH_PROXY` > remote settings > None
     /// - `allowed_domains`: `[toolset.web_fetch] allowed_domains` > remote settings > built-in defaults
+    /// - `allow_local`: `[toolset.web_fetch] allow_local` > `GROK_WEB_FETCH_ALLOW_LOCAL` > false
     pub(super) fn prepare_web_fetch_config(
         &self,
     ) -> xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig {
@@ -1537,10 +1537,6 @@ impl MvpAgent {
             resident_roster_titles: RefCell::new(HashMap::new()),
             initialize_request: OnceLock::new(),
             gateway,
-            subagent_model_overrides: cfg.subagent_model_overrides.clone(),
-            subagent_toggle: cfg.subagent_toggle.clone(),
-            subagent_roles: cfg.subagent_roles.clone(),
-            subagent_personas: cfg.subagent_personas.clone(),
             launch_cwd: std::env::current_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from(".")),
             launch_dir_trust: std::cell::OnceCell::new(),
@@ -1549,11 +1545,6 @@ impl MvpAgent {
                 cfg.plugins.cli_plugin_dirs.clone(),
             ),
             plugin_registry_initialized: std::cell::Cell::new(false),
-            persona_io_summaries: cfg
-                .subagent_personas
-                .iter()
-                .map(|(name, p)| p.render_io_summary(name))
-                .collect(),
             models_manager,
             chat_modes: {
                 let chat_modes = crate::agent::chat_modes::ChatModesManager::new(
@@ -3236,6 +3227,7 @@ impl MvpAgent {
             .cfg
             .borrow()
             .resolve_compaction_verbatim_input();
+        let compaction_tool_choice = self.cfg.borrow().resolve_compaction_tool_choice();
         let two_pass_enabled = self.cfg.borrow().is_two_pass_compaction_enabled();
         let remote_compaction_v2 = self.cfg.borrow().is_remote_compaction_v2_enabled();
         let auto_update = self.cfg.borrow().cli.auto_update;
@@ -3465,7 +3457,7 @@ impl MvpAgent {
         let laziness_debug_log_for_spawn = self.cfg.borrow().laziness_debug_log.clone();
         let respect_gitignore = self.cfg.borrow().respect_gitignore;
         let path_not_found_hints = self.cfg.borrow().path_not_found_hints;
-        let subagent_toggle = self.subagent_toggle.clone();
+        let subagent_toggle = self.cfg.borrow().subagent_toggle.clone();
         let handle_display_cwd = prompt_display_cwd.clone();
         let auth_manager = Some(self.auth_manager.clone());
         let bash_params_json = {
@@ -3602,6 +3594,7 @@ impl MvpAgent {
                 .as_ref()
                 .and_then(|m| m.get("x.ai/gitHeadChanged"))
                 .and_then(|v| v.as_bool());
+            let session_cwd = std::path::Path::new(&session_info.cwd);
             let fs_watch_caps = crate::session::fs_watch::FsWatchCapabilities::resolve(crate::session::fs_watch::CapabilityInputs {
                 client_notify: fs_notify_config.is_some(),
                 hunk_tracking: hunk_plan.enabled(),
@@ -3636,6 +3629,7 @@ impl MvpAgent {
                     system_prompt_label,
                     compaction_mode,
                     compaction_verbatim_input,
+                    compaction_tool_choice,
                     two_pass_enabled,
                     remote_compaction_v2,
                     buffering_settings,
@@ -3688,7 +3682,7 @@ impl MvpAgent {
                     client_hooks,
                     prompt_display_cwd,
                     subagent_toggle,
-                    self.persona_io_summaries.clone(),
+                    Vec::new(),
                     xai_grok_agent::prompt::context::PromptAudience::Primary,
                     None,
                     None,
@@ -3698,7 +3692,6 @@ impl MvpAgent {
                     path_not_found_hints,
                     tool_params_json,
                     {
-                        let session_cwd = std::path::Path::new(&session_info.cwd);
                         let disk_cfg = crate::config::resolve_effective_plugins_config(
                                 session_cwd,
                             )

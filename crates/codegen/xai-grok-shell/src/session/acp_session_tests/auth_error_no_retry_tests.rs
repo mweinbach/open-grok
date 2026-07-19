@@ -297,6 +297,101 @@ async fn pre_flight_refresh_skips_api_key_auth_type() {
         .await;
 }
 
+/// Hard-expired session token: pre-flight must call the refresher and must
+/// not leave credentials stuck while pretending the JWT/config path applies.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(attribution_emit_count)]
+async fn pre_flight_refreshes_hard_expired_session_token() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let called = Arc::new(AtomicBool::new(false));
+            let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> =
+                Arc::new(AlwaysSucceedRefresher {
+                    called: called.clone(),
+                });
+            let (_dir, am) = auth_manager_with_refresher(refresher);
+            assert!(
+                !am.has_usable_token(),
+                "precondition: access token is hard-expired"
+            );
+
+            let (actor, _rx) = make_actor_with_auth_manager(Some(am.clone())).await;
+            actor.refresh_token_if_expired().await;
+
+            assert!(
+                called.load(Ordering::SeqCst),
+                "pre-flight must invoke the refresher for a hard-expired session token"
+            );
+            assert_eq!(
+                actor
+                    .chat_state_handle
+                    .get_credentials()
+                    .await
+                    .api_key
+                    .as_deref(),
+                Some("refreshed-test-token"),
+                "credentials must be updated to the refreshed bearer"
+            );
+            assert!(am.has_usable_token());
+        })
+        .await;
+}
+
+/// Hard-expired + failed refresh: do not fall through to JWT/config.toml;
+/// leave credentials unchanged so 401 recovery remains the safety net.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(attribution_emit_count)]
+async fn pre_flight_hard_expired_refresh_failure_skips_jwt_fallthrough() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> = Arc::new({
+                struct AlwaysFail(Arc<std::sync::atomic::AtomicU32>);
+                #[async_trait::async_trait]
+                impl crate::auth::refresh::TokenRefresher for AlwaysFail {
+                    async fn refresh(
+                        &self,
+                        _: crate::auth::refresh::RefreshReason,
+                    ) -> crate::auth::refresh::RefreshOutcome {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                        crate::auth::refresh::RefreshOutcome::transient("refresh failed")
+                    }
+                }
+                AlwaysFail(call_count.clone())
+            });
+            let (_dir, am) = auth_manager_with_refresher(refresher);
+            let (actor, _rx) = make_actor_with_auth_manager(Some(am.clone())).await;
+
+            actor.refresh_token_if_expired().await;
+
+            assert!(
+                call_count.load(Ordering::SeqCst) >= 1,
+                "pre-flight must attempt refresh"
+            );
+            assert_eq!(
+                actor
+                    .chat_state_handle
+                    .get_credentials()
+                    .await
+                    .api_key
+                    .as_deref(),
+                Some("initial-test-key"),
+                "failed hard-expired pre-flight must not invent a JWT/config bearer"
+            );
+            assert!(
+                !am.has_usable_token(),
+                "token remains hard-expired after failed refresh"
+            );
+            assert!(
+                am.permanent_failure().is_none(),
+                "transient refresh failure must not poison permanent_failure"
+            );
+        })
+        .await;
+}
+
 /// Proactive refresh keeps the cache hot so `refresh_token_if_expired`
 /// (per-turn pre-flight) is a cache hit — the refresher fires once
 /// (proactive), then the per-turn call sees the fresh token without

@@ -1,3 +1,7 @@
+use crate::editor::{
+    ApplyEditPlanError, EditBuffer, EditCommand, EditCommandCategory, EditOutcome, EditPlan,
+    WordStyle, classify_key_event,
+};
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -184,8 +188,7 @@ impl ClickTracker {
 
 #[derive(Debug)]
 pub struct TextArea {
-    text: String,
-    cursor_pos: usize,
+    text: EditBuffer,
     wrap_cache: RefCell<Option<WrapCache>>,
     preferred_col: Option<usize>,
     elements: Vec<TextElement>,
@@ -407,8 +410,7 @@ impl TextArea {
 
     pub fn new() -> Self {
         Self {
-            text: String::new(),
-            cursor_pos: 0,
+            text: EditBuffer::new(),
             wrap_cache: RefCell::new(None),
             preferred_col: None,
             elements: Vec::new(),
@@ -477,13 +479,144 @@ impl TextArea {
         grapheme_display_width_with_tab(grapheme, self.tab_width)
     }
 
+    fn element_ranges(&self) -> Vec<Range<usize>> {
+        self.elements
+            .iter()
+            .map(|element| element.range.clone())
+            .collect()
+    }
+
+    fn adjust_position_after_edit(
+        position: usize,
+        replaced: &Range<usize>,
+        inserted_len: usize,
+    ) -> usize {
+        if position < replaced.start {
+            position
+        } else if position <= replaced.end {
+            replaced.start + inserted_len
+        } else {
+            position - replaced.len() + inserted_len
+        }
+    }
+
+    fn is_semantic_edit(plan: &EditPlan) -> bool {
+        plan.removed_text() != plan.replacement() || !plan.replaced_byte_range().is_empty()
+    }
+
+    fn assert_valid_edit_plan(&self, plan: &EditPlan) {
+        if let Err(error) = self.text.validate_plan(plan) {
+            panic!("textarea edit invariant failed: {error:?}");
+        }
+    }
+
+    fn apply_validated_edit_plan(
+        &mut self,
+        plan: EditPlan,
+        mutation_kind: Option<MutationKind>,
+    ) -> EditOutcome {
+        let semantic_edit = Self::is_semantic_edit(&plan);
+        let replaced = plan.replaced_byte_range();
+        let inserted_len = plan.replacement().len();
+        let outcome = self.text.apply_validated_plan(&plan);
+        if semantic_edit {
+            self.update_elements_after_replace(replaced.start, replaced.end, inserted_len);
+            if let Some(selection) = &mut self.selection {
+                selection.anchor =
+                    Self::adjust_position_after_edit(selection.anchor, &replaced, inserted_len);
+                selection.head =
+                    Self::adjust_position_after_edit(selection.head, &replaced, inserted_len);
+            }
+            if self
+                .selection
+                .is_some_and(|selection| selection.anchor == selection.head)
+            {
+                self.selection = None;
+            }
+            self.wrap_cache.replace(None);
+            if mutation_kind == Some(MutationKind::Kill) {
+                self.kill_buffer = plan.into_removed_text();
+            }
+        }
+        if semantic_edit || !matches!(outcome, EditOutcome::Unchanged) {
+            self.preferred_col = None;
+            self.scroll_override = None;
+        }
+        outcome
+    }
+
+    fn try_apply_edit_plan(
+        &mut self,
+        plan: EditPlan,
+        mutation_kind: Option<MutationKind>,
+    ) -> Result<EditOutcome, ApplyEditPlanError> {
+        self.text.validate_plan(&plan)?;
+        let semantic_edit = Self::is_semantic_edit(&plan);
+        if semantic_edit && let Some(kind) = mutation_kind {
+            self.pre_mutate(kind);
+        }
+        let outcome = self.apply_validated_edit_plan(plan, mutation_kind);
+        if semantic_edit && mutation_kind.is_some() {
+            self.post_mutate();
+        }
+        Ok(outcome)
+    }
+
+    fn apply_edit_plan(
+        &mut self,
+        plan: EditPlan,
+        mutation_kind: Option<MutationKind>,
+    ) -> EditOutcome {
+        match self.try_apply_edit_plan(plan, mutation_kind) {
+            Ok(outcome) => outcome,
+            Err(error) => panic!("textarea edit invariant failed: {error:?}"),
+        }
+    }
+
+    fn apply_edit_command(
+        &mut self,
+        command: EditCommand,
+        mutation_kind: Option<MutationKind>,
+    ) -> EditOutcome {
+        let category = command.category();
+        let ranges = self.element_ranges();
+        let plan = self.text.plan_command(command, &ranges);
+        let outcome = self.apply_edit_plan(plan, mutation_kind);
+        if category == EditCommandCategory::Navigation {
+            self.preferred_col = None;
+            self.scroll_override = None;
+        }
+        outcome
+    }
+
+    fn plan_edit_replacement(&self, range: Range<usize>, replacement: &str) -> EditPlan {
+        let replacement = self.expand_tabs(replacement).into_owned();
+        let ranges = self.element_ranges();
+        self.text
+            .plan_replace_byte_range(range, &replacement, &ranges)
+    }
+
+    fn apply_edit_replacement(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+        mutation_kind: Option<MutationKind>,
+    ) {
+        let plan = self.plan_edit_replacement(range, replacement);
+        self.apply_edit_plan(plan, mutation_kind);
+    }
+
     pub fn set_text(&mut self, text: &str) {
+        let cursor = self.cursor();
+        let plan = self.plan_edit_replacement(0..self.text.len(), text);
+        self.assert_valid_edit_plan(&plan);
         self.pre_mutate(MutationKind::Replace);
-        self.text = self.expand_tabs(text).into_owned();
-        self.cursor_pos = self.cursor_pos.clamp(0, self.text.len());
+        let _ = self.text.apply_validated_plan(&plan);
+        self.elements.clear();
+        let len = self.text.len();
+        self.set_cursor_inner(cursor.min(len));
         self.wrap_cache.replace(None);
         self.preferred_col = None;
-        self.elements.clear();
         // Kill buffer intentionally survives: yank is independent of buffer
         // content, so a cut can be pasted into a fresh prompt after send.
         self.selection = None;
@@ -502,7 +635,7 @@ impl TextArea {
     }
 
     pub fn text(&self) -> &str {
-        &self.text
+        self.text.text()
     }
 
     pub fn insert_str(&mut self, text: &str) {
@@ -520,99 +653,44 @@ impl TextArea {
                 self.undo.last_kind = None;
             }
         }
-        self.pre_mutate(MutationKind::Insert);
-        self.insert_str_inner(self.cursor_pos, text);
+        self.apply_edit_replacement(
+            self.cursor()..self.cursor(),
+            text,
+            Some(MutationKind::Insert),
+        );
         if let Some(last) = text.chars().last() {
             self.undo.last_insert_ws = last.is_whitespace();
         }
-        self.post_mutate();
     }
 
     pub fn insert_str_at(&mut self, pos: usize, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.pre_mutate(MutationKind::Insert);
-        self.insert_str_inner(pos, text);
+        self.apply_edit_replacement(pos..pos, text, Some(MutationKind::Insert));
         if let Some(last) = text.chars().last() {
             self.undo.last_insert_ws = last.is_whitespace();
         }
-        self.post_mutate();
-    }
-
-    /// Raw text insertion — no undo tracking. Called by all insert paths.
-    /// Returns the number of bytes actually inserted (post tab expansion).
-    fn insert_str_inner(&mut self, pos: usize, text: &str) -> usize {
-        if text.is_empty() {
-            return 0;
-        }
-        let pos = self.clamp_pos_for_insertion(pos);
-        let text = self.expand_tabs(text);
-        let inserted_len = text.len();
-        self.text.insert_str(pos, &text);
-        self.wrap_cache.replace(None);
-        if pos <= self.cursor_pos {
-            self.cursor_pos += inserted_len;
-        }
-        self.shift_elements(pos, 0, inserted_len);
-        self.preferred_col = None;
-        inserted_len
     }
 
     pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str) {
-        self.pre_mutate(MutationKind::Replace);
-        let range = self.expand_range_to_element_boundaries(range);
-        self.replace_range_raw(range, text);
-        self.post_mutate();
-    }
-
-    /// Returns the number of bytes inserted (post tab expansion).
-    fn replace_range_raw(&mut self, range: std::ops::Range<usize>, text: &str) -> usize {
-        assert!(range.start <= range.end);
-        let start = range.start.clamp(0, self.text.len());
-        let end = range.end.clamp(0, self.text.len());
-        let text = self.expand_tabs(text);
-        let removed_len = end - start;
-        let inserted_len = text.len();
-        if removed_len == 0 && inserted_len == 0 {
-            return 0;
-        }
-        // Any text mutation should snap the viewport back to follow the cursor.
-        self.scroll_override = None;
-        let diff = inserted_len as isize - removed_len as isize;
-
-        self.text.replace_range(start..end, &text);
-        self.wrap_cache.replace(None);
-        self.preferred_col = None;
-        self.update_elements_after_replace(start, end, inserted_len);
-
-        // Update the cursor position to account for the edit.
-        self.cursor_pos = if self.cursor_pos < start {
-            // Cursor was before the edited range – no shift.
-            self.cursor_pos
-        } else if self.cursor_pos <= end {
-            // Cursor was inside the replaced range – move to end of the new text.
-            start + inserted_len
-        } else {
-            // Cursor was after the replaced range – shift by the length diff.
-            ((self.cursor_pos as isize) + diff) as usize
-        }
-        .min(self.text.len());
-
-        // Ensure cursor is not inside an element
-        self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
-        inserted_len
+        self.apply_edit_replacement(range, text, Some(MutationKind::Replace));
     }
 
     pub fn cursor(&self) -> usize {
-        self.cursor_pos
+        self.text.cursor_byte()
     }
 
     pub fn set_cursor(&mut self, pos: usize) {
-        self.cursor_pos = pos.clamp(0, self.text.len());
-        self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
+        let pos = pos.clamp(0, self.text.len());
+        let pos = self.clamp_pos_to_nearest_boundary(pos);
+        self.set_cursor_inner(pos);
         self.preferred_col = None;
         self.scroll_override = None;
+    }
+
+    fn set_cursor_inner(&mut self, pos: usize) {
+        let _ = self.text.set_cursor_byte(pos);
     }
 
     /// Override the scroll position, bypassing cursor-follow logic.
@@ -656,9 +734,9 @@ impl TextArea {
         let tw = self.text_width(area);
         let lines = self.wrapped_lines(tw);
         let effective_scroll = self.effective_scroll(area.height, &lines, state.scroll);
-        let mut i = Self::wrapped_line_index_by_start(&lines, self.cursor_pos)?;
+        let mut i = Self::wrapped_line_index_by_start(&lines, self.cursor())?;
         let ls = &lines[i];
-        let mut col = self.display_width_of_range(ls.start, self.cursor_pos) as u16;
+        let mut col = self.display_width_of_range(ls.start, self.cursor()) as u16;
 
         // If the cursor sits at the exact wrap boundary (col == content width),
         // show it at the start of the next visual line instead of on the
@@ -915,9 +993,8 @@ impl TextArea {
             return false;
         };
         let start = range.start;
-        self.pre_mutate(MutationKind::Replace);
-        self.replace_range_raw(range, "");
-        self.cursor_pos = start.min(self.text.len());
+        self.apply_edit_replacement(range, "", Some(MutationKind::Replace));
+        self.set_cursor_inner(start.min(self.text.len()));
         self.post_mutate();
         self.selection = None;
         true
@@ -1013,7 +1090,7 @@ impl TextArea {
             .find(|e| pos >= e.range.start && pos <= e.range.end && !e.range.is_empty())?;
         let id = elem.id;
         let start = elem.range.start;
-        self.cursor_pos = start;
+        self.set_cursor_inner(start);
         self.preferred_col = None;
         self.drag_anchor = Some(start);
         self.pending_element_event = Some(TextElementEvent {
@@ -1143,11 +1220,12 @@ impl TextArea {
                             });
                             // Place cursor on the last character of the
                             // selection (neovim style), not one past the end.
-                            self.cursor_pos = self.text[start..end]
+                            let cursor = self.text[start..end]
                                 .char_indices()
                                 .next_back()
                                 .map(|(i, _)| start + i)
                                 .unwrap_or(start);
+                            self.set_cursor_inner(cursor);
                             self.preferred_col = None;
                             if let Some(text) = self.selected_text() {
                                 self.set_clipboard_text(text);
@@ -1155,7 +1233,7 @@ impl TextArea {
                             return MouseAction::SelectionFinished;
                         }
                         // Clicked on whitespace — just place cursor.
-                        self.cursor_pos = pos;
+                        self.set_cursor_inner(pos);
                         self.preferred_col = None;
                         MouseAction::CursorPlaced
                     }
@@ -1175,7 +1253,7 @@ impl TextArea {
                         });
                         // Keep cursor at the click position (like neovim),
                         // not at the end of the selection.
-                        self.cursor_pos = pos;
+                        self.set_cursor_inner(pos);
                         self.preferred_col = None;
                         if let Some(text) = self.selected_text() {
                             self.set_clipboard_text(text);
@@ -1194,7 +1272,7 @@ impl TextArea {
                         }
 
                         self.drag_anchor = Some(pos);
-                        self.cursor_pos = pos;
+                        self.set_cursor_inner(pos);
                         self.preferred_col = None;
 
                         MouseAction::CursorPlaced
@@ -1294,7 +1372,7 @@ impl TextArea {
                     self.drag_active = true;
                     self.selection = Some(Selection { anchor, head });
                 }
-                self.cursor_pos = head;
+                self.set_cursor_inner(head);
                 self.preferred_col = None;
 
                 if self.selection.is_some() {
@@ -1366,7 +1444,7 @@ impl TextArea {
                     if let Some(sel) = &mut self.selection {
                         sel.head = new_pos;
                     }
-                    self.cursor_pos = new_pos;
+                    self.set_cursor_inner(new_pos);
                 }
                 MouseAction::Scrolled
             }
@@ -1402,7 +1480,7 @@ impl TextArea {
                     if let Some(sel) = &mut self.selection {
                         sel.head = new_pos;
                     }
-                    self.cursor_pos = new_pos;
+                    self.set_cursor_inner(new_pos);
                 }
                 MouseAction::Scrolled
             }
@@ -1527,26 +1605,6 @@ impl TextArea {
         }
     }
 
-    /// Classify the atomic unit in `start..end` for word navigation.
-    ///
-    /// Elements are treated as their own navigable unit. Plain-text units use
-    /// the same word classes as double-click selection.
-    fn atomic_unit_class(&self, start: usize, end: usize) -> Option<u8> {
-        if start >= end {
-            return None;
-        }
-
-        if self
-            .elements
-            .iter()
-            .any(|e| start >= e.range.start && end <= e.range.end)
-        {
-            return Some(3);
-        }
-
-        self.text[start..end].chars().next().map(Self::char_class)
-    }
-
     /// Find the start of the word containing `pos` (for double-click selection).
     ///
     /// Uses vim-style word classes: word chars (alphanumeric + `_`), punctuation,
@@ -1617,7 +1675,7 @@ impl TextArea {
 
     fn current_display_col(&self) -> usize {
         let bol = self.beginning_of_current_line();
-        self.display_width_of_range(bol, self.cursor_pos)
+        self.display_width_of_range(bol, self.cursor())
     }
 
     /// Compute the display width of the buffer range `[from..to)`.
@@ -1789,9 +1847,10 @@ impl TextArea {
         line_end: usize,
         target_col: usize,
     ) {
-        self.cursor_pos = self
+        let cursor = self
             .display_col_to_buffer_pos(line_start, line_end, target_col)
             .0;
+        self.set_cursor_inner(cursor);
     }
 
     fn beginning_of_line(&self, pos: usize) -> usize {
@@ -1805,7 +1864,7 @@ impl TextArea {
         0
     }
     fn beginning_of_current_line(&self) -> usize {
-        self.beginning_of_line(self.cursor_pos)
+        self.beginning_of_line(self.cursor())
     }
 
     fn end_of_line(&self, pos: usize) -> usize {
@@ -1818,7 +1877,7 @@ impl TextArea {
         self.text.len()
     }
     fn end_of_current_line(&self) -> usize {
-        self.end_of_line(self.cursor_pos)
+        self.end_of_line(self.cursor())
     }
 
     /// Check if a byte position is inside (strictly within) an element.
@@ -1828,23 +1887,18 @@ impl TextArea {
             .any(|e| pos >= e.range.start && pos < e.range.end)
     }
 
-    /// Map a base US-keyboard character to its Shift-modified form.
-    ///
-    /// With the kitty keyboard protocol (`DISAMBIGUATE_ESCAPE_CODES`), some
-    /// terminals (notably VS Code's xterm.js) report shifted characters using
-    /// the **base** key codepoint with the SHIFT modifier instead of the
-    /// already-shifted codepoint.  For example, Shift+2 may arrive as
-    /// `Char('2') + SHIFT` rather than `Char('@') + SHIFT`.  This function
-    /// translates the base character so the correct symbol is inserted.
-    ///
-    /// Characters that are already shifted (e.g. `@`, `#`) or not in the US
-    /// layout map are returned unchanged.
-    fn apply_shift(c: char) -> char {
-        if c.is_ascii_lowercase() {
-            c.to_ascii_uppercase()
-        } else {
-            c
+    fn apply_classified_command(&mut self, command: EditCommand) {
+        if let EditCommand::Insert(character) = command {
+            self.insert_str(&character.to_string());
+            return;
         }
+        let mutation_kind = match command.category() {
+            EditCommandCategory::Insert => unreachable!("insert commands return above"),
+            EditCommandCategory::Navigation => None,
+            EditCommandCategory::Delete => Some(MutationKind::Delete),
+            EditCommandCategory::Kill => Some(MutationKind::Kill),
+        };
+        self.apply_edit_command(command, mutation_kind);
     }
 
     pub fn input(&mut self, event: KeyEvent) {
@@ -1852,38 +1906,16 @@ impl TextArea {
         // When a selection is active, certain keys interact with the selected
         // range rather than performing their normal single-char action.
         if self.selection.is_some() {
+            if let Some(EditCommand::Insert(character)) = classify_key_event(&event) {
+                self.begin_undo_group();
+                if !self.delete_selection() {
+                    self.clear_selection();
+                }
+                self.insert_str(&character.to_string());
+                self.end_undo_group();
+                return;
+            }
             match event {
-                KeyEvent {
-                    code: KeyCode::Char(c),
-                    modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
-                    ..
-                } if c != '\x08' && c != '\x7f' => {
-                    let c = if event.modifiers.contains(KeyModifiers::SHIFT) {
-                        Self::apply_shift(c)
-                    } else {
-                        c
-                    };
-                    self.begin_undo_group();
-                    if !self.delete_selection() {
-                        self.clear_selection();
-                    }
-                    self.insert_str(&c.to_string());
-                    self.end_undo_group();
-                    return;
-                }
-                KeyEvent {
-                    code: KeyCode::Char(c),
-                    modifiers,
-                    ..
-                } if crate::is_altgr(modifiers) => {
-                    self.begin_undo_group();
-                    if !self.delete_selection() {
-                        self.clear_selection();
-                    }
-                    self.insert_str(&c.to_string());
-                    self.end_undo_group();
-                    return;
-                }
                 // Enter / Ctrl-J/M → replace selection with newline.
                 KeyEvent {
                     code: KeyCode::Char('j' | 'm'),
@@ -1948,42 +1980,12 @@ impl TextArea {
             }
         }
 
+        if let Some(command) = classify_key_event(&event) {
+            self.apply_classified_command(command);
+            return;
+        }
+
         match event {
-            // Some terminals (or configurations) send Control key chords as
-            // C0 control characters without reporting the CONTROL modifier.
-            // Handle common fallbacks for Ctrl-B/Ctrl-F here so they don't get
-            // inserted as literal control bytes.
-            KeyEvent { code: KeyCode::Char('\u{0002}'), modifiers: KeyModifiers::NONE, .. } /* ^B */ => {
-                self.move_cursor_left();
-            }
-            KeyEvent { code: KeyCode::Char('\u{0006}'), modifiers: KeyModifiers::NONE, .. } /* ^F */ => {
-                self.move_cursor_right();
-            }
-            // When the Kitty keyboard protocol gets silently popped (e.g. by a
-            // terminal emulator losing track of enhancement state after heavy
-            // output or focus changes), Backspace can arrive as raw DEL (0x7F)
-            // or BS (0x08) characters instead of KeyCode::Backspace. Intercept
-            // them here so they don't get inserted as invisible garbage.
-            KeyEvent { code: KeyCode::Char('\u{007f}'), .. } /* DEL */ |
-            KeyEvent { code: KeyCode::Char('\u{0008}'), modifiers: KeyModifiers::NONE, .. } /* BS */ => {
-                self.delete_backward(1);
-            }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                // Insert plain characters (and Shift-modified). Do NOT insert when ALT is held,
-                // because many terminals map Option/Meta combos to ALT+<char> (e.g. ESC f/ESC b)
-                // for word navigation. Those are handled explicitly below.
-                // Also exclude \x08 (BS) and \x7f (DEL) which are handled as backspace/delete.
-                modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
-                ..
-            } if c != '\x08' && c != '\x7f' => {
-                let c = if event.modifiers.contains(KeyModifiers::SHIFT) {
-                    Self::apply_shift(c)
-                } else {
-                    c
-                };
-                self.insert_str(&c.to_string());
-            }
             KeyEvent {
                 code: KeyCode::Char('j' | 'm'),
                 modifiers: KeyModifiers::CONTROL,
@@ -1993,124 +1995,6 @@ impl TextArea {
                 code: KeyCode::Enter,
                 ..
             } => self.insert_str("\n"),
-            KeyEvent {
-                code: KeyCode::Char('h'),
-                modifiers,
-                ..
-            } if modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-                self.delete_backward_word()
-            }
-            // Must come after explicit Ctrl+Alt bindings so they aren't shadowed.
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            } if crate::is_altgr(modifiers) => {
-                self.insert_str(&c.to_string());
-            }
-            KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers: KeyModifiers::ALT,
-                ..
-            } => self.delete_backward_word(),
-            // Cmd+Backspace (macOS): delete from cursor to beginning of line.
-            KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers: KeyModifiers::SUPER,
-                ..
-            } => {
-                self.kill_to_beginning_of_line();
-            }
-            // Ctrl+Backspace: delete previous word (common on Linux/Windows).
-            KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => self.delete_backward_word(),
-            KeyEvent {
-                code: KeyCode::Backspace | KeyCode::Char('\x08'),
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('h'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => self.delete_backward(1),
-            // Delete forward word: Alt+Delete, Alt+D (Emacs Meta-d),
-            // Cmd+D (macOS Kitty), Ctrl+Delete (Linux/Windows; mirrors Ctrl+Backspace).
-            KeyEvent {
-                code: KeyCode::Delete,
-                modifiers: KeyModifiers::ALT,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Delete,
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::ALT,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::SUPER,
-                ..
-            } => self.delete_forward_word(),
-            KeyEvent {
-                code: KeyCode::Delete,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => self.delete_forward(1),
-
-            // Readline parity: C-w is unix-word-rubout; M-DEL/C-Backspace
-            // above intentionally keep chunked delete_backward_word.
-            KeyEvent {
-                code: KeyCode::Char('w'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.delete_backward_unix_word();
-            }
-            // Meta-b -> move to beginning of previous word
-            // Meta-f -> move to end of next word
-            // Many terminals map Option (macOS) to Alt. Some send Alt|Shift, so match contains(ALT).
-            KeyEvent {
-                code: KeyCode::Char('b'),
-                modifiers: KeyModifiers::ALT,
-                ..
-            } => {
-                self.set_cursor(self.beginning_of_previous_word());
-            }
-            KeyEvent {
-                code: KeyCode::Char('f'),
-                modifiers: KeyModifiers::ALT,
-                ..
-            } => {
-                self.set_cursor(self.end_of_next_word());
-            }
-            // Ctrl+U / terminal-translated Cmd+Backspace (^U): kill cursor → BOL.
-            // Many terminals map Cmd+Backspace to ^U; kill_current_line would wipe
-            // text after the cursor.
-            KeyEvent {
-                code: KeyCode::Char('u'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.kill_to_beginning_of_line();
-            }
-            KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.kill_to_end_of_line();
-            }
             KeyEvent {
                 code: KeyCode::Char('y'),
                 modifiers: KeyModifiers::CONTROL,
@@ -2152,62 +2036,6 @@ impl TextArea {
                 }
             }
 
-            // Cursor movement
-            KeyEvent {
-                code: KeyCode::Left,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
-                self.move_cursor_left();
-            }
-            KeyEvent {
-                code: KeyCode::Right,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
-                self.move_cursor_right();
-            }
-            KeyEvent {
-                code: KeyCode::Char('b'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.move_cursor_left();
-            }
-            KeyEvent {
-                code: KeyCode::Char('f'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.move_cursor_right();
-            }
-            // Some terminals send Alt+Arrow for word-wise movement:
-            // Option/Left -> Alt+Left (previous word start)
-            // Option/Right -> Alt+Right (next word end)
-            KeyEvent {
-                code: KeyCode::Left,
-                modifiers: KeyModifiers::ALT,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Left,
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.set_cursor(self.beginning_of_previous_word());
-            }
-            KeyEvent {
-                code: KeyCode::Right,
-                modifiers: KeyModifiers::ALT,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Right,
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.set_cursor(self.end_of_next_word());
-            }
             // Cmd+Left / Cmd+Right (macOS): terminals using the Kitty keyboard
             // protocol (Ghostty, Kitty, WezTerm) send these as Super+Arrow.
             KeyEvent {
@@ -2252,25 +2080,11 @@ impl TextArea {
             } => {
                 self.move_cursor_to_beginning_of_line(false);
             }
-            KeyEvent {
-                code: KeyCode::Char('a'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.move_cursor_to_beginning_of_line(true);
-            }
 
             KeyEvent {
                 code: KeyCode::End, ..
             } => {
                 self.move_cursor_to_end_of_line(false);
-            }
-            KeyEvent {
-                code: KeyCode::Char('e'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.move_cursor_to_end_of_line(true);
             }
             _o => {
                 #[cfg(feature = "debug-logs")]
@@ -2284,16 +2098,15 @@ impl TextArea {
     /// Create a snapshot of the current textarea state.
     fn snapshot(&self) -> UndoEntry {
         UndoEntry {
-            text: self.text.clone(),
-            cursor: self.cursor_pos,
+            text: self.text().to_owned(),
+            cursor: self.cursor(),
             elements: self.elements.clone(),
         }
     }
 
     /// Restore the textarea state from a snapshot.
     fn restore(&mut self, entry: UndoEntry) {
-        self.text = entry.text;
-        self.cursor_pos = entry.cursor;
+        self.text = EditBuffer::from_parts(entry.text, entry.cursor);
         self.elements = entry.elements;
         self.wrap_cache.replace(None);
         self.preferred_col = None;
@@ -2322,7 +2135,7 @@ impl TextArea {
             None => true,
             Some(prev) => {
                 prev != kind
-                    || self.cursor_pos != self.undo.last_cursor
+                    || self.cursor() != self.undo.last_cursor
                     || matches!(
                         kind,
                         MutationKind::Kill | MutationKind::Element | MutationKind::Replace
@@ -2344,7 +2157,7 @@ impl TextArea {
     /// Update `last_cursor` after a mutation completes so the next `pre_mutate`
     /// can detect cursor jumps.
     fn post_mutate(&mut self) {
-        self.undo.last_cursor = self.cursor_pos;
+        self.undo.last_cursor = self.cursor();
     }
 
     /// Clear the undo/redo history, leaving the current text and cursor
@@ -2360,7 +2173,7 @@ impl TextArea {
         self.undo.stack.clear();
         self.undo.redo.clear();
         self.undo.last_kind = None;
-        self.undo.last_cursor = self.cursor_pos;
+        self.undo.last_cursor = self.cursor();
     }
 
     /// Undo the last mutation. Returns `true` if there was something to undo.
@@ -2372,7 +2185,7 @@ impl TextArea {
             self.restore(entry);
             // Reset batching — next mutation starts a fresh group.
             self.undo.last_kind = None;
-            self.undo.last_cursor = self.cursor_pos;
+            self.undo.last_cursor = self.cursor();
             true
         } else {
             false
@@ -2388,7 +2201,7 @@ impl TextArea {
             self.restore(entry);
             // Reset batching — next mutation starts a fresh group.
             self.undo.last_kind = None;
-            self.undo.last_cursor = self.cursor_pos;
+            self.undo.last_cursor = self.cursor();
             true
         } else {
             false
@@ -2430,8 +2243,8 @@ impl TextArea {
         if self.undo.group_depth == 0 {
             if let Some(checkpoint) = self.undo.group_checkpoint.take() {
                 // Only push if state actually changed.
-                let changed = checkpoint.text != self.text
-                    || checkpoint.cursor != self.cursor_pos
+                let changed = checkpoint.text.as_str() != self.text()
+                    || checkpoint.cursor != self.cursor()
                     || checkpoint.elements.len() != self.elements.len();
                 if changed {
                     self.undo.stack.push(checkpoint);
@@ -2443,7 +2256,7 @@ impl TextArea {
             }
             // Reset batching state so the next mutation starts fresh.
             self.undo.last_kind = None;
-            self.undo.last_cursor = self.cursor_pos;
+            self.undo.last_cursor = self.cursor();
         }
     }
 
@@ -2462,64 +2275,76 @@ impl TextArea {
         }
         // Reset batching state.
         self.undo.last_kind = None;
-        self.undo.last_cursor = self.cursor_pos;
+        self.undo.last_cursor = self.cursor();
     }
 
     // ####### Input Functions #######
     pub fn delete_backward(&mut self, n: usize) {
-        if n == 0 || self.cursor_pos == 0 {
+        if n == 0 {
             return;
         }
-        self.pre_mutate(MutationKind::Delete);
-        let mut target = self.cursor_pos;
+        if n == 1 {
+            self.apply_edit_command(
+                EditCommand::DeleteGraphemeBackward,
+                Some(MutationKind::Delete),
+            );
+            return;
+        }
+        self.begin_undo_group();
         for _ in 0..n {
-            target = self.prev_atomic_boundary(target);
-            if target == 0 {
+            if matches!(
+                self.apply_edit_command(
+                    EditCommand::DeleteGraphemeBackward,
+                    Some(MutationKind::Delete),
+                ),
+                EditOutcome::Unchanged
+            ) {
                 break;
             }
         }
-        let range = self.expand_range_to_element_boundaries(target..self.cursor_pos);
-        self.replace_range_raw(range, "");
-        self.post_mutate();
+        self.end_undo_group();
     }
 
     pub fn delete_forward(&mut self, n: usize) {
-        if n == 0 || self.cursor_pos >= self.text.len() {
+        if n == 0 {
             return;
         }
-        self.pre_mutate(MutationKind::Delete);
-        let mut target = self.cursor_pos;
+        if n == 1 {
+            self.apply_edit_command(
+                EditCommand::DeleteGraphemeForward,
+                Some(MutationKind::Delete),
+            );
+            return;
+        }
+        self.begin_undo_group();
         for _ in 0..n {
-            target = self.next_atomic_boundary(target);
-            if target >= self.text.len() {
+            if matches!(
+                self.apply_edit_command(
+                    EditCommand::DeleteGraphemeForward,
+                    Some(MutationKind::Delete),
+                ),
+                EditOutcome::Unchanged
+            ) {
                 break;
             }
         }
-        let range = self.expand_range_to_element_boundaries(self.cursor_pos..target);
-        self.replace_range_raw(range, "");
-        self.post_mutate();
+        self.end_undo_group();
     }
 
     pub fn delete_backward_word(&mut self) {
-        let start = self.beginning_of_previous_word();
-        if start >= self.cursor_pos {
-            return;
-        }
-        self.pre_mutate(MutationKind::Kill);
-        self.kill_range(start..self.cursor_pos);
-        self.post_mutate();
+        self.apply_edit_command(
+            EditCommand::DeleteWordBackward(WordStyle::Small),
+            Some(MutationKind::Kill),
+        );
     }
 
     /// readline `unix-word-rubout` (whitespace-delimited), vs
     /// [`Self::delete_backward_word`]'s punctuation-chunked M-DEL semantics.
     pub fn delete_backward_unix_word(&mut self) {
-        let start = self.beginning_of_previous_unix_word();
-        if start >= self.cursor_pos {
-            return;
-        }
-        self.pre_mutate(MutationKind::Kill);
-        self.kill_range(start..self.cursor_pos);
-        self.post_mutate();
+        self.apply_edit_command(
+            EditCommand::DeleteWordBackward(WordStyle::WhitespaceDelimited),
+            Some(MutationKind::Kill),
+        );
     }
 
     /// Delete text to the right of the cursor using readline-style word semantics.
@@ -2528,46 +2353,18 @@ impl TextArea {
     /// by `end_of_next_word()`. Any delimiters between the cursor and that word
     /// (whitespace, punctuation, newlines) are included in the deletion.
     pub fn delete_forward_word(&mut self) {
-        let end = self.end_of_next_word();
-        if end > self.cursor_pos {
-            self.pre_mutate(MutationKind::Kill);
-            self.kill_range(self.cursor_pos..end);
-            self.post_mutate();
-        }
+        self.apply_edit_command(
+            EditCommand::DeleteWordForward(WordStyle::Small),
+            Some(MutationKind::Kill),
+        );
     }
 
     pub fn kill_to_end_of_line(&mut self) {
-        let eol = self.end_of_current_line();
-        let range = if self.cursor_pos == eol {
-            if eol < self.text.len() {
-                Some(self.cursor_pos..eol + 1)
-            } else {
-                None
-            }
-        } else {
-            Some(self.cursor_pos..eol)
-        };
-
-        if let Some(range) = range {
-            self.pre_mutate(MutationKind::Kill);
-            self.kill_range(range);
-            self.post_mutate();
-        }
+        self.apply_edit_command(EditCommand::DeleteToLineEnd, Some(MutationKind::Kill));
     }
 
     pub fn kill_to_beginning_of_line(&mut self) {
-        let bol = self.beginning_of_current_line();
-        let range = if self.cursor_pos == bol {
-            if bol > 0 { Some(bol - 1..bol) } else { None }
-        } else {
-            Some(bol..self.cursor_pos)
-        };
-
-        if let Some(range) = range {
-            self.pre_mutate(MutationKind::Kill);
-            self.kill_range(range);
-            self.post_mutate();
-        }
+        self.apply_edit_command(EditCommand::DeleteToLineStart, Some(MutationKind::Kill));
     }
 
     /// Kill the entire current line (BOL to EOL), regardless of cursor position.
@@ -2583,9 +2380,7 @@ impl TextArea {
         };
 
         if let Some(range) = range {
-            self.pre_mutate(MutationKind::Kill);
-            self.kill_range(range);
-            self.post_mutate();
+            self.apply_edit_replacement(range, "", Some(MutationKind::Kill));
         }
     }
 
@@ -2593,43 +2388,25 @@ impl TextArea {
         if self.kill_buffer.is_empty() {
             return;
         }
-        self.pre_mutate(MutationKind::Insert);
         let text = self.kill_buffer.clone();
-        self.insert_str_inner(self.cursor_pos, &text);
+        self.apply_edit_replacement(
+            self.cursor()..self.cursor(),
+            &text,
+            Some(MutationKind::Insert),
+        );
         if let Some(last) = text.chars().last() {
             self.undo.last_insert_ws = last.is_whitespace();
         }
-        self.post_mutate();
-    }
-
-    fn kill_range(&mut self, range: Range<usize>) {
-        let range = self.expand_range_to_element_boundaries(range);
-        let range = range.start.min(self.text.len())..range.end.min(self.text.len());
-        if range.start >= range.end {
-            return;
-        }
-
-        let removed = self.text[range.clone()].to_string();
-        if removed.is_empty() {
-            return;
-        }
-
-        self.kill_buffer = removed;
-        self.replace_range_raw(range, "");
     }
 
     /// Move the cursor left by a single grapheme cluster.
     pub fn move_cursor_left(&mut self) {
-        self.scroll_override = None;
-        self.cursor_pos = self.prev_atomic_boundary(self.cursor_pos);
-        self.preferred_col = None;
+        self.apply_edit_command(EditCommand::MoveGraphemeLeft, None);
     }
 
     /// Move the cursor right by a single grapheme cluster.
     pub fn move_cursor_right(&mut self) {
-        self.scroll_override = None;
-        self.cursor_pos = self.next_atomic_boundary(self.cursor_pos);
-        self.preferred_col = None;
+        self.apply_edit_command(EditCommand::MoveGraphemeRight, None);
     }
 
     pub fn move_cursor_up(&mut self) {
@@ -2639,10 +2416,10 @@ impl TextArea {
             let cache_ref = self.wrap_cache.borrow();
             if let Some(cache) = cache_ref.as_ref() {
                 let lines = &cache.lines;
-                if let Some(idx) = Self::wrapped_line_index_by_start(lines, self.cursor_pos) {
+                if let Some(idx) = Self::wrapped_line_index_by_start(lines, self.cursor()) {
                     let cur_range = &lines[idx];
                     let target_col = self.preferred_col.unwrap_or_else(|| {
-                        self.display_width_of_range(cur_range.start, self.cursor_pos)
+                        self.display_width_of_range(cur_range.start, self.cursor())
                     });
                     if idx > 0 {
                         let prev = &lines[idx - 1];
@@ -2670,7 +2447,7 @@ impl TextArea {
                 }
                 None => {
                     // Already at first visual line -> move to start
-                    self.cursor_pos = 0;
+                    self.set_cursor_inner(0);
                     self.preferred_col = None;
                     return;
                 }
@@ -2678,7 +2455,7 @@ impl TextArea {
         }
 
         // Fallback to logical line navigation if we don't have wrapping info yet.
-        if let Some(prev_nl) = self.text[..self.cursor_pos].rfind('\n') {
+        if let Some(prev_nl) = self.text[..self.cursor()].rfind('\n') {
             let target_col = match self.preferred_col {
                 Some(c) => c,
                 None => {
@@ -2691,7 +2468,7 @@ impl TextArea {
             let prev_line_end = prev_nl;
             self.move_to_display_col_on_line(prev_line_start, prev_line_end, target_col);
         } else {
-            self.cursor_pos = 0;
+            self.set_cursor_inner(0);
             self.preferred_col = None;
         }
     }
@@ -2703,10 +2480,10 @@ impl TextArea {
             let cache_ref = self.wrap_cache.borrow();
             if let Some(cache) = cache_ref.as_ref() {
                 let lines = &cache.lines;
-                if let Some(idx) = Self::wrapped_line_index_by_start(lines, self.cursor_pos) {
+                if let Some(idx) = Self::wrapped_line_index_by_start(lines, self.cursor()) {
                     let cur_range = &lines[idx];
                     let target_col = self.preferred_col.unwrap_or_else(|| {
-                        self.display_width_of_range(cur_range.start, self.cursor_pos)
+                        self.display_width_of_range(cur_range.start, self.cursor())
                     });
                     if idx + 1 < lines.len() {
                         let next = &lines[idx + 1];
@@ -2733,7 +2510,7 @@ impl TextArea {
                 }
                 None => {
                     // Already on last visual line -> move to end
-                    self.cursor_pos = self.text.len();
+                    self.set_cursor_inner(self.text.len());
                     self.preferred_col = None;
                     return;
                 }
@@ -2749,9 +2526,9 @@ impl TextArea {
                 c
             }
         };
-        if let Some(next_nl) = self.text[self.cursor_pos..]
+        if let Some(next_nl) = self.text[self.cursor()..]
             .find('\n')
-            .map(|i| i + self.cursor_pos)
+            .map(|i| i + self.cursor())
         {
             let next_line_start = next_nl + 1;
             let next_line_end = self.text[next_line_start..]
@@ -2760,7 +2537,7 @@ impl TextArea {
                 .unwrap_or(self.text.len());
             self.move_to_display_col_on_line(next_line_start, next_line_end, target_col);
         } else {
-            self.cursor_pos = self.text.len();
+            self.set_cursor_inner(self.text.len());
             self.preferred_col = None;
         }
     }
@@ -2768,40 +2545,39 @@ impl TextArea {
     /// Home / Super+Left when `move_up_at_bol` is false (visual row if wrapped);
     /// Ctrl+A when true (logical line; already-at-BOL chains to previous line).
     pub fn move_cursor_to_beginning_of_line(&mut self, move_up_at_bol: bool) {
-        if !move_up_at_bol && let Some(bol) = self.beginning_of_current_visual_line() {
+        if move_up_at_bol {
+            self.apply_edit_command(EditCommand::MoveLogicalLineStart, None);
+            return;
+        }
+        if let Some(bol) = self.beginning_of_current_visual_line() {
             self.set_cursor(bol);
             return;
         }
 
         let bol = self.beginning_of_current_line();
-        if move_up_at_bol && self.cursor_pos == bol {
-            self.set_cursor(self.beginning_of_line(self.cursor_pos.saturating_sub(1)));
-        } else {
-            self.set_cursor(bol);
-        }
+        self.set_cursor(bol);
     }
 
     /// End / Super+Right when `move_down_at_eol` is false (visual row if wrapped);
     /// Ctrl+E when true (logical line; already-at-EOL chains to next line).
     pub fn move_cursor_to_end_of_line(&mut self, move_down_at_eol: bool) {
-        if !move_down_at_eol && let Some(eol) = self.end_of_current_visual_line() {
+        if move_down_at_eol {
+            self.apply_edit_command(EditCommand::MoveLogicalLineEnd, None);
+            return;
+        }
+        if let Some(eol) = self.end_of_current_visual_line() {
             self.set_cursor(eol);
             return;
         }
 
         let eol = self.end_of_current_line();
-        if move_down_at_eol && self.cursor_pos == eol {
-            let next_pos = (self.cursor_pos.saturating_add(1)).min(self.text.len());
-            self.set_cursor(self.end_of_line(next_pos));
-        } else {
-            self.set_cursor(eol);
-        }
+        self.set_cursor(eol);
     }
 
     fn beginning_of_current_visual_line(&self) -> Option<usize> {
         let cache = self.wrap_cache.borrow();
         let cache = cache.as_ref()?;
-        let idx = Self::wrapped_line_index_by_start(&cache.lines, self.cursor_pos)?;
+        let idx = Self::wrapped_line_index_by_start(&cache.lines, self.cursor())?;
         Some(cache.lines[idx].start)
     }
 
@@ -2810,7 +2586,7 @@ impl TextArea {
     fn end_of_current_visual_line(&self) -> Option<usize> {
         let cache = self.wrap_cache.borrow();
         let cache = cache.as_ref()?;
-        let idx = Self::wrapped_line_index_by_start(&cache.lines, self.cursor_pos)?;
+        let idx = Self::wrapped_line_index_by_start(&cache.lines, self.cursor())?;
         let line = &cache.lines[idx];
         let end = line.end.min(self.text.len());
         let soft_continued = cache
@@ -2839,15 +2615,8 @@ impl TextArea {
         kind: ElementKind,
         display: Option<Line<'static>>,
     ) -> ElementId {
-        self.pre_mutate(MutationKind::Element);
-        let start = self.clamp_pos_for_insertion(self.cursor_pos);
-        let inserted_len = self.insert_str_inner(start, text);
-        let end = start + inserted_len;
-        let id = self.add_element(start..end, kind, display);
-        // Place cursor at end of inserted element
-        self.set_cursor(end);
-        self.post_mutate();
-        id
+        let plan = self.plan_edit_replacement(self.cursor()..self.cursor(), text);
+        self.apply_element_transaction(plan, kind, display)
     }
 
     /// Replace a range of buffer text with an atomic element.
@@ -2864,15 +2633,23 @@ impl TextArea {
         kind: ElementKind,
         display: Option<Line<'static>>,
     ) -> ElementId {
+        let plan = self.plan_edit_replacement(range, text);
+        self.apply_element_transaction(plan, kind, display)
+    }
+
+    fn apply_element_transaction(
+        &mut self,
+        plan: EditPlan,
+        kind: ElementKind,
+        display: Option<Line<'static>>,
+    ) -> ElementId {
+        let start = plan.replaced_byte_range().start;
+        let inserted_len = plan.replacement().len();
+        self.assert_valid_edit_plan(&plan);
         self.pre_mutate(MutationKind::Element);
-        // First, remove any elements that overlap the replacement range
-        self.elements
-            .retain(|e| !(e.range.start < range.end && e.range.end > range.start));
-        let start = range.start.clamp(0, self.text.len());
-        let inserted_len = self.replace_range_raw(range, text);
+        self.apply_validated_edit_plan(plan, Some(MutationKind::Element));
         let end = start + inserted_len;
         let id = self.add_element(start..end, kind, display);
-        // Place cursor at end of new element
         self.set_cursor(end);
         self.post_mutate();
         id
@@ -2894,6 +2671,7 @@ impl TextArea {
         };
         self.elements.push(elem);
         self.elements.sort_by_key(|e| e.range.start);
+        self.wrap_cache.replace(None);
         id
     }
 
@@ -2905,7 +2683,7 @@ impl TextArea {
     pub fn element_at_cursor(&self) -> Option<&TextElement> {
         self.elements
             .iter()
-            .find(|e| self.cursor_pos >= e.range.start && self.cursor_pos < e.range.end)
+            .find(|e| self.cursor() >= e.range.start && self.cursor() < e.range.end)
     }
 
     /// Returns the underlying buffer text for the element with the given id.
@@ -2961,7 +2739,7 @@ impl TextArea {
         self.pre_mutate(MutationKind::Element);
 
         self.elements.remove(idx);
-        self.cursor_pos = end;
+        self.set_cursor_inner(end);
         self.preferred_col = None;
         self.wrap_cache.replace(None);
         self.undo.last_kind = None; // always discrete
@@ -2980,7 +2758,7 @@ impl TextArea {
         if self.text.is_empty() {
             return None;
         }
-        let pos = self.cursor_pos.min(self.text.len());
+        let pos = self.cursor().min(self.text.len());
 
         // Find word start: scan backward from cursor to find whitespace boundary
         let start = self.text[..pos]
@@ -3029,23 +2807,6 @@ impl TextArea {
         }
         if let Some(idx) = self.find_element_containing(pos) {
             let e = &self.elements[idx];
-            let dist_start = pos.saturating_sub(e.range.start);
-            let dist_end = e.range.end.saturating_sub(pos);
-            if dist_start <= dist_end {
-                e.range.start
-            } else {
-                e.range.end
-            }
-        } else {
-            pos
-        }
-    }
-
-    fn clamp_pos_for_insertion(&self, pos: usize) -> usize {
-        // Do not allow inserting into the middle of an element
-        if let Some(idx) = self.find_element_containing(pos) {
-            let e = &self.elements[idx];
-            // Choose closest edge for insertion
             let dist_start = pos.saturating_sub(e.range.start);
             let dist_end = e.range.end.saturating_sub(pos);
             if dist_start <= dist_end {
@@ -3109,58 +2870,6 @@ impl TextArea {
         self.shift_elements(start, end.saturating_sub(start), inserted_len);
     }
 
-    fn prev_atomic_boundary(&self, pos: usize) -> usize {
-        if pos == 0 {
-            return 0;
-        }
-        // If currently at an element end or inside, jump to start of that element.
-        if let Some(idx) = self
-            .elements
-            .iter()
-            .position(|e| pos > e.range.start && pos <= e.range.end)
-        {
-            return self.elements[idx].range.start;
-        }
-        let mut gc = unicode_segmentation::GraphemeCursor::new(pos, self.text.len(), false);
-        match gc.prev_boundary(&self.text, 0) {
-            Ok(Some(b)) => {
-                if let Some(idx) = self.find_element_containing(b) {
-                    self.elements[idx].range.start
-                } else {
-                    b
-                }
-            }
-            Ok(None) => 0,
-            Err(_) => pos.saturating_sub(1),
-        }
-    }
-
-    fn next_atomic_boundary(&self, pos: usize) -> usize {
-        if pos >= self.text.len() {
-            return self.text.len();
-        }
-        // If currently at an element start or inside, jump to end of that element.
-        if let Some(idx) = self
-            .elements
-            .iter()
-            .position(|e| pos >= e.range.start && pos < e.range.end)
-        {
-            return self.elements[idx].range.end;
-        }
-        let mut gc = unicode_segmentation::GraphemeCursor::new(pos, self.text.len(), false);
-        match gc.next_boundary(&self.text, 0) {
-            Ok(Some(b)) => {
-                if let Some(idx) = self.find_element_containing(b) {
-                    self.elements[idx].range.end
-                } else {
-                    b
-                }
-            }
-            Ok(None) => self.text.len(),
-            Err(_) => pos.saturating_add(1),
-        }
-    }
-
     /// Move to the beginning of the previous navigable chunk.
     ///
     /// Word characters are alphanumeric plus `_`. Punctuation runs (such as
@@ -3168,59 +2877,22 @@ impl TextArea {
     /// right side of `-`, then the left side of `-`, then the start of `aa`.
     /// Whitespace is skipped over. Elements remain atomic units.
     pub fn beginning_of_previous_word(&self) -> usize {
-        let mut pos = self.cursor_pos.min(self.text.len());
-
-        while pos > 0 {
-            let prev = self.prev_atomic_boundary(pos);
-            match self.atomic_unit_class(prev, pos) {
-                Some(0) => pos = prev,
-                Some(_) => break,
-                None => return 0,
-            }
-        }
-
-        if pos == 0 {
-            return 0;
-        }
-
-        let target_class = self.atomic_unit_class(self.prev_atomic_boundary(pos), pos);
-        while pos > 0 {
-            let prev = self.prev_atomic_boundary(pos);
-            if self.atomic_unit_class(prev, pos) == target_class {
-                pos = prev;
-            } else {
-                break;
-            }
-        }
-
-        pos
+        let ranges = self.element_ranges();
+        self.text
+            .plan_command(EditCommand::MoveWordLeft(WordStyle::Small), &ranges)
+            .cursor_byte()
     }
 
     /// Start of the previous whitespace-delimited WORD; elements count as
     /// non-whitespace.
     pub fn beginning_of_previous_unix_word(&self) -> usize {
-        let mut pos = self.cursor_pos.min(self.text.len());
-
-        // Skip the whitespace run (class 0) left of the cursor.
-        while pos > 0 {
-            let prev = self.prev_atomic_boundary(pos);
-            match self.atomic_unit_class(prev, pos) {
-                Some(0) => pos = prev,
-                Some(_) => break,
-                None => return 0,
-            }
-        }
-
-        // Consume non-whitespace units (word chars, punctuation, elements).
-        while pos > 0 {
-            let prev = self.prev_atomic_boundary(pos);
-            match self.atomic_unit_class(prev, pos) {
-                Some(0) | None => break,
-                Some(_) => pos = prev,
-            }
-        }
-
-        pos
+        let ranges = self.element_ranges();
+        self.text
+            .plan_command(
+                EditCommand::MoveWordLeft(WordStyle::WhitespaceDelimited),
+                &ranges,
+            )
+            .cursor_byte()
     }
 
     /// Move to the end of the next navigable chunk.
@@ -3230,32 +2902,10 @@ impl TextArea {
     /// left side of `-`, then the right side of `-`, then the end of `bb`.
     /// Whitespace is skipped over. Elements remain atomic units.
     pub fn end_of_next_word(&self) -> usize {
-        let mut pos = self.cursor_pos.min(self.text.len());
-
-        while pos < self.text.len() {
-            let next = self.next_atomic_boundary(pos);
-            match self.atomic_unit_class(pos, next) {
-                Some(0) => pos = next,
-                Some(_) => break,
-                None => return self.text.len(),
-            }
-        }
-
-        if pos >= self.text.len() {
-            return self.text.len();
-        }
-
-        let target_class = self.atomic_unit_class(pos, self.next_atomic_boundary(pos));
-        while pos < self.text.len() {
-            let next = self.next_atomic_boundary(pos);
-            if self.atomic_unit_class(pos, next) == target_class {
-                pos = next;
-            } else {
-                break;
-            }
-        }
-
-        pos
+        let ranges = self.element_ranges();
+        self.text
+            .plan_command(EditCommand::MoveWordRight(WordStyle::Small), &ranges)
+            .cursor_byte()
     }
 
     fn adjust_pos_out_of_elements(&self, pos: usize, prefer_start: bool) -> usize {
@@ -3493,7 +3143,7 @@ impl TextArea {
         // Where is the cursor within wrapped lines? Prefer assigning boundary positions
         // (where pos equals the start of a wrapped line) to that later line.
         let cursor_line_idx =
-            Self::wrapped_line_index_by_start(lines, self.cursor_pos).unwrap_or(0) as u16;
+            Self::wrapped_line_index_by_start(lines, self.cursor()).unwrap_or(0) as u16;
 
         let mut scroll = current_scroll.min(max_scroll);
 
@@ -3937,6 +3587,281 @@ mod tests {
     }
 
     #[test]
+    fn canonical_adapter_matches_standalone_edit_buffer() {
+        let cases = [
+            (
+                "hello-world",
+                "hello-world".len(),
+                EditCommand::MoveWordLeft(WordStyle::Small),
+            ),
+            (
+                "hello-world",
+                0,
+                EditCommand::MoveWordRight(WordStyle::Small),
+            ),
+            (
+                "foo bar",
+                "foo bar".len(),
+                EditCommand::DeleteWordBackward(WordStyle::Small),
+            ),
+            (
+                "foo bar",
+                0,
+                EditCommand::DeleteWordForward(WordStyle::Small),
+            ),
+            ("one\ntwo", 4, EditCommand::MoveLogicalLineStart),
+            ("one\ntwo", 3, EditCommand::MoveLogicalLineEnd),
+            ("abc", 2, EditCommand::DeleteGraphemeBackward),
+            ("abc", 1, EditCommand::DeleteGraphemeForward),
+        ];
+
+        for (text, cursor, command) in cases {
+            let mut textarea = TextArea::new();
+            textarea.set_text(text);
+            textarea.clear_history();
+            textarea.set_cursor(cursor);
+            let mut buffer = EditBuffer::from_parts(text, cursor);
+
+            textarea.apply_classified_command(command);
+            let _ = buffer.apply(command);
+
+            assert_eq!(textarea.text(), buffer.text());
+            assert_eq!(textarea.cursor(), buffer.cursor_byte());
+        }
+    }
+
+    #[test]
+    fn canonical_adapter_updates_selection_from_applied_delta() {
+        let mut textarea = ta_with("abcdef");
+        textarea.set_selection(4, 6);
+        textarea.replace_range(0..2, "X");
+        assert_eq!(textarea.text(), "Xcdef");
+        assert_eq!(textarea.selection_range(), Some(3..5));
+    }
+
+    #[test]
+    fn canonical_adapter_applies_same_byte_metadata_edits_with_history() {
+        let mut textarea = TextArea::new();
+        let id = textarea.insert_element("TOKEN", ElementKind(1), None);
+        textarea.set_selection(0, 5);
+        textarea.clear_history();
+
+        textarea.replace_range(0..5, "TOKEN");
+        assert_eq!(textarea.text(), "TOKEN");
+        assert!(textarea.elements().is_empty());
+        assert!(textarea.selection.is_none());
+        assert!(textarea.can_undo());
+
+        assert!(textarea.undo());
+        assert_eq!(textarea.text(), "TOKEN");
+        assert_eq!(textarea.elements().len(), 1);
+        assert_eq!(textarea.elements()[0].id, id);
+        assert!(textarea.redo());
+        assert_eq!(textarea.text(), "TOKEN");
+        assert!(textarea.elements().is_empty());
+    }
+
+    #[test]
+    fn replace_element_forces_cursor_end_and_restores_metadata() {
+        let mut before = ta_with("left TOKEN right");
+        before.clear_history();
+        before.set_cursor(0);
+        let id = before.replace_range_with_element(5..10, "NODE", ElementKind(1), None);
+        let end = 5 + "NODE".len();
+        assert_eq!(before.cursor(), end);
+        assert_eq!(before.elements()[0].id, id);
+
+        assert!(before.undo());
+        assert_eq!(before.text(), "left TOKEN right");
+        assert!(before.elements().is_empty());
+        assert_eq!(before.cursor(), 0);
+        assert!(before.redo());
+        assert_eq!(before.text(), "left NODE right");
+        assert_eq!(before.elements()[0].id, id);
+        assert_eq!(before.cursor(), end);
+
+        let mut after = ta_with("left TOKEN right");
+        after.clear_history();
+        after.set_cursor(after.text().len());
+        after.replace_range_with_element(5..10, "NODE", ElementKind(1), None);
+        assert_eq!(after.cursor(), end);
+    }
+
+    #[test]
+    fn empty_set_text_invalidates_redo_and_is_undoable() {
+        let mut textarea = TextArea::new();
+        textarea.insert_str("x");
+        assert!(textarea.undo());
+        assert!(textarea.can_redo());
+
+        textarea.set_text("");
+        assert!(!textarea.can_redo());
+        assert!(textarea.can_undo());
+        assert_eq!(textarea.cursor(), 0);
+    }
+
+    #[test]
+    fn set_text_preserves_cursor_clamped_across_grow_and_shrink() {
+        let mut grow = ta_with("abcd");
+        grow.set_cursor(2);
+        grow.set_text("abcdefgh");
+        assert_eq!(grow.cursor(), 2);
+
+        let mut shrink = ta_with("abcdefgh");
+        shrink.set_cursor(6);
+        shrink.set_text("abc");
+        assert_eq!(shrink.cursor(), 3);
+    }
+
+    #[test]
+    fn set_text_restores_zero_length_element_metadata_through_history() {
+        let mut textarea = TextArea::new();
+        let id = textarea.insert_element("", ElementKind(7), None);
+        textarea.clear_history();
+
+        textarea.set_text("");
+        assert!(textarea.elements().is_empty());
+        assert!(textarea.undo());
+        assert_eq!(textarea.text(), "");
+        assert_eq!(textarea.elements().len(), 1);
+        assert_eq!(textarea.elements()[0].id, id);
+        assert_eq!(textarea.elements()[0].range, 0..0);
+        assert!(textarea.redo());
+        assert!(textarea.elements().is_empty());
+    }
+
+    #[test]
+    fn rejected_adapter_plan_has_no_side_effects() {
+        let mut textarea = TextArea::new();
+        let id = textarea.insert_element("TOKEN", ElementKind(1), None);
+        textarea.set_selection(0, 5);
+        textarea.kill_buffer = "sentinel".to_owned();
+        textarea.preferred_col = Some(3);
+        textarea.scroll_override = Some(2);
+        let _ = textarea.desired_height(20);
+        textarea.clear_history();
+        let plan = textarea.plan_edit_replacement(0..5, "X");
+        let _ = textarea.text.set_cursor_byte(0);
+
+        let result = textarea.try_apply_edit_plan(plan, Some(MutationKind::Replace));
+        assert_eq!(result, Err(ApplyEditPlanError::StalePlan));
+        assert_eq!(textarea.text(), "TOKEN");
+        assert_eq!(textarea.elements().len(), 1);
+        assert_eq!(textarea.elements()[0].id, id);
+        assert_eq!(textarea.selection_range(), Some(0..5));
+        assert_eq!(textarea.kill_buffer, "sentinel");
+        assert_eq!(textarea.preferred_col, Some(3));
+        assert_eq!(textarea.scroll_override, Some(2));
+        assert!(textarea.wrap_cache.borrow().is_some());
+        assert!(!textarea.can_undo());
+    }
+
+    #[test]
+    fn handled_boundary_navigation_clears_vertical_affinity() {
+        let mut textarea = ta_with("ab\nwxyz");
+        textarea.set_cursor(0);
+        textarea.preferred_col = Some(3);
+        textarea.scroll_override = Some(2);
+
+        textarea.move_cursor_left();
+        assert_eq!(textarea.cursor(), 0);
+        assert_eq!(textarea.preferred_col, None);
+        assert_eq!(textarea.scroll_override, None);
+
+        textarea.move_cursor_down();
+        assert_eq!(textarea.cursor(), 3);
+    }
+
+    #[test]
+    fn insert_str_at_inside_element_clamps_to_an_atomic_boundary() {
+        let mut textarea = TextArea::new();
+        textarea.insert_str("a");
+        textarea.insert_element("TOKEN", ElementKind(1), None);
+        textarea.insert_str("b");
+        textarea.clear_history();
+
+        textarea.insert_str_at(3, "X");
+        assert_eq!(textarea.text(), "aXTOKENb");
+        assert_eq!(textarea.cursor(), 8);
+        assert_eq!(textarea.elements()[0].range, 2..7);
+        assert!(textarea.undo());
+        assert_eq!(textarea.text(), "aTOKENb");
+        assert_eq!(textarea.elements()[0].range, 1..6);
+    }
+
+    #[test]
+    fn canonical_adapter_keeps_elements_atomic_for_motion_and_deletion() {
+        let mut backward = TextArea::new();
+        backward.insert_str("a");
+        let id = backward.insert_element("TOKEN", ElementKind(1), None);
+        backward.insert_str("b");
+        let range = backward.elements()[0].range.clone();
+        backward.set_cursor(range.end);
+        backward.move_cursor_left();
+        assert_eq!(backward.cursor(), range.start);
+        backward.move_cursor_right();
+        assert_eq!(backward.cursor(), range.end);
+        backward.delete_backward(1);
+        assert_eq!(backward.text(), "ab");
+        assert!(backward.elements().iter().all(|element| element.id != id));
+
+        let mut forward = TextArea::new();
+        forward.insert_str("a");
+        forward.insert_element("TOKEN", ElementKind(1), None);
+        forward.insert_str("b");
+        let range = forward.elements()[0].range.clone();
+        forward.set_cursor(range.start);
+        forward.delete_forward(1);
+        assert_eq!(forward.text(), "ab");
+        assert!(forward.elements().is_empty());
+    }
+
+    #[test]
+    fn canonical_adapter_ignores_element_newlines_and_restores_kills() {
+        let mut textarea = TextArea::new();
+        textarea.insert_str("a");
+        textarea.insert_element("X\nY", ElementKind(1), None);
+        textarea.insert_str("b\nc");
+        textarea.clear_history();
+
+        textarea.set_cursor(0);
+        textarea.move_cursor_to_end_of_line(true);
+        assert_eq!(textarea.cursor(), 5);
+        textarea.set_cursor(0);
+        textarea.kill_to_end_of_line();
+        assert_eq!(textarea.text(), "\nc");
+        assert_eq!(textarea.kill_buffer, "aX\nYb");
+
+        assert!(textarea.undo());
+        assert_eq!(textarea.text(), "aX\nYb\nc");
+        assert_eq!(textarea.elements().len(), 1);
+        assert!(textarea.redo());
+        assert_eq!(textarea.text(), "\nc");
+        assert!(textarea.elements().is_empty());
+    }
+
+    #[test]
+    fn canonical_adapter_preserves_right_affinity_through_undo_redo() {
+        let woman = "👩";
+        let tail = "👩🏽\u{200d}💻";
+        let original = format!("{woman}{tail}");
+        let mut textarea = ta_with(&original);
+        textarea.clear_history();
+        textarea.set_cursor(woman.len());
+
+        textarea.insert_str("\u{200d}");
+        assert_eq!(textarea.text().graphemes(true).count(), 1);
+        assert_eq!(textarea.cursor(), textarea.text().len());
+
+        assert!(textarea.undo());
+        assert_eq!(textarea.text(), original);
+        assert_eq!(textarea.cursor(), woman.len());
+        assert!(textarea.redo());
+        assert_eq!(textarea.text().graphemes(true).count(), 1);
+        assert_eq!(textarea.cursor(), textarea.text().len());
+    }
+
+    #[test]
     fn is_undo_input_accepts_ctrl_and_cmd_z() {
         assert!(is_undo_input(&KeyEvent::new(
             KeyCode::Char('z'),
@@ -4240,7 +4165,9 @@ mod tests {
 
         // cursor in the middle of the element, delete_forward_word deletes the element
         let elem_range = t.elements()[0].range.clone();
-        t.cursor_pos = elem_range.start + (elem_range.len() / 2);
+        let _ = t
+            .text
+            .set_cursor_byte(elem_range.start + (elem_range.len() / 2));
         t.delete_forward_word();
         assert_eq!(t.text(), "prefix  tail");
         assert_eq!(t.cursor(), elem_range.start);
@@ -5375,6 +5302,20 @@ mod tests {
     }
 
     #[test]
+    fn no_op_kill_preserves_the_kill_buffer() {
+        let mut textarea = ta_with("hello");
+        textarea.set_cursor(0);
+        textarea.kill_to_end_of_line();
+        assert_eq!(textarea.kill_buffer, "hello");
+
+        textarea.set_text("world");
+        textarea.set_cursor(textarea.text().len());
+        textarea.kill_to_end_of_line();
+        textarea.yank();
+        assert_eq!(textarea.text(), "worldhello");
+    }
+
+    #[test]
     fn kill_buffer_survives_set_text() {
         // A cut must outlive the buffer reset that send does via set_text("").
         let mut t = ta_with("hello");
@@ -5660,6 +5601,26 @@ mod tests {
     }
 
     #[test]
+    fn raw_delete_chars_ignore_stray_modifiers() {
+        for raw in ['\u{0008}', '\u{007f}'] {
+            for modifiers in [
+                KeyModifiers::ALT,
+                KeyModifiers::CONTROL,
+                KeyModifiers::SUPER,
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+            ] {
+                let mut t = ta_with("alpha beta");
+                t.input(KeyEvent::new(KeyCode::Char(raw), modifiers));
+                assert_eq!(
+                    t.text(),
+                    "alpha bet",
+                    "raw {raw:?} with {modifiers:?} must delete one grapheme",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn del_char_treated_as_backspace() {
         // When Kitty keyboard protocol gets silently popped, Backspace can
         // arrive as raw DEL (0x7F) instead of KeyCode::Backspace. Ensure it
@@ -5676,7 +5637,6 @@ mod tests {
         assert_eq!(t.text(), "helo");
         assert_eq!(t.cursor(), 0);
 
-        // With modifiers (e.g. ALT): still treated as backspace
         t.set_cursor(t.text().len());
         t.input(KeyEvent::new(KeyCode::Char('\u{007f}'), KeyModifiers::ALT));
         assert_eq!(t.text(), "hel");
@@ -6305,7 +6265,7 @@ mod tests {
                         ta.insert_str(&s);
                     }
                     1 => {
-                        // replace_range with small random slice
+                        // Include mid-grapheme char boundaries so normalization stays exercised.
                         let mut b: Vec<usize> = vec![0];
                         b.extend(ta.text().char_indices().map(|(i, _)| i).skip(1));
                         b.push(ta.text().len());
@@ -6322,24 +6282,17 @@ mod tests {
                             s.push_str(&rand_grapheme(&mut rng));
                         }
                         let before = ta.text().len();
-                        // If the chosen range intersects an element, replace_range will expand to
-                        // element boundaries, so the naive size delta assertion does not hold.
-                        let intersects_element = elem_texts.iter().any(|payload| {
-                            if let Some(pstart) = ta.text().find(payload) {
-                                let pend = pstart + payload.len();
-                                pstart < end && pend > start
-                            } else {
-                                false
-                            }
-                        });
+                        let atomic_ranges = ta.element_ranges();
+                        let plan = ta
+                            .text
+                            .plan_replace_byte_range(start..end, &s, &atomic_ranges);
+                        let normalized_len = plan.replaced_byte_range().len();
                         ta.replace_range(start..end, &s);
-                        if !intersects_element {
-                            let after = ta.text().len();
-                            assert_eq!(
-                                after as isize,
-                                before as isize + (s.len() as isize) - ((end - start) as isize)
-                            );
-                        }
+                        let after = ta.text().len();
+                        assert_eq!(
+                            after as isize,
+                            before as isize + (s.len() as isize) - (normalized_len as isize)
+                        );
                     }
                     2 => ta.delete_backward(rng.random_range(0..=3)),
                     3 => ta.delete_forward(rng.random_range(0..=3)),
@@ -6989,6 +6942,47 @@ mod tests {
     }
 
     #[test]
+    fn multi_grapheme_delete_calls_are_single_undo_steps() {
+        for forward in [false, true] {
+            let mut ta = ta_with("hello");
+            if forward {
+                ta.set_cursor(0);
+                ta.delete_forward(2);
+                assert_eq!(ta.text(), "llo");
+            } else {
+                ta.delete_backward(2);
+                assert_eq!(ta.text(), "hel");
+            }
+            assert!(ta.undo());
+            assert_eq!(ta.text(), "hello");
+        }
+    }
+
+    #[test]
+    fn multi_count_deletes_cross_atomic_element_boundaries() {
+        let mut backward = TextArea::new();
+        backward.insert_str("a");
+        backward.insert_element("TOKEN", ElementKind(1), None);
+        backward.insert_str("b");
+        backward.delete_backward(2);
+        assert_eq!(backward.text(), "a");
+        assert!(backward.elements().is_empty());
+        assert!(backward.undo());
+        assert_eq!(backward.text(), "aTOKENb");
+
+        let mut forward = TextArea::new();
+        forward.insert_str("a");
+        forward.insert_element("TOKEN", ElementKind(1), None);
+        forward.insert_str("b");
+        forward.set_cursor(0);
+        forward.delete_forward(2);
+        assert_eq!(forward.text(), "b");
+        assert!(forward.elements().is_empty());
+        assert!(forward.undo());
+        assert_eq!(forward.text(), "aTOKENb");
+    }
+
+    #[test]
     fn batch_consecutive_deletes_into_one_undo_step() {
         let mut ta = TextArea::new();
         ta.insert_str("hello");
@@ -7243,15 +7237,36 @@ mod tests {
         let id = ta.insert_element("@foo", ElementKind(1), None);
         assert_eq!(ta.elements().len(), 1);
         assert_eq!(ta.elements()[0].id, id);
+        assert_eq!(ta.cursor(), "@foo".len());
 
         ta.undo(); // remove element
         assert!(ta.elements().is_empty());
         assert_eq!(ta.text(), "");
+        assert_eq!(ta.cursor(), 0);
 
         ta.redo(); // restore element — same ElementId
         assert_eq!(ta.elements().len(), 1);
         assert_eq!(ta.elements()[0].id, id);
         assert_eq!(ta.text(), "@foo");
+        assert_eq!(ta.cursor(), "@foo".len());
+    }
+
+    #[test]
+    fn undo_redo_zero_length_element_preserves_metadata_and_cursor() {
+        let mut ta = TextArea::new();
+        let id = ta.insert_element("", ElementKind(9), None);
+        assert_eq!(ta.cursor(), 0);
+        assert_eq!(ta.elements()[0].range, 0..0);
+
+        assert!(ta.undo());
+        assert!(ta.elements().is_empty());
+        assert_eq!(ta.cursor(), 0);
+
+        assert!(ta.redo());
+        assert_eq!(ta.elements().len(), 1);
+        assert_eq!(ta.elements()[0].id, id);
+        assert_eq!(ta.elements()[0].range, 0..0);
+        assert_eq!(ta.cursor(), 0);
     }
 
     #[test]
@@ -7754,10 +7769,13 @@ mod tests {
     #[test]
     fn undo_after_delete_selection_restores() {
         let mut ta = ta_with("hello world");
+        ta.set_cursor(ta.text().len());
         ta.set_selection(0, 5);
 
         ta.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(ta.text(), " world");
+        assert_eq!(ta.cursor(), 0);
+        assert_eq!(ta.undo.last_cursor, 0);
 
         ta.undo();
         assert_eq!(ta.text(), "hello world");
@@ -9007,7 +9025,7 @@ mod tests {
         let mut ta = TextArea::new();
         ta.insert_str("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
         // Move cursor to start so we can verify it doesn't move.
-        ta.cursor_pos = 0;
+        let _ = ta.text.set_cursor_byte(0);
         let area = Rect::new(0, 0, 20, 5);
         let state = TextAreaState::default();
         // Click on the scrollbar column (rightmost column = 19),
@@ -9024,7 +9042,7 @@ mod tests {
         );
         assert_eq!(action, MouseAction::Scrolled);
         // Cursor should not have moved — scrollbar click doesn't place cursor.
-        assert_eq!(ta.cursor_pos, 0);
+        assert_eq!(ta.cursor(), 0);
         // scroll_override should be set.
         assert!(ta.scroll_override.is_some());
     }
@@ -9193,7 +9211,7 @@ mod tests {
         let mut ta = TextArea::new();
         // Fill 18 chars + enough lines to overflow.
         ta.insert_str(&format!("{}\n2\n3\n4\n5\n6", "x".repeat(18)));
-        ta.cursor_pos = 0; // at start
+        let _ = ta.text.set_cursor_byte(0); // at start
         let area = Rect::new(0, 0, 20, 5);
         let state = TextAreaState::default();
         let pos = ta.cursor_pos_with_state(area, state);
@@ -9633,14 +9651,48 @@ mod tests {
     }
 
     #[test]
-    fn apply_shift_only_uppercases_letters() {
-        assert_eq!(TextArea::apply_shift('a'), 'A');
-        assert_eq!(TextArea::apply_shift('z'), 'Z');
-        assert_eq!(TextArea::apply_shift('A'), 'A');
-        // Non-letters pass through unchanged (trust the terminal's layout mapping).
-        assert_eq!(TextArea::apply_shift('7'), '7');
-        assert_eq!(TextArea::apply_shift('/'), '/');
-        assert_eq!(TextArea::apply_shift(';'), ';');
+    fn shifted_character_classification_only_uppercases_letters() {
+        for (input, expected) in [
+            ('a', 'A'),
+            ('z', 'Z'),
+            ('A', 'A'),
+            ('7', '7'),
+            ('/', '/'),
+            (';', ';'),
+        ] {
+            assert_eq!(
+                classify_key_event(&KeyEvent::new(KeyCode::Char(input), KeyModifiers::SHIFT)),
+                Some(EditCommand::Insert(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn modified_delete_and_arrow_keys_keep_word_semantics() {
+        for modifiers in [
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        ] {
+            assert_eq!(
+                classify_key_event(&KeyEvent::new(KeyCode::Delete, modifiers)),
+                Some(EditCommand::DeleteWordForward(WordStyle::Small)),
+            );
+            assert_eq!(
+                classify_key_event(&KeyEvent::new(KeyCode::Left, modifiers)),
+                Some(EditCommand::MoveWordLeft(WordStyle::Small)),
+            );
+            assert_eq!(
+                classify_key_event(&KeyEvent::new(KeyCode::Right, modifiers)),
+                Some(EditCommand::MoveWordRight(WordStyle::Small)),
+            );
+        }
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::SUPER] {
+            assert_eq!(
+                classify_key_event(&KeyEvent::new(KeyCode::Char('d'), modifiers)),
+                Some(EditCommand::DeleteWordForward(WordStyle::Small)),
+            );
+        }
     }
 
     #[test]

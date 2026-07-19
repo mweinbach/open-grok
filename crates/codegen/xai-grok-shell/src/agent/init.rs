@@ -137,6 +137,8 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
         let grok_home = crate::util::grok_home::grok_home();
         crate::builtin::extract_bundled_files(&grok_home);
 
+        crate::extensions::marketplace::purge_default_skills_installs(&grok_home);
+
         // Auto-register is gated (default off; env/remote settings enables). Kept out
         // of extract_bundled_files so the gate can read the resolved
         // remote_settings, which resolve_config has populated by now.

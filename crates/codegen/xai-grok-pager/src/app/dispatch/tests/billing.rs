@@ -1,6 +1,7 @@
 //! Tests for credit-limit upsells, paywall gating, and auto-topup.
 
 use super::*;
+use xai_grok_shell::sampling::error::is_free_usage_exhausted_error;
 
 // ── Credit-limit upsell / max-tier tests ───────────────────────────
 

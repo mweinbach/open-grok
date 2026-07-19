@@ -279,14 +279,15 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                 // Nothing running locally: adopt now + run the turn-start shim
                 // (render the queued prompt's user block, set `TurnRunning`).
                 None => {
-                    if let Some(agent) = app.agents.get_mut(&aid) {
+                    let page_flip_entry = app.agents.get_mut(&aid).and_then(|agent| {
                         super::super::dispatch::apply_turn_start_shim(
                             agent,
                             pid,
                             running_text,
                             &running_kind,
-                        );
-                    }
+                        )
+                    });
+                    super::super::dispatch::note_peek_page_flip(app, aid, page_flip_entry);
                 }
                 // A different prompt is still finishing locally (FIFO handoff
                 // race — the next broadcast can arrive before the previous

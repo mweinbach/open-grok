@@ -594,8 +594,12 @@ impl ToolBridge {
 
     /// Drain newly-completed bash background tasks not yet reported.
     /// Marks returned tasks in [`ReportedTaskCompletions`] to prevent
-    /// duplicate reminders from [`TaskCompletionReminder`].
-    pub async fn drain_between_turn_bash_completions(&self) -> Vec<TaskSnapshot> {
+    /// duplicate reminders from [`TaskCompletionReminder`]. Reserved IDs stay
+    /// unreported for a later genuine user turn.
+    pub async fn drain_between_turn_bash_completions(
+        &self,
+        reserved_ids: &[String],
+    ) -> Vec<TaskSnapshot> {
         let tasks = match self.list_tasks().await {
             Some(t) => t,
             None => return Vec::new(),
@@ -625,6 +629,7 @@ impl ToolBridge {
         completed
             .into_iter()
             .filter(|t| task_owned_by_session(t, my_owner.as_deref()))
+            .filter(|t| !reserved_ids.contains(&t.task_id))
             .filter(|t| state.mark_reported(&t.task_id))
             .collect()
     }
@@ -817,7 +822,7 @@ mod tests {
             terminal: Some(backend),
         };
 
-        let drained = bridge.drain_between_turn_bash_completions().await;
+        let drained = bridge.drain_between_turn_bash_completions(&[]).await;
         let ids: Vec<&str> = drained.iter().map(|t| t.task_id.as_str()).collect();
 
         assert!(ids.contains(&"mine-task"), "own task must drain: {ids:?}");
@@ -828,6 +833,38 @@ mod tests {
         assert!(
             !ids.contains(&"parent-task"),
             "another session's task must NOT leak into this session: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn between_turn_bash_completions_skip_reserved_ids_without_reporting_them() {
+        let toolset = FinalizedToolset::empty_for_test();
+        {
+            let mut res = toolset.resources.lock().await;
+            res.register_state::<ReportedTaskCompletions>();
+        }
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal {
+            tasks: vec![completed_task("reserved", None)],
+        });
+        let bridge = ToolBridge {
+            registry: Arc::new(toolset),
+            terminal: Some(backend),
+        };
+
+        assert!(
+            bridge
+                .drain_between_turn_bash_completions(&["reserved".to_string()])
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            bridge
+                .drain_between_turn_bash_completions(&[])
+                .await
+                .into_iter()
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>(),
+            vec!["reserved".to_string()]
         );
     }
 }

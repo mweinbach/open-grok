@@ -85,11 +85,11 @@ use super::settings::setters::{
     set_default_selected_permission, set_display_refresh_auto_cadence, set_fork_secondary_model,
     set_group_tool_verbs, set_hunk_tracker_mode, set_invert_scroll, set_keep_text_selection,
     set_kimi_api_endpoint, set_kimi_api_key, set_max_thoughts_width, set_memory_model,
-    set_multiline_mode, set_perplexity_api_key, set_perplexity_web_search, set_prompt_suggestions,
-    set_recap_model, set_remember_tool_approvals, set_render_mermaid, set_respect_manual_folds,
-    set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed, set_show_thinking_blocks,
-    set_show_tips, set_simple_mode, set_theme, set_timeline, set_timestamps, set_vim_mode,
-    set_voice_capture_mode, set_voice_stt_language,
+    set_multiline_mode, set_page_flip_on_send, set_perplexity_api_key, set_perplexity_web_search,
+    set_prompt_suggestions, set_recap_model, set_remember_tool_approvals, set_render_mermaid,
+    set_respect_manual_folds, set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed,
+    set_show_thinking_blocks, set_show_tips, set_simple_mode, set_theme, set_timeline,
+    set_timestamps, set_vim_mode, set_voice_capture_mode, set_voice_stt_language,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette, dispatch_open_howto_guides,
@@ -121,9 +121,22 @@ use crate::app::app_view::{ActiveView, AppView, AuthState};
 use crate::scrollback::types::DisplayMode;
 use crate::views::session_picker::CONTENT_EXPAND_OFFSET;
 use xai_grok_telemetry::session_ctx::log_event;
-
-pub(super) fn auth_copy_was_confirmed(delivery: crate::clipboard::ClipboardDelivery) -> bool {
-    delivery == crate::clipboard::ClipboardDelivery::Confirmed
+pub(super) fn dispatch_copy_auth_url(
+    app: &mut AppView,
+    copy: impl FnOnce(&str) -> crate::clipboard::ClipboardDelivery,
+) -> Vec<Effect> {
+    let AuthState::Authenticating {
+        auth_url: Some(url),
+        ..
+    } = &app.auth_state
+    else {
+        return vec![];
+    };
+    app.auth_clipboard_delivery = Some(copy(url));
+    app.auth_clipboard_feedback_generation = app.auth_clipboard_feedback_generation.wrapping_add(1);
+    vec![Effect::ScheduleClearAuthCopyFeedback {
+        generation: app.auth_clipboard_feedback_generation,
+    }]
 }
 
 /// Dispatch an action: mutate state, return effects to execute.
@@ -1007,6 +1020,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetCompactMode(v) => set_compact_mode(app, v),
         Action::SetTimestamps(v) => set_timestamps(app, v),
         Action::SetTimeline(v) => set_timeline(app, v),
+        Action::SetPageFlipOnSend(v) => set_page_flip_on_send(app, v),
         Action::SetSimpleMode(v) => set_simple_mode(app, v),
         Action::SetContextualHintUndo(v) => set_contextual_hint_undo(app, v),
         Action::SetContextualHintPlanMode(v) => set_contextual_hint_plan_mode(app, v),
@@ -1109,19 +1123,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::CancelLogin => dispatch_cancel_login(app),
         Action::SubmitAuthCode(code) => dispatch_submit_auth_code(app, code),
         Action::CopyAuthUrl => {
-            if let AuthState::Authenticating {
-                auth_url: Some(url),
-                ..
-            } = &app.auth_state
-            {
-                app.auth_clipboard_copied =
-                    auth_copy_was_confirmed(crate::clipboard::SystemClipboard::try_set(url));
-            }
-            if app.auth_clipboard_copied {
-                vec![Effect::ScheduleClearAuthCopied]
-            } else {
-                vec![]
-            }
+            dispatch_copy_auth_url(app, crate::clipboard::SystemClipboard::try_set)
         }
         Action::ShowRawAuthUrl => {
             app.auth_show_raw_url = true;
@@ -1258,14 +1260,6 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::DashboardCancelRename => {
             if let Some(d) = app.dashboard.as_mut() {
                 d.rename = None;
-            }
-            vec![]
-        }
-        Action::DashboardRenameInput(text) => {
-            if let Some(d) = app.dashboard.as_mut()
-                && let Some(rn) = d.rename.as_mut()
-            {
-                rn.draft = text;
             }
             vec![]
         }

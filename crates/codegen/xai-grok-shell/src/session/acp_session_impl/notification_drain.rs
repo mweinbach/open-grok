@@ -19,6 +19,99 @@ pub(crate) struct PendingNotification {
 }
 
 impl SessionActor {
+    pub(super) fn push_pending_notification(state: &mut State, notification: PendingNotification) {
+        state.pending_notifications.push(notification);
+        let excess = state
+            .pending_notifications
+            .len()
+            .saturating_sub(MAX_PENDING_NOTIFICATIONS);
+        if excess > 0 {
+            state.pending_notifications.drain(..excess);
+            tracing::warn!(
+                dropped = excess,
+                "Dropped oldest pending notifications (exceeded cap of {})",
+                MAX_PENDING_NOTIFICATIONS,
+            );
+        }
+    }
+
+    pub(super) fn push_task_wake_fallback(state: &mut State, fallback: TaskWakeFallback) {
+        Self::push_pending_notification(
+            state,
+            PendingNotification {
+                prompt_id: fallback.prompt_id,
+                prompt_blocks: fallback.prompt_blocks,
+                priority: NotificationPriority::Later,
+                source: fallback.source,
+            },
+        );
+    }
+
+    pub(super) async fn consume_deferred_completions(&self) -> Vec<String> {
+        let mut state = self.state.lock().await;
+        self.sweep_monitor_buffer_into_pending(&mut state, "monitor-user-start-drain");
+        let mut completion_ids: Vec<String> = state
+            .pending_notifications
+            .iter()
+            .filter_map(|notification| match &notification.source {
+                NotificationSource::BashTaskCompleted { task_id }
+                | NotificationSource::MonitorCompleted { task_id } => Some(task_id.clone()),
+                NotificationSource::MonitorEvent { .. } => None,
+            })
+            .collect();
+        completion_ids.sort();
+        completion_ids.dedup();
+        let deferred_ids: std::collections::HashSet<&str> =
+            completion_ids.iter().map(String::as_str).collect();
+
+        let notifications = std::mem::take(&mut state.pending_notifications);
+        let mut deferred = Vec::new();
+        let mut retained = Vec::new();
+        for notification in notifications {
+            let consume = match &notification.source {
+                NotificationSource::BashTaskCompleted { .. }
+                | NotificationSource::MonitorCompleted { .. } => true,
+                NotificationSource::MonitorEvent { task_id } => {
+                    deferred_ids.contains(task_id.as_str())
+                }
+            };
+            if consume {
+                deferred.push(notification);
+            } else {
+                retained.push(notification);
+            }
+        }
+        state.pending_notifications = retained;
+
+        let completion_blocks =
+            Self::notification_blocks(&deferred, &self.tool_context.task_output_tool_name);
+        drop(state);
+
+        let completion_text = completion_blocks
+            .into_iter()
+            .filter_map(|block| match block {
+                acp::ContentBlock::Text(text) => Some(text.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !completion_text.is_empty() {
+            self.push_system_reminder(&completion_text);
+        }
+        let completion_id_refs: Vec<&str> = completion_ids.iter().map(String::as_str).collect();
+        self.mark_completions_reported(&completion_id_refs).await;
+        completion_ids
+    }
+
+    pub(super) async fn consume_deferred_completions_for_user_turn(&self) {
+        let consumed = self.consume_deferred_completions().await;
+        if let Some(reservations) = &self.tool_context.task_completion_reservations {
+            for task_id in consumed {
+                reservations.release(&task_id);
+            }
+        }
+    }
+
     pub(super) async fn maybe_start_running_task(
         self: Arc<Self>,
         completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
@@ -80,6 +173,7 @@ impl SessionActor {
             screen_mode,
             verbatim,
             json_schema,
+            origin,
         ) = {
             let Some(front) = state.pending_inputs.front_mut() else {
                 return;
@@ -96,8 +190,20 @@ impl SessionActor {
                 front.screen_mode.clone(),
                 front.verbatim,
                 front.json_schema.clone(),
+                front.origin.clone(),
             )
         };
+        if matches!(origin, super::PromptOrigin::User) {
+            if let Some(gate) = &self.tool_context.task_wake_suppressed {
+                gate.set(false);
+            }
+            state.notifications_suppressed = false;
+            xai_grok_telemetry::unified_log::info(
+                "shell.task_wake.gate_cleared",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({ "reason": "queued_user_promotion" })),
+            );
+        }
         {
             let mut current_prompt_id = self
                 .current_prompt_id
@@ -272,16 +378,19 @@ impl SessionActor {
             buffer,
             Some(self.session_info.id.0.as_ref()),
         ) {
-            state.pending_notifications.push(PendingNotification {
-                prompt_id: format!("{prompt_id_prefix}-{}", uuid::Uuid::now_v7()),
-                prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
-                    event.event_text,
-                ))],
-                priority: NotificationPriority::Next,
-                source: NotificationSource::MonitorEvent {
-                    task_id: event.task_id,
+            Self::push_pending_notification(
+                state,
+                PendingNotification {
+                    prompt_id: format!("{prompt_id_prefix}-{}", uuid::Uuid::now_v7()),
+                    prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        event.event_text,
+                    ))],
+                    priority: NotificationPriority::Next,
+                    source: NotificationSource::MonitorEvent {
+                        task_id: event.task_id,
+                    },
                 },
-            });
+            );
         }
     }
 
@@ -313,35 +422,34 @@ impl SessionActor {
         (to_surface, dropped)
     }
 
-    /// Build the merged `NotificationDrain` `InputItem` from `notifications`
-    /// and push it onto `state.pending_inputs`. Always returns `true` so the
-    /// caller starts the running task.
-    ///
-    /// Monitor-event notifications are collapsed into ONE
-    /// `format_monitor_events` block (same batched/deduped shape as the
-    /// mid-turn injection — `<monitor task_id=…>` groups with `[label N]`
-    /// lines), placed at the position of the first monitor entry. Other
-    /// notifications keep their raw blocks. Everything joins with `---`.
-    pub(super) fn drain_notifications_into_turn(
-        state: &mut State,
-        notifications: Vec<PendingNotification>,
+    fn notification_blocks(
+        notifications: &[PendingNotification],
         task_output_tool_name: &str,
-    ) -> bool {
+    ) -> Vec<acp::ContentBlock> {
         use xai_grok_tools::implementations::grok_build::task::types::MonitorEventNotification;
 
-        // Collapse monitor entries: collect their text into events, remember
-        // where the first one sat so the batch lands in arrival position.
+        let completion_task_ids: std::collections::HashSet<&str> = notifications
+            .iter()
+            .filter_map(|notification| match &notification.source {
+                NotificationSource::MonitorCompleted { task_id } => Some(task_id.as_str()),
+                NotificationSource::MonitorEvent { .. }
+                | NotificationSource::BashTaskCompleted { .. } => None,
+            })
+            .collect();
         let mut monitor_events: Vec<MonitorEventNotification> = Vec::new();
         let mut sections: Vec<Vec<acp::ContentBlock>> = Vec::new();
         let mut monitor_section_idx: Option<usize> = None;
-        for notif in &notifications {
-            match &notif.source {
+        for notification in notifications {
+            match &notification.source {
                 NotificationSource::MonitorEvent { task_id } => {
-                    let event_text = notif
+                    if completion_task_ids.contains(task_id.as_str()) {
+                        continue;
+                    }
+                    let event_text = notification
                         .prompt_blocks
                         .iter()
-                        .filter_map(|b| match b {
-                            acp::ContentBlock::Text(t) => Some(t.text.as_str()),
+                        .filter_map(|block| match block {
+                            acp::ContentBlock::Text(text) => Some(text.text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -353,33 +461,42 @@ impl SessionActor {
                     });
                     if monitor_section_idx.is_none() {
                         monitor_section_idx = Some(sections.len());
-                        sections.push(Vec::new()); // placeholder, filled below
+                        sections.push(Vec::new());
                     }
                 }
-                NotificationSource::BashTaskCompleted { .. } => {
-                    sections.push(notif.prompt_blocks.clone());
+                NotificationSource::MonitorCompleted { .. }
+                | NotificationSource::BashTaskCompleted { .. } => {
+                    sections.push(notification.prompt_blocks.clone());
                 }
             }
         }
-        if let (Some(idx), Some(batch)) = (
+        if let (Some(index), Some(batch)) = (
             monitor_section_idx,
             xai_grok_tools::reminders::task_completion::format_monitor_events(
                 &monitor_events,
                 Some(task_output_tool_name),
             ),
         ) {
-            sections[idx] = vec![acp::ContentBlock::Text(acp::TextContent::new(batch))];
+            sections[index] = vec![acp::ContentBlock::Text(acp::TextContent::new(batch))];
         }
 
-        let mut merged_blocks: Vec<acp::ContentBlock> = Vec::new();
-        for (i, section) in sections.iter().enumerate() {
-            if i > 0 {
-                merged_blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
-                    "---".to_string(),
-                )));
+        let mut blocks = Vec::new();
+        for (index, section) in sections.iter().enumerate() {
+            if index > 0 {
+                blocks.push(acp::ContentBlock::Text(acp::TextContent::new("---")));
             }
-            merged_blocks.extend(section.iter().cloned());
+            blocks.extend(section.iter().cloned());
         }
+        blocks
+    }
+
+    /// Merge notifications into one queued `NotificationDrain` turn.
+    pub(super) fn drain_notifications_into_turn(
+        state: &mut State,
+        notifications: Vec<PendingNotification>,
+        task_output_tool_name: &str,
+    ) -> bool {
+        let merged_blocks = Self::notification_blocks(&notifications, task_output_tool_name);
 
         let merged_prompt_id = format!("notifications-{}", uuid::Uuid::now_v7());
 
@@ -399,6 +516,7 @@ impl SessionActor {
             verbatim: true,
             json_schema: None,
             origin: super::PromptOrigin::NotificationDrain,
+            task_wake_fallback: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
@@ -412,6 +530,7 @@ impl SessionActor {
             later_count = notifications.iter().filter(|n| n.priority == NotificationPriority::Later).count(),
             sources = %notifications.iter().map(|n| match &n.source {
                 NotificationSource::MonitorEvent { task_id } => format!("monitor:{task_id}"),
+                NotificationSource::MonitorCompleted { task_id } => format!("monitor-completed:{task_id}"),
                 NotificationSource::BashTaskCompleted { task_id } => format!("bash:{task_id}"),
             }).collect::<Vec<_>>().join(","),
             "Drained pending notifications into single batched turn"

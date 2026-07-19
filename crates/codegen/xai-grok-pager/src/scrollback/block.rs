@@ -1138,7 +1138,7 @@ impl RenderBlock {
             RenderBlock::AgentMessage(b) => join_searchable([Some(b.copy_text(false))]),
             RenderBlock::Thinking(b) => join_searchable([Some(b.copy_text(false))]),
             RenderBlock::System(b) => join_searchable([Some(b.text.clone())]),
-            RenderBlock::SessionEvent(b) => join_searchable([Some(b.marker_text())]),
+            RenderBlock::SessionEvent(b) => join_searchable([Some(b.event.message())]),
             RenderBlock::BgTask(b) => {
                 join_searchable([Some(b.command.clone()), b.description.clone()])
             }

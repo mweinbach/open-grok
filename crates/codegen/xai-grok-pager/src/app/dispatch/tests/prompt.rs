@@ -3257,7 +3257,7 @@ fn local_drain_holds_while_server_row_queued() {
 
     let agent = app.agents.get_mut(&id).unwrap();
     assert!(agent.session.state.is_idle());
-    let effects = maybe_drain_queue(agent);
+    let effects = maybe_drain_queue(agent).effects;
     assert!(
         effects.is_empty(),
         "local drain must hold while the server owns the next turn, got {effects:?}"
@@ -3272,7 +3272,7 @@ fn local_drain_holds_while_server_row_queued() {
     // turn, not a queued one) — once it's marked running and the turn ends,
     // the local row drains normally.
     agent.session.current_prompt_id = Some("srv-1".into());
-    let effects = maybe_drain_queue(agent);
+    let effects = maybe_drain_queue(agent).effects;
     assert!(
         matches!(effects.as_slice(), [Effect::SendPrompt { .. }]),
         "a running-only shared queue must not hold the local drain, got {effects:?}"

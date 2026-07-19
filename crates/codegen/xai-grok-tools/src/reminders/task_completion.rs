@@ -21,7 +21,7 @@ use crate::types::output::ToolOutput;
 use crate::types::resources::{SharedResources, State, Terminal};
 use crate::types::tool::{Reminder, ToolKind};
 use crate::util::truncate::{PREVIEW_SIZE, truncate_with_preview};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use xai_tool_types::KillTaskOutput;
 use xai_tool_types::SubagentCompletedOutput;
@@ -33,56 +33,55 @@ pub const DEFAULT_TASK_OUTPUT_TOOL: &str = "get_task_output";
 /// disk-backed output file) are never truncated -- the inline branch is
 /// their only chance to see the output.
 const MAX_INLINE_COMPLETION_BYTES: usize = 4_000;
-/// Shared set of IDs that have already been delivered via auto-wake synthetic
-/// prompts. `TaskCompletionReminder` drains this set on each reminder pass
-/// and extends its suppress list, preventing duplicate reminders for
-/// completions that already triggered an auto-wake turn.
 #[derive(Clone, Debug, Default)]
-pub struct AutoWakeDeliveredIds(pub Arc<std::sync::Mutex<HashSet<String>>>);
-impl AutoWakeDeliveredIds {
-    /// Insert an ID into the delivered set.
-    pub fn insert(&self, id: String) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+pub struct TaskCompletionReservations(pub Arc<std::sync::Mutex<HashMap<String, usize>>>);
+impl TaskCompletionReservations {
+    pub fn reserve(&self, id: String) {
+        let mut ids = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *ids.entry(id).or_default() += 1;
     }
-    /// Remove a single ID from the delivered set (e.g. when a synthetic
-    /// prompt is preempted or cancelled before being processed).
-    pub fn remove(&self, id: &str) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    pub fn release(&self, id: &str) {
+        let mut ids = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = ids.get_mut(id) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                ids.remove(id);
+            }
+        }
     }
-    /// Return `true` if `id` is currently marked as delivered, without
-    /// draining the set. Preferred over [`snapshot`](Self::snapshot) for a
-    /// single-membership check on a hot path (e.g. per monitor stdout event):
-    /// it avoids cloning every ID into a `Vec`.
     pub fn contains(&self, id: &str) -> bool {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(id)
+            .contains_key(id)
     }
-    /// Drain all IDs from the set, returning them.
-    pub fn drain(&self) -> Vec<String> {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        guard.drain().collect()
-    }
-    /// Return a snapshot of the currently-marked IDs **without** draining them.
-    ///
-    /// Used by the between-turn completion drain in `xai-grok-shell` to
-    /// suppress completions already delivered via auto-wake synthetic prompts.
-    /// Unlike [`drain`](Self::drain) (the per-tool-call surface's consumption
-    /// point), this is read-only so the existing drain/un-mark lifecycle —
-    /// `TaskCompletionReminder` draining on each tool call and the
-    /// preempt/cancel paths un-marking dropped synthetic prompts — stays the
-    /// single source of truth for the set's contents.
     pub fn snapshot(&self) -> Vec<String> {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
+            .keys()
             .cloned()
             .collect()
     }
 }
-crate::register_resource!("grok_build", "AutoWakeDeliveredIds", AutoWakeDeliveredIds);
+crate::register_resource!(
+    "grok_build",
+    "TaskCompletionReservations",
+    TaskCompletionReservations
+);
+#[derive(Clone, Debug, Default)]
+pub struct TaskWakeSuppressed(pub Arc<std::sync::atomic::AtomicBool>);
+impl TaskWakeSuppressed {
+    pub fn set(&self, suppressed: bool) {
+        self.0
+            .store(suppressed, std::sync::atomic::Ordering::Release);
+    }
+    pub fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+crate::register_resource!("grok_build", "TaskWakeSuppressed", TaskWakeSuppressed);
 /// Set of task IDs whose completion has already been surfaced as a
 /// `<system-reminder>`.  Persisted via `State<T>` so it survives across
 /// tool calls within a session.
@@ -621,16 +620,28 @@ impl Reminder for TaskCompletionReminder {
         resources: SharedResources,
         tool_output: &ToolOutput,
     ) -> Vec<String> {
-        let mut suppress: Vec<String> = consumed_completion_ids(tool_output)
+        let consumed_ids: Vec<String> = consumed_completion_ids(tool_output)
             .into_iter()
             .map(str::to_string)
             .collect();
-        {
+        let reserved_ids = {
             let res = resources.lock().await;
-            if let Some(auto_wake) = res.get::<AutoWakeDeliveredIds>() {
-                suppress.extend(auto_wake.drain());
+            if res
+                .get::<TaskWakeSuppressed>()
+                .is_some_and(TaskWakeSuppressed::get)
+            {
+                tracing::debug!("task wake reminder suppressed");
+                return Vec::new();
             }
-        }
+            res.get::<TaskCompletionReservations>()
+                .map(TaskCompletionReservations::snapshot)
+                .unwrap_or_default()
+        };
+        let suppress_ids = consumed_ids
+            .iter()
+            .chain(&reserved_ids)
+            .cloned()
+            .collect::<Vec<_>>();
         let (terminal, event_sender) = {
             let res = resources.lock().await;
             (
@@ -673,7 +684,7 @@ impl Reminder for TaskCompletionReminder {
                     .map(str::to_string)
             });
             let state = res.get_or_default::<State<ReportedTaskCompletions>>();
-            for id in &suppress {
+            for id in &consumed_ids {
                 state.reported.insert(id.clone());
             }
             if surface_reminders {
@@ -681,7 +692,9 @@ impl Reminder for TaskCompletionReminder {
                     tasks
                         .iter()
                         .filter(|task| {
-                            task.completed && state.reported.insert(task.task_id.clone())
+                            task.completed
+                                && !reserved_ids.contains(&task.task_id)
+                                && state.reported.insert(task.task_id.clone())
                         })
                         .map(|task| {
                             format_bash_completion(
@@ -693,7 +706,7 @@ impl Reminder for TaskCompletionReminder {
                 );
             } else {
                 for task in &tasks {
-                    if task.completed {
+                    if task.completed && !reserved_ids.contains(&task.task_id) {
                         state.reported.insert(task.task_id.clone());
                     }
                 }
@@ -716,7 +729,7 @@ impl Reminder for TaskCompletionReminder {
             if sender
                 .0
                 .send(SubagentEvent::Completions(SubagentCompletionsRequest {
-                    suppress_ids: suppress,
+                    suppress_ids,
                     respond_to: tx,
                 }))
                 .is_err()
@@ -1197,6 +1210,14 @@ mod tests {
         res.register_state::<ReportedTaskCompletions>();
         res.into_shared()
     }
+    fn shared_with_gate(tasks: Vec<TaskSnapshot>, gate: TaskWakeSuppressed) -> SharedResources {
+        let mut res = Resources::new();
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal { tasks });
+        res.insert(Terminal(backend));
+        res.insert(gate);
+        res.register_state::<ReportedTaskCompletions>();
+        res.into_shared()
+    }
     /// Like `shared_with` but inserts `BashParams` with
     /// `surface_bg_completion_reminders = false` so the
     /// reminder is suppressed.
@@ -1301,11 +1322,46 @@ mod tests {
             truncation_hint: String::new(),
             raw_output_bytes: 4,
         }));
-        let r = reminder.collect_reminders(shared, &output).await;
+        let r = reminder.collect_reminders(shared.clone(), &output).await;
         assert!(
             r.is_empty(),
             "get_task_output(completed) should suppress reminder"
         );
+        assert!(
+            shared
+                .lock()
+                .await
+                .get::<State<ReportedTaskCompletions>>()
+                .expect("reported state")
+                .reported
+                .contains("t1")
+        );
+    }
+    #[tokio::test]
+    async fn ctrl_c_gate_suppresses_visible_completion_without_reporting_it() {
+        let gate = TaskWakeSuppressed::default();
+        gate.set(true);
+        let shared = shared_with_gate(vec![make_completed("visible")], gate.clone());
+        let output = ToolOutput::Dynamic(serde_json::Value::Null.into());
+        assert!(
+            TaskCompletionReminder
+                .collect_reminders(shared.clone(), &output)
+                .await
+                .is_empty()
+        );
+        assert!(
+            shared
+                .lock()
+                .await
+                .get::<State<ReportedTaskCompletions>>()
+                .is_none_or(|state| !state.reported.contains("visible"))
+        );
+        gate.set(false);
+        let reminders = TaskCompletionReminder
+            .collect_reminders(shared, &output)
+            .await;
+        assert_eq!(reminders.len(), 1);
+        assert!(reminders[0].contains("visible"));
     }
     #[tokio::test]
     async fn not_suppressed_for_unrelated_output() {
@@ -1608,56 +1664,99 @@ mod tests {
         );
     }
     #[test]
-    fn auto_wake_delivered_ids_insert_and_drain() {
-        let ids = AutoWakeDeliveredIds::default();
-        ids.insert("t1".into());
-        ids.insert("t2".into());
-        let drained = ids.drain();
-        assert_eq!(drained.len(), 2);
-        assert!(drained.contains(&"t1".to_string()));
-        assert!(drained.contains(&"t2".to_string()));
-        assert!(ids.drain().is_empty());
+    fn task_completion_reservations_are_reference_counted() {
+        let reservations = TaskCompletionReservations::default();
+        reservations.reserve("t1".into());
+        reservations.reserve("t1".into());
+        reservations.release("t1");
+        assert!(reservations.contains("t1"));
+        reservations.release("t1");
+        assert!(!reservations.contains("t1"));
     }
     #[test]
-    fn auto_wake_delivered_ids_dedup() {
-        let ids = AutoWakeDeliveredIds::default();
-        ids.insert("t1".into());
-        ids.insert("t1".into());
-        let drained = ids.drain();
-        assert_eq!(drained.len(), 1);
-    }
-    #[test]
-    fn auto_wake_delivered_ids_snapshot_is_non_destructive() {
-        let ids = AutoWakeDeliveredIds::default();
-        ids.insert("t1".into());
-        ids.insert("t2".into());
-        let snap = ids.snapshot();
-        assert_eq!(snap.len(), 2);
-        assert!(snap.contains(&"t1".to_string()));
-        assert!(snap.contains(&"t2".to_string()));
-        assert_eq!(ids.drain().len(), 2);
+    fn task_completion_reservations_snapshot_is_non_destructive() {
+        let reservations = TaskCompletionReservations::default();
+        reservations.reserve("t1".into());
+        reservations.reserve("t2".into());
+        let snapshot = reservations.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.contains(&"t1".to_string()));
+        assert!(snapshot.contains(&"t2".to_string()));
+        assert!(reservations.contains("t1"));
+        assert!(reservations.contains("t2"));
     }
     #[tokio::test]
-    async fn auto_wake_delivered_ids_suppress_reminders() {
+    async fn task_completion_reservations_suppress_reminders() {
         let mut res = Resources::new();
         let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal {
             tasks: vec![make_completed("t1"), make_completed("t2")],
         });
         res.insert(Terminal(backend));
         res.register_state::<ReportedTaskCompletions>();
-        let auto_wake = AutoWakeDeliveredIds::default();
-        auto_wake.insert("t1".into());
-        res.insert(auto_wake);
+        let reservations = TaskCompletionReservations::default();
+        reservations.reserve("t1".into());
+        res.insert(reservations);
         let shared = res.into_shared();
         let reminder = TaskCompletionReminder;
         let output = ToolOutput::Dynamic(serde_json::Value::Null.into());
-        let r = reminder.collect_reminders(shared, &output).await;
-        assert_eq!(
-            r.len(),
-            1,
-            "auto-wake delivered ID should suppress reminder"
-        );
+        let r = reminder.collect_reminders(shared.clone(), &output).await;
+        assert_eq!(r.len(), 1, "reserved ID should suppress reminder");
         assert!(r[0].contains("t2"));
+        let res = shared.lock().await;
+        assert!(
+            res.get::<TaskCompletionReservations>()
+                .is_some_and(|ids| ids.contains("t1"))
+        );
+        assert!(
+            !res.get::<State<ReportedTaskCompletions>>()
+                .expect("reported state")
+                .reported
+                .contains("t1")
+        );
+    }
+    #[tokio::test]
+    async fn reserved_completion_surfaces_after_release() {
+        let mut res = Resources::new();
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal {
+            tasks: vec![make_completed("reserved")],
+        });
+        res.insert(Terminal(backend));
+        res.register_state::<ReportedTaskCompletions>();
+        let reservations = TaskCompletionReservations::default();
+        reservations.reserve("reserved".into());
+        res.insert(reservations.clone());
+        let shared = res.into_shared();
+        let reminder = TaskCompletionReminder;
+        let output = ToolOutput::Dynamic(serde_json::Value::Null.into());
+        assert!(
+            reminder
+                .collect_reminders(shared.clone(), &output)
+                .await
+                .is_empty()
+        );
+        assert!(reservations.contains("reserved"));
+        assert!(
+            !shared
+                .lock()
+                .await
+                .get::<State<ReportedTaskCompletions>>()
+                .expect("reported state")
+                .reported
+                .contains("reserved")
+        );
+        reservations.release("reserved");
+        let reminders = reminder.collect_reminders(shared.clone(), &output).await;
+        assert_eq!(reminders.len(), 1);
+        assert!(reminders[0].contains("reserved"));
+        assert!(
+            shared
+                .lock()
+                .await
+                .get::<State<ReportedTaskCompletions>>()
+                .expect("reported state")
+                .reported
+                .contains("reserved")
+        );
     }
     /// Regression: subagent inline output larger than the bash-completion
     /// inline cap MUST be preserved verbatim. The inline branch is the

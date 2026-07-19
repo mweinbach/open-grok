@@ -310,7 +310,8 @@ pub struct PagerLocalSnapshot {
     pub kimi_api_endpoint: String,
     /// Whether the user has opted OUT of coding data sharing.
     /// Lives in auth metadata (no `UiConfig` field). Inverted mapping:
-    /// `opt_out == false` → canonical "opt-in".
+    /// `opt_out == false` → canonical "opt-in". Snapshot default is
+    /// `true` (opted out) to match the safer consumer default.
     pub coding_data_sharing_opt_out: bool,
     /// Whether plan mode is active. Uses effective state
     /// (`pending.unwrap_or(active)`) so rapid toggles don't double-send.
@@ -360,7 +361,7 @@ impl Default for PagerLocalSnapshot {
             perplexity_web_search_enabled: false,
             perplexity_api_key_status: SecretStatus::Missing,
             kimi_api_endpoint: "platform".to_owned(),
-            coding_data_sharing_opt_out: false,
+            coding_data_sharing_opt_out: true,
             plan_mode_active: false,
             swarm_mode: false,
             show_tips: None,
@@ -578,6 +579,10 @@ pub fn current_value_for(
         "compact_mode" => Some(SettingValue::Bool(ui.compact_mode)),
         "show_timestamps" => Some(SettingValue::Bool(ui.show_timestamps.unwrap_or(true))),
         "show_timeline" => Some(SettingValue::Bool(ui.show_timeline_enabled())),
+        // Cache is the send-path source of truth (same pattern as group_tool_verbs).
+        "page_flip_on_send" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_page_flip_on_send(),
+        )),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         "swarm_mode" => Some(SettingValue::Bool(ui.swarm_mode.unwrap_or(false))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
@@ -944,6 +949,13 @@ mod tests {
                         "show_timeline default drifts from UiConfig::default()"
                     );
                 }
+                ("page_flip_on_send", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.page_flip_on_send_enabled(),
+                        "page_flip_on_send default drifts from UiConfig::default()"
+                    );
+                }
                 ("simple_mode", SettingKind::Bool { default }) => {
                     assert_eq!(
                         *default,
@@ -1056,14 +1068,15 @@ mod tests {
                     );
                 }
                 // coding_data_sharing: no UiConfig field; default pinned
-                // against auth metadata (opt_out=false → "opt-in").
+                // against auth metadata (opt_out=true → "opt-out").
                 ("coding_data_sharing", SettingKind::Enum { default, .. }) => {
-                    let expected = "opt-in";
+                    let expected = "opt-out";
                     assert_eq!(
                         *default, expected,
-                        "coding_data_sharing registry default must be 'opt-in' — \
+                        "coding_data_sharing registry default must be 'opt-out' — \
                          the on-disk source of truth is `AuthEntry::coding_data_retention_opt_out: \
-                         bool` (defaults to `false`, i.e. user has NOT opted out)",
+                         bool` (defaults to `true`, i.e. user has opted out until they \
+                         explicitly share or the server opts them in)",
                     );
                 }
                 // CLI batch: fields live on CliConfig, not UiConfig.

@@ -828,6 +828,41 @@ fn shutdown_and_flush_telemetry(exit_code: i32) -> ! {
     xai_grok_telemetry::debug_log::flush();
     std::process::exit(exit_code);
 }
+async fn forward_stdio_line_to_leader(
+    line: Vec<u8>,
+    leader_tx: &tokio::sync::Mutex<tokio::sync::mpsc::UnboundedSender<String>>,
+    replay_state: &std::sync::Mutex<StdioReplayState>,
+    cancel: &CancellationToken,
+) {
+    let line = String::from_utf8_lossy(&line);
+    let mut trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+    if trimmed.is_empty() {
+        return;
+    }
+    if trimmed.contains("\"initialize\"")
+        || trimmed.contains("\"session/load\"")
+        || trimmed.contains("\"session/new\"")
+    {
+        cache_outgoing_acp_state(&trimmed, replay_state);
+    }
+    let send_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        {
+            let tx = leader_tx.lock().await;
+            match tx.send(trimmed) {
+                Ok(()) => break,
+                Err(tokio::sync::mpsc::error::SendError(v)) => trimmed = v,
+            }
+        }
+        if cancel.is_cancelled() || tokio::time::Instant::now() >= send_deadline {
+            tracing::error!(
+                "stdio bridge: dropping client message after reconnect retries were exhausted"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
 /// Emitted by both leader guards (server mode and leader-connect) so the two sites
 /// can't drift.
 const PLUGIN_DIR_LEADER_WARNING: &str = "open-grok: --plugin-dir is ignored in leader mode; run with --no-leader to \
@@ -845,16 +880,11 @@ async fn run_agent_command(
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
+            use xai_grok_pager::app::signal_handler::next_signal_code;
             let mut term = signal(SignalKind::terminate()).ok();
             let mut hup = signal(SignalKind::hangup()).ok();
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => { shutdown_and_flush_telemetry(130); } _ =
-                async { if let Some(sig) = term.as_mut() { let _ = sig.recv(). await; }
-                else { std::future::pending::< () > (). await; } } => {
-                shutdown_and_flush_telemetry(143); } _ = async { if let Some(sig) = hup
-                .as_mut() { let _ = sig.recv(). await; } else { std::future::pending::<
-                () > (). await; } } => { shutdown_and_flush_telemetry(129); }
-            }
+            let code = next_signal_code(&mut term, &mut hup).await;
+            shutdown_and_flush_telemetry(code);
         }
         #[cfg(not(unix))]
         {
@@ -936,7 +966,6 @@ async fn run_agent_command(
     agent_config.resolve_runtime_fields(&xai_grok_shell::agent::config::RuntimeResolutionContext {
         raw_config: &raw_config,
         remote_settings: remote_settings.as_ref(),
-        cwd: None,
         is_headless: !is_leader,
         cli_subagents: None,
         cli_web_search_model: None,
@@ -1037,23 +1066,9 @@ async fn run_agent_command(
                         tokio::select! {
                             biased; _ = cancel_stdin.cancelled() => break, maybe_line =
                             stdin_lines.recv() => { let Some(line) = maybe_line else {
-                            break }; let line = String::from_utf8_lossy(& line); let
-                            trimmed = line.trim_end_matches(['\r', '\n']).to_string(); if
-                            trimmed.is_empty() { continue; } if trimmed
-                            .contains("\"initialize\"") || trimmed
-                            .contains("\"session/load\"") || trimmed
-                            .contains("\"session/new\"") { cache_outgoing_acp_state(&
-                            trimmed, & replay_state_stdin); } let send_deadline =
-                            tokio::time::Instant::now() +
-                            std::time::Duration::from_secs(300); loop { { let tx =
-                            leader_tx_stdin.lock(). await; if tx.send(trimmed.clone())
-                            .is_ok() { break; } } if cancel_stdin.is_cancelled() ||
-                            tokio::time::Instant::now() >= send_deadline {
-                            tracing::error!("stdio bridge: dropping client message after \
-                                             reconnect retries were exhausted");
-                            break; }
-                            tokio::time::sleep(std::time::Duration::from_millis(250)).
-                            await; } }
+                            break }; forward_stdio_line_to_leader(line, &
+                            leader_tx_stdin, & replay_state_stdin, & cancel_stdin,).
+                            await; }
                         }
                     }
                 });

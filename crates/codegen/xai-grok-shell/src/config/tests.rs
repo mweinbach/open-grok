@@ -975,7 +975,7 @@ fn with_grok_subagents<T>(value: &str, f: impl FnOnce() -> T) -> T {
 fn subagents_config_default_enabled() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
     });
 }
@@ -983,7 +983,7 @@ fn subagents_config_default_enabled() {
 fn subagents_config_cli_flag_enables() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
-        let sa = SubagentsConfig::resolve(true, &config, None);
+        let sa = SubagentsConfig::resolve(true, &config);
         assert!(sa.enabled);
     });
 }
@@ -993,7 +993,7 @@ fn subagents_config_env_var_enables() {
         "1",
         || {
             let config = toml::Value::Table(toml::map::Map::new());
-            let sa = SubagentsConfig::resolve(false, &config, None);
+            let sa = SubagentsConfig::resolve(false, &config);
             assert!(sa.enabled);
         },
     );
@@ -1005,7 +1005,7 @@ fn subagents_config_env_var_disables() {
         || {
             let config: toml::Value = toml::from_str("[subagents]\nenabled = true")
                 .unwrap();
-            let sa = SubagentsConfig::resolve(false, &config, None);
+            let sa = SubagentsConfig::resolve(false, &config);
             assert!(! sa.enabled, "GROK_SUBAGENTS=0 should override config file");
         },
     );
@@ -1014,7 +1014,7 @@ fn subagents_config_env_var_disables() {
 fn subagents_config_toml_enables() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
     });
 }
@@ -1023,7 +1023,7 @@ fn subagents_config_local_disabled_wins() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = false")
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(! sa.enabled, "local [subagents] enabled=false should win");
     });
 }
@@ -1033,7 +1033,7 @@ fn subagents_config_env_var_disables_default() {
         "0",
         || {
             let config = toml::Value::Table(toml::map::Map::new());
-            let sa = SubagentsConfig::resolve(false, &config, None);
+            let sa = SubagentsConfig::resolve(false, &config);
             assert!(
                 ! sa.enabled, "GROK_SUBAGENTS=0 should override the enabled default"
             );
@@ -1050,7 +1050,7 @@ fn subagents_config_remote_settings_key_is_ignored() {
             )
             .expect("unknown subagents_enabled key must not break parsing");
         let config = toml::Value::Table(toml::map::Map::new());
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
     });
 }
@@ -1060,7 +1060,7 @@ fn subagents_config_cli_flag_overrides_env_var() {
         "0",
         || {
             let config = toml::Value::Table(toml::map::Map::new());
-            let sa = SubagentsConfig::resolve(true, &config, None);
+            let sa = SubagentsConfig::resolve(true, &config);
             assert!(sa.enabled, "--subagents CLI flag should override GROK_SUBAGENTS=0");
         },
     );
@@ -1079,7 +1079,7 @@ fn subagents_config_models_parsed() {
                 "#,
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
         assert_eq!(sa.models.len(), 2);
         assert_eq!(sa.models.get("explore").unwrap(), "grok-3-fast");
@@ -1090,7 +1090,7 @@ fn subagents_config_models_parsed() {
 fn subagents_config_models_empty_when_missing() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
         assert!(sa.models.is_empty());
     });
@@ -1105,7 +1105,7 @@ fn subagents_config_models_without_enabled() {
                 "#,
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(
             ! sa.enabled, "explicit [subagents] section without enabled should be false"
         );
@@ -1125,7 +1125,7 @@ fn subagents_config_models_with_env_var_enables() {
                 "#,
                 )
                 .unwrap();
-            let sa = SubagentsConfig::resolve(false, &config, None);
+            let sa = SubagentsConfig::resolve(false, &config);
             assert!(sa.enabled, "GROK_SUBAGENTS=1 should enable");
             assert_eq!(sa.models.get("explore").unwrap(), "grok-3-fast");
         },
@@ -1147,7 +1147,7 @@ fn subagents_config_toggle_mixed_values() {
                 "#,
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
         assert_eq!(sa.toggle.len(), 4);
         assert_eq!(sa.toggle.get("explore").copied(), Some(true));
@@ -1160,7 +1160,7 @@ fn subagents_config_toggle_mixed_values() {
 fn subagents_config_toggle_missing_defaults_to_empty() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
-        let sa = SubagentsConfig::resolve(false, &config, None);
+        let sa = SubagentsConfig::resolve(false, &config);
         assert!(sa.enabled);
         assert!(
             sa.toggle.is_empty(),
@@ -2254,6 +2254,122 @@ fn discover_personas_inline_takes_precedence() {
         Some("Inline strict"),
     );
 }
+fn write_subagent_definitions(root: &std::path::Path, definitions: &[(&str, &str)]) {
+    let roles = root.join("roles");
+    let personas = root.join("personas");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::create_dir_all(&personas).unwrap();
+    for (name, source) in definitions {
+        std::fs::write(
+                roles.join(format!("{name}.toml")),
+                format!("description = \"{source} role\""),
+            )
+            .unwrap();
+        std::fs::write(
+                personas.join(format!("{name}.toml")),
+                format!("instructions = \"{source} persona\""),
+            )
+            .unwrap();
+    }
+}
+#[test]
+fn project_overlay_preserves_source_precedence() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    let bundled = tmp.path().join("bundled");
+    write_subagent_definitions(
+        &project.join(".opengrok"),
+        &[
+            ("shadowed", "Project"),
+            ("bundled-shadowed", "Project"),
+            ("inline", "Project"),
+            ("project-only", "Project"),
+        ],
+    );
+    write_subagent_definitions(
+        &home.join(".opengrok"),
+        &[("shadowed", "User"), ("user-only", "User")],
+    );
+    write_subagent_definitions(
+        &bundled,
+        &[("bundled-shadowed", "Bundled"), ("bundled-only", "Bundled")],
+    );
+    let config = toml::from_str::<
+        toml::Value,
+    >(
+            r#"
+            [subagents]
+            enabled = true
+
+            [subagents.roles.inline]
+            description = "Inline role"
+
+            [subagents.personas.inline]
+            instructions = "Inline persona"
+            "#,
+        )
+        .unwrap();
+    let base = SubagentsConfig::resolve_base_with_sources(
+        false,
+        &config,
+        Some(&home.join(".opengrok")),
+        &bundled,
+    );
+    let resolve = |project_trusted| {
+        let (roles, personas) = SubagentsConfig::effective_definition_maps(
+            &base.roles,
+            &base.personas,
+            &project,
+            project_trusted,
+        );
+        SubagentsConfig {
+            roles,
+            personas,
+            ..Default::default()
+        }
+    };
+    let untrusted = resolve(false);
+    assert_eq!(untrusted.get_role("shadowed").unwrap().description, "User role");
+    assert_eq!(
+        untrusted.get_persona("shadowed").and_then(| persona | persona.instructions
+        .as_deref()), Some("User persona")
+    );
+    assert!(untrusted.get_role("project-only").is_none());
+    assert!(untrusted.get_persona("project-only").is_none());
+    assert!(untrusted.get_role("user-only").is_some());
+    assert!(untrusted.get_persona("user-only").is_some());
+    assert!(untrusted.get_role("bundled-only").is_some());
+    assert!(untrusted.get_persona("bundled-only").is_some());
+    assert_eq!(
+        untrusted.get_role("bundled-shadowed").unwrap().description, "Bundled role"
+    );
+    assert_eq!(
+        untrusted.get_persona("bundled-shadowed").and_then(| persona | persona
+        .instructions.as_deref()), Some("Bundled persona")
+    );
+    let trusted = resolve(true);
+    assert_eq!(trusted.get_role("shadowed").unwrap().description, "Project role");
+    assert_eq!(
+        trusted.get_persona("shadowed").and_then(| persona | persona.instructions
+        .as_deref()), Some("Project persona")
+    );
+    assert_eq!(
+        trusted.get_role("bundled-shadowed").unwrap().description, "Project role"
+    );
+    assert_eq!(
+        trusted.get_persona("bundled-shadowed").and_then(| persona | persona.instructions
+        .as_deref()), Some("Project persona")
+    );
+    assert_eq!(trusted.get_role("inline").unwrap().description, "Inline role");
+    assert_eq!(
+        trusted.get_persona("inline").and_then(| persona | persona.instructions
+        .as_deref()), Some("Inline persona")
+    );
+    let denied_again = resolve(false);
+    assert_eq!(denied_again.get_role("shadowed").unwrap().description, "User role");
+    assert!(denied_again.get_role("project-only").is_none());
+}
 #[test]
 fn bundled_personas_and_roles_have_lowest_priority_in_resolve_order() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2296,84 +2412,104 @@ fn bundled_personas_and_roles_have_lowest_priority_in_resolve_order() {
             r#"instructions = "Project persona""#,
         )
         .unwrap();
-    with_env_var(
-        "HOME",
-        home.to_str().unwrap(),
-        || {
-            let config = toml::from_str::<
-                toml::Value,
-            >(
-                    r#"
-                [subagents]
-                enabled = true
+    let config = toml::from_str::<
+        toml::Value,
+    >(
+            r#"
+            [subagents]
+            enabled = true
 
-                [subagents.roles.reviewer]
-                description = "Inline reviewer"
+            [subagents.roles.reviewer]
+            description = "Inline reviewer"
 
-                [subagents.personas.reviewer]
-                instructions = "Inline persona"
-                "#,
-                )
-                .unwrap();
-            let resolved = SubagentsConfig::resolve(true, &config, Some(&workspace));
-            assert_eq!(
-                resolved.get_role("reviewer").unwrap().description, "Inline reviewer"
-            );
-            assert_eq!(
-                resolved.get_persona("reviewer").unwrap().instructions.as_deref(),
-                Some("Inline persona")
-            );
-        },
+            [subagents.personas.reviewer]
+            instructions = "Inline persona"
+            "#,
+        )
+        .unwrap();
+    let base = SubagentsConfig::resolve_base_with_sources(
+        true,
+        &config,
+        Some(&home.join(".opengrok")),
+        &bundled,
+    );
+    let (roles, personas) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        &workspace,
+        true,
+    );
+    let resolved = SubagentsConfig {
+        roles,
+        personas,
+        ..Default::default()
+    };
+    assert_eq!(resolved.get_role("reviewer").unwrap().description, "Inline reviewer");
+    assert_eq!(
+        resolved.get_persona("reviewer").unwrap().instructions.as_deref(),
+        Some("Inline persona")
     );
     std::fs::remove_file(workspace.join(".opengrok/roles/reviewer.toml")).unwrap();
     std::fs::remove_file(workspace.join(".opengrok/personas/reviewer.toml")).unwrap();
-    with_env_var(
-        "HOME",
-        home.to_str().unwrap(),
-        || {
-            let config = toml::from_str::<
-                toml::Value,
-            >(
-                    r#"
-                [subagents]
-                enabled = true
-                "#,
-                )
-                .unwrap();
-            let resolved = SubagentsConfig::resolve(true, &config, Some(&workspace));
-            assert_eq!(
-                resolved.get_role("reviewer").unwrap().description, "User reviewer"
-            );
-            assert_eq!(
-                resolved.get_persona("reviewer").unwrap().instructions.as_deref(),
-                Some("User persona")
-            );
-        },
+    let config = toml::from_str::<
+        toml::Value,
+    >(r#"
+            [subagents]
+            enabled = true
+            "#)
+        .unwrap();
+    let base = SubagentsConfig::resolve_base_with_sources(
+        true,
+        &config,
+        Some(&home.join(".opengrok")),
+        &bundled,
+    );
+    let (roles, personas) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        &workspace,
+        true,
+    );
+    let resolved = SubagentsConfig {
+        roles,
+        personas,
+        ..Default::default()
+    };
+    assert_eq!(resolved.get_role("reviewer").unwrap().description, "User reviewer");
+    assert_eq!(
+        resolved.get_persona("reviewer").unwrap().instructions.as_deref(),
+        Some("User persona")
     );
     std::fs::remove_file(home.join(".opengrok/roles/reviewer.toml")).unwrap();
     std::fs::remove_file(home.join(".opengrok/personas/reviewer.toml")).unwrap();
-    with_env_var(
-        "HOME",
-        home.to_str().unwrap(),
-        || {
-            let config = toml::from_str::<
-                toml::Value,
-            >(
-                    r#"
-                [subagents]
-                enabled = true
-                "#,
-                )
-                .unwrap();
-            let resolved = SubagentsConfig::resolve(true, &config, Some(&workspace));
-            assert_eq!(
-                resolved.get_role("reviewer").unwrap().description, "Bundled reviewer"
-            );
-            assert_eq!(
-                resolved.get_persona("reviewer").unwrap().instructions.as_deref(),
-                Some("Bundled persona")
-            );
-        },
+    let config = toml::from_str::<
+        toml::Value,
+    >(r#"
+            [subagents]
+            enabled = true
+            "#)
+        .unwrap();
+    let base = SubagentsConfig::resolve_base_with_sources(
+        true,
+        &config,
+        Some(&home.join(".opengrok")),
+        &bundled,
+    );
+    let (roles, personas) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        &workspace,
+        true,
+    );
+    let resolved = SubagentsConfig {
+        roles,
+        personas,
+        ..Default::default()
+    };
+    assert_eq!(resolved.get_role("reviewer").unwrap().description, "Bundled reviewer");
+    assert_eq!(
+        resolved.get_persona("reviewer").unwrap().instructions.as_deref(),
+        Some("Bundled persona")
     );
 }
 #[test]
@@ -2940,6 +3076,95 @@ fn managed_settings_does_not_override_user_yolo() {
 /// local/dev build auto-trusts). Hold the returned guard for the test body.
 fn simulate_release_build() -> xai_grok_test_support::EnvGuard {
     xai_grok_test_support::EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0.0-sim")
+}
+#[test]
+fn project_overlay_tracks_authoritative_trust_transitions() {
+    let source_root = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    write_subagent_definitions(
+        &repo.path().join(".opengrok"),
+        &[("shared", "Project"), ("project-only", "Project")],
+    );
+    let mut base = SubagentsConfig::default();
+    base.roles
+        .insert(
+            "shared".into(),
+            SubagentRole {
+                description: "User role".into(),
+                source_dir: Some(source_root.path().join("roles")),
+                ..Default::default()
+            },
+        );
+    base.personas
+        .insert(
+            "shared".into(),
+            SubagentPersona {
+                instructions: Some("User persona".into()),
+                source_path: Some(
+                    source_root.path().join("personas/shared.toml").display().to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+    let (untrusted_roles, _) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        repo.path(),
+        false,
+    );
+    assert_eq!(untrusted_roles["shared"].description, "User role");
+    assert!(! untrusted_roles.contains_key("project-only"));
+    let (trusted_roles, trusted_personas) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        repo.path(),
+        true,
+    );
+    assert_eq!(trusted_roles["shared"].description, "Project role");
+    assert!(trusted_personas.contains_key("project-only"));
+    let (revoked_roles, _) = SubagentsConfig::effective_definition_maps(
+        &base.roles,
+        &base.personas,
+        repo.path(),
+        false,
+    );
+    assert_eq!(revoked_roles["shared"].description, "User role");
+    assert!(! revoked_roles.contains_key("project-only"));
+}
+#[test]
+fn base_resolver_without_project_cwd_keeps_project_files_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_subagent_definitions(
+        &tmp.path().join(".opengrok"),
+        &[("project", "Project")],
+    );
+    let base = SubagentsConfig::resolve_base_with_sources(
+        false,
+        &toml::Value::Table(Default::default()),
+        None,
+        &tmp.path().join("bundled"),
+    );
+    assert!(base.get_role("project").is_none());
+    assert!(base.get_persona("project").is_none());
+}
+#[test]
+fn explicit_grok_root_is_the_only_user_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ambient = tmp.path().join("ambient-home/.opengrok");
+    let configured = tmp.path().join("configured-grok-home");
+    write_subagent_definitions(&ambient, &[("ambient", "Ambient")]);
+    write_subagent_definitions(&configured, &[("configured", "Configured")]);
+    let base = SubagentsConfig::resolve_base_with_sources(
+        false,
+        &toml::Value::Table(Default::default()),
+        Some(&configured),
+        &configured.join("bundled"),
+    );
+    assert!(base.get_role("ambient").is_none());
+    assert!(base.get_persona("ambient").is_none());
+    assert!(base.get_role("configured").is_some());
+    assert!(base.get_persona("configured").is_some());
 }
 /// SECURITY (plugin-RCE): a PROJECT-declared `[plugins].paths` loads as an
 /// auto-enabled, auto-trusted ConfigPath plugin, so it must merge into the

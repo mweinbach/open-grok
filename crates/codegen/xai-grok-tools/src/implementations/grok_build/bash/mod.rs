@@ -1425,8 +1425,8 @@ impl BashTool {
         r#"Run a ${%- if is_windows %} shell command${%- else %} bash command${%- endif %} and return its output.
 
 Usage notes:
-  - You can specify an optional timeout in milliseconds (up to ${{ max_timeout_ms | default(300000) }}ms). ${%- if auto_background_on_timeout %} If not specified, commands exceeding the default timeout will be automatically backgrounded instead of killed. You will receive a task_id to check output later.${%- else %} If not specified, commands will timeout after ${{ default_timeout_ms | default(120000) }}ms.${%- endif %}
-  - Timeout enforcement: when the timeout fires, the wrapper${%- if is_windows %} terminates the child's Job Object, killing every descendant process immediately (no graceful-termination grace period).${%- else %} kills the child process group (SIGTERM, escalated to SIGKILL after a ~1s grace period). Descendants that did not detach via `setsid` / `nohup` will also be killed.${%- endif %} `timeout: 0` in `${%- if params is defined and params.execute is defined and params.execute.is_background %}${{ params.execute.is_background }}${%- else %}background${%- endif %}: true` mode disables the wrapper timeout entirely; the child's lifetime is owned by the model via ${{ tools.by_kind.kill_task_action }}.
+  - You can specify an optional ${{ params.execute.timeout }} in milliseconds (up to ${{ max_timeout_ms | default(300000) }}ms). ${%- if auto_background_on_timeout %} If not specified, commands exceeding the default timeout will be automatically backgrounded instead of killed. You will receive a task_id to check output later.${%- else %} If not specified, commands will timeout after ${{ default_timeout_ms | default(120000) }}ms.${%- endif %}
+  - Timeout enforcement: when the timeout fires, the wrapper${%- if is_windows %} terminates the child's Job Object, killing every descendant process immediately (no graceful-termination grace period).${%- else %} kills the child process group (SIGTERM, escalated to SIGKILL after a ~1s grace period). Descendants that did not detach via `setsid` / `nohup` will also be killed.${%- endif %} `${{ params.execute.timeout }}: 0` in `${%- if params is defined and params.execute is defined and params.execute.is_background %}${{ params.execute.is_background }}${%- else %}background${%- endif %}: true` mode disables the wrapper timeout entirely; the child's lifetime is owned by the model via ${{ tools.by_kind.kill_task_action }}.
   - If the output exceeds {max_output_bytes} characters, output will be truncated before being returned to you.
   - You can use the ${{ params.execute.is_background }} parameter to run the command in the background (e.g., dev servers, long builds): it returns a task_id immediately and keeps running in the background. You are notified on completion, so do not poll or sleep-wait for it.${%- if has_unix_utilities %} You do not need to use '&' at the end of the command when using this parameter.${%- endif %}
 ${%- if shell_uses_semicolon %}
@@ -1441,7 +1441,7 @@ ${%- endif %}"#
         r#"Run a ${%- if is_windows %} shell command${%- else %} bash command${%- endif %} and return its output.
 
 Usage notes:
-  - You can specify an optional timeout in milliseconds (up to ${{ max_timeout_ms | default(300000) }}ms). If not specified, commands will timeout after ${{ default_timeout_ms | default(120000) }}ms.
+  - You can specify an optional ${{ params.execute.timeout }} in milliseconds (up to ${{ max_timeout_ms | default(300000) }}ms). If not specified, commands will timeout after ${{ default_timeout_ms | default(120000) }}ms.
   - Timeout enforcement: when the timeout fires, the wrapper${%- if is_windows %} terminates the child's Job Object, killing every descendant process immediately (no graceful-termination grace period).${%- else %} kills the child process group (SIGTERM, escalated to SIGKILL after a ~1s grace period).${%- endif %}
   - If the output exceeds {max_output_bytes} characters, output will be truncated before being returned to you.
 ${%- if shell_uses_semicolon %}
@@ -4666,6 +4666,40 @@ mod tests {
                 "has_unix_utilities": has_unix_utilities,
             });
             renderer.render_with_extra(template, &extras).unwrap()
+        }
+
+        #[test]
+        fn description_tracks_renamed_timeout() {
+            let renderer = TemplateRenderer::new(
+                HashMap::from([
+                    (ToolKind::Execute, "run_terminal_cmd".to_string()),
+                    (ToolKind::KillTaskAction, "kill_task".to_string()),
+                ]),
+                HashMap::from([(
+                    ToolKind::Execute,
+                    HashMap::from([
+                        ("timeout".to_string(), "max_wait".to_string()),
+                        ("is_background".to_string(), "is_background".to_string()),
+                    ]),
+                )]),
+            );
+            let extras = serde_json::json!({
+                "auto_background_on_timeout": true,
+                "is_windows": false,
+                "shell_uses_semicolon": false,
+                "has_unix_utilities": true,
+            });
+            let out = renderer
+                .render_with_extra(BashTool::default_description_template_enabled(), &extras)
+                .unwrap();
+            assert!(
+                out.contains("optional max_wait in milliseconds") && out.contains("`max_wait: 0`"),
+                "renamed timeout must appear:\n{out}"
+            );
+            assert!(
+                !out.contains("optional timeout in milliseconds") && !out.contains("`timeout: 0`"),
+                "canonical timeout must not remain after rename:\n{out}"
+            );
         }
 
         #[test]

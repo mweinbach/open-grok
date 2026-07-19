@@ -616,6 +616,10 @@ impl QueuePane {
         self.list_state.handle_key_event(key, &self.entries)
     }
 
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.list_state.handle_paste(text, &self.entries)
+    }
+
     /// Get the stable ID of the currently selected entry, if any.
     pub fn selected_id(&self) -> Option<u64> {
         self.list_state.selected_id()
@@ -1026,6 +1030,18 @@ mod tests {
 
     fn local_prompt(id: u64, text: &str) -> QueuedPrompt {
         QueuedPrompt::plain(id, text, QueueEntryKind::Prompt)
+    }
+
+    #[test]
+    fn paste_routes_to_active_list_input() {
+        let mut pane = QueuePane::new();
+        let mut local = std::collections::VecDeque::new();
+        local.push_back(local_prompt(1, "first"));
+        pane.sync_from_merged(&local, &[], None, None, &Default::default());
+        pane.list_state.open_comment_input("");
+
+        assert!(pane.handle_paste("queued text"));
+        assert_eq!(pane.list_state.input_text(), "queued text");
     }
 
     #[test]

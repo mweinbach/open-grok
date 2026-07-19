@@ -9,7 +9,7 @@
 //!
 //! - [`commit`] — committed-frontier logic, display policy, and the per-frame
 //!   commit-to-scrollback pass.
-//! - [`live`] — the pinned live region (tail + status + prompt).
+//! - [`live`] — the pinned live region (tail + todos + `/btw` + status + prompt).
 //! - [`todo`] — the persistent todo panel shown above the prompt.
 //! - [`auth`] — the in-region sign-in flow shown before a session exists.
 //! - [`overlay`] — the inline-overlay host (prompt-anchored dropdowns; grows /

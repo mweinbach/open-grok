@@ -10,7 +10,8 @@
 //!
 use super::commands::{
     LifecycleMutationBlock, LifecycleMutationKind, ParsedPromptInfo, PendingWebSearchReload,
-    PromptCompletionKind, PromptTurnOk, PromptTurnResult, SessionCommand, ok_end_turn,
+    PromptCompletionKind, PromptTurnOk, PromptTurnResult, SessionCommand, TaskWakeAdmission,
+    TaskWakeFallback, ok_end_turn,
 };
 use super::handle::SessionHandle;
 use super::notifications::NotificationSender;
@@ -199,6 +200,9 @@ pub(crate) struct InputItem {
     pub(crate) json_schema: Option<serde_json::Value>,
     /// Who originated this prompt — user or auto-wake system.
     pub(crate) origin: super::PromptOrigin,
+    /// Typed deferred completion retained while an admitted task wake is queued.
+    /// Consumed by Ctrl+C if it removes the wake before the turn starts.
+    pub(crate) task_wake_fallback: Option<TaskWakeFallback>,
     pub(crate) respond_to: oneshot::Sender<PromptTurnResult>,
     /// Fired after the user message is in chat history and a persistence flush
     /// barrier has completed (see `SessionCommand::Prompt::persist_ack`).
@@ -279,8 +283,8 @@ pub(crate) struct State {
     /// is released.
     pub(crate) lifecycle_mutation: Option<LifecycleMutationKind>,
     pub(crate) pending_web_search_reload: Option<PendingWebSearchReload>,
-    /// When true, notifications are buffered but not drained until the next
-    /// user-initiated prompt arrives. Set on cancel, cleared on user Prompt.
+    /// When true, notifications are buffered but not drained until genuine
+    /// user re-engagement. Set by interactive Ctrl+C, cleared by a user prompt.
     pub(crate) notifications_suppressed: bool,
     /// Active prompt is still rewindable until the first outbound prompt-scoped
     /// event is emitted.
@@ -311,13 +315,13 @@ impl State {
     }
     /// Sweep `pending_inputs`, removing entries matching `drop_if` EXCEPT the
     /// running turn's own slot, and return the removed items (callers harvest
-    /// them for telemetry counts / `auto_wake_delivered` un-marks).
+    /// them for telemetry counts / reservation releases).
     ///
     /// Returned items still carry live `respond_to` senders that this helper
     /// does NOT resolve — dropping them unfulfilled is correct only for
     /// synthetic items (no client RPC awaits them, the current callers); a
     /// caller whose predicate can match user-originated items must resolve
-    /// each returned item (see `respond_removed_queued_prompt`) or the
+    /// each returned item (see `respond_removed_prompt`) or the
     /// client's `session/prompt` hangs and fails spuriously.
     ///
     /// The guard is the safety invariant every sweep must inherit: the
@@ -353,9 +357,9 @@ impl State {
 /// and `arm_idle_notification` (idle-notification debounce) — all consult this
 /// so they share one definition of idleness, with no drift between them.
 ///
-/// Returns `true` exactly when: no turn is running, no user prompt is queued,
-/// no lifecycle mutation owns the start gate, and notifications haven't been
-/// suppressed by a cancel.
+/// Returns `true` exactly when: no turn is running, no user prompt is
+/// queued, no lifecycle mutation owns the start gate, and interactive Ctrl+C
+/// has not suppressed notifications pending genuine user re-engagement.
 pub(crate) fn is_session_idle_for_injection(state: &State) -> bool {
     state.running_task.is_none()
         && state.pending_inputs.is_empty()

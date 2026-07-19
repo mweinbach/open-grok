@@ -70,6 +70,7 @@ fn pending_input(prompt_id: &str) -> (InputItem, oneshot::Receiver<PromptTurnRes
         verbatim: false,
         json_schema: None,
         origin: crate::session::PromptOrigin::User,
+        task_wake_fallback: None,
         respond_to,
         persist_ack: None,
         parsed_prompt_tx: None,

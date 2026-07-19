@@ -410,7 +410,11 @@ Report an issue or send feedback.
 
 ### `/btw`
 
-Send an aside to the agent without interrupting the current task.
+Send an aside to the agent without interrupting the current task. In minimal
+mode (`--minimal`), the answer appears in a dismissible panel above the prompt.
+**Esc** dismisses the panel; a finished answer is saved into native scrollback,
+while a late response to a dismissed loading panel is dropped. Side Q/A is not
+part of the main turn.
 
 ```
 /btw also check the error handling
@@ -531,7 +535,15 @@ Show or toggle privacy and data-retention status.
 
 ```
 /privacy
+/privacy opt-in
+/privacy opt-out
 ```
+
+Does not change `[features] telemetry`, `trace_upload`, or external OTEL settings.
+See [Monitoring Usage](24-monitoring-usage.md#related-settings).
+On team accounts, only a team admin can toggle privacy with `/privacy`.
+Team admins can also enable or disable Zero Data Retention (ZDR) for their team:
+[How to enable ZDR](https://docs.x.ai/developers/faq/security#how-to-enable-zdr).
 
 ---
 

@@ -7,6 +7,7 @@
 //! - `trigger_feedback`: fire a synthetic `FeedbackRequestNotification`.
 //! - `arm_auto_compact`: arm the next turn to unconditionally trigger
 //!   auto-compaction, regardless of context window usage.
+//! - `agent`: agent-process diagnostics (registry counts).
 
 use agent_client_protocol as acp;
 
@@ -22,8 +23,15 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             handle_trigger_feedback(agent, args).await
         }
         "x.ai/debug/arm_auto_compact" => handle_arm_auto_compact(agent, args),
+        "x.ai/debug/agent" => handle_agent(agent),
         _ => Err(acp::Error::method_not_found()),
     }
+}
+
+fn handle_agent(agent: &MvpAgent) -> ExtResult {
+    ExtMethodResult::success(serde_json::json!({ "registries": agent.registry_snapshot() }))
+        .to_ext_response()
+        .map_err(|e| acp::Error::internal_error().data(e.to_string()))
 }
 
 async fn handle_trigger_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {

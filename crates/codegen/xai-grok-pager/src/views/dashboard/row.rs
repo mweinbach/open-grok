@@ -389,9 +389,9 @@ pub fn classify_top_level(agent: &AgentView) -> RowState {
 /// (`run_terminal_command` with `background=true`), a running `monitor`
 /// (a background task with `is_monitor`), or an active scheduled `/loop`.
 /// Mirrors the agent view's idle "watching" cue
-/// (`crate::views::turn_status::Watchers`) but also counts plain
-/// background tasks — any in-flight background work the user dispatched
-/// should read as "Working" on the dashboard.
+/// (`crate::views::turn_status::Watchers`, minus subagents — the dashboard
+/// lists those as their own rows) — any in-flight background work the user
+/// dispatched should read as "Working" on the dashboard.
 pub fn has_background_work(agent: &AgentView) -> bool {
     agent
         .session

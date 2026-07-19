@@ -48,7 +48,8 @@ impl AgentView {
             self.highlighted_link_idx = None;
             return InputOutcome::Action(Action::OpenLink(target));
         }
-        if key!(Enter).matches(key)
+        if crate::app::inline_edit::INLINE_EDIT_ENABLED
+            && key!(Enter).matches(key)
             && !self.scrollback.is_selected_group_header()
             && let Some(idx) = self.scrollback.selected()
             && self
@@ -195,32 +196,29 @@ impl AgentView {
             }
         }
         if composing {
-            match key.code {
-                KeyCode::Enter => {
-                    if self.scrollback_search.as_ref()?.query().is_empty() {
-                        self.scrollback_search = None;
-                    } else {
-                        if let Some(search) = self.scrollback_search.as_mut() {
-                            search.accept();
-                        }
-                        self.reveal_current_search_match();
+            if key.code == KeyCode::Enter {
+                if self.scrollback_search.as_ref()?.query().is_empty() {
+                    self.scrollback_search = None;
+                } else {
+                    if let Some(search) = self.scrollback_search.as_mut() {
+                        search.accept();
                     }
-                    Some(InputOutcome::Changed)
+                    self.reveal_current_search_match();
                 }
-                KeyCode::Backspace => {
-                    let mut q = self.scrollback_search.as_ref()?.query().to_string();
-                    q.pop();
-                    self.set_scrollback_search_query(&q);
-                    Some(InputOutcome::Changed)
-                }
-                KeyCode::Char(c) if !key.modifiers.intersects(non_text) => {
-                    let mut q = self.scrollback_search.as_ref()?.query().to_string();
-                    q.push(c);
-                    self.set_scrollback_search_query(&q);
-                    Some(InputOutcome::Changed)
-                }
-                _ => Some(InputOutcome::Unchanged),
+                return Some(InputOutcome::Changed);
             }
+            let outcome = self
+                .scrollback_search
+                .as_mut()?
+                .apply_query_key(key, &self.scrollback);
+            Some(match outcome {
+                crate::input::line_editor::LineEditOutcome::TextChanged
+                | crate::input::line_editor::LineEditOutcome::CursorChanged
+                | crate::input::line_editor::LineEditOutcome::HandledNoChange => {
+                    InputOutcome::Changed
+                }
+                crate::input::line_editor::LineEditOutcome::Unhandled => InputOutcome::Unchanged,
+            })
         } else {
             match key.code {
                 KeyCode::Char('n') if key.modifiers.is_empty() => self.navigate_search(true),
@@ -230,6 +228,19 @@ impl AgentView {
                 _ => None,
             }
         }
+    }
+    pub(super) fn handle_scrollback_search_paste(&mut self, text: &str) -> Option<InputOutcome> {
+        let search = self.scrollback_search.as_mut()?;
+        if !search.is_composing() {
+            return Some(InputOutcome::Unchanged);
+        }
+        let outcome = search.apply_query_paste(text, &self.scrollback);
+        Some(match outcome {
+            crate::input::line_editor::LineEditOutcome::TextChanged
+            | crate::input::line_editor::LineEditOutcome::CursorChanged
+            | crate::input::line_editor::LineEditOutcome::HandledNoChange => InputOutcome::Changed,
+            crate::input::line_editor::LineEditOutcome::Unhandled => InputOutcome::Unchanged,
+        })
     }
     /// Enqueue `query` for the background scan. Results (and the reveal) arrive
     /// later via [`poll_scrollback_search`](Self::poll_scrollback_search); the
@@ -724,5 +735,51 @@ mod scroll_granularity_tests {
             agent.prompt.suggestions.dropdown.selected, 0,
             "-3-line wheel notch must move the completion selection by exactly -1"
         );
+    }
+}
+#[cfg(test)]
+mod paste_routing_tests {
+    use super::super::{AgentPane, test_fixtures::make_agent};
+    use crate::actions::ActionRegistry;
+    use crate::app::app_view::InputOutcome;
+    use crate::scrollback::ScrollbackSearchState;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    #[test]
+    fn scrollback_search_paste_stays_scoped_and_browse_is_inert() {
+        let mut agent = make_agent();
+        agent.set_active_pane(AgentPane::Scrollback, true);
+        agent.prompt.set_text("hidden prompt");
+        agent.scrollback_search = Some(ScrollbackSearchState::open());
+        let registry = ActionRegistry::defaults();
+        let _ = agent.handle_input(&Event::Paste("ab".to_owned()), &registry);
+        let _ = agent.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &registry,
+        );
+        let outcome = agent.handle_input(&Event::Paste("中\r\n".to_owned()), &registry);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(
+            agent
+                .scrollback_search
+                .as_ref()
+                .map(ScrollbackSearchState::query),
+            Some("a中b")
+        );
+        assert_eq!(agent.prompt.text(), "hidden prompt");
+        agent.scrollback_search.as_mut().unwrap().accept();
+        let outcome = agent.handle_input(&Event::Paste("ignored".to_owned()), &registry);
+        assert!(matches!(outcome, InputOutcome::Unchanged));
+        assert_eq!(
+            agent
+                .scrollback_search
+                .as_ref()
+                .map(ScrollbackSearchState::query),
+            Some("a中b")
+        );
+        assert_eq!(agent.prompt.text(), "hidden prompt");
+        agent.scrollback_search = None;
+        let outcome = agent.handle_input(&Event::Paste("still ignored".to_owned()), &registry);
+        assert!(matches!(outcome, InputOutcome::Unchanged));
+        assert_eq!(agent.prompt.text(), "hidden prompt");
     }
 }

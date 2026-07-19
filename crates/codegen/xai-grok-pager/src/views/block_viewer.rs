@@ -1161,6 +1161,15 @@ impl BlockViewerPane {
         consumed
     }
 
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.rebuild_unified_cache();
+        let consumed = self.list_state.handle_paste(text, &self.cached_unified);
+        if consumed {
+            self.text_drag = None;
+        }
+        consumed
+    }
+
     /// Generate a patch string from the diff metadata in the given item range.
     ///
     /// Returns `None` if this isn't an edit viewer or the range has no diff lines.

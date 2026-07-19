@@ -304,6 +304,10 @@ impl SubagentCoordinator {
             will_wake: false,
         })
     }
+    /// Lifecycle-map entry counts as `(pending, active, completed)`.
+    pub(crate) fn registry_snapshot(&self) -> (usize, usize, usize) {
+        (self.pending.len(), self.active.len(), self.completed.len())
+    }
     /// Oldest completions are evicted first; their `output.json` stays on disk.
     pub fn enforce_completed_cap(&mut self) {
         if self.completed.len() <= MAX_COMPLETED_ENTRIES {

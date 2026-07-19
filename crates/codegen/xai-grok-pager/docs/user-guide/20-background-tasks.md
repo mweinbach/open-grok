@@ -186,6 +186,18 @@ To toggle the prompt queue instead, press `Ctrl+;`.
 
 ---
 
+## The Watching Status Line
+
+Whenever background work is still running while the agent looks idle — between turns, or while a turn is blocked on a user-interruptible wait — a persistent status line appears above the prompt:
+
+```
+◎ watching · 1 command · 2 monitors · 1 loop · 1 subagent
+```
+
+It counts running background commands, monitors, scheduled `/loop` tasks, and background subagents, and updates live as each finishes. Any of them can wake the agent for a new turn (commands and subagents on completion, monitors on events, loops on their timer), so the cue stays up until nothing is left. Completions land in the transcript as a single "Task completed" chip — the transcript never repeats "N commands still running" lines.
+
+---
+
 ## Use Cases and Patterns
 
 ### Dev Server + Coding

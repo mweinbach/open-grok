@@ -616,7 +616,7 @@ fn should_auto_wake_subagent_suppressed_by_block_waited_or_killed() {
 }
 /// A goal loop active in the parent suppresses the subagent
 /// auto-wake synthetic prompt — the structural sibling of the bash gate.
-/// Skipping the inject here also skips `auto_wake_delivered.insert`, so the
+/// Skipping the inject here also skips its completion reservation, so the
 /// per-tool-call / between-turn surfaces stay free to drain the completion.
 #[test]
 fn should_auto_wake_subagent_suppressed_by_goal_loop() {
@@ -648,7 +648,7 @@ fn auto_wake_test_request(id: &str) -> SubagentRequest {
 }
 /// Behavior-level: the action half of the subagent auto-wake.
 /// When the gate lets it run, `inject_subagent_completed_prompt` sends the
-/// synthetic `Prompt` to the parent AND marks the id auto-wake-delivered.
+/// synthetic `Prompt` to the parent and reserves its completion ID.
 /// Paired with `should_auto_wake_subagent_suppressed_by_goal_loop`, this
 /// proves the full Gap-1 contract on the subagent surface: goal active →
 /// gate false → this never runs (no prompt, not marked, so surfaces 2/3
@@ -656,7 +656,7 @@ fn auto_wake_test_request(id: &str) -> SubagentRequest {
 #[test]
 fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
-    let auto_wake = xai_grok_tools::reminders::task_completion::AutoWakeDeliveredIds::default();
+    let reservations = xai_grok_tools::reminders::task_completion::TaskCompletionReservations::default();
     let request = auto_wake_test_request("sa-1");
     let result = SubagentResult {
         success: true,
@@ -668,7 +668,7 @@ fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
         "sa-1",
         &result,
         &request,
-        &Some(auto_wake.clone()),
+        &Some(reservations.clone()),
         Some(&cmd_tx),
         "get_command_or_subagent_output",
         &None,
@@ -680,7 +680,36 @@ fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
         }
         _ => panic!("expected SessionCommand::Prompt"),
     }
-    assert_eq!(auto_wake.snapshot(), vec!["sa-1".to_string()]);
+    assert_eq!(reservations.snapshot(), vec!["sa-1".to_string()]);
+}
+#[test]
+fn inject_subagent_completed_prompt_releases_reservation_when_parent_closed() {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    drop(cmd_rx);
+    let reservations = xai_grok_tools::reminders::task_completion::TaskCompletionReservations::default();
+    reservations.reserve("sa-closed".into());
+    let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+    inject_subagent_completed_prompt(
+        "sa-closed",
+        &SubagentResult {
+            success: true,
+            subagent_id: "sa-closed".into(),
+            child_session_id: "sa-closed".into(),
+            ..Default::default()
+        },
+        &auto_wake_test_request("sa-closed"),
+        &Some(reservations.clone()),
+        Some(&cmd_tx),
+        "get_command_or_subagent_output",
+        &Some(trace_tx),
+    );
+    assert!(
+        reservations.contains("sa-closed"),
+        "send failure must release only the reservation acquired by this attempt"
+    );
+    reservations.release("sa-closed");
+    assert!(! reservations.contains("sa-closed"));
+    assert!(trace_rx.try_recv().is_err());
 }
 #[test]
 fn mark_explicitly_killed_sets_flag_on_completed() {

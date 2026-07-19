@@ -73,6 +73,7 @@ impl SessionActor {
             verbatim: false,
             json_schema: None,
             origin: super::super::PromptOrigin::User,
+            task_wake_fallback: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,

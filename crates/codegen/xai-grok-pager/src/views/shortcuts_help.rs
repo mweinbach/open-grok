@@ -301,16 +301,14 @@ pub fn build_entries(
 /// key + label columns.
 pub fn build_initial_picker_state(entries: &[ShortcutsHelpEntry]) -> PickerState {
     use crate::views::picker::{PickerMode, PopupConfig};
-    PickerState {
-        selected: entries.iter().position(|e| e.is_hint()).unwrap_or(0),
-        mode: PickerMode::Popup(PopupConfig {
-            width_pct: 0.6,
-            height_pct: 0.7,
-            min_width: 60,
-            min_height: 16,
-        }),
-        ..PickerState::default()
-    }
+    let mut state = PickerState::with_mode(PickerMode::Popup(PopupConfig {
+        width_pct: 0.6,
+        height_pct: 0.7,
+        min_width: 60,
+        min_height: 16,
+    }));
+    state.selected = entries.iter().position(|e| e.is_hint()).unwrap_or(0);
+    state
 }
 
 // ---------------------------------------------------------------------------
@@ -577,8 +575,7 @@ pub fn detail_from_entry(entry: &ShortcutsHelpEntry) -> Option<ShortcutsHelpMode
 /// detail returns to an unfiltered browse and closes with one more press.
 fn enter_detail(state: &mut PickerState, entry: &ShortcutsHelpEntry) -> Option<ShortcutsHelpMode> {
     let detail = detail_from_entry(entry)?;
-    state.query.clear();
-    state.query_cursor = 0;
+    state.set_query("");
     state.search_active = false;
     Some(detail)
 }
@@ -813,7 +810,7 @@ pub fn handle_input(
         return ShortcutsHelpOutcome::Unchanged;
     }
 
-    let searching = state.search_active || !state.query.is_empty();
+    let searching = state.search_active || !state.query().is_empty();
     let vim_mode = crate::appearance::cache::load_vim_mode();
 
     if !searching {
@@ -827,7 +824,7 @@ pub fn handle_input(
         if key.code == KeyCode::Char('f') {
             return ShortcutsHelpOutcome::ToggleFilter;
         }
-        let filtered = filter_entries(entries, &state.query, hide_dimmed, collapsed);
+        let filtered = filter_entries(entries, state.query(), hide_dimmed, collapsed);
         if let Some(ShortcutsHelpEntry::SectionHeader { category_idx, .. }) =
             selected_original_entry(&filtered, entries, state.selected)
         {
@@ -891,6 +888,9 @@ pub fn handle_input(
             return match handle_picker_input(&ev, state, filtered.len(), &config) {
                 PickerOutcome::Selected(_) | PickerOutcome::Closed => ShortcutsHelpOutcome::Close,
                 PickerOutcome::Unchanged => ShortcutsHelpOutcome::Unchanged,
+                PickerOutcome::Changed | PickerOutcome::QueryChanged => {
+                    ShortcutsHelpOutcome::Changed
+                }
                 _ => ShortcutsHelpOutcome::Changed,
             };
         }
@@ -898,14 +898,13 @@ pub fn handle_input(
     }
 
     if key.code == KeyCode::Esc {
-        state.query.clear();
-        state.query_cursor = 0;
+        state.set_query("");
         state.search_active = false;
         state.selected = 0;
         return ShortcutsHelpOutcome::Changed;
     }
 
-    let filtered = filter_entries(entries, &state.query, hide_dimmed, collapsed);
+    let filtered = filter_entries(entries, state.query(), hide_dimmed, collapsed);
     let non_sel: Vec<bool> = non_selectable_mask(&filtered, entries);
     let config = picker_config(&non_sel);
 
@@ -930,6 +929,7 @@ pub fn handle_input(
         }
         PickerOutcome::Closed => ShortcutsHelpOutcome::Close,
         PickerOutcome::Unchanged => ShortcutsHelpOutcome::Unchanged,
+        PickerOutcome::Changed | PickerOutcome::QueryChanged => ShortcutsHelpOutcome::Changed,
         _ => ShortcutsHelpOutcome::Changed,
     }
 }
@@ -960,7 +960,7 @@ pub fn handle_mouse(
         }
     }
 
-    let filtered = filter_entries(entries, &state.query, hide_dimmed, collapsed);
+    let filtered = filter_entries(entries, state.query(), hide_dimmed, collapsed);
     let non_sel: Vec<bool> = non_selectable_mask(&filtered, entries);
     let config = picker_config(&non_sel);
 
@@ -986,6 +986,7 @@ pub fn handle_mouse(
         }
         PickerOutcome::Closed => ShortcutsHelpOutcome::Close,
         PickerOutcome::Unchanged => ShortcutsHelpOutcome::Unchanged,
+        PickerOutcome::Changed | PickerOutcome::QueryChanged => ShortcutsHelpOutcome::Changed,
         _ => ShortcutsHelpOutcome::Changed,
     }
 }
@@ -1267,7 +1268,7 @@ pub fn render_modal(
         return;
     }
 
-    let rows = CheatsheetRows::build(entries, &state.query, filter_active, collapsed_sections);
+    let rows = CheatsheetRows::build(entries, state.query(), filter_active, collapsed_sections);
     let help_refs = rows.help_refs();
     let picker_entries = rows.picker_entries(state, expanded_ids, &help_refs);
     let non_sel: Vec<bool> = vec![false; picker_entries.len()];
@@ -1285,19 +1286,18 @@ pub fn render_modal(
     let content_area = mca.content;
     let inner_x = mca.inner_x;
     let inner_width = mca.inner_width;
-    let searching = state.search_active || !state.query.is_empty();
+    let searching = state.search_active || !state.query().is_empty();
     let show_search_hint = !searching;
 
-    picker::render_search_bar(
+    picker::render_picker_search_bar(
         buf,
         content_area.x,
         content_area.y,
         content_area.width,
         theme,
-        &state.query,
+        state,
         searching,
         show_search_hint,
-        state.query_cursor,
         Some(theme.bg_base),
     );
     let sep_y = content_area.y + 1;
@@ -1380,10 +1380,9 @@ pub fn handle_modal_key(
     use crate::views::modal_window as mw;
     use crossterm::event::KeyCode;
 
-    let searching = state.search_active || !state.query.is_empty();
+    let searching = state.search_active || !state.query().is_empty();
     if mode.is_browse() && searching && key.code == KeyCode::Esc {
-        state.query.clear();
-        state.query_cursor = 0;
+        state.set_query("");
         state.search_active = false;
         state.selected = 0;
         return ModalKeyOutcome::Changed;
@@ -1423,6 +1422,29 @@ pub fn handle_modal_key(
         ShortcutsHelpOutcome::ToggleExpand(id) => ModalKeyOutcome::ToggleExpand(id),
         ShortcutsHelpOutcome::Changed => ModalKeyOutcome::Changed,
         ShortcutsHelpOutcome::Unchanged => ModalKeyOutcome::Unchanged,
+    }
+}
+
+pub fn handle_paste(
+    text: &str,
+    state: &mut PickerState,
+    mode: &ShortcutsHelpMode,
+) -> ShortcutsHelpOutcome {
+    if mode.is_detail() || !state.search_active {
+        return ShortcutsHelpOutcome::Unchanged;
+    }
+    match state.paste_query(text) {
+        crate::input::line_editor::LineEditOutcome::TextChanged => {
+            state.selected = 0;
+            state.selection_hidden = false;
+            state.scroll_offset = None;
+            ShortcutsHelpOutcome::Changed
+        }
+        crate::input::line_editor::LineEditOutcome::HandledNoChange
+        | crate::input::line_editor::LineEditOutcome::CursorChanged => {
+            ShortcutsHelpOutcome::Changed
+        }
+        crate::input::line_editor::LineEditOutcome::Unhandled => ShortcutsHelpOutcome::Unchanged,
     }
 }
 
@@ -2220,8 +2242,7 @@ mod tests {
         ];
         let mut state = build_initial_picker_state(&entries);
         // Active search matching the hint, selection on the matching row.
-        state.query = "send".to_string();
-        state.query_cursor = state.query.len();
+        state.set_query("send");
         state.search_active = true;
         state.selected = 1;
         let mut mode = browse_mode();
@@ -2237,7 +2258,7 @@ mod tests {
         assert_eq!(result, ShortcutsHelpOutcome::Changed);
         assert!(mode.is_detail(), "Enter from search opens the detail page");
         assert!(
-            state.query.is_empty(),
+            state.query().is_empty(),
             "opening detail clears the search query"
         );
         assert!(!state.search_active, "opening detail clears search_active");
@@ -2257,11 +2278,10 @@ mod tests {
         ];
         let mut state = build_initial_picker_state(&entries);
         // Active search that still matches the hint row.
-        state.query = "send".to_string();
-        state.query_cursor = state.query.len();
+        state.set_query("send");
         state.search_active = true;
         // Map a click at row 2 to the hint's position in the filtered view.
-        let filtered = filter_entries(&entries, &state.query, false, &no_collapsed());
+        let filtered = filter_entries(&entries, state.query(), false, &no_collapsed());
         let hint_pos = filtered
             .iter()
             .position(|&i| matches!(entries[i], ShortcutsHelpEntry::Hint { .. }))
@@ -2292,7 +2312,7 @@ mod tests {
         assert_eq!(result, ShortcutsHelpOutcome::Changed);
         assert!(mode.is_detail(), "clicking a hint from search opens detail");
         assert!(
-            state.query.is_empty(),
+            state.query().is_empty(),
             "click-open detail clears the search query"
         );
         assert!(
@@ -2875,7 +2895,7 @@ mod tests {
         );
         assert_eq!(enter_search, ShortcutsHelpOutcome::Changed);
         assert!(state.search_active, "`i` must activate cheatsheet search");
-        assert!(state.query.is_empty(), "`i` must not enter search text");
+        assert!(state.query().is_empty(), "`i` must not enter search text");
 
         let type_j = handle_input(
             &make_key(crossterm::event::KeyCode::Char('j')),
@@ -2887,7 +2907,7 @@ mod tests {
             &mut mode,
         );
         assert_eq!(type_j, ShortcutsHelpOutcome::Changed);
-        assert_eq!(state.query, "j", "printables must type in active search");
+        assert_eq!(state.query(), "j", "printables must type in active search");
     }
 
     // ── vim_mode tests ───────────────────────────────────────────
@@ -2915,7 +2935,7 @@ mod tests {
         );
         assert_eq!(down, ShortcutsHelpOutcome::Changed);
         assert_eq!(state.selected, 2, "`j` must select the next row");
-        assert!(state.query.is_empty(), "`j` must not enter search text");
+        assert!(state.query().is_empty(), "`j` must not enter search text");
         assert!(!state.search_active, "`j` must leave search inactive");
 
         let up = handle_input(
@@ -2929,7 +2949,7 @@ mod tests {
         );
         assert_eq!(up, ShortcutsHelpOutcome::Changed);
         assert_eq!(state.selected, 1, "`k` must select the previous row");
-        assert!(state.query.is_empty(), "`k` must not enter search text");
+        assert!(state.query().is_empty(), "`k` must not enter search text");
         assert!(!state.search_active, "`k` must leave search inactive");
     }
 
@@ -2960,7 +2980,7 @@ mod tests {
                 ShortcutsHelpOutcome::Changed,
                 "non-vim `{ch}` must start search"
             );
-            assert_eq!(state.query, ch.to_string(), "non-vim `{ch}` must type");
+            assert_eq!(state.query(), ch.to_string(), "non-vim `{ch}` must type");
         }
     }
 
@@ -3227,7 +3247,7 @@ mod tests {
             ShortcutsHelpOutcome::Unchanged,
             "vim h on a collapsed action hint must be inert"
         );
-        assert!(state.query.is_empty(), "vim h must not enter search text");
+        assert!(state.query().is_empty(), "vim h must not enter search text");
 
         let key_id = ExpandKey::Action(ActionId::SendPrompt);
         let expanded = std::collections::HashSet::from([key_id]);
@@ -3245,7 +3265,7 @@ mod tests {
             ShortcutsHelpOutcome::ToggleExpand(key_id),
             "vim h must collapse an expanded action hint"
         );
-        assert!(state.query.is_empty(), "vim h must not enter search text");
+        assert!(state.query().is_empty(), "vim h must not enter search text");
     }
 
     #[test]
@@ -3324,7 +3344,7 @@ mod tests {
             ShortcutsHelpOutcome::ToggleExpand(key_id),
             "vim l must expand the paste pseudo-row"
         );
-        assert!(state.query.is_empty(), "vim l must not enter search text");
+        assert!(state.query().is_empty(), "vim l must not enter search text");
 
         let expanded = std::collections::HashSet::from([key_id]);
         let collapse = handle_input(
@@ -3341,7 +3361,7 @@ mod tests {
             ShortcutsHelpOutcome::ToggleExpand(key_id),
             "vim h must collapse the expanded paste pseudo-row"
         );
-        assert!(state.query.is_empty(), "vim h must not enter search text");
+        assert!(state.query().is_empty(), "vim h must not enter search text");
     }
 
     /// `handle_modal_key` (chrome + picker pipeline) maps the hint-row expand to

@@ -85,6 +85,7 @@ impl crate::types::tool_metadata::ToolMetadata for KillTaskTool {
                 subagent_present: true,
                 bash_present: true,
                 is_windows: cfg!(not(unix)),
+                task_id_param: "task_id",
             })
         });
         &DESC
@@ -147,6 +148,9 @@ fn kill_task_description(
         subagent_present: renderer.tool_for_kind(ToolKind::Task).is_some(),
         bash_present: renderer.tool_for_kind(ToolKind::Execute).is_some(),
         is_windows: cfg!(not(unix)),
+        task_id_param: renderer
+            .param_for_kind(ToolKind::KillTaskAction, "task_id")
+            .unwrap_or("task_id"),
     })
 }
 
@@ -435,6 +439,32 @@ mod tests {
                 "[{label}] subagent mention must match task-tool presence:\n{rendered}"
             );
         }
+    }
+
+    #[test]
+    fn description_tracks_renamed_task_id() {
+        use crate::types::template_renderer::TemplateRenderer;
+        use crate::types::tool::ToolKind;
+        use std::collections::HashMap;
+
+        let tools = HashMap::from([
+            (ToolKind::Execute, "run_terminal_command".to_string()),
+            (ToolKind::Monitor, "monitor".to_string()),
+            (ToolKind::KillTaskAction, "kill_task".to_string()),
+        ]);
+        let params = HashMap::from([(
+            ToolKind::KillTaskAction,
+            HashMap::from([("task_id".to_string(), "id".to_string())]),
+        )]);
+        let rendered = kill_task_description(&TemplateRenderer::new(tools, params), None);
+        assert!(
+            rendered.contains("Pass its id (a monitor's id is returned by monitor)"),
+            "renamed task_id must appear in pass-line and monitor aside:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("task_id"),
+            "canonical task_id must not remain after rename:\n{rendered}"
+        );
     }
 
     /// The kill mechanism is OS-level: Windows describes Job Object termination,

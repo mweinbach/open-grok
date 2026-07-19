@@ -9,6 +9,7 @@ use crate::actions::{ActionId, ActionRegistry, When};
 use crate::appearance::AppearanceConfig;
 use crate::input::KeyboardNormalizer;
 use crate::input::key::KeyShortcut;
+use crate::input::line_editor::{LineEditOutcome, LineEditor};
 use crate::input::mouse::{MouseScrollState, ScrollConfig, ScrollDirection};
 use crate::key;
 use crate::notifications::NotificationService;
@@ -27,28 +28,56 @@ use xai_acp_lib::AcpAgentTx;
 #[derive(Debug, Default)]
 pub struct NewWorktreeDialogState {
     /// Text input for the worktree label (empty = auto-generated name).
-    pub label_input: String,
+    label: LineEditor,
 }
+const MAX_WORKTREE_LABEL_BYTES: usize = 100;
 impl NewWorktreeDialogState {
     pub fn new() -> Self {
         Self {
-            label_input: String::new(),
+            label: LineEditor::default(),
         }
+    }
+    pub fn label(&self) -> &str {
+        self.label.text()
+    }
+    pub(crate) fn viewport(&self, width: usize) -> xai_ratatui_textarea::SingleLineViewport {
+        self.label.viewport(width)
+    }
+    #[cfg(test)]
+    pub(crate) fn set_label(&mut self, label: impl Into<String>) {
+        self.label.set_text(label);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_cursor_byte(&mut self, cursor_byte: usize) -> LineEditOutcome {
+        self.label.set_cursor_byte(cursor_byte)
+    }
+    pub fn insert_paste(&mut self, text: &str) -> NewWorktreeDialogOutcome {
+        Self::from_line_edit(
+            self.label
+                .insert_paste_with_byte_limit(text, MAX_WORKTREE_LABEL_BYTES),
+        )
     }
     /// Handle a key event. Returns the dialog outcome.
     pub fn handle_key(&mut self, key: &crossterm::event::KeyEvent) -> NewWorktreeDialogOutcome {
         use crossterm::event::{KeyCode, KeyModifiers};
+        if crate::input::key::is_paste_key(key) {
+            return crate::clipboard::system_clipboard_get()
+                .map_or(NewWorktreeDialogOutcome::Unchanged, |text| {
+                    self.insert_paste(&text)
+                });
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && !crate::input::key::is_altgr(key.modifiers)
+            && matches!(key.code, KeyCode::Char('c' | 'd' | 'q'))
         {
-            return match key.code {
-                KeyCode::Char('c' | 'd' | 'q') => NewWorktreeDialogOutcome::Cancelled,
-                _ => NewWorktreeDialogOutcome::Unchanged,
-            };
+            return NewWorktreeDialogOutcome::Cancelled;
+        }
+        if key.code == KeyCode::Enter && !key.modifiers.is_empty() {
+            return NewWorktreeDialogOutcome::Unchanged;
         }
         match key.code {
-            KeyCode::Enter => {
-                let label = self.label_input.trim().to_string();
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                let label = self.label().trim().to_string();
                 NewWorktreeDialogOutcome::Submitted(if label.is_empty() {
                     None
                 } else {
@@ -56,20 +85,21 @@ impl NewWorktreeDialogState {
                 })
             }
             KeyCode::Esc => NewWorktreeDialogOutcome::Cancelled,
-            KeyCode::Backspace => {
-                if self.label_input.pop().is_some() {
-                    NewWorktreeDialogOutcome::Changed
-                } else {
-                    NewWorktreeDialogOutcome::Unchanged
-                }
+            _ => {
+                let remaining = MAX_WORKTREE_LABEL_BYTES.saturating_sub(self.label().len());
+                let outcome = self.label.handle_key_with_insert_policy(key, |character| {
+                    character.len_utf8() <= remaining
+                });
+                Self::from_line_edit(outcome)
             }
-            KeyCode::Char(c) => {
-                if self.label_input.len() < 100 {
-                    self.label_input.push(c);
-                }
-                NewWorktreeDialogOutcome::Changed
-            }
-            _ => NewWorktreeDialogOutcome::Unchanged,
+        }
+    }
+    fn from_line_edit(outcome: LineEditOutcome) -> NewWorktreeDialogOutcome {
+        match outcome {
+            LineEditOutcome::TextChanged
+            | LineEditOutcome::CursorChanged
+            | LineEditOutcome::HandledNoChange => NewWorktreeDialogOutcome::Changed,
+            LineEditOutcome::Unhandled => NewWorktreeDialogOutcome::Unchanged,
         }
     }
 }
@@ -196,6 +226,26 @@ pub enum ActiveView {
     Agent(AgentId),
     /// The top-level Agent Dashboard. State lives in `AppView::dashboard`.
     AgentDashboard,
+}
+/// Target restored when leaving the dashboard (Ctrl+\ / Esc).
+/// Consumed by `dispatch_exit_dashboard`; dead agents fall back to
+/// insertion-order first / Welcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardReturn {
+    /// Plain agent view (no session-overlay chrome).
+    Agent(AgentId),
+    /// Session overlay: re-set `attached_agent` on the way back.
+    Overlay(AgentId),
+}
+impl DashboardReturn {
+    pub fn agent_id(self) -> AgentId {
+        match self {
+            Self::Agent(id) | Self::Overlay(id) => id,
+        }
+    }
+    pub fn is_overlay(self) -> bool {
+        matches!(self, Self::Overlay(_))
+    }
 }
 /// Tick cadence demanded by the current view state — see
 /// [`AppView::tick_demand`]. Ordered: `None < Slow < Fast`.
@@ -1094,7 +1144,7 @@ pub struct AppView {
     /// Initial auth mode hint from method metadata.
     pub auth_start_mode: AuthMode,
     /// Text buffer for manual auth token paste (loopback mode).
-    pub auth_code_input: String,
+    pub(crate) auth_code_input: LineEditor,
     /// Monotonically increasing sequence number for auth requests.
     pub next_auth_request_seq: u64,
     /// Abort handle for the in-flight `PollAuthUrl` task (with its request_seq).
@@ -1104,8 +1154,10 @@ pub struct AppView {
     pub deferred_startup: crate::app::session_startup::DeferredStartupActions,
     /// Whether deferred welcome-screen login should force OAuth.
     pub auth_use_oauth: bool,
-    /// Whether the last clipboard copy during auth succeeded.
-    pub auth_clipboard_copied: bool,
+    /// Delivery state from the last clipboard copy during auth.
+    pub auth_clipboard_delivery: Option<crate::clipboard::ClipboardDelivery>,
+    /// Generation of the current auth copy feedback and its clear timer.
+    pub auth_clipboard_feedback_generation: u64,
     /// Team principal UUID from auth (`None` for personal sessions).
     pub team_id: Option<String>,
     /// Team name from auth (displayed in the shortcuts bar).
@@ -1190,6 +1242,8 @@ pub struct AppView {
     /// Held outside the `ActiveView` discriminant because `DashboardState`
     /// is not `Copy` (owns its prompt widget, peek panel, etc.).
     pub dashboard: Option<crate::views::dashboard::DashboardState>,
+    /// Where to return when leaving the dashboard. See [`DashboardReturn`].
+    pub dashboard_return: Option<DashboardReturn>,
     /// Persisted dashboard configuration (pinned rows, reorderings,
     /// grouping). Loaded once on startup from
     /// `~/.opengrok/config.toml`. `None` when the file/section is absent
@@ -1606,17 +1660,18 @@ impl AppView {
             login_label: None,
             login_method_id: None,
             auth_start_mode: AuthMode::Pending,
-            auth_code_input: String::new(),
+            auth_code_input: LineEditor::default(),
             next_auth_request_seq: 1,
             auth_url_poll_handle: None,
             deferred_startup: Default::default(),
             auth_use_oauth: false,
-            auth_clipboard_copied: false,
+            auth_clipboard_delivery: None,
+            auth_clipboard_feedback_generation: 0,
             team_id: None,
             team_name: None,
             is_zdr: false,
             team_role: None,
-            coding_data_retention_opt_out: false,
+            coding_data_retention_opt_out: true,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
@@ -1662,6 +1717,7 @@ impl AppView {
             cancel_rewind_enabled: true,
             session_recap_available: false,
             dashboard: None,
+            dashboard_return: None,
             dashboard_persisted: None,
             keyboard_normalizer: KeyboardNormalizer::from_terminal_context(),
             voice_mode_enabled: false,
@@ -2383,9 +2439,19 @@ impl AppView {
     /// moved out of the crossterm event before the regular borrowed routing
     /// path, ensuring the original allocation is zeroized rather than later
     /// dropping as an ordinary plaintext `String`.
+    #[cfg(test)]
     pub(crate) fn handle_owned_input_with_paste_provenance(
         &mut self,
         ev: &mut Event,
+        paste_provenance: PasteProvenance,
+    ) -> InputOutcome {
+        self.handle_owned_input_at_with_paste_provenance(ev, Instant::now(), paste_provenance)
+    }
+
+    pub(crate) fn handle_owned_input_at_with_paste_provenance(
+        &mut self,
+        ev: &mut Event,
+        arrived_at: Instant,
         paste_provenance: PasteProvenance,
     ) -> InputOutcome {
         if let Event::Paste(text) = ev
@@ -2424,7 +2490,7 @@ impl AppView {
                 .expect("secret paste target disappeared during synchronous routing")
                 .handle_settings_secret_paste(pasted);
         }
-        self.handle_input_with_paste_provenance(ev, paste_provenance)
+        self.handle_input_at_with_paste_provenance(ev, arrived_at, paste_provenance)
     }
 
     /// Handle a terminal event. Routes through the input layer stack:
@@ -2436,11 +2502,12 @@ impl AppView {
     /// Quit always goes through double-press confirmation, even when
     /// escalated from agent-level (e.g., Ctrl-C while cancelling).
     pub fn handle_input(&mut self, ev: &Event) -> InputOutcome {
-        self.handle_input_with_paste_provenance(ev, PasteProvenance::Terminal)
+        self.handle_input_at_with_paste_provenance(ev, Instant::now(), PasteProvenance::Terminal)
     }
-    pub(crate) fn handle_input_with_paste_provenance(
+    pub(crate) fn handle_input_at_with_paste_provenance(
         &mut self,
         ev: &Event,
+        arrived_at: Instant,
         paste_provenance: PasteProvenance,
     ) -> InputOutcome {
         debug_assert!(
@@ -2488,7 +2555,9 @@ impl AppView {
             let config = self
                 .scroll_config
                 .with_viewport_height(self.scroll_viewport_height());
-            let update = self.scroll_state.on_scroll_event(direction, config);
+            let update = self
+                .scroll_state
+                .on_scroll_event_at(arrived_at, direction, config);
             let pos = (mouse.column, mouse.row);
             self.last_scroll_pos = Some(pos);
             if update.lines != 0 {
@@ -2764,7 +2833,9 @@ impl AppView {
                 match self.agents.get_mut(&id) {
                     Some(agent) => {
                         let secret_input = agent.settings_secret_editor_active();
-                        let outcome = if prompt_paging {
+                        let outcome = if self.screen_mode.is_minimal() {
+                            agent.handle_minimal_input(ev, &self.registry)
+                        } else if prompt_paging {
                             agent.handle_input_with_prompt_paging(ev, &self.registry)
                         } else {
                             agent.handle_input(ev, &self.registry)
@@ -3115,7 +3186,10 @@ impl AppView {
     }
 }
 pub(crate) use crate::views::session_picker::filter_session_entries;
-use crate::views::session_picker::{CONTENT_EXPAND_OFFSET, PickerItem, build_entry_map};
+use crate::views::session_picker::{
+    CONTENT_EXPAND_OFFSET, PickerItem, SessionPickerWorktreeSelection, build_entry_map,
+    session_picker_worktree_selection, sync_session_picker_query_expansion,
+};
 /// Context for welcome-view input handling.
 struct WelcomeInputCtx<'a> {
     auth_state: &'a AuthState,
@@ -3129,7 +3203,7 @@ struct WelcomeInputCtx<'a> {
     /// that was started from inside a session. Esc / `q` then cancel the
     /// login and return to the session rather than quitting the app.
     mid_session_login: bool,
-    auth_code_input: &'a mut String,
+    auth_code_input: &'a mut LineEditor,
     prompt: &'a mut PromptWidget,
     prompt_focused: &'a mut bool,
     new_worktree_dialog: &'a mut Option<NewWorktreeDialogState>,
@@ -3263,31 +3337,30 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
         return InputOutcome::Unchanged;
     }
     if let Some(dialog) = ctx.new_worktree_dialog.as_mut() {
-        if let Event::Key(key) = ev {
-            if key.kind == crossterm::event::KeyEventKind::Release {
-                return InputOutcome::Unchanged;
+        let outcome = match ev {
+            Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
+                dialog.handle_key(key)
             }
-            match dialog.handle_key(key) {
-                NewWorktreeDialogOutcome::Submitted(label) => {
-                    *ctx.new_worktree_dialog = None;
-                    return InputOutcome::Action(Action::NewWorktreeSession {
-                        load_session_id: None,
-                        label,
-                        git_ref: None,
-                    });
-                }
-                NewWorktreeDialogOutcome::Cancelled => {
-                    *ctx.new_worktree_dialog = None;
-                    return InputOutcome::Changed;
-                }
-                NewWorktreeDialogOutcome::Changed => return InputOutcome::Changed,
-                NewWorktreeDialogOutcome::Unchanged => return InputOutcome::Unchanged,
+            Event::Paste(text) => dialog.insert_paste(text),
+            Event::Resize(_, _) => return InputOutcome::Changed,
+            _ => NewWorktreeDialogOutcome::Unchanged,
+        };
+        match outcome {
+            NewWorktreeDialogOutcome::Submitted(label) => {
+                *ctx.new_worktree_dialog = None;
+                return InputOutcome::Action(Action::NewWorktreeSession {
+                    load_session_id: None,
+                    label,
+                    git_ref: None,
+                });
             }
+            NewWorktreeDialogOutcome::Cancelled => {
+                *ctx.new_worktree_dialog = None;
+                return InputOutcome::Changed;
+            }
+            NewWorktreeDialogOutcome::Changed => return InputOutcome::Changed,
+            NewWorktreeDialogOutcome::Unchanged => return InputOutcome::Unchanged,
         }
-        if matches!(ev, Event::Resize(_, _)) {
-            return InputOutcome::Changed;
-        }
-        return InputOutcome::Unchanged;
     }
     if matches!(ctx.auth_state, AuthState::Done)
         && ctx.has_access
@@ -3333,7 +3406,6 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
     }
     if ctx.sp_entries.is_some() && matches!(ctx.auth_state, AuthState::Done) {
         use crate::views::picker::{PickerConfig, PickerOutcome, handle_picker_input};
-        let query_before = ctx.sp_state.query.clone();
         let source_filter = *ctx.sp_source_filter;
         let current_repo =
             crate::views::session_picker::repo_name_from_cwd(&ctx.cwd.to_string_lossy());
@@ -3341,7 +3413,7 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             ctx.sp_entries.as_deref(),
             ctx.sp_content_results.as_deref(),
             crate::views::session_picker::effective_filter_query(
-                &ctx.sp_state.query,
+                ctx.sp_state.query(),
                 ctx.sp_entries_query.as_deref(),
             ),
             ctx.session_picker_grouped,
@@ -3372,6 +3444,33 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             search_only_on_slash: false,
             vim_normal_first: crate::appearance::cache::load_vim_mode(),
         };
+        if let Event::Key(key) = ev {
+            if key.kind == KeyEventKind::Press
+                && (key!('c', CONTROL).matches(key) || key!('d', CONTROL).matches(key))
+            {
+                return InputOutcome::Action(Action::Quit);
+            }
+            if let Some(selection) = session_picker_worktree_selection(
+                key,
+                ctx.sp_state,
+                &entry_map,
+                &non_selectable_flags,
+                ctx.sp_entries.as_deref(),
+                ctx.sp_content_results.as_deref(),
+            ) {
+                return InputOutcome::Action(match selection {
+                    SessionPickerWorktreeSelection::Fuzzy(original_index) => {
+                        Action::PickSessionInWorktree(original_index)
+                    }
+                    SessionPickerWorktreeSelection::Content { session_id, cwd } => {
+                        Action::PickContentSessionInWorktree { session_id, cwd }
+                    }
+                    SessionPickerWorktreeSelection::Unavailable => {
+                        return InputOutcome::Changed;
+                    }
+                });
+            }
+        }
         let outcome = handle_picker_input(ev, ctx.sp_state, entry_count, &config);
         match outcome {
             PickerOutcome::Selected(i) => match entry_map.get(i).and_then(|e| e.as_ref()) {
@@ -3392,7 +3491,7 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                 None => return InputOutcome::Changed,
             },
             PickerOutcome::SubmitQuery => {
-                let query = ctx.sp_state.query.trim().to_string();
+                let query = ctx.sp_state.query().trim().to_string();
                 if !query.is_empty() {
                     return InputOutcome::Action(Action::LoadSession(query, None, false));
                 }
@@ -3468,53 +3567,26 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                 }
                 return InputOutcome::Changed;
             }
-            PickerOutcome::Changed => {
-                if ctx.sp_state.query != query_before {
-                    return InputOutcome::Action(Action::TriggerDeepSearch);
-                }
-                return InputOutcome::Changed;
+            PickerOutcome::QueryChanged => {
+                sync_session_picker_query_expansion(
+                    ctx.sp_entries.as_deref(),
+                    ctx.sp_content_results.as_deref(),
+                    ctx.sp_entries_query.as_deref(),
+                    ctx.sp_state,
+                    ctx.session_picker_grouped,
+                    ctx.sp_content_loading,
+                    source_filter,
+                    Some(current_repo.as_str()),
+                );
+                return InputOutcome::Action(Action::TriggerDeepSearch);
             }
+            PickerOutcome::Changed => return InputOutcome::Changed,
             PickerOutcome::Unchanged => {
                 if let Event::Key(key) = ev
                     && key.kind == KeyEventKind::Press
                 {
-                    if key!('w', CONTROL).matches(key) && entry_count > 0 {
-                        match entry_map
-                            .get(ctx.sp_state.selected)
-                            .and_then(|e| e.as_ref())
-                        {
-                            Some(PickerItem::Fuzzy { original_index }) => {
-                                if let Some(entries) = ctx.sp_entries.as_ref()
-                                    && let Some(entry) = entries.get(*original_index)
-                                    && !crate::app::foreign_sessions::is_foreign_picker_source(
-                                        &entry.source,
-                                    )
-                                {
-                                    return InputOutcome::Action(Action::PickSessionInWorktree(
-                                        *original_index,
-                                    ));
-                                }
-                            }
-                            Some(PickerItem::Content { hit_index }) => {
-                                if let Some(hits) = ctx.sp_content_results.as_ref()
-                                    && let Some(hit) = hits.get(*hit_index)
-                                {
-                                    return InputOutcome::Action(
-                                        Action::PickContentSessionInWorktree {
-                                            session_id: hit.session_id.clone(),
-                                            cwd: hit.cwd.clone(),
-                                        },
-                                    );
-                                }
-                            }
-                            None => {}
-                        }
-                    }
-                    if key!('/', CONTROL).matches(key) && !ctx.sp_state.query.trim().is_empty() {
+                    if key!('/', CONTROL).matches(key) && !ctx.sp_state.query().trim().is_empty() {
                         return InputOutcome::Action(Action::ForceDeepSearch);
-                    }
-                    if key!('c', CONTROL).matches(key) || key!('d', CONTROL).matches(key) {
-                        return InputOutcome::Action(Action::Quit);
                     }
                 }
                 return InputOutcome::Unchanged;
@@ -3684,20 +3756,34 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                     return InputOutcome::Action(Action::QuitConfirmed);
                 }
                 if key!(Enter).matches(key) {
-                    let trimmed = ctx.auth_code_input.trim().to_string();
+                    let trimmed = ctx.auth_code_input.text().trim().to_string();
                     if !trimmed.is_empty() {
                         return InputOutcome::Action(Action::SubmitAuthCode(trimmed));
                     }
                     return InputOutcome::Unchanged;
                 }
-                if key!(Backspace).matches(key) {
-                    ctx.auth_code_input.pop();
+                let outcome = if crate::input::key::is_paste_key(key) {
+                    let Some(text) = crate::clipboard::system_clipboard_get() else {
+                        return InputOutcome::Unchanged;
+                    };
+                    ctx.auth_code_input.insert_paste(&text)
+                } else if key.modifiers.intersects(
+                    crossterm::event::KeyModifiers::CONTROL
+                        | crossterm::event::KeyModifiers::ALT
+                        | crossterm::event::KeyModifiers::SUPER,
+                ) && !crate::input::key::is_altgr(key.modifiers)
+                {
                     return InputOutcome::Changed;
-                }
-                if let crossterm::event::KeyCode::Char(c) = key.code {
-                    ctx.auth_code_input.push(c);
-                    return InputOutcome::Changed;
-                }
+                } else {
+                    ctx.auth_code_input
+                        .handle_key_with_insert_policy(key, |character| !character.is_control())
+                };
+                return match outcome {
+                    LineEditOutcome::TextChanged
+                    | LineEditOutcome::CursorChanged
+                    | LineEditOutcome::HandledNoChange => InputOutcome::Changed,
+                    LineEditOutcome::Unhandled => InputOutcome::Unchanged,
+                };
             }
             AuthState::Authenticating { .. } => {
                 if key!(Esc).matches(key)
@@ -3724,8 +3810,7 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                 mode: AuthMode::Loopback,
                 ..
             } => {
-                let cleaned: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-                ctx.auth_code_input.push_str(&cleaned);
+                let _ = ctx.auth_code_input.insert_paste(text);
                 return InputOutcome::Changed;
             }
             _ => {}
@@ -4344,8 +4429,9 @@ impl AppView {
                             auth_state: &self.auth_state,
                             trust_state: &self.trust_state,
                             login_label: self.login_label.as_deref(),
-                            auth_code_input: &self.auth_code_input,
-                            clipboard_copied: self.auth_clipboard_copied,
+                            auth_code_input: self.auth_code_input.text(),
+                            auth_code_cursor_byte: self.auth_code_input.cursor_byte(),
+                            clipboard_delivery: self.auth_clipboard_delivery,
                             show_raw_url: self.auth_show_raw_url,
                             announcement: hero_announcement,
                             tip,
@@ -5645,10 +5731,12 @@ pub(crate) mod tests {
         use ratatui::{TerminalOptions, Viewport};
         test_support::install_counting_hook();
         crate::memory_release::run_deferred_release();
-        let (frame_tx, _frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let backend = ratatui::backend::CrosstermBackend::new(
-            crate::render::draw::TermWriter::new(frame_tx, crate::render::draw::WriterSync::new()),
-        );
+        let (frame_tx, _frame_rx) =
+            std::sync::mpsc::channel::<crate::render::draw::WriterPayload>();
+        let writer =
+            crate::render::draw::TermWriter::new(frame_tx, crate::render::draw::WriterSync::new())
+                .expect("single test writer");
+        let backend = ratatui::backend::CrosstermBackend::new(writer);
         let mut terminal = xai_ratatui_inline::Terminal::with_options(
             backend,
             TerminalOptions {
@@ -5761,17 +5849,18 @@ pub(crate) mod tests {
             login_label: None,
             login_method_id: None,
             auth_start_mode: AuthMode::Pending,
-            auth_code_input: String::new(),
+            auth_code_input: LineEditor::default(),
             next_auth_request_seq: 1,
             auth_url_poll_handle: None,
             deferred_startup: Default::default(),
             auth_use_oauth: false,
-            auth_clipboard_copied: false,
+            auth_clipboard_delivery: None,
+            auth_clipboard_feedback_generation: 0,
             team_id: None,
             team_name: None,
             is_zdr: false,
             team_role: None,
-            coding_data_retention_opt_out: false,
+            coding_data_retention_opt_out: true,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
@@ -5870,6 +5959,7 @@ pub(crate) mod tests {
             cancel_rewind_enabled: true,
             session_recap_available: false,
             dashboard: None,
+            dashboard_return: None,
             dashboard_persisted: None,
             keyboard_normalizer: KeyboardNormalizer::from_terminal_context(),
             voice_mode_enabled: false,
@@ -5940,12 +6030,7 @@ pub(crate) mod tests {
             app.current_ui.clone(),
             crate::settings::PagerLocalSnapshot::default(),
         );
-        settings.mode = crate::views::settings_modal::SettingsModalMode::EditingSecret {
-            key: "kimi_api_key",
-            buffer: crate::settings::SecretInput::default(),
-            cursor_byte: 0,
-            validation_error: None,
-        };
+        settings.enter_secret_editor_for_test("kimi_api_key");
         app.agents.get_mut(&id).unwrap().active_modal =
             Some(crate::views::modal::ActiveModal::Settings {
                 state: Box::new(settings),
@@ -5961,11 +6046,7 @@ pub(crate) mod tests {
         else {
             panic!("settings modal should remain open");
         };
-        assert!(matches!(
-            &state.mode,
-            crate::views::settings_modal::SettingsModalMode::EditingSecret { buffer, .. }
-                if buffer.expose() == "sk-owned-secret"
-        ));
+        assert!(state.secret_editor_matches_for_test("sk-owned-secret"));
     }
     #[test]
     fn dashboard_owned_secret_paste_moves_text_out_of_terminal_event() {
@@ -5977,12 +6058,7 @@ pub(crate) mod tests {
             app.current_ui.clone(),
             crate::settings::PagerLocalSnapshot::default(),
         );
-        settings.mode = crate::views::settings_modal::SettingsModalMode::EditingSecret {
-            key: "kimi_api_key",
-            buffer: crate::settings::SecretInput::default(),
-            cursor_byte: 0,
-            validation_error: None,
-        };
+        settings.enter_secret_editor_for_test("kimi_api_key");
         dashboard.settings_modal = Some(Box::new(settings));
         app.dashboard = Some(dashboard);
 
@@ -5997,11 +6073,7 @@ pub(crate) mod tests {
             .as_ref()
             .and_then(|dashboard| dashboard.settings_modal.as_deref())
             .expect("dashboard Settings modal should remain open");
-        assert!(matches!(
-            &state.mode,
-            crate::views::settings_modal::SettingsModalMode::EditingSecret { buffer, .. }
-                if buffer.expose() == "sk-dashboard-secret"
-        ));
+        assert!(state.secret_editor_matches_for_test("sk-dashboard-secret"));
 
         let close = app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(matches!(close, InputOutcome::Changed));
@@ -6012,7 +6084,7 @@ pub(crate) mod tests {
             .expect("first Esc should return to Settings browse mode");
         assert!(
             matches!(
-                state.mode,
+                state.mode(),
                 crate::views::settings_modal::SettingsModalMode::Browse
             ),
             "Esc should drop and zeroize the dashboard credential draft"
@@ -6056,8 +6128,9 @@ pub(crate) mod tests {
         primary.active_view = ActiveView::AgentDashboard;
         primary.dashboard = Some(crate::views::dashboard::DashboardState::new());
         crate::clipboard::set_clipboard_probe_hook(clipboard_hook());
-        let outcome = primary.handle_input_with_paste_provenance(
+        let outcome = primary.handle_input_at_with_paste_provenance(
             &Event::Paste(PRIMARY.to_owned()),
+            Instant::now(),
             PasteProvenance::X11Primary,
         );
         let probe_calls = crate::clipboard::clipboard_probe_call_count();
@@ -7530,6 +7603,77 @@ pub(crate) mod tests {
             "full TUI must keep the queue-pane toggle, got {out:?}"
         );
     }
+    fn welcome_session_entry(id: &str) -> SessionPickerEntry {
+        SessionPickerEntry {
+            id: id.into(),
+            summary: id.into(),
+            updated_at: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            cwd: "/tmp/repo".into(),
+            hostname: None,
+            source: "local".into(),
+            model_id: None,
+            num_messages: 0,
+            last_active_at: None,
+            branch: None,
+            repo_name: "tmp-repo".into(),
+            worktree_label: None,
+            card_detail: None,
+        }
+    }
+    fn open_welcome_session_picker(app: &mut AppView) {
+        crate::appearance::cache::set_vim_mode(false);
+        app.session_picker_entries = Some(vec![welcome_session_entry("session-0")]);
+        app.session_picker_state.search_active = true;
+    }
+    #[test]
+    fn welcome_session_picker_ctrl_w_resumes_in_worktree_while_search_is_focused() {
+        let mut app = test_app();
+        open_welcome_session_picker(&mut app);
+        app.session_picker_state.set_query("session");
+        let outcome = app.handle_input(&key_event(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::PickSessionInWorktree(0))
+        ));
+        assert_eq!(app.session_picker_state.query(), "session");
+    }
+    #[test]
+    fn welcome_session_picker_ctrl_d_keeps_global_quit_precedence() {
+        let mut app = test_app();
+        open_welcome_session_picker(&mut app);
+        app.session_picker_state.set_query("session");
+        let outcome = app.handle_input(&ctrl_d());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(matches!(
+            app.pending_action.as_ref().map(|pending| &pending.action),
+            Some(Action::Quit)
+        ));
+        assert_eq!(app.session_picker_state.query(), "session");
+    }
+    #[test]
+    fn welcome_session_picker_cursor_motion_does_not_trigger_deep_search() {
+        let mut app = test_app();
+        open_welcome_session_picker(&mut app);
+        app.session_picker_state.set_query("session");
+        let outcome = app.handle_input(&key_event(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(app.session_picker_state.query(), "session");
+    }
+    #[test]
+    fn welcome_session_picker_ctrl_u_kills_to_cursor_and_triggers_deep_search() {
+        let mut app = test_app();
+        open_welcome_session_picker(&mut app);
+        app.session_picker_state.set_query("session");
+        let _ = app.handle_input(&key_event(KeyCode::Left, KeyModifiers::NONE));
+        let outcome = app.handle_input(&key_event(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::TriggerDeepSearch)
+        ));
+        assert_eq!(app.session_picker_state.query(), "n");
+        assert_eq!(app.session_picker_state.query_cursor(), 0);
+    }
     #[test]
     fn welcome_ctrl_w_opens_new_worktree_dialog() {
         let mut app = test_app();
@@ -8949,6 +9093,18 @@ pub(crate) mod tests {
         assert!(app.new_worktree_dialog.is_none());
     }
     #[test]
+    fn worktree_dialog_modified_enter_is_ignored() {
+        let mut app = test_app();
+        app.auth_state = AuthState::Done;
+        app.new_worktree_dialog = Some(NewWorktreeDialogState::new());
+        let outcome = app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert!(matches!(outcome, InputOutcome::Unchanged));
+        assert!(app.new_worktree_dialog.is_some());
+        let outcome = app.handle_input(&key_event(KeyCode::Char('w'), KeyModifiers::SHIFT));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label(), "W");
+    }
+    #[test]
     fn worktree_dialog_enter_threads_label() {
         let mut app = test_app();
         app.auth_state = AuthState::Done;
@@ -8980,21 +9136,56 @@ pub(crate) mod tests {
         app.new_worktree_dialog = Some(NewWorktreeDialogState::new());
         let outcome = app.handle_input(&key_event(KeyCode::Char('h'), KeyModifiers::NONE));
         assert!(matches!(outcome, InputOutcome::Changed));
-        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label_input, "h");
+        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label(), "h");
         let outcome = app.handle_input(&key_event(KeyCode::Char('i'), KeyModifiers::NONE));
         assert!(matches!(outcome, InputOutcome::Changed));
-        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label_input, "hi");
+        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label(), "hi");
     }
     #[test]
     fn worktree_dialog_backspace_removes_char() {
         let mut app = test_app();
         app.auth_state = AuthState::Done;
-        app.new_worktree_dialog = Some(NewWorktreeDialogState {
-            label_input: "test".into(),
-        });
+        let mut dialog = NewWorktreeDialogState::new();
+        dialog.set_label("test");
+        app.new_worktree_dialog = Some(dialog);
         let outcome = app.handle_input(&key_event(KeyCode::Backspace, KeyModifiers::NONE));
         assert!(matches!(outcome, InputOutcome::Changed));
-        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label_input, "tes");
+        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label(), "tes");
+    }
+    #[test]
+    fn worktree_dialog_enforces_byte_cap_for_typing_and_middle_paste() {
+        let mut app = test_app();
+        app.auth_state = AuthState::Done;
+        let mut dialog = NewWorktreeDialogState::new();
+        dialog.set_label("a".repeat(98));
+        let _ = dialog.set_cursor_byte(1);
+        app.new_worktree_dialog = Some(dialog);
+        let outcome = app.handle_input(&Event::Paste("éx".to_owned()));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        let dialog = app.new_worktree_dialog.as_ref().unwrap();
+        assert_eq!(dialog.label().len(), 100);
+        assert_eq!(&dialog.label()[1.."aé".len()], "é");
+        let outcome = app.handle_input(&key_event(KeyCode::Char('中'), KeyModifiers::NONE));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label().len(), 100);
+        let mut dialog = NewWorktreeDialogState::new();
+        dialog.set_label("a".repeat(99));
+        app.new_worktree_dialog = Some(dialog);
+        let _ = app.handle_input(&key_event(KeyCode::Char('é'), KeyModifiers::NONE));
+        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label().len(), 99);
+    }
+    #[test]
+    fn worktree_dialog_paste_is_scoped_away_from_welcome_prompt() {
+        let mut app = test_app();
+        app.auth_state = AuthState::Done;
+        let mut dialog = NewWorktreeDialogState::new();
+        dialog.set_label("ab");
+        let _ = dialog.set_cursor_byte(1);
+        app.new_worktree_dialog = Some(dialog);
+        let outcome = app.handle_input(&Event::Paste("中".to_owned()));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label(), "a中b");
+        assert!(app.welcome_prompt.text().is_empty());
     }
     #[test]
     fn authenticating_loopback_esc_quits() {
@@ -9036,7 +9227,7 @@ pub(crate) mod tests {
             matches!(outcome, InputOutcome::Changed),
             "typing 'q' must edit the auth code input, got {outcome:?}"
         );
-        assert_eq!(app.auth_code_input, "q");
+        assert_eq!(app.auth_code_input.text(), "q");
     }
     /// Users reflex-type the displayed device code; bare 'q' must not abort.
     #[test]
@@ -9091,7 +9282,40 @@ pub(crate) mod tests {
         };
         let outcome = app.handle_input(&key_event(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(matches!(outcome, InputOutcome::Changed));
-        assert_eq!(app.auth_code_input, "a");
+        assert_eq!(app.auth_code_input.text(), "a");
+    }
+    #[test]
+    fn authenticating_loopback_readline_control_chords_are_ignored() {
+        for code in [KeyCode::Char('u'), KeyCode::Char('d')] {
+            let mut app = test_app();
+            app.auth_state = AuthState::Authenticating {
+                request_seq: 1,
+                handle: None,
+                auth_url: None,
+                mode: AuthMode::Loopback,
+            };
+            app.auth_code_input.set_text("token");
+            let outcome = app.handle_input(&key_event(code, KeyModifiers::CONTROL));
+            assert!(matches!(outcome, InputOutcome::Changed));
+            assert_eq!(app.auth_code_input.text(), "token");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn authenticating_loopback_altgr_char_mutates_input() {
+        let mut app = test_app();
+        app.auth_state = AuthState::Authenticating {
+            request_seq: 1,
+            handle: None,
+            auth_url: None,
+            mode: AuthMode::Loopback,
+        };
+        let outcome = app.handle_input(&key_event(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(app.auth_code_input.text(), "@");
     }
     #[test]
     fn authenticating_loopback_backspace_removes_char() {
@@ -9102,10 +9326,10 @@ pub(crate) mod tests {
             auth_url: None,
             mode: AuthMode::Loopback,
         };
-        app.auth_code_input = "ab".to_string();
+        app.auth_code_input.set_text("ab");
         let outcome = app.handle_input(&key_event(KeyCode::Backspace, KeyModifiers::NONE));
         assert!(matches!(outcome, InputOutcome::Changed));
-        assert_eq!(app.auth_code_input, "a");
+        assert_eq!(app.auth_code_input.text(), "a");
     }
     #[test]
     fn authenticating_loopback_paste_appends_text() {
@@ -9116,10 +9340,45 @@ pub(crate) mod tests {
             auth_url: None,
             mode: AuthMode::Loopback,
         };
-        app.auth_code_input = "tok".to_string();
+        app.auth_code_input.set_text("tok");
         let outcome = app.handle_input(&Event::Paste("en_value".to_string()));
         assert!(matches!(outcome, InputOutcome::Changed));
-        assert_eq!(app.auth_code_input, "token_value");
+        assert_eq!(app.auth_code_input.text(), "token_value");
+    }
+    #[test]
+    fn authenticating_loopback_cursor_edit_and_paste_stay_scoped() {
+        let mut app = test_app();
+        app.auth_state = AuthState::Authenticating {
+            request_seq: 1,
+            handle: None,
+            auth_url: None,
+            mode: AuthMode::Loopback,
+        };
+        app.auth_code_input.set_text("ab");
+        let _ = app.handle_input(&key_event(KeyCode::Left, KeyModifiers::NONE));
+        let _ = app.handle_input(&Event::Paste("中\r\n".to_owned()));
+        assert_eq!(app.auth_code_input.text(), "a中b");
+        assert!(app.welcome_prompt.text().is_empty());
+        let _ = app.handle_input(&key_event(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(app.auth_code_input.text(), "a中");
+    }
+    #[test]
+    fn authenticating_loopback_uses_canonical_super_v_paste() {
+        let mut app = test_app();
+        app.auth_state = AuthState::Authenticating {
+            request_seq: 1,
+            handle: None,
+            auth_url: None,
+            mode: AuthMode::Loopback,
+        };
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::no_raster(Some("secret\r\n")),
+        );
+        let outcome = app.handle_input(&key_event(KeyCode::Char('v'), KeyModifiers::SUPER));
+        crate::clipboard::clear_clipboard_probe_hook();
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(app.auth_code_input.text(), "secret");
+        assert!(app.welcome_prompt.text().is_empty());
     }
     #[test]
     fn authenticating_loopback_enter_empty_is_noop() {
@@ -9130,7 +9389,7 @@ pub(crate) mod tests {
             auth_url: None,
             mode: AuthMode::Loopback,
         };
-        app.auth_code_input = "   ".to_string();
+        app.auth_code_input.set_text("   ");
         let outcome = app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(outcome, InputOutcome::Unchanged));
     }
@@ -9143,7 +9402,7 @@ pub(crate) mod tests {
             auth_url: None,
             mode: AuthMode::Loopback,
         };
-        app.auth_code_input = " token123 ".to_string();
+        app.auth_code_input.set_text(" token123 ");
         let outcome = app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE));
         match outcome {
             InputOutcome::Action(Action::SubmitAuthCode(code)) => {
@@ -10167,11 +10426,7 @@ pub(crate) mod tests {
         else {
             panic!("provider Settings modal should remain open");
         };
-        assert!(matches!(
-            &state.mode,
-            crate::views::settings_modal::SettingsModalMode::EditingSecret { buffer, .. }
-                if buffer.expose() == "s"
-        ));
+        assert!(state.secret_editor_matches_for_test("s"));
     }
     /// With a pending input overlay, neither `q` nor `Esc` is consumed as a
     /// dashboard-overlay exit — both fall through to the agent (the scrollback
@@ -11231,7 +11486,8 @@ pub(crate) mod tests {
             "f must not cycle the hidden source filter under chat mode"
         );
         assert_eq!(
-            app.session_picker_state.query, "f",
+            app.session_picker_state.query(),
+            "f",
             "under chat mode `f` keeps its normal typing/search meaning"
         );
         app.session_picker_state.reset();

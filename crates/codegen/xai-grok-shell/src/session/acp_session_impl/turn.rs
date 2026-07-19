@@ -301,7 +301,14 @@ impl SessionActor {
                 { "prompt_id" : prompt_id, "block_count" : prompt_blocks.len(), }
             )),
         );
-        if !super::super::PromptOrigin::from_prompt_id(prompt_id).is_synthetic() {
+        let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
+        if let Some(completion_id) = origin.completion_id() {
+            self.mark_completions_reported(&[completion_id]).await;
+            if let Some(reservations) = &self.tool_context.task_completion_reservations {
+                reservations.release(completion_id);
+            }
+        }
+        if !origin.is_synthetic() {
             self.cancel_pending_recap_for_new_prompt();
         }
         *self.turn_start_prompt_mode.lock() = prompt_mode;
@@ -707,6 +714,17 @@ impl SessionActor {
         self.maybe_inject_date_rollover_reminder().await;
         self.inject_plan_mode_reminders().await;
         self.inject_resumed_tasks_reminder();
+        if matches!(&origin, super::super::PromptOrigin::User) {
+            if let Some(gate) = &self.tool_context.task_wake_suppressed {
+                gate.set(false);
+            }
+            xai_grok_telemetry::unified_log::info(
+                "shell.task_wake.gate_cleared",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({ "reason" : "handle_prompt_user_start" })),
+            );
+            self.consume_deferred_completions_for_user_turn().await;
+        }
         self.drain_between_turn_completions().await;
         let user_message = if user_images.is_empty() {
             user_message

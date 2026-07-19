@@ -84,13 +84,21 @@ async fn gh_pr_view_by_branch(cwd: &str, branch: &str) -> Option<PrData> {
     .stdin(std::process::Stdio::null());
     xai_grok_tools::util::detach_command(&mut cmd);
     cmd.envs(xai_grok_tools::util::pager_env());
+    // gh colorizes even piped --json output under CLICOLOR_FORCE or
+    // GH_FORCE_TTY (inherited from terminal-launched dev environments), and
+    // forcing beats NO_COLOR in gh's precedence; there is no --no-color flag
+    // (cli/cli#9436). CLICOLOR_FORCE=0 is gh's documented off-switch.
+    cmd.env("NO_COLOR", "1");
+    cmd.env("CLICOLOR_FORCE", "0");
+    cmd.env_remove("GH_FORCE_TTY");
     let output = cmd.output().await.ok()?;
 
     if !output.status.success() {
         return None;
     }
 
-    let parsed = serde_json::from_slice::<GhPrViewResponse>(&output.stdout).ok()?;
+    let parsed =
+        serde_json::from_slice::<GhPrViewResponse>(&strip_ansi_csi(&output.stdout)).ok()?;
     let url = parsed.url?;
     let state = match parsed
         .state
@@ -131,7 +139,10 @@ async fn gh_pr_is_in_merge_queue(cwd: &str, pr_url: &str) -> bool {
     .stdin(std::process::Stdio::null());
     xai_grok_tools::util::detach_command(&mut cmd);
     cmd.envs(xai_grok_tools::util::pager_env());
+    // Forcing (CLICOLOR_FORCE/GH_FORCE_TTY) beats NO_COLOR in gh's precedence.
     cmd.env("NO_COLOR", "1");
+    cmd.env("CLICOLOR_FORCE", "0");
+    cmd.env_remove("GH_FORCE_TTY");
     let output = match cmd.output().await {
         Ok(output) => output,
         Err(_) => return false,
@@ -186,6 +197,18 @@ fn strip_ansi_csi(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gh_pr_view_json_parses_after_stripping_forced_color() {
+        let stdout = b"\x1b[1;37m{\x1b[m\n  \x1b[1;34m\"isDraft\"\x1b[m\x1b[1;37m:\x1b[m \x1b[33mfalse\x1b[m\x1b[1;37m,\x1b[m\n  \x1b[1;34m\"number\"\x1b[m\x1b[1;37m:\x1b[m 242682\x1b[1;37m,\x1b[m\n  \x1b[1;34m\"state\"\x1b[m\x1b[1;37m:\x1b[m \x1b[32m\"OPEN\"\x1b[m\x1b[1;37m,\x1b[m\n  \x1b[1;34m\"title\"\x1b[m\x1b[1;37m:\x1b[m \x1b[32m\"t\"\x1b[m\x1b[1;37m,\x1b[m\n  \x1b[1;34m\"url\"\x1b[m\x1b[1;37m:\x1b[m \x1b[32m\"https://github.com/xai-org/xai/pull/242682\"\x1b[m\n\x1b[1;37m}\x1b[m\n";
+        let parsed = serde_json::from_slice::<GhPrViewResponse>(&strip_ansi_csi(stdout)).unwrap();
+        assert_eq!(parsed.number, Some(242682));
+        assert_eq!(parsed.state.as_deref(), Some("OPEN"));
+        assert_eq!(
+            parsed.url.as_deref(),
+            Some("https://github.com/xai-org/xai/pull/242682")
+        );
+    }
 
     #[test]
     fn parse_is_in_merge_queue_true() {

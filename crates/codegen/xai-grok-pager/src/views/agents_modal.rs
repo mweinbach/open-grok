@@ -4,6 +4,7 @@
 //! [`ModalWindow`](super::modal_window) chrome. Blocks all input until
 //! closed with `Esc`.
 use crate::app::bundle::{BundleState, PersonaDetail};
+use crate::input::line_editor::{LineEditOutcome, LineEditor};
 use crate::theme::Theme;
 use crate::views::modal_window::{
     self, ModalContentArea, ModalSizing, ModalWindowConfig, ModalWindowState, Shortcut,
@@ -155,14 +156,71 @@ pub enum CreateField {
 }
 /// State for the inline create-persona form.
 pub struct PersonaCreateInput {
-    pub name: String,
-    pub name_cursor: usize,
-    pub description: String,
-    pub desc_cursor: usize,
-    pub instructions: String,
-    pub instructions_cursor: usize,
-    pub scope: ConfigFileScope,
-    pub active_field: CreateField,
+    name: LineEditor,
+    description: LineEditor,
+    instructions: LineEditor,
+    scope: ConfigFileScope,
+    active_field: CreateField,
+}
+impl PersonaCreateInput {
+    fn new() -> Self {
+        Self {
+            name: LineEditor::default(),
+            description: LineEditor::default(),
+            instructions: LineEditor::default(),
+            scope: ConfigFileScope::User,
+            active_field: CreateField::Name,
+        }
+    }
+    pub fn name(&self) -> &str {
+        self.name.text()
+    }
+    pub fn description(&self) -> &str {
+        self.description.text()
+    }
+    pub fn instructions(&self) -> &str {
+        self.instructions.text()
+    }
+    pub fn scope(&self) -> ConfigFileScope {
+        self.scope
+    }
+    pub fn active_field(&self) -> CreateField {
+        self.active_field
+    }
+    fn name_editor(&self) -> &LineEditor {
+        &self.name
+    }
+    fn description_editor(&self) -> &LineEditor {
+        &self.description
+    }
+    fn instructions_editor(&self) -> &LineEditor {
+        &self.instructions
+    }
+    fn active_editor_mut(&mut self) -> Option<&mut LineEditor> {
+        let field = self.active_field;
+        self.field_editor_mut(field)
+    }
+    fn field_editor_mut(&mut self, field: CreateField) -> Option<&mut LineEditor> {
+        match field {
+            CreateField::Name => Some(&mut self.name),
+            CreateField::Description => Some(&mut self.description),
+            CreateField::Instructions => Some(&mut self.instructions),
+            CreateField::Scope => None,
+        }
+    }
+    #[cfg(test)]
+    fn set_field_text(&mut self, field: CreateField, text: impl Into<String>) {
+        if let Some(editor) = self.field_editor_mut(field) {
+            editor.set_text(text);
+        }
+    }
+    #[cfg(test)]
+    fn set_field_cursor_byte(&mut self, field: CreateField, cursor_byte: usize) -> LineEditOutcome {
+        self.field_editor_mut(field)
+            .map_or(LineEditOutcome::Unhandled, |editor| {
+                editor.set_cursor_byte(cursor_byte)
+            })
+    }
 }
 /// Pending confirmation action (delete local persona).
 pub enum PersonaConfirmAction {
@@ -181,7 +239,7 @@ pub struct AgentsModalState {
     pub agents: Vec<AgentListEntry>,
     pub selected: usize,
     pub scroll: usize,
-    pub search_query: String,
+    search: LineEditor,
     pub search_active: bool,
     /// Maps screen Y position to agent index. Rebuilt every render frame
     /// for mouse click → agent selection.
@@ -242,7 +300,7 @@ impl AgentsModalState {
             agents,
             selected: 0,
             scroll: 0,
-            search_query: String::new(),
+            search: LineEditor::default(),
             search_active: false,
             row_map: Vec::new(),
             content_rect: None,
@@ -281,6 +339,41 @@ impl AgentsModalState {
         match tab {
             AgentsTab::Agents => self.rebuild_agents(),
             AgentsTab::Personas => self.refresh_personas(),
+        }
+    }
+    pub fn search_query(&self) -> &str {
+        self.search.text()
+    }
+    pub fn search_cursor_byte(&self) -> usize {
+        self.search.cursor_byte()
+    }
+    fn search_editor(&self) -> &LineEditor {
+        &self.search
+    }
+    #[cfg(test)]
+    fn search_viewport(&self, width: usize) -> xai_ratatui_textarea::SingleLineViewport {
+        self.search.viewport(width)
+    }
+    #[cfg(test)]
+    fn set_search_query(&mut self, query: impl Into<String>) {
+        self.search.set_text(query);
+    }
+    #[cfg(test)]
+    fn set_search_cursor_byte(&mut self, cursor_byte: usize) -> LineEditOutcome {
+        self.search.set_cursor_byte(cursor_byte)
+    }
+    fn reset_selection_after_search_change(&mut self) {
+        match self.active_tab {
+            AgentsTab::Agents => {
+                if let Some(&first) = self.filtered_indices().first() {
+                    self.selected = first;
+                }
+            }
+            AgentsTab::Personas => {
+                if let Some(&first) = self.filtered_persona_indices().first() {
+                    self.persona_selected = first;
+                }
+            }
         }
     }
 }
@@ -797,10 +890,10 @@ fn render_prompt_body(body: &str, tool_config: &ToolServerConfig) -> String {
 impl AgentsModalState {
     /// Indices of agents matching the current search query.
     pub fn filtered_indices(&self) -> Vec<usize> {
-        if self.search_query.is_empty() {
+        if self.search_query().is_empty() {
             return (0..self.agents.len()).collect();
         }
-        let q = self.search_query.to_lowercase();
+        let q = self.search_query().to_lowercase();
         self.agents
             .iter()
             .enumerate()
@@ -846,10 +939,10 @@ impl AgentsModalState {
     }
     /// Indices of personas matching the current search query.
     pub fn filtered_persona_indices(&self) -> Vec<usize> {
-        if self.search_query.is_empty() {
+        if self.search_query().is_empty() {
             return (0..self.personas.len()).collect();
         }
-        let q = self.search_query.to_lowercase();
+        let q = self.search_query().to_lowercase();
         self.personas
             .iter()
             .enumerate()
@@ -1092,6 +1185,58 @@ fn build_personas_tab_shortcuts<'a>(state: &AgentsModalState) -> Vec<Shortcut<'a
         shortcuts
     }
 }
+fn render_agents_search(
+    buf: &mut Buffer,
+    area: Rect,
+    editor: &LineEditor,
+    focused: bool,
+    theme: &Theme,
+) {
+    if area.width == 0 {
+        return;
+    }
+    for x in area.x..area.x + area.width {
+        if let Some(cell) = buf.cell_mut((x, area.y)) {
+            cell.set_char(' ');
+            cell.set_style(Style::default().fg(theme.gray_dim));
+        }
+    }
+    let prefix = "/ ";
+    let prefix_width = prefix.width() as u16;
+    let painted_prefix_width = prefix_width.min(area.width);
+    buf.set_span(
+        area.x,
+        area.y,
+        &ratatui::text::Span::styled(prefix, Style::default().fg(theme.accent_user)),
+        painted_prefix_width,
+    );
+    let editor_x = area.x + painted_prefix_width;
+    let editor_width = area.width - painted_prefix_width;
+    let viewport = editor.viewport(editor_width as usize);
+    let leading;
+    let visible: &str = if focused {
+        &editor.text()[viewport.visible_byte_range.clone()]
+    } else {
+        leading = crate::render::line_utils::truncate_str(editor.text(), editor_width as usize);
+        &leading
+    };
+    if editor_width > 0 {
+        buf.set_string(
+            editor_x,
+            area.y,
+            visible,
+            Style::default().fg(theme.accent_user),
+        );
+    }
+    if focused {
+        let cursor_offset = painted_prefix_width
+            .saturating_add(viewport.cursor_display_column as u16)
+            .min(area.width - 1);
+        if let Some(cell) = buf.cell_mut((area.x + cursor_offset, area.y)) {
+            cell.set_style(Style::default().fg(theme.bg_base).bg(theme.text_primary));
+        }
+    }
+}
 /// Render the Agents tab content (existing agents list).
 fn render_agents_tab(
     buf: &mut Buffer,
@@ -1104,18 +1249,14 @@ fn render_agents_tab(
     if let Some(ref msg) = state.message {
         y = render_modal_message_line(buf, content_area.x, y, w, msg, theme);
     }
-    if state.search_active || !state.search_query.is_empty() {
-        let prompt_str = format!("/ {}", state.search_query);
-        let display = crate::render::line_utils::truncate_str(&prompt_str, w);
-        let style = Style::default().fg(theme.accent_user);
-        buf.set_string(content_area.x, y, &display, style);
-        let used = display.width() as u16;
-        for x in content_area.x + used..content_area.x + content_area.width {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_char(' ');
-                cell.set_style(Style::default().fg(theme.gray_dim));
-            }
-        }
+    if state.search_active || !state.search_query().is_empty() {
+        render_agents_search(
+            buf,
+            Rect::new(content_area.x, y, content_area.width, 1),
+            state.search_editor(),
+            state.search_active,
+            theme,
+        );
         y += 1;
         y += 1;
     }
@@ -1125,7 +1266,7 @@ fn render_agents_tab(
     }
     let filtered = state.filtered_indices();
     if filtered.is_empty() {
-        let msg = if state.search_query.is_empty() {
+        let msg = if state.search_query().is_empty() {
             "No agents found"
         } else {
             "No matching agents"
@@ -1384,18 +1525,14 @@ fn render_personas_tab(
     let blurb2 = "Used by skills (e.g. /implement) and by the model when spawning subagents.";
     buf.set_string(content_area.x, y, blurb2, blurb_style);
     y += 2;
-    if state.search_active || !state.search_query.is_empty() {
-        let prompt_str = format!("/ {}", state.search_query);
-        let display = crate::render::line_utils::truncate_str(&prompt_str, w);
-        let style = Style::default().fg(theme.accent_user);
-        buf.set_string(content_area.x, y, &display, style);
-        let used = display.width() as u16;
-        for x in content_area.x + used..content_area.x + content_area.width {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_char(' ');
-                cell.set_style(Style::default().fg(theme.gray_dim));
-            }
-        }
+    if state.search_active || !state.search_query().is_empty() {
+        render_agents_search(
+            buf,
+            Rect::new(content_area.x, y, content_area.width, 1),
+            state.search_editor(),
+            state.search_active,
+            theme,
+        );
         y += 1;
         y += 1;
     }
@@ -1650,8 +1787,7 @@ fn render_create_text_field(
     y: u16,
     w: usize,
     label: &str,
-    text: &str,
-    cursor: usize,
+    editor: &LineEditor,
     active: bool,
     theme: &Theme,
 ) -> u16 {
@@ -1661,13 +1797,21 @@ fn render_create_text_field(
         Style::default().fg(theme.gray)
     };
     buf.set_string(content_area.x, y, label, label_style);
-    let field_x = content_area.x + label.len() as u16;
-    let remaining = w.saturating_sub(label.len());
-    let display: String = text.chars().take(remaining).collect();
+    let label_width = label.width();
+    let field_x = content_area.x + label_width as u16;
+    let remaining = w.saturating_sub(label_width);
+    let viewport = editor.viewport(remaining);
+    let leading;
+    let display: &str = if active {
+        &editor.text()[viewport.visible_byte_range.clone()]
+    } else {
+        leading = crate::render::line_utils::truncate_str(editor.text(), remaining);
+        &leading
+    };
     let field_style = Style::default().fg(theme.text_primary);
-    buf.set_string(field_x, y, &display, field_style);
+    buf.set_string(field_x, y, display, field_style);
     if active {
-        let cursor_x = field_x + text[..cursor.min(text.len())].width() as u16;
+        let cursor_x = field_x + viewport.cursor_display_column as u16;
         if cursor_x < content_area.x + content_area.width
             && let Some(cell) = buf.cell_mut((cursor_x, y))
         {
@@ -1707,8 +1851,7 @@ fn render_persona_create_form(
         y,
         w,
         "Name: ",
-        &input.name,
-        input.name_cursor,
+        input.name_editor(),
         input.active_field == CreateField::Name,
         theme,
     );
@@ -1718,8 +1861,7 @@ fn render_persona_create_form(
         y,
         w,
         "Description: ",
-        &input.description,
-        input.desc_cursor,
+        input.description_editor(),
         input.active_field == CreateField::Description,
         theme,
     );
@@ -1729,8 +1871,7 @@ fn render_persona_create_form(
         y,
         w,
         "Instructions: ",
-        &input.instructions,
-        input.instructions_cursor,
+        input.instructions_editor(),
         input.active_field == CreateField::Instructions,
         theme,
     );
@@ -1829,7 +1970,7 @@ fn clear_overlays_for_tab(state: &mut AgentsModalState, tab: AgentsTab) {
 fn switch_agents_tab(state: &mut AgentsModalState, tab: AgentsTab) {
     clear_overlays_for_tab(state, tab);
     state.active_tab = tab;
-    state.search_query.clear();
+    state.search.reset();
     state.search_active = false;
 }
 /// Handle a key event while the agents modal is open.
@@ -1842,72 +1983,27 @@ pub fn handle_agents_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
         return handle_persona_confirm_key(state, key);
     }
     if state.search_active {
-        match key.code {
-            KeyCode::Esc => {
-                state.search_query.clear();
-                state.search_active = false;
-                return AgentsModalOutcome::Changed;
-            }
-            KeyCode::Enter => {
-                state.search_active = false;
-                return AgentsModalOutcome::Changed;
-            }
-            KeyCode::Backspace => {
-                state.search_query.pop();
-                match state.active_tab {
-                    AgentsTab::Agents => {
-                        let indices = state.filtered_indices();
-                        if let Some(&first) = indices.first() {
-                            state.selected = first;
-                        }
-                    }
-                    AgentsTab::Personas => {
-                        let indices = state.filtered_persona_indices();
-                        if let Some(&first) = indices.first() {
-                            state.persona_selected = first;
-                        }
-                    }
-                }
-                return AgentsModalOutcome::Changed;
-            }
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                state.search_query.push(c);
-                match state.active_tab {
-                    AgentsTab::Agents => {
-                        let indices = state.filtered_indices();
-                        if let Some(&first) = indices.first() {
-                            state.selected = first;
-                        }
-                    }
-                    AgentsTab::Personas => {
-                        let indices = state.filtered_persona_indices();
-                        if let Some(&first) = indices.first() {
-                            state.persona_selected = first;
-                        }
-                    }
-                }
-                return AgentsModalOutcome::Changed;
-            }
-            KeyCode::Tab
-                if !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                ) =>
-            {
-                let tab = state.active_tab.next();
-                switch_agents_tab(state, tab);
-                return AgentsModalOutcome::Changed;
-            }
-            KeyCode::BackTab => {
-                let tab = state.active_tab.prev();
-                switch_agents_tab(state, tab);
-                return AgentsModalOutcome::Changed;
-            }
-            _ => return AgentsModalOutcome::Unchanged,
+        if key.code == KeyCode::Esc {
+            state.search.reset();
+            state.search_active = false;
+            return AgentsModalOutcome::Changed;
         }
+        if key.code == KeyCode::Enter {
+            state.search_active = false;
+            return AgentsModalOutcome::Changed;
+        }
+        if crate::input::key::is_shift_tab(key) {
+            let tab = state.active_tab.prev();
+            switch_agents_tab(state, tab);
+            return AgentsModalOutcome::Changed;
+        }
+        if crate::input::key::KeyShortcut::key(KeyCode::Tab).matches(key) {
+            let tab = state.active_tab.next();
+            switch_agents_tab(state, tab);
+            return AgentsModalOutcome::Changed;
+        }
+        let outcome = state.search.handle_key(key);
+        return finish_search_edit(state, outcome);
     }
     let tab_labels: Vec<&str> = AgentsTab::ALL.iter().map(|t| t.label()).collect();
     let config = ModalWindowConfig {
@@ -1930,16 +2026,12 @@ pub fn handle_agents_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
         }
         _ => {}
     }
-    if key.code == KeyCode::Tab
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
+    if crate::input::key::KeyShortcut::key(KeyCode::Tab).matches(key) {
         let tab = state.active_tab.next();
         switch_agents_tab(state, tab);
         return AgentsModalOutcome::Changed;
     }
-    if key.code == KeyCode::BackTab {
+    if crate::input::key::is_shift_tab(key) {
         let tab = state.active_tab.prev();
         switch_agents_tab(state, tab);
         return AgentsModalOutcome::Changed;
@@ -1947,6 +2039,43 @@ pub fn handle_agents_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agents
     match state.active_tab {
         AgentsTab::Agents => handle_agents_tab_key(state, key),
         AgentsTab::Personas => handle_personas_tab_key(state, key),
+    }
+}
+pub fn handle_agents_paste(state: &mut AgentsModalState, text: &str) -> AgentsModalOutcome {
+    if let Some(input) = state.persona_input.as_mut() {
+        let Some(editor) = input.active_editor_mut() else {
+            return AgentsModalOutcome::Unchanged;
+        };
+        let outcome = editor.insert_paste(text);
+        if outcome == LineEditOutcome::TextChanged {
+            state.message = None;
+        }
+        return finish_line_edit(outcome);
+    }
+    if state.search_active {
+        let outcome = state.search.insert_paste(text);
+        if outcome == LineEditOutcome::TextChanged {
+            state.message = None;
+        }
+        return finish_search_edit(state, outcome);
+    }
+    AgentsModalOutcome::Unchanged
+}
+fn finish_search_edit(
+    state: &mut AgentsModalState,
+    outcome: LineEditOutcome,
+) -> AgentsModalOutcome {
+    if outcome == LineEditOutcome::TextChanged {
+        state.reset_selection_after_search_change();
+    }
+    finish_line_edit(outcome)
+}
+fn finish_line_edit(outcome: LineEditOutcome) -> AgentsModalOutcome {
+    match outcome {
+        LineEditOutcome::TextChanged
+        | LineEditOutcome::HandledNoChange
+        | LineEditOutcome::CursorChanged => AgentsModalOutcome::Changed,
+        LineEditOutcome::Unhandled => AgentsModalOutcome::Unchanged,
     }
 }
 /// Handle key input specific to the Agents tab.
@@ -2130,16 +2259,7 @@ fn handle_personas_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agen
             AgentsModalOutcome::Unchanged
         }
         KeyCode::Char('n') => {
-            state.persona_input = Some(PersonaCreateInput {
-                name: String::new(),
-                name_cursor: 0,
-                description: String::new(),
-                desc_cursor: 0,
-                instructions: String::new(),
-                instructions_cursor: 0,
-                scope: ConfigFileScope::User,
-                active_field: CreateField::Name,
-            });
+            state.persona_input = Some(PersonaCreateInput::new());
             AgentsModalOutcome::Changed
         }
         KeyCode::Char('d') => {
@@ -2186,13 +2306,16 @@ fn try_toggle_create_scope(
     let toggle = matches!(
         key.code,
         KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-    );
+    ) && key.modifiers.is_empty();
     if toggle {
         *scope = scope.toggle();
     }
     toggle
 }
 fn persona_create_form_field_nav(active_field: CreateField, key: &KeyEvent) -> Option<CreateField> {
+    if !key.modifiers.is_empty() {
+        return None;
+    }
     match key.code {
         KeyCode::Up => Some(prev_persona_create_field(active_field)),
         KeyCode::Down => Some(next_persona_create_field(active_field)),
@@ -2209,41 +2332,6 @@ fn persona_create_form_field_nav_scroll(
         prev_persona_create_field(active_field)
     }
 }
-fn edit_create_field_backspace(text: &mut String, cursor: &mut usize) {
-    if *cursor > 0 {
-        let prev = text[..*cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        text.remove(prev);
-        *cursor = prev;
-    }
-}
-fn edit_create_field_left(text: &str, cursor: &mut usize) {
-    if *cursor > 0 {
-        let prev = text[..*cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        *cursor = prev;
-    }
-}
-fn edit_create_field_right(text: &str, cursor: &mut usize) {
-    if *cursor < text.len() {
-        let next = text[*cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| *cursor + i)
-            .unwrap_or(text.len());
-        *cursor = next;
-    }
-}
-fn edit_create_field_insert(text: &mut String, cursor: &mut usize, c: char) {
-    text.insert(*cursor, c);
-    *cursor += c.len_utf8();
-}
 /// Handle key input in the persona create form.
 fn handle_persona_create_form_key(
     state: &mut AgentsModalState,
@@ -2253,91 +2341,53 @@ fn handle_persona_create_form_key(
         return AgentsModalOutcome::Unchanged;
     };
     let cwd = state.cwd.clone();
-    match key.code {
-        KeyCode::Esc => {
-            state.persona_input = None;
-            AgentsModalOutcome::Changed
-        }
-        KeyCode::Tab => {
-            input.active_field = handle_persona_create_form_tab_key(input.active_field, false);
-            AgentsModalOutcome::Changed
-        }
-        KeyCode::BackTab => {
-            input.active_field = handle_persona_create_form_tab_key(input.active_field, true);
-            AgentsModalOutcome::Changed
-        }
-        _ if try_toggle_create_scope(input.active_field, &mut input.scope, key) => {
-            AgentsModalOutcome::Changed
-        }
-        _ if persona_create_form_field_nav(input.active_field, key).is_some_and(|f| {
-            input.active_field = f;
-            true
-        }) =>
-        {
-            AgentsModalOutcome::Changed
-        }
-        KeyCode::Enter => {
-            let name = input.name.trim().to_string();
-            let description = input.description.trim().to_string();
-            let instructions = input.instructions.trim().to_string();
-            let scope = input.scope;
-            if name.is_empty() {
-                state.message = Some(AgentsModalMessage::error("Name is required"));
-                return AgentsModalOutcome::Changed;
-            }
-            match create_persona_template(&name, &description, &instructions, scope, &cwd) {
-                Ok(path) => {
-                    let label = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&name);
-                    state.persona_input = None;
-                    state.refresh_personas();
-                    state.message = Some(AgentsModalMessage::success(format!(
-                        "Created persona '{label}'"
-                    )));
-                }
-                Err(e) => {
-                    state.message = Some(AgentsModalMessage::error(e));
-                }
-            }
-            AgentsModalOutcome::Changed
-        }
-        KeyCode::Backspace if input.active_field != CreateField::Scope => {
-            let (text, cursor) = persona_active_field_mut(input);
-            edit_create_field_backspace(text, cursor);
-            AgentsModalOutcome::Changed
-        }
-        KeyCode::Left if input.active_field != CreateField::Scope => {
-            let (text, cursor) = persona_active_field_mut(input);
-            edit_create_field_left(text, cursor);
-            AgentsModalOutcome::Changed
-        }
-        KeyCode::Right if input.active_field != CreateField::Scope => {
-            let (text, cursor) = persona_active_field_mut(input);
-            edit_create_field_right(text, cursor);
-            AgentsModalOutcome::Changed
-        }
-        KeyCode::Char(c)
-            if input.active_field != CreateField::Scope
-                && (!key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                ) || crate::input::key::is_altgr(key.modifiers)) =>
-        {
-            let (text, cursor) = persona_active_field_mut(input);
-            edit_create_field_insert(text, cursor, c);
-            AgentsModalOutcome::Changed
-        }
-        _ => AgentsModalOutcome::Unchanged,
+    if key.code == KeyCode::Esc {
+        state.persona_input = None;
+        return AgentsModalOutcome::Changed;
     }
-}
-fn persona_active_field_mut(input: &mut PersonaCreateInput) -> (&mut String, &mut usize) {
-    match input.active_field {
-        CreateField::Name => (&mut input.name, &mut input.name_cursor),
-        CreateField::Description => (&mut input.description, &mut input.desc_cursor),
-        CreateField::Instructions => (&mut input.instructions, &mut input.instructions_cursor),
-        CreateField::Scope => {
-            debug_assert!(false, "choice fields do not accept text edits");
-            (&mut input.instructions, &mut input.instructions_cursor)
-        }
+    if crate::input::key::is_shift_tab(key) {
+        input.active_field = handle_persona_create_form_tab_key(input.active_field, true);
+        return AgentsModalOutcome::Changed;
     }
+    if crate::input::key::KeyShortcut::key(KeyCode::Tab).matches(key) {
+        input.active_field = handle_persona_create_form_tab_key(input.active_field, false);
+        return AgentsModalOutcome::Changed;
+    }
+    if try_toggle_create_scope(input.active_field, &mut input.scope, key) {
+        return AgentsModalOutcome::Changed;
+    }
+    if let Some(field) = persona_create_form_field_nav(input.active_field, key) {
+        input.active_field = field;
+        return AgentsModalOutcome::Changed;
+    }
+    if key.code == KeyCode::Enter {
+        let name = input.name().trim().to_string();
+        let description = input.description().trim().to_string();
+        let instructions = input.instructions().trim().to_string();
+        let scope = input.scope;
+        if name.is_empty() {
+            state.message = Some(AgentsModalMessage::error("Name is required"));
+            return AgentsModalOutcome::Changed;
+        }
+        match create_persona_template(&name, &description, &instructions, scope, &cwd) {
+            Ok(path) => {
+                let label = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&name);
+                state.persona_input = None;
+                state.refresh_personas();
+                state.message = Some(AgentsModalMessage::success(format!(
+                    "Created persona '{label}'"
+                )));
+            }
+            Err(e) => {
+                state.message = Some(AgentsModalMessage::error(e));
+            }
+        }
+        return AgentsModalOutcome::Changed;
+    }
+    let Some(editor) = input.active_editor_mut() else {
+        return AgentsModalOutcome::Unchanged;
+    };
+    finish_line_edit(editor.handle_key(key))
 }
 /// Handle key input in the persona confirm dialog.
 fn handle_persona_confirm_key(state: &mut AgentsModalState, key: &KeyEvent) -> AgentsModalOutcome {
@@ -2689,13 +2739,13 @@ mod tests {
         };
         let personas = merge_persona_lists(&bundle, Path::new("/tmp"));
         let make_state = |query: &str| -> AgentsModalState {
-            AgentsModalState {
+            let mut state = AgentsModalState {
                 window: ModalWindowState::with_tabs(2),
                 active_tab: AgentsTab::Personas,
                 agents: Vec::new(),
                 selected: 0,
                 scroll: 0,
-                search_query: query.to_string(),
+                search: LineEditor::default(),
                 search_active: false,
                 row_map: Vec::new(),
                 content_rect: None,
@@ -2711,7 +2761,9 @@ mod tests {
                 persona_selected: 0,
                 persona_scroll: 0,
                 persona_expanded: std::collections::HashSet::new(),
-            }
+            };
+            state.set_search_query(query);
+            state
         };
         let s = make_state("");
         assert_eq!(s.filtered_persona_indices(), vec![0, 1]);
@@ -2728,13 +2780,13 @@ mod tests {
         query: &str,
         selected: usize,
     ) -> AgentsModalState {
-        AgentsModalState {
+        let mut state = AgentsModalState {
             window: ModalWindowState::with_tabs(2),
             active_tab: AgentsTab::Personas,
             agents: Vec::new(),
             selected: 0,
             scroll: 0,
-            search_query: query.to_string(),
+            search: LineEditor::default(),
             search_active: false,
             row_map: Vec::new(),
             content_rect: None,
@@ -2750,7 +2802,9 @@ mod tests {
             persona_selected: selected,
             persona_scroll: 0,
             persona_expanded: std::collections::HashSet::new(),
-        }
+        };
+        state.set_search_query(query);
+        state
     }
     fn three_personas() -> Vec<PersonaDetail> {
         vec![
@@ -2931,5 +2985,341 @@ mod tests {
             "Personas browse footer must advertise `/ search`"
         );
         crate::appearance::cache::set_vim_mode(false);
+    }
+    #[test]
+    fn search_text_changes_refilter_but_cursor_moves_do_not() {
+        let mut state = make_persona_state(three_personas(), "", 0);
+        state.search_active = true;
+        let outcome = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        );
+        assert!(matches!(outcome, AgentsModalOutcome::Changed));
+        assert_eq!(state.search_query(), "g");
+        assert_eq!(state.persona_selected, 2);
+        let outcome = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        );
+        assert!(matches!(outcome, AgentsModalOutcome::Changed));
+        assert_eq!(state.search_query(), "g");
+        assert_eq!(state.search_cursor_byte(), 0);
+        assert_eq!(state.persona_selected, 2);
+    }
+    #[test]
+    fn no_form_search_paste_sanitizes_at_cursor_and_resets_selection() {
+        let mut state = make_persona_state(three_personas(), "ab", 2);
+        state.search_active = true;
+        state.message = Some(AgentsModalMessage::error("stale"));
+        let _ = state.set_search_cursor_byte(1);
+        let outcome = handle_agents_paste(&mut state, "中\r\n");
+        assert!(matches!(outcome, AgentsModalOutcome::Changed));
+        assert_eq!(state.search_query(), "a中b");
+        assert_eq!(state.persona_selected, 2);
+        assert!(state.filtered_persona_indices().is_empty());
+        assert!(state.message.is_none());
+        state.search_active = false;
+        let outcome = handle_agents_paste(&mut state, "ignored");
+        assert!(matches!(outcome, AgentsModalOutcome::Unchanged));
+        assert_eq!(state.search_query(), "a中b");
+    }
+    #[test]
+    fn create_text_field_paste_owns_input_and_clears_message_on_change() {
+        let mut state = make_persona_state(three_personas(), "hidden", 1);
+        state.search_active = true;
+        state.persona_input = Some(PersonaCreateInput::new());
+        state.message = Some(AgentsModalMessage::error("stale"));
+        let outcome = handle_agents_paste(&mut state, "na\r\nme");
+        assert!(matches!(outcome, AgentsModalOutcome::Changed));
+        assert_eq!(
+            state.persona_input.as_ref().map(PersonaCreateInput::name),
+            Some("name")
+        );
+        assert_eq!(state.search_query(), "hidden");
+        assert!(state.message.is_none());
+    }
+    #[test]
+    fn scope_form_paste_is_consumed_without_hidden_search_fallthrough() {
+        let mut state = make_persona_state(three_personas(), "hidden", 1);
+        state.search_active = true;
+        let mut input = PersonaCreateInput::new();
+        input.active_field = CreateField::Scope;
+        state.persona_input = Some(input);
+        state.message = Some(AgentsModalMessage::error("keep"));
+        let outcome = handle_agents_paste(&mut state, "must not leak");
+        assert!(matches!(outcome, AgentsModalOutcome::Unchanged));
+        let input = state.persona_input.as_ref().unwrap();
+        assert!(input.name().is_empty());
+        assert!(input.description().is_empty());
+        assert!(input.instructions().is_empty());
+        assert_eq!(state.search_query(), "hidden");
+        assert_eq!(
+            state.message.as_ref().map(|message| message.text.as_str()),
+            Some("keep")
+        );
+    }
+    #[test]
+    fn handled_empty_paste_preserves_messages_for_form_and_search() {
+        let mut state = make_persona_state(three_personas(), "search", 1);
+        state.search_active = true;
+        state.persona_input = Some(PersonaCreateInput::new());
+        state.message = Some(AgentsModalMessage::error("form error"));
+        let outcome = handle_agents_paste(&mut state, "\r\n");
+        assert!(matches!(outcome, AgentsModalOutcome::Changed));
+        assert_eq!(
+            state.message.as_ref().map(|message| message.text.as_str()),
+            Some("form error")
+        );
+        assert!(state.persona_input.as_ref().unwrap().name().is_empty());
+        assert_eq!(state.search_query(), "search");
+        state.persona_input = None;
+        state.message = Some(AgentsModalMessage::error("search error"));
+        let outcome = handle_agents_paste(&mut state, "\r\n");
+        assert!(matches!(outcome, AgentsModalOutcome::Changed));
+        assert_eq!(
+            state.message.as_ref().map(|message| message.text.as_str()),
+            Some("search error")
+        );
+        assert_eq!(state.search_query(), "search");
+    }
+    #[test]
+    fn search_uses_canonical_word_and_grapheme_editing() {
+        for key in [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+        ] {
+            let mut state = make_persona_state(three_personas(), "hello-world", 0);
+            state.search_active = true;
+            let outcome = handle_agents_key(&mut state, &key);
+            assert!(matches!(outcome, AgentsModalOutcome::Changed));
+            assert_eq!(state.search_query(), "hello-world");
+            assert_eq!(state.search_cursor_byte(), "hello-".len());
+        }
+        for key in [
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        ] {
+            let mut state = make_persona_state(three_personas(), "hello-world", 0);
+            state.search_active = true;
+            let _ = state.set_search_cursor_byte(0);
+            let outcome = handle_agents_key(&mut state, &key);
+            assert!(matches!(outcome, AgentsModalOutcome::Changed));
+            assert_eq!(state.search_query(), "hello-world");
+            assert_eq!(state.search_cursor_byte(), "hello".len());
+        }
+        let grapheme = "👩🏽\u{200d}💻";
+        let mut state = make_persona_state(three_personas(), &format!("a{grapheme}b"), 0);
+        state.search_active = true;
+        let _ = state.set_search_cursor_byte(1);
+        let outcome = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert!(matches!(outcome, AgentsModalOutcome::Changed));
+        assert_eq!(state.search_query(), "ab");
+        assert_eq!(state.search_cursor_byte(), 1);
+    }
+    #[test]
+    fn persona_create_field_navigation_keeps_jk_as_text() {
+        let mut state = make_persona_state(three_personas(), "", 0);
+        let _ = handle_personas_tab_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        for ch in ['j', 'k'] {
+            let _ = handle_agents_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        let input = state.persona_input.as_ref().unwrap();
+        assert_eq!(input.name(), "jk");
+        assert_eq!(input.active_field(), CreateField::Name);
+        let outcome = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL),
+        );
+        assert!(matches!(outcome, AgentsModalOutcome::Unchanged));
+        assert_eq!(
+            state.persona_input.as_ref().unwrap().active_field(),
+            CreateField::Name
+        );
+        let _ = handle_agents_key(&mut state, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            state.persona_input.as_ref().unwrap().active_field(),
+            CreateField::Description
+        );
+        let _ = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        );
+        assert_eq!(
+            state.persona_input.as_ref().unwrap().active_field(),
+            CreateField::Name
+        );
+        let _ = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            state.persona_input.as_ref().unwrap().active_field(),
+            CreateField::Description
+        );
+        let _ = handle_agents_key(&mut state, &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            state.persona_input.as_ref().unwrap().active_field(),
+            CreateField::Name
+        );
+    }
+    #[test]
+    fn persona_create_validates_sanitizes_persists_and_rejects_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = make_persona_state(vec![], "", 0);
+        state.cwd = directory.path().to_path_buf();
+        let _ = handle_personas_tab_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        let outcome = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(outcome, AgentsModalOutcome::Changed));
+        assert!(state.persona_input.is_some());
+        assert_eq!(
+            state.message.as_ref().map(|message| message.text.as_str()),
+            Some("Name is required")
+        );
+        for ch in "my persona".chars() {
+            let _ = handle_agents_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        let _ = handle_agents_key(&mut state, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "helps".chars() {
+            let _ = handle_agents_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        let _ = handle_agents_key(&mut state, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "be useful".chars() {
+            let _ = handle_agents_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        let _ = handle_agents_key(&mut state, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let _ = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            state.persona_input.as_ref().unwrap().scope(),
+            ConfigFileScope::Project
+        );
+        let _ = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let path = directory
+            .path()
+            .join(".opengrok")
+            .join("personas")
+            .join("my-persona.toml");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("description = \"helps\""));
+        assert!(content.contains("instructions = \"be useful\""));
+        assert!(state.persona_input.is_none());
+        let _ = handle_personas_tab_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        for ch in "my persona".chars() {
+            let _ = handle_agents_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        for _ in 0..3 {
+            let _ = handle_agents_key(&mut state, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        let _ = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        let _ = handle_agents_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(state.persona_input.is_some());
+        assert!(
+            state
+                .message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("already exists"))
+        );
+    }
+    #[test]
+    fn search_and_create_renderers_keep_unicode_cursor_visible() {
+        let grapheme = "👩🏽\u{200d}💻";
+        let text = format!("12345678901234567890中e\u{301}{grapheme}z");
+        let theme = Theme::current();
+        let mut state = make_persona_state(three_personas(), &text, 0);
+        state.search_active = true;
+        let _ = state.set_search_cursor_byte(text.len() - 1);
+        let search_area = Rect::new(0, 0, 18, 1);
+        let mut search_buffer = Buffer::empty(search_area);
+        render_agents_search(
+            &mut search_buffer,
+            search_area,
+            state.search_editor(),
+            true,
+            &theme,
+        );
+        let search_view = state.search_viewport(16);
+        let search_visible = &state.search_query()[search_view.visible_byte_range.clone()];
+        assert!(search_visible.contains('中'));
+        assert!(search_visible.contains("e\u{301}"));
+        assert!(search_visible.contains(grapheme));
+        let search_cursor_x = 2 + search_view.cursor_display_column as u16;
+        assert_eq!(search_buffer[(search_cursor_x, 0)].bg, theme.text_primary);
+        state.search_active = false;
+        let mut unfocused_search = Buffer::empty(search_area);
+        render_agents_search(
+            &mut unfocused_search,
+            search_area,
+            state.search_editor(),
+            false,
+            &theme,
+        );
+        let unfocused_text = (2..search_area.width)
+            .map(|x| unfocused_search[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(unfocused_text.starts_with("1234567890"));
+        let mut input = PersonaCreateInput::new();
+        input.set_field_text(CreateField::Name, &text);
+        let _ = input.set_field_cursor_byte(CreateField::Name, text.len() - 1);
+        let create_area = Rect::new(0, 0, 24, 12);
+        let mut create_buffer = Buffer::empty(create_area);
+        render_persona_create_form(&mut create_buffer, &create_area, &input, None, &theme);
+        let editor_width = create_area.width as usize - "Name: ".len();
+        let create_view = input.name_editor().viewport(editor_width);
+        let create_visible = &input.name()[create_view.visible_byte_range.clone()];
+        assert!(create_visible.contains('中'));
+        assert!(create_visible.contains("e\u{301}"));
+        assert!(create_visible.contains(grapheme));
+        let create_cursor_x = "Name: ".len() as u16 + create_view.cursor_display_column as u16;
+        assert_eq!(create_buffer[(create_cursor_x, 2)].bg, theme.text_primary);
+        input.set_field_text(CreateField::Description, &text);
+        let _ = input.set_field_cursor_byte(CreateField::Description, text.len() - 1);
+        let mut inactive_buffer = Buffer::empty(create_area);
+        render_persona_create_form(&mut inactive_buffer, &create_area, &input, None, &theme);
+        let description_text = ("Description: ".len() as u16..create_area.width)
+            .map(|x| inactive_buffer[(x, 4)].symbol())
+            .collect::<String>();
+        assert!(description_text.starts_with("1234567890"));
     }
 }

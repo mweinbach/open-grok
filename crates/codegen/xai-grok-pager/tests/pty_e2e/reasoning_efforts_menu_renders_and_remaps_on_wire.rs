@@ -72,10 +72,10 @@ async fn reasoning_efforts_menu_renders_and_remaps_on_wire() {
     let sent_xhigh = content
         .request_bodies()
         .iter()
-        .any(|b| b.pointer("/reasoning_effort").and_then(|v| v.as_str()) == Some("xhigh"));
+        .any(|b| b.pointer("/reasoning/effort").and_then(|v| v.as_str()) == Some("xhigh"));
     assert!(
         sent_xhigh,
-        "`/effort deep` must send the mapped canonical reasoning_effort=xhigh\nbodies: {:#?}",
+        "`/effort deep` must send the mapped canonical reasoning.effort=xhigh\nbodies: {:#?}",
         content.request_bodies()
     );
 

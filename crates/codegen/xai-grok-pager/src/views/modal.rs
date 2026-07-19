@@ -1032,10 +1032,10 @@ pub fn render_doc_picker_overlay(
         render_centered_tip_footer, split_content_for_tip_footer,
     };
     use super::picker::{self, PickerEntry, PickerRow};
-    let filtered: Vec<_> = if state.query.is_empty() {
+    let filtered: Vec<_> = if state.query().is_empty() {
         entries.iter().enumerate().collect()
     } else {
-        let q = state.query.to_lowercase();
+        let q = state.query().to_lowercase();
         entries
             .iter()
             .enumerate()

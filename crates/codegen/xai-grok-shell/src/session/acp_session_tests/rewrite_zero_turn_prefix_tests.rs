@@ -99,6 +99,58 @@ async fn rebuild_reinjects_goal_update_handle() {
         })
         .await;
 }
+#[tokio::test(flavor = "current_thread")]
+async fn rebuild_reinjects_task_completion_resource_identity() {
+    use xai_grok_tools::reminders::task_completion::{
+        TaskCompletionReservations, TaskWakeSuppressed,
+    };
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gw_tx, _gw_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persist_tx, _persist_rx) = tokio::sync::mpsc::unbounded_channel();
+            let actor = create_test_actor(0, 256_000, 85, gw_tx, persist_tx).await;
+            let session_reservations = actor
+                .tool_context
+                .task_completion_reservations
+                .clone()
+                .expect("session completion reservations");
+            let session_gate = actor
+                .tool_context
+                .task_wake_suppressed
+                .clone()
+                .expect("session task-wake gate");
+            session_reservations.reserve("before-rebuild".to_string());
+            session_gate.set(true);
+            actor
+                .handle_rebuild_agent_for_definition(
+                    xai_grok_agent::AgentDefinition::default_grok_build(),
+                    false,
+                )
+                .await
+                .expect("zero-turn rebuild should succeed");
+            let bridge = actor.agent.borrow().tool_bridge().clone();
+            let resources = bridge.shared_resources().await;
+            let guard = resources.lock().await;
+            let rebuilt_reservations = guard
+                .get::<TaskCompletionReservations>()
+                .expect("rebuilt bridge completion reservations");
+            let rebuilt_gate = guard
+                .get::<TaskWakeSuppressed>()
+                .expect("rebuilt bridge task-wake gate");
+            assert!(rebuilt_reservations.contains("before-rebuild"));
+            assert!(rebuilt_gate.get());
+            session_reservations.release("before-rebuild");
+            session_gate.set(false);
+            assert!(!rebuilt_reservations.contains("before-rebuild"));
+            assert!(!rebuilt_gate.get());
+            rebuilt_reservations.reserve("from-rebuilt-bridge".to_string());
+            rebuilt_gate.set(true);
+            assert!(session_reservations.contains("from-rebuilt-bridge"));
+            assert!(session_gate.get());
+        })
+        .await;
+}
 /// The seeded skill used by the rebuild skill-reminder tests. A non-plugin
 /// Local skill is always listable, so it renders into the grok markdown skill
 /// catalog when the pending baseline is drained for a different agent.

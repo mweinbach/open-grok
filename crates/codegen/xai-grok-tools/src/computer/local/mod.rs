@@ -5,6 +5,8 @@ pub mod file_system;
 pub mod mock_fs;
 #[cfg(unix)]
 pub mod shell_state;
+#[cfg(unix)]
+pub mod static_shell;
 pub mod terminal;
 
 pub use cgroup::{CgroupMemoryConfig, PROCESS_OOM_EXIT_CODE};

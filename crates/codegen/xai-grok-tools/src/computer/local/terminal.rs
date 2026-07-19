@@ -150,8 +150,14 @@ enum TerminalCommand {
         reply: oneshot::Sender<Option<PathBuf>>,
     },
 
+    WarmShell {
+        cwd: PathBuf,
+    },
+
     /// Kill all running foreground processes owned by a specific session.
-    KillForegroundCommandsByOwner { owner_session_id: String },
+    KillForegroundCommandsByOwner {
+        owner_session_id: String,
+    },
 
     /// Kill all running background tasks owned by a specific session.
     KillTasksByOwner {
@@ -502,6 +508,8 @@ struct LocalTerminalActor {
     /// Whether persistent shell state is enabled.
     persistent_shell: bool,
 
+    login_shell_capture: bool,
+
     /// Per-backend `find`→`bfs` / `grep`→`ugrep` shadow enable state, resolved
     /// once by the host and baked in at construction. Passed to
     /// `search_injection` per command rather than read from a process-global, so
@@ -513,12 +521,12 @@ struct LocalTerminalActor {
     #[cfg(unix)]
     shell_state: Option<shell_state::ShellState>,
 
-    /// Captured login-shell PATH for the non-persistent path.
-    /// Lazily initialized on first command when `persistent_shell` is false.
-    /// Ensures CLI tools from rc files are discoverable even without a full
-    /// shell snapshot.
+    /// Static alias/function snapshot for the non-persistent path.
     #[cfg(unix)]
-    login_path_env: Option<HashMap<String, String>>,
+    static_shell: Option<super::static_shell::StaticShellSnapshot>,
+
+    #[cfg(unix)]
+    login_env: Option<HashMap<String, String>>,
 }
 
 impl LocalTerminalActor {
@@ -528,6 +536,7 @@ impl LocalTerminalActor {
         cgroup_guard: CgroupGuard,
         memory_monitor: MemoryMonitor,
         persistent_shell: bool,
+        login_shell_capture: bool,
         search_shadows: SearchShadowConfig,
         completed_task_ttl: Duration,
         foreground_block_budget: Duration,
@@ -547,11 +556,14 @@ impl LocalTerminalActor {
             _cgroup_guard: cgroup_guard,
             memory_monitor,
             persistent_shell,
+            login_shell_capture,
             search_shadows,
             #[cfg(unix)]
             shell_state: None,
             #[cfg(unix)]
-            login_path_env: None,
+            static_shell: None,
+            #[cfg(unix)]
+            login_env: None,
         }
     }
 
@@ -570,15 +582,19 @@ impl LocalTerminalActor {
             return self.spawn_persistent_command(command, cwd, env).await;
         }
 
-        // Lazy-init: capture the user's login-shell PATH on first command so
-        // CLI tools from rc files (.bashrc, .zshrc, virtualenvs) are visible.
         #[cfg(unix)]
-        if self.login_path_env.is_none() {
-            self.login_path_env = Some(capture_login_path().await);
+        if self.login_shell_capture && login_env_capture_enabled() {
+            self.ensure_static_shell_initialized(cwd).await;
+            return self.spawn_static_command(command, cwd, env).await;
         }
 
         #[cfg(unix)]
-        let login_env = self.login_path_env.as_ref();
+        if self.login_env.is_none() {
+            self.login_env = Some(capture_login_env().await);
+        }
+
+        #[cfg(unix)]
+        let login_env = self.login_env.as_ref();
         #[cfg(not(unix))]
         let login_env: Option<&HashMap<String, String>> = None;
 
@@ -589,6 +605,134 @@ impl LocalTerminalActor {
             process_group,
             state_dump_handle: None,
         })
+    }
+
+    #[cfg(unix)]
+    async fn ensure_static_shell_initialized(&mut self, cwd: &std::path::Path) {
+        if self.static_shell.is_some() && self.login_env.is_some() {
+            return;
+        }
+        let (snapshot, login_env) = tokio::join!(
+            async {
+                if self.static_shell.is_none() {
+                    Some(super::static_shell::StaticShellSnapshot::init(cwd).await)
+                } else {
+                    None
+                }
+            },
+            async {
+                if self.login_env.is_none() {
+                    Some(capture_login_env().await)
+                } else {
+                    None
+                }
+            }
+        );
+        if let Some(snapshot) = snapshot {
+            self.static_shell = Some(snapshot);
+        }
+        if let Some(env) = login_env {
+            self.login_env = Some(env);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn spawn_static_command(
+        &mut self,
+        command: &str,
+        cwd: &std::path::Path,
+        env: &HashMap<String, String>,
+    ) -> Result<SpawnResult, ComputerError> {
+        use command_fds::CommandFdExt;
+
+        let static_shell = self.static_shell.as_ref().unwrap();
+        let prep = static_shell
+            .prepare_command(command, self.search_shadows)
+            .map_err(|e| ComputerError::io(format!("prepare static command: {e}")))?;
+
+        let mut cmd = tokio::process::Command::new(&prep.binary);
+        cmd.args(&prep.args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        if let Some(login) = self.login_env.as_ref() {
+            for (key, value) in login {
+                if key != "PATH" && std::env::var_os(key).is_none() {
+                    cmd.env(key, value);
+                }
+            }
+        }
+        cmd.envs(shell_state::shell_env_overrides());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.envs(crate::util::pager_env());
+        if let Some(path) = self.login_env.as_ref().and_then(|l| l.get("PATH")) {
+            cmd.env("PATH", path);
+        }
+        crate::util::apply_grok_agent_marker(&mut cmd);
+
+        cmd.fd_mappings(prep.fd_mappings)
+            .map_err(|e| ComputerError::io(format!("fd mapping: {e}")))?;
+
+        unsafe {
+            cmd.pre_exec(crate::util::detach_from_tty);
+        }
+
+        #[cfg(target_os = "linux")]
+        if xai_grok_sandbox::should_restrict_child_network() {
+            unsafe {
+                cmd.pre_exec(|| xai_grok_sandbox::child_net::install_child_network_filter());
+            }
+        }
+
+        let child = cmd.spawn().map_err(|e| {
+            ComputerError::io_with_kind(format!("spawn shell in {}: {e}", cwd.display()), e.kind())
+        })?;
+        drop(cmd);
+
+        let mut process_group = crate::util::ProcessGroup::new()
+            .map_err(|e| ComputerError::io(format!("ProcessGroup::new: {e}")))?;
+        if let Err(e) = process_group.attach(&child) {
+            tracing::debug!("Failed to attach static-shell child to ProcessGroup: {e}");
+        }
+
+        let snapshot = static_shell.snapshot.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                super::static_shell::write_snapshot_to_pipe(&snapshot, prep.state_in_write).await
+            {
+                tracing::debug!("failed to write static shell snapshot to pipe: {e}");
+            }
+        });
+
+        Ok(SpawnResult {
+            child,
+            process_group,
+            state_dump_handle: None,
+        })
+    }
+
+    #[cfg(unix)]
+    async fn ensure_persistent_shell_initialized(&mut self, cwd: &std::path::Path) {
+        if self.shell_state.is_some() {
+            return;
+        }
+        let shell = shell_state::ShellKind::detect();
+        match shell_state::ShellState::init(shell, cwd).await {
+            Ok(state) => self.shell_state = Some(state),
+            Err(e) => {
+                tracing::warn!("persistent shell init failed, using empty state: {e}");
+                self.shell_state = Some(shell_state::ShellState {
+                    cwd: cwd.to_path_buf(),
+                    snapshot: String::new(),
+                    shell,
+                });
+            }
+        }
     }
 
     /// Spawn a command with persistent shell state: restore the prior snapshot
@@ -602,42 +746,41 @@ impl LocalTerminalActor {
     ) -> Result<SpawnResult, ComputerError> {
         use command_fds::CommandFdExt;
 
-        // Lazy init: first command triggers the login-shell init.
-        if self.shell_state.is_none() {
-            let shell = shell_state::ShellKind::detect();
-            match shell_state::ShellState::init(shell, cwd).await {
-                Ok(state) => self.shell_state = Some(state),
-                Err(e) => {
-                    tracing::warn!("persistent shell init failed, using empty state: {e}");
-                    self.shell_state = Some(shell_state::ShellState {
-                        cwd: cwd.to_path_buf(),
-                        snapshot: String::new(),
-                        shell,
-                    });
-                }
-            }
-        }
+        self.ensure_persistent_shell_initialized(cwd).await;
 
         let shell_state = self.shell_state.as_ref().unwrap();
-        // When the persistent shell already tracks a
-        // model-set cwd (the model ran a `cd`), honor it unconditionally.
-        // The bash tool always populates `request.working_directory` with
-        // the workspace's resolved Cwd, even when no per-call override is
-        // intended; treating that as "explicit override and reset" was the
-        // bug that made `cd` not persist across consecutive Shell calls.
-        //
-        // Per-call working_directory overrides arrive through the
-        // shell adapter, which prefixes a subshell `(cd <wd> &&
-        // …)` to the command string — that mechanism is local to a single
-        // call and does NOT mutate the parent shell's `$PWD`, so we never
-        // need to surface it as a `cwd_override` here.
-        let cwd_override: Option<&std::path::Path> = None;
-        // Silence the unused-binding lint on the inbound `cwd` parameter:
-        // it's still threaded into `spawn_command` (the non-persistent
-        // fallback path) below.
-        let _ = cwd;
+        let tracked_cwd_alive = match tokio::fs::metadata(&shell_state.cwd).await {
+            Ok(m) => m.is_dir(),
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ),
+        };
+        let (cwd_override, spawn_notice): (Option<&std::path::Path>, Option<String>) =
+            if tracked_cwd_alive {
+                (None, None)
+            } else {
+                tracing::warn!(
+                    tracked_cwd = %shell_state.cwd.display(),
+                    fallback = %cwd.display(),
+                    "persistent shell cwd no longer exists; falling back to request working directory"
+                );
+                (
+                    Some(cwd),
+                    Some(format!(
+                        "warning: shell working directory {} no longer exists; this command ran in {} instead\n",
+                        shell_state.cwd.display(),
+                        cwd.display()
+                    )),
+                )
+            };
         let prep = shell_state
-            .prepare_command(command, cwd_override, self.search_shadows)
+            .prepare_command(
+                command,
+                cwd_override,
+                self.search_shadows,
+                spawn_notice.as_deref(),
+            )
             .map_err(|e| ComputerError::io(format!("prepare persistent command: {e}")))?;
 
         let mut cmd = tokio::process::Command::new(&prep.binary);
@@ -674,7 +817,12 @@ impl LocalTerminalActor {
             }
         }
 
-        let child = cmd.spawn().map_err(ComputerError::from)?;
+        let child = cmd.spawn().map_err(|e| {
+            ComputerError::io_with_kind(
+                format!("spawn shell in {}: {e}", prep.cwd.display()),
+                e.kind(),
+            )
+        })?;
         // Drop cmd to release the FdMapping OwnedFds held in its pre_exec closure.
         // Without this, the parent keeps the write-end of the state-out pipe open,
         // preventing the dump reader from seeing EOF.
@@ -793,10 +941,27 @@ impl LocalTerminalActor {
             }
             TerminalCommand::GetShellCwd { reply } => {
                 #[cfg(unix)]
-                let cwd = self.shell_state.as_ref().map(|s| s.cwd.clone());
+                let cwd = if self.persistent_shell {
+                    self.shell_state.as_ref().map(|s| s.cwd.clone())
+                } else {
+                    None
+                };
                 #[cfg(not(unix))]
                 let cwd = None;
                 let _ = reply.send(cwd);
+            }
+            TerminalCommand::WarmShell { cwd } => {
+                #[cfg(unix)]
+                if self.persistent_shell {
+                    // Cursor's persistent shell initializes lazily on first
+                    // command; warming is only for the static capture path.
+                } else if self.login_shell_capture && login_env_capture_enabled() {
+                    self.ensure_static_shell_initialized(&cwd).await;
+                } else if self.login_env.is_none() {
+                    self.login_env = Some(capture_login_env().await);
+                }
+                #[cfg(not(unix))]
+                let _ = cwd;
             }
             TerminalCommand::KillForegroundCommands => {
                 self.kill_foreground_commands().await;
@@ -1402,7 +1567,7 @@ impl LocalTerminalActor {
         // branch — see the comment there). This pass must still fire
         // `send_task_complete` unconditionally for newly-completed
         // background tasks so the pager UI, persistence, and
-        // `AutoWakeDeliveredIds` bookkeeping all still get the snapshot.
+        // `TaskCompletionReservations` bookkeeping all still get the snapshot.
         for task_id in newly_completed {
             if let Some(process) = self.processes.get(&task_id) {
                 let snapshot = process.to_task_snapshot(&task_id).await;
@@ -1969,7 +2134,7 @@ impl LocalTerminalBackend {
     /// If `memory_config` is provided, a cgroupv2 memory limit is enforced on
     /// all spawned commands (Linux only; silently degrades to no-op elsewhere).
     pub fn new() -> Self {
-        Self::new_inner(None, false, false, SearchShadowConfig::default())
+        Self::new_inner(None, false, false, true, SearchShadowConfig::default())
     }
 
     /// Create a new LocalTerminalBackend with persistent shell state.
@@ -1978,19 +2143,31 @@ impl LocalTerminalBackend {
     /// and shell options persist across command invocations. The user's login shell
     /// (bash or zsh) is detected and its rc files are loaded once on first command.
     pub fn with_persistent_shell() -> Self {
-        Self::new_inner(None, false, true, SearchShadowConfig::default())
+        Self::new_inner(None, false, true, true, SearchShadowConfig::default())
     }
 
     /// Create a new LocalTerminalBackend with cgroup memory limits.
     ///
     /// See [`CgroupMemoryConfig`] for details on the soft/hard limit model.
     pub fn with_memory_limit(config: CgroupMemoryConfig) -> Self {
-        Self::new_inner(Some(config), false, false, SearchShadowConfig::default())
+        Self::new_inner(
+            Some(config),
+            false,
+            false,
+            true,
+            SearchShadowConfig::default(),
+        )
     }
 
     /// Create a new LocalTerminalBackend with both memory limits and persistent shell.
     pub fn with_memory_limit_and_persistent_shell(config: CgroupMemoryConfig) -> Self {
-        Self::new_inner(Some(config), false, true, SearchShadowConfig::default())
+        Self::new_inner(
+            Some(config),
+            false,
+            true,
+            true,
+            SearchShadowConfig::default(),
+        )
     }
 
     /// Create a new LocalTerminalBackend using spawn_local (for single-threaded runtimes).
@@ -1998,7 +2175,14 @@ impl LocalTerminalBackend {
     /// `search_shadows` is the host-resolved `find`→`bfs` / `grep`→`ugrep` enable
     /// state, baked into this backend (see [`SearchShadowConfig`]).
     pub fn new_local(search_shadows: SearchShadowConfig) -> Self {
-        Self::new_inner(None, true, false, search_shadows)
+        Self::new_inner(None, true, false, true, search_shadows)
+    }
+
+    pub fn new_local_with_login_shell_capture(
+        search_shadows: SearchShadowConfig,
+        login_shell_capture: bool,
+    ) -> Self {
+        Self::new_inner(None, true, false, login_shell_capture, search_shadows)
     }
 
     /// Create a new LocalTerminalBackend using spawn_local with persistent shell.
@@ -2006,12 +2190,18 @@ impl LocalTerminalBackend {
     /// `search_shadows` is the host-resolved `find`→`bfs` / `grep`→`ugrep` enable
     /// state, baked into this backend (see [`SearchShadowConfig`]).
     pub fn new_local_with_persistent_shell(search_shadows: SearchShadowConfig) -> Self {
-        Self::new_inner(None, true, true, search_shadows)
+        Self::new_inner(None, true, true, true, search_shadows)
     }
 
     /// Create a new LocalTerminalBackend using spawn_local with memory limits.
     pub fn new_local_with_memory_limit(config: CgroupMemoryConfig) -> Self {
-        Self::new_inner(Some(config), true, false, SearchShadowConfig::default())
+        Self::new_inner(
+            Some(config),
+            true,
+            false,
+            true,
+            SearchShadowConfig::default(),
+        )
     }
 
     /// Test-only: a spawn_local backend that enrolls spawned children into
@@ -2026,6 +2216,7 @@ impl LocalTerminalBackend {
             None,
             true,
             false,
+            true,
             search_shadows,
             COMPLETED_TASK_TTL,
             FOREGROUND_BLOCK_BUDGET,
@@ -2041,6 +2232,7 @@ impl LocalTerminalBackend {
             None,
             false,
             false,
+            true,
             SearchShadowConfig::default(),
             ttl,
             FOREGROUND_BLOCK_BUDGET,
@@ -2056,6 +2248,7 @@ impl LocalTerminalBackend {
             None,
             false,
             false,
+            true,
             SearchShadowConfig::default(),
             COMPLETED_TASK_TTL,
             budget,
@@ -2071,6 +2264,7 @@ impl LocalTerminalBackend {
             None,
             false,
             false,
+            true,
             SearchShadowConfig::default(),
             COMPLETED_TASK_TTL,
             FOREGROUND_BLOCK_BUDGET,
@@ -2083,12 +2277,14 @@ impl LocalTerminalBackend {
         memory_config: Option<CgroupMemoryConfig>,
         use_spawn_local: bool,
         persistent_shell: bool,
+        login_shell_capture: bool,
         search_shadows: SearchShadowConfig,
     ) -> Self {
         Self::new_with_ttl(
             memory_config,
             use_spawn_local,
             persistent_shell,
+            login_shell_capture,
             search_shadows,
             COMPLETED_TASK_TTL,
             foreground_block_budget_from_env(),
@@ -2101,6 +2297,7 @@ impl LocalTerminalBackend {
         memory_config: Option<CgroupMemoryConfig>,
         use_spawn_local: bool,
         persistent_shell: bool,
+        login_shell_capture: bool,
         search_shadows: SearchShadowConfig,
         completed_task_ttl: Duration,
         foreground_block_budget: Duration,
@@ -2126,6 +2323,7 @@ impl LocalTerminalBackend {
                 cgroup_guard,
                 memory_monitor,
                 persistent_shell,
+                login_shell_capture,
                 search_shadows,
                 completed_task_ttl,
                 foreground_block_budget,
@@ -2260,6 +2458,15 @@ impl TerminalBackend for LocalTerminalBackend {
             .await
             .ok()?;
         reply_rx.await.ok().flatten()
+    }
+
+    async fn warm_shell(&self, cwd: &std::path::Path) {
+        let _ = self
+            .cmd_tx
+            .send(TerminalCommand::WarmShell {
+                cwd: cwd.to_path_buf(),
+            })
+            .await;
     }
 
     async fn kill_foreground_commands(&self) {
@@ -2592,17 +2799,63 @@ async fn open_output_file(path: &std::path::Path) -> std::io::Result<File> {
         .await
 }
 
-/// Capture the user's login-shell PATH so CLI tools from rc files are discoverable.
-///
-/// Non-interactive shells (`/bin/bash -c`) don't source rc files, so tools
-/// installed via `.bashrc`/`.zshrc`/virtualenvs are invisible. This runs the
-/// detected shell with `-lc` plus an explicit `source` of the rc file, extracts
-/// PATH using SOH byte markers, and merges it with the current process PATH.
-///
-/// Returns a `HashMap` with a single `PATH` key, or an empty map on failure.
-/// A 5-second timeout kills the child if rc files hang (conda init, nvm, etc.).
 #[cfg(unix)]
-async fn capture_login_path() -> HashMap<String, String> {
+const ENV_LOGIN_ENV: &str = "GROK_LOGIN_ENV";
+
+#[cfg(unix)]
+fn login_env_capture_enabled() -> bool {
+    !matches!(
+        std::env::var(ENV_LOGIN_ENV).as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+#[cfg(unix)]
+fn login_env_var_excluded(key: &str) -> bool {
+    matches!(
+        key,
+        "PWD"
+            | "OLDPWD"
+            | "SHLVL"
+            | "_"
+            | "TERM"
+            | "GROK_AGENT"
+            | "SUDO_ASKPASS"
+            | "GROK_ASKPASS"
+            | "ELECTRON_RUN_AS_NODE"
+            | "SSH_AUTH_SOCK"
+            | "DBUS_SESSION_BUS_ADDRESS"
+            | "XDG_RUNTIME_DIR"
+            | "WAYLAND_DISPLAY"
+            | "GPG_TTY"
+    ) || key.to_ascii_lowercase().ends_with("_proxy")
+        || key.starts_with("GROK_SANDBOX")
+}
+
+#[cfg(unix)]
+fn parse_login_env_capture(stdout: &str) -> (Option<String>, HashMap<String, String>) {
+    let parts: Vec<&str> = stdout.split('\x01').collect();
+    let login_path = parts
+        .get(1)
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    let mut env_map = HashMap::new();
+    if let Some(blob) = parts.get(2) {
+        for pair in blob.split('\0') {
+            if let Some((key, value)) = pair.split_once('=')
+                && !key.is_empty()
+                && key != "PATH"
+                && !login_env_var_excluded(key)
+            {
+                env_map.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    (login_path, env_map)
+}
+
+#[cfg(unix)]
+async fn capture_login_env() -> HashMap<String, String> {
     use tokio::io::AsyncReadExt;
 
     let shell = shell_state::ShellKind::detect();
@@ -2610,7 +2863,9 @@ async fn capture_login_path() -> HashMap<String, String> {
 
     // Use $HOME inside the script (not interpolated from Rust) to avoid
     // shell injection if HOME contains special characters.
-    let script = format!("source \"$HOME/{rc_file}\" 2>/dev/null; printf '\\x01%s\\x01' \"$PATH\"");
+    let script = format!(
+        "source \"$HOME/{rc_file}\" 2>/dev/null; printf '\\x01%s\\x01' \"$PATH\"; command env -0 2>/dev/null; printf '\\x01'"
+    );
 
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut cmd = tokio::process::Command::new(shell.binary_path());
@@ -2634,11 +2889,11 @@ async fn capture_login_path() -> HashMap<String, String> {
         }
 
         let stdout = String::from_utf8_lossy(&stdout_buf);
-        let parts: Vec<&str> = stdout.split('\x01').collect();
-        let login_path = (parts.len() >= 3).then(|| parts[1].trim())?;
+        let (login_path, mut env_map) = parse_login_env_capture(&stdout);
+        let login_path = login_path?;
 
-        if login_path.is_empty() {
-            return None;
+        if !login_env_capture_enabled() {
+            env_map.clear();
         }
 
         // Merge: login PATH first, then current-process entries not already present.
@@ -2649,16 +2904,17 @@ async fn capture_login_path() -> HashMap<String, String> {
             .chain(current_path.split(':'))
             .filter(|e| !e.is_empty() && seen.insert(*e))
             .collect();
+        env_map.insert("PATH".to_string(), merged.join(":"));
 
-        Some(merged.join(":"))
+        Some(env_map)
     })
     .await;
 
     match result {
-        Ok(Some(path)) => HashMap::from([("PATH".to_string(), path)]),
+        Ok(Some(env_map)) => env_map,
         Ok(None) => HashMap::new(),
         Err(_) => {
-            tracing::warn!("login-shell PATH capture timed out after 5s");
+            tracing::warn!("login-shell env capture timed out after 5s");
             HashMap::new()
         }
     }
@@ -2710,6 +2966,13 @@ fn spawn_shell_command(
             // detach_from_tty() handles both session and process group creation.
             .kill_on_drop(true);
 
+        if let Some(login) = login_env {
+            for (key, value) in login {
+                if key != "PATH" && std::env::var_os(key).is_none() {
+                    cmd.env(key, value);
+                }
+            }
+        }
         // Apply env vars from the request (e.g., .envrc, color vars, ACP-provided vars).
         cmd.envs(shell_state::shell_env_overrides());
         for (key, value) in env {
@@ -2722,8 +2985,8 @@ fn spawn_shell_command(
         // request env often carries a copy of the parent process's PATH which
         // doesn't include rc-file additions — applying login PATH after the
         // request env ensures those additions aren't clobbered.
-        if let Some(login) = login_env {
-            cmd.envs(login);
+        if let Some(path) = login_env.and_then(|l| l.get("PATH")) {
+            cmd.env("PATH", path);
         }
         // Agent marker must win over request/login env.
         crate::util::apply_grok_agent_marker(&mut cmd);
@@ -2793,7 +3056,9 @@ fn spawn_shell_command(
     #[cfg(unix)]
     let mut group = crate::util::ProcessGroup::new()?;
     #[cfg(unix)]
-    let child = cmd.spawn()?;
+    let child = cmd.spawn().map_err(|e| {
+        std::io::Error::new(e.kind(), format!("spawn shell in {}: {e}", cwd.display()))
+    })?;
 
     #[cfg(not(unix))]
     let (child, mut group) = {
@@ -4234,6 +4499,150 @@ mod tests {
             "captured_value",
             "variable from command substitution should persist"
         );
+    }
+
+    #[tokio::test]
+    async fn test_persistent_shell_deleted_cwd_falls_back_to_request_cwd() {
+        let backend = LocalTerminalBackend::with_persistent_shell();
+
+        let scratch = tempfile::TempDir::new().unwrap();
+        let result = backend
+            .run(make_request(&format!("cd {}", scratch.path().display())))
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        drop(scratch);
+
+        let result = backend.run(make_request("pwd")).await.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        let output = &result.combined_output;
+        assert!(
+            output.contains("no longer exists"),
+            "fallback warning must be in the command output, got: {output:?}"
+        );
+        let pwd = output.lines().last().unwrap_or_default().trim();
+        assert!(
+            pwd == "/tmp" || pwd == "/private/tmp",
+            "command must run in the request working directory, got: {pwd:?}"
+        );
+
+        let result = backend.run(make_request("pwd")).await.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert!(
+            !result.combined_output.contains("no longer exists"),
+            "state must heal after the fallback, got: {:?}",
+            result.combined_output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persistent_shell_spawn_error_names_missing_cwd() {
+        let backend = LocalTerminalBackend::with_persistent_shell();
+
+        let scratch = tempfile::TempDir::new().unwrap();
+        let result = backend
+            .run(make_request(&format!("cd {}", scratch.path().display())))
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        drop(scratch);
+
+        let gone = tempfile::TempDir::new().unwrap();
+        let gone_path = gone.path().to_path_buf();
+        drop(gone);
+        let mut req = make_request("pwd");
+        req.working_directory = gone_path.clone();
+
+        let Err(err) = backend.run(req).await else {
+            panic!("spawn must fail when both directories are missing");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("spawn shell in") && msg.contains(&gone_path.display().to_string()),
+            "error must name the spawn directory, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persistent_shell_does_not_inherit_dump_errexit() {
+        let backend = LocalTerminalBackend::with_persistent_shell();
+
+        let result = backend.run(make_request("true")).await.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+
+        let result = backend
+            .run(make_request("false; echo STILL_ALIVE"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "a failing statement must not abort the command: {:?}",
+            result.combined_output
+        );
+        assert!(
+            result.combined_output.contains("STILL_ALIVE"),
+            "execution must continue past a failing statement: {:?}",
+            result.combined_output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_shell_unaffected_by_deleted_cd_target() {
+        let backend = LocalTerminalBackend::new();
+
+        let scratch = tempfile::TempDir::new().unwrap();
+        let result = backend
+            .run(make_request(&format!("cd {}", scratch.path().display())))
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        drop(scratch);
+
+        let result = backend.run(make_request("pwd")).await.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        let pwd = result.combined_output.trim();
+        assert!(
+            pwd == "/tmp" || pwd == "/private/tmp",
+            "spawns must use the request cwd, got: {pwd:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_login_env_capture() {
+        let stdout = "motd noise\n\x01/opt/rc/bin:/usr/bin\x01\
+                      XDG_CONFIG_HOME=/Users/u/.config\0\
+                      GH_CONFIG_DIR=/Users/u/.config/gh\0\
+                      MULTILINE=a\nb\0\
+                      PATH=/login/path\0\
+                      PWD=/somewhere\0\
+                      SHLVL=2\0\
+                      GPG_TTY=/dev/ttys001\0\
+                      http_proxy=http://p:3128\0\x01";
+        let (path, env) = parse_login_env_capture(stdout);
+        assert_eq!(path.as_deref(), Some("/opt/rc/bin:/usr/bin"));
+        assert_eq!(
+            env.get("XDG_CONFIG_HOME").map(String::as_str),
+            Some("/Users/u/.config")
+        );
+        assert_eq!(
+            env.get("GH_CONFIG_DIR").map(String::as_str),
+            Some("/Users/u/.config/gh")
+        );
+        assert_eq!(env.get("MULTILINE").map(String::as_str), Some("a\nb"));
+        for excluded in ["PATH", "PWD", "SHLVL", "GPG_TTY", "http_proxy"] {
+            assert!(
+                !env.contains_key(excluded),
+                "{excluded} must be filtered from the captured login env"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_login_env_capture_path_only() {
+        let (path, env) = parse_login_env_capture("\x01/usr/bin\x01");
+        assert_eq!(path.as_deref(), Some("/usr/bin"));
+        assert!(env.is_empty());
     }
 
     #[tokio::test]

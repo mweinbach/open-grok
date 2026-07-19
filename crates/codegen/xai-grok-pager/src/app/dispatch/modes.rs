@@ -1,7 +1,7 @@
 //! Plan, yolo, auto, and permission mode transitions and toasts.
 
 use super::ctx::with_active_agent;
-use super::queue::{maybe_drain_queue, note_peek_page_flip_after_drain};
+use super::queue::{maybe_drain_queue, note_peek_page_flip};
 use super::session::lifecycle::skip_picker_and_create_session;
 use super::settings::ui::{refresh_open_settings_modals, save_success_toast};
 use crate::app::actions::Effect;
@@ -80,9 +80,9 @@ pub(super) fn dispatch_enter_plan_mode(
             .session
             .enqueue_prompt_with_skill_tokens(desc, skill_token_ranges);
         let drain = maybe_drain_queue(agent);
-        note_peek_page_flip_after_drain(app, id);
+        note_peek_page_flip(app, id, drain.page_flip_entry);
         let mut effects = Vec::with_capacity(1);
-        for eff in drain {
+        for eff in drain.effects {
             match eff {
                 Effect::SendPrompt {
                     agent_id,

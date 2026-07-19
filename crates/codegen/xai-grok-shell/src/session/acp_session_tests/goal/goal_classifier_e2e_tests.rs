@@ -1683,6 +1683,7 @@ async fn goal_classifier_nudge_suppresses_subsequent_goal_summary() {
                     verbatim: true,
                     json_schema: None,
                     origin: PromptOrigin::GoalClassifierNudge,
+                    task_wake_fallback: None,
                     respond_to,
                     persist_ack: None,
                     parsed_prompt_tx: None,

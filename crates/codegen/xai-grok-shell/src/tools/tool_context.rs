@@ -77,10 +77,10 @@ pub struct ToolContext {
     /// synthetic user message before the next sampling step.
     pub monitor_event_buffer:
         Option<xai_grok_tools::implementations::grok_build::task::types::MonitorEventBuffer>,
-    /// Shared set of IDs delivered via auto-wake synthetic prompts.
-    /// Used by `TaskCompletionReminder` to suppress duplicate reminders.
-    pub auto_wake_delivered:
-        Option<xai_grok_tools::reminders::task_completion::AutoWakeDeliveredIds>,
+    pub task_completion_reservations:
+        Option<xai_grok_tools::reminders::task_completion::TaskCompletionReservations>,
+    pub task_wake_suppressed:
+        Option<xai_grok_tools::reminders::task_completion::TaskWakeSuppressed>,
     /// Channel for requesting trace uploads for synthetic auto-wake turns.
     pub(crate) synthetic_trace_tx:
         Option<tokio::sync::mpsc::UnboundedSender<crate::upload::turn::SyntheticTurnTraceRequest>>,
@@ -143,7 +143,8 @@ impl ToolContext {
             lsp_server_names: Vec::new(),
             is_turn_active: None,
             monitor_event_buffer: None,
-            auto_wake_delivered: None,
+            task_completion_reservations: None,
+            task_wake_suppressed: None,
             synthetic_trace_tx: None,
             synthetic_trace_tx_shared: None,
             task_output_tool_name:
@@ -179,7 +180,8 @@ impl ToolContext {
             lsp_server_names: Vec::new(),
             is_turn_active: None,
             monitor_event_buffer: None,
-            auto_wake_delivered: None,
+            task_completion_reservations: None,
+            task_wake_suppressed: None,
             synthetic_trace_tx: None,
             synthetic_trace_tx_shared: None,
             task_output_tool_name:
@@ -235,7 +237,8 @@ mod tests {
                 lsp_server_names: Vec::new(),
                 is_turn_active: None,
                 monitor_event_buffer: None,
-                auto_wake_delivered: None,
+                task_completion_reservations: None,
+                task_wake_suppressed: None,
                 synthetic_trace_tx: None,
                 synthetic_trace_tx_shared: None,
                 task_output_tool_name:

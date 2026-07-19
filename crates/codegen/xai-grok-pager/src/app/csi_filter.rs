@@ -4,7 +4,7 @@
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use super::event_loop::is_bare_esc_press;
+use super::event_loop::{TimedInputEvent, is_bare_esc_press};
 
 /// Persistent filter that reassembles CSI fragments leaked by crossterm when a
 /// control sequence splits across `read()` boundaries — SGR mouse reports
@@ -17,7 +17,7 @@ use super::event_loop::is_bare_esc_press;
 /// whose `\e` was isolated in a prior batch still leaks.
 pub(super) struct CsiFragmentFilter {
     state: CsiFragmentState,
-    tentative: Vec<Event>,
+    tentative: Vec<TimedInputEvent>,
 }
 
 impl CsiFragmentFilter {
@@ -31,13 +31,13 @@ impl CsiFragmentFilter {
     /// Process a batch of events, filtering any CSI fragments.
     /// Partial matches are held in `self.tentative` until the next call.
     /// The `esc_before_run` pop is per-call only (can't retract across batches).
-    pub(super) fn filter(&mut self, events: Vec<Event>) -> Vec<Event> {
+    pub(super) fn filter(&mut self, events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
         let mut result = Vec::with_capacity(self.tentative.len() + events.len());
         let mut esc_before_run = false;
         let mut filtered_count = 0usize;
 
         for ev in events {
-            if is_bare_esc_press(&ev) {
+            if is_bare_esc_press(&ev.event) {
                 result.append(&mut self.tentative);
                 self.state = CsiFragmentState::Idle;
                 result.push(ev);
@@ -45,7 +45,7 @@ impl CsiFragmentFilter {
                 continue;
             }
 
-            match csi_filterable_char(&ev) {
+            match csi_filterable_char(&ev.event) {
                 Some(ch) => match self.state.advance(ch) {
                     CsiAdvance::Continue(next) => {
                         self.state = next;
@@ -67,10 +67,13 @@ impl CsiFragmentFilter {
                             self.tentative.clear();
                             result.pop(); // retract the bare Esc
                             // translate the reassembled report into its focus event so focus-driven UX (prompt refocus, recap away-timer, /gboom key-release) still fires over SSH
-                            result.push(if ch == 'I' {
-                                Event::FocusGained
-                            } else {
-                                Event::FocusLost
+                            result.push(TimedInputEvent {
+                                event: if ch == 'I' {
+                                    Event::FocusGained
+                                } else {
+                                    Event::FocusLost
+                                },
+                                arrived_at: ev.arrived_at,
                             });
                             esc_before_run = false;
                             self.state = CsiFragmentState::Idle;
@@ -180,23 +183,34 @@ fn csi_filterable_char(ev: &Event) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
 
-    fn press_mods(code: KeyCode, modifiers: KeyModifiers) -> Event {
-        Event::Key(KeyEvent {
-            code,
-            modifiers,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        })
+    fn test_instant() -> Instant {
+        static NOW: OnceLock<Instant> = OnceLock::new();
+        *NOW.get_or_init(Instant::now)
     }
 
-    fn press(code: KeyCode) -> Event {
+    fn press_mods(code: KeyCode, modifiers: KeyModifiers) -> TimedInputEvent {
+        TimedInputEvent {
+            event: Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            }),
+            arrived_at: test_instant(),
+        }
+    }
+
+    fn press(code: KeyCode) -> TimedInputEvent {
         press_mods(code, KeyModifiers::NONE)
     }
 
-    fn press_shift(code: KeyCode) -> Event {
+    fn press_shift(code: KeyCode) -> TimedInputEvent {
         press_mods(code, KeyModifiers::SHIFT)
     }
 
@@ -204,7 +218,7 @@ mod tests {
 
     /// Build key events matching crossterm's actual output for a fragmented
     /// SGR mouse report `[<btn;col;row{M|m}]`.
-    fn sgr_fragment(btn: &str, col: &str, row: &str, term: char) -> Vec<Event> {
+    fn sgr_fragment(btn: &str, col: &str, row: &str, term: char) -> Vec<TimedInputEvent> {
         let mut events = vec![press(KeyCode::Char('[')), press(KeyCode::Char('<'))];
         for c in btn.chars() {
             events.push(press(KeyCode::Char(c)));
@@ -307,13 +321,19 @@ mod tests {
 
     #[test]
     fn csi_filter_non_key_events_preserved() {
-        let mut events = vec![Event::Resize(80, 24)];
+        let mut events = vec![TimedInputEvent {
+            event: Event::Resize(80, 24),
+            arrived_at: test_instant(),
+        }];
         events.extend(sgr_fragment("35", "261", "67", 'M'));
-        events.push(Event::Resize(100, 30));
+        events.push(TimedInputEvent {
+            event: Event::Resize(100, 30),
+            arrived_at: test_instant(),
+        });
         let result = CsiFragmentFilter::new().filter(events);
         assert_eq!(result.len(), 2);
-        assert!(matches!(result[0], Event::Resize(80, 24)));
-        assert!(matches!(result[1], Event::Resize(100, 30)));
+        assert!(matches!(result[0].event, Event::Resize(80, 24)));
+        assert!(matches!(result[1].event, Event::Resize(100, 30)));
     }
 
     #[test]
@@ -575,6 +595,31 @@ mod tests {
     // ── CSI focus report filtering tests ─────────────────────────────
 
     #[test]
+    fn csi_filter_focus_timestamp_comes_from_completing_fragment() {
+        let start = Instant::now();
+        let complete = start + std::time::Duration::from_millis(7);
+        let events = vec![
+            TimedInputEvent {
+                event: press(KeyCode::Esc).event,
+                arrived_at: start,
+            },
+            TimedInputEvent {
+                event: press(KeyCode::Char('[')).event,
+                arrived_at: start + std::time::Duration::from_millis(3),
+            },
+            TimedInputEvent {
+                event: press_shift(KeyCode::Char('I')).event,
+                arrived_at: complete,
+            },
+        ];
+
+        let result = CsiFragmentFilter::new().filter(events);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].event, Event::FocusGained);
+        assert_eq!(result[0].arrived_at, complete);
+    }
+
+    #[test]
     fn csi_filter_focus_in_after_esc_translated() {
         // Split \e[I focus-in (Esc, [, I — uppercase I arrives with SHIFT) is
         // reassembled into a FocusGained event, not dropped.
@@ -585,7 +630,10 @@ mod tests {
         ];
         assert_eq!(
             CsiFragmentFilter::new().filter(events),
-            vec![Event::FocusGained]
+            vec![TimedInputEvent {
+                event: Event::FocusGained,
+                arrived_at: test_instant()
+            }]
         );
     }
 
@@ -600,7 +648,10 @@ mod tests {
         ];
         assert_eq!(
             CsiFragmentFilter::new().filter(events),
-            vec![Event::FocusLost]
+            vec![TimedInputEvent {
+                event: Event::FocusLost,
+                arrived_at: test_instant()
+            }]
         );
     }
 
@@ -661,7 +712,10 @@ mod tests {
             result,
             vec![
                 press(KeyCode::Char('a')),
-                Event::FocusGained,
+                TimedInputEvent {
+                    event: Event::FocusGained,
+                    arrived_at: test_instant()
+                },
                 press(KeyCode::Char('b')),
             ]
         );

@@ -38,7 +38,7 @@ const DESCRIPTION: &str = r#"Reads a file from the local filesystem. You can acc
 Assume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.
 
 Usage:
-- The file_path parameter must be an absolute path, not a relative path
+- The ${{ params.read.filePath }} parameter must be an absolute path, not a relative path
 - By default, it reads up to {max_lines_read} lines starting from the beginning of the file
 - You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
 - Any lines longer than {max_chars_per_line} characters will be truncated

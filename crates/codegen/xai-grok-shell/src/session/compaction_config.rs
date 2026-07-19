@@ -150,6 +150,7 @@ pub struct CompactionConfig {
     pub compaction_mode: xai_chat_state::CompactionMode,
     /// When `true`, feed the summarizer the verbatim conversation instead of the lossy rewrite (the retry loop may still fall back).
     pub verbatim_input: bool,
+    pub tool_choice: crate::util::config::CompactionToolChoice,
     /// Prefire two-pass state (background NOTE₁ cache + in-flight guard).
     /// `Default` (empty cache, not in-flight).
     pub prefire: PrefireState,

@@ -30,6 +30,7 @@ const TIMESTAMPS_DEFAULT: bool = true;
 /// [`UiConfig::SHOW_TIMELINE_DEFAULT`]; aliased here for the `Cell::new`
 /// const context and the effective-config fallback read.
 const TIMELINE_DEFAULT: bool = UiConfig::SHOW_TIMELINE_DEFAULT;
+const PAGE_FLIP_ON_SEND_DEFAULT: bool = UiConfig::PAGE_FLIP_ON_SEND_DEFAULT;
 const SIMPLE_MODE_DEFAULT: bool = true;
 /// Vim-mode scrollback default — matches the previous on-disk default.
 const VIM_MODE_DEFAULT: bool = false;
@@ -133,6 +134,34 @@ pub fn load_show_timeline() -> bool {
 pub fn set_show_timeline(enabled: bool) {
     TIMELINE_CURRENT.with(|c| c.set(enabled));
     TIMELINE_LOADED.with(|l| l.set(true));
+}
+
+// -- Page-flip on send ---------------------------------------------------------
+
+thread_local! {
+    static PAGE_FLIP_ON_SEND_CURRENT: Cell<bool> = const { Cell::new(PAGE_FLIP_ON_SEND_DEFAULT) };
+    static PAGE_FLIP_ON_SEND_LOADED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Cached `page_flip_on_send`, seeding from `[ui]` on first call.
+pub fn load_page_flip_on_send() -> bool {
+    PAGE_FLIP_ON_SEND_LOADED.with(|loaded| {
+        if !loaded.get() {
+            PAGE_FLIP_ON_SEND_CURRENT.with(|c| {
+                c.set(load_bool_from_effective_config(
+                    "page_flip_on_send",
+                    PAGE_FLIP_ON_SEND_DEFAULT,
+                ))
+            });
+            loaded.set(true);
+        }
+    });
+    PAGE_FLIP_ON_SEND_CURRENT.with(|c| c.get())
+}
+
+pub fn set_page_flip_on_send(enabled: bool) {
+    PAGE_FLIP_ON_SEND_CURRENT.with(|c| c.set(enabled));
+    PAGE_FLIP_ON_SEND_LOADED.with(|l| l.set(true));
 }
 
 // -- Simple mode --------------------------------------------------------------
@@ -545,6 +574,7 @@ pub fn prime(ui: &UiConfig) {
     set(ui.compact_mode);
     set_timestamps(ui.show_timestamps.unwrap_or(TIMESTAMPS_DEFAULT));
     set_show_timeline(ui.show_timeline_enabled());
+    set_page_flip_on_send(ui.page_flip_on_send_enabled());
     set_simple_mode(ui.simple_mode.unwrap_or(SIMPLE_MODE_DEFAULT));
     set_keep_text_selection(text_selection_from_ui(ui));
     // Layered-config keys (not the `UiConfig` arg) — seed so the first frame
@@ -656,6 +686,7 @@ mod tests {
         assert_eq!(COMPACT_DEFAULT, ui.compact_mode);
         assert_eq!(TIMESTAMPS_DEFAULT, ui.show_timestamps.unwrap_or(true));
         assert_eq!(TIMELINE_DEFAULT, ui.show_timeline_enabled());
+        assert_eq!(PAGE_FLIP_ON_SEND_DEFAULT, ui.page_flip_on_send_enabled());
         assert_eq!(SIMPLE_MODE_DEFAULT, ui.simple_mode.unwrap_or(true));
         assert_eq!(VIM_MODE_DEFAULT, ui.vim_mode.unwrap_or(false));
         assert_eq!(
@@ -721,6 +752,18 @@ mod tests {
             assert!(!load_timestamps());
             set_timestamps(true);
             assert!(load_timestamps());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn set_then_load_round_trips_page_flip_on_send() {
+        std::thread::spawn(|| {
+            set_page_flip_on_send(true);
+            assert!(load_page_flip_on_send());
+            set_page_flip_on_send(false);
+            assert!(!load_page_flip_on_send());
         })
         .join()
         .unwrap();

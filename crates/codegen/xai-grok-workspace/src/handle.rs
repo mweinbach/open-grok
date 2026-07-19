@@ -2697,6 +2697,9 @@ impl WorkspaceHandle {
     pub fn session_ids(&self) -> Vec<String> {
         self.shared.sessions.read().keys().cloned().collect()
     }
+    pub fn session_count(&self) -> usize {
+        self.shared.sessions.read().len()
+    }
     /// Fork a new subagent session. Clones (not references) the parent's
     /// tool config and env. Enforces capability subset and fork budget.
     ///

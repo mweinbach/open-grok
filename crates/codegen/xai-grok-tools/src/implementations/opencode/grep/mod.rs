@@ -34,10 +34,10 @@ Usage:
 - Prefer ${{ tools.by_kind.search }} for exact symbol/string searches. Whenever possible, use this instead of terminal grep/rg. This tool is faster and respects .gitignore
 - Supports full regex syntax, e.g. `log.*Error`, `function\s+\w+`. Ensure you escape special chars to get exact matches, e.g. `functionCall\(`
 - Avoid overly broad glob patterns (e.g., '--glob *') as they bypass .gitignore rules and may be slow
-- The pattern field is a raw regex string: do NOT wrap it in quotes or add trailing quote characters unnecessarily
-- Only use 'include' when certain of the file type needed. Note: import paths may not match source file types (.js vs .ts)
+- The ${{ params.search.pattern }} field is a raw regex string: do NOT wrap it in quotes or add trailing quote characters unnecessarily
+- Only use '${{ params.search.include }}' when certain of the file type needed. Note: import paths may not match source file types (.js vs .ts)
 - Results are capped for responsiveness; truncated results show "at least" counts.
-- Filter files by pattern with the include parameter (e.g. "*.js", "*.{ts,tsx}")
+- Filter files by pattern with the ${{ params.search.include }} parameter (e.g. "*.js", "*.{ts,tsx}")
 - Returns file paths and line numbers with at least one match sorted by modification time
 - Use this tool when you need to find files containing specific patterns"#;
 

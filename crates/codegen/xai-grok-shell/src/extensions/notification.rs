@@ -548,10 +548,10 @@ pub enum SessionUpdate {
     /// Task completed notification
     TaskCompleted {
         task_snapshot: TaskSnapshot,
-        /// Whether an auto-wake prompt follows this completion. The pager
-        /// skips its between-turns status line when set — the wake turn's
-        /// end marker carries the fresh counts instead. Missing (old
-        /// shells) reads as `false`: emit the line.
+        /// Advisory: an auto-wake prompt follows this completion. The
+        /// first-party TUI no longer consumes it (remaining background work
+        /// is surfaced by its persistent "watching" status row); kept for
+        /// wire compatibility and other clients. Missing reads as `false`.
         #[serde(default)]
         will_wake: bool,
     },
@@ -678,10 +678,10 @@ pub enum SessionUpdate {
         /// Final output text from the subagent (if completed).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
-        /// Whether an auto-wake prompt follows this completion. The pager
-        /// skips its between-turns status line when set — the wake turn's
-        /// end marker carries the fresh counts instead. Missing (old
-        /// shells) reads as `false`: emit the line.
+        /// Advisory: an auto-wake prompt follows this completion. The
+        /// first-party TUI no longer consumes it (remaining background work
+        /// is surfaced by its persistent "watching" status row); kept for
+        /// wire compatibility and other clients. Missing reads as `false`.
         #[serde(default)]
         will_wake: bool,
     },

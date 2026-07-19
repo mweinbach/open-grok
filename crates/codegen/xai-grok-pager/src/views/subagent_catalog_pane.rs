@@ -221,6 +221,10 @@ impl SubagentCatalogPane {
         self.list_state.handle_key_event(key, &self.entries)
     }
 
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.list_state.handle_paste(text, &self.entries)
+    }
+
     pub fn handle_scroll(&mut self, lines: i32, col: u16, row: u16) {
         let max = match self.list_state.viewport_height() {
             0..=5 => 1,

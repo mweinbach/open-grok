@@ -30,6 +30,58 @@ mod yolo_toggle_report_tests {
 /// Best-effort removal of this session's per-session scratch staging on
 /// teardown. A no-op in builds without a scratch producer.
 fn cleanup_session_scratch(_session: &SessionActor) {}
+impl SessionActor {
+    /// Serialize terminal task-wake admission with interactive cancellation.
+    pub(super) async fn admit_task_completion_wake(
+        &self,
+        origin: &super::PromptOrigin,
+        admission: TaskWakeAdmission,
+    ) -> Option<TaskWakeFallback> {
+        let TaskWakeAdmission {
+            respond_to,
+            fallback,
+        } = admission;
+        let super::PromptOrigin::TaskCompleted { task_id } = origin else {
+            return respond_to.send(true).is_ok().then_some(fallback);
+        };
+        let gate_suppressed = self
+            .tool_context
+            .task_wake_suppressed
+            .as_ref()
+            .is_some_and(|gate| gate.get());
+        let mut state = self.state.lock().await;
+        let state_suppressed = state.notifications_suppressed;
+        let admitted = !gate_suppressed && !state_suppressed;
+        if !admitted {
+            Self::push_task_wake_fallback(&mut state, fallback);
+            drop(state);
+            xai_grok_telemetry::unified_log::info(
+                "shell.task_wake.actor_admission",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!(
+                    { "task_id" : task_id, "gate" : gate_suppressed, "state" :
+                    state_suppressed, "admitted" : false, }
+                )),
+            );
+            let _ = respond_to.send(false);
+            return None;
+        }
+        if respond_to.send(true).is_err() {
+            Self::push_task_wake_fallback(&mut state, fallback);
+            return None;
+        }
+        drop(state);
+        xai_grok_telemetry::unified_log::info(
+            "shell.task_wake.actor_admission",
+            Some(self.session_info.id.0.as_ref()),
+            Some(serde_json::json!(
+                { "task_id" : task_id, "gate" : gate_suppressed, "state" :
+                state_suppressed, "admitted" : true, }
+            )),
+        );
+        Some(fallback)
+    }
+}
 pub(super) async fn run_session(
     session: Arc<SessionActor>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
@@ -285,11 +337,18 @@ pub(super) async fn run_session(
             move { s.resume_plan_approval(completion_tx). await; }); }
             SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode,
             artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent,
-            json_schema, send_now, respond_to, persist_ack, parsed_prompt_tx } => {
-            session.ensure_prefix_ready(). await; let origin =
-            super::PromptOrigin::from_prompt_id(& prompt_id); if ! origin.is_synthetic()
-            { let mut state = session.state.lock(). await; state.notifications_suppressed
-            = false; session.user_input_generation.fetch_add(1,
+            json_schema, send_now, admission, respond_to, persist_ack, parsed_prompt_tx }
+            => { let origin = super::PromptOrigin::from_prompt_id(& prompt_id); let
+            (actor_admitted, task_wake_fallback) = match admission { Some(admission) => {
+            let fallback = session.admit_task_completion_wake(& origin, admission).
+            await; (fallback.is_some(), fallback) } None => (true, None), }; if !
+            actor_admitted { SessionActor::respond_removed_prompt(respond_to); continue;
+            } session.ensure_prefix_ready(). await; if ! origin.is_synthetic() { if let
+            Some(gate) = & session.tool_context.task_wake_suppressed { gate.set(false); }
+            let mut state = session.state.lock(). await; state.notifications_suppressed =
+            false; xai_grok_telemetry::unified_log::info("shell.task_wake.gate_cleared",
+            Some(session.session_info.id.0.as_ref()), Some(serde_json::json!({ "reason" :
+            "user_intake" })),); session.user_input_generation.fetch_add(1,
             std::sync::atomic::Ordering::AcqRel); } if origin.is_synthetic() { let state
             = session.state.lock(). await; let has_running = state.running_task
             .is_some(); let queue_depth = state.pending_inputs.len(); drop(state);
@@ -303,8 +362,8 @@ pub(super) async fn run_session(
             session.maybe_inject_swarm_reminder().await;
             let cancel_for_send_now = session.queue_input(prompt_blocks, prompt_id,
             prompt_mode, trace_gcs_config, artifact_tracker, client_identifier,
-            screen_mode, verbatim, json_schema, send_now, respond_to, persist_ack,
-            parsed_prompt_tx). await; if cancel_for_send_now { session
+            screen_mode, verbatim, json_schema, send_now, task_wake_fallback, respond_to,
+            persist_ack, parsed_prompt_tx). await; if cancel_for_send_now { session
             .cancel_turn_for_send_now(& mut replay_buffer). await; }
             SessionActor::maybe_start_running_task(session.clone(), completion_tx
             .clone()). await; } SessionCommand::SessionMode { session_mode, responds_to }
@@ -408,14 +467,9 @@ pub(super) async fn run_session(
             .session_info.id.0.to_string(),), }, MAX_BUFFER_EVENTS,);
             tracing::debug!(task_id = % task_id,
             "Routed monitor event to mid-turn buffer"); } } else { { let mut state =
-            session.state.lock(). await; state.pending_notifications
-            .push(PendingNotification { prompt_id, prompt_blocks, priority, source, });
-            if state.pending_notifications.len() > MAX_PENDING_NOTIFICATIONS { let excess
-            = state.pending_notifications.len() - MAX_PENDING_NOTIFICATIONS; state
-            .pending_notifications.drain(..excess); tracing::warn!(dropped = excess,
-            "Dropped oldest pending notifications (exceeded cap of {})",
-            MAX_PENDING_NOTIFICATIONS,); } }
-            SessionActor::maybe_drain_notifications(session.clone(), completion_tx
+            session.state.lock(). await; SessionActor::push_pending_notification(& mut
+            state, PendingNotification { prompt_id, prompt_blocks, priority, source, },);
+            } SessionActor::maybe_drain_notifications(session.clone(), completion_tx
             .clone()). await; } } SessionCommand::RecordGoalTurnTaskIds { task_ids } => {
             session.record_reparented_goal_turn_task_ids(task_ids); }
             SessionCommand::RemoveQueuedPrompt { id, expected_version, owner } => {
@@ -434,12 +488,15 @@ pub(super) async fn run_session(
             kill_background_tasks, rewind_if_pristine, trigger, } => { if let
             Some(notification) = replay_buffer.flush() { session
             .emit_buffered(notification). await; } session.pending_interjections.clear();
-            session.cancel_running_task(cancel_subagents, kill_background_tasks,
+            let suppress_task_wakes = trigger.as_deref() == Some("ctrl_c"); session
+            .cancel_running_task(cancel_subagents, kill_background_tasks,
             rewind_if_pristine, trigger,). await; session.auto_pause_goal_if_active(crate
             ::session::goal_tracker::GoalPauseReason::User,). await;
             SessionActor::maybe_start_running_task(session.clone(), completion_tx
-            .clone()). await; } SessionCommand::CompactSession { user_context, respond_to
-            } => { session.start_manual_compaction(user_context, respond_to,
+            .clone()). await; if ! suppress_task_wakes {
+            SessionActor::maybe_drain_notifications(session.clone(), completion_tx
+            .clone(),). await; } } SessionCommand::CompactSession { user_context,
+            respond_to } => { session.start_manual_compaction(user_context, respond_to,
             completion_tx.clone()).await; } SessionCommand::ReloadPlugins { registry } => {
             if ! session.startup_hints.is_subagent { let registry = session
             .preserve_session_plugin_dirs(registry); session
@@ -772,19 +829,20 @@ pub(super) async fn run_session(
             prompt_blocks, prompt_mode : crate ::session::plan_mode::PromptMode::Agent,
             trace_gcs_config : None, artifact_tracker : None, client_identifier : None,
             screen_mode : None, verbatim : true, json_schema : None, origin :
-            super::PromptOrigin::GoalSummary, respond_to, persist_ack : None,
-            parsed_prompt_tx : None, queue_meta : None, send_now : false, }); }
-            SessionActor::maybe_start_running_task(session.clone(), completion_tx
-            .clone()). await; } SessionCommand::TakeTurnMessages { respond_to } => { let
-            result = session.chat_state_handle.take_turn_messages(). await; let _ =
-            respond_to.send(result); } SessionCommand::TakeHarnessTraceTurns { respond_to
-            } => { let result = session.chat_state_handle.take_harness_trace_turns().
-            await; let _ = respond_to.send(result); }
-            SessionCommand::TakeStreamingCapture { prompt_id, respond_to } => { let taken
-            = { let mut cap = session.streaming_turn_capture.lock(); if cap.prompt_id
-            .as_deref() == Some(prompt_id.as_str()) { Some(std::mem::take(& mut * cap)) }
-            else { if ! cap.is_empty() { tracing::warn!(requested_prompt_id = %
-            prompt_id, slot_prompt_id = ? cap.prompt_id,
+            super::PromptOrigin::GoalSummary, task_wake_fallback : None, respond_to,
+            persist_ack : None, parsed_prompt_tx : None, queue_meta : None, send_now :
+            false, }); } SessionActor::maybe_start_running_task(session.clone(),
+            completion_tx.clone()). await; } SessionCommand::TakeTurnMessages {
+            respond_to } => { let result = session.chat_state_handle.take_turn_messages()
+            . await; let _ = respond_to.send(result); }
+            SessionCommand::TakeHarnessTraceTurns { respond_to } => { let result =
+            session.chat_state_handle.take_harness_trace_turns(). await; let _ =
+            respond_to.send(result); } SessionCommand::TakeStreamingCapture { prompt_id,
+            respond_to } => { let taken = { let mut cap = session.streaming_turn_capture
+            .lock(); if cap.prompt_id.as_deref() == Some(prompt_id.as_str()) {
+            Some(std::mem::take(& mut * cap)) } else { if ! cap.is_empty() {
+            tracing::warn!(requested_prompt_id = % prompt_id, slot_prompt_id = ? cap
+            .prompt_id,
             "streaming_capture race: live slot belongs to a different prompt; \
                                              dropping streaming_partial.json for the requested turn",);
             } None } }; let result = taken.and_then(| mut cap | { cap

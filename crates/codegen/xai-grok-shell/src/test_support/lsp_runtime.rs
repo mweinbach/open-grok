@@ -103,7 +103,6 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         parent_session_info: None,
         subagent_roles: HashMap::new(),
         subagent_personas: HashMap::new(),
-        persona_io_summaries: Vec::new(),
         parent_chat_state: None,
         available_models: indexmap::IndexMap::new(),
         subagent_model_overrides: HashMap::new(),
@@ -149,7 +148,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         parent_skills: None,
         parent_skills_config: xai_grok_agent::prompt::skills::SkillsConfig::default(),
         parent_compat: xai_grok_tools::types::compat::CompatConfig::default(),
-        auto_wake_delivered: None,
+        task_completion_reservations: None,
         synthetic_trace_tx: None,
         task_output_tool_name: xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL
             .to_string(),

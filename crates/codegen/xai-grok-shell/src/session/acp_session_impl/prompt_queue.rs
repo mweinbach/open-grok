@@ -18,6 +18,7 @@ impl SessionActor {
         verbatim: bool,
         json_schema: Option<serde_json::Value>,
         send_now: bool,
+        task_wake_fallback: Option<TaskWakeFallback>,
         respond_to: oneshot::Sender<PromptTurnResult>,
         persist_ack: Option<oneshot::Sender<()>>,
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
@@ -84,10 +85,8 @@ impl SessionActor {
             (trace_gcs_config, artifact_tracker)
         };
 
-        // Pre-mark auto-wake completion IDs so TaskCompletionReminder doesn't
-        // duplicate the notification the model already sees in the synthetic prompt.
-        if let Some(id) = origin.completion_id() {
-            self.mark_completions_reported(&[id]).await;
+        if let crate::session::PromptOrigin::SubagentCompleted { subagent_id } = &origin {
+            self.mark_completions_reported(&[subagent_id]).await;
         }
 
         // For synthetic prompts, derive trace config from the template
@@ -133,17 +132,18 @@ impl SessionActor {
             });
             if preempt_armed {
                 let dropped = state.sweep_pending_inputs(|i| i.origin.is_synthetic());
+                if let Some(reservations) = &self.tool_context.task_completion_reservations {
+                    for task_id in dropped
+                        .iter()
+                        .filter_map(|item| item.origin.completion_id())
+                    {
+                        reservations.release(task_id);
+                    }
+                }
                 tracing::info!(
                     dropped_count = dropped.len(),
                     "auto-wake: dropping pending synthetic prompts (user prompt has priority)"
                 );
-                // Un-mark preempted IDs so TaskCompletionReminder can report
-                // them on the next pass instead of permanently suppressing them.
-                if let Some(ref auto_wake) = self.tool_context.auto_wake_delivered {
-                    for id in dropped.iter().filter_map(|i| i.origin.completion_id()) {
-                        auto_wake.remove(id);
-                    }
-                }
             }
         }
 
@@ -190,6 +190,7 @@ impl SessionActor {
             verbatim,
             json_schema,
             origin,
+            task_wake_fallback,
             respond_to,
             persist_ack,
             parsed_prompt_tx,
@@ -392,7 +393,7 @@ impl SessionActor {
     /// benign no-op — the actor still re-broadcasts so the client reconciles.
     /// The in-flight turn is never removed. `owner` (when `Some`) scopes the
     /// edit to the requesting client's own items.
-    /// Resolve a removed/cleared queued prompt's in-flight `session/prompt` RPC
+    /// Resolve a removed prompt's in-flight `session/prompt` RPC
     /// before its [`InputItem`] is dropped.
     ///
     /// A queued prompt still has a client awaiting its `respond_to` oneshot (the
@@ -412,8 +413,8 @@ impl SessionActor {
     /// delta, so other attached clients (leader mode) don't see the running
     /// turn spuriously end. Token count is `0` — a removed queued prompt never
     /// ran (and the value is discarded by the gate regardless).
-    fn respond_removed_queued_prompt(item: InputItem) {
-        let _ = item.respond_to.send(Ok(PromptTurnOk {
+    pub(super) fn respond_removed_prompt(respond_to: oneshot::Sender<PromptTurnResult>) {
+        let _ = respond_to.send(Ok(PromptTurnOk {
             stop_reason: acp::StopReason::Cancelled,
             total_tokens: 0,
             turn_snapshot: None,
@@ -441,7 +442,7 @@ impl SessionActor {
             })
         {
             if let Some(item) = state.pending_inputs.remove(pos) {
-                Self::respond_removed_queued_prompt(item);
+                Self::respond_removed_prompt(item.respond_to);
             }
             removed = true;
         }
@@ -619,7 +620,7 @@ impl SessionActor {
         let mut state = self.state.lock().await;
         // Partition rather than `retain`: each cleared user prompt still has a
         // client awaiting its `respond_to`, so it must be resolved with
-        // `Cancelled` (see [`respond_removed_queued_prompt`]) instead of being
+        // `Cancelled` (see [`respond_removed_prompt`]) instead of being
         // dropped — a bare drop surfaces as "session failed to respond" and a
         // spurious "Turn failed" on the running turn.
         let running_id = state.running_prompt_id().map(str::to_string);
@@ -638,7 +639,7 @@ impl SessionActor {
             if keep {
                 kept.push_back(item);
             } else {
-                Self::respond_removed_queued_prompt(item);
+                Self::respond_removed_prompt(item.respond_to);
             }
         }
         state.pending_inputs = kept;

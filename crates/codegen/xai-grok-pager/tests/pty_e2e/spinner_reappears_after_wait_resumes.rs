@@ -139,10 +139,11 @@ async fn spinner_reappears_after_wait_resumes() {
 
     std::fs::write(&id_ready_flag, b"ready").expect("release id-extraction hold");
 
-    // Parked look: the marker renders and the running chrome (turn-status
-    // row / cancel keybar) drops — the session reads as stopped.
+    // Parked look: the plain marker renders, the "watching · …" cue takes
+    // the status row, and the running chrome (cancel keybar) drops — the
+    // session reads as stopped.
     harness
-        .wait_for_text("1 command still running", Duration::from_secs(60))
+        .wait_for_text("Worked for", Duration::from_secs(60))
         .unwrap_or_else(|_| {
             panic!(
                 "parked marker never appeared; screen:\n{}\n--- non-system messages ---\n{}",
@@ -150,11 +151,14 @@ async fn spinner_reappears_after_wait_resumes() {
                 dump_non_system_messages(&content.request_bodies())
             )
         });
-    assert!(
-        harness.contains_text("Worked for"),
-        "the parked marker keeps the completion prefix; screen:\n{}",
-        harness.screen_contents()
-    );
+    harness
+        .wait_for_text("watching · 1 command", Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            panic!(
+                "parked watching cue never appeared; screen:\n{}",
+                harness.screen_contents()
+            )
+        });
     let chrome_hidden = wait_until(Duration::from_secs(10), || {
         harness.update(Duration::from_millis(100));
         !harness.contains_text(CANCEL_HINT)

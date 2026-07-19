@@ -402,7 +402,9 @@ fn finish_perplexity_web_search_update(app: &mut AppView) -> Vec<Effect> {
         }
         if let Some(agent) = app.agents.get_mut(&agent_id) {
             agent.session.provider_rebind_pending = false;
-            effects.extend(crate::app::dispatch::queue::maybe_drain_queue(agent));
+            effects.extend(crate::app::dispatch::maybe_drain_queue_and_note_peek(
+                app, agent_id,
+            ));
         }
     }
     effects
@@ -434,7 +436,7 @@ fn reconcile_pending_perplexity_session_after_model_switch(
         return vec![];
     };
     agent.session.provider_rebind_pending = false;
-    crate::app::dispatch::queue::maybe_drain_queue(agent)
+    crate::app::dispatch::maybe_drain_queue_and_note_peek(app, agent_id)
 }
 
 fn mark_runtime_pending_kimi_session(
@@ -515,10 +517,10 @@ fn handle_kimi_model_rebind_complete(
         // the pager now considers current before releasing the queue.
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent);
+            return crate::app::dispatch::maybe_drain_queue(agent).effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent);
+            return crate::app::dispatch::maybe_drain_queue(agent).effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -580,11 +582,7 @@ fn handle_kimi_model_rebind_complete(
     }
     finish_kimi_rebind(app, agent_id);
 
-    let mut effects = app
-        .agents
-        .get_mut(&agent_id)
-        .map(crate::app::dispatch::queue::maybe_drain_queue)
-        .unwrap_or_default();
+    let mut effects = crate::app::dispatch::maybe_drain_queue_and_note_peek(app, agent_id);
     if matches!(app.active_view, ActiveView::Agent(active) if active == agent_id) {
         effects.extend(app.sync_primary_provider_from_active_agent());
     }
@@ -1068,10 +1066,12 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         }
         TaskResult::RosterLoaded { sessions } => {
             app.leader_roster = sessions;
+            app.dashboard_sessions_loading = false;
             vec![]
         }
         TaskResult::RosterFailed { error } => {
             tracing::debug!(error = % error, "leader roster fetch failed");
+            app.dashboard_sessions_loading = false;
             vec![]
         }
         TaskResult::DashboardSessionsLoaded { sessions } => {
@@ -1376,7 +1376,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 } else {
                     app.auth_state = AuthState::Pending { error: Some(error) };
                 }
-                app.auth_code_input.clear();
+                app.auth_code_input.reset();
             }
             vec![]
         }
@@ -1685,7 +1685,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::BtwResponse { agent_id, result } => handle_btw_response(app, agent_id, result),
+        TaskResult::BtwResponse {
+            agent_id,
+            result,
+            minimal_request_id,
+        } => handle_btw_response(app, agent_id, result, minimal_request_id),
         TaskResult::InterjectQueued { .. } => vec![],
         TaskResult::RecapRequested {
             session_id,
@@ -1743,8 +1747,10 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::AuthCopiedTimeout => {
-            app.auth_clipboard_copied = false;
+        TaskResult::AuthCopyFeedbackTimeout { generation } => {
+            if generation == app.auth_clipboard_feedback_generation {
+                app.auth_clipboard_delivery = None;
+            }
             vec![]
         }
         TaskResult::PaywallCheckTick => {
@@ -1781,7 +1787,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.last_subscription_check_at = None;
             app.login_method_id = None;
             ensure_login_method(app);
-            app.auth_clipboard_copied = false;
+            app.auth_clipboard_delivery = None;
             let active_agent_id = match app.active_view {
                 ActiveView::Agent(id) => Some(id),
                 _ => None,

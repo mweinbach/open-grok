@@ -1500,6 +1500,29 @@ impl ListPaneState {
     // Keyboard input
     // =======================================================================
 
+    /// Paste into the active input bar. Returns `false` when no editor is open.
+    pub fn handle_paste<T: ListItem>(&mut self, text: &str, items: &[T]) -> bool {
+        let Some(mode) = self.input_mode else {
+            return false;
+        };
+        let old_text = self.input_textarea.text().to_owned();
+        if mode == InputBarMode::Comment {
+            self.input_textarea.insert_str(text);
+        } else {
+            let cleaned = crate::input::line_editor::sanitize_single_line(text);
+            self.input_textarea.insert_str(&cleaned);
+        }
+        if self.input_textarea.text() == old_text {
+            return false;
+        }
+        match mode {
+            InputBarMode::GotoLine => self.apply_goto_line_live(items),
+            InputBarMode::Search | InputBarMode::Filter => self.apply_input_buffer(items),
+            InputBarMode::Comment => {}
+        }
+        true
+    }
+
     /// Handle a key event for navigation, search, and filter.
     ///
     /// Returns `true` if the key was consumed (state changed), `false` if

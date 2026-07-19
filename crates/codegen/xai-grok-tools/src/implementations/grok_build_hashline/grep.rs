@@ -146,10 +146,10 @@ Content output format:
   {grep_context}    ← context (-)
 
 Usage:
-- Pattern is a regex: `log.*Error`, `function\s+\w+`, `TODO`
+- ${{ params.search.pattern }} is a regex: `log.*Error`, `function\s+\w+`, `TODO`
 - Output modes: "content" (default, with anchors), "files_with_matches", "count"
 - Use -A, -B, -C for context lines around matches
-- Only use 'type' or 'glob' when certain of the file type
+- Only use '${{ params.search.type }}' or '${{ params.search.glob }}' when certain of the file type
 - Results are capped; truncated results show "at least" counts"#;
 
 /// `hashline_grep` — searches with anchor-annotated results.

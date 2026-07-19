@@ -1417,6 +1417,17 @@ mod tests {
             std::path::PathBuf::from("/worktree/abc/src/main.rs")
         );
     }
+    #[test]
+    fn resolve_model_path_sensitive_edit_spellings() {
+        let cwd = std::path::Path::new("/worktree/abc");
+        for input in ["  /etc/hosts  ", "\"/etc/hosts\\n\"", "'/etc/hosts\\r\\t'"] {
+            assert_eq!(
+                super::resolve_model_path(cwd, None, input),
+                std::path::PathBuf::from("/etc/hosts"),
+                "{input:?}"
+            );
+        }
+    }
     /// An *unquoted* path keeps its backslashes: `\n` there may be a real
     /// path component (e.g. a Windows-style separator + dir named `n`).
     #[test]

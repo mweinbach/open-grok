@@ -230,6 +230,84 @@ pub(crate) fn is_safe_write_sink(path: &str) -> bool {
     matches!(path, "/dev/null" | "/dev/stdout" | "/dev/stderr")
 }
 
+/// Whether an already-resolved direct edit target needs explicit confirmation.
+///
+/// The caller uses the edit tools' shared model-path resolver first. This helper
+/// preserves its uncollapsed components for physical symlink + `..` resolution,
+/// while checking a separate lexical normalization for traversal aliases.
+pub(crate) fn edit_target_requires_prompt(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return true;
+    }
+    let lexical = xai_grok_paths::normalize_lexically(path);
+    if protected_edit_path(&lexical) {
+        return true;
+    }
+    let Some(resolved) = resolve_following_symlinks(path, 0) else {
+        return true;
+    };
+    protected_edit_path(&resolved) || resolved_path_is_within_root(&resolved, Path::new("/etc"))
+}
+
+fn protected_edit_path(path: &Path) -> bool {
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let string_components: Vec<&str> = components.iter().map(String::as_str).collect();
+    let file = string_components.last().copied().unwrap_or("");
+    const STARTUP_FILES: &[&str] = &[
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".bash_logout",
+        ".profile",
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".zlogin",
+        ".zlogout",
+        ".kshrc",
+        ".cshrc",
+        ".tcshrc",
+        ".login",
+        ".logout",
+        ".inputrc",
+        ".xprofile",
+    ];
+
+    STARTUP_FILES.contains(&file)
+        || protected_git_hooks_path(&string_components)
+        || string_components.contains(&".ssh")
+        || string_components.ends_with(&[".opengrok", "config.toml"])
+        || path == Path::new("/etc")
+        || path.starts_with(Path::new("/etc"))
+}
+
+fn protected_git_hooks_path(components: &[&str]) -> bool {
+    components.windows(2).any(|pair| pair == [".git", "hooks"])
+        || components.iter().enumerate().any(|(git, component)| {
+            *component == ".git"
+                && components.get(git + 1) == Some(&"modules")
+                && components[git + 2..]
+                    .iter()
+                    .skip(1)
+                    .any(|component| *component == "hooks")
+        })
+}
+
+/// `resolved_path` is already physical; resolve `root` so platform aliases such
+/// as macOS `/etc -> /private/etc` compare in the same namespace. Resolution
+/// failure is conservative: the caller then requires confirmation.
+fn resolved_path_is_within_root(resolved_path: &Path, root: &Path) -> bool {
+    resolve_following_symlinks(root, 0)
+        .map(|resolved_root| resolved_path.starts_with(resolved_root))
+        .unwrap_or(true)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ShellFileMode {
     Read,
@@ -738,8 +816,8 @@ fn resolve_symlink_target(absolute: &str) -> Option<String> {
 
 /// Resolve `path` following every symlink, including a *dangling* final link
 /// (which `canonicalize` alone rejects) and not-yet-existing trailing
-/// components. Depth-bounded against cycles; any fs error yields `None`.
-/// Blocking fs syscalls; runs per operand when file rules exist.
+/// components. Depth-bounded against cycles; unexpected fs errors yield `None`.
+/// Blocking fs syscalls; runs for shell operands under file rules and direct edits.
 fn resolve_following_symlinks(path: &Path, depth: usize) -> Option<PathBuf> {
     const MAX_SYMLINK_DEPTH: usize = 40;
     if depth > MAX_SYMLINK_DEPTH {
@@ -750,13 +828,17 @@ fn resolve_following_symlinks(path: &Path, depth: usize) -> Option<PathBuf> {
         return Some(canonical);
     }
     // Resolve the parent, then the final component, so a dangling/new leaf still follows.
+    // Missing components are valid new paths; other metadata errors fail closed.
     let parent = path.parent()?;
     let file_name = path.file_name()?;
     let resolved_parent = resolve_following_symlinks(parent, depth + 1)?;
     let candidate = resolved_parent.join(file_name);
-    if let Ok(meta) = std::fs::symlink_metadata(&candidate)
-        && meta.file_type().is_symlink()
-    {
+    let metadata = match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
+    if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
         // A symlink must be followed; if it can't be read, treat the whole path
         // as unresolved (`None`) rather than returning the link's own path.
         let target = std::fs::read_link(&candidate).ok()?;
@@ -816,6 +898,111 @@ mod tests {
 
     fn cwd() -> &'static std::path::Path {
         std::path::Path::new("/work")
+    }
+
+    #[test]
+    fn sensitive_edit_targets_and_lexical_aliases_prompt() {
+        for path in [
+            "/home/user/.zshrc",
+            "/etc",
+            "/etc/grok-test",
+            "/work/subdir/../.git/hooks/pre-commit",
+        ] {
+            assert!(
+                edit_target_requires_prompt(Path::new(path)),
+                "protected edit target must prompt: {path}"
+            );
+        }
+        for path in [
+            "/work/src/main.rs",
+            "/work/project/.opengrok/config.toml/backup",
+        ] {
+            assert!(
+                !edit_target_requires_prompt(Path::new(path)),
+                "ordinary edit target should not prompt: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_edit_targets_include_submodule_hooks() {
+        for path in [
+            "/work/.git/modules/foo/hooks/pre-commit",
+            "/work/.git/modules/submodules/sglang-private/hooks/pre-commit",
+            "/work/.git/modules/outer/modules/inner/hooks/pre-commit",
+            "/work/subdir/../.git/modules/foo/hooks/pre-commit",
+        ] {
+            assert!(
+                edit_target_requires_prompt(Path::new(path)),
+                "submodule hook target must prompt: {path}"
+            );
+        }
+        for path in [
+            "/work/.git/modules/hooks/pre-commit",
+            "/work/.git/module/foo/hooks/pre-commit",
+            "/work/.git/modules/foo/hook/pre-commit",
+            "/work/.git/modules/foo/hooks-disabled/pre-commit",
+            "/work/src/modules/foo/hooks/pre-commit",
+        ] {
+            assert!(
+                !edit_target_requires_prompt(Path::new(path)),
+                "non-hook control must not prompt: {path}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sensitive_edit_targets_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let startup = outside.path().join(".zshrc");
+        std::fs::write(&startup, b"").unwrap();
+        symlink(&startup, ws.path().join("file-link")).unwrap();
+        std::fs::create_dir_all(outside.path().join(".git/hooks")).unwrap();
+        symlink(
+            outside.path().join(".git/hooks"),
+            ws.path().join("hooks-link"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(outside.path().join(".git/modules/foo/hooks")).unwrap();
+        symlink(
+            outside.path().join(".git/modules/foo/hooks"),
+            ws.path().join("module-hooks-link"),
+        )
+        .unwrap();
+
+        for path in [
+            ws.path().join("file-link"),
+            ws.path().join("hooks-link/new-hook"),
+            ws.path().join("module-hooks-link/new-hook"),
+        ] {
+            assert!(
+                edit_target_requires_prompt(&path),
+                "symlinked protected edit target must prompt: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_root_alias_matches_physical_destination() {
+        let resolved_root = resolve_following_symlinks(Path::new("/etc"), 0).unwrap();
+        assert!(resolved_path_is_within_root(
+            &resolved_root.join("grok-test"),
+            Path::new("/etc")
+        ));
+        assert!(!resolved_path_is_within_root(
+            Path::new("/tmp/grok-test"),
+            Path::new("/etc")
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn private_etc_alias_requires_prompt() {
+        assert!(edit_target_requires_prompt(Path::new("/private/etc/hosts")));
     }
 
     #[test]

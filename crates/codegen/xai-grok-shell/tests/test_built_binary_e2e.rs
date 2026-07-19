@@ -41,6 +41,8 @@ where
     tokio::task::LocalSet::new().run_until(f()).await;
 }
 
+const CHAT_COMPLETIONS_MODEL: &str = "chat-completions-model";
+
 /// Start a mock server with one model named `model` on the given API backend.
 async fn single_model_server(model: &str, backend: &str) -> MockInferenceServer {
     MockInferenceServer::start_with_models(vec![
@@ -468,19 +470,19 @@ async fn test_headless_streaming_json_output() {
 async fn test_headless_json_reports_server_cost() {
     use xai_grok_test_support::scripted::SseEvent;
 
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     let chunk = |body: serde_json::Value| SseEvent::data(body.to_string());
     server.enqueue_response(
         "/v1/chat/completions",
         xai_grok_test_support::scripted::ScriptedResponse::sse(vec![
             chunk(serde_json::json!({
                 "id": "chatcmpl-cost", "object": "chat.completion.chunk", "created": 0,
-                "model": "grok-4.5",
+                "model": CHAT_COMPLETIONS_MODEL,
                 "choices": [{ "index": 0, "delta": { "content": "4" }, "finish_reason": "stop" }]
             })),
             chunk(serde_json::json!({
                 "id": "chatcmpl-cost", "object": "chat.completion.chunk", "created": 0,
-                "model": "grok-4.5", "choices": [],
+                "model": CHAT_COMPLETIONS_MODEL, "choices": [],
                 "usage": {
                     "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
                     "cost_in_usd_ticks": 1_234_500_000_i64
@@ -498,7 +500,7 @@ async fn test_headless_json_reports_server_cost() {
             "what is 2+2",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--max-turns",
             "1",
             "--output-format",
@@ -528,7 +530,7 @@ async fn test_headless_json_reports_server_cost() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_json_reports_usage_on_max_turns() {
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     server.enqueue_response(
         "/v1/chat/completions",
         xai_grok_test_support::scripted::ScriptedResponse::sse(
@@ -537,7 +539,7 @@ async fn test_headless_json_reports_usage_on_max_turns() {
                 "call-1",
                 "read_file",
                 r#"{"path":"README.md"}"#,
-                "grok-4.5",
+                CHAT_COMPLETIONS_MODEL,
             ),
         ),
     );
@@ -550,7 +552,7 @@ async fn test_headless_json_reports_usage_on_max_turns() {
             "read the readme",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--max-turns",
             "1",
             "--output-format",
@@ -569,7 +571,7 @@ async fn test_headless_json_reports_usage_on_max_turns() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_streaming_json_usage() {
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     let workdir = git_workdir();
     let result = run_headless(
         &server,
@@ -578,7 +580,7 @@ async fn test_headless_streaming_json_usage() {
             "say hello",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--output-format",
             "streaming-json",
         ],
@@ -604,7 +606,7 @@ async fn test_headless_streaming_json_usage() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn headless_json_schema_chat_completions_uses_response_format() {
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     server.set_response(r#"{"name":"Alice","age":30}"#);
 
     let workdir = git_workdir();
@@ -615,7 +617,7 @@ async fn headless_json_schema_chat_completions_uses_response_format() {
             "extract name and age",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--json-schema",
             r#"{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}"#,
             "--max-turns",
@@ -887,7 +889,7 @@ async fn headless_json_schema_messages_retries_on_schema_violation() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn invalid_json_schema_disables_structured_output_and_surfaces_error() {
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     server.set_response(r#"{"name":"Alice","age":30}"#);
 
     let workdir = git_workdir();
@@ -898,7 +900,7 @@ async fn invalid_json_schema_disables_structured_output_and_surfaces_error() {
             "extract name and age",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             // Valid JSON object, but `pattern` is an invalid regex → schema
             // compilation (`jsonschema::validator_for`) fails.
             "--json-schema",
@@ -963,7 +965,7 @@ async fn invalid_json_schema_disables_structured_output_and_surfaces_error() {
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_stdio_full_session_lifecycle() {
     with_local_set(|| async {
-        let server = MockInferenceServer::start().await.expect("start mock server");
+        let server = grok_build_server().await;
         let workdir = git_workdir();
         let client = GrokStdioClient::spawn(&server, workdir.path()).await;
 
@@ -1310,7 +1312,7 @@ impl ConfigTestHarness {
 
 // ── Enterprise managed config tests ────────────────────────────────────────
 
-/// Enterprise BYOK: managed_config.toml overrides grok-build with a custom
+/// Enterprise BYOK: managed_config.toml overrides the default model with a custom
 /// endpoint + env_key. Mock rejects unauthenticated requests with 401.
 /// Regression guard for the 0.1.220 authentication regression.
 #[tokio::test]
@@ -1332,7 +1334,7 @@ async fn test_headless_managed_config_byok_sends_authorized_requests() {
 deployment_key = "test-deployment-key"
 xai_api_base_url = "{url}"
 
-[model.grok-build]
+[model."grok-4.5"]
 api_backend = "responses"
 base_url = "{url}"
 context_window = 500000
@@ -1369,7 +1371,7 @@ default = "grok-4.5"
 #[ignore] // requires pre-built binary; run with --ignored
 async fn headless_reasoning_efforts_payload_parses_and_legacy_effort_rides_wire() {
     let server = MockInferenceServer::start_with_models(vec![
-        MockModelEntry::new("grok-4.5")
+        MockModelEntry::new(CHAT_COMPLETIONS_MODEL)
             .with_api_backend("chat_completions")
             .with_supports_reasoning_effort(true)
             .with_reasoning_effort("xhigh")
@@ -1390,7 +1392,7 @@ async fn headless_reasoning_efforts_payload_parses_and_legacy_effort_rides_wire(
             "hi",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--max-turns",
             "1",
         ],

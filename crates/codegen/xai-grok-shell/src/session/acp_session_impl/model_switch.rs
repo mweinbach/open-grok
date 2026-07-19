@@ -497,6 +497,12 @@ impl SessionActor {
                     ),
                 )
                 .await;
+            if let Some(reservations) = self.tool_context.task_completion_reservations.clone() {
+                bridge.update_resource(reservations).await;
+            }
+            if let Some(gate) = self.tool_context.task_wake_suppressed.clone() {
+                bridge.update_resource(gate).await;
+            }
             self.inject_deny_read_globs().await;
         }
         {

@@ -24,7 +24,7 @@ use xai_grok_tools::util::truncate::estimate_tokens;
 const TREE: &str = "\u{2514}";
 
 /// Coarse scope label for project instructions and plugin entries.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
     Project,
@@ -438,13 +438,35 @@ fn has_rules_directory(file_path: &str, config_dir: &str) -> bool {
     false
 }
 
+fn instruction_scope(
+    file_path: &str,
+    grok_home: &Path,
+    vendor_homes: &[(PathBuf, bool)],
+    workspace_root: &Path,
+) -> Scope {
+    if crate::util::is_user_instruction_path(
+        Path::new(file_path),
+        grok_home,
+        vendor_homes,
+        Some(workspace_root),
+    ) {
+        Scope::Global
+    } else {
+        Scope::Project
+    }
+}
+
 fn instruction_file_type(
     file_path: &str,
+    grok_home: &Path,
     claude_imported: bool,
     extra_rule_prefixes: &[PathBuf],
 ) -> &'static str {
     let path = Path::new(file_path);
-    if has_rules_directory(file_path, ".opengrok")
+    if path
+        .parent()
+        .is_some_and(|parent| parent == grok_home.join("rules"))
+        || has_rules_directory(file_path, ".opengrok")
         || has_rules_directory(file_path, ".cursor")
         || (!claude_imported && has_rules_directory(file_path, ".claude"))
         || extra_rule_prefixes
@@ -466,7 +488,19 @@ async fn list_instructions(cwd: &Path) -> Vec<InstructionFile> {
     )
     .await;
 
-    let grok_home = Some(crate::util::grok_home::grok_home());
+    let grok_home = crate::util::grok_home::grok_home();
+    let vendor_homes = dirs::home_dir()
+        .map(|home_dir| {
+            vec![
+                (home_dir.join(".claude"), true),
+                (home_dir.join(".cursor"), true),
+            ]
+        })
+        .unwrap_or_default();
+    let workspace_root = git2::Repository::discover(cwd)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
 
     // Phase 2 cutoff: when imported, stop classifying `.claude/rules/` paths
     // as rules. Equivalent dirs come in via `[paths] extra_rule_dirs`.
@@ -492,15 +526,9 @@ async fn list_instructions(cwd: &Path) -> Vec<InstructionFile> {
     configs
         .into_iter()
         .map(|c| {
-            let file_type = instruction_file_type(&c.file_path, imported, &extra_rule_prefixes);
-            let scope = if grok_home
-                .as_deref()
-                .is_some_and(|home| Path::new(&c.file_path).starts_with(home))
-            {
-                Scope::Global
-            } else {
-                Scope::Project
-            };
+            let file_type =
+                instruction_file_type(&c.file_path, &grok_home, imported, &extra_rule_prefixes);
+            let scope = instruction_scope(&c.file_path, &grok_home, &vendor_homes, &workspace_root);
             let size = c.content.len();
             let vendor = derive_vendor(&c.file_path).map(String::from);
             InstructionFile {
@@ -1602,7 +1630,8 @@ mod tests {
             ("claude", "/repo/.claude/rules/team.md"),
             ("claude", r"C:\repo\.claude\rules\team.md"),
         ] {
-            let file_type = instruction_file_type(path, false, &[]);
+            let file_type =
+                instruction_file_type(path, Path::new("/home/user/.opengrok"), false, &[]);
             assert_eq!(file_type, "rules");
             assert_eq!(
                 instruction_compat_status(&Some(vendor.to_owned()), file_type, &report),
@@ -1614,19 +1643,26 @@ mod tests {
             "/repo/.opengrok/rules/team.md",
             r"C:\repo\.opengrok\rules\team.md",
         ] {
-            assert_eq!(instruction_file_type(path, false, &[]), "rules");
+            assert_eq!(
+                instruction_file_type(path, Path::new("/home/user/.opengrok"), false, &[]),
+                "rules"
+            );
         }
         for path in [
             "/repo/.cursor/rules/team.md",
             r"C:\repo\.cursor\rules\team.md",
         ] {
-            assert_eq!(instruction_file_type(path, true, &[]), "rules");
+            assert_eq!(
+                instruction_file_type(path, Path::new("/home/user/.opengrok"), true, &[]),
+                "rules"
+            );
         }
         for path in [
             "/repo/.claude/rules/team.md",
             r"C:\repo\.claude\rules\team.md",
         ] {
-            let file_type = instruction_file_type(path, true, &[]);
+            let file_type =
+                instruction_file_type(path, Path::new("/home/user/.opengrok"), true, &[]);
             assert_eq!(file_type, "agents_md");
             assert_eq!(
                 instruction_compat_status(&Some("claude".to_owned()), file_type, &report),
@@ -1637,8 +1673,94 @@ mod tests {
             "/repo/not.cursor/rules/team.md",
             r"C:\repo\.cursor\ruleset\team.md",
         ] {
-            assert_eq!(instruction_file_type(path, false, &[]), "agents_md");
+            assert_eq!(
+                instruction_file_type(path, Path::new("/home/user/.opengrok"), false, &[]),
+                "agents_md"
+            );
         }
+    }
+
+    #[test]
+    fn grok_home_nested_in_workspace_keeps_direct_surfaces_global() {
+        let grok_home = Path::new("/repo/config");
+        let workspace = Path::new("/repo");
+        for path in ["/repo/config/AGENTS.md", "/repo/config/rules/global.md"] {
+            assert!(matches!(
+                instruction_scope(path, grok_home, &[], workspace),
+                Scope::Global
+            ));
+        }
+        for path in [
+            "/repo/config/.opengrok/rules/project.md",
+            "/repo/config/src/AGENTS.md",
+        ] {
+            assert!(matches!(
+                instruction_scope(path, grok_home, &[], workspace),
+                Scope::Project
+            ));
+        }
+    }
+
+    #[test]
+    fn vendor_home_nested_in_workspace_keeps_direct_surfaces_global() {
+        let vendor_homes = vec![(Path::new("/repo/.claude").to_path_buf(), true)];
+        let workspace = Path::new("/repo");
+        for path in ["/repo/.claude/rules/global.md", "/repo/.claude/CLAUDE.md"] {
+            assert!(matches!(
+                instruction_scope(path, Path::new("/other/grok"), &vendor_homes, workspace),
+                Scope::Global
+            ));
+        }
+        for path in [
+            "/repo/.claude/.claude/rules/project.md",
+            "/repo/.claude/src/AGENTS.md",
+        ] {
+            assert!(matches!(
+                instruction_scope(path, Path::new("/other/grok"), &vendor_homes, workspace),
+                Scope::Project
+            ));
+        }
+    }
+
+    #[test]
+    fn workspace_scope_wins_inside_grok_home() {
+        let grok_home = Path::new("/custom/grok");
+        let workspace = Path::new("/custom/grok/worktrees/repo");
+        for path in [
+            "/custom/grok/worktrees/repo/.cursor/rules/project.md",
+            "/custom/grok/worktrees/repo/src/AGENTS.md",
+        ] {
+            assert!(matches!(
+                instruction_scope(path, grok_home, &[], workspace),
+                Scope::Project
+            ));
+        }
+        assert!(matches!(
+            instruction_scope("/custom/grok/rules/global.md", grok_home, &[], workspace,),
+            Scope::Global
+        ));
+    }
+
+    #[test]
+    fn custom_grok_home_rules_are_classified_as_rules() {
+        assert_eq!(
+            instruction_file_type(
+                "/custom/config/rules/team.md",
+                Path::new("/custom/config"),
+                false,
+                &[],
+            ),
+            "rules"
+        );
+        assert_eq!(
+            instruction_file_type(
+                "/custom/config/AGENTS.md",
+                Path::new("/custom/config"),
+                false,
+                &[],
+            ),
+            "agents_md"
+        );
     }
 
     #[test]

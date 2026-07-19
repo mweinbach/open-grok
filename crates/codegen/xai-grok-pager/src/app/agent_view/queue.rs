@@ -137,7 +137,7 @@ impl AgentView {
             // The tracker drops wait_commands_or_subagents' explicit task_ids;
             // zero visible work is the only signal available here.
             Some(TurnActivity::Waiting(WaitingReason::TasksComplete)) => {
-                self.current_end_work().nonzero().is_none()
+                self.watchers().awaitable_work() == 0
             }
             _ => false,
         }
@@ -159,16 +159,17 @@ impl AgentView {
             .is_some_and(|info| !info.is_running())
     }
 
-    /// Push a "Worked for X. {k} … still running…" marker when the turn is
-    /// parked on a sendable wait and the transcript tail is not already this
-    /// turn's marker with current counts — the tail keeps explaining the
-    /// idle-looking chrome across parks, restatements, and re-parks. Our own
-    /// push satisfies the check, so markers never self-chain.
+    /// Push a "Worked for X" marker when the turn parks on a sendable wait —
+    /// the transcript boundary explaining the idle-looking chrome. One marker
+    /// per park episode: same agent-output epoch as the rendered slot means
+    /// no re-push (chips/completions don't bump it); an epoch bump means the
+    /// wait resumed and re-parked, which pushes a fresh marker. Completion
+    /// rails also call this to re-eval a park withheld at park time (e.g.
+    /// held queue since drained).
     ///
     /// Called from the ACP notification path — not the draw path — so
     /// background tabs and minimal mode stamp the park at its true moment;
-    /// each push is append-only (minimal mode commits print-once). The
-    /// subagent-only refresh path may mutate an uncommitted parked row. A
+    /// each push is append-only (minimal mode commits print-once). A
     /// [`ParkedMarkerSlot::Forgone`] slot stays silent for the rest of the
     /// turn (see [`Self::suppress_parked_marker_on_interject`]). UI-only: no
     /// turn-lifecycle event, no stop hooks; the real completion prints its
@@ -186,8 +187,20 @@ impl AgentView {
         match &self.parked_wait_marker_for {
             // Interjection ordering: forgone is final for the turn.
             Some(ParkedMarkerSlot::Forgone(pid)) if *pid == prompt_id => return,
+            // Same park episode (no parent output since the marker): the one
+            // marker already explains this park — chips landing below it
+            // must not re-push.
+            Some(ParkedMarkerSlot::Rendered {
+                prompt_id: pid,
+                agent_output_epoch,
+                ..
+            }) if *pid == prompt_id
+                && *agent_output_epoch == self.session.tracker.agent_output_epoch() =>
+            {
+                return;
+            }
             // A tail user prompt after a rendered marker is an interjection:
-            // a "still running" line beneath it would flip the transcript.
+            // a marker line beneath it would flip the transcript.
             Some(ParkedMarkerSlot::Rendered { prompt_id: pid, .. })
                 if *pid == prompt_id && self.tail_is_user_prompt() =>
             {
@@ -195,10 +208,7 @@ impl AgentView {
             }
             _ => {}
         }
-        if self.parked_marker_is_current_tail(&prompt_id) {
-            return;
-        }
-        // Below the tail dedupe: a rendered park would otherwise log a false
+        // Below the slot dedupe: a rendered park would otherwise log a false
         // "skipped" on every subsequent update.
         if self.parked_wait_resolves_imminently() {
             tracing::debug!(
@@ -210,54 +220,6 @@ impl AgentView {
         self.push_parked_marker_block(prompt_id);
     }
 
-    /// Refresh the current uncommitted parked marker after a live subagent completion.
-    pub(crate) fn maybe_refresh_parked_subagent_marker(&mut self) {
-        if !self.renders_parked()
-            || self.has_held_user_queue()
-            || self.tail_is_user_prompt()
-            || self.parked_wait_resolves_imminently()
-        {
-            return;
-        }
-        let end_work = self.current_end_work();
-        if end_work.nonzero().is_none() {
-            return;
-        }
-        let Some(prompt_id) = self.session.current_prompt_id.clone() else {
-            return;
-        };
-        let Some((entry_id, marker_epoch)) = self
-            .parked_wait_marker_for
-            .as_ref()
-            .and_then(ParkedMarkerSlot::rendered_marker)
-        else {
-            return;
-        };
-        let agent_output_epoch = self.session.tracker.agent_output_epoch();
-        let elapsed = self.turn_elapsed().unwrap_or_default();
-        if marker_epoch == agent_output_epoch
-            && self
-                .scrollback
-                .refresh_parked_subagent_marker(entry_id, &prompt_id, elapsed, end_work)
-        {
-            return;
-        }
-        self.maybe_push_parked_marker();
-    }
-
-    /// The transcript tail is this turn's parked marker carrying the
-    /// current work counts.
-    fn parked_marker_is_current_tail(&self, prompt_id: &str) -> bool {
-        match self.scrollback.last().map(|entry| &entry.block) {
-            Some(crate::scrollback::block::RenderBlock::SessionEvent(b)) => {
-                b.parked
-                    && b.prompt_id.as_deref() == Some(prompt_id)
-                    && b.end_work == self.current_end_work().nonzero()
-            }
-            _ => false,
-        }
-    }
-
     /// The transcript tail is a user-authored prompt row.
     fn tail_is_user_prompt(&self) -> bool {
         matches!(
@@ -267,29 +229,23 @@ impl AgentView {
     }
 
     /// The parked marker block shape: a `TurnCompleted` marker flagged
-    /// `parked` (renders mid-turn, never accepts stop hooks) with the work
-    /// counts snapshotted at push time.
+    /// `parked` (renders mid-turn, never accepts stop hooks).
     fn push_parked_marker_block(&mut self, prompt_id: String) {
         let agent_output_epoch = self.session.tracker.agent_output_epoch();
         let mut block = crate::scrollback::blocks::SessionEventBlock::new(
             crate::scrollback::blocks::SessionEvent::TurnCompleted {
-                // Legacy copy on purpose: unknown elapsed keeps the "in 0.0s"
-                // form here — only wake markers use the honest `None` form.
+                // Unknown elapsed renders as "Worked for 0.0s" rather than
+                // falling back to `None`'s bare "Turn completed." — the park
+                // boundary should read like every other turn marker.
                 elapsed: Some(self.turn_elapsed().unwrap_or_default()),
             },
         );
         block.parked = true;
         block.prompt_id = Some(prompt_id.clone());
-        // Park never touches `end_work_announced` (the turn is still running
-        // shell-side; the window is a between-turns concept) — so it does not
-        // use `push_end_marker_block`, only the field-normalization rule.
-        block.end_work = self.current_end_work().nonzero();
-        let entry_id = self
-            .scrollback
+        self.scrollback
             .push_block(crate::scrollback::block::RenderBlock::SessionEvent(block));
         self.parked_wait_marker_for = Some(ParkedMarkerSlot::Rendered {
             prompt_id,
-            entry_id,
             agent_output_epoch,
         });
     }
@@ -429,10 +385,10 @@ impl AgentView {
             && !self.is_waiting_on_subagent()
     }
 
-    /// Live background work on this agent's root session, split the way the
-    /// marker copy reads it (monitors apart from commands).
-    pub(crate) fn current_end_work(&self) -> crate::scrollback::blocks::EndWork {
-        let mut work = crate::scrollback::blocks::EndWork::default();
+    /// Live counts for the turn-status watching cue; see
+    /// [`crate::views::turn_status::Watchers`].
+    pub(crate) fn watchers(&self) -> crate::views::turn_status::Watchers {
+        let mut watchers = crate::views::turn_status::Watchers::default();
         for task in self
             .session
             .bg_tasks
@@ -440,62 +396,34 @@ impl AgentView {
             .filter(|t| t.status == crate::app::agent::BgTaskStatus::Running)
         {
             if task.is_monitor {
-                work.running_monitors += 1;
+                watchers.monitors += 1;
             } else {
-                work.running_commands += 1;
+                watchers.commands += 1;
             }
         }
-        work.running_subagents = self
+        watchers.loops = self.session.scheduled_tasks.len();
+        watchers.subagents = self
             .subagent_sessions
             .values()
             .filter(|s| s.is_running())
             .count();
-        work
+        watchers
     }
 
-    /// Shared tail of every turn-end marker push — the real-turn rail
-    /// (`push_turn_terminal_marker`) and the wake rail (`push_wake_end_marker`):
-    /// snapshot the current counts into `end_work` (zero → `None` → legacy
-    /// text) and apply the announce window's single assignment — a counted
-    /// marker opens the between-turns status window, a workless one closes it.
+    /// Shared tail of every turn-end marker push
+    /// (`push_turn_terminal_marker`).
     pub(crate) fn push_end_marker_block(
         &mut self,
         event: crate::scrollback::blocks::SessionEvent,
         stop_hooks: Vec<(String, Vec<crate::scrollback::blocks::tool::HookRunEntry>)>,
         prompt_id: Option<String>,
     ) {
-        let end_work = self.current_end_work().nonzero();
         // The marker keeps its turn's pid for the tail-merge attribution check.
-        let mut block = crate::scrollback::blocks::SessionEventBlock::with_stop_hooks(
+        let block = crate::scrollback::blocks::SessionEventBlock::with_stop_hooks(
             event, stop_hooks, prompt_id,
         );
-        block.end_work = end_work;
         self.scrollback
             .push_block(crate::scrollback::block::RenderBlock::SessionEvent(block));
-        self.end_work_announced = end_work.is_some();
-    }
-
-    /// Push the work-only status line ("2 commands still running") after a
-    /// background completion that lands between turns AND is not followed by
-    /// a wake response — the no-wake fallback. Wake-bound completions
-    /// (`will_wake` stamped by the shell) skip this line: the wake turn's end
-    /// marker carries the fresh counts instead (see `push_wake_end_marker`).
-    /// Without a wake the story stays chronological the old way: marker(3) →
-    /// chip → status(2) → chip → status(1) → chip → nothing (zero left: the
-    /// last chip closes it). Gated on the last turn-end marker having
-    /// announced work and on no real turn running — mid-turn completions push
-    /// chips only. Returns whether a line was pushed (callers needing a
-    /// redraw verdict use it; chip sites ignore it).
-    pub(crate) fn maybe_push_work_status(&mut self) -> bool {
-        if !self.end_work_announced || self.session.state.is_busy() {
-            return false;
-        }
-        let Some(text) = self.current_end_work().still_running_text() else {
-            return false;
-        };
-        self.scrollback
-            .push_block(crate::scrollback::block::RenderBlock::system(text));
-        true
     }
 
     /// `Some(is_prompt_like)` for a resolvable merged-queue row; `None` when it
@@ -1806,9 +1734,9 @@ mod queue_edit_routing_tests {
 }
 
 #[cfg(test)]
-mod end_work_tests {
+mod watcher_tests {
     use super::super::test_agent_view;
-    use crate::scrollback::blocks::EndWork;
+    use crate::views::turn_status::Watchers;
 
     fn insert_bg_task(
         agent: &mut crate::app::agent_view::AgentView,
@@ -1842,7 +1770,7 @@ mod end_work_tests {
     }
 
     #[test]
-    fn current_end_work_counts_monitors_apart_from_commands() {
+    fn watchers_counts_monitors_apart_from_commands() {
         let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
         insert_bg_task(&mut agent, "bg-1", false);
         insert_bg_task(&mut agent, "mon-1", true);
@@ -1850,11 +1778,12 @@ mod end_work_tests {
         agent.session.bg_tasks.get_mut("done-1").unwrap().status =
             crate::app::agent::BgTaskStatus::Done;
         assert_eq!(
-            agent.current_end_work(),
-            EndWork {
-                running_commands: 1,
-                running_monitors: 1,
-                running_subagents: 0,
+            agent.watchers(),
+            Watchers {
+                commands: 1,
+                monitors: 1,
+                loops: 0,
+                subagents: 0,
             }
         );
     }

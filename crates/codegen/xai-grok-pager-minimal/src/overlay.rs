@@ -297,27 +297,50 @@ fn compute_target(app: &mut AppView, term_h: u16, width: u16) -> u16 {
         .max(1);
 
     // Size the viewport to exactly its content — tail (uncommitted streaming
-    // output) + todo panel + status + overlay + prompt — so the prompt sits
-    // directly after the conversation with no gap, whether idle or mid-turn.
-    // When a turn is "thinking" the tail is empty, so the prompt stays right
-    // under the content instead of floating below a fixed empty region; as
-    // output streams the tail grows and the viewport grows downward with it.
-    // The region is not bottom-pinned, so the rest of the screen below stays
-    // empty (the app "owns" the window from the top down).
+    // output) + todo panel + /btw panel + status + overlay + prompt — so the
+    // prompt sits directly after the conversation with no gap, whether idle or
+    // mid-turn. When a turn is "thinking" the tail is empty, so the prompt
+    // stays right under the content instead of floating below a fixed empty
+    // region; as output streams the tail grows and the viewport grows downward
+    // with it. The region is not bottom-pinned, so the rest of the screen below
+    // stays empty (the app "owns" the window from the top down).
     let tail_h = super::live::tail_height(agent, width, &commit_app);
     let todos_h = super::todo::todo_panel_height(agent, force_todos);
     // Below the prompt sits either the dropdown overlay or the 1-row info bar
     // (model · context usage · turn time/tokens); reserve at least the info row
     // when no dropdown is open so it isn't clipped / doesn't scroll content.
     let below_h = overlay_h.max(1);
-    content_target(tail_h, todos_h, below_h, prompt_h, ceiling)
+    // `/btw` is a non-blocking side panel above the status/prompt (same place
+    // as the full TUI). Height is measured at full viewport width so wrap
+    // matches `live::draw_live`. Only reserve rows the shared minimal paint
+    // policy accepts, otherwise a narrow or short terminal leaves a blank strip.
+    let raw_btw = if minimal_api::minimal_btw_surface_available(agent) {
+        xai_grok_pager::views::btw_overlay::btw_panel_height(agent.btw_state.as_ref(), width)
+    } else {
+        0
+    };
+    let chrome = 1u16 // status row
+        .saturating_add(below_h)
+        .saturating_add(prompt_h);
+    let available = ceiling.saturating_sub(chrome);
+    let btw_h = minimal_api::minimal_btw_visible_height(raw_btw, width, available);
+    content_target(tail_h, todos_h, btw_h, below_h, prompt_h, ceiling)
 }
 
-/// Live-viewport height sized to exactly its content: tail + todo panel + status
-/// row + overlay + prompt. Floored at 2 (status + prompt), capped at the screen.
-fn content_target(tail_h: u16, todos_h: u16, overlay_h: u16, prompt_h: u16, ceiling: u16) -> u16 {
+/// Live-viewport height sized to exactly its content: tail + todo panel + /btw
+/// panel + status row + overlay + prompt. Floored at 2 (status + prompt), capped
+/// at the screen.
+fn content_target(
+    tail_h: u16,
+    todos_h: u16,
+    btw_h: u16,
+    overlay_h: u16,
+    prompt_h: u16,
+    ceiling: u16,
+) -> u16 {
     tail_h
         .saturating_add(todos_h)
+        .saturating_add(btw_h)
         .saturating_add(1) // status row
         .saturating_add(overlay_h)
         .saturating_add(prompt_h)
@@ -994,18 +1017,24 @@ mod tests {
 
     #[test]
     fn content_target_fits_content_with_no_gap() {
-        // Viewport = tail + todos + status(1) + overlay + prompt — no base
+        // Viewport = tail + todos + btw + status(1) + overlay + prompt — no base
         // floor, so the prompt sits right after the conversation. Idle (tail 0,
         // empty prompt) is just status + prompt.
-        assert_eq!(content_target(0, 0, 0, 1, 40), 2); // status + 1-row prompt
-        assert_eq!(content_target(0, 3, 0, 1, 40), 5); // + 3 todo rows
-        assert_eq!(content_target(0, 3, 5, 2, 40), 11); // + overlay(5) + 2-row prompt
+        assert_eq!(content_target(0, 0, 0, 0, 1, 40), 2); // status + 1-row prompt
+        assert_eq!(content_target(0, 3, 0, 0, 1, 40), 5); // + 3 todo rows
+        assert_eq!(content_target(0, 3, 0, 5, 2, 40), 11); // + overlay(5) + 2-row prompt
+        // /btw Loading/Error is 3 rows; Done grows with the answer.
+        assert_eq!(content_target(0, 0, 3, 0, 1, 40), 5); // + btw(3)
+        // Production idle always reserves ≥1 below the prompt (info bar).
+        assert_eq!(content_target(0, 0, 3, 1, 1, 40), 6); // btw+status+info+prompt
+        // todos + btw stack without collapsing either.
+        assert_eq!(content_target(0, 3, 3, 0, 1, 40), 8);
         // The streaming tail grows the viewport (no fixed empty gap while
         // "thinking": tail 0 → just status + prompt).
-        assert_eq!(content_target(6, 0, 0, 1, 40), 8); // tail(6) + status + prompt
+        assert_eq!(content_target(6, 0, 0, 0, 1, 40), 8); // tail(6) + status + prompt
         // Floored at 2 (status + prompt) and capped at the screen ceiling.
-        assert_eq!(content_target(0, 0, 0, 0, 40), 2);
-        assert_eq!(content_target(50, 0, 0, 0, 20), 20);
+        assert_eq!(content_target(0, 0, 0, 0, 0, 40), 2);
+        assert_eq!(content_target(50, 0, 0, 0, 0, 20), 20);
     }
 
     #[test]
@@ -1040,7 +1069,25 @@ mod tests {
     fn content_target_clamps_to_screen() {
         // Content taller than the screen clamps to the ceiling (then the tail
         // scrolls / clips); a tiny terminal still yields at least the floor.
-        assert_eq!(content_target(30, 0, 0, 1, 24), 24);
-        assert_eq!(content_target(5, 0, 0, 1, 2), 2);
+        assert_eq!(content_target(30, 0, 0, 0, 1, 24), 24);
+        assert_eq!(content_target(5, 0, 0, 0, 1, 2), 2);
+        // A tall /btw Done answer still clamps rather than overflowing.
+        assert_eq!(content_target(0, 0, 20, 0, 1, 10), 10);
+    }
+
+    #[test]
+    fn btw_height_policy_matches_draw_live_boundaries() {
+        let visible = minimal_api::minimal_btw_visible_height;
+        assert_eq!(visible(3, 80, 40), 3);
+        assert_eq!(visible(12, 80, 40), 12);
+        assert_eq!(visible(20, 80, 10), 10);
+        assert_eq!(visible(0, 80, 40), 0);
+        // Width 11/12 and available rows 2/3 are the production boundary.
+        assert_eq!(visible(3, 11, 40), 0);
+        assert_eq!(visible(3, 12, 40), 3);
+        assert_eq!(visible(3, 80, 2), 0);
+        assert_eq!(visible(3, 80, 3), 3);
+        assert_eq!(content_target(0, 0, visible(3, 11, 40), 1, 1, 40), 3);
+        assert_eq!(content_target(0, 0, visible(3, 80, 2), 1, 1, 5), 3);
     }
 }

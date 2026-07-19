@@ -249,9 +249,6 @@ pub(crate) struct SubagentSpawnContext {
     /// Subagent personas config for persona/SOUL layering.
     pub subagent_personas:
         std::collections::HashMap<String, xai_grok_subagent_resolution::config::SubagentPersona>,
-    /// Pre-rendered persona IO summaries for the task tool description.
-    /// Threaded through to child sessions for recursive persona discovery.
-    pub persona_io_summaries: Vec<String>,
     /// Parent session's ChatStateHandle — used to read the actual live
     /// sampling config and credentials from the parent session actor (async).
     /// Cheap Clone (mpsc sender). `None` when parent SessionHandle not found.
@@ -360,9 +357,9 @@ pub(crate) struct SubagentSpawnContext {
     /// Parent's resolved vendor-compat config, inherited by the child so its
     /// skills / rules / AGENTS.md discovery honors the same vendor toggles.
     pub parent_compat: xai_grok_tools::types::compat::CompatConfig,
-    /// Shared set of IDs delivered via auto-wake synthetic prompts.
-    pub auto_wake_delivered:
-        Option<xai_grok_tools::reminders::task_completion::AutoWakeDeliveredIds>,
+    /// Shared completion reservations held by auto-wake prompts.
+    pub task_completion_reservations:
+        Option<xai_grok_tools::reminders::task_completion::TaskCompletionReservations>,
     /// Channel for requesting trace uploads for synthetic auto-wake turns.
     pub synthetic_trace_tx:
         Option<tokio::sync::mpsc::UnboundedSender<crate::upload::turn::SyntheticTurnTraceRequest>>,
@@ -433,6 +430,18 @@ impl SubagentSpawnContext {
             .default(true)
             .resolve()
             .value
+    }
+    pub fn resolve_compaction_tool_choice(&self) -> crate::util::config::CompactionToolChoice {
+        crate::util::config::resolve_compaction_tool_choice_from(
+            crate::agent::config::env_string(crate::util::config::ENV_COMPACTION_TOOL_CHOICE)
+                .as_deref(),
+            self.agent_config
+                .as_ref()
+                .and_then(|c| c.features.compaction_tool_choice.as_deref()),
+            self.remote_settings
+                .as_ref()
+                .and_then(|r| r.compaction_tool_choice.as_deref()),
+        )
     }
     /// Whether a completed subagent's worktree is snapshotted into a durable ref
     /// and its directory deleted. Resolution mirrors the other subagent gates
@@ -2191,6 +2200,7 @@ async fn await_subagent_turn_with_summary_floor(
             traceparent: xai_file_utils::trace_context::current_traceparent(),
             json_schema: None,
             send_now: false,
+            admission: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
@@ -2292,7 +2302,7 @@ fn cancellation_error_message(
 /// result has not already been consumed (via block-wait or explicit kill).
 /// Also suppressed while the parent's goal loop is active (mirrors the bash
 /// gate in `notification_bridge`); skipping the inject also skips the
-/// `auto_wake_delivered.insert`, leaving surfaces 2/3 free to drain it.
+/// the completion reservation, leaving surfaces 2/3 free to drain it.
 /// `parent_channel_open` folds `inject_subagent_completed_prompt`'s own
 /// no-channel bail into the decision, so the `will_wake` stamped on the
 /// completion notification can never promise a wake the inject won't do.
@@ -2329,7 +2339,9 @@ fn inject_subagent_completed_prompt(
     subagent_id: &str,
     result: &SubagentResult,
     request: &SubagentRequest,
-    auto_wake_delivered: &Option<xai_grok_tools::reminders::task_completion::AutoWakeDeliveredIds>,
+    task_completion_reservations: &Option<
+        xai_grok_tools::reminders::task_completion::TaskCompletionReservations,
+    >,
     parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
     task_output_tool_name: &str,
     synthetic_trace_tx: &Option<
@@ -2339,8 +2351,8 @@ fn inject_subagent_completed_prompt(
     let Some(cmd_tx) = parent_cmd_tx else {
         return;
     };
-    if let Some(auto_wake) = auto_wake_delivered {
-        auto_wake.insert(subagent_id.to_string());
+    if let Some(reservations) = task_completion_reservations {
+        reservations.reserve(subagent_id.to_string());
     }
     let summary = SubagentCompletionSummary {
         subagent_id: subagent_id.to_string(),
@@ -2369,21 +2381,30 @@ fn inject_subagent_completed_prompt(
     };
     let (respond_to, completion_rx) = tokio::sync::oneshot::channel();
     let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(wrapped))];
-    let _ = cmd_tx.send(SessionCommand::Prompt {
-        prompt_id: prompt_id.clone(),
-        prompt_blocks,
-        prompt_mode: crate::session::plan_mode::PromptMode::Agent,
-        artifact_upload_ctx: None,
-        client_identifier: None,
-        screen_mode: None,
-        verbatim: true,
-        traceparent: None,
-        json_schema: None,
-        send_now: false,
-        respond_to,
-        persist_ack: None,
-        parsed_prompt_tx: None,
-    });
+    if cmd_tx
+        .send(SessionCommand::Prompt {
+            prompt_id: prompt_id.clone(),
+            prompt_blocks,
+            prompt_mode: crate::session::plan_mode::PromptMode::Agent,
+            artifact_upload_ctx: None,
+            client_identifier: None,
+            screen_mode: None,
+            verbatim: true,
+            traceparent: None,
+            json_schema: None,
+            send_now: false,
+            admission: None,
+            respond_to,
+            persist_ack: None,
+            parsed_prompt_tx: None,
+        })
+        .is_err()
+    {
+        if let Some(reservations) = task_completion_reservations {
+            reservations.release(subagent_id);
+        }
+        return;
+    }
     if let Some(trace_tx) = synthetic_trace_tx {
         let _ = trace_tx.send(crate::upload::turn::SyntheticTurnTraceRequest {
             session_id: acp::SessionId::new(request.parent_session_id.clone()),

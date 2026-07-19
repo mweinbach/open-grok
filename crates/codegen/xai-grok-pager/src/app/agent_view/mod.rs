@@ -673,16 +673,19 @@ pub(crate) enum AgentDeferredSend {
     Interject,
 }
 /// How the parked-marker slot was consumed. Both variants carry the turn's
-/// prompt id and both keep the parked (idle) chrome. `Rendered` markers keep
-/// flowing on tail staleness (see `maybe_push_parked_marker`); `Forgone` (an
+/// prompt id and both keep the parked (idle) chrome. `Rendered` markers are
+/// one-per-park-episode — a re-park after new parent output (epoch bump)
+/// pushes a fresh one (see `maybe_push_parked_marker`); `Forgone` (an
 /// interjection continued the parked turn) is final — a later "Worked for"
 /// line would land below the interjected message, flipping the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParkedMarkerSlot {
-    /// A "Worked for X. … still running." marker block was pushed.
+    /// A "Worked for X" marker block was pushed.
     Rendered {
         prompt_id: String,
-        entry_id: EntryId,
+        /// The parent-output boundary at push time: chips/completions landing
+        /// under the marker don't bump it, so a matching epoch means "same
+        /// park episode — don't re-push".
         agent_output_epoch: u64,
     },
     /// The marker was forgone: an interjection continued the parked turn.
@@ -695,17 +698,6 @@ impl ParkedMarkerSlot {
             ParkedMarkerSlot::Rendered { prompt_id, .. } | ParkedMarkerSlot::Forgone(prompt_id) => {
                 prompt_id
             }
-        }
-    }
-    /// The mutable parked marker entry and its parent-output boundary.
-    pub(crate) fn rendered_marker(&self) -> Option<(EntryId, u64)> {
-        match self {
-            ParkedMarkerSlot::Rendered {
-                entry_id,
-                agent_output_epoch,
-                ..
-            } => Some((*entry_id, *agent_output_epoch)),
-            ParkedMarkerSlot::Forgone(_) => None,
         }
     }
 }
@@ -855,14 +847,6 @@ pub struct AgentView {
     /// Keyed by prompt id: a new turn naturally invalidates the slot with no
     /// explicit clear site. See [`ParkedMarkerSlot`].
     pub(crate) parked_wait_marker_for: Option<ParkedMarkerSlot>,
-    /// A turn-end marker announced background work ("N still running"), so
-    /// no-wake completions landing between turns re-emit a fresh work-only
-    /// status line after their chip (wake-bound ones get the wake turn's end
-    /// marker instead). Written by exactly one assignment — the shared
-    /// marker tail `push_end_marker_block` (real-turn AND wake markers:
-    /// counted opens, workless closes) — and cleared when a real turn starts
-    /// and on every replay-window entry, closing the between-turns window.
-    pub(crate) end_work_announced: bool,
     /// Live `stop`/`stop_failure` hook runs held for the turn's terminal
     /// marker (driver order: the hooks arrive before the `PromptResponse`
     /// that pushes it). Consumed or flushed by `push_turn_terminal_marker`;
@@ -881,15 +865,9 @@ pub struct AgentView {
     /// UTC ms when the current turn started (`turnStartMs` from notification meta).
     /// Used for turn elapsed display.
     pub turn_start_ms: Option<i64>,
-    /// `(prompt_id, turnStartMs)` of the streaming wake turn, recorded off its
-    /// live deltas. Non-adopted synthetic turns never set `turn_started_at`,
-    /// and the durable `TurnCompleted` envelope carries no timing — this is
-    /// the wake-end marker's only elapsed source. Consumed (pid-matched) at
-    /// that marker's push; `None` there renders the marker without a duration.
-    pub wake_turn_start: Option<(String, i64)>,
     /// Local wall-clock time when the current turn started.
     /// Set by `maybe_drain_queue` when a prompt is sent. Used to compute
-    /// elapsed time for "Worked for Xm Ys." system messages.
+    /// elapsed time for "Worked for Xm Ys" system messages.
     pub turn_started_at: Option<Instant>,
     /// Turn-start anchor a `turn.first_activity` log was already emitted for (fire-once-per-turn guard).
     pub first_activity_logged_for: Option<Instant>,
@@ -1154,6 +1132,8 @@ pub struct AgentView {
     /// Active /btw side question overlay. When `Some`, renders as a dismissible
     /// overlay and captures keyboard input (Esc/Enter/Space to dismiss).
     pub btw_state: Option<crate::views::btw_overlay::BtwOverlayState>,
+    /// Minimal-only ownership/correlation for `btw_state`; absent in fullscreen.
+    pub(crate) minimal_btw_lifecycle: Option<crate::minimal_api::MinimalBtwLifecycle>,
     /// Whether the /btw panel holds keyboard focus. The panel is non-blocking,
     /// so Up/Down/PgUp/PgDn scroll it when focused and otherwise reach the
     /// prompt. Set on a `Done` answer; cleared when the user types in or clicks
@@ -2303,7 +2283,7 @@ pub(super) mod test_fixtures {
         );
     }
     /// A minimal running (foreground) subagent registry row, so tests can
-    /// count it in `current_end_work` / park-marker snapshots.
+    /// count it in `watchers()` snapshots.
     pub fn running_subagent_info(child_sid: &str) -> crate::app::subagent::SubagentInfo {
         use std::sync::Arc;
         use std::time::Instant;
@@ -2347,8 +2327,8 @@ pub(super) mod test_fixtures {
             child_updates_replayed: false,
         }
     }
-    /// Count of parked ("Worked for … still running") marker blocks in
-    /// the agent's scrollback.
+    /// Count of parked ("Worked for X") marker blocks in the agent's
+    /// scrollback.
     pub fn count_parked(agent: &AgentView) -> usize {
         use crate::scrollback::block::RenderBlock;
         (0..agent.scrollback.len())

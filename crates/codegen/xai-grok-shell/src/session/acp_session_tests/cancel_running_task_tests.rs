@@ -164,6 +164,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
+                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
@@ -631,6 +632,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
+                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
@@ -911,6 +913,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
+                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
@@ -1085,6 +1088,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                         verbatim: false,
                         json_schema: None,
                         origin: crate::session::PromptOrigin::User,
+                        task_wake_fallback: None,
                         respond_to: tx,
                         persist_ack: None,
                         parsed_prompt_tx: None,
@@ -1521,6 +1525,7 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
             verbatim: false,
             json_schema: None,
             origin: crate::session::PromptOrigin::User,
+            task_wake_fallback: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
@@ -1683,6 +1688,191 @@ async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
         })
         .await;
 }
+#[tokio::test(flavor = "current_thread")]
+async fn interactive_cancel_drops_queued_task_wakes_and_promotes_user() {
+    use tokio::sync::oneshot::error::TryRecvError;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let reservations = actor
+                .tool_context
+                .task_completion_reservations
+                .clone()
+                .expect("completion reservations");
+            reservations.reserve("bg-queued".to_string());
+            let actor = Arc::new(actor);
+            let (running_item, mut running_rx) =
+                input_with_origin_rx("user-running", crate::session::PromptOrigin::User);
+            let (mut wake_item, mut wake_rx) = input_with_origin_rx(
+                "task-completed-bg-queued",
+                crate::session::PromptOrigin::TaskCompleted {
+                    task_id: "bg-queued".to_string(),
+                },
+            );
+            wake_item.task_wake_fallback = Some(crate::session::commands::TaskWakeFallback {
+                prompt_id: "bash-completed-bg-queued".to_string(),
+                prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "completion bg-queued",
+                ))],
+                source: NotificationSource::BashTaskCompleted {
+                    task_id: "bg-queued".to_string(),
+                },
+            });
+            let (queued_user, mut queued_user_rx) =
+                input_with_origin_rx("user-next", crate::session::PromptOrigin::User);
+            {
+                let mut state = actor.state.lock().await;
+                state.running_task = Some(running_task_stub("user-running"));
+                state.pending_inputs.push_back(running_item);
+                state.pending_inputs.push_back(wake_item);
+                state.pending_inputs.push_back(queued_user);
+            }
+            let cancel = actor.cancel_running_task(true, false, false, Some("ctrl_c".to_string()));
+            tokio::pin!(cancel);
+            tokio::select! {
+                _ = & mut cancel => {} _ = tokio::task::yield_now() => { assert!(actor
+                .state.try_lock().expect("state lock").notifications_suppressed,
+                "Ctrl+C must arm actor suppression before the first await");
+                assert!(actor.tool_context.task_wake_suppressed.as_ref().is_some_and(|
+                gate | gate.get()),
+                "Ctrl+C must arm the reminder gate before the first await"); cancel.
+                await; }
+            }
+            assert!(
+                actor
+                    .tool_context
+                    .task_wake_suppressed
+                    .as_ref()
+                    .is_some_and(|gate| gate.get()),
+                "Ctrl+C must synchronously arm the reminder gate"
+            );
+            {
+                let state = actor.state.lock().await;
+                let remaining: Vec<&str> = state
+                    .pending_inputs
+                    .iter()
+                    .map(|item| item.prompt_id.as_str())
+                    .collect();
+                assert_eq!(remaining, vec!["user-next"]);
+                assert!(
+                    matches!(state.pending_notifications.as_slice(), [PendingNotification
+                    { source : NotificationSource::BashTaskCompleted { task_id }, .. }]
+                    if task_id == "bg-queued")
+                );
+                assert!(state.notifications_suppressed);
+            }
+            assert!(matches!(running_rx.try_recv(), Ok(Ok(_))));
+            assert!(matches!(
+                wake_rx.try_recv(),
+                Ok(Ok(crate::session::commands::PromptTurnOk {
+                    completion_kind: PromptCompletionKind::RemovedFromQueue,
+                    ..
+                }))
+            ));
+            assert!(matches!(
+                queued_user_rx.try_recv(),
+                Err(TryRecvError::Empty)
+            ));
+            assert!(reservations.contains("bg-queued"));
+            actor.consume_deferred_completions_for_user_turn().await;
+            {
+                let state = actor.state.lock().await;
+                assert!(
+                    state.pending_notifications.is_empty(),
+                    "the genuine user turn must consume the parked fallback exactly once"
+                );
+            }
+            assert!(!reservations.contains("bg-queued"));
+            actor.consume_deferred_completions_for_user_turn().await;
+            assert!(
+                actor.state.lock().await.pending_notifications.is_empty(),
+                "a second user-start drain must not rediscover the completion"
+            );
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn ctrl_c_clears_turn_active_before_background_completion_routes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let is_turn_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            actor.tool_context.is_turn_active = Some(is_turn_active.clone());
+            let (running_item, _running_rx) =
+                input_with_origin_rx("user-running", crate::session::PromptOrigin::User);
+            {
+                let mut state = actor.state.lock().await;
+                state.running_task = Some(running_task_stub("user-running"));
+                state.pending_inputs.push_back(running_item);
+            }
+            actor
+                .cancel_running_task(true, false, false, Some("ctrl_c".to_string()))
+                .await;
+            assert!(!is_turn_active.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(actor.state.lock().await.notifications_suppressed);
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn non_ctrl_c_cancel_preserves_queued_task_wakes_and_does_not_arm_barrier() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for trigger in [Some("esc"), Some("mouse"), Some("dashboard"), None] {
+                let (gateway_tx, _gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, _persistence_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                let (running_item, _running_rx) =
+                    input_with_origin_rx("user-running", crate::session::PromptOrigin::User);
+                let (wake_item, _wake_rx) = input_with_origin_rx(
+                    "task-completed-bg-preserved",
+                    crate::session::PromptOrigin::TaskCompleted {
+                        task_id: "bg-preserved".to_string(),
+                    },
+                );
+                let (queued_user, _queued_user_rx) =
+                    input_with_origin_rx("user-next", crate::session::PromptOrigin::User);
+                {
+                    let mut state = actor.state.lock().await;
+                    state.running_task = Some(running_task_stub("user-running"));
+                    state.pending_inputs.push_back(running_item);
+                    state.pending_inputs.push_back(wake_item);
+                    state.pending_inputs.push_back(queued_user);
+                }
+                actor
+                    .cancel_running_task(true, false, false, trigger.map(str::to_string))
+                    .await;
+                let state = actor.state.lock().await;
+                let remaining: Vec<&str> = state
+                    .pending_inputs
+                    .iter()
+                    .map(|item| item.prompt_id.as_str())
+                    .collect();
+                assert_eq!(
+                    remaining,
+                    vec!["task-completed-bg-preserved", "user-next"],
+                    "non-Ctrl+C cancel {trigger:?} must preserve the queued task wake"
+                );
+                assert!(
+                    !state.notifications_suppressed,
+                    "non-Ctrl+C cancel {trigger:?} must not arm task-wake suppression"
+                );
+            }
+        })
+        .await;
+}
 /// Regression for the cancel-spinner hang: an interactive cancel must resolve
 /// the in-flight front prompt's `respond_to` with `Cancelled` even when
 /// `state.running_task` is `None`.
@@ -1715,6 +1905,7 @@ async fn cancel_resolves_front_when_running_task_is_none() {
             verbatim: false,
             json_schema: None,
             origin: crate::session::PromptOrigin::User,
+            task_wake_fallback: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
@@ -1965,6 +2156,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
+                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
@@ -2252,6 +2444,7 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
             verbatim: false,
             json_schema: None,
             origin: crate::session::PromptOrigin::User,
+            task_wake_fallback: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,

@@ -274,14 +274,17 @@ impl MvpAgent {
                 ps.and_then(|h| h.allowed_subagent_types.clone()),
             )
         };
-        let cli_agent_names: Vec<String> = {
+        let (cli_agent_names, subagent_toggle) = {
             let cfg = self.cfg.borrow();
-            cfg.cli_agents.iter().map(|d| d.name.clone()).collect()
+            (
+                cfg.cli_agents.iter().map(|d| d.name.clone()).collect(),
+                cfg.subagent_toggle.clone(),
+            )
         };
         crate::agent::subagent::SubagentValidationContext {
             parent_cwd,
             plugin_registry: self.plugin_registry_handle.snapshot(),
-            subagent_toggle: self.subagent_toggle.clone(),
+            subagent_toggle,
             allowed_subagent_types,
             cli_agent_names,
         }
@@ -447,6 +450,23 @@ impl MvpAgent {
             }
             None => (None, None),
         };
+        let project_trusted = crate::agent::folder_trust::project_scope_allowed(&parent_cwd);
+        let (base_roles, base_personas, subagent_model_overrides, subagent_toggle) = {
+            let cfg = self.cfg.borrow();
+            (
+                cfg.subagent_roles.clone(),
+                cfg.subagent_personas.clone(),
+                cfg.subagent_model_overrides.clone(),
+                cfg.subagent_toggle.clone(),
+            )
+        };
+        let (subagent_roles, subagent_personas) =
+            crate::config::SubagentsConfig::effective_definition_maps(
+                &base_roles,
+                &base_personas,
+                &parent_cwd,
+                project_trusted,
+            );
         Some(crate::agent::subagent::SubagentSpawnContext {
             lsp: parent_lsp,
             gateway: self.gateway.clone(),
@@ -499,11 +519,10 @@ impl MvpAgent {
             parent_chat_state,
             parent_max_turns,
             available_models,
-            subagent_model_overrides: self.subagent_model_overrides.clone(),
-            subagent_toggle: self.subagent_toggle.clone(),
-            subagent_roles: self.subagent_roles.clone(),
-            subagent_personas: self.subagent_personas.clone(),
-            persona_io_summaries: self.persona_io_summaries.clone(),
+            subagent_model_overrides,
+            subagent_toggle,
+            subagent_roles,
+            subagent_personas,
             disable_web_search: self.cfg.borrow().disable_web_search,
             todo_gate: self.cfg.borrow().todo_gate,
             remote_settings: self.cfg.borrow().remote_settings.clone(),
@@ -566,11 +585,11 @@ impl MvpAgent {
             parent_skills: None,
             parent_skills_config: self.cfg.borrow().skills.clone(),
             parent_compat: self.cfg.borrow().compat_resolved,
-            auto_wake_delivered: {
+            task_completion_reservations: {
                 let sessions = self.sessions.borrow();
                 sessions
                     .get(&parent_sid)
-                    .and_then(|h| h.tool_context.auto_wake_delivered.clone())
+                    .and_then(|h| h.tool_context.task_completion_reservations.clone())
             },
             synthetic_trace_tx: {
                 let sessions = self.sessions.borrow();

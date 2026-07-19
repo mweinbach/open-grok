@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation as _};
@@ -30,6 +30,35 @@ pub enum EditCommand {
     DeleteWordForward(WordStyle),
     DeleteToLineStart,
     DeleteToLineEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditCommandCategory {
+    Insert,
+    Navigation,
+    Delete,
+    Kill,
+}
+
+impl EditCommand {
+    pub(crate) fn category(self) -> EditCommandCategory {
+        match self {
+            Self::Insert(_) => EditCommandCategory::Insert,
+            Self::MoveGraphemeLeft
+            | Self::MoveGraphemeRight
+            | Self::MoveWordLeft(_)
+            | Self::MoveWordRight(_)
+            | Self::MoveLogicalLineStart
+            | Self::MoveLogicalLineEnd => EditCommandCategory::Navigation,
+            Self::DeleteGraphemeBackward | Self::DeleteGraphemeForward => {
+                EditCommandCategory::Delete
+            }
+            Self::DeleteWordBackward(_)
+            | Self::DeleteWordForward(_)
+            | Self::DeleteToLineStart
+            | Self::DeleteToLineEnd => EditCommandCategory::Kill,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +184,14 @@ impl PartialEq for EditBuffer {
 
 impl Eq for EditBuffer {}
 
+impl Deref for EditBuffer {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.text()
+    }
+}
+
 impl EditBuffer {
     pub fn new() -> Self {
         Self::default()
@@ -210,14 +247,14 @@ impl EditBuffer {
     #[must_use]
     pub fn insert_str(&mut self, text: &str) -> EditOutcome {
         let plan = self.plan_replace_byte_range(self.cursor_byte..self.cursor_byte, text, &[]);
-        self.apply_valid_plan(&plan)
+        self.apply_validated_plan(&plan)
     }
 
     /// Edit-result cursors keep right affinity when adjacent text merges into one grapheme.
     #[must_use]
     pub fn replace_byte_range(&mut self, range: Range<usize>, replacement: &str) -> EditOutcome {
         let plan = self.plan_replace_byte_range(range, replacement, &[]);
-        self.apply_valid_plan(&plan)
+        self.apply_validated_plan(&plan)
     }
 
     pub fn plan_replace_byte_range(
@@ -380,13 +417,13 @@ impl EditBuffer {
 
     pub fn apply_plan(&mut self, plan: &EditPlan) -> Result<EditOutcome, ApplyEditPlanError> {
         self.validate_plan(plan)?;
-        Ok(self.apply_valid_plan(plan))
+        Ok(self.apply_validated_plan(plan))
     }
 
     #[must_use]
     pub fn apply(&mut self, command: EditCommand) -> EditOutcome {
         let plan = self.plan_command(command, &[]);
-        self.apply_valid_plan(&plan)
+        self.apply_validated_plan(&plan)
     }
 
     fn make_plan(
@@ -408,7 +445,7 @@ impl EditBuffer {
         }
     }
 
-    fn validate_plan(&self, plan: &EditPlan) -> Result<(), ApplyEditPlanError> {
+    pub(crate) fn validate_plan(&self, plan: &EditPlan) -> Result<(), ApplyEditPlanError> {
         if !Arc::ptr_eq(&plan.source_identity, &self.identity)
             || plan.source_generation != self.generation
         {
@@ -447,7 +484,7 @@ impl EditBuffer {
         Ok(())
     }
 
-    fn apply_valid_plan(&mut self, plan: &EditPlan) -> EditOutcome {
+    pub(crate) fn apply_validated_plan(&mut self, plan: &EditPlan) -> EditOutcome {
         let old_cursor = self.cursor_byte;
         let text_changed = plan.removed_text != plan.replacement;
         let inserted_len = plan.replacement.len();

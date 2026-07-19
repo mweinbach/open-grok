@@ -62,9 +62,13 @@ code_mode = "direct"                   # "direct", "code_mode" (mixed), or "code
 show_thinking_blocks = true            # show agent thinking blocks in the TUI (default: true)
 group_tool_verbs = true                # fold runs of read/search/list tool calls and subagent rows
                                        # — and finished thoughts among them — into one row (default: true)
-collapsed_edit_blocks = false          # show edits as one-line +N/-M diffstat summaries, expand for
-                                       # the diff (default: false; pager.toml [scrollback.blocks.edit]
-                                       # expanded_by_default/line_summary override it when set)
+collapsed_edit_blocks = false          # show edits as one-line +N/-M diffstat summaries and merge
+                                       # back-to-back same-file edits into one row, expand for the
+                                       # diffs (default: false; pager.toml [scrollback.blocks.edit]
+                                       # expanded_by_default/line_summary override its fold shape)
+page_flip_on_send = true               # pin a just-sent prompt at the top of the viewport so the
+                                       # response starts on a fresh page (default: true); set false
+                                       # so sending never moves the scroll position
 screen_mode = "fullscreen"             # sticky render mode: "minimal" or "fullscreen"; written
                                        # automatically by --minimal/--fullscreen and /minimal//fullscreen
 
@@ -214,6 +218,14 @@ value for that invocation (and updates it), and `screen_mode` takes precedence
 over the legacy `[terminal] minimal` key in `pager.toml`. Delete the key to
 restore the legacy behavior.
 
+#### Snap prompt to top on send
+
+By default, sending a prompt scrolls it to the top of the viewport so the
+response starts on a fresh page. Set `[ui] page_flip_on_send = false` (or
+toggle **Snap prompt to top on send** in `/settings` → Appearance) to leave
+the scroll position unchanged when you send. Applies on the next send; no
+restart.
+
 #### Scrolling
 
 Four `[ui]` settings tune mouse-wheel and trackpad scrolling in the
@@ -258,7 +270,13 @@ timeout_secs = 1800                    # seconds to wait when enabled (default: 
 [toolset.web_fetch]
 proxy_endpoint = "https://proxy.example.com"   # egress proxy URL
 allowed_domains = ["docs.rs", "x.ai"]           # override the built-in allowlist
+allow_local = false                              # true = allow localhost / 127.0.0.0/8 / ::1 only
 ```
+
+`allow_local` is off by default (SSRF fail-closed). When `true` (or
+`GROK_WEB_FETCH_ALLOW_LOCAL=1`), `web_fetch` may reach **explicit** loopback
+hosts only — private, link-local, and cloud-metadata ranges stay blocked.
+Resolution: TOML > env > default off.
 
 `[toolset.ask_user_question]` is honored across **requirements.toml**, **managed
 config**, and **user `config.toml`**. Precedence: requirements → env
@@ -441,16 +459,16 @@ Session cells remain staged until a foreign-session scanner consumes them. Each 
 ```toml
 [compat.cursor]
 skills = true     # scan ~/.cursor/skills/ and <cwd>/.cursor/skills/
-rules = true      # scan <cwd>/.cursor/rules/
-agents = true     # scan ~/.cursor/ for AGENTS.md files
+rules = true      # scan ~/.cursor/rules/ and <dir>/.cursor/rules/
+agents = true     # scan ~/.cursor/ for named instruction files
 mcps = true       # scan ~/.cursor/mcp.json and <cwd>/.cursor/mcp.json
 hooks = true      # scan ~/.cursor/hooks.json and <cwd>/.cursor/hooks.json
 sessions = true   # staged; no scanner consumer yet
 
 [compat.claude]
 skills = true     # scan ~/.claude/skills/ and <cwd>/.claude/skills/
-rules = true      # scan <cwd>/.claude/rules/
-agents = true     # scan ~/.claude/ for CLAUDE.md / CLAUDE.local.md
+rules = true      # scan ~/.claude/rules/ and <dir>/.claude/rules/
+agents = true     # scan ~/.claude/ and <dir>/.claude/CLAUDE*.md
 mcps = true       # scan ~/.claude.json for MCP servers
 hooks = true      # scan ~/.claude/settings.json for hooks
 sessions = true   # staged; no scanner consumer yet
@@ -460,6 +478,8 @@ sessions = true   # staged; no scanner consumer yet
 ```
 
 Codex `skills`, `rules`, `agents`, `mcps`, and `hooks` cells are reserved and currently inert; they do not enable `.codex` discovery.
+
+For Claude and Cursor, `rules` and `agents` are independent: disabling named instruction files does not disable either the home or project rules directory, and disabling rules does not disable named files. Claude's `agents` cell gates home-level `~/.claude/` named files and project `<dir>/.claude/CLAUDE*.md`; generic top-level `Claude.md`, `CLAUDE.md`, and `CLAUDE.local.md` remain recognized. Project rule paths are scanned at every directory from the repo root to the current directory.
 
 Each cell can be toggled via environment variable or `config.toml`. See the
 environment-variables reference for the env var names. Resolution order:
@@ -617,7 +637,15 @@ See [Keyboard Shortcuts](03-keyboard-shortcuts.md) for the complete reference.
 
 ### Telemetry
 
-The `[features] telemetry` toggle (in the `[features]` block above) is the master switch for anonymous usage telemetry. When telemetry is enabled, enterprises that run their own collector can redirect it or selectively disable parts of it under `[telemetry]`:
+Independent knobs (see [Monitoring Usage](24-monitoring-usage.md#related-settings)):
+
+- **`[features] telemetry`** / `GROK_TELEMETRY_ENABLED`: product analytics master switch. `/privacy` does not change it.
+- **`/privacy`** / Settings: coding data sharing (separate from telemetry).
+- **`[telemetry] trace_upload`** / `GROK_TELEMETRY_TRACE_UPLOAD`: session traces; follows telemetry when unset.
+- **`[telemetry] otel_*`** / `GROK_EXTERNAL_OTEL`: external OTEL to your collector (below).
+
+When telemetry is enabled, enterprises that run their own collector can redirect
+it or selectively disable parts of it under `[telemetry]`:
 
 ```toml
 [telemetry]
@@ -629,7 +657,7 @@ trace_upload = false                                      # disable session/trac
 
 Set these only to point telemetry at your own infrastructure or to turn parts of it off. The built-in endpoint and credentials are managed by Grok; leave them unset to use the defaults.
 
-The same `[telemetry]` table also configures the **external OpenTelemetry stream** — an independent opt-in (it does not require the telemetry toggle above) that ships a curated, content-free usage schema to your *own* OTLP collector. Collector auth is supplied via `OTEL_EXPORTER_OTLP_HEADERS` and is never stored on disk. See [Monitoring & Usage](24-monitoring-usage.md) for the full schema, env vars, and privacy model.
+The same `[telemetry]` table also configures the **external OpenTelemetry stream**, an independent opt-in (it does not require the telemetry toggle above) that ships a curated, content-free usage schema to your *own* OTLP collector. Collector auth is supplied via `OTEL_EXPORTER_OTLP_HEADERS` and is never stored on disk. See [Monitoring & Usage](24-monitoring-usage.md) for the full schema, env vars, and privacy model.
 
 ```toml
 [telemetry]
@@ -822,6 +850,7 @@ Key environment variables. See the README for the complete list.
 | `GROK_MEMORY` | Enable (`1`) or disable (`0`) cross-session memory |
 | `GROK_SUBAGENTS` | Enable (`1`) or disable (`0`) subagents |
 | `GROK_WEB_FETCH` | Enable (`1`) or disable (`0`) the web_fetch tool |
+| `GROK_WEB_FETCH_ALLOW_LOCAL` | Allow `web_fetch` to explicit loopback hosts only (`localhost` / `127.0.0.0/8` / `::1`). Same as `[toolset.web_fetch] allow_local`. Default off. Private/metadata stay blocked. |
 | `GROK_AGENT` | Custom agent definition path or name |
 | `GROK_SANDBOX` | Sandbox profile (off, workspace, devbox, read-only, strict; or a custom profile name) |
 
@@ -844,6 +873,9 @@ Key environment variables. See the README for the complete list.
 | Variable | Description |
 |----------|-------------|
 | `GROK_TELEMETRY_ENABLED` | Enable/disable telemetry |
+| `GROK_TELEMETRY_TRACE_UPLOAD` | Enable/disable session trace upload |
+| `GROK_TELEMETRY_MIXPANEL_ENABLED` | Enable/disable Mixpanel specifically |
+| `GROK_EXTERNAL_OTEL` | External OTEL to your collector (see [24-monitoring-usage.md](24-monitoring-usage.md)) |
 | `GROK_FEEDBACK_ENABLED` | Enable/disable feedback system |
 | `GROK_DEPLOYMENT_KEY` | Management API key for enterprise |
 

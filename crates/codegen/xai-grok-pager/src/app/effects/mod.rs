@@ -915,11 +915,13 @@ pub(crate) fn execute(
                 tracing::warn!(error = % e, "project picker: failed to set_current_dir");
             }
         }
-        Effect::ScheduleClearAuthCopied => {
+        Effect::ScheduleClearAuthCopyFeedback { generation } => {
             tasks
-                .spawn(async {
+                .spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    TaskResult::AuthCopiedTimeout
+                    TaskResult::AuthCopyFeedbackTimeout {
+                        generation,
+                    }
                 });
         }
         Effect::Logout {
@@ -4384,7 +4386,7 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::SendBtw { agent_id, session_id, question } => {
+        Effect::SendBtw { agent_id, session_id, question, minimal_request_id } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
@@ -4414,6 +4416,7 @@ pub(crate) fn execute(
                             TaskResult::BtwResponse {
                                 agent_id,
                                 result: Ok(answer),
+                                minimal_request_id,
                             }
                         }
                         Err(e) => {
@@ -4422,6 +4425,7 @@ pub(crate) fn execute(
                                 result: Err(
                                     sanitize_user_error(&format!("side question failed: {e}")),
                                 ),
+                                minimal_request_id,
                             }
                         }
                     }

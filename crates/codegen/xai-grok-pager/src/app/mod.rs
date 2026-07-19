@@ -27,6 +27,12 @@ mod dispatch;
 /// Display-refresh probe + motion cadence + terminal telemetry at startup.
 mod display_refresh_startup;
 mod effects;
+pub mod roster;
+pub mod session_startup;
+pub mod status_blocks;
+pub mod subagent;
+pub mod subscription;
+pub(crate) use effects::sanitize_user_error;
 mod event_loop;
 mod foreign_sessions;
 mod inline_edit;
@@ -35,13 +41,8 @@ mod leader_cluster;
 mod modals;
 mod mouse;
 mod queue_edit;
-pub mod roster;
 pub(crate) mod screen_mode_relaunch;
-pub mod session_startup;
-mod signal_handler;
-pub mod status_blocks;
-pub mod subagent;
-pub mod subscription;
+pub mod signal_handler;
 mod turn_completion;
 mod xt_filter;
 pub(crate) use crate::terminal::kitty_flags_pushed;
@@ -56,7 +57,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
-pub(crate) use dispatch::{FREE_USAGE_USER_MESSAGE, acp_error_is_free_usage_exhausted};
 pub use foreign_sessions::ForeignScanCoordinator;
 pub(crate) use foreign_sessions::{
     badge_for_picker_source, foreign_tool_display_label, is_foreign_picker_source,
@@ -645,7 +645,8 @@ pub async fn run(
     );
     engage_startup_theme(screen_mode);
     let minimal_live_rows = config_watcher.current().minimal_live_rows;
-    let (frame_tx, writer_sync, writer_thread) = crate::render::draw::spawn_writer_thread();
+    let (frame_tx, writer_sync, writer_event_rx, writer_thread) =
+        crate::render::draw::spawn_writer_thread();
     let cursor_blink = event_loop::load_initial_ui_config().cursor_blink;
     let (mut terminal, screen_mode) = init_terminal(
         screen_mode,
@@ -689,12 +690,29 @@ pub async fn run(
         term_state,
         materialized,
         bg_update_rx,
+        writer_event_rx,
     )
     .await;
     crate::unified_log::flush_blocking().await;
-    let _ = restore_terminal(terminal, writer_thread, screen_mode);
+    let restore_result = restore_terminal(terminal, writer_thread, screen_mode);
     cancel.cancel();
     xai_tty_utils::global_process_scope().kill_all();
+    if let Err(cleanup_error) = restore_result {
+        match &result {
+            Ok(_) => {
+                tracing::warn!(
+                    error = % cleanup_error,
+                    "terminal cleanup failed after successful event loop"
+                )
+            }
+            Err(run_error) => {
+                tracing::warn!(
+                    error = % cleanup_error, run_error = % run_error,
+                    "terminal cleanup also failed"
+                )
+            }
+        }
+    }
     match result {
         Ok(run_result) => {
             if run_result.quit_for_update {
@@ -721,7 +739,7 @@ pub async fn run(
             }
             Ok(false)
         }
-        Err(e) => Err(e),
+        Err(run_error) => Err(run_error),
     }
 }
 /// Plain-quit "Resume this session with…" lines (after terminal restore).
@@ -1019,7 +1037,7 @@ fn init_terminal(
     mode: ScreenMode,
     minimal_live_rows: u16,
     clear_main_screen: bool,
-    frame_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    frame_tx: crate::render::draw::WriterSender,
     writer_sync: crate::render::draw::WriterSync,
     cursor_blink: Option<bool>,
 ) -> io::Result<(PagerTerminal, ScreenMode)> {
@@ -1117,8 +1135,10 @@ fn init_terminal(
         }
         crate::terminal::set_kitty_flags_pushed(use_keyboard_enhancement);
         if mode.is_fullscreen() {
-            let backend =
-                CrosstermBackend::new(crate::render::draw::TermWriter::new(frame_tx, writer_sync));
+            let backend = CrosstermBackend::new(
+                crate::render::draw::TermWriter::new(frame_tx, writer_sync)
+                    .map_err(io::Error::other)?,
+            );
             Ok((
                 xai_ratatui_inline::Terminal::new(backend)?,
                 ScreenMode::Fullscreen,
@@ -1130,10 +1150,10 @@ fn init_terminal(
             } else {
                 rows
             };
-            let probe_backend = CrosstermBackend::new(crate::render::draw::TermWriter::new(
-                frame_tx.clone(),
-                writer_sync.clone(),
-            ));
+            let probe_backend = CrosstermBackend::new(
+                crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
+                    .map_err(io::Error::other)?,
+            );
             if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
                 probe_backend,
                 ratatui::TerminalOptions {
@@ -1157,10 +1177,10 @@ fn init_terminal(
                     execute!(stderr, event::EnableMouseCapture)
                 })?;
                 MOUSE_CAPTURE_ENABLED.store(true, Ordering::Release);
-                let retry_backend = CrosstermBackend::new(crate::render::draw::TermWriter::new(
-                    frame_tx.clone(),
-                    writer_sync.clone(),
-                ));
+                let retry_backend = CrosstermBackend::new(
+                    crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
+                        .map_err(io::Error::other)?,
+                );
                 if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
                     retry_backend,
                     ratatui::TerminalOptions {
@@ -1179,8 +1199,10 @@ fn init_terminal(
                     cursor::MoveTo(0, 0),
                 )
             })?;
-            let backend =
-                CrosstermBackend::new(crate::render::draw::TermWriter::new(frame_tx, writer_sync));
+            let backend = CrosstermBackend::new(
+                crate::render::draw::TermWriter::new(frame_tx, writer_sync)
+                    .map_err(io::Error::other)?,
+            );
             let term = xai_ratatui_inline::Terminal::with_options(
                 backend,
                 ratatui::TerminalOptions {
@@ -1205,9 +1227,9 @@ fn init_terminal(
 fn drain_writer_thread_before_teardown(
     terminal: PagerTerminal,
     writer_thread: crate::render::draw::WriterThread,
-) {
+) -> io::Result<()> {
     drop(terminal);
-    writer_thread.join();
+    writer_thread.join()
 }
 /// Inline teardown escape sequences in the canonical order, shared by
 /// `restore_terminal` and `set_panic_hook` so the on-wire byte order is
@@ -1268,16 +1290,18 @@ fn emit_terminal_teardown_sequences(mode: ScreenMode, inline_cursor_row: Option<
     #[cfg(windows)]
     win_native_selection::restore_stdin_mode();
 }
-/// Consumes `terminal` and `writer_thread`: queues a final clear in
-/// fullscreen mode, drains the writer thread, then emits the inline
-/// teardown sequences. The drain ordering guarantees no late frame can
-/// land after `LeaveAlternateScreen`.
-fn restore_terminal(
+/// Consumes `terminal` and `writer_thread`: queues a final fullscreen clear,
+/// drains every accepted frame, then emits teardown sequences. Teardown still
+/// runs if draining fails, so terminal state is restored before returning that
+/// error. Draining first prevents a late frame after `LeaveAlternateScreen`.
+fn restore_terminal_with(
     mut terminal: PagerTerminal,
     writer_thread: crate::render::draw::WriterThread,
     mode: ScreenMode,
+    drain: impl FnOnce(PagerTerminal, crate::render::draw::WriterThread) -> io::Result<()>,
+    teardown: impl FnOnce(ScreenMode, Option<u16>),
 ) -> io::Result<()> {
-    if mode.is_fullscreen() {
+    if mode.is_fullscreen() && !writer_thread.writer_sync().failed() {
         let _ = terminal.clear();
         {
             use std::io::Write;
@@ -1285,14 +1309,27 @@ fn restore_terminal(
         }
     }
     let inline_cursor_row = (!mode.is_fullscreen()).then(|| terminal.viewport_area().bottom());
-    drain_writer_thread_before_teardown(terminal, writer_thread);
-    emit_terminal_teardown_sequences(mode, inline_cursor_row);
+    let drain_result = drain(terminal, writer_thread);
+    teardown(mode, inline_cursor_row);
     drain_pending_events_with_timeout(std::time::Duration::from_millis(10));
     let _ = terminal::disable_raw_mode();
     signal_handler::mark_restored();
     xai_crash_handler::disable_terminal_escape_restore();
     xai_tty_utils::restore_native_stderr();
-    Ok(())
+    drain_result
+}
+fn restore_terminal(
+    terminal: PagerTerminal,
+    writer_thread: crate::render::draw::WriterThread,
+    mode: ScreenMode,
+) -> io::Result<()> {
+    restore_terminal_with(
+        terminal,
+        writer_thread,
+        mode,
+        drain_writer_thread_before_teardown,
+        emit_terminal_teardown_sequences,
+    )
 }
 pub(crate) fn set_terminal_title(title: &str) {
     let full = terminal_title_string(title);
@@ -1329,6 +1366,39 @@ fn set_panic_hook(mode: ScreenMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restore_runs_teardown_even_when_writer_failed() {
+        use ratatui::{TerminalOptions, Viewport};
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::render::draw::WriterPayload>();
+        let sync = crate::render::draw::WriterSync::new();
+        let backend = CrosstermBackend::new(
+            crate::render::draw::TermWriter::new(tx, sync).expect("single test writer"),
+        );
+        let terminal = xai_ratatui_inline::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("test terminal");
+        let (writer_tx, _writer_sync, _events, writer_thread) =
+            crate::render::draw::spawn_writer_thread();
+        drop(writer_tx);
+        let teardown_called = std::cell::Cell::new(false);
+        let result = restore_terminal_with(
+            terminal,
+            writer_thread,
+            ScreenMode::Inline,
+            |terminal, writer_thread| {
+                drop(terminal);
+                drop(writer_thread);
+                Err(io::Error::other("injected drain failure"))
+            },
+            |_, _| teardown_called.set(true),
+        );
+        assert!(result.is_err());
+        assert!(teardown_called.get());
+    }
     /// `[ui].cursor_blink` tri-state → startup cursor policy; the `None`
     /// default must be Inherit (emit nothing).
     #[test]

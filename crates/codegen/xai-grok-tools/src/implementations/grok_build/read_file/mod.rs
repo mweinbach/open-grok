@@ -103,7 +103,7 @@ fn extract_pptx_text(file_bytes: Vec<u8>) -> Result<ReadFileOutput, String> {
 pub(crate) const DESCRIPTION_FULL: &str = r#"Read a file.
 
 Usage:
-- The target_file parameter can be a relative path in the workspace or an absolute path
+- The ${{ params.read.target_file }} parameter can be a relative path in the workspace or an absolute path
 - By default, it reads up to {max_lines_read} lines starting from the beginning of the file
 - Results are returned with line numbers starting at 1. The format is: LINE_NUMBER→LINE_CONTENT
 - This tool can read PDF files (.pdf), PowerPoint files (.pptx), Jupyter notebooks (.ipynb files), and image files (e.g. PNG, JPG, etc).

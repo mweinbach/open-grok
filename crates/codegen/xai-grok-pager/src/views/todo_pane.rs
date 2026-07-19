@@ -433,6 +433,10 @@ impl TodoPane {
         self.list_state.handle_key_event(key, &self.entries)
     }
 
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.list_state.handle_paste(text, &self.entries)
+    }
+
     /// Handle a mouse scroll event over the todo pane area.
     ///
     /// Caps scroll speed for small viewports — the app-level scroll

@@ -30,7 +30,7 @@ impl PickerSurface<'_> {
             self.entries.as_deref(),
             self.content_results.as_deref(),
             self.state,
-            effective_filter_query(&self.state.query, self.entries_query.as_deref()),
+            effective_filter_query(self.state.query(), self.entries_query.as_deref()),
             self.grouped,
             *self.content_loading,
             self.source_filter,
@@ -40,7 +40,7 @@ impl PickerSurface<'_> {
 
     fn restore_selection(&mut self, anchor: PickerSelectionAnchor) {
         let filter_query =
-            effective_filter_query(&self.state.query, self.entries_query.as_deref()).to_owned();
+            effective_filter_query(self.state.query(), self.entries_query.as_deref()).to_owned();
         restore_picker_selection(
             anchor,
             self.entries.as_deref(),
@@ -141,8 +141,7 @@ pub(in crate::app::dispatch) fn dispatch_fetch_session_list(app: &mut AppView) -
     app.session_picker_loading = true;
     app.session_picker_entries = None;
     app.session_picker_state.selected = 0;
-    app.session_picker_state.query.clear();
-    app.session_picker_state.query_cursor = 0;
+    app.session_picker_state.set_query("");
     app.session_picker_state.search_active = false;
     app.session_picker_state.expanded.clear();
     app.session_picker_content_results = None;

@@ -8,7 +8,8 @@
 mod trust;
 
 pub use trust::{
-    ClipboardDelivery, NativeClipboardPreflight, expected_delivery, native_clipboard_preflight,
+    ClipboardDelivery, ClipboardEnvironment, NativeClipboardPreflight, Osc52Capability,
+    expected_delivery, native_clipboard_preflight,
 };
 pub use xai_ratatui_textarea::{ClipboardProvider, InternalClipboard};
 
@@ -188,7 +189,7 @@ impl SystemClipboard {
     /// Full write route classified by the environment-based delivery policy.
     pub fn try_set(text: &str) -> ClipboardDelivery {
         let legs = clipboard_write_with_route(text, clipboard_route());
-        decision_for_legs(&legs, text).delivery
+        decision_for_legs(&legs, text).delivery()
     }
 }
 
@@ -301,6 +302,20 @@ pub(crate) enum ClipboardFeedback {
 }
 
 impl ClipboardFeedback {
+    pub(crate) fn delivery(self) -> ClipboardDelivery {
+        match self {
+            Self::Copied
+            | Self::CopiedTmux
+            | Self::CopiedOscContainer
+            | Self::CopiedOscRemote
+            | Self::VsCodeSshNonAscii => ClipboardDelivery::Confirmed,
+            Self::UnverifiedOscRemote | Self::UnverifiedOscContainer => {
+                ClipboardDelivery::Unverified
+            }
+            Self::FailedRemote | Self::Failed => ClipboardDelivery::Failed,
+        }
+    }
+
     /// User-facing toast message for this kind.
     fn message(self) -> &'static str {
         match self {
@@ -333,32 +348,30 @@ impl ClipboardFeedback {
         }
     }
 
-    fn to_result(self, delivery: ClipboardDelivery) -> CopyResult {
+    fn to_result(self) -> CopyResult {
         CopyResult {
             message: self.message(),
             ticks: self.ticks(),
-            delivery,
+            delivery: self.delivery(),
         }
     }
 }
 
-fn decision_for_legs(legs: &ClipboardWriteLegs, text: &str) -> trust::ClipboardDecision {
-    let remote = is_remote();
-    let container = is_container_no_display();
-    let mut decision = trust::resolve_copy_decision(
-        legs,
-        text,
-        crate::terminal::terminal_context().brand,
-        crate::host::HostOs::current(),
-        crate::host::DisplayServer::current(),
-        remote,
-        container,
-        osc52_sink_active(),
-    );
-    if decision.delivery == ClipboardDelivery::Failed && (remote || container) {
-        decision.feedback = ClipboardFeedback::FailedRemote;
+fn clipboard_environment(legs: &ClipboardWriteLegs) -> ClipboardEnvironment {
+    ClipboardEnvironment {
+        brand: crate::terminal::terminal_context().brand,
+        host_os: crate::host::HostOs::current(),
+        display_server: crate::host::DisplayServer::current(),
+        remote: is_remote(),
+        container: is_container_no_display(),
+        osc52_sink: osc52_sink_active(),
+        wayland_data_control: legs.data_control,
+        wl_copy_available: legs.wl_copy_ok,
     }
-    decision
+}
+
+fn decision_for_legs(legs: &ClipboardWriteLegs, text: &str) -> ClipboardFeedback {
+    trust::resolve_copy_decision(legs, text, clipboard_environment(legs))
 }
 
 /// Write text and return a toast; emits `grok-shell-clipboard_copy` when enabled.
@@ -366,17 +379,17 @@ pub fn copy_text(text: &str) -> CopyResult {
     let started = std::time::Instant::now();
     let route = clipboard_route();
     let legs = clipboard_write_with_route(text, route);
-    let decision = decision_for_legs(&legs, text);
-    if decision.delivery.is_failed() {
+    let feedback = decision_for_legs(&legs, text);
+    if feedback.delivery().is_failed() {
         tracing::warn!(
             len = text.len(),
             display_server = %crate::host::DisplayServer::current(),
             "clipboard write failed on all trusted backends"
         );
     }
-    let result = decision.feedback.to_result(decision.delivery);
-    let toast_kind: &'static str = decision.feedback.into();
-    log_clipboard_copy_event(text, route, &legs, decision, toast_kind, started);
+    let result = feedback.to_result();
+    let toast_kind: &'static str = feedback.into();
+    log_clipboard_copy_event(text, route, &legs, feedback, toast_kind, started);
     result
 }
 
@@ -384,7 +397,7 @@ fn log_clipboard_copy_event(
     text: &str,
     route: &ClipboardRoute,
     legs: &ClipboardWriteLegs,
-    decision: trust::ClipboardDecision,
+    feedback: ClipboardFeedback,
     toast_kind: &'static str,
     started: std::time::Instant,
 ) {
@@ -406,10 +419,10 @@ fn log_clipboard_copy_event(
         data_control: legs.data_control,
         tmux_ok: legs.tmux_ok,
         osc52_ok: legs.osc52_ok,
-        delivery: decision.delivery.telemetry_label(),
+        delivery: feedback.delivery().telemetry_label(),
         osc52_sink: osc52_sink_active(),
         container_no_display: is_container_no_display(),
-        reported_success: decision.delivery.reported_success(),
+        reported_success: feedback.delivery().reported_success(),
         toast_kind,
         duration_ms: started.elapsed().as_millis() as u64,
     });
@@ -1755,7 +1768,8 @@ mod tests {
             ),
         ];
         for (feedback, delivery, message, telemetry, ticks) in cases {
-            let result = feedback.to_result(delivery);
+            let result = feedback.to_result();
+            assert_eq!(feedback.delivery(), delivery);
             assert_eq!(feedback.message(), message);
             assert_eq!(Into::<&'static str>::into(feedback), telemetry);
             assert_eq!(result.message, message);
@@ -1763,7 +1777,6 @@ mod tests {
             assert_eq!(result.delivery, delivery);
         }
     }
-
     #[test]
     fn clipboard_fallbacks_are_short_and_actionable() {
         for feedback in [

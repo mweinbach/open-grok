@@ -46,70 +46,115 @@ use crossterm::{QueueableCommand, cursor};
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use std::io::Write;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use xai_ratatui_inline::LinkSpan;
 /// Terminal type for the pager. Defined here (beside [`TermWriter`]) so the
 /// `render` module does not depend on `app`. Re-exported from `app` as
 /// `crate::app::PagerTerminal` for existing call sites.
 pub type PagerTerminal = xai_ratatui_inline::Terminal<CrosstermBackend<TermWriter>>;
-/// Shared queued/written frame counters linking [`TermWriter`] to the writer
-/// thread, so callers can wait for the output pipeline to drain.
+#[derive(Debug)]
+pub enum WriterEvent {
+    Written(u64),
+    Failed(std::io::Error),
+}
+/// Outcome of a bounded writer drain attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriterDrain {
+    Drained,
+    TimedOut,
+}
+/// Tracks submitted and successfully flushed presentation sequences.
 ///
-/// The channel between them is fire-and-forget by design (the event loop must
-/// never block on pty I/O), but a few operations need a *happens-before* on
-/// terminal bytes: suspending into a tty-taking child (`$EDITOR` / `$PAGER`)
-/// while a frame is still queued lets that frame race the child's own output —
-/// it can land on the child's alternate screen (so the main screen never
-/// receives it) or tear mid-escape-sequence around the alt-screen switch,
-/// leaving the restored screen out of sync with the renderer's diff buffer
-/// (stale rows, one-line offsets, literal `[` fragments). [`wait_drained`]
-/// closes that window.
-///
-/// `queued` is incremented *before* the frame is sent and `written` after the
-/// writer thread has flushed it to the tty, so `written == queued` ⇒ every
-/// frame handed to the channel has reached the terminal fd.
-///
-/// [`wait_drained`]: WriterSync::wait_drained
-#[derive(Clone, Debug, Default)]
+/// During a child handoff, input is parked before this state is drained. Since
+/// a sequence is reserved before its payload is sent, an accepted frame blocks
+/// the drain before it is visible to the writer; no queued frame can land after
+/// the child takes the tty.
+#[derive(Clone, Debug)]
 pub struct WriterSync {
-    queued: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    queued: Arc<AtomicU64>,
+    written: Arc<AtomicU64>,
+    failed: Arc<AtomicBool>,
+    writer_active: Arc<AtomicBool>,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<WriterEvent>>,
+}
+impl Default for WriterSync {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl WriterSync {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            queued: Arc::new(AtomicU64::new(0)),
+            written: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicBool::new(false)),
+            writer_active: Arc::new(AtomicBool::new(false)),
+            event_tx: None,
+        }
     }
-    /// Record a frame handed to the channel. Called by [`TermWriter::flush`]
-    /// *before* the send so `written` can never observably exceed `queued`.
-    fn mark_queued(&self) {
-        self.queued
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fn with_event_sender(event_tx: tokio::sync::mpsc::UnboundedSender<WriterEvent>) -> Self {
+        Self {
+            queued: Arc::new(AtomicU64::new(0)),
+            written: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicBool::new(false)),
+            writer_active: Arc::new(AtomicBool::new(false)),
+            event_tx: Some(event_tx),
+        }
     }
-    /// Record a frame fully written + flushed to the tty (writer thread).
-    fn mark_written(&self) {
-        self.written
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    fn new_for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<WriterEvent>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self::with_event_sender(event_tx), event_rx)
     }
-    /// Whether every queued frame has been written to the tty.
-    pub fn is_drained(&self) -> bool {
-        self.written.load(std::sync::atomic::Ordering::SeqCst)
-            >= self.queued.load(std::sync::atomic::Ordering::SeqCst)
+    fn reserve_sequence(&self) -> u64 {
+        self.queued.fetch_add(1, Ordering::Release) + 1
     }
-    /// Block (bounded) until the writer thread has flushed every queued frame.
-    ///
-    /// Returns `true` when drained, `false` on timeout (wedged pty / dead
-    /// writer thread — callers proceed anyway, matching the bounded
-    /// reader-park in the suspend path).
-    pub fn wait_drained(&self, timeout: Duration) -> bool {
+    fn mark_written(&self, sequence: u64) {
+        self.written.store(sequence, Ordering::Release);
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx.send(WriterEvent::Written(sequence));
+        }
+    }
+    fn mark_failed(&self, error: std::io::Error) {
+        if self
+            .failed
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx.send(WriterEvent::Failed(error));
+        }
+    }
+    pub fn queued(&self) -> u64 {
+        self.queued.load(Ordering::Acquire)
+    }
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::Acquire)
+    }
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+    fn is_drained(&self) -> bool {
+        !self.failed() && self.written() >= self.queued()
+    }
+    /// Block until the writer flushes every accepted payload, output fails, or
+    /// the deadline passes.
+    pub fn wait_drained(&self, timeout: Duration) -> std::io::Result<WriterDrain> {
         let deadline = Instant::now() + timeout;
         while !self.is_drained() {
+            if self.failed() {
+                return Err(std::io::Error::other("terminal output failed"));
+            }
             if Instant::now() >= deadline {
-                return false;
+                return Ok(WriterDrain::TimedOut);
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        true
+        Ok(WriterDrain::Drained)
     }
 }
 /// A writer that buffers frame output and sends it to a background thread
@@ -124,25 +169,41 @@ impl WriterSync {
 /// terminal emulator is slow to read (e.g. Ghostty busy with another pane),
 /// only the writer thread stalls — the event loop keeps processing timers,
 /// events, and ACP messages.
+pub struct WriterPayload {
+    pub(crate) sequence: u64,
+    pub(crate) data: Vec<u8>,
+}
+pub type WriterSender = mpsc::Sender<WriterPayload>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterAlreadyActive;
+impl std::fmt::Display for WriterAlreadyActive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriterSync already owns a live TermWriter")
+    }
+}
+impl std::error::Error for WriterAlreadyActive {}
 pub struct TermWriter {
     buf: Vec<u8>,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: WriterSender,
     sync: WriterSync,
 }
 impl TermWriter {
-    pub fn new(tx: mpsc::Sender<Vec<u8>>, sync: WriterSync) -> Self {
-        Self {
+    pub fn new(tx: WriterSender, sync: WriterSync) -> Result<Self, WriterAlreadyActive> {
+        sync.writer_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| WriterAlreadyActive)?;
+        Ok(Self {
             buf: Vec::with_capacity(32 * 1024),
             tx,
             sync,
-        }
+        })
     }
     /// Drop the current frame's buffered bytes without sending them.
     pub fn discard(&mut self) {
         self.buf.clear();
     }
-    /// The queued/written counters shared with the writer thread. Used by the
-    /// suspend path to [`WriterSync::wait_drained`] before a child takes the tty.
+    /// Shared writer progress used by the suspend path to
+    /// [`WriterSync::wait_drained`] before a child takes the tty.
     pub fn writer_sync(&self) -> &WriterSync {
         &self.sync
     }
@@ -153,10 +214,19 @@ impl Write for TermWriter {
         Ok(data.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        if !self.buf.is_empty() {
-            let data = std::mem::take(&mut self.buf);
-            self.sync.mark_queued();
-            let _ = self.tx.send(data);
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let sequence = self.sync.reserve_sequence();
+        let data = std::mem::take(&mut self.buf);
+        if self.tx.send(WriterPayload { sequence, data }).is_err() {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "terminal writer thread exited",
+            );
+            self.sync
+                .mark_failed(std::io::Error::new(error.kind(), error.to_string()));
+            return Err(error);
         }
         Ok(())
     }
@@ -164,6 +234,7 @@ impl Write for TermWriter {
 impl Drop for TermWriter {
     fn drop(&mut self) {
         let _ = self.flush();
+        self.sync.writer_active.store(false, Ordering::Release);
     }
 }
 /// Handle for the background writer thread.
@@ -171,16 +242,24 @@ impl Drop for TermWriter {
 /// Joining ensures all queued frames have been written to the terminal
 /// before proceeding with teardown (e.g. `LeaveAlternateScreen`).
 pub struct WriterThread {
-    handle: Option<std::thread::JoinHandle<()>>,
+    handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    sync: WriterSync,
 }
 impl WriterThread {
     /// Block until the writer thread has processed all pending frames and
     /// exited. The [`mpsc::Sender`] must be dropped *before* calling this,
     /// otherwise the thread will never see the channel close.
-    pub fn join(mut self) {
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+    pub fn join(mut self) -> std::io::Result<()> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::other("terminal writer thread panicked")),
         }
+    }
+    pub fn writer_sync(&self) -> &WriterSync {
+        &self.sync
     }
 }
 impl Drop for WriterThread {
@@ -190,25 +269,47 @@ impl Drop for WriterThread {
         }
     }
 }
+fn write_payload(
+    writer: &mut impl Write,
+    payload: &WriterPayload,
+    sync: &WriterSync,
+) -> std::io::Result<()> {
+    match writer
+        .write_all(&payload.data)
+        .and_then(|()| writer.flush())
+    {
+        Ok(()) => {
+            sync.mark_written(payload.sequence);
+            Ok(())
+        }
+        Err(error) => {
+            sync.mark_failed(std::io::Error::new(error.kind(), error.to_string()));
+            Err(error)
+        }
+    }
+}
 /// Spawn a background OS thread that writes frame data to stderr.
 ///
-/// Returns `(Sender, WriterSync, WriterThread)`. Send `Vec<u8>` frame data
-/// through the sender; the thread writes each frame to stderr via a 64 KiB
-/// `BufWriter`. The [`WriterSync`] must be shared with every [`TermWriter`]
-/// built on the sender so [`WriterSync::wait_drained`] tracks the queue.
-/// Drop the sender to signal the thread to exit, then call
-/// [`WriterThread::join`] to wait for it.
-pub fn spawn_writer_thread() -> (mpsc::Sender<Vec<u8>>, WriterSync, WriterThread) {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let sync = WriterSync::new();
+/// Returns the frame sender, shared writer state, completion-event receiver,
+/// and the thread handle that must be joined during terminal teardown.
+pub fn spawn_writer_thread() -> (
+    WriterSender,
+    WriterSync,
+    tokio::sync::mpsc::UnboundedReceiver<WriterEvent>,
+    WriterThread,
+) {
+    let (tx, rx) = mpsc::channel::<WriterPayload>();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sync = WriterSync::with_event_sender(event_tx);
     let thread_sync = sync.clone();
+    let writer_thread_sync = sync.clone();
     let test_delay = std::env::var("GROK_TEST_FRAME_WRITE_DELAY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis);
     let handle = std::thread::Builder::new()
         .name("term-writer".into())
-        .spawn(move || {
+        .spawn(move || -> std::io::Result<()> {
             #[cfg(not(windows))]
             let mut writer: Box<dyn std::io::Write> = {
                 let tui_out = xai_tty_utils::dup_tui_stderr().unwrap_or_else(|_| {
@@ -223,24 +324,33 @@ pub fn spawn_writer_thread() -> (mpsc::Sender<Vec<u8>>, WriterSync, WriterThread
                 64 * 1024,
                 std::io::stderr(),
             ));
-            while let Ok(data) = rx.recv() {
+            while let Ok(payload) = rx.recv() {
                 if let Some(delay) = test_delay {
                     std::thread::sleep(delay);
                 }
-                {
+                let result = {
                     let _guard = xai_grok_shared::stderr::stderr_lock();
-                    let _ = writer.write_all(&data);
-                    let _ = writer.flush();
+                    write_payload(&mut writer, &payload, &thread_sync)
+                };
+                if let Err(error) = result {
+                    tracing::error!(% error, "terminal output failed");
+                    return Err(error);
                 }
-                thread_sync.mark_written();
+            }
+            if thread_sync.failed() {
+                Err(std::io::Error::other("terminal output failed"))
+            } else {
+                Ok(())
             }
         })
         .expect("failed to spawn term-writer thread");
     (
         tx,
         sync,
+        event_rx,
         WriterThread {
             handle: Some(handle),
+            sync: writer_thread_sync,
         },
     )
 }
@@ -386,8 +496,10 @@ mod tests {
             frame.render_widget(Paragraph::new("hello world"), frame.area());
             (None, None)
         }
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let backend = CrosstermBackend::new(TermWriter::new(tx, WriterSync::new()));
+        let (tx, rx) = mpsc::channel::<WriterPayload>();
+        let backend = CrosstermBackend::new(
+            TermWriter::new(tx, WriterSync::new()).expect("single test writer"),
+        );
         let mut terminal = xai_ratatui_inline::Terminal::with_options(
             backend,
             TerminalOptions {
@@ -397,10 +509,10 @@ mod tests {
         .expect("build terminal");
         let mut cursor = CursorState::new();
         draw_frame(&mut terminal, &mut cursor, render);
-        let first: Vec<u8> = rx.try_iter().flatten().collect();
+        let first: Vec<u8> = rx.try_iter().flat_map(|payload| payload.data).collect();
         assert!(!first.is_empty(), "first frame should emit bytes");
         draw_frame(&mut terminal, &mut cursor, render);
-        let second: Vec<u8> = rx.try_iter().flatten().collect();
+        let second: Vec<u8> = rx.try_iter().flat_map(|payload| payload.data).collect();
         assert!(
             second.is_empty(),
             "idle (unchanged) frame must emit 0 bytes, got {}: {:?}",
@@ -408,41 +520,127 @@ mod tests {
             String::from_utf8_lossy(&second),
         );
     }
-    /// `wait_drained` semantics: drained when `written` has caught up with
-    /// `queued` — immediately when nothing is pending, after the consumer
-    /// marks the frame written, and a bounded `false` when it never does.
-    /// This is the happens-before the suspend path relies on so no queued
-    /// frame can race a tty-taking `$EDITOR` / `$PAGER` child.
     #[test]
-    fn writer_sync_drains_when_written_catches_queued() {
-        let sync = WriterSync::new();
-        assert!(sync.wait_drained(Duration::from_millis(1)));
-        sync.mark_queued();
-        assert!(!sync.is_drained());
-        assert!(!sync.wait_drained(Duration::from_millis(5)));
-        let consumer_sync = sync.clone();
-        let consumer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            consumer_sync.mark_written();
-        });
-        assert!(sync.wait_drained(Duration::from_secs(5)));
-        consumer.join().expect("consumer thread");
+    fn writer_success_is_acknowledged_after_flush() {
+        let (sync, mut events) = WriterSync::new_for_test();
+        let sequence = sync.reserve_sequence();
+        let payload = WriterPayload {
+            sequence,
+            data: b"frame bytes".to_vec(),
+        };
+        let mut sink = Vec::new();
+        write_payload(&mut sink, &payload, &sync).expect("write payload");
+        assert_eq!(sink, b"frame bytes");
+        assert_eq!(sync.written(), sequence);
+        assert!(
+            matches!(events.try_recv(), Ok(WriterEvent::Written(written)) if written ==
+            sequence)
+        );
+        assert_eq!(
+            sync.wait_drained(Duration::from_secs(1)).unwrap(),
+            WriterDrain::Drained
+        );
     }
-    /// A `TermWriter::flush` with buffered bytes marks the frame queued; the
-    /// writer-thread side marking it written restores the drained state.
     #[test]
-    fn term_writer_flush_marks_queued() {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    fn writer_flush_failure_is_not_acknowledged() {
+        struct FlushFailWriter {
+            data: Vec<u8>,
+        }
+        impl Write for FlushFailWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.data.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush failed"))
+            }
+        }
+        let (sync, mut events) = WriterSync::new_for_test();
+        let sequence = sync.reserve_sequence();
+        let payload = WriterPayload {
+            sequence,
+            data: b"frame bytes".to_vec(),
+        };
+        let mut sink = FlushFailWriter { data: Vec::new() };
+        assert!(write_payload(&mut sink, &payload, &sync).is_err());
+        assert_eq!(sink.data, b"frame bytes");
+        assert_eq!(sync.written(), 0);
+        assert!(sync.failed());
+        assert!(matches!(events.try_recv(), Ok(WriterEvent::Failed(_))));
+    }
+    #[test]
+    fn writer_failure_is_not_acknowledged() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("write failed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (sync, mut events) = WriterSync::new_for_test();
+        let sequence = sync.reserve_sequence();
+        let payload = WriterPayload {
+            sequence,
+            data: b"frame bytes".to_vec(),
+        };
+        assert!(write_payload(&mut FailingWriter, &payload, &sync).is_err());
+        assert_eq!(sync.written(), 0);
+        assert!(sync.failed());
+        assert!(matches!(events.try_recv(), Ok(WriterEvent::Failed(_))));
+        assert!(sync.wait_drained(Duration::from_secs(1)).is_err());
+    }
+    #[test]
+    fn writer_drain_timeout_is_bounded_and_retryable() {
         let sync = WriterSync::new();
-        let mut writer = TermWriter::new(tx, sync.clone());
+        let sequence = sync.reserve_sequence();
+        let started = Instant::now();
+        assert_eq!(
+            sync.wait_drained(Duration::from_millis(5)).unwrap(),
+            WriterDrain::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        sync.mark_written(sequence);
+        assert_eq!(
+            sync.wait_drained(Duration::ZERO).unwrap(),
+            WriterDrain::Drained
+        );
+    }
+    #[test]
+    fn term_writer_send_failure_is_published_and_not_acknowledged() {
+        let (tx, rx) = mpsc::channel::<WriterPayload>();
+        drop(rx);
+        let (sync, mut events) = WriterSync::new_for_test();
+        let mut writer = TermWriter::new(tx, sync.clone()).expect("single test writer");
+        writer.write_all(b"frame bytes").expect("buffer write");
+        assert!(writer.flush().is_err());
+        assert_eq!(sync.queued(), 1);
+        assert_eq!(sync.written(), 0);
+        assert!(matches!(events.try_recv(), Ok(WriterEvent::Failed(_))));
+    }
+    #[test]
+    fn writer_sync_rejects_multiple_live_producers() {
+        let (tx, _rx) = mpsc::channel::<WriterPayload>();
+        let sync = WriterSync::new();
+        let first = TermWriter::new(tx.clone(), sync.clone()).expect("first writer");
+        assert!(matches!(
+            TermWriter::new(tx.clone(), sync.clone()),
+            Err(WriterAlreadyActive)
+        ));
+        drop(first);
+        assert!(TermWriter::new(tx, sync).is_ok());
+    }
+    #[test]
+    fn drain_observes_reservation_before_payload_is_consumed() {
+        let (tx, rx) = mpsc::channel::<WriterPayload>();
+        let sync = WriterSync::new();
+        let mut writer = TermWriter::new(tx, sync.clone()).expect("single test writer");
+        writer.write_all(b"frame bytes").expect("buffer write");
         writer.flush().expect("flush");
-        assert!(sync.is_drained());
-        writer.write_all(b"frame bytes").expect("write");
-        writer.flush().expect("flush");
-        assert!(!sync.is_drained(), "queued frame not yet written");
-        assert_eq!(rx.try_recv().expect("frame on channel"), b"frame bytes");
-        sync.mark_written();
-        assert!(sync.is_drained());
+        assert_eq!(sync.queued(), 1);
+        assert!(!sync.is_drained());
+        assert_eq!(rx.recv().expect("payload").sequence, 1);
     }
     fn state_hidden() -> CursorState {
         CursorState { last_pos: None }

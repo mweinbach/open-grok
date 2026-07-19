@@ -104,33 +104,43 @@ impl InstallRegistry {
     ///
     /// If the registry file doesn't exist, returns an empty registry.
     pub fn load() -> Self {
-        let install_dir = Self::resolve_install_dir();
-        let registry_path = install_dir.join("registry.json");
+        Self::load_from(Self::resolve_install_dir())
+    }
 
-        match std::fs::read_to_string(&registry_path) {
-            Ok(content) => match serde_json::from_str::<InstallRegistry>(&content) {
-                Ok(mut reg) => {
-                    reg.install_dir = install_dir;
-                    reg
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %registry_path.display(),
-                        error = %e,
-                        "failed to parse install registry; starting fresh"
-                    );
-                    Self::empty(install_dir)
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::empty(install_dir),
+    /// Load the registry from an explicit install directory.
+    ///
+    /// Missing file → empty registry. Read/parse errors → empty registry after a warning.
+    pub fn load_from(install_dir: PathBuf) -> Self {
+        match Self::try_load_from(install_dir.clone()) {
+            Ok(reg) => reg,
             Err(e) => {
                 tracing::warn!(
-                    path = %registry_path.display(),
+                    path = %install_dir.join("registry.json").display(),
                     error = %e,
-                    "failed to read install registry; starting fresh"
+                    "failed to load install registry; starting fresh"
                 );
                 Self::empty(install_dir)
             }
+        }
+    }
+
+    /// Fallible load: missing `registry.json` is empty; read/parse errors are `Err`.
+    pub fn try_load_from(install_dir: PathBuf) -> Result<Self, InstallError> {
+        let registry_path = install_dir.join("registry.json");
+        match std::fs::read_to_string(&registry_path) {
+            Ok(content) => {
+                let mut reg: InstallRegistry =
+                    serde_json::from_str(&content).map_err(|e| InstallError::Json {
+                        detail: e.to_string(),
+                    })?;
+                reg.install_dir = install_dir;
+                Ok(reg)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty(install_dir)),
+            Err(e) => Err(InstallError::Io {
+                path: registry_path,
+                source: e,
+            }),
         }
     }
 

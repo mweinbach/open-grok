@@ -2584,6 +2584,7 @@ impl acp::Agent for MvpAgent {
                 traceparent: xai_file_utils::trace_context::current_traceparent(),
                 json_schema,
                 send_now,
+                admission: None,
                 respond_to: tx,
                 persist_ack: None,
                 parsed_prompt_tx,

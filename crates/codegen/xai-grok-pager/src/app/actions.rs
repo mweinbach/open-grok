@@ -540,6 +540,8 @@ pub enum Action {
     SetTimestamps(bool),
     /// Set timeline sidebar visibility (per-turn tick rail).
     SetTimeline(bool),
+    /// Set `[ui].page_flip_on_send` (default ON). Persists via `Effect::PersistSetting`.
+    SetPageFlipOnSend(bool),
     /// Set simple mode (ASCII / minimal glyphs). Persists via `Effect::PersistSetting`.
     SetSimpleMode(bool),
     /// Set the per-tip contextual-hint user config (`[ui.contextual_hints]`).
@@ -853,8 +855,6 @@ pub enum Action {
     DashboardCommitRename,
     /// Cancel an in-progress rename without committing.
     DashboardCancelRename,
-    /// Apply a single keystroke to the in-progress rename draft.
-    DashboardRenameInput(String),
     /// Stop / kill the selected row (top-level: cancel turn → close;
     /// subagent: kill). Double-press protected for top-level rows.
     DashboardStop,
@@ -2004,6 +2004,8 @@ pub enum Effect {
         agent_id: AgentId,
         session_id: acp::SessionId,
         question: String,
+        /// Correlates minimal responses; fullscreen leaves this unset.
+        minimal_request_id: Option<uuid::Uuid>,
     },
     /// Request a session recap via the x.ai/recap ext method. Fire-and-forget:
     /// the recap arrives later as a `SessionRecap` notification.
@@ -2062,8 +2064,8 @@ pub enum Effect {
         method_id: acp::AuthMethodId,
         use_oauth: bool,
     },
-    /// Clear the "copied!" feedback after a delay.
-    ScheduleClearAuthCopied,
+    /// Clear the auth copy feedback after a delay if its generation is still current.
+    ScheduleClearAuthCopyFeedback { generation: u64 },
     /// Register the current session in the active-sessions crash-recovery
     /// registry (`~/.opengrok/active_sessions.json`).
     RegisterActiveSession {
@@ -2769,6 +2771,8 @@ pub enum TaskResult {
     BtwResponse {
         agent_id: AgentId,
         result: Result<String, String>,
+        /// Correlates minimal responses; fullscreen leaves this unset.
+        minimal_request_id: Option<uuid::Uuid>,
     },
     /// `x.ai/recap` request acknowledged (fire-and-forget). The recap itself
     /// arrives separately as a `SessionRecap` notification; this only carries
@@ -2846,8 +2850,10 @@ pub enum TaskResult {
     GateVerifyTimeout {
         generation: u64,
     },
-    /// The 2-second "copied!" display timer expired.
-    AuthCopiedTimeout,
+    /// The 2-second auth copy feedback timer expired.
+    AuthCopyFeedbackTimeout {
+        generation: u64,
+    },
     DeepSearchResults {
         results: Vec<xai_grok_shell::extensions::session_search::SearchSessionHit>,
         seq: u64,

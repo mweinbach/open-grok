@@ -72,7 +72,7 @@ pub(crate) fn parse_output(output: &std::process::Output) -> anyhow::Result<Grok
         organization_role: None,
         user_blocked_reason: None,
         team_blocked_reasons: vec![],
-        coding_data_retention_opt_out: false,
+        coding_data_retention_opt_out: crate::auth::default_coding_data_retention_opt_out(),
         has_grok_code_access: None,
         refresh_token,
         expires_at,

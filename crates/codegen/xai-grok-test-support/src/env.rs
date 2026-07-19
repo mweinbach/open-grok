@@ -155,6 +155,14 @@ pub fn test_env_cmd_tokio(
     mock_url: &str,
     home: &std::path::Path,
 ) {
+    for key in [
+        "MOONSHOT_API_KEY",
+        "KIMI_CODE_API_KEY",
+        "KIMI_API_KEY",
+        "OPENAI_API_KEY",
+    ] {
+        cmd.env_remove(key);
+    }
     cmd.env("HOME", home)
         // HOME alone does not sandbox grok on Windows: the product resolves
         // `~` via `USERPROFILE`/Known Folders (`std::env::home_dir()`), so

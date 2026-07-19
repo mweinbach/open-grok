@@ -30,8 +30,15 @@ impl AgentView {
             self.last_seen_event_id = None;
             self.last_applied_event_seq = None;
             self.last_applied_xai_event_seq = None;
+            self.clear_minimal_btw_lifecycle();
         }
         self.session.session_id = Some(session_id);
+    }
+    /// Unbind this view from its current session identity.
+    pub(crate) fn unbind_session_id(&mut self) {
+        if self.session.session_id.take().is_some() {
+            self.clear_minimal_btw_lifecycle();
+        }
     }
     /// Record a prompt id this client originated (sent to the agent as the turn
     /// driver). Used by the ACP gate to keep `attached_as_viewer` per-turn
@@ -97,12 +104,10 @@ impl AgentView {
             auto_topup: None,
             goal_state: None,
             parked_wait_marker_for: None,
-            end_work_announced: false,
             pending_stop_hooks: None,
             last_cleared_goal_id: None,
             show_goal_detail: false,
             turn_start_ms: None,
-            wake_turn_start: None,
             turn_started_at: None,
             first_activity_logged_for: None,
             turn_paused_duration: std::time::Duration::ZERO,
@@ -203,6 +208,7 @@ impl AgentView {
             agents_modal: None,
             persona_detail: None,
             btw_state: None,
+            minimal_btw_lifecycle: None,
             btw_focused: false,
             hit_btw_close: Default::default(),
             toast: None,
@@ -314,18 +320,21 @@ impl AgentView {
         self.turn_paused_duration = std::time::Duration::ZERO;
         self.last_active_at = Some(Instant::now());
     }
+    /// Invalidate and clear a minimal `/btw` lifecycle at a session boundary.
+    pub(crate) fn clear_minimal_btw_lifecycle(&mut self) {
+        crate::minimal_api::clear_minimal_btw(self);
+    }
     /// Enter a `session/load` replay window: flip `loading_replay` on and reset
     /// every field coupled to that transition together, so no site can drift
     /// (e.g. reset one coupled field but miss another). Called at every
     /// replay-window entry: the fresh/restore load ctor paths and the
     /// reconnect/fork reuse paths.
     pub(crate) fn begin_replay_window(&mut self) {
+        self.clear_minimal_btw_lifecycle();
         self.session.loading_replay = true;
         self.replayed_terminal_prompts.clear();
         self.unexpected_replay_drops = 0;
         self.pending_stop_hooks = None;
-        self.end_work_announced = false;
-        self.wake_turn_start = None;
         self.clear_send_now_expectation();
         self.optimistic_queue_ids.clear();
         self.send_now_awaiting_confirm = None;
@@ -398,14 +407,11 @@ impl AgentView {
             reload.saw_todo_update = true;
         }
     }
-    /// Start a locally-tracked turn: close the between-turns status window
-    /// (completions inside a turn push chips only), then enter TurnRunning.
-    /// Every real turn start must route through here so no caller can miss
-    /// the close. Deliberately NOT used by server-initiated synthetic turns
-    /// (auto-wake / actor runs): they never call `start_turn`, and their
-    /// completions still deserve status lines.
+    /// Start a locally-tracked turn: enter TurnRunning with the turn-scoped
+    /// bookkeeping every real turn start must apply, so no caller can miss
+    /// it. Deliberately NOT used by server-initiated synthetic turns
+    /// (auto-wake / actor runs): they never call `start_turn`.
     pub(crate) fn start_turn_boundary(&mut self, starting_prompt_id: Option<&str>) {
-        self.end_work_announced = false;
         if self
             .expect_send_now_cancel
             .as_deref()
@@ -1337,24 +1343,34 @@ mod resolve_turn_activity_tests {
 mod status_window_tests {
     use super::super::test_agent_view;
     #[test]
-    fn start_turn_boundary_closes_status_window() {
+    fn start_turn_boundary_enters_turn_running() {
         let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
-        agent.end_work_announced = true;
         agent.start_turn_boundary(None);
-        assert!(
-            !agent.end_work_announced,
-            "a real turn start closes the between-turns status window"
-        );
         assert!(agent.session.state.is_turn_running());
     }
     #[test]
-    fn begin_replay_window_closes_status_window() {
+    fn session_rebind_and_replay_invalidate_minimal_btw() {
         let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
-        agent.end_work_announced = true;
+        let old_request = crate::minimal_api::start_minimal_btw(&mut agent, "old question".into());
+        agent.bind_session_id(agent_client_protocol::SessionId::new("s2"));
+        assert!(agent.btw_state.is_none());
+        assert!(agent.minimal_btw_lifecycle.is_none());
+        assert!(!crate::minimal_api::finish_minimal_btw(
+            &mut agent,
+            old_request,
+            Ok("old answer".into())
+        ));
+        assert!(agent.btw_state.is_none());
+        let replay_request =
+            crate::minimal_api::start_minimal_btw(&mut agent, "pre-replay question".into());
         agent.begin_replay_window();
-        assert!(
-            !agent.end_work_announced,
-            "a replay window closes the between-turns status window"
-        );
+        assert!(agent.btw_state.is_none());
+        assert!(agent.minimal_btw_lifecycle.is_none());
+        assert!(!crate::minimal_api::finish_minimal_btw(
+            &mut agent,
+            replay_request,
+            Ok("pre-replay answer".into())
+        ));
+        assert!(agent.btw_state.is_none());
     }
 }

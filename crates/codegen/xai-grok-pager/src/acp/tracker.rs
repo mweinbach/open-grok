@@ -854,6 +854,7 @@ impl AcpUpdateTracker {
         self.retry_activity = None;
         self.suppressed_tools.clear();
         self.blocking_waits.clear();
+        self.orphan_updates.clear();
         self.skip_next_skill_body = false;
     }
     /// Finish the current thinking block, passing elapsed time to the entry.
@@ -2925,10 +2926,22 @@ mod tests {
         tracker.handle_update(thought_chunk("thinking"), &meta(), &mut sb);
         assert!(tracker.current_agent_msg.is_some());
         assert!(tracker.current_thinking.is_some());
+        tracker.handle_update(tool_update_completed("tc-orphan"), &meta(), &mut sb);
+        assert_eq!(tracker.orphan_updates.len(), 1);
+        tracker.task_tool_background.insert("task-x".into(), true);
         tracker.finish_turn(&mut sb);
         assert!(tracker.current_agent_msg.is_none());
         assert!(tracker.current_thinking.is_none());
         assert!(tracker.pending_tools.is_empty());
+        assert!(
+            tracker.orphan_updates.is_empty(),
+            "orphaned tool-call updates are turn-scoped"
+        );
+        assert_eq!(
+            tracker.task_tool_background.get("task-x"),
+            Some(&true),
+            "background Task flags survive turn end for the late SubagentSpawned"
+        );
         assert!(
             !sb.needs_animation(),
             "no entries should be running after finish_turn"

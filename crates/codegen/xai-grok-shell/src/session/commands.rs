@@ -40,7 +40,7 @@ pub enum PromptCompletionKind {
     /// every attached leader-mode client the *running* turn ended) and the
     /// roster `Idle` delta (which would flip the dashboard off `Working` while
     /// the real turn is still in flight) must be skipped. See
-    /// `MvpAgent::prompt`'s short-circuit and `respond_removed_queued_prompt`.
+    /// `MvpAgent::prompt`'s short-circuit and `respond_removed_prompt`.
     RemovedFromQueue,
 }
 /// Successful prompt/turn payload returned to the ACP layer and trace uploaders.
@@ -143,14 +143,28 @@ pub enum NotificationPriority {
 #[derive(Debug, Clone)]
 pub enum NotificationSource {
     MonitorEvent { task_id: String },
+    MonitorCompleted { task_id: String },
     BashTaskCompleted { task_id: String },
 }
 impl NotificationSource {
     pub fn task_id(&self) -> &str {
         match self {
-            Self::MonitorEvent { task_id } | Self::BashTaskCompleted { task_id } => task_id,
+            Self::MonitorEvent { task_id }
+            | Self::MonitorCompleted { task_id }
+            | Self::BashTaskCompleted { task_id } => task_id,
         }
     }
+}
+#[derive(Debug)]
+pub struct TaskWakeFallback {
+    pub prompt_id: String,
+    pub prompt_blocks: Vec<acp::ContentBlock>,
+    pub source: NotificationSource,
+}
+#[derive(Debug)]
+pub struct TaskWakeAdmission {
+    pub respond_to: oneshot::Sender<bool>,
+    pub fallback: TaskWakeFallback,
 }
 pub enum SessionCommand {
     Initialize {
@@ -191,6 +205,8 @@ pub enum SessionCommand {
         /// Also derived server-side during an interruptible wait (see
         /// [`SessionActor::queue_input`]).
         send_now: bool,
+        /// Actor-authoritative admission and deferred fallback for terminal task wakes.
+        admission: Option<TaskWakeAdmission>,
         respond_to: oneshot::Sender<PromptTurnResult>,
         /// Optional oneshot fired after the user message has been appended to
         /// chat history and a persistence flush barrier has completed, before
@@ -621,10 +637,10 @@ pub enum SessionCommand {
     },
     /// Cancel the running turn. `kill_background_tasks` distinguishes a hard
     /// teardown (subagent shutdown — drains the whole queue) from a normal
-    /// interactive cancel (Ctrl+C — preserves the queued prompts so the next
-    /// one auto-runs). On an interactive cancel only the running turn (the front
-    /// of `pending_inputs`) is torn down; the follow-up `maybe_start_running_task`
-    /// promotes the new front so the user's next queued prompt auto-runs.
+    /// interactive cancel (Ctrl+C — preserves queued user prompts so the next
+    /// one auto-runs). Ctrl+C tears down the running turn and queued terminal
+    /// task-completion wakes; other cancel triggers tear down only the running
+    /// turn. The follow-up `maybe_start_running_task` promotes the next item.
     Cancel {
         cancel_subagents: bool,
         kill_background_tasks: bool,

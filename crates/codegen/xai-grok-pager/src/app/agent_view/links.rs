@@ -1553,8 +1553,16 @@ mod link_click_tests {
         let registry = ActionRegistry::defaults();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let outcome = agent.handle_scrollback_key(&enter, &registry);
-        assert!(matches!(outcome, InputOutcome::Changed), "got {outcome:?}");
-        assert!(agent.inline_edit.is_some(), "Enter must start inline edit");
+        if crate::app::inline_edit::INLINE_EDIT_ENABLED {
+            assert!(matches!(outcome, InputOutcome::Changed), "got {outcome:?}");
+            assert!(agent.inline_edit.is_some(), "Enter must start inline edit");
+        } else {
+            assert!(agent.inline_edit.is_none(), "feature gated off: no edit");
+            assert!(
+                matches!(outcome, InputOutcome::Action(Action::OpenBlockViewer)),
+                "gated off: Enter must fall through to OpenBlockViewer, got {outcome:?}"
+            );
+        }
     }
     /// Bash prompts are not inline-editable: Enter falls through to the
     /// registry (OpenBlockViewer) exactly as before.
@@ -1575,8 +1583,10 @@ mod link_click_tests {
             "expected fall-through to OpenBlockViewer, got {outcome:?}"
         );
     }
-    /// Double-click on a user prompt enters inline edit mode (replacing the
-    /// old fold-toggle for editable prompts).
+    /// Double-click on a user prompt: enters inline edit when the feature is
+    /// enabled; while gated off it does NOT edit (falls through to the fold
+    /// arm), leaving the prompt free for text selection. Written for both flag
+    /// states so it stays valid when INLINE_EDIT_ENABLED is flipped back on.
     #[test]
     fn double_click_on_user_prompt_enters_inline_edit() {
         let mut agent = make_agent();
@@ -1592,10 +1602,17 @@ mod link_click_tests {
         let now = std::time::Instant::now();
         (agent.last_click, _) = agent.handle_scrollback_click(now, 0, false);
         let _ = agent.handle_scrollback_click(now + std::time::Duration::from_millis(10), 0, false);
-        assert!(
-            agent.inline_edit.is_some(),
-            "double-click must start inline edit"
-        );
+        if crate::app::inline_edit::INLINE_EDIT_ENABLED {
+            assert!(
+                agent.inline_edit.is_some(),
+                "double-click must start inline edit"
+            );
+        } else {
+            assert!(
+                agent.inline_edit.is_none(),
+                "feature gated off: double-click must not edit"
+            );
+        }
     }
     #[test]
     fn enter_on_subagent_group_header_falls_through_to_group_toggle() {

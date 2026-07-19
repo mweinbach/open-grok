@@ -432,28 +432,6 @@ mod tests {
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
-    struct HomeGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => unsafe {
-                    std::env::set_var("HOME", previous);
-                },
-                None => unsafe {
-                    std::env::remove_var("HOME");
-                },
-            }
-        }
-    }
-    fn with_bundled_home(tmp: &TempDir) -> HomeGuard {
-        let previous = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-        }
-        HomeGuard { previous }
-    }
     fn sample_bundle() -> SubagentBundle {
         let mut bundle = SubagentBundle::empty("bundle-v1");
         bundle.personas.insert(
@@ -588,8 +566,8 @@ mod tests {
     #[serial]
     fn status_reports_no_cache_when_manifest_missing() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let status = status_bundle_at(&bundle::bundled_root()).unwrap();
+        let root = tmp.path().join("bundled");
+        let status = status_bundle_at(&root).unwrap();
         assert_eq!(
             status,
             BundleStatusResult {
@@ -608,15 +586,14 @@ mod tests {
     #[serial]
     fn status_reports_cached_entries_from_manifest_and_disk() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let root = bundle::bundled_root();
+        let root = tmp.path().join("bundled");
         bundle::write_bundle_to_cache(&root, &sample_bundle()).unwrap();
         std::fs::write(
             root.join("personas/local-only.toml"),
             "instructions = \"ignore\"",
         )
         .unwrap();
-        let status = status_bundle_at(&bundle::bundled_root()).unwrap();
+        let status = status_bundle_at(&root).unwrap();
         assert!(status.has_cache);
         assert_eq!(status.version.as_deref(), Some("bundle-v1"));
         assert_eq!(status.personas, vec!["researcher"]);
@@ -628,14 +605,13 @@ mod tests {
     #[serial]
     async fn sync_success_writes_cache_and_returns_counts() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
+        let root = tmp.path().join("bundled");
         let bundle = sample_bundle();
         let (proxy_base_url, _seen_headers, server) = start_bundle_server(
             axum::http::StatusCode::OK,
             serde_json::to_value(&bundle).unwrap(),
         )
         .await;
-        let root = bundle::bundled_root();
         let am = test_auth_manager();
         let result = sync_bundle_to_root(&root, &proxy_base_url, Some(&am), None, None, false)
             .await
@@ -654,11 +630,10 @@ mod tests {
     #[serial]
     async fn sync_force_true_has_same_write_semantics() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
+        let root = tmp.path().join("bundled");
         let bundle = sample_bundle();
         let (proxy_base_url, _seen_headers, server) =
             start_bundle_server(StatusCode::OK, serde_json::to_value(&bundle).unwrap()).await;
-        let root = bundle::bundled_root();
         let am = test_auth_manager();
         let normal = sync_bundle_to_root(&root, &proxy_base_url, Some(&am), None, None, false)
             .await
@@ -673,23 +648,16 @@ mod tests {
     #[serial]
     async fn sync_http_failure_surfaces_error() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
+        let root = tmp.path().join("bundled");
         let (proxy_base_url, _seen_headers, server) = start_bundle_server(
             StatusCode::UNAUTHORIZED,
             serde_json::json!({ "error" : "unauthorized" }),
         )
         .await;
         let am = test_auth_manager();
-        let error = sync_bundle_to_root(
-            &bundle::bundled_root(),
-            &proxy_base_url,
-            Some(&am),
-            None,
-            None,
-            false,
-        )
-        .await
-        .unwrap_err();
+        let error = sync_bundle_to_root(&root, &proxy_base_url, Some(&am), None, None, false)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("401"));
         server.abort();
     }
@@ -697,13 +665,13 @@ mod tests {
     #[serial]
     async fn sync_uses_deployment_key_auth_mode() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
+        let root = tmp.path().join("bundled");
         let bundle = sample_bundle();
         let (proxy_base_url, seen_headers, server) =
             start_bundle_server(StatusCode::OK, serde_json::to_value(&bundle).unwrap()).await;
         let am = test_auth_manager();
         let result = sync_bundle_to_root(
-            &bundle::bundled_root(),
+            &root,
             &proxy_base_url,
             Some(&am),
             Some("deploy-key"),
@@ -726,8 +694,7 @@ mod tests {
     #[serial]
     fn status_only_reports_bundled_cache_not_higher_priority_sources() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let root = bundle::bundled_root();
+        let root = tmp.path().join("bundled");
         bundle::write_bundle_to_cache(&root, &sample_bundle()).unwrap();
         let project_root = tmp.path().join("workspace");
         std::fs::create_dir_all(project_root.join(".opengrok/personas")).unwrap();
@@ -742,23 +709,26 @@ mod tests {
             "description = \"project role\"\n",
         )
         .unwrap();
-        let config = crate::config::SubagentsConfig::resolve(
+        let base = crate::config::SubagentsConfig::resolve_base_with_sources(
             false,
             &toml::Value::Table(Default::default()),
-            Some(&project_root),
+            None,
+            &root,
+        );
+        let (roles, personas) = crate::config::SubagentsConfig::effective_definition_maps(
+            &base.roles,
+            &base.personas,
+            &project_root,
+            true,
         );
         assert_eq!(
-            config
-                .personas
+            personas
                 .get("researcher")
                 .and_then(|persona| persona.instructions.as_deref()),
             Some("project persona")
         );
         assert_eq!(
-            config
-                .roles
-                .get("reviewer")
-                .map(|role| role.description.as_str()),
+            roles.get("reviewer").map(|role| role.description.as_str()),
             Some("project role")
         );
         let status = status_bundle_at(&root).unwrap();
@@ -771,9 +741,9 @@ mod tests {
     #[serial]
     fn sync_requires_auth_or_deployment_key() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
+        let root = tmp.path().join("bundled");
         let error = futures::executor::block_on(sync_bundle_to_root(
-            &bundle::bundled_root(),
+            &root,
             "http://127.0.0.1:1/v1",
             None,
             None,
@@ -790,8 +760,7 @@ mod tests {
     #[serial]
     fn get_entry_reads_persona_file() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let root = bundle::bundled_root();
+        let root = tmp.path().join("bundled");
         bundle::write_bundle_to_cache(&root, &sample_bundle()).unwrap();
         let result = get_entry_at(&root, "persona", "researcher").unwrap();
         assert_eq!(result.kind, "persona");
@@ -802,8 +771,7 @@ mod tests {
     #[serial]
     fn get_entry_unknown_kind_returns_error() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let root = bundle::bundled_root();
+        let root = tmp.path().join("bundled");
         let err = get_entry_at(&root, "widget", "foo").unwrap_err();
         assert!(err.to_string().contains("unknown entry kind: widget"));
     }
@@ -811,8 +779,7 @@ mod tests {
     #[serial]
     fn get_entry_missing_file_returns_error() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let root = bundle::bundled_root();
+        let root = tmp.path().join("bundled");
         bundle::write_bundle_to_cache(&root, &sample_bundle()).unwrap();
         let err = get_entry_at(&root, "persona", "nonexistent").unwrap_err();
         assert!(err.to_string().contains("not found in bundle cache"));
@@ -840,8 +807,7 @@ mod tests {
     #[serial]
     fn status_includes_persona_and_role_details() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let root = bundle::bundled_root();
+        let root = tmp.path().join("bundled");
         bundle::write_bundle_to_cache(&root, &sample_bundle()).unwrap();
         let status = status_bundle_at(&root).unwrap();
         assert_eq!(status.persona_details.len(), 1);
@@ -862,8 +828,7 @@ mod tests {
     #[serial]
     fn status_without_toml_files_returns_empty_details() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let root = bundle::bundled_root();
+        let root = tmp.path().join("bundled");
         let mut bundle = SubagentBundle::empty("v1");
         bundle
             .personas
@@ -912,12 +877,12 @@ mod tests {
     #[serial]
     async fn sync_with_skills_reports_skills_count() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
+        let root = tmp.path().join("bundled");
         let bundle = sample_bundle_with_skills();
         let (proxy_base_url, _seen_headers, server) =
             start_bundle_server(StatusCode::OK, serde_json::to_value(&bundle).unwrap()).await;
         let result = sync_bundle_to_root(
-            &bundle::bundled_root(),
+            &root,
             &proxy_base_url,
             Some(&test_auth_manager()),
             None,
@@ -936,8 +901,7 @@ mod tests {
     #[serial]
     fn status_lists_skill_names_from_manifest() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let root = bundle::bundled_root();
+        let root = tmp.path().join("bundled");
         bundle::write_bundle_to_cache(&root, &sample_bundle_with_skills()).unwrap();
         let status = status_bundle_at(&root).unwrap();
         assert!(status.has_cache);
@@ -948,8 +912,7 @@ mod tests {
     #[serial]
     fn status_skills_only_lists_files_present_on_disk() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
-        let root = bundle::bundled_root();
+        let root = tmp.path().join("bundled");
         bundle::write_bundle_to_cache(&root, &sample_bundle_with_skills()).unwrap();
         std::fs::remove_file(root.join("skills/commit/SKILL.md")).unwrap();
         let status = status_bundle_at(&root).unwrap();
@@ -981,7 +944,7 @@ mod tests {
     #[serial]
     async fn sync_with_archive_endpoint_extracts_and_reports_counts() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
+        let root = tmp.path().join("bundled");
         let archive = make_test_archive(&[
             ("bundle.json", br#"{"version":"archive-v1"}"#),
             (
@@ -993,7 +956,7 @@ mod tests {
         ]);
         let (proxy_base_url, server) = start_archive_bundle_server(archive).await;
         let result = sync_bundle_to_root(
-            &bundle::bundled_root(),
+            &root,
             &proxy_base_url,
             Some(&test_auth_manager()),
             None,
@@ -1007,28 +970,20 @@ mod tests {
         assert_eq!(result.roles_count, 1);
         assert_eq!(result.agents_count, 0);
         assert_eq!(result.skills_count, 1);
-        assert!(
-            bundle::bundled_root()
-                .join("personas/researcher.toml")
-                .exists()
-        );
-        assert!(
-            bundle::bundled_root()
-                .join("skills/commit/SKILL.md")
-                .exists()
-        );
+        assert!(root.join("personas/researcher.toml").exists());
+        assert!(root.join("skills/commit/SKILL.md").exists());
         server.abort();
     }
     #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn sync_falls_back_to_legacy_when_archive_unavailable() {
         let tmp = TempDir::new().unwrap();
-        let _home = with_bundled_home(&tmp);
+        let root = tmp.path().join("bundled");
         let bundle = sample_bundle_with_skills();
         let (proxy_base_url, _seen_headers, server) =
             start_bundle_server(StatusCode::OK, serde_json::to_value(&bundle).unwrap()).await;
         let result = sync_bundle_to_root(
-            &bundle::bundled_root(),
+            &root,
             &proxy_base_url,
             Some(&test_auth_manager()),
             None,

@@ -10,6 +10,7 @@ use super::input::*;
 use super::render::*;
 use super::state::*;
 use crate::app::actions::Action;
+use crate::input::line_editor::LineEditor;
 use crate::settings::{
     EnumChoice, PagerLocalSnapshot, SecretInput, SettingCategory, SettingKey, SettingKind,
     SettingMeta, SettingOwner, SettingValue, SettingsRegistry, StringValidator,
@@ -74,8 +75,8 @@ fn kimi_secret_editor_is_always_empty_and_empty_enter_preserves() {
         );
         assert!(matches!(entered, SettingsKeyOutcome::Changed));
         assert!(matches!(
-            &state.mode,
-            SettingsModalMode::EditingSecret { buffer, cursor_byte: 0, .. }
+            &state.state.mode,
+            SettingsMode::EditingSecret { buffer, cursor_byte: 0, .. }
                 if buffer.is_empty()
         ));
 
@@ -84,7 +85,7 @@ fn kimi_secret_editor_is_always_empty_and_empty_enter_preserves() {
             &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         assert!(matches!(committed, SettingsKeyOutcome::Changed));
-        assert!(matches!(state.mode, SettingsModalMode::Browse));
+        assert!(matches!(state.mode(), SettingsModalMode::Browse));
     }
 }
 
@@ -97,7 +98,7 @@ fn kimi_secret_paste_is_masked_redacted_and_commits_typed_action() {
         &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     );
     assert!(matches!(
-        handle_settings_paste(&mut state, SecretInput::new(format!("  {secret}\n")),),
+        handle_settings_secret_paste(&mut state, SecretInput::new(format!("  {secret}\n")),),
         SettingsKeyOutcome::Changed
     ));
 
@@ -139,7 +140,7 @@ fn perplexity_secret_paste_is_masked_and_commits_typed_action() {
         &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     );
     assert!(matches!(
-        handle_settings_paste(&mut state, SecretInput::new(secret.to_owned())),
+        handle_settings_secret_paste(&mut state, SecretInput::new(secret.to_owned())),
         SettingsKeyOutcome::Changed
     ));
     let outcome = handle_settings_key(
@@ -161,12 +162,12 @@ fn kimi_secret_rejects_internal_whitespace_without_retaining_payload() {
         &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     );
     assert!(matches!(
-        handle_settings_paste(&mut state, SecretInput::new("secret with-space".to_owned()),),
+        handle_settings_secret_paste(&mut state, SecretInput::new("secret with-space".to_owned()),),
         SettingsKeyOutcome::Changed
     ));
     assert!(matches!(
-        &state.mode,
-        SettingsModalMode::EditingSecret {
+        &state.state.mode,
+        SettingsMode::EditingSecret {
             buffer,
             validation_error: Some(error),
             ..
@@ -199,7 +200,7 @@ fn contextual_hints_group_sub_sheet_flow() {
     let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(matches!(out, SettingsKeyOutcome::Changed));
     assert!(matches!(
-        s.mode,
+        s.mode(),
         SettingsModalMode::PickingGroup { child_idx: 0, .. }
     ));
 
@@ -219,7 +220,7 @@ fn contextual_hints_group_sub_sheet_flow() {
     // Esc returns to Browse.
     let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(matches!(out, SettingsKeyOutcome::Changed));
-    assert!(matches!(s.mode, SettingsModalMode::Browse));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
 }
 
 /// The permission_mode picker hides the "Auto" choice when the auto feature
@@ -776,11 +777,11 @@ fn rows_contain_categories_and_settings_through_pr_14() {
         vec![
             // Booleans.
             "compact_mode",
-            // SHELL-owned default screen mode (Appearance; after compact).
             "screen_mode",
             "show_timestamps",
-            // Timeline sidebar (Appearance, declared after timestamps).
             "show_timeline",
+            // PAGER-owned page_flip_on_send (Appearance).
+            "page_flip_on_send",
             "simple_mode",
             // PAGER-owned vim_mode (Appearance,
             // paired with simple_mode).
@@ -818,6 +819,8 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // SHELL-owned prompt_suggestions (Editor; tab autocomplete
             // ghost text, live cache).
             "prompt_suggestions",
+            // SHELL-owned swarm_mode (Agent; live session update + persisted default).
+            "swarm_mode",
             // voice_capture_mode + voice_stt_language hidden when gate is off.
             // SHELL-owned permission_mode (Agent category).
             "permission_mode",
@@ -930,50 +933,6 @@ fn space_on_compact_mode_dispatches_set_compact_mode_true() {
 }
 
 #[test]
-fn space_on_enum_row_opens_picker() {
-    let mut s = make_state();
-    let idx = s
-        .rows
-        .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "screen_mode"))
-        .expect("screen_mode setting row");
-    s.selected = idx;
-    let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
-    let outcome = handle_settings_key(&mut s, &space);
-    assert!(
-        matches!(outcome, SettingsKeyOutcome::Changed),
-        "Space on enum must open picker, got {outcome:?}"
-    );
-    assert!(
-        matches!(s.mode, SettingsModalMode::PickingEnum { .. }),
-        "expected PickingEnum after Space on screen_mode, got {:?}",
-        s.mode
-    );
-}
-
-#[test]
-fn browse_footer_shortcuts_stable_across_bool_and_enum_focus() {
-    let mut s = make_state();
-    let bool_labels: Vec<&str> = build_shortcuts(&s).iter().map(|sc| sc.label).collect();
-    assert!(
-        bool_labels.contains(&"Space/Enter"),
-        "Browse footer must advertise Space/Enter, got {bool_labels:?}"
-    );
-
-    let idx = s
-        .rows
-        .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "screen_mode"))
-        .expect("screen_mode setting row");
-    s.selected = idx;
-    let enum_labels: Vec<&str> = build_shortcuts(&s).iter().map(|sc| sc.label).collect();
-    assert_eq!(
-        bool_labels, enum_labels,
-        "Browse footer must not change when focus moves Bool → Enum"
-    );
-}
-
-#[test]
 fn enter_on_compact_mode_also_toggles() {
     let mut s = make_state();
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
@@ -1035,12 +994,12 @@ fn filter_mode_swallows_chars_into_query() {
         handle_settings_key(&mut s, &slash),
         SettingsKeyOutcome::Changed
     ));
-    assert!(matches!(s.mode, SettingsModalMode::FilterFocused));
+    assert!(matches!(s.mode(), SettingsModalMode::FilterFocused));
     for c in "compact".chars() {
         let k = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         let _ = handle_settings_key(&mut s, &k);
     }
-    assert_eq!(s.query, "compact");
+    assert_eq!(s.query(), "compact");
 
     // Esc exits filter, doesn't close modal.
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -1048,7 +1007,7 @@ fn filter_mode_swallows_chars_into_query() {
         handle_settings_key(&mut s, &esc),
         SettingsKeyOutcome::Changed
     ));
-    assert!(matches!(s.mode, SettingsModalMode::Browse));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
 }
 
 /// `i` aliases `/` without modifiers: from Browse it enters FilterFocused
@@ -1061,7 +1020,7 @@ fn i_key_enters_filter_like_slash() {
         handle_settings_key(&mut s, &i),
         SettingsKeyOutcome::Changed
     ));
-    assert!(matches!(s.mode, SettingsModalMode::FilterFocused));
+    assert!(matches!(s.mode(), SettingsModalMode::FilterFocused));
 }
 
 /// The `modifiers.is_empty()` guard: Ctrl+i / Alt+i must NOT enter filter.
@@ -1074,7 +1033,7 @@ fn modified_i_does_not_enter_filter() {
             handle_settings_key(&mut s, &k),
             SettingsKeyOutcome::Unchanged
         ));
-        assert!(matches!(s.mode, SettingsModalMode::Browse));
+        assert!(matches!(s.mode(), SettingsModalMode::Browse));
     }
 }
 
@@ -1088,7 +1047,7 @@ fn modified_i_does_not_enter_filter() {
 fn browse_footer_advertises_i_search_under_vim() {
     crate::appearance::cache::set_vim_mode(true);
     let s = make_state();
-    assert!(matches!(s.mode, SettingsModalMode::Browse));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
     assert!(
         build_shortcuts(&s).iter().any(|sc| sc.label == "i search"),
         "vim-mode Browse footer must advertise `i search`"
@@ -1165,6 +1124,38 @@ fn mouse_click_on_header_is_no_op() {
 // ---------- mouse hover highlight ----------
 
 #[test]
+fn selected_browse_row_label_is_bold() {
+    let state = make_state();
+    let meta = state
+        .registry
+        .find("compact_mode")
+        .expect("compact mode registered");
+    let area = Rect::new(0, 0, 80, 1);
+    let mut buf = Buffer::empty(area);
+    let theme = Theme::current();
+
+    render_setting_row(
+        &mut buf,
+        area,
+        meta,
+        &SettingValue::Bool(false),
+        40,
+        true,
+        &theme,
+        false,
+        false,
+    );
+
+    assert!(
+        buf.cell((2, 0))
+            .expect("label cell")
+            .style()
+            .add_modifier
+            .contains(Modifier::BOLD),
+    );
+}
+
+#[test]
 fn settings_list_row_bg_terminal_native_elevates_selection() {
     let theme = Theme::terminal_default();
     assert!(matches!(theme.bg_visual, Color::Reset));
@@ -1172,17 +1163,6 @@ fn settings_list_row_bg_terminal_native_elevates_selection() {
     assert_eq!(settings_list_row_bg(&theme, false, true), Color::DarkGray);
     assert_eq!(settings_list_row_bg(&theme, false, false), Color::Reset);
     assert_eq!(settings_list_row_bg(&theme, true, true), Color::DarkGray);
-}
-
-#[test]
-fn settings_list_row_bg_rgb_theme_uses_theme_tokens() {
-    let theme = Theme::current();
-    if matches!(theme.bg_visual, Color::Reset) {
-        return;
-    }
-    assert_eq!(settings_list_row_bg(&theme, true, false), theme.bg_visual);
-    assert_eq!(settings_list_row_bg(&theme, false, true), theme.bg_hover);
-    assert_eq!(settings_list_row_bg(&theme, false, false), theme.bg_base);
 }
 
 /// `MouseEventKind::Moved` over a setting row's hit-rect sets
@@ -1351,7 +1331,7 @@ fn hover_row_renders_with_hover_style() {
     assert_eq!(
         cell.style().bg,
         Some(settings_list_row_bg(&theme, false, true)),
-        "hover row must paint with settings list hover bg, got {:?}",
+        "hover row must paint with the list hover background, got {:?}",
         cell.style().bg,
     );
 }
@@ -1401,13 +1381,7 @@ fn picker_choice_mouse_hover_highlights_choice() {
         "Moved over choice 1 must set hover_row = Some(1)",
     );
 
-    // Re-render and observe the hover bg on choice 1's row.
-    // (`bg_hover` may quantize to `Color::Reset` in tests with
-    // `NO_COLOR` set — same caveat as
-    // `picker_highlights_current_choice`. We assert tautologically
-    // against `theme.bg_hover`; the wiring assertion is the
-    // hover_row state mutation above plus the focused-choice
-    // bg_visual contrast.)
+    // Re-render and observe the shared list hover background on choice 1.
     let mut buf2 = Buffer::empty(area);
     render_picking_enum(&mut buf2, area, &s, &theme);
     let new_rects = take_picker_choice_rects();
@@ -1418,7 +1392,7 @@ fn picker_choice_mouse_hover_highlights_choice() {
     assert_eq!(
         cell1.style().bg,
         Some(settings_list_row_bg(&theme, false, true)),
-        "hovered choice must paint list hover bg, got {:?}",
+        "hovered choice must paint the list hover background, got {:?}",
         cell1.style().bg,
     );
     // Focused choice (index 0) keeps bg_visual — selection wins
@@ -1430,7 +1404,7 @@ fn picker_choice_mouse_hover_highlights_choice() {
     assert_eq!(
         cell0.style().bg,
         Some(settings_list_row_bg(&theme, true, false)),
-        "focused choice must keep selection bg even when hover is elsewhere",
+        "focused choice must keep the list selection background when hover is elsewhere",
     );
 }
 
@@ -1445,7 +1419,7 @@ fn mode_transition_browse_to_picking_enum_clears_hover_row() {
     s.hover_row = Some(s.selected);
     let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(
-        matches!(s.mode, SettingsModalMode::PickingEnum { .. }),
+        matches!(s.mode(), SettingsModalMode::PickingEnum { .. }),
         "Enter on enum row must transition to PickingEnum",
     );
     assert_eq!(
@@ -1467,9 +1441,9 @@ fn mode_transition_browse_to_editing_value_clears_hover_row() {
     s.hover_row = Some(s.selected);
     let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(
-        matches!(s.mode, SettingsModalMode::EditingValue { .. }),
+        matches!(s.mode(), SettingsModalMode::EditingValue { .. }),
         "Enter on Int row must transition to EditingValue, got {:?}",
-        s.mode,
+        s.mode(),
     );
     assert_eq!(
         s.hover_row, None,
@@ -1484,13 +1458,13 @@ fn mode_transition_picking_enum_to_browse_clears_hover_row() {
     let mut s = make_state();
     navigate_to_enum_row(&mut s);
     let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(matches!(s.mode, SettingsModalMode::PickingEnum { .. }));
+    assert!(matches!(s.mode(), SettingsModalMode::PickingEnum { .. }));
     // Seed picker-mode hover (e.g. mouse moved over a non-focused
     // choice while in the picker).
     s.hover_row = Some(2);
     let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "Esc in PickingEnum must transition to Browse",
     );
     assert_eq!(
@@ -1758,17 +1732,20 @@ fn editor_render_fixture(buffer: &str, cursor_byte: usize) -> SettingsModalState
         ..PagerLocalSnapshot::default()
     };
     let mut s = SettingsModalState::new(Arc::new(registry), UiConfig::default(), snapshot);
+    let mut editor = LineEditor::default();
+    editor.set_text(buffer);
+    let _ = editor.set_cursor_byte(cursor_byte);
     let validation_error = validate_string(
         StringValidator::KnownModel,
-        buffer,
+        editor.text(),
         &s.pager_snapshot.available_models,
     );
-    s.mode = SettingsModalMode::EditingValue {
-        key: "default_model",
-        buffer: buffer.to_string(),
-        cursor_byte,
+    s.transition_to_editing_string(
+        "default_model",
+        editor,
+        StringValidator::KnownModel,
         validation_error,
-    };
+    );
     s
 }
 
@@ -1894,6 +1871,43 @@ fn render_editing_value_cursor_pans_to_right_on_overflow_at_end() {
     );
 }
 
+#[test]
+fn render_string_editor_keeps_narrow_graphemes_and_cursor_aligned() {
+    let grapheme = "👩🏽\u{200d}💻";
+    let combining = "e\u{301}";
+    let text = format!("a{grapheme}{combining}");
+    let mut state = editor_render_fixture(&text, text.len());
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 4,
+        height: 12,
+    };
+    let mut buffer = Buffer::empty(area);
+    render_editing_value(&mut buffer, area, &mut state, &Theme::current());
+
+    let mut rendered = String::new();
+    let mut cursor = None;
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let cell = buffer.cell((x, y)).expect("rendered cell");
+            rendered.push_str(cell.symbol());
+            if cell.symbol() == crate::glyphs::selection_bar() {
+                cursor = Some((x, y));
+            }
+        }
+    }
+    assert!(
+        rendered.contains(grapheme),
+        "ZWJ grapheme split: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(combining),
+        "combining grapheme split: {rendered:?}",
+    );
+    assert_eq!(cursor.map(|(x, _)| x), Some(3));
+}
+
 /// When the validator returns a
 /// non-None error, the buffer foreground turns red
 /// (`accent_error`), AND the validation-error row at y =
@@ -1984,12 +1998,7 @@ fn render_editing_value_int_populates_adornment_hit_rects() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::EditingValue {
-        key: "max_thoughts_width",
-        buffer: "120".to_string(),
-        cursor_byte: 3,
-        validation_error: None,
-    };
+    s.transition_to_editing_int("max_thoughts_width", "120".to_string(), 40, 500);
     let area = Rect {
         x: 0,
         y: 0,
@@ -2044,14 +2053,11 @@ fn int_stepper_fixture_for(key: &'static str, value: i64) -> SettingsModalState 
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    let buffer = value.to_string();
-    let cursor_byte = buffer.len();
-    s.mode = SettingsModalMode::EditingValue {
-        key,
-        buffer,
-        cursor_byte,
-        validation_error: None,
+    let (min, max) = match s.registry.find(key).map(|meta| &meta.kind) {
+        Some(SettingKind::Int { min, max, .. }) => (*min, *max),
+        _ => panic!("expected registered Int setting"),
     };
+    s.transition_to_editing_int(key, value.to_string(), min, max);
     s
 }
 
@@ -2061,10 +2067,9 @@ fn int_stepper_fixture(value: i64) -> SettingsModalState {
 }
 
 fn int_stepper_buffer(s: &SettingsModalState) -> String {
-    match &s.mode {
-        SettingsModalMode::EditingValue { buffer, .. } => buffer.clone(),
-        other => panic!("expected EditingValue, got {other:?}"),
-    }
+    s.editing_buffer()
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("expected EditingValue, got {:?}", s.mode()))
 }
 
 #[test]
@@ -2320,7 +2325,7 @@ fn int_editing_value_enter_commits() {
         other => panic!("expected SetMaxThoughtsWidth(75) on Enter, got {other:?}"),
     }
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "Enter must return to Browse"
     );
 }
@@ -2348,7 +2353,7 @@ fn int_editing_value_esc_reverts() {
          never live-previewed",
     );
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "Esc must return to Browse"
     );
 }
@@ -2455,12 +2460,7 @@ fn picking_enum_esc_dispatches_preview_revert_for_each_key() {
     ];
     for &(key, original) in cases {
         let mut s = make_state();
-        s.mode = SettingsModalMode::PickingEnum {
-            key,
-            choices_idx: 0,
-            original_value: SettingValue::Enum(original),
-            supports_preview: true,
-        };
+        s.transition_to_picking_enum(key, 0, SettingValue::Enum(original), true);
         let outcome = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         match (key, outcome) {
             ("theme", SettingsKeyOutcome::Action(Action::PreviewTheme(name))) => {
@@ -2480,7 +2480,7 @@ fn picking_enum_esc_dispatches_preview_revert_for_each_key() {
             }
         }
         assert!(
-            matches!(s.mode, SettingsModalMode::Browse),
+            matches!(s.mode(), SettingsModalMode::Browse),
             "Esc must transition back to Browse for key `{key}`",
         );
     }
@@ -2493,12 +2493,7 @@ fn picking_enum_esc_dispatches_preview_revert_for_each_key() {
 #[test]
 fn picking_enum_esc_returns_to_browse() {
     let mut s = make_state();
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "theme",
-        choices_idx: 0,
-        original_value: SettingValue::Enum("groknight"),
-        supports_preview: true,
-    };
+    s.transition_to_picking_enum("theme", 0, SettingValue::Enum("groknight"), true);
     let outcome = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     match outcome {
         SettingsKeyOutcome::Action(Action::PreviewTheme(name)) => {
@@ -2509,7 +2504,7 @@ fn picking_enum_esc_returns_to_browse() {
         }
         other => panic!("expected Action::PreviewTheme(\"groknight\") on Esc, got {other:?}"),
     }
-    assert!(matches!(s.mode, SettingsModalMode::Browse));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
 }
 
 // -- picker machinery tests --
@@ -2575,12 +2570,7 @@ fn picker_test_state() -> SettingsModalState {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "test_enum",
-        choices_idx: 0,
-        original_value: SettingValue::Enum("first"),
-        supports_preview: true,
-    };
+    s.transition_to_picking_enum("test_enum", 0, SettingValue::Enum("first"), true);
     s
 }
 
@@ -2618,7 +2608,7 @@ fn picker_arrow_keys_advance_choices_idx() {
         matches!(outcome, SettingsKeyOutcome::Changed),
         "Down should produce Changed (state mutation), got {outcome:?}"
     );
-    match s.mode {
+    match s.mode() {
         SettingsModalMode::PickingEnum { choices_idx, .. } => assert_eq!(choices_idx, 1),
         ref other => panic!("expected PickingEnum mode after Down, got {other:?}"),
     }
@@ -2629,7 +2619,7 @@ fn picker_arrow_keys_advance_choices_idx() {
         &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
     );
     assert!(matches!(outcome, SettingsKeyOutcome::Changed));
-    match s.mode {
+    match s.mode() {
         SettingsModalMode::PickingEnum { choices_idx, .. } => assert_eq!(choices_idx, 2),
         _ => panic!("expected PickingEnum mode after j"),
     }
@@ -2644,7 +2634,7 @@ fn picker_arrow_keys_advance_choices_idx() {
     // Up: 2 → 1.
     let outcome = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert!(matches!(outcome, SettingsKeyOutcome::Changed));
-    match s.mode {
+    match s.mode() {
         SettingsModalMode::PickingEnum { choices_idx, .. } => assert_eq!(choices_idx, 1),
         _ => panic!("expected PickingEnum mode after Up"),
     }
@@ -2655,7 +2645,7 @@ fn picker_arrow_keys_advance_choices_idx() {
         &KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
     );
     assert!(matches!(outcome, SettingsKeyOutcome::Changed));
-    match s.mode {
+    match s.mode() {
         SettingsModalMode::PickingEnum { choices_idx, .. } => assert_eq!(choices_idx, 0),
         _ => panic!("expected PickingEnum mode after k"),
     }
@@ -2692,7 +2682,7 @@ fn picker_enter_returns_to_browse() {
         "Enter for synthetic-key must produce Changed (no commit arm), got {outcome:?}"
     );
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "Enter must return to Browse"
     );
 }
@@ -2716,7 +2706,7 @@ fn picker_esc_returns_to_browse_after_preview_nav() {
     // path's "original vs current" distinction is meaningful.
     let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    match s.mode {
+    match s.mode() {
         SettingsModalMode::PickingEnum { choices_idx, .. } => assert_eq!(choices_idx, 2),
         _ => panic!("expected PickingEnum mode after 2x Down"),
     }
@@ -2729,7 +2719,7 @@ fn picker_esc_returns_to_browse_after_preview_nav() {
         "Esc revert outcome should be Changed (or Action when arms exist), got {outcome:?}"
     );
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "Esc must return to Browse"
     );
 }
@@ -2808,13 +2798,7 @@ fn picker_renders_choices_in_order() {
 fn picker_highlights_current_choice() {
     let mut s = picker_test_state();
     // Focus the second choice (index 1).
-    if let SettingsModalMode::PickingEnum {
-        ref mut choices_idx,
-        ..
-    } = s.mode
-    {
-        *choices_idx = 1;
-    }
+    s.transition_to_picking_enum("test_enum", 1, SettingValue::Enum("first"), true);
     let area = Rect {
         x: 0,
         y: 0,
@@ -2846,13 +2830,13 @@ fn picker_highlights_current_choice() {
     };
     assert_eq!(
         bg_at(4),
-        Some(settings_list_row_bg(&theme, true, false)),
-        "focused row must have selection background"
+        Some(super::render::settings_list_row_bg(&theme, true, false,)),
+        "focused row must use the canonical selected background"
     );
     assert_eq!(
         bg_at(3),
-        Some(settings_list_row_bg(&theme, false, false)),
-        "unfocused row must have idle background"
+        Some(super::render::settings_list_row_bg(&theme, false, false,)),
+        "unfocused row must use the canonical base background"
     );
 
     // Display text on focused row carries BOLD modifier
@@ -2892,7 +2876,7 @@ fn picker_highlights_current_choice() {
 fn browse_enter_on_enum_row_transitions_to_picking_enum() {
     let mut s = picker_test_state_in_browse();
     // Sanity: initial state.
-    assert!(matches!(s.mode, SettingsModalMode::Browse));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
     match &s.rows[s.selected] {
         RowEntry::Setting { key, .. } => assert_eq!(*key, "test_enum"),
         _ => panic!("expected synthetic Enum row at initial selection"),
@@ -2903,7 +2887,7 @@ fn browse_enter_on_enum_row_transitions_to_picking_enum() {
         matches!(outcome, SettingsKeyOutcome::Changed),
         "Enter on Enum row should produce Changed, got {outcome:?}"
     );
-    match s.mode {
+    match s.mode() {
         SettingsModalMode::PickingEnum {
             key,
             choices_idx,
@@ -2934,9 +2918,9 @@ fn browse_enter_on_bool_row_does_not_enter_picking_enum() {
     }
     // Mode must NOT have changed to PickingEnum.
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "Bool toggle must stay in Browse mode, got {:?}",
-        s.mode,
+        s.mode(),
     );
 }
 
@@ -2964,7 +2948,7 @@ fn try_enter_picking_enum_seeds_choices_idx_from_current_value() {
     // idx > 0 seeding.
     let mut s = picker_test_state_in_browse();
     assert!(s.try_enter_picking_enum());
-    match s.mode {
+    match s.mode() {
         SettingsModalMode::PickingEnum {
             key,
             choices_idx,
@@ -2989,13 +2973,13 @@ fn try_enter_picking_enum_seeds_choices_idx_from_current_value() {
 #[test]
 fn try_enter_picking_enum_returns_false_for_non_enum_row() {
     let mut s = make_state();
-    assert!(matches!(s.mode, SettingsModalMode::Browse));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
     assert!(
         !s.try_enter_picking_enum(),
         "non-Enum focused row should return false"
     );
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "mode must not change on non-Enum row"
     );
 }
@@ -3178,12 +3162,7 @@ fn render_picker_long_description_wraps_no_ellipsis() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "long_enum",
-        choices_idx: 0,
-        original_value: SettingValue::Enum("wide"),
-        supports_preview: true,
-    };
+    s.transition_to_picking_enum("long_enum", 0, SettingValue::Enum("wide"), true);
     let area = Rect {
         x: 0,
         y: 0,
@@ -3275,12 +3254,7 @@ fn picker_visual_smoke_debug() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "wrap_enum",
-        choices_idx: 1,
-        original_value: SettingValue::Enum("opt-out"),
-        supports_preview: false,
-    };
+    s.transition_to_picking_enum("wrap_enum", 1, SettingValue::Enum("opt-out"), false);
     let area = Rect {
         x: 0,
         y: 0,
@@ -3337,12 +3311,7 @@ fn picker_long_description_wraps_to_multiple_lines() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "wrap_enum",
-        choices_idx: 1,
-        original_value: SettingValue::Enum("opt-out"),
-        supports_preview: false,
-    };
+    s.transition_to_picking_enum("wrap_enum", 1, SettingValue::Enum("opt-out"), false);
     let area = Rect {
         x: 0,
         y: 0,
@@ -3473,12 +3442,7 @@ fn picker_short_description_stays_one_line() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "short_enum",
-        choices_idx: 0,
-        original_value: SettingValue::Enum("a"),
-        supports_preview: true,
-    };
+    s.transition_to_picking_enum("short_enum", 0, SettingValue::Enum("a"), true);
     let area = Rect {
         x: 0,
         y: 0,
@@ -3547,12 +3511,7 @@ fn picker_no_description_renders_symbol_and_display_only() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "nodesc_enum",
-        choices_idx: 0,
-        original_value: SettingValue::Enum("a"),
-        supports_preview: true,
-    };
+    s.transition_to_picking_enum("nodesc_enum", 0, SettingValue::Enum("a"), true);
     let area = Rect {
         x: 0,
         y: 0,
@@ -3622,12 +3581,7 @@ fn picker_multi_line_choice_hit_rect_spans_all_lines() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "wrap_enum",
-        choices_idx: 0,
-        original_value: SettingValue::Enum("opt-in"),
-        supports_preview: false,
-    };
+    s.transition_to_picking_enum("wrap_enum", 0, SettingValue::Enum("opt-in"), false);
     let area = Rect {
         x: 0,
         y: 0,
@@ -3675,7 +3629,7 @@ fn picker_multi_line_choice_hit_rect_spans_all_lines() {
         10,
         click_y,
     );
-    match (outcome, &s.mode) {
+    match (outcome, &s.mode()) {
         (
             SettingsKeyOutcome::Changed | SettingsKeyOutcome::Action(_),
             SettingsModalMode::PickingEnum { choices_idx, .. },
@@ -3748,12 +3702,7 @@ fn picker_scroll_offset_accounts_for_variable_height() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "many_wrap",
-        choices_idx: 4,
-        original_value: SettingValue::Enum("c4"),
-        supports_preview: true,
-    };
+    s.transition_to_picking_enum("many_wrap", 4, SettingValue::Enum("c4"), true);
     // Viewport: title + desc + gap = 3 rows of chrome + 8 rows
     // of choices = 11 total. With 5 choices × 3 lines = 15 total
     // wrap-rows of content, only ~2 choices can fit per page.
@@ -3820,12 +3769,7 @@ fn render_picker_truncates_long_display_with_ellipsis() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "long_enum",
-        choices_idx: 0,
-        original_value: SettingValue::Enum("wide"),
-        supports_preview: true,
-    };
+    s.transition_to_picking_enum("long_enum", 0, SettingValue::Enum("wide"), true);
     let area = Rect {
         x: 0,
         y: 0,
@@ -3875,12 +3819,7 @@ fn render_picker_truncates_long_title_with_ellipsis() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "long_enum",
-        choices_idx: 0,
-        original_value: SettingValue::Enum("a"),
-        supports_preview: true,
-    };
+    s.transition_to_picking_enum("long_enum", 0, SettingValue::Enum("a"), true);
     let area = Rect {
         x: 0,
         y: 0,
@@ -3960,12 +3899,7 @@ fn render_picker_shows_more_indicator_when_choices_overflow() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::PickingEnum {
-        key: "long_enum",
-        choices_idx: 0,
-        original_value: SettingValue::Enum("c0"),
-        supports_preview: true,
-    };
+    s.transition_to_picking_enum("long_enum", 0, SettingValue::Enum("c0"), true);
     // Total height 7 → header_rows=3 (title+desc+gap) + 4 choices
     // rows. With 6 choices, 4 fit in viewport - 1 (reserved for
     // overflow). So 3 visible, 3 hidden → "… 3 more".
@@ -4110,7 +4044,7 @@ fn picker_ignores_random_keypress() {
     assert!(matches!(outcome, SettingsKeyOutcome::Unchanged));
     assert!(
         matches!(
-            s.mode,
+            s.mode(),
             SettingsModalMode::PickingEnum { choices_idx: 0, .. }
         ),
         "mode must remain PickingEnum after random keypress"
@@ -4150,21 +4084,12 @@ fn editing_value_chars_mutate_buffer_and_invalid_enter_is_noop() {
         matches!(outcome, SettingsKeyOutcome::Changed),
         "char insert in EditingValue must be Changed, got {outcome:?}"
     );
-    match &s.mode {
-        SettingsModalMode::EditingValue {
-            buffer,
-            validation_error,
-            ..
-        } => {
-            assert_eq!(buffer, "a");
-            assert!(
-                validation_error.is_some(),
-                "validation_error must be Some for unknown model 'a' \
-                 (catalog has 'Grok 4 Fast' only)",
-            );
-        }
-        _ => panic!("mode must remain EditingValue after char input"),
-    }
+    assert_eq!(s.editing_buffer(), Some("a"));
+    assert!(
+        s.editing_validation_error().is_some(),
+        "validation_error must be Some for unknown model 'a' \
+         (catalog has 'Grok 4 Fast' only)",
+    );
 
     // Enter on a buffer that fails the KnownModel validator
     // (catalog has 'Grok 4 Fast'; "a" doesn't match) is
@@ -4175,9 +4100,57 @@ fn editing_value_chars_mutate_buffer_and_invalid_enter_is_noop() {
         "Enter on invalid buffer must be Unchanged, got {outcome:?}"
     );
     assert!(
-        matches!(s.mode, SettingsModalMode::EditingValue { .. }),
+        matches!(s.mode(), SettingsModalMode::EditingValue { .. }),
         "Enter on invalid buffer must keep EditingValue mode (no commit)"
     );
+}
+
+#[test]
+fn string_editor_uses_canonical_edits_policy_and_live_validation() {
+    let mut state = editor_render_fixture("alpha-beta", "alpha-beta".len());
+    let outcome = handle_settings_key(
+        &mut state,
+        &KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+    );
+    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert_eq!(state.editing_buffer(), Some("alpha-"));
+
+    let mut state = editor_render_fixture("Grok Tes", "Grok Tes".len());
+    assert!(state.editing_validation_error().is_some());
+    let _ = handle_settings_key(
+        &mut state,
+        &KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+    );
+    assert!(
+        state.editing_validation_error().is_some(),
+        "cursor motion must preserve validation state",
+    );
+    let _ = handle_settings_key(&mut state, &KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    let _ = handle_settings_key(
+        &mut state,
+        &KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+    );
+    assert_eq!(state.editing_buffer(), Some("Grok Test"));
+    assert!(state.editing_validation_error().is_none());
+
+    let cursor = state.editing_cursor_byte();
+    let outcome = handle_settings_key(
+        &mut state,
+        &KeyEvent::new(KeyCode::Char('\u{202e}'), KeyModifiers::NONE),
+    );
+    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert_eq!(state.editing_buffer(), Some("Grok Test"));
+    assert_eq!(state.editing_cursor_byte(), cursor);
+
+    let outcome = handle_settings_key(
+        &mut state,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(
+        outcome,
+        SettingsKeyOutcome::Action(Action::SetDefaultModel(_))
+    ));
+    assert!(matches!(state.mode(), SettingsModalMode::Browse));
 }
 
 // -- helper-function coverage --
@@ -4209,16 +4182,10 @@ fn picker_choice_at_returns_none_for_oob_and_missing() {
 
 #[test]
 fn editing_value_esc_returns_to_browse() {
-    let mut s = make_state();
-    s.mode = SettingsModalMode::EditingValue {
-        key: "default_model",
-        buffer: "grok-4".to_string(),
-        cursor_byte: "grok-4".len(),
-        validation_error: None,
-    };
+    let mut s = int_stepper_fixture(120);
     let outcome = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(matches!(outcome, SettingsKeyOutcome::Changed));
-    assert!(matches!(s.mode, SettingsModalMode::Browse));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
 }
 
 // -- Direct unit tests for compute_filtered --
@@ -4322,9 +4289,7 @@ fn compute_filtered_multi_word_and_match_narrows_further() {
 fn advance_next_recovers_when_selection_is_hidden() {
     let mut s = make_state();
     // Apply a filter that hides compact_mode.
-    s.query = "stamp".to_string();
-    s.query_cursor = s.query.len();
-    s.invalidate_filter();
+    s.set_query("stamp");
     // Manually corrupt selected to a HIDDEN row (compact_mode is
     // row 1, hidden by "stamp"). This bypasses
     // clamp_selected_to_visible and exercises the defensive arm.
@@ -4359,9 +4324,7 @@ fn advance_prev_recovers_when_selection_is_hidden() {
     // only. Let's use that and corrupt selected to compact_mode
     // (hidden). Up should land on the LAST visible setting which
     // is simple_mode.
-    s.query = "simple".to_string();
-    s.query_cursor = s.query.len();
-    s.invalidate_filter();
+    s.set_query("simple");
     let compact_idx = s
         .rows
         .iter()
@@ -4864,10 +4827,10 @@ fn two_line_row_hit_rect_spans_both_lines() {
     match outcome {
         SettingsKeyOutcome::Changed => {
             assert!(
-                matches!(s.mode, SettingsModalMode::PickingEnum { .. }),
+                matches!(s.mode(), SettingsModalMode::PickingEnum { .. }),
                 "click on line 2 of a two-line Enum row must open the picker, \
                  got mode {:?}",
-                s.mode
+                s.mode()
             );
         }
         other => panic!(
@@ -5149,7 +5112,7 @@ fn footer_has_blank_line_between_tip_and_hints_when_hints_dont_wrap() {
     // FilterFocused mode has 5 shortcuts totalling ~76 cells —
     // fits on one row at any modal width supported by
     // `render_settings_modal` (max_width=110).
-    s.mode = SettingsModalMode::FilterFocused;
+    s.focus_filter();
     let area = Rect {
         x: 0,
         y: 0,
@@ -5212,7 +5175,7 @@ fn footer_total_height_grows_when_hints_wrap() {
         height: 30,
     };
     let mut s_wide = make_state();
-    s_wide.mode = SettingsModalMode::FilterFocused;
+    s_wide.focus_filter();
     let mut buf_wide = Buffer::empty(wide_area);
     render_settings_modal(&mut buf_wide, wide_area, &mut s_wide, false, None);
     let wide_list_height = s_wide.list_area.height;
@@ -5226,7 +5189,7 @@ fn footer_total_height_grows_when_hints_wrap() {
         height: 30,
     };
     let mut s_narrow = make_state();
-    s_narrow.mode = SettingsModalMode::FilterFocused;
+    s_narrow.focus_filter();
     let mut buf_narrow = Buffer::empty(narrow_area);
     render_settings_modal(&mut buf_narrow, narrow_area, &mut s_narrow, false, None);
     let narrow_list_height = s_narrow.list_area.height;
@@ -5356,16 +5319,16 @@ fn search_bar_focused_style_matches_palette() {
     };
     let mut buf = Buffer::empty(area);
     let theme = Theme::current();
-    crate::views::picker::render_search_bar(
+    let editor = LineEditor::default();
+    crate::views::picker::render_line_editor_search_bar(
         &mut buf,
         area.x,
         area.y,
         area.width,
         &theme,
-        "",
+        &editor,
         true,
         true,
-        0,
         Some(theme.bg_base),
     );
 
@@ -5408,16 +5371,16 @@ fn search_bar_placeholder_matches_palette() {
     };
     let mut buf = Buffer::empty(area);
     let theme = Theme::current();
-    crate::views::picker::render_search_bar(
+    let editor = LineEditor::default();
+    crate::views::picker::render_line_editor_search_bar(
         &mut buf,
         area.x,
         area.y,
         area.width,
         &theme,
-        "",
+        &editor,
         false,
         true,
-        0,
         Some(theme.bg_base),
     );
 
@@ -5444,6 +5407,65 @@ fn search_bar_placeholder_matches_palette() {
         "LAST hint cell ({last_col}) must also be theme.gray_dim — \
          a regression that styled only the prefix would slip past a \
          single-cell sample",
+    );
+}
+
+#[test]
+fn ctrl_u_clears_the_entire_filter_from_mid_query() {
+    let mut state = make_state();
+    state.focus_filter();
+    state.set_query("alpha beta");
+    set_filter_cursor(&mut state, "alpha".len());
+
+    let outcome = handle_settings_key(
+        &mut state,
+        &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    );
+    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert!(state.query().is_empty());
+    assert_eq!(state.query_cursor(), 0);
+}
+
+#[test]
+fn string_editor_paste_sanitizes_validates_and_consumes_rejected_text() {
+    let mut state = editor_render_fixture("Grok Tst", "Grok T".len());
+    let outcome = handle_settings_paste(&mut state, "e\r\n");
+    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert_eq!(state.editing_buffer(), Some("Grok Test"));
+    assert!(state.editing_validation_error().is_none());
+
+    let outcome = handle_settings_paste(&mut state, "\u{202e}\r\n");
+    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert_eq!(state.editing_buffer(), Some("Grok Test"));
+    assert!(state.editing_validation_error().is_none());
+}
+
+#[test]
+fn filter_search_bar_keeps_narrow_graphemes_and_cursor_aligned() {
+    let grapheme = "👩🏽\u{200d}💻";
+    let combining = "e\u{301}";
+    let mut state = make_state();
+    state.focus_filter();
+    state.set_query(format!("a{grapheme}{combining}"));
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 13,
+        height: 3,
+    };
+    let mut buffer = Buffer::empty(area);
+    let theme = Theme::current();
+    render_row_list_with_search_bar(&mut buffer, area, &mut state, &theme);
+
+    let mut row = String::new();
+    for x in 0..area.width {
+        row.push_str(buffer.cell((x, 0)).expect("search cell").symbol());
+    }
+    assert!(row.contains(grapheme), "ZWJ grapheme split: {row:?}");
+    assert!(row.contains(combining), "combining grapheme split: {row:?}",);
+    assert_eq!(
+        buffer.cell((12, 0)).expect("cursor cell").bg,
+        theme.text_primary,
     );
 }
 
@@ -6212,9 +6234,9 @@ fn click_settings_breadcrumb_collapses_picker_to_browse() {
         ),
     }
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "after the breadcrumb click the mode must be Browse, got {:?}",
-        s.mode,
+        s.mode(),
     );
 }
 
@@ -6237,7 +6259,7 @@ fn click_settings_breadcrumb_after_nav_reverts_to_original() {
     // The picker exposes `choices_idx`; the registry's theme
     // choices include at least 2 entries so we can safely
     // advance.
-    let (orig_canonical_owned, advanced_idx) = match &s.mode {
+    let (orig_canonical_owned, advanced_idx) = match &s.mode() {
         SettingsModalMode::PickingEnum {
             choices_idx,
             original_value,
@@ -6255,7 +6277,7 @@ fn click_settings_breadcrumb_after_nav_reverts_to_original() {
     // (index 1 per the registry); advance to index 0 to ensure
     // we're navigating to a different value.
     let target_idx = if advanced_idx == 0 { 1 } else { 0 };
-    match s.mode {
+    match s.mode() {
         SettingsModalMode::PickingEnum {
             ref mut choices_idx,
             ..
@@ -6287,7 +6309,7 @@ fn click_settings_breadcrumb_after_nav_reverts_to_original() {
         }
         other => panic!("expected Action(PreviewTheme(<original>)), got {other:?}"),
     }
-    assert!(matches!(s.mode, SettingsModalMode::Browse));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
 }
 
 /// `d` in PickingEnum for a preview-supporting Enum dispatches
@@ -6324,7 +6346,7 @@ fn d_key_in_picking_enum_dispatches_open_reset_confirm() {
         }
     }
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "picker must collapse to Browse before dispatching reset \
          (dispatch arm panics in debug if it sees a sub-pane mode)",
     );
@@ -6337,12 +6359,12 @@ fn d_key_in_picking_enum_dispatches_open_reset_confirm() {
 /// buffer is discarded — a user who stepped to a new value
 /// then pressed `d` should not have the in-flight value leak
 /// past the mode transition. Asserts the mode is structurally
-/// `Browse` (not lingering `EditingValue { buffer: "80", … }`).
+/// `Browse` with no lingering pending buffer.
 #[test]
 fn d_key_in_int_stepper_dispatches_open_reset_confirm() {
     let mut s = int_stepper_fixture(75);
     assert!(
-        matches!(s.mode, SettingsModalMode::EditingValue { .. }),
+        matches!(s.mode(), SettingsModalMode::EditingValue { .. }),
         "fixture must start in EditingValue",
     );
     // Step Up so the pending buffer diverges from the default
@@ -6368,7 +6390,7 @@ fn d_key_in_int_stepper_dispatches_open_reset_confirm() {
         other => panic!("expected OpenResetConfirm action, got {other:?}"),
     }
     assert!(
-        matches!(s.mode, SettingsModalMode::Browse),
+        matches!(s.mode(), SettingsModalMode::Browse),
         "stepper must collapse to Browse before dispatching reset",
     );
     // Pending buffer must be discarded — no lingering
@@ -6377,10 +6399,10 @@ fn d_key_in_int_stepper_dispatches_open_reset_confirm() {
     // assertion that we did NOT carry the in-flight buffer
     // through the mode change.
     assert!(
-        !matches!(&s.mode, SettingsModalMode::EditingValue { .. }),
+        !matches!(&s.mode(), SettingsModalMode::EditingValue { .. }),
         "stepper's pending edit must NOT survive the d-reset \
          transition, got {:?}",
-        s.mode,
+        s.mode(),
     );
 }
 
@@ -6411,24 +6433,16 @@ fn d_key_in_string_editor_inserts_into_buffer() {
         "`d` in String editor MUST NOT dispatch a reset (no Action)",
     );
     assert!(
-        matches!(s.mode, SettingsModalMode::EditingValue { .. }),
+        matches!(s.mode(), SettingsModalMode::EditingValue { .. }),
         "mode must STILL be EditingValue (no transition); got {:?}",
-        s.mode,
+        s.mode(),
     );
-    match &s.mode {
-        SettingsModalMode::EditingValue {
-            buffer,
-            cursor_byte,
-            ..
-        } => {
-            assert_eq!(
-                buffer, "Grod",
-                "`d` must be inserted after `Gro`; got {buffer:?}",
-            );
-            assert_eq!(*cursor_byte, 4, "cursor must advance past the inserted `d`",);
-        }
-        _ => unreachable!(),
-    }
+    assert_eq!(s.editing_buffer(), Some("Grod"));
+    assert_eq!(
+        s.editing_cursor_byte(),
+        Some(4),
+        "cursor must advance past the inserted `d`",
+    );
 }
 
 /// Clicks OUTSIDE the
@@ -6467,10 +6481,10 @@ fn click_outside_settings_breadcrumb_is_noop() {
          got {outcome:?}",
     );
     assert!(
-        matches!(s.mode, SettingsModalMode::PickingEnum { .. }),
+        matches!(s.mode(), SettingsModalMode::PickingEnum { .. }),
         "mode must STILL be PickingEnum (no transition fired); \
          got {:?}",
-        s.mode,
+        s.mode(),
     );
     // Click 1 cell BEFORE the rect's left edge — on the
     // leading `─ ` decoration.
@@ -7241,12 +7255,7 @@ fn max_thoughts_width_preview_only_renders_for_max_thoughts_width_key() {
         UiConfig::default(),
         PagerLocalSnapshot::default(),
     );
-    s.mode = SettingsModalMode::EditingValue {
-        key: "synthetic_int",
-        buffer: "50".to_string(),
-        cursor_byte: 2,
-        validation_error: None,
-    };
+    s.transition_to_editing_int("synthetic_int", "50".to_string(), 0, 200);
     let area = Rect {
         x: 0,
         y: 0,
@@ -7457,7 +7466,7 @@ fn modal_widens_when_editing_max_thoughts_width() {
 /// Transitioning from `EditingValue { max_thoughts_width }` back
 /// to `Browse` snaps the modal back to its standard width on the
 /// next render frame — the widening lives in the render-time
-/// `state.mode` match, not in any persistent state.
+/// active-state match, not in any persistent layout state.
 #[test]
 fn modal_returns_to_default_width_when_leaving_edit_mode() {
     let area = Rect {

@@ -365,14 +365,71 @@ fn try_parse_error(data: &str) -> Option<(String, String)> {
     None
 }
 
-pub fn parse_error_bytes(bytes: &[u8]) -> String {
-    if let Some((error_type, message)) = std::str::from_utf8(bytes).ok().and_then(try_parse_error) {
-        if error_type == "unknown" || error_type == "server_error" {
-            return message;
+/// Max chars of a structured (JSON) error message shown to users.
+pub const MAX_USER_ERROR_BODY_CHARS: usize = 280;
+
+/// Short status-based copy when the body is not a structured JSON error.
+///
+/// Edge proxies (Cloudflare 52x, 502/503/504) return HTML pages; we never
+/// sniff body text — only the HTTP status drives this fallback.
+pub fn status_user_message(status: StatusCode) -> String {
+    match status.as_u16() {
+        code @ 502..=504 => {
+            format!("Grok is temporarily unavailable. Please try again in a moment. (HTTP {code}).")
         }
-        return format!("{error_type}: {message}");
+        // Cloudflare edge codes (origin down / connect fail / timeout / …).
+        code @ 520..=524 => {
+            format!(
+                "Connection to Grok timed out or was interrupted. Please try again. (HTTP {code})."
+            )
+        }
+        code if status.is_server_error() => {
+            format!("Something went wrong on the server (HTTP {code}).")
+        }
+        code if status.is_client_error() => format!("Request failed (HTTP {code})."),
+        code => format!("Request failed (HTTP {code})."),
     }
-    String::from_utf8_lossy(bytes).trim().to_owned()
+}
+
+fn truncate_user_error(s: &str) -> String {
+    let s = s.trim();
+    let count = s.chars().count();
+    if count <= MAX_USER_ERROR_BODY_CHARS {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(MAX_USER_ERROR_BODY_CHARS).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Format a known JSON error envelope; `None` if the body is not structured.
+fn structured_error_message(bytes: &[u8]) -> Option<String> {
+    let (error_type, message) = std::str::from_utf8(bytes).ok().and_then(try_parse_error)?;
+    let msg = if error_type == "unknown" || error_type == "server_error" {
+        message
+    } else {
+        format!("{error_type}: {message}")
+    };
+    Some(truncate_user_error(&msg))
+}
+
+/// Parse an API error body into a short string.
+///
+/// Only structured JSON error envelopes are surfaced. Non-JSON bodies
+/// (HTML edge pages, plain text dumps) return a fixed placeholder — never
+/// the raw bytes. Prefer [`user_facing_api_error_message`] when a status
+/// code is available.
+pub fn parse_error_bytes(bytes: &[u8]) -> String {
+    structured_error_message(bytes).unwrap_or_else(|| "upstream error".into())
+}
+
+/// User-facing message for a failed API call.
+///
+/// Structured JSON error envelopes keep their message. Everything else
+/// (including Cloudflare HTML) maps to a status-based string — no body
+/// content matching.
+pub fn user_facing_api_error_message(status: StatusCode, bytes: &[u8]) -> String {
+    structured_error_message(bytes).unwrap_or_else(|| status_user_message(status))
 }
 
 pub fn try_parse_stream_error(data: &str) -> Option<SamplingError> {
@@ -547,6 +604,52 @@ mod tests {
             msg,
             "The service is currently unavailable: Service temporarily unavailable."
         );
+    }
+
+    #[test]
+    fn parse_error_bytes_rejects_non_json_body() {
+        let html = br#"<!DOCTYPE html>
+<html lang="en-US">
+<head><title>grok.com | 524: A timeout occurred</title></head>
+<body><h1>A timeout occurred Error code 524</h1></body>
+</html>"#;
+        let msg = parse_error_bytes(html);
+        assert_eq!(msg, "upstream error");
+        // Plain non-JSON text is also rejected (no body sniffing).
+        assert_eq!(
+            parse_error_bytes(b"some random gateway text"),
+            "upstream error"
+        );
+    }
+
+    #[test]
+    fn user_facing_api_error_message_maps_non_json_by_status() {
+        let html = br#"<!DOCTYPE html><html><body>timeout</body></html>"#;
+        let msg = user_facing_api_error_message(StatusCode::from_u16(524).unwrap(), html);
+        assert_eq!(msg, status_user_message(StatusCode::from_u16(524).unwrap()));
+
+        let msg_503 =
+            user_facing_api_error_message(StatusCode::SERVICE_UNAVAILABLE, b"not json either");
+        assert_eq!(
+            msg_503,
+            status_user_message(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn user_facing_keeps_json_error_message() {
+        let bytes = br#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
+        let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
+        assert_eq!(msg, "rate_limit_error: rate limit exceeded");
+    }
+
+    #[test]
+    fn structured_error_message_is_length_capped() {
+        let long_msg = "x".repeat(MAX_USER_ERROR_BODY_CHARS + 50);
+        let bytes = format!(r#"{{"error":{{"message":"{long_msg}","type":"server_error"}}}}"#);
+        let msg = parse_error_bytes(bytes.as_bytes());
+        assert!(msg.chars().count() <= MAX_USER_ERROR_BODY_CHARS + 1);
+        assert!(msg.ends_with('\u{2026}'));
     }
 
     /// Regression test: 403 Forbidden must NOT be classified as an auth

@@ -36,10 +36,7 @@ mod transcript;
 mod turn;
 mod voice;
 
-pub(crate) use billing::{
-    FREE_USAGE_USER_MESSAGE, UPSELL_URL_PAYG, UPSELL_URL_UPGRADE,
-    acp_error_is_free_usage_exhausted, is_credit_limit_error, is_free_usage_exhausted_error,
-};
+pub(crate) use billing::{UPSELL_URL_PAYG, UPSELL_URL_UPGRADE, is_credit_limit_error};
 pub(crate) use modes::{downgrade_displayed_auto_if_gated, effective_auto};
 pub(crate) use notes::{recap_unavailable_toast, scrollback_has_user_messages};
 pub(crate) use permissions::resolve_permission_queue_transition;
@@ -48,7 +45,7 @@ pub(in crate::app) use prompt::{show_small_screen_tip, show_ssh_wrap_tip};
 pub(crate) use queue::maybe_drain_queue;
 pub(super) use queue::{
     apply_turn_start_shim, arm_send_now_and_paint, maybe_drain_queue_and_note_peek,
-    shim_renders_own_user_block,
+    note_peek_page_flip, shim_renders_own_user_block,
 };
 pub(in crate::app) use rewind::{find_user_prompt_entry_for_shell_index, shell_prompt_index_at};
 pub(crate) use router::dispatch;

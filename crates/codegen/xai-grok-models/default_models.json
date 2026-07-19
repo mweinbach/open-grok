@@ -1,18 +1,42 @@
 {
-  "default": "grok-build",
+  "default": "grok-4.5",
   "web_search": "grok-4.20-multi-agent",
-  "image_description": "grok-build",
-  "session_summary": "grok-build",
+  "image_description": "grok-4.5",
+  "session_summary": "grok-4.5",
   "models": [
     {
-      "model": "grok-build",
-      "name": "Grok Build",
-      "description": "Best for advanced coding tasks",
+      "id": "grok-4.5",
+      "model": "grok-4.5",
+      "name": "Grok 4.5",
+      "description": "SpaceXAI's new frontier model",
       "context_window": 500000,
-      "temperature": 0.7,
-      "top_p": 0.95,
       "api_backend": "responses",
-      "supported_in_api": false
+      "supports_backend_search": false,
+      "system_prompt_label": "Grok 4.5",
+      "show_model_fingerprint": true,
+      "supports_reasoning_effort": true,
+      "reasoning_effort": "high",
+      "auto_compact_threshold_percent": 80,
+      "compaction_at_tokens": true,
+      "compactions_remaining": 1,
+      "reasoning_efforts": [
+        {
+          "value": "high",
+          "label": "High Effort",
+          "description": "Highest implementation quality with extensive reasoning",
+          "default": true
+        },
+        {
+          "value": "medium",
+          "label": "Medium Effort",
+          "description": "Balanced effort with standard implementation and testing"
+        },
+        {
+          "value": "low",
+          "label": "Low Effort",
+          "description": "Quick, fast implementations"
+        }
+      ]
     },
     {
       "model": "kimi-k3",

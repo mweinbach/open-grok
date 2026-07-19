@@ -59,6 +59,10 @@ pub fn sync_source_cache_with_mode(
     cache_root: &Path,
     mode: SyncMode,
 ) -> Result<SourceCacheLease, String> {
+    let url = xai_grok_agent::plugins::git_install::validate_git_url(url)?;
+    let branch = branch
+        .map(xai_grok_agent::plugins::git_install::validate_git_ref)
+        .transpose()?;
     let hash = cache_hash(url);
     let cache_dir = cache_root.join(&hash);
     let start = Instant::now();
@@ -89,6 +93,10 @@ fn sync_cache_locked(
     cache_dir: &Path,
     mode: SyncMode,
 ) -> Result<(), String> {
+    let url = xai_grok_agent::plugins::git_install::validate_git_url(url)?;
+    let branch = branch
+        .map(xai_grok_agent::plugins::git_install::validate_git_ref)
+        .transpose()?;
     if cache_dir.join(".git").exists() {
         if mode == SyncMode::UseTtl && is_cache_fresh(cache_dir) {
             return Ok(());
@@ -225,6 +233,10 @@ fn unique_reclone_suffix() -> u128 {
 }
 
 fn clone_with_git2(url: &str, branch: Option<&str>, dest: &Path) -> Result<(), String> {
+    let url = xai_grok_agent::plugins::git_install::validate_git_url(url)?;
+    let branch = branch
+        .map(xai_grok_agent::plugins::git_install::validate_git_ref)
+        .transpose()?;
     let mut fetch_opts = git2::FetchOptions::new();
     fetch_opts.depth(1);
 
@@ -261,15 +273,22 @@ pub fn git_command() -> std::process::Command {
     cmd
 }
 
-fn clone_with_cli(url: &str, branch: Option<&str>, dest: &Path) -> Result<(), String> {
+fn clone_cli_command(url: &str, branch: Option<&str>, dest: &Path) -> std::process::Command {
     let mut cmd = git_command();
     cmd.args(["clone", "--depth", "1"]);
     if let Some(b) = branch {
         cmd.args(["--branch", b]);
     }
-    cmd.arg(url).arg(dest.as_os_str());
+    cmd.arg("--").arg(url).arg(dest.as_os_str());
+    cmd
+}
 
-    let output = cmd
+fn clone_with_cli(url: &str, branch: Option<&str>, dest: &Path) -> Result<(), String> {
+    let url = xai_grok_agent::plugins::git_install::validate_git_url(url)?;
+    let branch = branch
+        .map(xai_grok_agent::plugins::git_install::validate_git_ref)
+        .transpose()?;
+    let output = clone_cli_command(url, branch, dest)
         .output()
         .map_err(|e| format!("failed to run git clone: {e}"))?;
     if !output.status.success() {
@@ -279,11 +298,24 @@ fn clone_with_cli(url: &str, branch: Option<&str>, dest: &Path) -> Result<(), St
     Ok(())
 }
 
+fn fetch_cli_command(repo_dir: &Path, branch: Option<&str>) -> std::process::Command {
+    let mut cmd = git_command();
+    cmd.current_dir(repo_dir).args([
+        "fetch",
+        "--depth",
+        "1",
+        "--",
+        "origin",
+        branch.unwrap_or("HEAD"),
+    ]);
+    cmd
+}
+
 fn fetch_reset_cached_repo(repo_dir: &Path, branch: Option<&str>) -> Result<(), String> {
-    let branch_arg = branch.unwrap_or("HEAD");
-    let fetch_output = git_command()
-        .current_dir(repo_dir)
-        .args(["fetch", "--depth", "1", "origin", branch_arg])
+    let branch = branch
+        .map(xai_grok_agent::plugins::git_install::validate_git_ref)
+        .transpose()?;
+    let fetch_output = fetch_cli_command(repo_dir, branch)
         .output()
         .map_err(|e| format!("failed to run git fetch: {e}"))?;
 
@@ -341,6 +373,60 @@ mod tests {
     fn default_cache_root_under_grok() {
         let root = default_cache_root();
         assert!(root.to_string_lossy().contains("marketplace-cache"));
+    }
+
+    #[test]
+    fn cli_git_args_terminate_options_before_operands() {
+        let clone_cmd = clone_cli_command("repo", Some("main"), Path::new("dest"));
+        let clone_args: Vec<_> = clone_cmd
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            clone_args,
+            [
+                "--no-optional-locks",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "main",
+                "--",
+                "repo",
+                "dest",
+            ]
+        );
+
+        let fetch_cmd = fetch_cli_command(Path::new("repo"), Some("main"));
+        let fetch_args: Vec<_> = fetch_cmd
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            fetch_args,
+            [
+                "--no-optional-locks",
+                "fetch",
+                "--depth",
+                "1",
+                "--",
+                "origin",
+                "main",
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_cache_operands_fail_before_cache_root_creation() {
+        for (url, branch) in [
+            ("--upload-pack=cmd", Some("main")),
+            ("https://example.com/repo.git", Some("--upload-pack=cmd")),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let cache_root = parent.path().join("cache");
+            assert!(sync_source_cache(url, branch, &cache_root).is_err());
+            assert!(!cache_root.exists());
+        }
     }
 
     #[test]

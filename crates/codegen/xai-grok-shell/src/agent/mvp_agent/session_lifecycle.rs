@@ -426,4 +426,47 @@ impl MvpAgent {
             .await
             .unwrap_or(true)
     }
+    /// Entry counts for every collection [`Self::remove_session`] drains,
+    /// plus the workspace binding and subagent maps.
+    pub(crate) fn registry_snapshot(&self) -> RegistrySnapshot {
+        let (subagent_pending, subagent_active, subagent_completed) =
+            self.subagent_coordinator.borrow().registry_snapshot();
+        RegistrySnapshot {
+            sessions: self.sessions.borrow().len(),
+            session_threads: self.session_threads.borrow().len(),
+            dispatch_locks: self.dispatch_locks.borrow().len(),
+            session_turn_numbers: self.session_turn_numbers.borrow().len(),
+            permission_event_receivers: self.permission_event_receivers.borrow().len(),
+            model_unavailable_sessions: self.model_unavailable_sessions.borrow().len(),
+            session_live_state: self.session_live_state.borrow().len(),
+            session_index_claims: self.session_index_claims.borrow().len(),
+            require_gateway_sessions: self.require_gateway_sessions.borrow().len(),
+            subagent_pending,
+            subagent_active,
+            subagent_completed,
+            workspace_bindings: self
+                .workspace_ops
+                .borrow()
+                .as_ref()
+                .and_then(|ops| ops.workspace_handle().map(|h| h.session_count())),
+        }
+    }
+}
+/// Field names are the wire contract of `x.ai/debug/agent`'s `registries`
+/// object; each maps to the same-named registry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RegistrySnapshot {
+    pub sessions: usize,
+    pub session_threads: usize,
+    pub dispatch_locks: usize,
+    pub session_turn_numbers: usize,
+    pub permission_event_receivers: usize,
+    pub model_unavailable_sessions: usize,
+    pub session_live_state: usize,
+    pub session_index_claims: usize,
+    pub require_gateway_sessions: usize,
+    pub subagent_pending: usize,
+    pub subagent_active: usize,
+    pub subagent_completed: usize,
+    pub workspace_bindings: Option<usize>,
 }

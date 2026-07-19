@@ -42,15 +42,19 @@ use crate::types::tool::{ToolKind, ToolNamespace};
 // Description
 // ───────────────────────────────────────────────────────────────────────────
 
+// NOTE: OpenCode's `EditInput` serializes camelCase (`oldString`, `newString`,
+// `replaceAll`), so param refs must use the camelCase schema property names —
+// the snake_case `params.edit.old_string` keys of the grok_build twin resolve
+// to "" here (the kind-params map is keyed by schema property names).
 const DESCRIPTION: &str = r#"Performs exact string replacements in files.
 
 Usage:
 - You must use your `${{ tools.by_kind.read }}` tool at least once in the conversation before editing.
-- When editing text from ${{ tools.by_kind.read }} tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + →. Everything after that → separator is the actual file content to match. Never include any part of the line number prefix in the ${{ params.edit.old_string }} or ${{ params.edit.new_string }}.
+- When editing text from ${{ tools.by_kind.read }} tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + →. Everything after that → separator is the actual file content to match. Never include any part of the line number prefix in the ${{ params.edit.oldString }} or ${{ params.edit.newString }}.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
-- The edit will FAIL if `${{ params.edit.old_string }}` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `${{ params.edit.replace_all }}` to change every instance of `${{ params.edit.old_string }}`.
-- Use `${{ params.edit.replace_all }}` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
-- To create a new file, set ${{ params.edit.old_string }} to an empty string.
+- The edit will FAIL if `${{ params.edit.oldString }}` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `${{ params.edit.replaceAll }}` to change every instance of `${{ params.edit.oldString }}`.
+- Use `${{ params.edit.replaceAll }}` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
+- To create a new file, set ${{ params.edit.oldString }} to an empty string.
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked."#;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -70,7 +74,9 @@ pub struct EditInput {
     pub old_string: String,
 
     /// The replacement text (must differ from old_string).
-    #[schemars(description = "The text to replace it with (must be different from old_string)")]
+    #[schemars(
+        description = "The text to replace it with (must be different from ${{ params.edit.oldString }})"
+    )]
     pub new_string: String,
 
     /// When true, replace every occurrence of `old_string` (default false).
@@ -78,7 +84,9 @@ pub struct EditInput {
         default,
         deserialize_with = "crate::types::schema::deserialize_lenient_option_bool"
     )]
-    #[schemars(description = "Replace all occurrences of old_string (default false)")]
+    #[schemars(
+        description = "Replace all occurrences of ${{ params.edit.oldString }} (default false)"
+    )]
     pub replace_all: Option<bool>,
 }
 
@@ -373,7 +381,7 @@ async fn handle_replacement(
     if positions.len() > 1 && !replace_all {
         let replace_all_name = crate::types::template_renderer::TemplateRenderer::resolve(
             &resources,
-            "${{ params.edit.replace_all }}",
+            "${{ params.edit.replaceAll }}",
         )
         .await?;
         return Ok(SearchReplaceOutput::MultipleMatchesFound(format!(
@@ -493,10 +501,12 @@ mod tests {
         resources.insert(FileSystem(Arc::new(LocalFs)));
         resources.insert(NotificationHandle(ToolNotificationHandle::noop()));
 
+        // Keys mirror finalize-time seeding: schema property names, which are
+        // camelCase for OpenCode's EditInput.
         let edit_params = std::collections::HashMap::from([
-            ("old_string".to_string(), "old_string".to_string()),
-            ("new_string".to_string(), "new_string".to_string()),
-            ("replace_all".to_string(), "replaceAll".to_string()),
+            ("oldString".to_string(), "oldString".to_string()),
+            ("newString".to_string(), "newString".to_string()),
+            ("replaceAll".to_string(), "replaceAll".to_string()),
         ]);
         resources.insert(TemplateRenderer::new(
             std::collections::HashMap::from([(ToolKind::Read, "read_file".to_string())]),
@@ -765,8 +775,10 @@ mod tests {
             std::collections::HashMap::from([(ToolKind::Read, "file_reader".to_string())]),
             std::collections::HashMap::from([(
                 ToolKind::Edit,
+                // Keyed by the camelCase schema property name (finalize seeds
+                // kind params from schema properties).
                 std::collections::HashMap::from([(
-                    "replace_all".to_string(),
+                    "replaceAll".to_string(),
                     "replaceEverything".to_string(),
                 )]),
             )]),

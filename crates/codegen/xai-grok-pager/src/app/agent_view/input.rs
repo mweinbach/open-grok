@@ -37,7 +37,7 @@ impl AgentView {
             self.active_modal,
             Some(ActiveModal::Settings { ref state })
                 if matches!(
-                    state.mode,
+                    state.mode(),
                     crate::views::settings_modal::SettingsModalMode::EditingSecret { .. }
                 )
         )
@@ -100,7 +100,7 @@ impl AgentView {
         let Some(ActiveModal::Settings { state }) = self.active_modal.as_mut() else {
             return InputOutcome::Unchanged;
         };
-        let outcome = crate::views::settings_modal::handle_settings_paste(state, pasted);
+        let outcome = crate::views::settings_modal::handle_settings_secret_paste(state, pasted);
         apply_settings_outcome(self, outcome)
     }
 
@@ -318,6 +318,86 @@ impl AgentView {
     ) -> InputOutcome {
         self.handle_input_inner(ev, registry, true)
     }
+    /// Route minimal-only `/btw` ownership before the unchanged shared router.
+    pub(in crate::app) fn handle_minimal_input(
+        &mut self,
+        ev: &Event,
+        registry: &ActionRegistry,
+    ) -> InputOutcome {
+        match self.handle_minimal_btw_input(ev) {
+            crate::minimal_api::MinimalBtwInput::Handled(outcome) => *outcome,
+            crate::minimal_api::MinimalBtwInput::Occluded => {
+                let jump_dismissed = self.dismiss_jump_picker_if_suppressed();
+                let suspended = crate::minimal_api::suspend_minimal_btw(self);
+                let outcome = if jump_dismissed
+                    && matches!(
+                        ev, Event::Key(key) if key.kind != KeyEventKind::Release && key
+                        .code == KeyCode::Esc && key.modifiers.is_empty()
+                    ) {
+                    InputOutcome::Changed
+                } else {
+                    self.handle_input(ev, registry)
+                };
+                if let Some(suspended) = suspended {
+                    crate::minimal_api::restore_minimal_btw(self, suspended);
+                }
+                outcome
+            }
+            crate::minimal_api::MinimalBtwInput::Delegate => self.handle_input(ev, registry),
+        }
+    }
+    /// Handle only minimal `/btw` dismissal and keyboard scrolling.
+    fn handle_minimal_btw_input(&mut self, ev: &Event) -> crate::minimal_api::MinimalBtwInput {
+        use crate::minimal_api::MinimalBtwInput::{Delegate, Handled, Occluded};
+        if !crate::minimal_api::minimal_btw_surface_available(self) {
+            return Occluded;
+        }
+        if let Event::Key(key) = ev
+            && key.kind != KeyEventKind::Release
+            && key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && self.btw_state.is_some()
+        {
+            return Handled(Box::new(self.dismiss_btw_panel()));
+        }
+        if self.active_pane != AgentPane::Prompt
+            || !self.btw_focused
+            || !crate::minimal_api::minimal_btw_geometry_is_paintable(self.last_btw_area)
+        {
+            return Delegate;
+        }
+        let Some(btw_scroll_max) = self.btw_state.as_ref().and_then(|btw| {
+            matches!(btw, crate::views::btw_overlay::BtwOverlayState::Done { .. }).then(|| {
+                let content_width = self.last_btw_area.width.saturating_sub(4) as usize;
+                let max_body = self.last_btw_area.height.saturating_sub(2) as usize;
+                btw.max_scroll_offset(content_width, max_body)
+            })
+        }) else {
+            return Delegate;
+        };
+        if btw_scroll_max == 0 {
+            return Delegate;
+        }
+        let Event::Key(key) = ev else {
+            return Delegate;
+        };
+        if key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
+            return Delegate;
+        }
+        let page = self.last_btw_area.height.saturating_sub(2).max(1) as usize;
+        let Some(btw) = self.btw_state.as_mut() else {
+            return Delegate;
+        };
+        match key.code {
+            KeyCode::Up => btw.scroll_up(1),
+            KeyCode::Down => btw.scroll_down(1, btw_scroll_max),
+            KeyCode::PageUp => btw.scroll_up(page),
+            KeyCode::PageDown => btw.scroll_down(page, btw_scroll_max),
+            _ => return Delegate,
+        }
+        self.clear_btw_drag_state();
+        Handled(Box::new(InputOutcome::Changed))
+    }
     fn handle_input_inner(
         &mut self,
         ev: &Event,
@@ -490,7 +570,7 @@ impl AgentView {
             {
                 return InputOutcome::Changed;
             }
-            if let Event::Mouse(_) = ev {
+            if matches!(ev, Event::Mouse(_) | Event::Paste(_)) {
                 return InputOutcome::Changed;
             }
         }
@@ -578,6 +658,17 @@ impl AgentView {
                         }
                         self.handle_line_viewer_key(key)
                     }
+                    Event::Paste(text) => {
+                        self.line_viewer
+                            .as_mut()
+                            .map_or(InputOutcome::Unchanged, |viewer| {
+                                if viewer.list_state.handle_paste(text, &viewer.lines) {
+                                    InputOutcome::Changed
+                                } else {
+                                    InputOutcome::Unchanged
+                                }
+                            })
+                    }
                     Event::Mouse(mouse) => self.handle_line_viewer_mouse(mouse),
                     _ => InputOutcome::Changed,
                 };
@@ -631,6 +722,7 @@ impl AgentView {
                     self.handle_persona_detail_key(key)
                 }
                 Event::Mouse(mouse) => self.handle_persona_detail_mouse(mouse),
+                Event::Paste(text) => self.handle_persona_detail_paste(text),
                 _ => InputOutcome::Changed,
             };
         }
@@ -643,6 +735,7 @@ impl AgentView {
                     self.handle_agents_modal_key(key)
                 }
                 Event::Mouse(mouse) => self.handle_agents_modal_mouse(mouse),
+                Event::Paste(text) => self.handle_agents_modal_paste(text),
                 _ => InputOutcome::Changed,
             };
         }
@@ -655,6 +748,17 @@ impl AgentView {
                     self.handle_block_viewer_key(key)
                 }
                 Event::Mouse(mouse) => self.handle_block_viewer_mouse(mouse),
+                Event::Paste(text) => {
+                    self.block_viewer
+                        .as_mut()
+                        .map_or(InputOutcome::Unchanged, |viewer| {
+                            if viewer.handle_paste(text) {
+                                InputOutcome::Changed
+                            } else {
+                                InputOutcome::Unchanged
+                            }
+                        })
+                }
                 _ => InputOutcome::Changed,
             };
         }
@@ -667,6 +771,7 @@ impl AgentView {
                     self.handle_modal_key(key)
                 }
                 Event::Mouse(mouse) => self.handle_modal_mouse(mouse),
+                Event::Paste(text) => self.handle_modal_paste(text),
                 _ => InputOutcome::Changed,
             };
         }
@@ -756,7 +861,17 @@ impl AgentView {
                     }
                     self.handle_plan_feedback_key(key)
                 }
-                Event::Paste(text) => self.route_popup_paste(text),
+                Event::Paste(text) => {
+                    if self
+                        .plan_approval_view
+                        .as_ref()
+                        .is_some_and(|view| view.focus != PlanApprovalFocus::Preview)
+                    {
+                        self.route_popup_paste(text)
+                    } else {
+                        InputOutcome::Unchanged
+                    }
+                }
                 Event::Mouse(mouse) => {
                     let mut changed = false;
                     match mouse.kind {
@@ -908,12 +1023,10 @@ impl AgentView {
                 AgentPane::Catalog => self.handle_catalog_key(key, registry),
             },
             Event::Paste(text) => {
-                if self.active_pane != AgentPane::Prompt
-                    && self.session.state.is_idle()
-                    && self.active_modal.is_none()
-                    && self.question_view.is_none()
+                if self.active_pane == AgentPane::Scrollback
+                    && let Some(outcome) = self.handle_scrollback_search_paste(text)
                 {
-                    self.set_active_pane(AgentPane::Prompt, false);
+                    return outcome;
                 }
                 if self.active_pane == AgentPane::Prompt {
                     self.ephemeral_tip
@@ -944,7 +1057,18 @@ impl AgentView {
                     let _ = synchronous_text_insertion;
                     outcome
                 } else {
-                    InputOutcome::Unchanged
+                    let consumed = match self.active_pane {
+                        AgentPane::Todo => self.todo.handle_paste(text),
+                        AgentPane::Tasks => self.tasks.handle_paste(text),
+                        AgentPane::Catalog => self.catalog.handle_paste(text),
+                        AgentPane::Queue => self.queue.handle_paste(text),
+                        AgentPane::Prompt | AgentPane::Scrollback => false,
+                    };
+                    if consumed {
+                        InputOutcome::Changed
+                    } else {
+                        InputOutcome::Unchanged
+                    }
                 }
             }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -1316,6 +1440,29 @@ mod btw_focus_tests {
             .expect("btw panel present")
             .scroll_offset()
     }
+    fn minimal_btw_agent() -> AgentView {
+        let mut agent = prompt_focused_agent();
+        let request_id = crate::minimal_api::start_minimal_btw(&mut agent, "q".into());
+        assert!(crate::minimal_api::finish_minimal_btw(
+            &mut agent,
+            request_id,
+            Ok(long_btw_answer())
+        ));
+        agent
+    }
+    fn assert_minimal_btw_active(agent: &AgentView, surface: &str) {
+        assert!(
+            agent.btw_state.is_some(),
+            "{surface} Esc must leave the latent /btw panel intact"
+        );
+        assert!(
+            matches!(
+                agent.minimal_btw_lifecycle,
+                Some(crate::minimal_api::MinimalBtwLifecycle::Active { .. })
+            ),
+            "{surface} Esc must restore the complete minimal /btw lifecycle"
+        );
+    }
     #[test]
     fn focused_panel_scrolls_with_arrows() {
         let mut agent = prompt_focused_agent();
@@ -1436,6 +1583,103 @@ mod btw_focus_tests {
         agent.handle_input(&key(KeyCode::Esc), &reg);
         assert!(agent.btw_state.is_none(), "Esc dismisses the /btw panel");
         assert!(!agent.btw_focused, "dismissing the panel clears its focus");
+    }
+    #[test]
+    fn minimal_permission_owns_esc_over_hidden_btw() {
+        let mut agent = minimal_btw_agent();
+        let reg = ActionRegistry::defaults();
+        agent
+            .permission_queue
+            .push_back(super::paste_key_tests::make_followup_permission_state());
+        agent.handle_minimal_input(&key(KeyCode::Esc), &reg);
+        assert_minimal_btw_active(&agent, "permission");
+        assert_eq!(
+            agent.permission_queue.len(),
+            1,
+            "Esc preserves the pending permission"
+        );
+        assert_eq!(
+            agent
+                .permission_queue
+                .front()
+                .map(|permission| permission.focus),
+            Some(crate::views::permission_view::PermissionFocus::Options),
+            "permission handled Esc by returning focus to options"
+        );
+    }
+    #[test]
+    fn minimal_modal_and_viewers_own_esc_over_hidden_btw() {
+        let reg = ActionRegistry::defaults();
+        let mut agents = minimal_btw_agent();
+        agents.agents_modal = Some(crate::views::agents_modal::AgentsModalState::new(
+            std::path::Path::new("/nonexistent"),
+            &std::collections::HashMap::new(),
+            &crate::app::bundle::BundleState::default(),
+            None,
+            None,
+        ));
+        agents.handle_minimal_input(&key(KeyCode::Esc), &reg);
+        assert!(agents.agents_modal.is_none(), "agents modal handled Esc");
+        assert_minimal_btw_active(&agents, "agents modal");
+        let mut block = minimal_btw_agent();
+        block.block_viewer = Some(crate::views::block_viewer::BlockViewerPane::for_plain_text(
+            "t", "content",
+        ));
+        block.handle_minimal_input(&key(KeyCode::Esc), &reg);
+        assert!(block.block_viewer.is_none(), "block viewer handled Esc");
+        assert_minimal_btw_active(&block, "block viewer");
+        let mut video = minimal_btw_agent();
+        video.video_viewer = Some(crate::prompt_images::VideoViewerState::test_stub());
+        video.handle_minimal_input(&key(KeyCode::Esc), &reg);
+        assert!(video.video_viewer.is_none(), "video viewer handled Esc");
+        assert_minimal_btw_active(&video, "video viewer");
+        let mut goal = minimal_btw_agent();
+        goal.goal_state = Some(crate::app::agent::GoalDisplayState::test_stub());
+        goal.show_goal_detail = true;
+        goal.handle_minimal_input(&key(KeyCode::Esc), &reg);
+        assert!(!goal.show_goal_detail, "goal detail handled Esc");
+        assert_minimal_btw_active(&goal, "goal detail");
+    }
+    #[test]
+    fn minimal_btw_surface_owner_covers_shared_modal_cascade() {
+        let mut agent = minimal_btw_agent();
+        assert!(crate::minimal_api::minimal_btw_surface_available(&agent));
+        agent.image_viewer = Some(
+            crate::prompt_images::ImageViewerState::open_from_path_deferred(std::path::Path::new(
+                "x.png",
+            )),
+        );
+        assert!(!crate::minimal_api::minimal_btw_surface_available(&agent));
+        agent.image_viewer = None;
+        agent.gboom = Some(crate::gboom::GboomState::new());
+        assert!(!crate::minimal_api::minimal_btw_surface_available(&agent));
+        agent.gboom = None;
+        agent.block_viewer = Some(crate::views::block_viewer::BlockViewerPane::for_plain_text(
+            "t", "content",
+        ));
+        assert!(!crate::minimal_api::minimal_btw_surface_available(&agent));
+    }
+    #[test]
+    fn fullscreen_keeps_btw_first_esc_precedence() {
+        let mut agent = prompt_focused_agent();
+        let reg = ActionRegistry::defaults();
+        agent.btw_state = Some(BtwOverlayState::done("q".into(), long_btw_answer()));
+        agent
+            .permission_queue
+            .push_back(super::paste_key_tests::make_followup_permission_state());
+        agent.handle_input(&key(KeyCode::Esc), &reg);
+        assert!(agent.btw_state.is_none());
+        assert!(!agent.permission_queue.is_empty());
+    }
+    #[test]
+    fn minimal_does_not_scroll_unpainted_btw_geometry() {
+        let mut agent = prompt_focused_agent();
+        let reg = ActionRegistry::defaults();
+        agent.btw_state = Some(BtwOverlayState::done("q".into(), long_btw_answer()));
+        agent.btw_focused = true;
+        agent.last_btw_area = Rect::default();
+        agent.handle_minimal_input(&key(KeyCode::Down), &reg);
+        assert_eq!(done_scroll_offset(&agent), 0);
     }
     /// A hidden `/jump` picker shadowed by the `/btw` panel must not let one Esc
     /// close both: the first Esc drops the shadowed picker (and is spent there),
@@ -1702,5 +1946,40 @@ mod voice_stop_click_during_plan_review_tests {
             matches!(outcome, InputOutcome::Action(Action::VoiceToggle)),
             "[stop] click during plan feedback must dispatch VoiceToggle, got {outcome:?}"
         );
+    }
+}
+#[cfg(test)]
+mod rich_textarea_paste_routing_tests {
+    use super::test_fixtures::make_agent;
+    use crate::actions::ActionRegistry;
+    use crate::app::inline_edit::InlineEditState;
+    use crate::scrollback::entry::EntryId;
+    use crossterm::event::Event;
+    use xai_ratatui_textarea::{TextArea, TextAreaState};
+    #[test]
+    fn inline_edit_receives_raw_multiline_paste_without_touching_prompt() {
+        let mut agent = make_agent();
+        agent.prompt.set_text("hidden prompt");
+        let mut textarea = TextArea::new();
+        textarea.set_text("ab");
+        textarea.set_cursor(1);
+        agent.inline_edit = Some(InlineEditState {
+            entry_id: EntryId::new(1),
+            prompt_index: 0,
+            original: "ab".to_owned(),
+            textarea,
+            textarea_state: TextAreaState::default(),
+            last_text_area: None,
+            last_rect: None,
+        });
+        let _ = agent.handle_input(
+            &Event::Paste("中\nline".to_owned()),
+            &ActionRegistry::defaults(),
+        );
+        assert_eq!(
+            agent.inline_edit.as_ref().map(|edit| edit.textarea.text()),
+            Some("a中\nlineb")
+        );
+        assert_eq!(agent.prompt.text(), "hidden prompt");
     }
 }

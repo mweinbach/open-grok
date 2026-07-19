@@ -16,6 +16,13 @@ pub const API_KEY_SCOPE: &str = "xai::api_key";
 const BLOCKED_REASON_NO_LOGS: &str = "BLOCKED_REASON_NO_LOGS";
 const BLOCKED_REASON_NO_LOGS_MODERATED: &str = "BLOCKED_REASON_NO_LOGS_MODERATED";
 
+/// Fresh-credential / missing-field default: opted out until the user or
+/// server enrichment opts in. Single source for `GrokAuth`, `AuthMeta`, and
+/// every login-path constructor so the sides cannot drift.
+pub(crate) fn default_coding_data_retention_opt_out() -> bool {
+    true
+}
+
 /// Token provenance (debugging/auth.json only -- no code branches on this).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -79,7 +86,9 @@ pub struct GrokAuth {
     pub user_blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub team_blocked_reasons: Vec<String>,
-    #[serde(default)]
+    /// Defaults to `true` (opted out) for safer consumer privacy until the
+    /// user explicitly shares or server enrichment sets the team preference.
+    #[serde(default = "default_coding_data_retention_opt_out")]
     pub coding_data_retention_opt_out: bool,
 
     /// Deprecated. Kept for deserializing existing auth.json files.
@@ -227,7 +236,7 @@ impl Default for GrokAuth {
             organization_role: None,
             user_blocked_reason: None,
             team_blocked_reasons: vec![],
-            coding_data_retention_opt_out: false,
+            coding_data_retention_opt_out: default_coding_data_retention_opt_out(),
             has_grok_code_access: None,
             refresh_token: None,
             expires_at: None,
@@ -248,6 +257,9 @@ impl GrokAuth {
         Self {
             key: "test-key".into(),
             user_id: "test-user".into(),
+            // Tests that exercise collection gates need sharing enabled by
+            // default; opt out explicitly when asserting the privacy path.
+            coding_data_retention_opt_out: false,
             ..Default::default()
         }
     }
@@ -486,5 +498,24 @@ mod tests {
         let json = r#"{"userId": "u1", "subscriptionTier": ""}"#;
         let info: UserInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.subscription_tier.as_deref(), Some(""));
+    }
+
+    /// Pre-default auth.json (no coding_data_retention_opt_out key) must
+    /// deserialize as opted-out, not the old fail-open false.
+    #[test]
+    fn missing_coding_data_retention_opt_out_deserializes_opted_out() {
+        let json = r#"{
+            "key": "k",
+            "auth_mode": "oidc",
+            "create_time": "2020-01-01T00:00:00Z",
+            "user_id": "u"
+        }"#;
+        let auth: GrokAuth = serde_json::from_str(json).unwrap();
+        assert!(
+            auth.coding_data_retention_opt_out,
+            "missing field must default to opted-out"
+        );
+        assert!(default_coding_data_retention_opt_out());
+        assert!(GrokAuth::default().coding_data_retention_opt_out);
     }
 }

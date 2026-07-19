@@ -59,10 +59,10 @@ use routing::{
     mcp_target_agent, resolve_notif_agent, resolve_target_view,
 };
 
+use prompt_origin::{finish_wake_turn, viewer_turn_anchor};
 pub(crate) use prompt_origin::{
     is_server_initiated_prompt, is_wake_prompt, should_adopt_running_prompt,
 };
-use prompt_origin::{push_wake_end_marker, viewer_turn_anchor, wake_turn_elapsed};
 
 pub(crate) use subagent_activity::finalize_killed_subagent;
 use subagent_activity::{subagent_activity_label, sync_subagent_activity};
@@ -244,18 +244,6 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         }
                         if let Some(ts) = meta.turn_start_ms {
                             agent.turn_start_ms = Some(ts);
-                            // A wake turn's end marker derives elapsed from its
-                            // deltas — non-adopted turns have no other timing
-                            // source. `turnStartMs` is constant per turn, so
-                            // record once per pid (the equality check also
-                            // skips the classifier on the turn's later deltas).
-                            if let Some(pid) = meta.prompt_id.as_deref()
-                                && agent.wake_turn_start.as_ref().map(|(p, _)| p.as_str())
-                                    != Some(pid)
-                                && is_wake_prompt(pid)
-                            {
-                                agent.wake_turn_start = Some((pid.to_string(), ts));
-                            }
                         }
                     }
 
@@ -381,9 +369,6 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                             && agent.session.current_prompt_id.as_ref() != Some(notif_pid)
                             && agent.attached_as_viewer
                         {
-                            // The driver's next turn closes the between-turns
-                            // status window on this pane too.
-                            agent.end_work_announced = false;
                             agent.session.current_prompt_id = Some(notif_pid.clone());
                             // A viewer adopting another client's new turn: drop
                             // the prior turn's chips but KEEP the seen ring so a

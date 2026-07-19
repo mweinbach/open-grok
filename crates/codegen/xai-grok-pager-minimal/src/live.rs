@@ -1,11 +1,12 @@
 //! Minimal-mode live region: the small pinned viewport holding the running-turn
-//! tail (model B), a one-line status indicator, and the always-focused prompt.
+//! tail (model B), optional todos / `/btw` panels, a one-line status indicator,
+//! and the always-focused prompt.
 //!
-//! Layout (top → bottom): live tail · status · prompt. The tail shows the
-//! bottom of the uncommitted run (streaming message / running tool) so output
-//! is visible as it generates; finished blocks scroll up into native scrollback
-//! via [`super::commit`]. When idle the tail is empty and only status + prompt
-//! show.
+//! Layout (top → bottom): live tail · todos · `/btw` · status · prompt ·
+//! overlay/info. The tail shows the bottom of the uncommitted run (streaming
+//! message / running tool) so output is visible as it generates; finished blocks
+//! scroll up into native scrollback via [`super::commit`]. When idle the tail is
+//! empty and only status + prompt (+ optional panels) show.
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -41,6 +42,22 @@ fn inset_left(area: Rect, inset: u16) -> Rect {
         width: area.width - dx,
         ..area
     }
+}
+/// Drop cached `/btw` geometry so minimal input cannot scroll an invisible
+/// panel after a modal host path skipped painting it.
+fn clear_btw_geometry(agent: &mut xai_grok_pager::app::agent_view::AgentView) {
+    agent.last_btw_selection_model =
+        xai_grok_pager::scrollback::text_selection::ResolvedSelectionModel::default();
+    agent.last_btw_area = Rect::default();
+}
+/// Keep a paintable `/btw` area only when it is wholly inside the frame buffer.
+fn paintable_btw_area(frame_area: Rect, area: Rect) -> Option<Rect> {
+    (minimal_api::minimal_btw_geometry_is_paintable(area)
+        && area.x >= frame_area.x
+        && area.y >= frame_area.y
+        && area.x.saturating_add(area.width) <= frame_area.x.saturating_add(frame_area.width)
+        && area.y.saturating_add(area.height) <= frame_area.y.saturating_add(frame_area.height))
+    .then_some(area)
 }
 /// The prompt style used by the minimal live region.
 ///
@@ -108,6 +125,11 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
     let row_inset = live_left_inset(appearance);
     let layout_cfg = &appearance.scrollback.layout;
     let term_h = terminal.last_known_area().height;
+    if let Some(id) = agent_id
+        && let Some(agent) = agents.get_mut(&id)
+    {
+        clear_btw_geometry(agent);
+    }
     xai_grok_pager::render::draw::draw_frame(terminal, cursor, |frame, _link_spans| {
         let area = frame.area();
         if area.height == 0 || area.width < 4 {
@@ -119,6 +141,7 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
             crate::auth::render_auth(frame.buffer_mut(), area, &theme, &auth_hint);
             return (None, None);
         };
+        agent.active_pane = xai_grok_pager::app::agent_view::AgentPane::Prompt;
         let status_activity = minimal_advance_phase_timer(agent);
         let show_todos = crate::todo::todo_panel_visible(agent, force_todos);
         let queued = agent.session.pending_prompts.len() + agent.shared_queue.len();
@@ -218,19 +241,30 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
             .min(avail)
             .max(1);
         let rest = avail.saturating_sub(prompt_h);
-        let todos_cap = if force_todos {
-            rest
+        let raw_btw = if minimal_api::minimal_btw_surface_available(agent) {
+            xai_grok_pager::views::btw_overlay::btw_panel_height(
+                agent.btw_state.as_ref(),
+                area.width,
+            )
         } else {
-            rest.min(crate::todo::MAX_TODO_ROWS)
+            0
+        };
+        let btw_desired = minimal_api::minimal_btw_visible_height(raw_btw, area.width, rest);
+        let after_btw = rest.saturating_sub(btw_desired);
+        let todos_cap = if force_todos {
+            after_btw
+        } else {
+            after_btw.min(crate::todo::MAX_TODO_ROWS)
         };
         let todo_lines = if show_todos {
             crate::todo::todo_panel_lines(agent, todos_cap, force_todos)
         } else {
             Vec::new()
         };
-        let todos_h = (todo_lines.len() as u16).min(rest);
-        let tail_h = rest.saturating_sub(todos_h);
-        let tick = (now_millis() / 100) as u64;
+        let todos_h = (todo_lines.len() as u16).min(after_btw);
+        let btw_h = btw_desired;
+        let tail_h = rest.saturating_sub(todos_h + btw_h);
+        let tick = agent.scrollback.animation_tick();
         if tail_h > 0 {
             let tail_area = Rect {
                 x: area.x,
@@ -266,10 +300,34 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
                 &todo_lines,
             );
         }
+        let btw_area = paintable_btw_area(
+            area,
+            Rect {
+                x: area.x,
+                y: area.y.saturating_add(tail_h).saturating_add(todos_h),
+                width: area.width,
+                height: btw_h,
+            },
+        );
+        if let (Some(btw), Some(btw_area)) = (agent.btw_state.as_ref(), btw_area) {
+            let focused = minimal_api::btw_focused(agent);
+            xai_grok_pager::views::btw_overlay::render_btw_panel(
+                frame.buffer_mut(),
+                btw,
+                btw_area,
+                tick,
+                focused,
+                None,
+                &mut agent.last_btw_selection_model,
+                None,
+                &[],
+            );
+            agent.last_btw_area = btw_area;
+        }
         let status_area = inset_left(
             Rect {
                 x: area.x,
-                y: area.y + tail_h + todos_h,
+                y: area.y + tail_h + todos_h + btw_h,
                 width: area.width,
                 height: status_h,
             },
@@ -285,7 +343,7 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
         );
         let prompt_area = Rect {
             x: area.x,
-            y: area.y + tail_h + todos_h + status_h,
+            y: area.y + tail_h + todos_h + btw_h + status_h,
             width: area.width,
             height: prompt_h,
         };
@@ -427,29 +485,6 @@ fn draw_tail(
         }
     }
 }
-/// Count idle-surviving "watchers" — running monitors, active scheduled
-/// `/loop` tasks, and running (background) subagents — so the shared turn-status
-/// widget can show the persistent "watching · N monitors · M loops · K
-/// subagents" cue while the agent is idle. Mirrors the full-TUI computation in
-/// `AgentView::draw` (which minimal bypasses).
-fn minimal_watchers(agent: &xai_grok_pager::app::agent_view::AgentView) -> turn_status::Watchers {
-    turn_status::Watchers {
-        monitors: agent
-            .session
-            .bg_tasks
-            .values()
-            .filter(|t| {
-                t.is_monitor && t.status == xai_grok_pager::app::agent::BgTaskStatus::Running
-            })
-            .count(),
-        loops: agent.session.scheduled_tasks.len(),
-        subagents: agent
-            .subagent_sessions
-            .values()
-            .filter(|s| s.is_running())
-            .count(),
-    }
-}
 /// Resolve the current turn activity and advance the phase timer when it
 /// changes. The full TUI runs this inside its own `draw` (reset
 /// `activity_started_at` on every phase transition); minimal has a separate
@@ -470,11 +505,12 @@ fn minimal_advance_phase_timer(
 /// Reuses the full-TUI [`turn_status::render_turn_status`] widget so minimal
 /// surfaces the same rich activity detail (`Run …` / `Thinking…` /
 /// `Waiting on subagent…` / `Retrying (attempt N)…` / `Cancelling…`), the
-/// per-phase + turn timers, and the idle "watching · …" cue (running monitors /
-/// loops / background subagents) — instead of collapsing everything to
-/// "working…". Keyboard-only, so the mouse `[stop]` / `[↓]` buttons are
-/// suppressed (`None`), and `flat_background` keeps the row transparent like the
-/// rest of the live region. When the widget would draw nothing (plain idle, no
+/// per-phase + turn timers, and the "watching · …" cue (running commands /
+/// monitors / loops / background subagents, shown while idle or parked) —
+/// instead of collapsing everything to "working…". Keyboard-only, so the
+/// mouse `[stop]` / `[↓]` buttons are suppressed (`None`), and
+/// `flat_background` keeps the row transparent like the rest of the live
+/// region. When the widget would draw nothing (plain idle or parked, no
 /// watchers) a small `minimal · /help` hint is shown instead.
 fn render_minimal_status(
     buf: &mut Buffer,
@@ -498,16 +534,16 @@ fn render_minimal_status(
         );
         return;
     }
-    let watchers = minimal_watchers(agent);
+    let watchers = minimal_api::watchers(agent);
     let drain_blocked = minimal_api::drain_blocked(agent);
-    if minimal_api::renders_parked(agent)
-        || !turn_status::should_show(
-            &agent.session.state,
-            drain_blocked,
-            minimal_api::mcp_init_progress(agent),
-            watchers,
-        )
-    {
+    let parked = minimal_api::renders_parked(agent);
+    if !turn_status::should_show(
+        &agent.session.state,
+        drain_blocked,
+        minimal_api::mcp_init_progress(agent),
+        watchers,
+        parked,
+    ) {
         render_idle_hint(buf, area, theme);
         return;
     }
@@ -534,6 +570,7 @@ fn render_minimal_status(
         is_pending_user_input,
         goal_verifying,
         watchers,
+        parked,
         true,
         minimal_api::held_queue_count(agent),
         minimal_api::held_queue_top_sendable(agent),
@@ -713,6 +750,21 @@ mod tests {
         minimal_api::test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"))
     }
     #[test]
+    fn btw_area_must_be_fully_paintable() {
+        let frame = Rect::new(0, 0, 80, 20);
+        assert_eq!(
+            paintable_btw_area(frame, Rect::new(0, 4, 80, 3)),
+            Some(Rect::new(0, 4, 80, 3))
+        );
+        assert!(!minimal_api::minimal_btw_size_is_paintable(11, 3));
+        assert!(minimal_api::minimal_btw_size_is_paintable(12, 3));
+        assert!(!minimal_api::minimal_btw_size_is_paintable(80, 2));
+        assert!(paintable_btw_area(frame, Rect::new(0, 4, 11, 3)).is_none());
+        assert!(paintable_btw_area(frame, Rect::new(0, 4, 80, 2)).is_none());
+        assert!(paintable_btw_area(frame, Rect::new(0, 19, 80, 3)).is_none());
+        assert!(paintable_btw_area(frame, Rect::new(79, 4, 2, 3)).is_none());
+    }
+    #[test]
     fn tail_height_uses_owning_session_cwd_for_tool_paths() {
         use xai_grok_pager::app::agent::AgentState;
         use xai_grok_pager::scrollback::RenderBlock;
@@ -832,7 +884,7 @@ mod tests {
                 tag: "loop".to_string(),
             },
         );
-        assert_eq!(minimal_watchers(&a).loops, 1);
+        assert_eq!(minimal_api::watchers(&a).loops, 1);
         let mut buf = Buffer::empty(area);
         render_minimal_status(&mut buf, area, &a, &None, None, &theme);
         let text = read(&buf);

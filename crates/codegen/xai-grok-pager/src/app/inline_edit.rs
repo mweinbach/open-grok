@@ -23,6 +23,15 @@ use super::actions::Action;
 use super::agent_view::AgentView;
 use super::app_view::InputOutcome;
 
+/// Master switch for the in-place prompt edit feature.
+///
+/// Disabled while we resolve an unsolved scroll jump on enter (see
+/// `x/agottumukkala/inline-edit-scroll-jank.md`). Gates the user entry points
+/// (Enter in `agent_view/panes.rs`, double-click in `agent_view/selection.rs`).
+/// Everything else stays wired and unit-tested, so flipping this to `true`
+/// re-enables the feature in one place.
+pub(crate) const INLINE_EDIT_ENABLED: bool = false;
+
 /// State of an in-place edit of a previous user prompt.
 pub struct InlineEditState {
     /// Stable id of the edited entry (indices shift; re-resolve per use).

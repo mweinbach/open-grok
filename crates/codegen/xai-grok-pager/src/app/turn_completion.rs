@@ -18,29 +18,21 @@ use super::app_view::AppView;
 /// any pending stop/stop_failure hook runs into it so they render inline
 /// (right-justified) on the marker line instead of as a standalone block.
 ///
-/// All four marker rails route through here: the driver's `PromptResponse`,
-/// the lost-RPC reconcile, the viewer finalize, and wake turns'
-/// `push_wake_end_marker` (acp_handler). `event == None` (bash turns,
-/// rate-limit / re-auth UX that replaces the marker) flushes the held hooks
-/// as the legacy standalone lifecycle block so failures stay visible.
+/// All three marker rails route through here: the driver's `PromptResponse`,
+/// the lost-RPC reconcile, and the viewer finalize. (Wake turns close
+/// markerless — see `finish_wake_turn` in acp_handler.) `event == None`
+/// (bash turns, rate-limit / re-auth UX that replaces the marker) flushes the
+/// held hooks as the legacy standalone lifecycle block so failures stay
+/// visible.
 ///
-/// A stamped stash folds only on an exact ending-id match. On a mismatch the
-/// real-turn rails flush it standalone (the ending turn is THE turn — an
-/// older stash has no marker coming); the wake rail instead passes
-/// `preserve_mismatched_stash` so a REAL turn's leftover stash stays pending
-/// for its own marker rail rather than flushing on an unrelated wake. An
-/// unstamped stash keeps the legacy stashed-during-this-turn heuristic.
-///
-/// The marker carries a snapshot of the background work still running
-/// ("Worked for X. N commands still running") when any exists — a
-/// workless marker renders the legacy text unchanged. Announcing work opens
-/// the between-turns status window: completions landing before the next
-/// turn re-emit a fresh work-only status line after their chip.
+/// A stamped stash folds only on an exact ending-id match. On a mismatch it
+/// flushes standalone (the ending turn is THE turn — an older stash has no
+/// marker coming). An unstamped stash keeps the legacy
+/// stashed-during-this-turn heuristic.
 pub(super) fn push_turn_terminal_marker(
     agent: &mut AgentView,
     event: Option<SessionEvent>,
     ending_prompt_id: Option<&str>,
-    preserve_mismatched_stash: bool,
 ) {
     let pending = agent.pending_stop_hooks.take();
     let groups = match pending {
@@ -52,14 +44,8 @@ pub(super) fn push_turn_terminal_marker(
                 (None, _) => false,
             };
             if stale {
-                if preserve_mismatched_stash {
-                    // Wake rail: the stash belongs to a real turn whose own
-                    // marker rail will fold it — leave it pending.
-                    agent.pending_stop_hooks = Some(pending);
-                } else {
-                    for (name, runs) in pending.groups {
-                        agent.scrollback.push_lifecycle_hooks(name, runs);
-                    }
+                for (name, runs) in pending.groups {
+                    agent.scrollback.push_lifecycle_hooks(name, runs);
                 }
                 Vec::new()
             } else {
@@ -297,7 +283,7 @@ pub(super) fn finalize_turn_from_terminal(
             elapsed: Some(elapsed),
         }),
     };
-    push_turn_terminal_marker(agent, event, ending_prompt_id.as_deref(), false);
+    push_turn_terminal_marker(agent, event, ending_prompt_id.as_deref());
 
     agent.mark_turn_finished();
 

@@ -5,7 +5,6 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::app_view::NewWorktreeDialogState;
@@ -20,14 +19,12 @@ const LABEL_PREFIX: &str = "Name (optional): ";
 
 /// Render the new-worktree popup dialog centered on screen.
 ///
-/// The dialog grows with the typed label (up to the available terminal
-/// width) so long names stay fully visible. When the terminal itself is
-/// too narrow for the full name, the input scrolls to keep the cursor
-/// (end of the label) in view, with a leading `…` when scrolled.
+/// The dialog grows with the typed label up to the available width, then
+/// scrolls the input viewport to keep the live cursor visible.
 pub fn render_new_worktree_dialog(area: Rect, buf: &mut Buffer, state: &NewWorktreeDialogState) {
     let theme = Theme::current();
 
-    let dialog_width = dialog_width_for(area.width, &state.label_input);
+    let dialog_width = dialog_width_for(area.width, state.label());
 
     if area.height < DIALOG_HEIGHT || area.width < 20 {
         // Too small to render — draw a minimal "resize" hint so the user
@@ -126,19 +123,22 @@ pub fn render_new_worktree_dialog(area: Rect, buf: &mut Buffer, state: &NewWorkt
     ));
     title.render(Rect::new(inner_x, dialog.y + 1, inner_width, 1), buf);
 
-    // Row 2: Label input — grow with content; scroll when still too wide.
+    // Row 2: Label input.
     let prefix_w = LABEL_PREFIX.width() as u16;
-    let cursor_w = 1u16;
-    let input_budget = inner_width
-        .saturating_sub(prefix_w)
-        .saturating_sub(cursor_w) as usize;
-    let visible_input = visible_input_suffix(&state.label_input, input_budget);
+    let input_width = inner_width.saturating_sub(prefix_w);
+    let viewport = state.viewport(input_width as usize);
+    let visible_input = &state.label()[viewport.visible_byte_range];
 
     let prefix_span = Span::styled(LABEL_PREFIX, Style::default().fg(theme.gray_bright));
     let input_span = Span::styled(visible_input, Style::default().fg(theme.text_primary));
-    let cursor_span = Span::styled("\u{2588}", Style::default().fg(theme.accent_user));
-    let input_line = Line::from(vec![prefix_span, input_span, cursor_span]);
+    let input_line = Line::from(vec![prefix_span, input_span]);
     input_line.render(Rect::new(inner_x, dialog.y + 2, inner_width, 1), buf);
+    if input_width > 0 {
+        let cursor_x = inner_x + prefix_w + viewport.cursor_display_column as u16;
+        if let Some(cell) = buf.cell_mut((cursor_x, dialog.y + 2)) {
+            cell.set_style(Style::default().fg(theme.bg_dark).bg(theme.text_primary));
+        }
+    }
 
     // Row 3: Hints
     let hints = Line::from(vec![
@@ -168,40 +168,6 @@ fn dialog_width_for(area_width: u16, label: &str) -> u16 {
     needed.max(MIN_DIALOG_WIDTH).min(max_width)
 }
 
-/// Return the visible portion of `label` for an end-anchored input field.
-///
-/// When `label` fits in `budget` columns, returns it unchanged. Otherwise
-/// returns a leading `…` plus the suffix that fits, so the cursor at the
-/// end of the label stays visible while typing a long name.
-///
-/// Walks Unicode grapheme clusters (not scalar values) so combining marks
-/// and ZWJ sequences are never split across the scroll boundary.
-fn visible_input_suffix(label: &str, budget: usize) -> String {
-    if budget == 0 {
-        return String::new();
-    }
-    if label.width() <= budget {
-        return label.to_string();
-    }
-    if budget == 1 {
-        return "…".to_string();
-    }
-
-    let suffix_budget = budget - 1; // reserve one column for leading …
-    let mut width = 0usize;
-    let mut start = label.len();
-    let graphemes: Vec<(usize, &str)> = label.grapheme_indices(true).collect();
-    for &(i, g) in graphemes.iter().rev() {
-        let cw = UnicodeWidthStr::width(g);
-        if width + cw > suffix_budget {
-            break;
-        }
-        width += cw;
-        start = i;
-    }
-    format!("…{}", &label[start..])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,9 +176,8 @@ mod tests {
 
     fn render_to_text(area: Rect, label: &str) -> String {
         let mut buf = Buffer::empty(area);
-        let state = NewWorktreeDialogState {
-            label_input: label.to_string(),
-        };
+        let mut state = NewWorktreeDialogState::new();
+        state.set_label(label);
         render_new_worktree_dialog(area, &mut buf, &state);
         let mut lines = Vec::new();
         for y in 0..area.height {
@@ -256,52 +221,6 @@ mod tests {
     }
 
     #[test]
-    fn visible_suffix_keeps_end_when_scrolled() {
-        let label = "abcdefghijklmnopqrstuvwxyz0123456789";
-        let visible = visible_input_suffix(label, 10);
-        assert!(
-            visible.starts_with('…'),
-            "expected leading ellipsis: {visible}"
-        );
-        assert!(
-            visible.ends_with("0123456789") || visible.ends_with("123456789"),
-            "expected end of label visible: {visible}"
-        );
-        assert_eq!(visible.width(), 10);
-    }
-
-    #[test]
-    fn visible_suffix_unchanged_when_fits() {
-        assert_eq!(visible_input_suffix("short", 20), "short");
-    }
-
-    #[test]
-    fn visible_suffix_does_not_split_grapheme_clusters() {
-        // "e" + combining acute (U+0301) is one grapheme; pad so we must scroll.
-        let cluster = "e\u{0301}";
-        let label = format!("{}{}", "x".repeat(20), cluster);
-        let visible = visible_input_suffix(&label, 8);
-        assert!(
-            visible.starts_with('…'),
-            "expected leading ellipsis: {visible}"
-        );
-        // Either the full cluster is present, or it was dropped as a unit —
-        // never a lone combining mark after the ellipsis.
-        let after_ellipsis = &visible[visible.char_indices().nth(1).map(|(i, _)| i).unwrap_or(0)..];
-        assert!(
-            !after_ellipsis.starts_with('\u{0301}'),
-            "must not start scrolled suffix on a combining mark: {visible:?}"
-        );
-        if after_ellipsis.contains('e') {
-            assert!(
-                after_ellipsis.contains(cluster),
-                "base 'e' must keep its combining mark: {visible:?}"
-            );
-        }
-        assert!(visible.width() <= 8, "width overflow: {visible:?}");
-    }
-
-    #[test]
     fn long_name_fully_visible_on_wide_terminal() {
         let area = Rect::new(0, 0, 100, 20);
         let label = "biscuit-worktree-popup-long-name-fix";
@@ -327,6 +246,26 @@ mod tests {
         assert!(
             text.contains('…') || text.contains(tail),
             "expected scrolled indicator or tail:\n{text}"
+        );
+    }
+
+    #[test]
+    fn narrow_dialog_keeps_middle_unicode_cursor_visible() {
+        let area = Rect::new(0, 0, 40, 12);
+        let grapheme = "👩🏽\u{200d}💻";
+        let label = format!("xxxxxxxxxxxx中e\u{301}{grapheme}tail");
+        let mut state = NewWorktreeDialogState::new();
+        state.set_label(&label);
+        let cursor_byte = "xxxxxxxxxxxx中e\u{301}".len();
+        let _ = state.set_cursor_byte(cursor_byte);
+        let mut buffer = Buffer::empty(area);
+        render_new_worktree_dialog(area, &mut buffer, &state);
+
+        assert!(
+            (0..area.height).any(|y| {
+                (0..area.width).any(|x| buffer[(x, y)].bg == Theme::current().text_primary)
+            }),
+            "live cursor cell must remain visible",
         );
     }
 }

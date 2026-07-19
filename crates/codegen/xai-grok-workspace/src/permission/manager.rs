@@ -14,16 +14,19 @@ use crate::permission::bash_command_splitting::{
 use crate::permission::policy::CompiledPolicy;
 use crate::permission::prompter::{AcpPrompter, PromptOutcome};
 use crate::permission::shell_access::{
-    combine_decisions, command_write_paths_in_tree, is_safe_write_sink,
+    combine_decisions, command_write_paths_in_tree, edit_target_requires_prompt, is_safe_write_sink,
 };
 use crate::permission::state::{PermissionState, load_state_from_disk, persist_state};
 use crate::permission::types::{
-    AccessKind, ClientType, Decision, EditPolicy, PermissionCommand, PermissionEvent, PromptPolicy,
+    AccessKind, ClientType, Decision, EditPathContext, EditPolicy, PermissionCommand,
+    PermissionEvent, PromptPolicy,
 };
+use xai_grok_mcp::servers::parse_mcp_qualified_name;
 use xai_grok_paths::AbsPathBuf;
 use xai_grok_tools::implementations::grok_build::web_fetch::{
     DomainMatcher, domain::normalize_domain,
 };
+use xai_grok_tools::types::resources::resolve_model_path;
 
 /// Canonical `decision_reason` triggers for the uploaded artifact. Single source
 /// so the emit sites can't drift or misspell (the field doc lists these values).
@@ -97,17 +100,11 @@ pub enum PermissionHandle {
     AllowAll,
 }
 
-/// True iff `name` is an MCP tool whose server prefix (everything before the
-/// first `__`) is in `servers`. The empty-prefix guard rejects corrupt entries
-/// such as `{""}` or names like `"__tool"`.
+/// True iff `name` is a valid qualified MCP ID whose server is in `servers`.
+/// Malformed names fail closed, including `{""}` or names like `"__tool"`.
 fn mcp_server_prefix_allowed(name: &str, servers: &HashSet<String>) -> bool {
-    if servers.is_empty() {
-        return false;
-    }
-    let Some((server, _)) = name.split_once("__") else {
-        return false;
-    };
-    !server.is_empty() && servers.contains(server)
+    !servers.is_empty()
+        && parse_mcp_qualified_name(name).is_some_and(|(_, server, _)| servers.contains(server))
 }
 
 /// Pre-decision lookup for an MCP tool. Returns `Some(Decision::Allow)`
@@ -670,6 +667,28 @@ impl PermissionHandle {
         subagent_type: Option<String>,
         subagent_description: Option<String>,
     ) -> Decision {
+        self.request_with_edit_path_context(
+            access,
+            tool_call_update,
+            None,
+            session_id,
+            subagent_type,
+            subagent_description,
+        )
+        .await
+    }
+
+    /// Request permission with the edit tool's per-session execution cwd.
+    /// Shared parent/subagent managers must use this for `AccessKind::Edit`.
+    pub async fn request_with_edit_path_context(
+        &self,
+        access: AccessKind,
+        tool_call_update: acp::ToolCallUpdate,
+        edit_path_context: Option<EditPathContext>,
+        session_id: Option<String>,
+        subagent_type: Option<String>,
+        subagent_description: Option<String>,
+    ) -> Decision {
         match self {
             PermissionHandle::AllowAll => Decision::Allow,
             PermissionHandle::Actor {
@@ -682,6 +701,7 @@ impl PermissionHandle {
                 let msg = PermissionCommand::Request {
                     access,
                     tool_call_update,
+                    edit_path_context,
                     respond_to: tx,
                     session_id,
                     subagent_type,
@@ -1118,6 +1138,7 @@ fn spawn_permission_manager_with_pin(
                 PermissionCommand::Request {
                     access,
                     tool_call_update,
+                    edit_path_context,
                     mut respond_to,
                     session_id: request_session_id,
                     subagent_type: request_subagent_type,
@@ -1219,6 +1240,23 @@ fn spawn_permission_manager_with_pin(
                         AccessKind::Bash(cmd) => Some(evaluate_bash(cmd, &state, true)),
                         _ => None,
                     };
+                    let protected_edit = match (&access, edit_path_context.as_ref()) {
+                        (AccessKind::Edit(path), Some(context)) => {
+                            let resolved = resolve_model_path(
+                                &context.real_cwd,
+                                context.display_cwd.as_deref(),
+                                path,
+                            );
+                            edit_target_requires_prompt(&resolved)
+                        }
+                        // Direct workspace callers predate per-request context and execute
+                        // against the manager cwd; the shell always supplies context.
+                        (AccessKind::Edit(path), None) => {
+                            let resolved = resolve_model_path(cwd.as_path(), None, path);
+                            edit_target_requires_prompt(&resolved)
+                        }
+                        _ => false,
+                    };
 
                     // Evaluate managed policy (direct access + per-segment Bash command
                     // rules + Bash shell-file args) up front so the YOLO/sandbox fast
@@ -1280,6 +1318,7 @@ fn spawn_permission_manager_with_pin(
                     // Ask floors fall through so managed Ask / shell-file Ask stay binding.
                     if !policy_forced_prompt
                         && !shell_forced_prompt
+                        && !protected_edit
                         && let Some((decision, reason)) = session_grant_pre_decision(
                             &access,
                             bash_evaluation.as_ref(),
@@ -1313,7 +1352,8 @@ fn spawn_permission_manager_with_pin(
                             AutoFastPath, ClassifierVerdict, access_requires_user_interaction,
                             auto_mode_fast_path,
                         };
-                        let needs_user = access_requires_user_interaction(&tool_name, &access);
+                        let needs_user =
+                            protected_edit || access_requires_user_interaction(&tool_name, &access);
                         let fast = auto_mode_fast_path(&access, &tool_name, needs_user);
                         match fast {
                             AutoFastPath::Allow => {
@@ -1427,7 +1467,7 @@ fn spawn_permission_manager_with_pin(
                     // pre-decision match: a policy `Ask` rule on an MCP tool
                     // overrides the session allowlist and forces a re-prompt.
                     // Other access kinds keep their legacy fall-through behavior,
-                    // subject to Bash request floors.
+                    // subject to Bash request and protected-edit floors.
                     match policy_decision {
                         Some(Decision::Ask) => {
                             tracing::info!(
@@ -1437,12 +1477,13 @@ fn spawn_permission_manager_with_pin(
                             );
                         }
                         Some(Decision::Allow)
-                            if bash_request_floor_requires_prompt(bash_evaluation.as_ref()) =>
+                            if protected_edit
+                                || bash_request_floor_requires_prompt(bash_evaluation.as_ref()) =>
                         {
                             tracing::info!(
                                 tool = ?tool_name,
                                 source = "policy",
-                                "permission policy allow deferred to Bash prompt floor"
+                                "permission policy allow deferred to confirmation floor"
                             );
                         }
                         Some(decision) => {
@@ -1496,7 +1537,7 @@ fn spawn_permission_manager_with_pin(
                         )
                         .map(|d| (d, reasons::PERSISTED_GRANT)),
                         AccessKind::Edit(_) => {
-                            if allow_edits_for_session {
+                            if allow_edits_for_session && !protected_edit {
                                 Some((Decision::Allow, reasons::PERSISTED_GRANT))
                             } else {
                                 match state.edit_policy {
@@ -1763,20 +1804,15 @@ fn spawn_permission_manager_with_pin(
                                 }
                                 PromptOutcome::AllowAlwaysMcpServer(server_prefix) => {
                                     // Derive the canonical server prefix from the current
-                                    // AccessKind via `split_once("__")`. Validate the
-                                    // client-supplied prefix against it; on mismatch (or
-                                    // empty / no separator), downgrade to tool-scope using
-                                    // the access-kind name. This prevents a buggy or
-                                    // malicious client from whitelisting an unrelated
-                                    // server.
+                                    // AccessKind and validate the client-supplied prefix
+                                    // against it. On mismatch or malformed input, downgrade
+                                    // to tool-scope using the access-kind name.
                                     if let AccessKind::MCPTool {
                                         name: access_name, ..
                                     } = &access
                                     {
-                                        let canonical = access_name
-                                            .split_once("__")
-                                            .map(|(s, _)| s)
-                                            .filter(|s| !s.is_empty());
+                                        let canonical = parse_mcp_qualified_name(access_name)
+                                            .map(|(_, server, _)| server);
                                         match canonical {
                                             Some(canonical) if canonical == server_prefix => {
                                                 state
@@ -1790,10 +1826,9 @@ fn spawn_permission_manager_with_pin(
                                                 persist_state(&cwd, &state, client_id_ref).await;
                                             }
                                             _ => {
-                                                // Mismatch, empty prefix, or no `__` separator
-                                                // in the access name. Defensively downgrade to
-                                                // tool-scope on the access-kind name so the
-                                                // user is not re-prompted, but the blast
+                                                // Mismatch or malformed access name. Defensively
+                                                // downgrade to tool-scope on the access-kind name
+                                                // so the user is not re-prompted, but the blast
                                                 // radius is the smaller scope they actually
                                                 // saw.
                                                 tracing::warn!(
@@ -2122,6 +2157,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_edit_grant_excludes_protected_target() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let transport = fake_hub(serde_json::json!({ "outcome": "always_approve" }));
+                let (mgr, _e) = test_manager_with_hub(&cwd, transport.clone());
+                for path in ["src/first.rs", "src/second.rs", "~/.zshrc"] {
+                    assert_eq!(
+                        mgr.request(AccessKind::Edit(path.into()), tool_call(), None, None, None)
+                            .await,
+                        Decision::Allow
+                    );
+                }
+                assert_eq!(transport.seen.lock().unwrap().len(), 2);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shared_manager_uses_request_edit_path_context() {
+        use std::os::unix::fs::symlink;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let parent = tempfile::tempdir().unwrap();
+                let child = tempfile::tempdir().unwrap();
+                let display = tempfile::tempdir().unwrap();
+                symlink("/etc", child.path().join("link")).unwrap();
+                let parent_cwd = AbsPathBuf::new(parent.path().to_path_buf()).unwrap();
+                let transport = fake_hub(serde_json::json!({ "outcome": "approve" }));
+                let (mgr, _events) = test_manager_with_hub(&parent_cwd, transport.clone());
+                mgr.set_auto_mode(true);
+                let context = EditPathContext {
+                    real_cwd: child.path().to_path_buf(),
+                    display_cwd: Some(display.path().to_path_buf()),
+                };
+
+                for displayed in [
+                    display.path().join("link/hosts"),
+                    display.path().join("src.rs"),
+                ] {
+                    assert_eq!(
+                        mgr.request_with_edit_path_context(
+                            AccessKind::Edit(displayed.to_string_lossy().into_owned()),
+                            tool_call(),
+                            Some(context.clone()),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await,
+                        Decision::Allow
+                    );
+                }
+                assert_eq!(
+                    transport.seen.lock().unwrap().len(),
+                    1,
+                    "child protected target prompts; ordinary displayed child path stays auto"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn hub_permission_reject_aborts() {
         let local = tokio::task::LocalSet::new();
         local
@@ -2218,6 +2321,64 @@ mod tests {
                     1,
                     "always_approve must persist so the second call needs no hook"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_mcp_server_scope_downgrades_to_exact_persisted_grant() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for (name, forged_server) in [("a__b__c", "a"), ("foo___bar", "foo")] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let transport = fake_hub(serde_json::json!({
+                        "outcome": "always_approve",
+                        "scope": { "kind": "server_prefix", "value": forged_server },
+                    }));
+                    let (mgr, _e) = test_manager_with_hub(&cwd, transport.clone());
+                    let decision = mgr
+                        .request(
+                            AccessKind::MCPTool {
+                                name: name.into(),
+                                input: serde_json::Value::Null,
+                            },
+                            tool_call(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    assert_eq!(decision, Decision::Allow);
+
+                    let persisted = load_state_from_disk(&cwd, None).await;
+                    assert!(persisted.allowed_mcp_servers.is_empty(), "{name}");
+                    assert!(persisted.allowed_mcp_tools.contains(name), "{name}");
+                    assert!(matches!(
+                        mcp_pre_decision(name, &persisted, false, false),
+                        Some(Decision::Allow)
+                    ));
+
+                    let replay_transport = fake_hub(serde_json::json!({ "outcome": "reject" }));
+                    let (reloaded, _e) = test_manager_with_hub(&cwd, replay_transport.clone());
+                    assert_eq!(
+                        reloaded
+                            .request(
+                                AccessKind::MCPTool {
+                                    name: name.into(),
+                                    input: serde_json::Value::Null,
+                                },
+                                tool_call(),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await,
+                        Decision::Allow
+                    );
+                    assert!(replay_transport.seen.lock().unwrap().is_empty());
+                }
             })
             .await;
     }
@@ -3489,6 +3650,59 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn protected_edit_floor_covers_auto_config_allow_and_dont_ask() {
+        use crate::permission::types::{PermissionRule, RuleAction, ToolFilter};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut auto = crate::permission::types::PermissionConfig::new(vec![]);
+                auto.prompt_policy = PromptPolicy::Auto;
+                let allow = crate::permission::types::PermissionConfig::new(vec![PermissionRule {
+                    action: RuleAction::Allow,
+                    tool: ToolFilter::Edit,
+                    pattern: None,
+                    pattern_mode: Default::default(),
+                }]);
+                let mut deny = crate::permission::types::PermissionConfig::new(vec![]);
+                deny.prompt_policy = PromptPolicy::Deny;
+
+                for (name, config, expected_prompts, policy_deny) in [
+                    ("auto", auto, 1, false),
+                    ("configured allow", allow, 1, false),
+                    ("dontAsk", deny, 0, true),
+                ] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, _events) = manager_with_recording_client(
+                        &cwd,
+                        Some(config),
+                        client,
+                        ClientType::Generic,
+                    );
+                    let decision = mgr
+                        .request(
+                            AccessKind::Edit("/etc/hosts".into()),
+                            tool_call(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    assert_eq!(prompts.borrow().len(), expected_prompts, "{name}");
+                    if policy_deny {
+                        assert!(matches!(decision, Decision::PolicyDeny(_)), "{name}");
+                    } else {
+                        assert!(matches!(decision, Decision::Reject(_)), "{name}");
+                    }
+                }
+            })
+            .await;
+    }
+
     #[test]
     fn sandbox_auto_allow_respects_real_file_write_floor() {
         let state = PermissionState::default();
@@ -3565,6 +3779,7 @@ mod tests {
                     .send(PermissionCommand::Request {
                         access: AccessKind::Bash("curl http://example.com".into()),
                         tool_call_update: tool_call(),
+                        edit_path_context: None,
                         respond_to: tx,
                         session_id: None,
                         subagent_type: None,
@@ -3674,6 +3889,7 @@ mod tests {
                     .send(PermissionCommand::Request {
                         access: AccessKind::Bash("curl http://example.com".into()),
                         tool_call_update: tool_call(),
+                        edit_path_context: None,
                         respond_to: tx,
                         session_id: None,
                         subagent_type: None,
@@ -5146,10 +5362,13 @@ mod tests {
 
         #[test]
         fn server_prefix_match_allows() {
-            assert!(mcp_server_prefix_allowed(
-                "linear__list",
-                &servers(&["linear"])
-            ));
+            for (name, server) in [
+                ("linear__list", "linear"),
+                ("123__lookup", "123"),
+                ("server:scope__tool", "server:scope"),
+            ] {
+                assert!(mcp_server_prefix_allowed(name, &servers(&[server])));
+            }
         }
 
         #[test]
@@ -5158,8 +5377,24 @@ mod tests {
         }
 
         #[test]
-        fn no_separator_rejects() {
-            assert!(!mcp_server_prefix_allowed("linear", &servers(&["linear"])));
+        fn malformed_names_do_not_consume_server_grants() {
+            for (name, server) in [
+                ("server__part__tool", "server"),
+                ("server__tool__part", "server"),
+                ("foo___bar", "foo"),
+                ("foo___bar", "foo_"),
+                ("foo____bar", "foo"),
+                ("server__", "server"),
+                ("server", "server"),
+                ("__tool", ""),
+                ("", ""),
+                ("server__bad.tool", "server"),
+            ] {
+                assert!(
+                    !mcp_server_prefix_allowed(name, &servers(&[server])),
+                    "unexpectedly allowed {name:?}"
+                );
+            }
         }
 
         #[test]
@@ -5179,9 +5414,8 @@ mod tests {
         }
 
         #[test]
-        fn first_double_underscore_anchors_split() {
-            // "a__b__c" splits into ("a", "b__c"); server "a" matches.
-            assert!(mcp_server_prefix_allowed("a__b__c", &servers(&["a"])));
+        fn multiple_delimiters_do_not_inherit_first_segment_grant() {
+            assert!(!mcp_server_prefix_allowed("a__b__c", &servers(&["a"])));
         }
 
         #[test]
@@ -5195,20 +5429,16 @@ mod tests {
         }
 
         #[test]
-        fn empty_tool_name_after_prefix_still_allowed() {
-            // The MCP server is responsible for rejecting empty tool names;
-            // the prefix match is what gates access.
-            assert!(mcp_server_prefix_allowed("foo__", &servers(&["foo"])));
-        }
-
-        #[test]
         fn pre_decision_tool_grant_allows() {
             let mut state = PermissionState::default();
             state.allowed_mcp_tools.insert("linear__list".to_string());
-            assert!(matches!(
-                mcp_pre_decision("linear__list", &state, false, false),
-                Some(Decision::Allow)
-            ));
+            state.allowed_mcp_tools.insert("a__b__c".to_string());
+            for name in ["linear__list", "a__b__c"] {
+                assert!(matches!(
+                    mcp_pre_decision(name, &state, false, false),
+                    Some(Decision::Allow)
+                ));
+            }
         }
 
         #[test]
@@ -5367,10 +5597,8 @@ mod tests {
             .await;
     }
 
-    /// Auto mode accepts ALL file edits via the fast path regardless of location
-    /// (the accept-all-edits product decision, no workspace restriction): both an
-    /// in-cwd edit and an absolute path clearly OUTSIDE cwd fast-path Allow. The
-    /// fast path is path-independent, so the target file need not exist.
+    /// Auto mode accepts ordinary file edits via the fast path regardless of
+    /// location (the accept-all-edits product decision, no workspace restriction).
     #[tokio::test]
     async fn auto_mode_edit_fast_path_allows() {
         let local = tokio::task::LocalSet::new();
@@ -5387,7 +5615,6 @@ mod tests {
                     )
                 };
 
-                // In-cwd edit → Allow (file need not exist).
                 let in_cwd = tmp.path().join("f.rs").to_string_lossy().into_owned();
                 let d = mgr
                     .request(AccessKind::Edit(in_cwd), mk("tc-edit-in"), None, None, None)
@@ -5397,10 +5624,9 @@ mod tests {
                     "in-cwd edit under auto must fast-path allow, got {d:?}"
                 );
 
-                // Out-of-workspace absolute edit → Allow too (no workspace restriction).
                 let d = mgr
                     .request(
-                        AccessKind::Edit("/etc/hosts".into()),
+                        AccessKind::Edit("/tmp/out-of-ws.rs".into()),
                         mk("tc-edit-out"),
                         None,
                         None,

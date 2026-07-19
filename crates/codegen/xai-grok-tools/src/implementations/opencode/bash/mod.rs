@@ -65,7 +65,7 @@ Before executing the command, please follow these steps:
 
 Usage notes:
   - The command argument is required.
-  - You can specify an optional timeout in milliseconds. If not specified, commands will use the default timeout.
+  - You can specify an optional ${{ params.execute.timeout }} in milliseconds. If not specified, commands will use the default timeout.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds {max_output_bytes} characters, output will be truncated before being returned to you.
 ${%- if tools.by_kind.list or tools.by_kind.search or tools.by_kind.read or tools.by_kind.edit or tools.by_kind.write %}
@@ -570,6 +570,31 @@ mod tests {
         resources.insert(SessionEnv(Arc::new(HashMap::new())));
         resources.insert(NotificationHandle(ToolNotificationHandle::noop()));
         resources
+    }
+
+    #[test]
+    fn description_template_tracks_renamed_timeout() {
+        use crate::types::template_renderer::TemplateRenderer;
+        use crate::types::tool::ToolKind;
+        use crate::types::tool_metadata::ToolMetadata;
+        use std::collections::HashMap;
+
+        let tools = HashMap::from([(ToolKind::Execute, "bash".to_string())]);
+        let params = HashMap::from([(
+            ToolKind::Execute,
+            HashMap::from([("timeout".to_string(), "max_wait".to_string())]),
+        )]);
+        let rendered = TemplateRenderer::new(tools, params)
+            .render(ToolMetadata::description_template(&BashTool))
+            .unwrap();
+        assert!(
+            rendered.contains("optional max_wait in milliseconds"),
+            "renamed timeout must appear:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("optional timeout in milliseconds"),
+            "canonical timeout must not remain after rename:\n{rendered}"
+        );
     }
 
     fn make_input(command: &str) -> BashInput {
@@ -1106,8 +1131,12 @@ mod tests {
                     (ToolKind::Read, "read_file".to_string()),
                     (ToolKind::Edit, "search_replace".to_string()),
                     (ToolKind::Write, "write".to_string()),
+                    (ToolKind::Execute, "bash".to_string()),
                 ]),
-                HashMap::new(),
+                HashMap::from([(
+                    ToolKind::Execute,
+                    HashMap::from([("timeout".to_string(), "timeout".to_string())]),
+                )]),
             )
         }
 

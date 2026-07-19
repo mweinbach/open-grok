@@ -389,12 +389,25 @@ pub(crate) fn build_virtual_list(
     items
 }
 
-/// Build a position-indexed entry map for the session picker.
-///
-/// Each element is `Some(item)` for selectable rows or `None` for
-/// non-selectable headers. When `grouped` is true, repo-group headers
-/// are interleaved so indices match what the renderer stores in hit areas.
-/// `current_repo` pins the matching repo group to the top of the list.
+/// Rebuild expansion keys in the backing-data index space used by session rendering.
+pub(crate) fn expand_all_mapped_session_items(
+    state: &mut PickerState,
+    entry_map: &[Option<PickerItem>],
+) {
+    state.expanded.clear();
+    if state.query().is_empty() {
+        return;
+    }
+    for item in entry_map.iter().flatten() {
+        let key = match item {
+            PickerItem::Fuzzy { original_index } => *original_index,
+            PickerItem::Content { hit_index } => CONTENT_EXPAND_OFFSET + hit_index,
+        };
+        state.expanded.insert(key);
+    }
+}
+
+/// Build the position-indexed session map, including non-selectable headers.
 pub(crate) fn build_entry_map(
     entries: Option<&[SessionPickerEntry]>,
     content_results: Option<&[xai_grok_shell::extensions::session_search::SearchSessionHit]>,
@@ -487,6 +500,77 @@ pub(crate) fn build_entry_map(
         }
         map
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionPickerWorktreeSelection {
+    Fuzzy(usize),
+    Content { session_id: String, cwd: String },
+    Unavailable,
+}
+
+/// Resolve Ctrl+W before generic editing because the line editor binds it to delete-word.
+pub(crate) fn session_picker_worktree_selection(
+    key: &crossterm::event::KeyEvent,
+    state: &mut PickerState,
+    entry_map: &[Option<PickerItem>],
+    non_selectable: &[bool],
+    entries: Option<&[SessionPickerEntry]>,
+    content_results: Option<&[xai_grok_shell::extensions::session_search::SearchSessionHit]>,
+) -> Option<SessionPickerWorktreeSelection> {
+    if key.kind != crossterm::event::KeyEventKind::Press || !crate::key!('w', CONTROL).matches(key)
+    {
+        return None;
+    }
+    if entry_map.is_empty() {
+        return Some(SessionPickerWorktreeSelection::Unavailable);
+    }
+    crate::views::picker::clamp_picker_selection(state, entry_map.len(), non_selectable);
+    Some(
+        match entry_map
+            .get(state.selected)
+            .and_then(|entry| entry.as_ref())
+        {
+            Some(PickerItem::Fuzzy { original_index }) => entries
+                .and_then(|entries| entries.get(*original_index))
+                .filter(|entry| !crate::app::is_foreign_picker_source(&entry.source))
+                .map_or(SessionPickerWorktreeSelection::Unavailable, |_| {
+                    SessionPickerWorktreeSelection::Fuzzy(*original_index)
+                }),
+            Some(PickerItem::Content { hit_index }) => content_results
+                .and_then(|results| results.get(*hit_index))
+                .map_or(SessionPickerWorktreeSelection::Unavailable, |hit| {
+                    SessionPickerWorktreeSelection::Content {
+                        session_id: hit.session_id.clone(),
+                        cwd: hit.cwd.clone(),
+                    }
+                }),
+            None => SessionPickerWorktreeSelection::Unavailable,
+        },
+    )
+}
+
+/// Rebuild backing-index expansion after a session query changes.
+pub(crate) fn sync_session_picker_query_expansion(
+    entries: Option<&[SessionPickerEntry]>,
+    content_results: Option<&[xai_grok_shell::extensions::session_search::SearchSessionHit]>,
+    entries_query: Option<&str>,
+    state: &mut PickerState,
+    grouped: bool,
+    content_loading: bool,
+    source_filter: SourceFilter,
+    current_repo: Option<&str>,
+) {
+    let entry_map = build_entry_map(
+        entries,
+        content_results,
+        effective_filter_query(state.query(), entries_query),
+        grouped,
+        content_loading,
+        source_filter,
+        current_repo,
+    );
+    expand_all_mapped_session_items(state, &entry_map);
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,6 +1178,28 @@ mod tests {
         ));
         assert!(map[2].is_none(), "content header");
         assert!(matches!(map[3], Some(PickerItem::Content { hit_index: 0 })));
+    }
+
+    #[test]
+    fn expand_all_mapped_session_items_uses_backing_indices() {
+        let entries = vec![make_entry("zero", "repo-a"), make_entry("needle", "repo-b")];
+        let hits = vec![make_content_hit("content")];
+        let map = build_entry_map(
+            Some(&entries),
+            Some(&hits),
+            "needle",
+            true,
+            false,
+            SourceFilter::All,
+            None,
+        );
+        let mut state = PickerState::default();
+        state.set_query("needle");
+
+        expand_all_mapped_session_items(&mut state, &map);
+
+        assert_eq!(state.expanded, HashSet::from([1, CONTENT_EXPAND_OFFSET]),);
+        assert!(!state.expanded.contains(&0), "group header is not an item");
     }
 
     #[test]

@@ -233,8 +233,8 @@ pub fn persist_trust(store: &mut TrustStore, key: &Path) {
     }
 }
 
-/// Whether any repo-local code-exec config is present for `cwd`. When none are
-/// present there is nothing to gate, so we skip the prompt entirely.
+/// Whether any repo-local trust-sensitive config is present for `cwd`. When none
+/// are present there is nothing to gate, so we skip the prompt entirely.
 ///
 /// Thin wrapper over [`collect_repo_config_kinds`] with `first_only = true`, so
 /// the gate and the display-only [`repo_config_kinds`] enumerate the EXACT same
@@ -244,12 +244,13 @@ pub fn repo_configs_present(cwd: &Path) -> bool {
     !collect_repo_config_kinds(cwd, true).is_empty()
 }
 
-/// Display-only: which repo-local code-exec config KINDS are present for `cwd`
-/// (`mcp`, `plugins`, `lsp`, `envrc`, `claude`, `hooks`, `agents`), deduped in
-/// cheap→expensive marker order. Single source with [`repo_configs_present`]
-/// (which is `!repo_config_kinds(cwd).is_empty()`), so a folder that the gate
-/// fired on always has a non-empty, accurate kind list — no `[plugins].paths` /
-/// `.claude` / `.opengrok/agents` / subdir-launch gaps. NOT itself the trust gate.
+/// Display-only: which repo-local trust-sensitive config KINDS are present for
+/// `cwd` (`mcp`, `plugins`, `lsp`, `envrc`, `claude`, `hooks`, `agents`, `roles`,
+/// `personas`), deduped in cheap→expensive marker order. Single source with
+/// [`repo_configs_present`] (which is `!repo_config_kinds(cwd).is_empty()`), so a
+/// folder that the gate fired on always has a non-empty, accurate kind list — no
+/// `[plugins].paths` / `.claude` / `.opengrok/agents` / subdir-launch gaps. NOT
+/// itself the trust gate.
 pub fn repo_config_kinds(cwd: &Path) -> Vec<&'static str> {
     collect_repo_config_kinds(cwd, false)
 }
@@ -257,6 +258,14 @@ pub fn repo_config_kinds(cwd: &Path) -> Vec<&'static str> {
 fn path_present_or_uncertain(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn directory_present_or_uncertain(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_dir(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => true,
     }
@@ -375,6 +384,14 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     // can't drift from agent discovery — same pattern as the plugin line above.
     if !xai_grok_agent::discovery::project_agent_dirs_in(&chain.dirs).is_empty() {
         hit!("agents");
+    }
+    // Presence matches exact-cwd discovery without parsing repository content.
+    let grok = cwd.join(".opengrok");
+    if directory_present_or_uncertain(&grok.join("roles")) {
+        hit!("roles");
+    }
+    if directory_present_or_uncertain(&grok.join("personas")) {
+        hit!("personas");
     }
     // `~/.claude.json` `projects.<cwd>.mcpServers`.
     if claude_project_mcp_present(cwd) {
@@ -593,6 +610,64 @@ mod tests {
         let subdir = tmp.path().join("crates").join("inner");
         std::fs::create_dir_all(&subdir).unwrap();
         assert!(repo_configs_present(&subdir));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_project_roles() {
+        let tmp = repo_tmp();
+        std::fs::create_dir_all(tmp.path().join(".opengrok").join("roles")).unwrap();
+
+        assert!(repo_configs_present(tmp.path()));
+        assert!(repo_config_kinds(tmp.path()).contains(&"roles"));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_project_personas() {
+        let tmp = repo_tmp();
+        std::fs::create_dir_all(tmp.path().join(".opengrok").join("personas")).unwrap();
+
+        assert!(repo_configs_present(tmp.path()));
+        assert!(repo_config_kinds(tmp.path()).contains(&"personas"));
+    }
+
+    #[test]
+    fn project_subagent_marker_regular_file_is_absent() {
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".opengrok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(grok.join("roles"), "not a directory").unwrap();
+        assert!(!repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn project_subagent_marker_at_repo_root_is_absent_from_subdir() {
+        let tmp = repo_tmp();
+        std::fs::create_dir_all(tmp.path().join(".opengrok/roles")).unwrap();
+        let subdir = tmp.path().join("nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(!repo_configs_present(&subdir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_subagent_marker_symlink_to_directory_is_present() {
+        let tmp = repo_tmp();
+        let target = tmp.path().join("target-roles");
+        let grok = tmp.path().join(".opengrok");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&grok).unwrap();
+        std::os::unix::fs::symlink(&target, grok.join("roles")).unwrap();
+        assert!(repo_configs_present(tmp.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_project_subagent_marker_is_absent() {
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".opengrok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::os::unix::fs::symlink("missing", grok.join("personas")).unwrap();
+        assert!(!repo_configs_present(tmp.path()));
     }
 
     #[test]

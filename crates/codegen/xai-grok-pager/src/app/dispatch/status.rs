@@ -71,6 +71,9 @@ pub(super) fn dispatch_show_session_info(app: &mut AppView) -> Vec<Effect> {
 /// Three-state display: Enterprise ZDR, coding data sharing opted out,
 /// or opted in. Labels align with `CODING_DATA_SHARING_CHOICES` in
 /// `settings/defs.rs` and the `coding_data_sharing_toast` format.
+///
+/// Also lists config knobs that `/privacy` does not change (technical
+/// pointers only; no policy claims).
 pub(super) fn dispatch_show_privacy_info(app: &mut AppView) -> Vec<Effect> {
     let mut lines = Vec::new();
 
@@ -92,6 +95,12 @@ pub(super) fn dispatch_show_privacy_info(app: &mut AppView) -> Vec<Effect> {
         lines.push("  Use /privacy opt-out to enable privacy mode.");
     }
 
+    // Config keys only; do not describe retention/training/analytics policy here.
+    lines.push("");
+    lines.push("  Other settings (not changed by /privacy):");
+    lines.push("  - [features] telemetry / GROK_TELEMETRY_ENABLED");
+    lines.push("  - [telemetry] trace_upload / GROK_TELEMETRY_TRACE_UPLOAD");
+    lines.push("  - GROK_EXTERNAL_OTEL / OTEL_*");
     lines.push("");
     lines.push("  Learn more: https://x.ai/legal");
     let text = lines.join("\n");

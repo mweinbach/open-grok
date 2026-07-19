@@ -26,15 +26,12 @@ use xai_grok_pager::scrollback::{
     RenderBlock, ScratchBuffer, ScrollbackPane, ScrollbackSearchState, ScrollbackState,
 };
 use xai_grok_pager::theme::Theme;
-use xai_grok_pager::views::picker::render_search_bar;
+use xai_grok_pager::views::picker::render_search_bar_with_viewport;
 
 struct App {
     scrollback: ScrollbackState,
     scratch: ScratchBuffer,
     search: ScrollbackSearchState,
-    /// The query input buffer the user is editing (the source of truth for the
-    /// composing string, mirroring how the production input router will work).
-    query: String,
     events: VecDeque<String>,
 }
 
@@ -58,7 +55,6 @@ impl App {
             scrollback,
             scratch: ScratchBuffer::new(),
             search: ScrollbackSearchState::open(),
-            query: String::new(),
             events: VecDeque::new(),
         }
     }
@@ -70,13 +66,10 @@ impl App {
         }
     }
 
-    /// Re-run the search for the current query buffer.
-    fn refresh_query(&mut self) {
-        self.search.update_query(&self.query, &self.scrollback);
-        self.reveal_current();
+    fn log_query(&mut self) {
         self.push(format!(
             "query={:?} matches={}",
-            self.query,
+            self.search.query(),
             self.search.match_count()
         ));
     }
@@ -138,21 +131,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         // Esc clears the query; quit only when it's already empty.
         KeyCode::Esc => {
-            if app.query.is_empty() {
+            if app.search.query().is_empty() {
                 return true;
             }
-            app.query.clear();
             app.search = ScrollbackSearchState::open();
-            app.refresh_query();
             app.push("clear".to_string());
         }
         KeyCode::Enter => {
             app.search.accept();
             app.push("accept: browsing".to_string());
-        }
-        KeyCode::Backspace => {
-            app.query.pop();
-            app.refresh_query();
         }
         // While browsing (accepted), `n` / `N` navigate. While composing they
         // are typed into the query, matching real vim `/` behavior.
@@ -166,9 +153,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             app.reveal_current();
             app.push(format!("prev -> {:?}", app.search.current_index()));
         }
-        KeyCode::Char(c) => {
-            app.query.push(c);
-            app.refresh_query();
+        _ if app.search.is_composing() => {
+            let before = app.search.query().to_owned();
+            if app.search.handle_query_key(&key, &app.scrollback) && app.search.query() != before {
+                app.log_query();
+            }
         }
         _ => {}
     }
@@ -230,26 +219,35 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     // -- Search bar --
-    render_search_bar(
+    let query = app.search.query();
+    let counter = match app.search.current_index() {
+        Some(i) => Some(format!("{}/{}", i + 1, app.search.match_count())),
+        None if app.search.has_error() => Some("bad pattern".to_string()),
+        None if !query.is_empty() => Some("no matches".to_string()),
+        None => None,
+    };
+    let counter_width = counter
+        .as_deref()
+        .map_or(0, |text| UnicodeWidthStr::width(text) as u16);
+    let search_layout =
+        xai_grok_pager::views::picker::search_bar_layout(block_area.width, counter_width);
+    render_search_bar_with_viewport(
         f.buffer_mut(),
         block_area.x,
         bar_y,
-        block_area.width,
+        search_layout,
         &theme,
-        &app.query,
+        query,
         app.search.is_composing(),
-        app.query.is_empty() && app.search.is_composing(),
-        app.query.len(),
+        query.is_empty() && app.search.is_composing(),
         None,
+        app.search.query_viewport(search_layout.input_width()),
     );
 
     // Right-aligned match counter: `m/n`, or `no matches` for a live query.
-    let counter = match app.search.current_index() {
-        Some(i) => Some(format!("{}/{}", i + 1, app.search.match_count())),
-        None if !app.query.is_empty() => Some("no matches".to_string()),
-        None => None,
-    };
-    if let Some(counter) = counter {
+    if let Some(counter) = counter
+        && search_layout.trailing_width() > 0
+    {
         let w = counter.width() as u16;
         if block_area.width > w {
             f.buffer_mut().set_string(

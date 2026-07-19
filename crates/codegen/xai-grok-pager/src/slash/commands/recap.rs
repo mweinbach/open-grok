@@ -1,4 +1,4 @@
-//! `/recap` -- summarize the session so far ("where was I").
+//! `/recap` (alias `/summarize`) -- summarize the session so far ("where was I").
 //!
 //! Returns `CommandResult::Action(Action::SendRecap { auto: false })` so the
 //! dispatch layer fires it as an ACP ext method (`x.ai/recap`) that bypasses
@@ -13,6 +13,10 @@ pub struct RecapCommand;
 impl SlashCommand for RecapCommand {
     fn name(&self) -> &str {
         "recap"
+    }
+
+    fn aliases(&self) -> &[&str] {
+        &["summarize"]
     }
 
     fn description(&self) -> &str {

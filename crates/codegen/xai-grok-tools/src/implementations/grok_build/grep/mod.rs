@@ -249,9 +249,9 @@ impl crate::types::tool_metadata::ToolMetadata for GrepTool {
         r#"Search file contents with regular expressions (ripgrep).
 
 - Full regex syntax, so escape literal special characters: `functionCall\(`, or `interface\{\}` to find interface{} in Go.
-- Pass the pattern as a raw regex string — no surrounding quotes.
+- Pass ${{ params.search.pattern }} as a raw regex string — no surrounding quotes.
 - Respects .gitignore unless you pass a broad glob like '--glob *'.
-- Only filter by 'type' or 'glob' when you are sure of the file type; import paths may not match source file types (.js vs .ts).
+- Only filter by '${{ params.search.type }}' or '${{ params.search.glob }}' when you are sure of the file type; import paths may not match source file types (.js vs .ts).
 - Output is ripgrep-style: ':' marks match lines, '-' marks context lines, grouped by file. Large results are capped and report "at least" counts."#
     }
 }
@@ -1637,6 +1637,39 @@ mod tests {
         assert_eq!(xai_tool_runtime::Tool::id(&tool).as_str(), "grep");
         assert!(tool.description_template().contains("ripgrep"));
         assert!(tool.description_template().contains("regex"));
+    }
+
+    #[test]
+    fn description_template_tracks_renamed_search_params() {
+        use crate::types::template_renderer::TemplateRenderer;
+        use crate::types::tool::ToolKind;
+        use crate::types::tool_metadata::ToolMetadata;
+        use std::collections::HashMap;
+
+        let tools = HashMap::from([(ToolKind::Search, "grep".to_string())]);
+        let params = HashMap::from([(
+            ToolKind::Search,
+            HashMap::from([
+                ("pattern".to_string(), "query".to_string()),
+                ("type".to_string(), "filetype".to_string()),
+                ("glob".to_string(), "include".to_string()),
+            ]),
+        )]);
+        let rendered = TemplateRenderer::new(tools, params)
+            .render(ToolMetadata::description_template(&GrepTool))
+            .unwrap();
+        assert!(
+            rendered.contains("Pass query as a raw regex")
+                && rendered.contains("'filetype'")
+                && rendered.contains("'include'"),
+            "renamed search params must appear:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Pass pattern as")
+                && !rendered.contains("'type'")
+                && !rendered.contains("'glob'"),
+            "canonical search param names must not remain after rename:\n{rendered}"
+        );
     }
 
     #[tokio::test]

@@ -305,7 +305,7 @@ impl ExecuteToolCallBlock {
         };
         let mut spans = vec![Span::styled("Run ", label_style)];
         if self.bash_mode {
-            // Same style as session event messages (e.g. "Worked for 2.3s.")
+            // Same style as session event messages (e.g. "Worked for 2.3s")
             spans.push(Span::styled("(user) ", theme.muted()));
         }
         // Single ratatui Line — never pass raw newlines (callers that need

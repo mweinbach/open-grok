@@ -20,6 +20,7 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -27,6 +28,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::input::line_editor::{LineEditOutcome, LineEditor};
 use crate::render::line_utils::truncate_str;
 use crate::render::wrapping::word_wrap_line;
 use crate::theme::Theme;
@@ -191,6 +193,52 @@ pub fn compute_scroll_offset(
 // Search bar
 // ---------------------------------------------------------------------------
 
+const SEARCH_BAR_LABEL: &str = " search: ";
+const SEARCH_BAR_TRAILING_GAP: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchBarLayout {
+    render_width: u16,
+    input_width: usize,
+    trailing_width: u16,
+}
+
+impl SearchBarLayout {
+    pub fn input_width(self) -> usize {
+        self.input_width
+    }
+
+    pub fn trailing_width(self) -> u16 {
+        self.trailing_width
+    }
+}
+
+pub fn search_bar_layout(width: u16, trailing_width: u16) -> SearchBarLayout {
+    let label_width = (SEARCH_BAR_LABEL.len() as u16).min(width);
+    let available_input = width - label_width;
+    let trailing_reserved = if trailing_width > 0
+        && available_input
+            >= trailing_width
+                .saturating_add(SEARCH_BAR_TRAILING_GAP)
+                .saturating_add(1)
+    {
+        trailing_width.saturating_add(SEARCH_BAR_TRAILING_GAP)
+    } else {
+        0
+    };
+    let render_width = width - trailing_reserved;
+    let input_width = render_width.saturating_sub(label_width) as usize;
+    SearchBarLayout {
+        render_width,
+        input_width,
+        trailing_width: if trailing_reserved == 0 {
+            0
+        } else {
+            trailing_width
+        },
+    }
+}
+
 /// Render a search bar row: ` search: {query}_` or ` / to search` hint.
 ///
 /// - `active`: whether the cursor blinks (search mode is engaged).
@@ -217,12 +265,140 @@ pub fn render_search_bar(
         y,
         width,
         theme,
-        " search: ",
+        SEARCH_BAR_LABEL,
         query,
         active,
         show_hint,
         query_cursor,
         bg,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_search_bar_with_viewport(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    layout: SearchBarLayout,
+    theme: &Theme,
+    query: &str,
+    active: bool,
+    show_hint: bool,
+    bg: Option<ratatui::style::Color>,
+    viewport: xai_ratatui_textarea::SingleLineViewport,
+) {
+    render_search_bar_with_label_viewport(
+        buf,
+        x,
+        y,
+        layout.render_width,
+        theme,
+        SEARCH_BAR_LABEL,
+        query,
+        active,
+        show_hint,
+        0,
+        bg,
+        Some(viewport),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_picker_search_bar(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    theme: &Theme,
+    state: &PickerState,
+    active: bool,
+    show_hint: bool,
+    bg: Option<ratatui::style::Color>,
+) {
+    render_line_editor_search_bar(buf, x, y, width, theme, &state.query, active, show_hint, bg);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_line_editor_search_bar(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    theme: &Theme,
+    editor: &LineEditor,
+    active: bool,
+    show_hint: bool,
+    bg: Option<ratatui::style::Color>,
+) {
+    render_line_editor_search_bar_with_label(
+        buf,
+        x,
+        y,
+        width,
+        theme,
+        SEARCH_BAR_LABEL,
+        editor,
+        active,
+        show_hint,
+        bg,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_picker_search_bar_with_label(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    theme: &Theme,
+    label: &str,
+    state: &PickerState,
+    active: bool,
+    show_hint: bool,
+    bg: Option<ratatui::style::Color>,
+) {
+    render_line_editor_search_bar_with_label(
+        buf,
+        x,
+        y,
+        width,
+        theme,
+        label,
+        &state.query,
+        active,
+        show_hint,
+        bg,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_line_editor_search_bar_with_label(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    theme: &Theme,
+    label: &str,
+    editor: &LineEditor,
+    active: bool,
+    show_hint: bool,
+    bg: Option<ratatui::style::Color>,
+) {
+    let input_width = width.saturating_sub(label.len() as u16) as usize;
+    let viewport = editor.viewport(input_width);
+    render_search_bar_with_label_viewport(
+        buf,
+        x,
+        y,
+        width,
+        theme,
+        label,
+        editor.text(),
+        active,
+        show_hint,
+        editor.cursor_byte(),
+        bg,
+        Some(viewport),
     );
 }
 
@@ -242,6 +418,37 @@ pub fn render_search_bar_with_label(
     show_hint: bool,
     query_cursor: usize,
     bg: Option<ratatui::style::Color>,
+) {
+    render_search_bar_with_label_viewport(
+        buf,
+        x,
+        y,
+        width,
+        theme,
+        label,
+        query,
+        active,
+        show_hint,
+        query_cursor,
+        bg,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_search_bar_with_label_viewport(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    theme: &Theme,
+    label: &str,
+    query: &str,
+    active: bool,
+    show_hint: bool,
+    query_cursor: usize,
+    bg: Option<ratatui::style::Color>,
+    viewport: Option<xai_ratatui_textarea::SingleLineViewport>,
 ) {
     // Minimal mode renders every UI element background-free.
     let bg = if crate::views::modal_window::embedded() {
@@ -267,53 +474,56 @@ pub fn render_search_bar_with_label(
         );
 
         let input_x = x + label_w;
-        let input_max = width.saturating_sub(label_w + 1) as usize;
-
-        // Cursor-following window: find the visible slice of the query
-        // that keeps the cursor in view.  When the cursor is at the end
-        // (the common case), this is equivalent to tail-scroll.
-        let mut cursor_byte = query_cursor.min(query.len());
-        while cursor_byte > 0 && !query.is_char_boundary(cursor_byte) {
-            cursor_byte -= 1;
-        }
-        let prefix_w = query[..cursor_byte].width();
-        let (start_byte, cursor_col) = if prefix_w <= input_max {
-            // Cursor fits from the start — no scrolling needed.
-            (0, prefix_w)
-        } else {
-            // Walk forward from byte 0, accumulating width, until the
-            // remaining prefix fits within `input_max`.
-            let mut skip_w = 0usize;
-            let mut sb = 0usize;
-            for (idx, ch) in query.char_indices() {
-                if idx >= cursor_byte {
-                    break;
-                }
-                let cw = ch.width().unwrap_or(0);
-                if prefix_w - skip_w <= input_max {
-                    break;
-                }
-                skip_w += cw;
-                sb = idx + ch.len_utf8();
+        let input_width = width.saturating_sub(label_w) as usize;
+        let cursor_limit = input_width.saturating_sub(1);
+        let cursor_col = if let Some(viewport) = viewport {
+            if !query.is_empty() {
+                let displayed = &query[viewport.visible_byte_range];
+                buf.set_span(
+                    input_x,
+                    y,
+                    &Span::styled(displayed, bg_style(Style::default().fg(theme.text_primary))),
+                    displayed.width() as u16,
+                );
             }
-            (sb, prefix_w - skip_w)
+            viewport.cursor_display_column
+        } else {
+            // Compatibility path for raw-string inputs that have not adopted LineEditor.
+            let mut cursor_byte = query_cursor.min(query.len());
+            while cursor_byte > 0 && !query.is_char_boundary(cursor_byte) {
+                cursor_byte -= 1;
+            }
+            let prefix_width = query[..cursor_byte].width();
+            let (start_byte, cursor_col) = if prefix_width <= cursor_limit {
+                (0, prefix_width)
+            } else {
+                let mut skipped_width = 0usize;
+                let mut start_byte = 0usize;
+                for (index, character) in query.char_indices() {
+                    if index >= cursor_byte || prefix_width - skipped_width <= cursor_limit {
+                        break;
+                    }
+                    skipped_width += character.width().unwrap_or(0);
+                    start_byte = index + character.len_utf8();
+                }
+                (start_byte, prefix_width - skipped_width)
+            };
+            if !query.is_empty() {
+                let displayed = truncate_str(&query[start_byte..], cursor_limit);
+                buf.set_span(
+                    input_x,
+                    y,
+                    &Span::styled(
+                        &displayed,
+                        bg_style(Style::default().fg(theme.text_primary)),
+                    ),
+                    displayed.width() as u16,
+                );
+            }
+            cursor_col
         };
 
-        if !query.is_empty() {
-            let visible = &query[start_byte..];
-            let displayed = truncate_str(visible, input_max);
-            buf.set_span(
-                input_x,
-                y,
-                &Span::styled(
-                    &displayed,
-                    bg_style(Style::default().fg(theme.text_primary)),
-                ),
-                displayed.width() as u16,
-            );
-        }
-
-        let cursor_display_w = (cursor_col as u16).min(input_max as u16);
+        let cursor_display_w = (cursor_col as u16).min(cursor_limit as u16);
 
         if active || always_active {
             let cursor_x = input_x + cursor_display_w;
@@ -1323,7 +1533,7 @@ pub fn render_fullscreen_frame(
 ///
 /// Fields used by both the `render_picker()` path (welcome screen) and
 /// the `ModalWindow` + `render_picker_content()` path (modal popups):
-/// `selected`, `query`, `search_active`, `expanded`, `hovered`,
+/// `selected`, query editor, `search_active`, `expanded`, `hovered`,
 /// `scroll_offset`, `hit_areas`.
 ///
 /// Fields used **only** by the `render_picker()` path (welcome screen):
@@ -1334,13 +1544,8 @@ pub fn render_fullscreen_frame(
 pub struct PickerState {
     /// Currently selected index in the filtered entries list.
     pub selected: usize,
-    /// Search query string.
-    pub query: String,
-    /// Byte offset of the editing cursor within `query`. Invariant:
-    /// always on a char boundary in `[0, query.len()]`. Operations
-    /// that mutate `query` must keep this in sync (see helper methods
-    /// on `PickerState`).
-    pub query_cursor: usize,
+    /// Canonical single-line search editor.
+    query: LineEditor,
     /// Whether the search input is focused (only relevant when `show_search_hint` is true).
     pub search_active: bool,
     /// Indices of expanded entries in original data (empty = all collapsed). Caller-managed.
@@ -1378,8 +1583,7 @@ impl Default for PickerState {
     fn default() -> Self {
         Self {
             selected: 0,
-            query: String::new(),
-            query_cursor: 0,
+            query: LineEditor::default(),
             search_active: false,
             expanded: HashSet::new(),
             mode: PickerMode::Floating,
@@ -1421,8 +1625,7 @@ impl PickerState {
     /// preserving the display mode and clearing hit areas.
     pub fn reset(&mut self) {
         self.selected = 0;
-        self.query.clear();
-        self.query_cursor = 0;
+        self.query.reset();
         self.search_active = false;
         self.expanded.clear();
         self.close_hovered = false;
@@ -1439,12 +1642,32 @@ impl PickerState {
     /// returning to an empty-query view without touching focus flags
     /// (`tabs_focused`) or hit areas. Used by the vim Esc-to-nav-mode path.
     pub fn clear_query(&mut self) {
-        self.query.clear();
-        self.query_cursor = 0;
+        self.query.reset();
         self.scroll_offset = None;
         self.selected = 0;
         self.selection_hidden = false;
         self.expanded.clear();
+    }
+
+    pub fn query(&self) -> &str {
+        self.query.text()
+    }
+
+    pub fn query_cursor(&self) -> usize {
+        self.query.cursor_byte()
+    }
+
+    /// Replace the query, remove line breaks, and place the cursor at text end.
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        self.query.set_text(query);
+    }
+
+    fn edit_query(&mut self, key: &KeyEvent) -> LineEditOutcome {
+        self.query.handle_key(key)
+    }
+
+    pub(crate) fn paste_query(&mut self, text: &str) -> LineEditOutcome {
+        self.query.insert_paste(text)
     }
 
     /// When a search query is active on an expandable picker, force-expand
@@ -1519,7 +1742,7 @@ pub struct PickerConfig<'a> {
     /// Each entry is `(key_char, description)` shown in shortcuts.
     pub action_keys: &'a [(char, &'a str)],
     /// If true, suppress the search bar entirely (and any text input into
-    /// `state.query`). The first content row is replaced by `config.title`
+    /// `state.query()`). The first content row is replaced by `config.title`
     /// rendered as a plain title. Useful for read-only cheatsheet modals.
     pub disable_search: bool,
     /// If true, render the bottom shortcuts bar using ONLY `config.shortcuts`
@@ -1578,10 +1801,12 @@ pub enum PickerOutcome {
     /// User wants to copy entry at this index (if config.expandable).
     Copy(usize),
     /// User pressed Enter with a non-empty query but no matching entries.
-    /// Caller can use the query string (from `state.query`) to attempt a direct lookup.
+    /// Caller can use the query string from `state.query()` to attempt a direct lookup.
     SubmitQuery,
-    /// Visual state changed, needs redraw.
+    /// Visual state or query cursor changed; query text is unchanged.
     Changed,
+    /// Query text changed; hosts should refresh filtering/search once.
+    QueryChanged,
     /// Nothing changed.
     Unchanged,
     /// User switched to tab at given index.
@@ -1717,16 +1942,15 @@ pub fn render_picker_in_modal_inner(
     search_active: bool,
     show_search_hint: bool,
 ) {
-    render_search_bar(
+    render_picker_search_bar(
         buf,
         content_area.x,
         content_area.y,
         content_area.width,
         theme,
-        &state.query,
+        state,
         search_active,
         show_search_hint,
-        state.query_cursor,
         Some(theme.bg_base),
     );
     let sep_y = content_area.y + 1;
@@ -2156,16 +2380,15 @@ pub fn render_picker(
         }
     } else {
         // Cursor tracks focus (`search_active`) for every picker — like the Settings pane; `show_search_hint` is input-only and no longer forces an always-on cursor.
-        render_search_bar(
+        render_picker_search_bar(
             buf,
             content.x,
             content.y,
             search_width,
             theme,
-            &state.query,
+            state,
             state.search_active,
             true,
-            state.query_cursor,
             bg,
         );
     }
@@ -2295,11 +2518,30 @@ pub fn render_picker(
     }
 }
 
-/// Handle input events for the picker. Returns what happened.
-///
-/// The caller provides the number of filtered entries for bounds checking.
-/// After receiving `Changed`, the caller should re-filter entries based on
-/// `state.query` and call `render_picker()` with the updated entries.
+/// Clamp selection to a selectable row after a host changes the picker entries.
+pub fn clamp_picker_selection(
+    state: &mut PickerState,
+    entry_count: usize,
+    non_selectable: &[bool],
+) {
+    let is_non_sel = |i: usize| non_selectable.get(i).copied().unwrap_or(false);
+    if entry_count > 0 {
+        state.selected = state.selected.min(entry_count.saturating_sub(1));
+        while is_non_sel(state.selected) && state.selected < entry_count - 1 {
+            state.selected += 1;
+        }
+        if is_non_sel(state.selected) {
+            state.selected = 0;
+            while is_non_sel(state.selected) && state.selected < entry_count - 1 {
+                state.selected += 1;
+            }
+        }
+    } else {
+        state.selected = 0;
+    }
+}
+
+/// Handle one picker event; hosts re-filter only after [`PickerOutcome::QueryChanged`].
 pub fn handle_picker_input(
     ev: &crossterm::event::Event,
     state: &mut PickerState,
@@ -2317,22 +2559,7 @@ pub fn handle_picker_input(
     };
     // Clamp selected to valid range — entries may have changed since last input
     // (e.g., query filter reduced the list).
-    if entry_count > 0 {
-        // Clamp selected into valid range first — entries may have shrunk.
-        state.selected = state.selected.min(entry_count.saturating_sub(1));
-        // Skip non-selectable items (e.g., section headers)
-        while is_non_sel(state.selected) && state.selected < entry_count - 1 {
-            state.selected += 1;
-        }
-        if is_non_sel(state.selected) {
-            state.selected = 0;
-            while is_non_sel(state.selected) && state.selected < entry_count - 1 {
-                state.selected += 1;
-            }
-        }
-    } else {
-        state.selected = 0;
-    }
+    clamp_picker_selection(state, entry_count, config.non_selectable);
 
     // Precompute first/last selectable for boundary-aware Up/Down navigation
     // (search focus at edges, skipping any non-selectable headers).
@@ -2458,15 +2685,36 @@ pub fn handle_picker_input(
         }
     }
 
-    // Helper to deduplicate paste logic between is_paste_key and Event::Paste.
-    // Also ensures scroll_offset=None on all paste-driven query mutations, for
-    // consistency with every other query-mutating arm.
-    //
-    // Implemented as a local `fn` (not a closure) so we can legitimately use
-    // `impl AsRef<str>` in argument position (allowed for fn parameters, not
-    // for closure parameters). This gives us a single, flexible implementation
-    // that accepts String, &String, &str, etc. without explicit borrows at the
-    // call sites, avoiding both the type error and any needless_borrow lint.
+    fn finish_query_edit(
+        state: &mut PickerState,
+        outcome: LineEditOutcome,
+    ) -> Option<PickerOutcome> {
+        match outcome {
+            LineEditOutcome::Unhandled => None,
+            LineEditOutcome::HandledNoChange | LineEditOutcome::CursorChanged => {
+                Some(PickerOutcome::Changed)
+            }
+            LineEditOutcome::TextChanged => {
+                state.selected = 0;
+                state.selection_hidden = false;
+                state.scroll_offset = None;
+                state.tabs_focused = false;
+                state.expanded.clear();
+                Some(PickerOutcome::QueryChanged)
+            }
+        }
+    }
+
+    fn is_plain_query_character(key: &KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char(_))
+            && (key.modifiers.is_empty() || key.modifiers == crossterm::event::KeyModifiers::SHIFT)
+    }
+
+    fn is_legacy_alt_word_key(key: &KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char('b' | 'f'))
+            && key.modifiers == crossterm::event::KeyModifiers::ALT
+    }
+
     fn handle_paste(
         state: &mut PickerState,
         text: impl AsRef<str>,
@@ -2477,25 +2725,11 @@ pub fn handle_picker_input(
         if config.vim_normal_first && !state.search_active {
             return PickerOutcome::Unchanged;
         }
-        let cleaned: String = text
-            .as_ref()
-            .chars()
-            .filter(|c| *c != '\n' && *c != '\r')
-            .collect();
-        if cleaned.is_empty() {
-            return PickerOutcome::Unchanged;
-        }
-        state.query.insert_str(state.query_cursor, &cleaned);
-        state.query_cursor += cleaned.len();
-        if config.show_search_hint {
+        let outcome = state.paste_query(text.as_ref());
+        if outcome == LineEditOutcome::TextChanged && config.show_search_hint {
             state.search_active = true;
         }
-        state.selected = 0;
-        state.selection_hidden = false;
-        state.expanded.clear();
-        state.scroll_offset = None;
-        state.tabs_focused = false;
-        PickerOutcome::Changed
+        finish_query_edit(state, outcome).unwrap_or(PickerOutcome::Unchanged)
     }
 
     // ── Key handling ──
@@ -2515,76 +2749,23 @@ pub fn handle_picker_input(
             return PickerOutcome::Unchanged;
         }
 
-        // ── Left/Right cursor movement (only when search input is focused) ──
-        let search_input_active =
-            !config.disable_search && (state.search_active || !config.show_search_hint);
-        if search_input_active && !state.query.is_empty() {
-            if key.code == KeyCode::Left {
-                if state.query_cursor > 0 {
-                    let new = state.query[..state.query_cursor]
-                        .char_indices()
-                        .next_back()
-                        .map_or(0, |(i, _)| i);
-                    state.query_cursor = new;
-                }
-                return PickerOutcome::Changed;
-            }
-            if key.code == KeyCode::Right {
-                if state.query_cursor < state.query.len() {
-                    let rest = &state.query[state.query_cursor..];
-                    let ch_len = rest.chars().next().map_or(0, |c| c.len_utf8());
-                    state.query_cursor += ch_len;
-                }
-                return PickerOutcome::Changed;
-            }
-        }
-
         // Search mode (currently active). Also reachable for vim_normal_first
         // pickers without a search hint, so typing/Esc/Backspace work once
         // search is entered via `i`/`/`.
         if (config.show_search_hint || config.vim_normal_first) && state.search_active {
             if key.code == KeyCode::Esc {
+                let query_changed = config.vim_normal_first && !state.query().is_empty();
                 state.search_active = false;
                 // vim_normal_first: Esc leaves search for nav mode and clears the
                 // query in one step (mirrors scrollback vim-mode).
                 if config.vim_normal_first {
                     state.clear_query();
                 }
-                return PickerOutcome::Changed;
-            }
-            if key.code == KeyCode::Char('u')
-                && key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                state.query.clear();
-                state.query_cursor = 0;
-                state.scroll_offset = None;
-                state.selected = 0;
-                state.selection_hidden = false;
-                state.expanded.clear();
-                state.tabs_focused = false;
-                return PickerOutcome::Changed;
-            }
-            if key.code == KeyCode::Backspace {
-                if state.query_cursor > 0 {
-                    let prev = state.query[..state.query_cursor]
-                        .char_indices()
-                        .next_back()
-                        .map_or(0, |(i, _)| i);
-                    state.query.drain(prev..state.query_cursor);
-                    state.query_cursor = prev;
-                }
-                state.scroll_offset = None;
-                state.selected = 0;
-                state.selection_hidden = false;
-                state.tabs_focused = false;
-                if config.expandable && !state.query.is_empty() {
-                    state.expand_all_for_search(entry_count);
+                return if query_changed {
+                    PickerOutcome::QueryChanged
                 } else {
-                    state.expanded.clear();
-                }
-                return PickerOutcome::Changed;
+                    PickerOutcome::Changed
+                };
             }
             if let Some(tabs) = config.tabs {
                 let tab_count = tabs.len();
@@ -2628,25 +2809,20 @@ pub fn handle_picker_input(
                     state.scroll_offset = None;
                     return PickerOutcome::Changed;
                 }
-            } else if let KeyCode::Char(c) = key.code
-                && !key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                state.query.insert_str(state.query_cursor, s);
-                state.query_cursor += s.len();
-                state.scroll_offset = None;
-                state.selected = 0;
-                state.selection_hidden = false;
-                if config.expandable {
-                    state.expand_all_for_search(entry_count);
-                } else {
-                    state.expanded.clear();
+            }
+            if config.expandable && state.query().is_empty() {
+                if key.code == KeyCode::Right {
+                    return PickerOutcome::Expand(state.selected);
                 }
-                return PickerOutcome::Changed;
-            } else {
+                if key.code == KeyCode::Left {
+                    return PickerOutcome::Collapse(state.selected);
+                }
+            }
+            if key.code != KeyCode::Enter {
+                let outcome = state.edit_query(key);
+                if let Some(outcome) = finish_query_edit(state, outcome) {
+                    return outcome;
+                }
                 return PickerOutcome::Unchanged;
             }
         }
@@ -2718,26 +2894,22 @@ pub fn handle_picker_input(
                 }
                 if !config.search_only_on_slash
                     && !config.vim_normal_first
-                    && let KeyCode::Char(c) = key.code
-                    && !key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                    && is_legacy_alt_word_key(key)
                 {
-                    state.tabs_focused = false;
-                    state.search_active = true;
-                    let mut buf = [0u8; 4];
-                    let s = c.encode_utf8(&mut buf);
-                    state.query.insert_str(state.query_cursor, s);
-                    state.query_cursor += s.len();
-                    state.scroll_offset = None;
-                    state.selected = 0;
-                    state.selection_hidden = false;
-                    if config.expandable {
-                        state.expand_all_for_search(entry_count);
-                    } else {
-                        state.expanded.clear();
-                    }
                     return PickerOutcome::Changed;
+                }
+                if !config.search_only_on_slash
+                    && !config.vim_normal_first
+                    && is_plain_query_character(key)
+                {
+                    let outcome = state.edit_query(key);
+                    if outcome == LineEditOutcome::TextChanged {
+                        state.tabs_focused = false;
+                        state.search_active = true;
+                    }
+                    if let Some(outcome) = finish_query_edit(state, outcome) {
+                        return outcome;
+                    }
                 }
             }
 
@@ -2759,15 +2931,10 @@ pub fn handle_picker_input(
 
         // Esc.
         if key.code == KeyCode::Esc {
-            if config.esc_clears_query && !state.query.is_empty() {
-                state.query.clear();
-                state.query_cursor = 0;
-                state.scroll_offset = None;
-                state.selected = 0;
-                state.selection_hidden = false;
-                state.expanded.clear(); // back to default collapsed when search ends
+            if config.esc_clears_query && !state.query().is_empty() {
+                state.clear_query();
                 state.tabs_focused = false;
-                return PickerOutcome::Changed;
+                return PickerOutcome::QueryChanged;
             }
             state.tabs_focused = false;
             return PickerOutcome::Closed;
@@ -2778,7 +2945,7 @@ pub fn handle_picker_input(
             if entry_count > 0 && !is_non_sel(state.selected) {
                 return PickerOutcome::Selected(state.selected);
             }
-            if entry_count == 0 && !state.query.is_empty() {
+            if entry_count == 0 && !state.query().is_empty() {
                 return PickerOutcome::SubmitQuery;
             }
             return PickerOutcome::Changed;
@@ -2892,10 +3059,8 @@ pub fn handle_picker_input(
             if key.code == KeyCode::Char('E') {
                 return PickerOutcome::Collapse(state.selected);
             }
-            // Left/Right arrows: collapse/expand when query is empty
-            // (when query is non-empty, Left/Right handle cursor movement
-            // earlier in this function and never reach here).
-            // Only when the list content has focus (not the tabs region).
+            // Outside search, arrows always act on the selected row; the
+            // retained query only filters which rows are visible.
             if key.code == KeyCode::Right {
                 return PickerOutcome::Expand(state.selected);
             }
@@ -2977,100 +3142,45 @@ pub fn handle_picker_input(
             state.tabs_focused = false;
             return PickerOutcome::Changed;
         }
-        // Always-active search (no hint). Suppressed entirely when the caller
-        // asked to disable search (e.g. read-only cheatsheet), and under
-        // vim_normal_first (where typing instead flows through the search-active
-        // block once `i`/`/` enters search).
         if !config.show_search_hint && !config.disable_search && !config.vim_normal_first {
-            if key.code == KeyCode::Char('u')
-                && key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                state.query.clear();
-                state.query_cursor = 0;
-                state.scroll_offset = None;
-                state.selected = 0;
-                state.expanded.clear();
-                state.tabs_focused = false;
-                return PickerOutcome::Changed;
-            }
-            if key.code == KeyCode::Backspace {
-                if state.query_cursor > 0 {
-                    let prev = state.query[..state.query_cursor]
-                        .char_indices()
-                        .next_back()
-                        .map_or(0, |(i, _)| i);
-                    state.query.drain(prev..state.query_cursor);
-                    state.query_cursor = prev;
-                }
-                state.scroll_offset = None;
-                state.selected = 0;
-                state.expanded.clear();
-                state.tabs_focused = false;
-                return PickerOutcome::Changed;
-            }
-            // `/` activates search instead of self-inserting when it can't
-            // plausibly be query text. The "/ to search" placeholder renders
-            // exactly while `!search_active` with an empty query, even for
-            // always-active pickers (e.g. the `/docs` how-to picker), so
-            // this condition mirrors the renderer's: the advertised chord
-            // must not type a literal `/` into the query. A `/` typed
-            // mid-query (non-empty) or while the search bar is already
-            // focused (`input_active()` pickers, the dashboard location
-            // picker's leading-`/` paths) still inserts, so path-like
-            // queries keep working.
             if key.code == KeyCode::Char('/')
                 && key.modifiers.is_empty()
-                && state.query.is_empty()
+                && state.query().is_empty()
                 && !state.search_active
             {
                 state.search_active = true;
                 state.tabs_focused = false;
                 return PickerOutcome::Changed;
             }
-            if let KeyCode::Char(c) = key.code
-                && (key.modifiers.is_empty()
-                    || key.modifiers == crossterm::event::KeyModifiers::SHIFT)
-            {
-                let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                state.query.insert_str(state.query_cursor, s);
-                state.query_cursor += s.len();
-                state.scroll_offset = None;
-                state.selected = 0;
-                state.expanded.clear();
-                state.tabs_focused = false;
-                return PickerOutcome::Changed;
+            let outcome = state.edit_query(key);
+            if let Some(outcome) = finish_query_edit(state, outcome) {
+                return outcome;
             }
         }
-
         // Hint-based search, not active.
         if config.show_search_hint && !state.search_active {
             if key.code == KeyCode::Char('/') && key.modifiers.is_empty() {
                 state.search_active = true;
                 return PickerOutcome::Changed;
             }
-            // Auto-activate search on any printable char — opt-out via
-            // `search_only_on_slash` for tabs where letters are action
-            // keys (e.g. extensions modal Skills tab), and via
-            // `vim_normal_first` where bare letters never type.
             if !config.search_only_on_slash
                 && !config.vim_normal_first
-                && let KeyCode::Char(c) = key.code
-                && !key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL)
+                && is_legacy_alt_word_key(key)
             {
-                state.search_active = true;
-                state.tabs_focused = false;
-                let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                state.query.insert_str(state.query_cursor, s);
-                state.query_cursor += s.len();
-                state.selected = 0;
-                state.expanded.clear();
                 return PickerOutcome::Changed;
+            }
+            if !config.search_only_on_slash
+                && !config.vim_normal_first
+                && is_plain_query_character(key)
+            {
+                let outcome = state.edit_query(key);
+                if outcome == LineEditOutcome::TextChanged {
+                    state.search_active = true;
+                    state.tabs_focused = false;
+                }
+                if let Some(outcome) = finish_query_edit(state, outcome) {
+                    return outcome;
+                }
             }
         }
 
@@ -3138,8 +3248,8 @@ mod tests {
         let config = cfg(false, false);
         let mut state = PickerState::default();
         let outcome = handle_picker_input(&press('a'), &mut state, 3, &config);
-        assert!(matches!(outcome, PickerOutcome::Changed));
-        assert_eq!(state.query, "a");
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert_eq!(state.query(), "a");
     }
 
     #[test]
@@ -3148,9 +3258,9 @@ mod tests {
         let config = cfg(true, false);
         let mut state = PickerState::default();
         let outcome = handle_picker_input(&press('a'), &mut state, 3, &config);
-        assert!(matches!(outcome, PickerOutcome::Changed));
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
         assert!(state.search_active);
-        assert_eq!(state.query, "a");
+        assert_eq!(state.query(), "a");
     }
 
     #[test]
@@ -3163,11 +3273,11 @@ mod tests {
         let outcome = handle_picker_input(&press('/'), &mut state, 3, &config);
         assert!(matches!(outcome, PickerOutcome::Changed));
         assert!(state.search_active);
-        assert!(state.query.is_empty());
+        assert!(state.query().is_empty());
         // Typing after the activation chord filters normally.
         let outcome = handle_picker_input(&press('t'), &mut state, 3, &config);
-        assert!(matches!(outcome, PickerOutcome::Changed));
-        assert_eq!(state.query, "t");
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert_eq!(state.query(), "t");
     }
 
     #[test]
@@ -3178,10 +3288,10 @@ mod tests {
         let mut state = PickerState::default();
         handle_picker_input(&press('a'), &mut state, 3, &config);
         handle_picker_input(&press('b'), &mut state, 3, &config);
-        assert_eq!(state.query, "ab");
+        assert_eq!(state.query(), "ab");
         let outcome = handle_picker_input(&press('/'), &mut state, 3, &config);
-        assert!(matches!(outcome, PickerOutcome::Changed));
-        assert_eq!(state.query, "ab/");
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert_eq!(state.query(), "ab/");
         assert!(!state.search_active);
     }
 
@@ -3194,8 +3304,8 @@ mod tests {
         let config = cfg(false, false);
         let mut state = PickerState::input_active();
         let outcome = handle_picker_input(&press('/'), &mut state, 3, &config);
-        assert!(matches!(outcome, PickerOutcome::Changed));
-        assert_eq!(state.query, "/");
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert_eq!(state.query(), "/");
     }
 
     #[test]
@@ -3206,10 +3316,10 @@ mod tests {
         let outcome = handle_picker_input(&press('/'), &mut state, 3, &config);
         assert!(matches!(outcome, PickerOutcome::Changed));
         assert!(state.search_active);
-        assert!(state.query.is_empty());
+        assert!(state.query().is_empty());
         let outcome = handle_picker_input(&press('t'), &mut state, 3, &config);
-        assert!(matches!(outcome, PickerOutcome::Changed));
-        assert_eq!(state.query, "t");
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert_eq!(state.query(), "t");
     }
 
     #[test]
@@ -3261,6 +3371,111 @@ mod tests {
             unfocused_text.contains("/ to search"),
             "unfocused search bar should show the `/ to search` placeholder, got {unfocused_text:?}",
         );
+    }
+
+    #[test]
+    fn viewport_search_bar_reserves_counter_without_text_or_cursor_overlap() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let theme = Theme::current();
+        let width = 20u16;
+        let counter_width = "12/34".width() as u16;
+        let layout = search_bar_layout(width, counter_width);
+        assert_eq!(layout.input_width(), 5);
+        assert_eq!(layout.trailing_width(), counter_width);
+
+        let mut editor = LineEditor::default();
+        editor.set_text("123456789中e\u{301}👩🏽\u{200d}💻z");
+        let viewport = editor.viewport(layout.input_width());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+        buffer.set_string(0, 0, "#".repeat(width as usize), Style::default());
+        render_search_bar_with_viewport(
+            &mut buffer,
+            0,
+            0,
+            layout,
+            &theme,
+            editor.text(),
+            true,
+            false,
+            None,
+            viewport,
+        );
+
+        for x in layout.render_width..width {
+            assert_eq!(
+                buffer[(x, 0)].symbol(),
+                "#",
+                "reserved counter cell {x} was overwritten",
+            );
+        }
+        let cursor_x = (0..layout.render_width)
+            .find(|x| buffer[(*x, 0)].bg == theme.text_primary)
+            .expect("cursor inside search render width");
+        assert!(cursor_x < layout.render_width);
+    }
+
+    #[test]
+    fn narrow_search_bar_omits_real_counters_to_preserve_caret_cell() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let theme = Theme::current();
+        for counter in ["no matches", "bad pattern", "12/34"] {
+            let counter_width = counter.width() as u16;
+            let width = SEARCH_BAR_LABEL.len() as u16 + counter_width + SEARCH_BAR_TRAILING_GAP;
+            let layout = search_bar_layout(width, counter_width);
+            assert_eq!(
+                layout.trailing_width(),
+                0,
+                "{counter:?} must be omitted without one editor cell",
+            );
+            assert!(layout.input_width() >= 1);
+
+            let mut editor = LineEditor::default();
+            editor.set_text("long-query-中e\u{301}👩🏽\u{200d}💻");
+            let viewport = editor.viewport(layout.input_width());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+            render_search_bar_with_viewport(
+                &mut buffer,
+                0,
+                0,
+                layout,
+                &theme,
+                editor.text(),
+                true,
+                false,
+                None,
+                viewport,
+            );
+            let cursor_x = (0..width)
+                .find(|x| buffer[(*x, 0)].bg == theme.text_primary)
+                .expect("active query keeps a visible caret");
+            assert!(cursor_x < width);
+
+            let fit_layout = search_bar_layout(width + 1, counter_width);
+            assert_eq!(fit_layout.trailing_width(), counter_width);
+            assert_eq!(fit_layout.input_width(), 1);
+            let viewport = editor.viewport(fit_layout.input_width());
+            let mut fit_buffer = Buffer::empty(Rect::new(0, 0, width + 1, 1));
+            render_search_bar_with_viewport(
+                &mut fit_buffer,
+                0,
+                0,
+                fit_layout,
+                &theme,
+                editor.text(),
+                true,
+                false,
+                None,
+                viewport,
+            );
+            let cursor_x = (0..fit_layout.render_width)
+                .find(|x| fit_buffer[(*x, 0)].bg == theme.text_primary)
+                .expect("just-fit counter preserves one caret cell");
+            assert!(cursor_x < fit_layout.render_width);
+        }
     }
 
     #[test]
@@ -3339,7 +3554,7 @@ mod tests {
             let config = cfg(hint, true);
             let mut state = PickerState::default();
             let outcome = handle_picker_input(&press('a'), &mut state, 3, &config);
-            assert!(state.query.is_empty(), "hint={hint}");
+            assert!(state.query().is_empty(), "hint={hint}");
             assert!(!state.search_active, "hint={hint}");
             assert!(matches!(outcome, PickerOutcome::Unchanged), "hint={hint}");
         }
@@ -3353,7 +3568,7 @@ mod tests {
             let outcome = handle_picker_input(&press('i'), &mut state, 3, &config);
             assert!(matches!(outcome, PickerOutcome::Changed), "hint={hint}");
             assert!(state.search_active, "hint={hint}");
-            assert!(state.query.is_empty(), "hint={hint}");
+            assert!(state.query().is_empty(), "hint={hint}");
         }
     }
 
@@ -3367,14 +3582,80 @@ mod tests {
     }
 
     #[test]
+    fn expandable_picker_routes_arrows_by_focus() {
+        let mut config = cfg(true, false);
+        config.expandable = true;
+
+        let mut search = PickerState::input_active();
+        assert!(matches!(
+            handle_picker_input(
+                &Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                &mut search,
+                3,
+                &config,
+            ),
+            PickerOutcome::Expand(0)
+        ));
+
+        search.set_query("match");
+        let outcome = handle_picker_input(&press_esc(), &mut search, 3, &config);
+        assert!(matches!(outcome, PickerOutcome::Changed));
+        assert!(!search.search_active);
+        assert!(matches!(
+            handle_picker_input(
+                &Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+                &mut search,
+                3,
+                &config,
+            ),
+            PickerOutcome::Collapse(0)
+        ));
+    }
+
+    #[test]
+    fn first_hint_search_edit_leaves_expansion_to_the_host() {
+        let mut config = cfg(true, false);
+        config.expandable = true;
+        let mut state = PickerState::default();
+
+        let outcome = handle_picker_input(&press('a'), &mut state, 3, &config);
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert!(state.expanded.is_empty());
+    }
+
+    #[test]
+    fn set_query_sanitizes_before_filtering_and_places_cursor_at_end() {
+        let mut state = PickerState::default();
+        state.set_query("alpha\r\nbeta\n");
+        assert_eq!(state.query(), "alphabeta");
+        assert_eq!(state.query_cursor(), state.query().len());
+
+        let visible = ["alpha", "alphabeta", "beta"]
+            .into_iter()
+            .filter(|candidate| candidate.contains(state.query()))
+            .collect::<Vec<_>>();
+        assert_eq!(visible, vec!["alphabeta"]);
+    }
+
+    #[test]
+    fn clamp_selection_skips_group_headers() {
+        let mut state = PickerState::default();
+        clamp_picker_selection(&mut state, 3, &[true, false, false]);
+        assert_eq!(state.selected, 1);
+    }
+
+    #[test]
     fn vim_char_types_after_entering_search() {
         for hint in [true, false] {
             let config = cfg(hint, true);
             let mut state = PickerState::default();
             handle_picker_input(&press('i'), &mut state, 3, &config);
             let outcome = handle_picker_input(&press('a'), &mut state, 3, &config);
-            assert!(matches!(outcome, PickerOutcome::Changed), "hint={hint}");
-            assert_eq!(state.query, "a", "hint={hint}");
+            assert!(
+                matches!(outcome, PickerOutcome::QueryChanged),
+                "hint={hint}"
+            );
+            assert_eq!(state.query(), "a", "hint={hint}");
         }
     }
 
@@ -3385,11 +3666,14 @@ mod tests {
             let mut state = PickerState::default();
             handle_picker_input(&press('i'), &mut state, 3, &config);
             handle_picker_input(&press('a'), &mut state, 3, &config);
-            assert_eq!(state.query, "a", "hint={hint}");
+            assert_eq!(state.query(), "a", "hint={hint}");
             let outcome = handle_picker_input(&press_esc(), &mut state, 3, &config);
-            assert!(!matches!(outcome, PickerOutcome::Closed), "hint={hint}");
+            assert!(
+                matches!(outcome, PickerOutcome::QueryChanged),
+                "hint={hint}"
+            );
             assert!(!state.search_active, "hint={hint}");
-            assert!(state.query.is_empty(), "hint={hint}");
+            assert!(state.query().is_empty(), "hint={hint}");
         }
     }
 
@@ -3454,7 +3738,7 @@ mod tests {
             let outcome = handle_picker_input(&press('/'), &mut state, 3, &config);
             assert!(matches!(outcome, PickerOutcome::Changed), "hint={hint}");
             assert!(state.search_active, "hint={hint}");
-            assert!(state.query.is_empty(), "hint={hint}");
+            assert!(state.query().is_empty(), "hint={hint}");
         }
     }
 
@@ -3471,13 +3755,25 @@ mod tests {
     }
 
     #[test]
+    fn paste_search_leaves_expansion_to_the_host() {
+        let mut config = cfg(true, false);
+        config.expandable = true;
+        let mut state = PickerState::default();
+
+        let outcome =
+            handle_picker_input(&Event::Paste("needle".to_string()), &mut state, 3, &config);
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert!(state.expanded.is_empty());
+    }
+
+    #[test]
     fn vim_paste_suppressed_when_not_searching() {
         for hint in [true, false] {
             let config = cfg(hint, true);
             let mut state = PickerState::default();
             let outcome =
                 handle_picker_input(&Event::Paste("hello".to_string()), &mut state, 3, &config);
-            assert!(state.query.is_empty(), "hint={hint}");
+            assert!(state.query().is_empty(), "hint={hint}");
             assert!(matches!(outcome, PickerOutcome::Unchanged), "hint={hint}");
         }
     }
@@ -3489,8 +3785,8 @@ mod tests {
         let mut state = PickerState::default();
         handle_picker_input(&press('i'), &mut state, 3, &config);
         let outcome = handle_picker_input(&Event::Paste("hi".to_string()), &mut state, 3, &config);
-        assert!(matches!(outcome, PickerOutcome::Changed));
-        assert_eq!(state.query, "hi");
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert_eq!(state.query(), "hi");
     }
 
     #[test]
@@ -3503,7 +3799,7 @@ mod tests {
             let mut state = PickerState::default();
             let outcome = handle_picker_input(&press(c), &mut state, 3, &config);
             assert!(!state.search_active, "c={c}");
-            assert!(state.query.is_empty(), "c={c}");
+            assert!(state.query().is_empty(), "c={c}");
             assert!(matches!(outcome, PickerOutcome::Unchanged), "c={c}");
         }
     }
@@ -3520,7 +3816,7 @@ mod tests {
         assert!(!state.tabs_focused);
         // A bare printable char does not type while in nav mode.
         let outcome = handle_picker_input(&press('a'), &mut state, 3, &config);
-        assert!(state.query.is_empty());
+        assert!(state.query().is_empty());
         assert!(matches!(outcome, PickerOutcome::Unchanged));
     }
 
@@ -3539,5 +3835,166 @@ mod tests {
         handle_picker_input(&press('j'), &mut state, 3, &config);
         assert!(!state.search_active);
         assert!(!state.tabs_focused);
+    }
+
+    #[test]
+    fn query_cursor_edits_do_not_reset_list_state() {
+        let config = cfg(false, false);
+        let mut state = PickerState::default();
+        state.set_query("alpha-beta");
+        state.selected = 2;
+        state.expanded.insert(1);
+        state.scroll_offset = Some(4);
+
+        let left_word = Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        let outcome = handle_picker_input(&left_word, &mut state, 3, &config);
+        assert!(matches!(outcome, PickerOutcome::Changed));
+        assert_eq!(state.query(), "alpha-beta");
+        assert_eq!(state.query_cursor(), "alpha-".len());
+        assert_eq!(state.selected, 2);
+        assert_eq!(state.expanded, HashSet::from([1]));
+        assert_eq!(state.scroll_offset, Some(4));
+
+        let mut empty = PickerState {
+            selected: 2,
+            ..PickerState::default()
+        };
+        let outcome = handle_picker_input(
+            &Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut empty,
+            3,
+            &config,
+        );
+        assert!(matches!(outcome, PickerOutcome::Changed));
+        assert_eq!(empty.selected, 2);
+    }
+
+    #[test]
+    fn query_text_edits_reset_list_state_once() {
+        let config = cfg(false, false);
+        let mut state = PickerState::default();
+        state.set_query("alpha-beta");
+        state.selected = 2;
+        state.expanded.insert(1);
+        state.scroll_offset = Some(4);
+
+        let outcome = handle_picker_input(
+            &Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+            &mut state,
+            3,
+            &config,
+        );
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert_eq!(state.query(), "alpha-");
+        assert_eq!(state.selected, 0);
+        assert!(state.expanded.is_empty());
+        assert_eq!(state.scroll_offset, None);
+    }
+
+    #[test]
+    fn canonical_alt_words_work_in_normal_and_vim_input() {
+        let mut state = PickerState::default();
+        state.set_query("alpha-beta");
+        let config = cfg(false, false);
+        for (character, cursor) in [('b', "alpha-".len()), ('f', "alpha-beta".len())] {
+            let outcome = handle_picker_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT)),
+                &mut state,
+                3,
+                &config,
+            );
+            assert!(matches!(outcome, PickerOutcome::Changed));
+            assert_eq!(state.query_cursor(), cursor);
+        }
+
+        let config = cfg(true, true);
+        let mut vim_state = PickerState::default();
+        handle_picker_input(&press('i'), &mut vim_state, 3, &config);
+        vim_state.set_query("alpha-beta");
+        let outcome = handle_picker_input(
+            &Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+            &mut vim_state,
+            3,
+            &config,
+        );
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert_eq!(vim_state.query(), "alpha-");
+
+        let mut hinted = PickerState::default();
+        let hinted_config = cfg(true, false);
+        let outcome = handle_picker_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)),
+            &mut hinted,
+            3,
+            &hinted_config,
+        );
+        assert!(matches!(outcome, PickerOutcome::Changed));
+        assert!(hinted.query().is_empty());
+        assert!(!hinted.search_active);
+
+        let ctrl_w = Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        let mut navigation = PickerState::default();
+        assert!(matches!(
+            handle_picker_input(&ctrl_w, &mut navigation, 3, &hinted_config),
+            PickerOutcome::Unchanged
+        ));
+        navigation.search_active = true;
+        assert!(matches!(
+            handle_picker_input(&ctrl_w, &mut navigation, 3, &hinted_config),
+            PickerOutcome::Changed
+        ));
+    }
+
+    #[test]
+    fn picker_graphemes_paste_and_viewport_use_line_editor() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let config = cfg(false, false);
+        let grapheme = "👩🏽\u{200d}💻";
+        let mut state = PickerState::default();
+        state.set_query(format!("a{grapheme}b"));
+        handle_picker_input(
+            &Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut state,
+            3,
+            &config,
+        );
+        let viewport = state.query.viewport(3);
+        assert_eq!(
+            &state.query()[viewport.visible_byte_range.clone()],
+            format!("{grapheme}b")
+        );
+        assert_eq!(viewport.cursor_display_column, 2);
+        let area = Rect::new(0, 0, 12, 1);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::current();
+        render_picker_search_bar(
+            &mut buffer,
+            area.x,
+            area.y,
+            area.width,
+            &theme,
+            &state,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(
+            buffer.cell((11, 0)).expect("cursor cell").bg,
+            theme.text_primary
+        );
+
+        handle_picker_input(
+            &Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            &mut state,
+            3,
+            &config,
+        );
+        assert_eq!(state.query(), "ab");
+        let outcome =
+            handle_picker_input(&Event::Paste("x\r\ny".to_owned()), &mut state, 3, &config);
+        assert!(matches!(outcome, PickerOutcome::QueryChanged));
+        assert_eq!(state.query(), "axyb");
     }
 }

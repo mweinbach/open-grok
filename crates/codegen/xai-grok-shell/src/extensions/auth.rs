@@ -242,8 +242,11 @@ fn handle_info(agent: &MvpAgent) -> ExtResult {
             .as_ref()
             .map(|a| a.team_blocked_reasons.clone())
             .unwrap_or_default(),
+        // No credential ⇒ unknown privacy state: report opted-out (fail closed),
+        // matching `AuthManager::allows_data_collection` / GrokAuth Default.
         coding_data_retention_opt_out: auth
             .as_ref()
-            .is_some_and(|a| a.coding_data_retention_opt_out),
+            .map(|a| a.coding_data_retention_opt_out)
+            .unwrap_or_else(crate::auth::default_coding_data_retention_opt_out),
     })
 }

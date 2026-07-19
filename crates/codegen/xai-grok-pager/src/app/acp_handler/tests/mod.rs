@@ -194,12 +194,12 @@ pub(super) fn insert_running_task(agent: &mut AgentView, task_id: &str, command:
             },
         );
 }
-/// Marker texts of all parked blocks in scrollback, in order — the
-/// initial parked marker plus every countdown re-push.
+/// Marker texts of all parked blocks in scrollback, in order — one per
+/// park episode (re-pushed only after new parent output, i.e. a re-park).
 pub(super) fn parked_marker_messages(agent: &AgentView) -> Vec<String> {
     (0..agent.scrollback.len())
         .filter_map(|i| match agent.scrollback.get(i).map(|e| &e.block) {
-            Some(RenderBlock::SessionEvent(b)) if b.parked => Some(b.marker_text()),
+            Some(RenderBlock::SessionEvent(b)) if b.parked => Some(b.event.message()),
             _ => None,
         })
         .collect()
@@ -933,18 +933,6 @@ pub(super) fn xai_wake_turn_completed_notif(
         std::sync::Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
     )
 }
-/// The newest turn-marker block on the agent's scrollback.
-pub(super) fn last_marker_block(
-    sb: &ScrollbackState,
-) -> &crate::scrollback::blocks::SessionEventBlock {
-    (0..sb.len())
-        .rev()
-        .find_map(|i| match sb.get(i).map(|e| &e.block) {
-            Some(RenderBlock::SessionEvent(b)) => Some(b),
-            _ => None,
-        })
-        .expect("a turn-end marker must exist")
-}
 /// Build a `HookExecution` update (one successful run) on the
 /// `x.ai/session/update` rail, optionally stamped `isReplay`.
 /// `prompt_id == None` models pre-attribution shells.
@@ -1007,6 +995,7 @@ pub(super) fn last_marker_stop_hook_groups(
         })
 }
 /// Work-only status lines ("N … still running") pushed as system rows.
+/// Never pushed in production; tests assert emptiness.
 pub(super) fn work_status_lines(sb: &ScrollbackState) -> Vec<String> {
     (0..sb.len())
         .filter_map(|i| match sb.get(i).map(|e| &e.block) {
@@ -1018,9 +1007,8 @@ pub(super) fn work_status_lines(sb: &ScrollbackState) -> Vec<String> {
         .collect()
 }
 /// Register two running background commands on the (idle) agent through
-/// the wire, then open the between-turns status window the way a
-/// counted turn-end marker would.
-pub(super) fn seed_two_bg_tasks_and_announce(app: &mut AppView, session_id: &str) {
+/// the wire.
+pub(super) fn seed_two_bg_tasks(app: &mut AppView, session_id: &str) {
     let _ = handle_ext_notification(
         &make_task_backgrounded_notif(session_id, "tc-1", "task-1", "sleep 98"),
         app,
@@ -1029,7 +1017,6 @@ pub(super) fn seed_two_bg_tasks_and_announce(app: &mut AppView, session_id: &str
         &make_task_backgrounded_notif(session_id, "tc-2", "task-2", "sleep 99"),
         app,
     );
-    app.agents.get_mut(&AgentId(0)).unwrap().end_work_announced = true;
 }
 /// Build an `x.ai/session/interjection` ext-notification (no id).
 pub(super) fn interjection_ext(session_id: &str, text: &str) -> acp::ExtNotification {
@@ -1208,12 +1195,6 @@ pub(super) fn test_subagent_spawned(
     }
 }
 pub(super) fn test_subagent_finished(child_sid: &str) -> XaiSessionUpdate {
-    test_subagent_finished_with_wake(child_sid, false)
-}
-pub(super) fn test_subagent_finished_with_wake(
-    child_sid: &str,
-    will_wake: bool,
-) -> XaiSessionUpdate {
     XaiSessionUpdate::SubagentFinished {
         subagent_id: child_sid.into(),
         child_session_id: child_sid.into(),
@@ -1224,7 +1205,7 @@ pub(super) fn test_subagent_finished_with_wake(
         duration_ms: 500,
         tokens_used: 0,
         output: None,
-        will_wake,
+        will_wake: false,
     }
 }
 pub(super) fn test_subagent_progress(

@@ -1,13 +1,14 @@
-//! PTY: a re-parked wait re-pushes the parked marker when intervening
-//! content buried the previous one, so the transcript tail keeps explaining
-//! the idle-looking parked chrome.
+//! PTY: a re-parked wait (new parent output between parks) pushes a fresh
+//! parked marker for the new park episode, so the transcript keeps a
+//! boundary where each park began, while the persistent "watching · …"
+//! status row explains the still-running background work.
 //!
 //! Wire journey, flag-file driven like `endline_park_two_static_markers`:
 //! background a flag-gated command, hold on a flag-gated foreground command
 //! while the runtime task id is extracted, then script three more rounds on
 //! the real id — a short wait (`timeout_ms: 4000`) that expires with the
 //! task still running (park #1 + marker), a quick foreground echo, and a
-//! long wait (park #2: chrome hidden and a fresh marker at the tail).
+//! long wait (park #2: chrome hidden and a fresh marker for the new episode).
 #[allow(unused_imports)]
 use super::common::*;
 
@@ -196,14 +197,23 @@ async fn reparked_wait_repushes_buried_marker() {
     // Everything downstream is scripted — release the id-extraction hold.
     std::fs::write(&id_ready_flag, b"ready").expect("release id-extraction hold");
 
-    // Park #1 marker.
+    // Park #1 marker (plain "Worked for X" — no still-running suffix).
     harness
-        .wait_for_text("1 command still running", Duration::from_secs(90))
+        .wait_for_text("Worked for", Duration::from_secs(90))
         .unwrap_or_else(|_| {
             panic!(
                 "park #1 marker never appeared; screen:\n{}\n--- non-system messages ---\n{}",
                 harness.screen_contents(),
                 dump_non_system_messages(&content.request_bodies())
+            )
+        });
+    // The parked status row carries the still-running story instead.
+    harness
+        .wait_for_text("watching · 1 command", Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            panic!(
+                "parked watching cue never appeared; screen:\n{}",
+                harness.screen_contents()
             )
         });
 
@@ -229,14 +239,15 @@ async fn reparked_wait_repushes_buried_marker() {
         harness.screen_contents()
     );
 
-    // Park #2 re-pushes a second marker below the between-parks content.
+    // Park #2 pushes a second marker below the between-parks content (a new
+    // park episode after new parent output).
     let repushed = wait_until(Duration::from_secs(30), || {
         harness.update(Duration::from_millis(100));
         harness.screen_contents().matches("Worked for").count() == 2
     });
     assert!(
         repushed,
-        "re-park with a buried marker must re-push a second marker; screen:\n{}",
+        "re-park after buried marker must push a fresh marker; screen:\n{}",
         harness.screen_contents()
     );
     let screen = harness.screen_contents();
@@ -251,10 +262,14 @@ async fn reparked_wait_repushes_buried_marker() {
         first_marker < midwork_at && midwork_at < second_marker,
         "expected marker, content, then the re-pushed marker in order; screen:\n{screen}"
     );
-    // The re-pushed marker still counts the running work.
+    // The still-running story lives in the status row, not the transcript.
     assert!(
-        screen[second_marker..].contains("1 command still running"),
-        "the re-pushed marker carries the live work count; screen:\n{screen}"
+        !screen.contains("still running"),
+        "no still-running suffix anywhere in the transcript; screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("watching · 1 command"),
+        "the parked status row keeps the watching cue during park #2; screen:\n{screen}"
     );
     // The parked look still hides spinner and chrome.
     let below_midwork = &screen[midwork_at..];

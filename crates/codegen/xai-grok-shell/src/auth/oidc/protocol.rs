@@ -689,7 +689,7 @@ pub(super) async fn validate_and_extract_user_info(
         organization_role: None,
         user_blocked_reason: None,
         team_blocked_reasons: vec![],
-        coding_data_retention_opt_out: false,
+        coding_data_retention_opt_out: crate::auth::default_coding_data_retention_opt_out(),
     })
 }
 pub(super) async fn extract_user_info(
@@ -720,7 +720,7 @@ pub(super) async fn extract_user_info(
             organization_role: None,
             user_blocked_reason: None,
             team_blocked_reasons: vec![],
-            coding_data_retention_opt_out: false,
+            coding_data_retention_opt_out: crate::auth::default_coding_data_retention_opt_out(),
         });
     }
     let token = id_token.ok_or_else(|| anyhow::Error::new(OidcError::MissingIdToken))?;

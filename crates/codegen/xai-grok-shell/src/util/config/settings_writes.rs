@@ -28,6 +28,10 @@ pub async fn set_show_timeline(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.show_timeline = Some(value)).await
 }
 
+pub async fn set_page_flip_on_send(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.page_flip_on_send = Some(value)).await
+}
+
 /// Persist `[ui].simple_mode` via `update_config`. Same `Option<bool>`
 /// shape as `show_timestamps`.
 pub async fn set_simple_mode(value: bool) -> Result<()> {

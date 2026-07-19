@@ -710,7 +710,6 @@ pub struct Requirements {
 pub struct RuntimeResolutionContext<'a> {
     pub raw_config: &'a toml::Value,
     pub remote_settings: Option<&'a crate::util::config::RemoteSettings>,
-    pub cwd: Option<&'a std::path::Path>,
     pub is_headless: bool,
     /// `Some(true)` = CLI explicitly enabled, `None` = defer to config/env/remote.
     pub cli_subagents: Option<bool>,
@@ -1244,6 +1243,9 @@ pub struct MarketplaceConfig {
     /// Written/read out-of-band by `extensions::marketplace`, opaque so a wrong-typed value can't fail load.
     #[serde(default)]
     pub official_marketplace_auto_installed: Option<toml::Value>,
+    /// Written/read out-of-band by `extensions::marketplace`, opaque so a wrong-typed value can't fail load.
+    #[serde(default)]
+    pub default_skills_installs_purged: Option<toml::Value>,
 }
 /// A single `[[marketplace.sources]]` entry.
 #[derive(Clone, Debug, Deserialize)]
@@ -1548,11 +1550,12 @@ pub struct Config {
     /// Keys are agent names, values are booleans. Omitted agents default to enabled.
     #[serde(skip)]
     pub subagent_toggle: std::collections::HashMap<String, bool>,
-    /// Per-subagent role definitions from `[subagents.roles]` in config.toml
-    /// and `.opengrok/roles/*.toml` file discovery.
+    /// Trust-independent roles from inline, user, and bundled sources.
+    /// Project `.opengrok/roles/*.toml` entries are overlaid only after trust.
     #[serde(skip)]
     pub subagent_roles:
         std::collections::HashMap<String, xai_grok_subagent_resolution::config::SubagentRole>,
+    /// Trust-independent personas from inline, user, and bundled sources.
     #[serde(skip)]
     pub subagent_personas:
         std::collections::HashMap<String, xai_grok_subagent_resolution::config::SubagentPersona>,
@@ -1978,18 +1981,13 @@ impl Config {
         config.apply_env_overrides();
         Ok(config)
     }
-    /// Populate `#[serde(skip)]` subagent fields from `SubagentsConfig::resolve()`.
+    /// Populate trust-independent `#[serde(skip)]` subagent base fields.
     ///
     /// Must be called after `new_from_toml_cfg` on the **primary startup path**
-    /// before the config is handed to `MvpAgent`. Model-reload and API-key-reload
-    /// paths only read model/key fields and do not need this call.
-    pub fn resolve_subagents(
-        &mut self,
-        cli_flag: bool,
-        raw_config: &toml::Value,
-        cwd: Option<&std::path::Path>,
-    ) {
-        let sa = crate::config::SubagentsConfig::resolve(cli_flag, raw_config, cwd);
+    /// before the config is handed to `MvpAgent`. Project definitions are overlaid
+    /// per cwd after that cwd's authoritative folder-trust resolve.
+    pub fn resolve_subagents(&mut self, cli_flag: bool, raw_config: &toml::Value) {
+        let sa = crate::config::SubagentsConfig::resolve(cli_flag, raw_config);
         self.subagents_enabled = sa.enabled;
         self.subagent_model_overrides = sa.models;
         self.subagent_toggle = sa.toggle;
@@ -1999,7 +1997,7 @@ impl Config {
     /// Resolve all `#[serde(skip)]` runtime fields that have resolver functions.
     ///
     /// Call immediately after `new_from_toml_cfg()`. Fields resolved:
-    /// - subagents (6 fields) via `SubagentsConfig::resolve`
+    /// - subagents base layers (6 fields) via `SubagentsConfig::resolve`
     /// - respect_gitignore via `ToolsConfig::resolve`
     /// - disable_zdr_incompatible_tools via `ToolsConfig::resolve`
     /// - managed_mcps_enabled via `ManagedMcpsConfig::resolve`
@@ -2017,7 +2015,7 @@ impl Config {
         self.web_search_model_override = ctx.cli_web_search_model.map(|s| s.to_owned());
         self.session_summary_model_override = ctx.cli_session_summary_model.map(|s| s.to_owned());
         let cli_flag = ctx.cli_subagents.unwrap_or(false);
-        self.resolve_subagents(cli_flag, ctx.raw_config, ctx.cwd);
+        self.resolve_subagents(cli_flag, ctx.raw_config);
         let tools = crate::config::ToolsConfig::resolve(ctx.raw_config);
         self.respect_gitignore = match self.requirements.respect_gitignore.pinned() {
             Some(pinned) => pinned,
@@ -2068,16 +2066,11 @@ impl Config {
         self.compat_resolved = resolve_compat_config(&self.compat, ctx.remote_settings);
     }
     /// Re-resolve eagerly-resolved runtime fields using the current `Config`
-    /// state and fresh `raw_config` + `cwd`. Builds a
-    /// [`RuntimeResolutionContext`] from the CLI flags already stored on this
-    /// `Config` so callers don't need to manually extract each field.
+    /// state and fresh `raw_config`. Builds a [`RuntimeResolutionContext`] from
+    /// the CLI flags already stored on this `Config`.
     ///
     /// Integration test coverage: `tests/test_settings_refresh.rs`.
-    pub fn re_resolve_runtime_fields(
-        &mut self,
-        raw_config: &toml::Value,
-        cwd: Option<&std::path::Path>,
-    ) {
+    pub fn re_resolve_runtime_fields(&mut self, raw_config: &toml::Value) {
         let remote_settings = self.remote_settings.clone();
         let cli_web_search_model = self.web_search_model_override.clone();
         let cli_session_summary_model = self.session_summary_model_override.clone();
@@ -2085,7 +2078,6 @@ impl Config {
         let ctx = RuntimeResolutionContext {
             raw_config,
             remote_settings: remote_settings.as_ref(),
-            cwd,
             is_headless: self.mode == AgentMode::Headless,
             cli_subagents: self.cli_subagents,
             cli_web_search_model: cli_web_search_model.as_deref(),
@@ -2683,6 +2675,17 @@ impl Config {
             .default(true)
             .resolve()
             .value
+    }
+    pub(crate) fn resolve_compaction_tool_choice(
+        &self,
+    ) -> crate::util::config::CompactionToolChoice {
+        crate::util::config::resolve_compaction_tool_choice_from(
+            env_string(crate::util::config::ENV_COMPACTION_TOOL_CHOICE).as_deref(),
+            self.features.compaction_tool_choice.as_deref(),
+            self.remote_settings
+                .as_ref()
+                .and_then(|r| r.compaction_tool_choice.as_deref()),
+        )
     }
     /// Precedence: env `GROK_COMPACTION_DETAIL`, then config
     /// `features.compaction_detail`, then remote settings
@@ -3694,6 +3697,10 @@ struct DefaultModelJson {
     compaction_at_tokens: Option<CompactionAtTokens>,
     #[serde(default)]
     show_model_fingerprint: bool,
+    #[serde(default)]
+    auto_compact_threshold_percent: Option<u8>,
+    #[serde(default)]
+    system_prompt_label: Option<String>,
 }
 fn default_models(
     endpoints: &EndpointsConfig,
@@ -3769,8 +3776,8 @@ fn default_models(
                 name: m.name,
                 description: m.description,
                 context_window,
-                auto_compact_threshold_percent: None,
-                system_prompt_label: None,
+                auto_compact_threshold_percent: m.auto_compact_threshold_percent,
+                system_prompt_label: m.system_prompt_label,
                 temperature: m.temperature,
                 top_p: m.top_p,
                 max_completion_tokens: m.max_completion_tokens,
@@ -4745,6 +4752,8 @@ pub struct Features {
     /// Feed the summarizer the verbatim conversation instead of the lossy rewrite; `None` = defer to env/remote settings/default (true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_verbatim_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_tool_choice: Option<String>,
     /// Snapshot a completed subagent's isolated worktree into a durable git ref
     /// and delete its directory (resume rehydrates from the ref). This is the
     /// per-deployment rollout lever (set in managed_config.toml `[features]`).
@@ -6044,7 +6053,6 @@ reasoning_effort = "low"
             RuntimeResolutionContext {
                 raw_config: raw,
                 remote_settings: None,
-                cwd: None,
                 is_headless: false,
                 cli_subagents: None,
                 cli_web_search_model: None,
@@ -6073,7 +6081,6 @@ reasoning_effort = "low"
             RuntimeResolutionContext {
                 raw_config: raw,
                 remote_settings: None,
-                cwd: None,
                 is_headless: true,
                 cli_subagents: None,
                 cli_web_search_model: None,
@@ -10563,6 +10570,7 @@ agent_type = "cursor"
             url = "https://mcp.test.com"
             [toolset.bash]
             timeout_secs = 120
+            login_shell_capture = true
             [shortcuts]
             ctrl_k = "search"
             [grok_com_config]
@@ -10673,6 +10681,7 @@ agent_type = "cursor"
         let toml_str = r#"
             [marketplace]
             official_marketplace_auto_installed = "yes"
+            default_skills_installs_purged = "yes"
         "#;
         let unused = unused_keys_from_toml(toml_str);
         assert!(unused.is_empty(), "got: {unused:?}");
@@ -10690,6 +10699,7 @@ agent_type = "cursor"
             deny = ["Bash(rm *)"]
             [marketplace]
             official_marketplace_auto_installed = true
+            default_skills_installs_purged = true
             [ui]
             yollo = true
         "#,
@@ -11456,7 +11466,6 @@ hooks = true
         config.resolve_runtime_fields(&RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: Some(&remote),
-            cwd: None,
             is_headless: false,
             cli_subagents: None,
             cli_web_search_model: None,
@@ -11482,7 +11491,6 @@ hooks = true
         cfg.resolve_runtime_fields(&RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: None,
-            cwd: None,
             is_headless: false,
             cli_subagents: None,
             cli_web_search_model: None,
@@ -11518,7 +11526,6 @@ hooks = true
         cfg.resolve_runtime_fields(&RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: None,
-            cwd: None,
             is_headless: true,
             cli_subagents: None,
             cli_web_search_model: None,
@@ -11550,7 +11557,6 @@ hooks = true
         cfg.resolve_runtime_fields(&RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: Some(&remote),
-            cwd: None,
             is_headless: false,
             cli_subagents: None,
             cli_web_search_model: None,
@@ -11573,7 +11579,6 @@ hooks = true
         cfg.resolve_runtime_fields(&RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: None,
-            cwd: None,
             is_headless: false,
             cli_subagents: None,
             cli_web_search_model: None,
@@ -11596,7 +11601,6 @@ hooks = true
         cfg.resolve_runtime_fields(&RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: None,
-            cwd: None,
             is_headless: false,
             cli_subagents: Some(true),
             cli_web_search_model: None,
@@ -11620,7 +11624,6 @@ hooks = true
         cfg.resolve_runtime_fields(&RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: None,
-            cwd: None,
             is_headless: false,
             cli_subagents: None,
             cli_web_search_model: None,
@@ -11644,7 +11647,6 @@ hooks = true
         cfg.resolve_runtime_fields(&RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: None,
-            cwd: None,
             is_headless: false,
             cli_subagents: None,
             cli_web_search_model: Some("custom-ws"),
@@ -11672,7 +11674,6 @@ hooks = true
         cfg.resolve_runtime_fields(&RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: Some(&remote),
-            cwd: None,
             is_headless: false,
             cli_subagents: None,
             cli_web_search_model: None,
@@ -11695,7 +11696,6 @@ hooks = true
         let ctx = RuntimeResolutionContext {
             raw_config: &raw,
             remote_settings: None,
-            cwd: None,
             is_headless: false,
             cli_subagents: None,
             cli_web_search_model: None,
@@ -12243,12 +12243,13 @@ default = "grok-4.5"
     #[test]
     fn resolve_model_list_inherits_context_window_from_default_when_prefetched_has_fallback() {
         let cfg = Config::default();
+        let dm = crate::models::default_model();
         let default_cw = DEFAULT_CONTEXT_WINDOW;
-        let entry = prefetch_model_entry("grok-build", default_cw, ApiBackend::default());
+        let entry = prefetch_model_entry(dm, default_cw, ApiBackend::default());
         let mut prefetched = IndexMap::new();
-        prefetched.insert("grok-build".to_owned(), entry);
+        prefetched.insert(dm.to_owned(), entry);
         let resolved = resolve_model_list(&cfg, Some(prefetched));
-        let entry = resolved.get("grok-build").expect("model must exist");
+        let entry = resolved.get(dm).expect("model must exist");
         assert_ne!(
             entry.info.context_window.get(),
             default_cw,
@@ -12258,12 +12259,13 @@ default = "grok-4.5"
     #[test]
     fn resolve_model_list_does_not_override_explicitly_set_context_window() {
         let cfg = Config::default();
+        let dm = crate::models::default_model();
         let explicit_cw = 65_536;
-        let entry = prefetch_model_entry("grok-build", explicit_cw, ApiBackend::default());
+        let entry = prefetch_model_entry(dm, explicit_cw, ApiBackend::default());
         let mut prefetched = IndexMap::new();
-        prefetched.insert("grok-build".to_owned(), entry);
+        prefetched.insert(dm.to_owned(), entry);
         let resolved = resolve_model_list(&cfg, Some(prefetched));
-        let entry = resolved.get("grok-build").expect("model must exist");
+        let entry = resolved.get(dm).expect("model must exist");
         assert_eq!(
             entry.info.context_window.get(),
             explicit_cw,
@@ -12273,14 +12275,15 @@ default = "grok-4.5"
     #[test]
     fn resolve_model_list_inherits_agent_type_and_api_backend() {
         let cfg = Config::default();
+        let dm = crate::models::default_model();
         let default_cw = DEFAULT_CONTEXT_WINDOW;
-        let entry = prefetch_model_entry("grok-build", default_cw, ApiBackend::default());
+        let entry = prefetch_model_entry(dm, default_cw, ApiBackend::default());
         let mut prefetched = IndexMap::new();
-        prefetched.insert("grok-build".to_owned(), entry);
+        prefetched.insert(dm.to_owned(), entry);
         let resolved = resolve_model_list(&cfg, Some(prefetched));
-        let entry = resolved.get("grok-build").expect("model must exist");
+        let entry = resolved.get(dm).expect("model must exist");
         let defaults = default_model_entries(&EndpointsConfig::default());
-        if let Some(default) = defaults.get("grok-build") {
+        if let Some(default) = defaults.get(dm) {
             if default.info.agent_type != DEFAULT_AGENT_TYPE {
                 assert_eq!(
                     entry.info.agent_type, default.info.agent_type,
@@ -12318,23 +12321,25 @@ default = "grok-4.5"
     #[test]
     fn resolve_model_list_prunes_bundled_entries_not_in_prefetch() {
         let cfg = Config::default();
+        let dm = crate::models::default_model();
         let mut defs = default_model_entries(&EndpointsConfig::default());
         let mut p = IndexMap::new();
-        if let Some(e) = defs.shift_remove("grok-build") {
-            p.insert("grok-build".to_string(), e);
+        if let Some(e) = defs.shift_remove(dm) {
+            p.insert(dm.to_string(), e);
         }
         let resolved = resolve_model_list(&cfg, Some(p));
-        assert!(resolved.contains_key("grok-build"));
+        assert!(resolved.contains_key(dm));
         let no_p = resolve_model_list(&cfg, None);
-        assert!(no_p.contains_key("grok-build"));
+        assert!(no_p.contains_key(dm));
     }
     #[test]
     fn resolve_model_list_prefetch_visibility_matches_auth_and_server_list() {
         let cfg = Config::default();
+        let dm = crate::models::default_model();
         let mut defs = default_model_entries(&EndpointsConfig::default());
         let mut p = IndexMap::new();
-        if let Some(e) = defs.shift_remove("grok-build") {
-            p.insert("grok-build".to_string(), e);
+        if let Some(e) = defs.shift_remove(dm) {
+            p.insert(dm.to_string(), e);
         }
         let resolved = resolve_model_list(&cfg, Some(p));
         let sess: Vec<_> = resolved
@@ -12348,27 +12353,29 @@ default = "grok-4.5"
             .filter(|e| e.visible_for_auth(false))
             .collect();
         assert_eq!(sess.len(), 1);
-        assert!(api.is_empty());
+        assert_eq!(api.len(), 1);
     }
     #[test]
     fn resolve_model_list_keeps_prefetch_only_entries_and_prunes_defaults() {
         let cfg = Config::default();
+        let dm = crate::models::default_model();
         let mut p = IndexMap::new();
         let e = prefetch_model_entry("secret-xyz", 200000, ApiBackend::default());
         p.insert("secret-xyz".to_string(), e);
         let resolved = resolve_model_list(&cfg, Some(p));
         assert!(resolved.contains_key("secret-xyz"));
-        assert!(!resolved.contains_key("grok-build"));
+        assert!(!resolved.contains_key(dm));
     }
     #[test]
     fn resolve_model_list_prefetch_replaces_bundled_entirely() {
         let cfg = Config::default();
+        let dm = crate::models::default_model();
         let mut p = IndexMap::new();
-        let e = prefetch_model_entry("grok-4.5", 500_000, ApiBackend::Responses);
-        p.insert("grok-4.5".to_string(), e);
+        let e = prefetch_model_entry("other-model", 500_000, ApiBackend::Responses);
+        p.insert("other-model".to_string(), e);
         let resolved = resolve_model_list(&cfg, Some(p));
-        assert!(resolved.contains_key("grok-4.5"));
-        assert!(!resolved.contains_key("grok-build"));
+        assert!(resolved.contains_key("other-model"));
+        assert!(!resolved.contains_key(dm));
     }
     #[test]
     fn resolve_model_list_empty_xai_prefetch_preserves_non_xai_fallbacks() {
@@ -12821,14 +12828,14 @@ default = "grok-4.5"
         assert_eq!(codex.info.api_backend, ApiBackend::Responses);
         assert_eq!(codex.info.tool_mode, Some(ToolMode::CodeModeOnly));
     }
-    /// Regression: enterprise managed config aliases grok-build to their own
-    /// endpoint with env_key. The bundled grok-build has supported_in_api=false.
-    /// The config overlay must be visible to API-key users (env_key = BYOK).
+    /// Regression: enterprise managed config overlays env_key on an oauth-only
+    /// catalog entry. BYOK must force visibility for API-key users so a
+    /// base `supported_in_api: false` does not leak into the overlay.
     #[test]
     fn byok_config_overlay_visible_to_api_key_users() {
         let raw: toml::Value = toml::from_str(
             r#"
-            [model.grok-build]
+            [model.enterprise-alias]
             model = "grok-4.5"
             base_url = "https://inference.company.com/v1"
             env_key = "COMPANY_TOKEN"
@@ -12836,31 +12843,48 @@ default = "grok-4.5"
         )
         .unwrap();
         let cfg = Config::new_from_toml_cfg(&raw).expect("config should parse");
-        let resolved = resolve_model_list(&cfg, None);
-        let entry = resolved.get("grok-build").expect("grok-build must exist");
+        let mut base = prefetch_model_entry("enterprise-alias", 200_000, ApiBackend::default());
+        base.info.supported_in_api = false;
+        let mut prefetched = IndexMap::new();
+        prefetched.insert("enterprise-alias".to_owned(), base);
+        let resolved = resolve_model_list(&cfg, Some(prefetched));
+        let entry = resolved
+            .get("enterprise-alias")
+            .expect("enterprise-alias must exist");
         assert!(
             entry.visible_for_auth(false),
             "BYOK config entry must be visible to API-key users — \
-             bundled supported_in_api=false must not leak into credentialed overlays"
+             env_key must override base supported_in_api=false"
         );
     }
-    /// Guard: config overlay WITHOUT credentials must NOT override the
-    /// bundled supported_in_api flag. Only BYOK triggers the override.
+    /// Guard: config overlay WITHOUT credentials must NOT flip the
+    /// bundled supported_in_api flag. Only BYOK triggers that override.
     #[test]
     fn plain_config_overlay_preserves_bundled_visibility() {
-        let raw: toml::Value = toml::from_str(
+        let dm = crate::models::default_model();
+        let bundled = default_model_entries(&EndpointsConfig::default())
+            .get(dm)
+            .expect("bundled default must exist")
+            .clone();
+        let raw: toml::Value = toml::from_str(&format!(
             r#"
-            [model.grok-build]
+            [model."{dm}"]
             context_window = 300000
-            "#,
-        )
+            "#
+        ))
         .unwrap();
         let cfg = Config::new_from_toml_cfg(&raw).expect("config should parse");
         let resolved = resolve_model_list(&cfg, None);
-        let entry = resolved.get("grok-build").expect("grok-build must exist");
-        assert!(
-            !entry.visible_for_auth(false),
-            "non-BYOK config overlay must preserve bundled supported_in_api=false"
+        let entry = resolved.get(dm).expect("bundled default must exist");
+        assert_eq!(
+            entry.visible_for_auth(false),
+            bundled.visible_for_auth(false),
+            "non-BYOK config overlay must preserve bundled supported_in_api"
+        );
+        assert_eq!(
+            entry.visible_for_auth(true),
+            bundled.visible_for_auth(true),
+            "non-BYOK config overlay must preserve bundled OAuth visibility"
         );
     }
     #[test]

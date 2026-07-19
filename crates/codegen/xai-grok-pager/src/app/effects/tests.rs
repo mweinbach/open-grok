@@ -1,6 +1,7 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
 use xai_grok_shell::extensions::billing::{BillingConfig, Cent, UsagePeriod};
+use xai_grok_shell::sampling::error::FREE_USAGE_USER_MESSAGE;
 /// The invalid-params server detail survives `attach_prompt_usage`
 /// wrapping `error.data` as `{message, promptUsage}`.
 #[test]
@@ -22,9 +23,37 @@ fn format_acp_error_rate_limit_is_auth_aware() {
         RATE_LIMITED_ERROR_CODE, RATE_LIMITED_USER_MESSAGE_API_KEY,
         RATE_LIMITED_USER_MESSAGE_OAUTH,
     };
-    let err = acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited").data("slow down");
-    assert_eq!(format_acp_error(&err, false), RATE_LIMITED_USER_MESSAGE_OAUTH);
-    assert_eq!(format_acp_error(&err, true), RATE_LIMITED_USER_MESSAGE_API_KEY);
+    let cap_body = "The service is temporarily at capacity. Please retry your request shortly.";
+    let capacity = acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited")
+        .data(format!("API error (status 429 Too Many Requests): {cap_body}"));
+    assert_eq!(format_acp_error(& capacity, false), cap_body);
+    assert_eq!(format_acp_error(& capacity, true), cap_body);
+    let rpm_body = "You are sending requests too quickly. Please slow down, or upgrade to a Grok subscription for higher limits: https://grok.com/supergrok";
+    let rpm = acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited")
+        .data(format!("API error (status 429 Too Many Requests): {rpm_body}"));
+    assert!(format_acp_error(& rpm, false).contains("grok.com/supergrok"));
+    assert_eq!(format_acp_error(& rpm, true), RATE_LIMITED_USER_MESSAGE_API_KEY);
+    let empty = acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited");
+    assert_eq!(format_acp_error(& empty, false), RATE_LIMITED_USER_MESSAGE_OAUTH);
+    assert_eq!(format_acp_error(& empty, true), RATE_LIMITED_USER_MESSAGE_API_KEY);
+    let free = acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited")
+        .data(
+            "API error (status 429 Too Many Requests): \
+             subscription:free-usage-exhausted: You have used all your free usage.",
+        );
+    assert_eq!(format_acp_error(& free, false), FREE_USAGE_USER_MESSAGE);
+    assert_eq!(format_acp_error(& free, true), FREE_USAGE_USER_MESSAGE);
+    let free_wrapped = acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited")
+        .data(
+            serde_json::json!(
+                { "message" :
+                "API error (status 429 Too Many Requests): \
+                    subscription:free-usage-exhausted: You have used all your free usage.",
+                "promptUsage" : { "inputTokens" : 12, "outputTokens" : 0, "numTurns" : 1
+                } }
+            ),
+        );
+    assert_eq!(format_acp_error(& free_wrapped, false), FREE_USAGE_USER_MESSAGE);
 }
 /// Non-empty token ranges ride the wire block meta as `skillTokenRanges`
 /// byte pairs; the text itself is untouched.
@@ -682,6 +711,16 @@ async fn persist_setting_type_mismatch_errors_show_timeline() {
     assert!(
         err.contains("persist_setting(show_timeline) expected Bool"),
         "error message must mention key + expected kind, got: {err}",
+    );
+}
+#[tokio::test]
+async fn persist_setting_type_mismatch_errors_page_flip_on_send() {
+    use crate::settings::SettingValue;
+    let r = persist_setting("page_flip_on_send", SettingValue::String("nope".into()))
+        .await;
+    let err = r.expect_err("page_flip_on_send with String payload must return Err");
+    assert!(
+        err.contains("persist_setting(page_flip_on_send) expected Bool"), "got: {err}",
     );
 }
 /// Type-mismatch for `simple_mode`.

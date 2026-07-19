@@ -5,12 +5,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthStr;
 
 use super::layout::{MIN_DASHBOARD_WIDTH, compute_layout};
 use super::row::{DashboardRow, RowBadge, build_rows_with_roster};
 use super::state::{
-    DashboardRowId, DashboardState, Filter, Focusable, Grouping, LocationPickerState, RowState,
-    SectionKey,
+    DashboardRowId, DashboardState, Filter, Focusable, Grouping, LocationPickerState, RenameDraft,
+    RowState, SectionKey,
 };
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
@@ -286,16 +287,13 @@ pub fn render_dashboard(
     // Header.
     render_header(buf, layout.header, &theme, &rows, state, upgrade_cta);
 
-    // Body.
-    //
-    // Three distinct branches:
-    //  (a) no agents at all → "no agents yet" hint
-    //  (b) agents exist but filter hides all → "no match" hint
-    //  (c) otherwise → render rows
-    if agents.is_empty() {
-        render_empty_state(buf, layout.list, &theme, dashboard_sessions_loading);
-    } else if rows.is_empty() {
-        render_no_match(buf, layout.list, &theme, &state.filter);
+    // Body: key off visible rows (local agents + roster), not the local map alone.
+    if rows.is_empty() {
+        if state.filter.is_active() {
+            render_no_match(buf, layout.list, &theme, &state.filter);
+        } else {
+            render_empty_state(buf, layout.list, &theme, dashboard_sessions_loading);
+        }
     } else if area.width < MIN_DASHBOARD_WIDTH {
         render_narrow_rows(buf, layout.list, &theme, &rows, state);
     } else {
@@ -480,63 +478,78 @@ pub fn render_dashboard(
         return None;
     }
 
-    // Return a visible cursor for the dispatch input
-    // / rename overlay so the user sees where typing lands.
-    // Rename takes precedence — it paints over the row list.
-    //
-    // Cursor width is computed from the SANITISED
-    // draft (matching what the renderer paints). The previous
-    // `rn.draft.as_str()` form drifted right of the actual end of
-    // typed text when the draft contained control characters.
-    //
-    // Clamp `cx` to the row's right edge so a
-    // wider-than-rect draft doesn't park the cursor off the row.
+    // An active rename replaces the dispatch caret with its row-local editor caret.
     if let Some(pos) = rename_cursor_pos(state, &rows) {
         return Some(pos);
     }
     dispatch_cursor
 }
 
-/// Cursor position for the in-flight rename overlay: one cell past the
-/// end of the typed draft, on the renamed row's title line. `None` when
-/// no rename is active (or its row isn't on screen).
-///
-/// The overlay paints `rename: {draft}` at the title's own column —
-/// past the marker (1) + gap (1) + indent + icon + gap (1) chrome — in
-/// BOTH layouts (`render_row` / `render_narrow_rows` share the
-/// formula). The cursor mirrors that chrome math; anything else parks
-/// it over the `rename:` prefix or past the typed text. Indent and
-/// icon width come from the live row so a Working spinner or a
-/// (future) indented renameable row can't drift the formula.
-///
-/// Width is computed from the SANITISED draft (matching
-/// what the renderer paints). Clamped to the row's right
-/// edge so a wider-than-rect draft doesn't park the cursor off the row.
+const RENAME_PREFIX: &str = "rename: ";
+
+fn rename_editor_view(draft: &RenameDraft, width: u16) -> (&str, u16) {
+    let prefix_width = UnicodeWidthStr::width(RENAME_PREFIX) as u16;
+    let editor_width = width.saturating_sub(prefix_width);
+    let viewport = draft.viewport(editor_width as usize);
+    let visible = &draft.text()[viewport.visible_byte_range];
+    let cursor_offset = prefix_width
+        .saturating_add(viewport.cursor_display_column as u16)
+        .min(width.saturating_sub(1));
+    (visible, cursor_offset)
+}
+
+fn render_rename_editor(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    style: Style,
+    draft: &RenameDraft,
+) {
+    if width == 0 {
+        return;
+    }
+    let prefix_width = UnicodeWidthStr::width(RENAME_PREFIX) as u16;
+    buf.set_span(
+        x,
+        y,
+        &Span::styled(RENAME_PREFIX, style),
+        prefix_width.min(width),
+    );
+    let (visible, _) = rename_editor_view(draft, width);
+    if !visible.is_empty() && prefix_width < width {
+        buf.set_span(
+            x + prefix_width,
+            y,
+            &Span::styled(visible, style),
+            width - prefix_width,
+        );
+    }
+}
+
+/// Return the in-flight rename caret when its row is visible.
 fn rename_cursor_pos(state: &DashboardState, rows: &[DashboardRow]) -> Option<(u16, u16)> {
-    use unicode_width::UnicodeWidthStr;
     let rn = state.rename.as_ref()?;
     let (_, rect) = state.row_rects.iter().find(|(id, _)| *id == rn.row)?;
-    let safe_draft = crate::views::session_title::sanitize_display_text(&rn.draft);
-    let prefix_w = UnicodeWidthStr::width("rename: ") as u16;
-    let draft_w = UnicodeWidthStr::width(safe_draft.as_ref()) as u16;
-    let (indent_w, icon_w) = rows
+    let (marker_width, indent_width, icon_width) = rows
         .iter()
         .find(|r| r.id == rn.row)
         .map(|r| {
             (
+                UnicodeWidthStr::width(crate::glyphs::selection_bar()) as u16,
                 (r.indent as u16) * 2,
                 UnicodeWidthStr::width(state_icon(r.state, state.spinner_tick)) as u16,
             )
         })
-        .unwrap_or((0, 1));
-    let chrome_w = 1 + 1 + indent_w + icon_w + 1;
-    let unbounded_cx = rect
-        .x
-        .saturating_add(chrome_w)
-        .saturating_add(prefix_w)
-        .saturating_add(draft_w);
-    let cx_max = rect.x.saturating_add(rect.width.saturating_sub(1));
-    Some((unbounded_cx.min(cx_max), rect.y))
+        .unwrap_or((1, 0, 1));
+    let chrome_width = marker_width + 1 + indent_width + icon_width + 1;
+    let content_x = rect.x.saturating_add(chrome_width);
+    let content_width = rect.x.saturating_add(rect.width).saturating_sub(content_x);
+    let (_, cursor_offset) = rename_editor_view(rn, content_width);
+    let cursor_x = content_x
+        .saturating_add(cursor_offset)
+        .min(rect.x.saturating_add(rect.width.saturating_sub(1)));
+    Some((cursor_x, rect.y))
 }
 
 /// Render the compact dashboard "banner" used when an agent is
@@ -685,7 +698,6 @@ fn render_header(
     upgrade_cta: Option<HeaderUpgradeCta<'_>>,
 ) {
     use ratatui::text::{Line, Span};
-    use unicode_width::UnicodeWidthStr;
 
     use crate::views::agent_status::AgentStatusBar;
 
@@ -1004,7 +1016,8 @@ fn render_location_picker(
         ModalSizing, ModalWindowConfig, Shortcut, push_vim_nav_search_hint, render_modal_window,
     };
     use crate::views::picker::{
-        PickerEntry, PickerRow, render_divider, render_picker_content, render_search_bar_with_label,
+        PickerEntry, PickerRow, render_divider, render_picker_content,
+        render_picker_search_bar_with_label,
     };
 
     let mut shortcuts = vec![
@@ -1090,17 +1103,16 @@ fn render_location_picker(
         } else {
             (content_area.width, None)
         };
-        render_search_bar_with_label(
+        render_picker_search_bar_with_label(
             buf,
             content_area.x,
             content_area.y,
             path_w,
             theme,
             " path: ",
-            &modal.picker.query,
+            &modal.picker,
             /* active */ false,
             /* show_hint */ false,
-            modal.picker.query_cursor,
             Some(theme.bg_base),
         );
         modal.worktree_hit.set(wt_rect);
@@ -1176,7 +1188,6 @@ fn render_location_picker(
     // `render_picker_row`'s layout (fold prefix 2, gap 2, trailing 1); the
     // `-1` conservatively reserves a scrollbar column.
     let details: Vec<String> = {
-        use unicode_width::UnicodeWidthStr;
         const PREFIX: u16 = 2;
         const GAP: u16 = 2;
         const TRAILING: u16 = 1;
@@ -1757,7 +1768,6 @@ fn render_group_header(
     selected: bool,
     hovered: bool,
 ) {
-    use unicode_width::UnicodeWidthStr;
     let bg = Style::default().bg(theme.bg_base);
     let fill = " ".repeat(rect.width as usize);
     buf.set_string(rect.x, rect.y, fill, bg);
@@ -2043,7 +2053,6 @@ fn render_row(
     row: &DashboardRow,
     state: &DashboardState,
 ) {
-    use unicode_width::UnicodeWidthStr;
     if rect.area() == 0 {
         return;
     }
@@ -2127,19 +2136,17 @@ fn render_row(
             icon,
             Style::default().fg(icon_color).bg(bg),
         );
-        let prefix = "rename: ";
-        let safe_draft = crate::views::session_title::sanitize_display_text(&rn.draft).into_owned();
-        let line = format!("{prefix}{safe_draft}");
-        let avail = (rect.x + rect.width).saturating_sub(content_start_x + 1);
-        let truncated = truncate_str(&line, avail as usize);
-        buf.set_string(
+        let available = (rect.x + rect.width).saturating_sub(content_start_x);
+        render_rename_editor(
+            buf,
             content_start_x,
             title_y,
-            truncated,
+            available,
             Style::default()
                 .fg(theme.accent_user)
                 .bg(bg)
                 .add_modifier(Modifier::BOLD),
+            rn,
         );
         return;
     }
@@ -2358,7 +2365,6 @@ fn render_narrow_rows(
     // form would push too many rows off-screen on a 40-col terminal).
     // We still emit group headers and the selection marker so the
     // visual vocabulary stays consistent.
-    use unicode_width::UnicodeWidthStr;
     let lines = build_dashboard_lines(
         rows,
         state.grouping,
@@ -2486,18 +2492,16 @@ fn render_narrow_rows(
                 &chrome,
                 Style::default().fg(theme.text_primary).bg(bg),
             );
-            let safe_draft =
-                crate::views::session_title::sanitize_display_text(&rn.draft).into_owned();
-            let line = format!("rename: {safe_draft}");
-            let truncated = truncate_str(&line, body_width.saturating_sub(chrome_w) as usize);
-            buf.set_string(
+            render_rename_editor(
+                buf,
                 area.x + chrome_w,
                 y,
-                truncated,
+                body_width.saturating_sub(chrome_w),
                 Style::default()
                     .fg(theme.accent_user)
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
+                rn,
             );
         } else {
             let marker = if selected {
@@ -2621,8 +2625,6 @@ fn paint_dispatch_feedback_badge(
     theme: &Theme,
     error_toast: Option<&str>,
 ) {
-    use unicode_width::UnicodeWidthStr;
-
     let Some(err) = error_toast else {
         return;
     };
@@ -2746,7 +2748,6 @@ fn render_dispatch(
     overlay_area: Option<Rect>,
 ) -> Option<(u16, u16)> {
     use ratatui::widgets::{Block, BorderType, Borders, Widget};
-    use unicode_width::UnicodeWidthStr;
 
     use crate::views::prompt_widget::PromptStyle;
 
@@ -2806,7 +2807,7 @@ fn render_dispatch(
             height: 1,
         }
     };
-    if content.width < 4 {
+    if content.width == 0 {
         return None;
     }
 
@@ -2817,34 +2818,61 @@ fn render_dispatch(
     if state.search_mode {
         let prefix = "Search: ";
         let prefix_w = UnicodeWidthStr::width(prefix) as u16;
-        buf.set_string(
+        let painted_prefix_w = prefix_w.min(content.width);
+        buf.set_span(
             content.x,
             content.y,
-            prefix,
-            Style::default()
-                .fg(theme.warning)
-                .bg(theme.bg_base)
-                .add_modifier(Modifier::BOLD),
+            &Span::styled(
+                prefix,
+                Style::default()
+                    .fg(theme.warning)
+                    .bg(theme.bg_base)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            painted_prefix_w,
         );
-        let avail = content.width.saturating_sub(prefix_w);
-        let (to_show, style) = if state.dispatch.text().is_empty() {
-            (
-                "Type to filter sessions\u{2026}".to_string(),
-                Style::default().fg(theme.gray_dim).bg(theme.bg_base),
-            )
+        let editor_x = content.x + painted_prefix_w;
+        let avail = content.width - painted_prefix_w;
+        let cursor_column = if state.dispatch.text().is_empty() {
+            if avail > 0 {
+                let placeholder = truncate_str("Type to filter sessions\u{2026}", avail as usize);
+                buf.set_string(
+                    editor_x,
+                    content.y,
+                    placeholder,
+                    Style::default().fg(theme.gray_dim).bg(theme.bg_base),
+                );
+            }
+            0
         } else {
-            (
-                state.dispatch.text().to_string(),
-                Style::default().fg(theme.text_primary).bg(theme.bg_base),
+            let viewport = xai_ratatui_textarea::EditBuffer::from_parts(
+                state.dispatch.text(),
+                state.dispatch.cursor(),
             )
+            .single_line_viewport(avail as usize);
+            let visible = &state.dispatch.text()[viewport.visible_byte_range];
+            if avail > 0 {
+                buf.set_span(
+                    editor_x,
+                    content.y,
+                    &Span::styled(
+                        visible,
+                        Style::default().fg(theme.text_primary).bg(theme.bg_base),
+                    ),
+                    (UnicodeWidthStr::width(visible) as u16).min(avail),
+                );
+            }
+            viewport.cursor_display_column as u16
         };
-        let trunc = truncate_str(&to_show, avail as usize);
-        buf.set_string(content.x + prefix_w, content.y, trunc, style);
-        let text_disp_w: u16 = UnicodeWidthStr::width(state.dispatch.text())
-            .try_into()
-            .unwrap_or(u16::MAX);
-        let cx = content.x + prefix_w + text_disp_w.min(avail.saturating_sub(1));
+        let cursor_offset = painted_prefix_w
+            .saturating_add(cursor_column)
+            .min(content.width - 1);
+        let cx = content.x + cursor_offset;
         return input_focused.then_some((cx, content.y));
+    }
+
+    if content.width < 4 {
+        return None;
     }
 
     let prefix = "\u{276F} ";
@@ -3825,7 +3853,6 @@ pub fn render_popup_overlay(
 
     let title_text = format!(" \u{2771} {title_label} ");
 
-    use unicode_width::UnicodeWidthStr;
     let close_label = crate::glyphs::ballot_x_button();
     let close_w = UnicodeWidthStr::width(close_label) as u16;
     // Reserve close-affordance width + a 1-cell gap on the right;
@@ -4047,8 +4074,6 @@ fn paint_session_title_bar(
     left_inset: u16,
     right_inset: u16,
 ) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
-    use unicode_width::UnicodeWidthStr;
-
     // `‹` / `›` / `✗` are all painted as plain bracketed text
     // (no button background fills). Hover only changes the fg
     // color (`text_primary` vs `gray`) for subtle clickability
@@ -4264,6 +4289,51 @@ mod tests {
         assert!(
             content.contains("No agents yet, type a prompt to start one."),
             "expected empty-state hint, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn render_dashboard_shows_roster_when_local_agents_empty() {
+        use crate::app::roster::{RosterActivity, RosterEntry, RosterOrigin};
+
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+        let mut agents: IndexMap<AgentId, AgentView> = IndexMap::new();
+        let mut state = DashboardState::new();
+        let registry = crate::actions::ActionRegistry::defaults();
+        let roster = [RosterEntry {
+            session_id: "sess-fleet-1".into(),
+            title: Some("Fix fleet dashboard".into()),
+            cwd: "/repo/work".into(),
+            is_worktree: false,
+            model_id: None,
+            yolo: false,
+            activity: RosterActivity::Working,
+            resident: true,
+            last_change_unix_ms: 1_725_000_000_000,
+            origin: RosterOrigin::default(),
+        }];
+
+        let _ = render_dashboard(
+            &mut buf,
+            area,
+            &mut state,
+            &mut agents,
+            &registry,
+            None,
+            &roster,
+            false,
+            None,
+        );
+
+        let content = buf_to_text(&buf);
+        assert!(
+            content.contains("Fix fleet dashboard"),
+            "roster-only working session must paint when local agents are empty, got: {content:?}"
+        );
+        assert!(
+            !content.contains("No agents yet"),
+            "must not show empty-state while roster rows exist, got: {content:?}"
         );
     }
 
@@ -5385,13 +5455,10 @@ mod tests {
         );
     }
 
-    /// The in-flight rename overlay sanitises the
-    /// draft before painting so a smuggled ANSI escape never lands in
-    /// the buffer (test wide-mode and narrow-mode separately).
+    /// RenameDraft sanitation keeps control characters out of both render paths.
     #[test]
-    fn render_rename_overlay_strips_control_chars_from_live_draft() {
+    fn sanitized_rename_draft_is_safe_in_both_render_paths() {
         use crate::app::agent::AgentId;
-        use crate::views::dashboard::state::RenameDraft;
         let id = DashboardRowId::TopLevel(AgentId(7));
         let row = DashboardRow {
             id: id.clone(),
@@ -5420,10 +5487,7 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, 80, 3));
             let mut state = DashboardState::new();
             state.selected = Some(id.clone());
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: "a\x1b[31m".to_string(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), "a\x1b[31m"));
             render_rows(&mut buf, Rect::new(0, 0, 80, 3), &theme, &rows, &mut state);
             let content = buf_to_text(&buf);
             assert!(
@@ -5441,10 +5505,7 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, 30, 3));
             let mut state = DashboardState::new();
             state.selected = Some(id.clone());
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: "a\x1b[31m".to_string(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), "a\x1b[31m"));
             render_narrow_rows(&mut buf, Rect::new(0, 0, 30, 3), &theme, &rows, &mut state);
             let content = buf_to_text(&buf);
             assert!(
@@ -5458,13 +5519,10 @@ mod tests {
         }
     }
 
-    /// The rename overlay keeps the row's chrome (state icon) and paints
-    /// `rename:` at the title's own column, so the editing row stays
-    /// aligned with its neighbours (wide and narrow layouts).
+    /// Rename rendering preserves row chrome and title alignment in both layouts.
     #[test]
     fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
         use crate::app::agent::AgentId;
-        use crate::views::dashboard::state::RenameDraft;
         let id = DashboardRowId::TopLevel(AgentId(7));
         let row = DashboardRow {
             id: id.clone(),
@@ -5506,10 +5564,7 @@ mod tests {
         {
             let mut buf = Buffer::empty(Rect::new(0, 0, 80, 5));
             let mut state = DashboardState::new();
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: "new name".to_string(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), "new name"));
             render_rows(&mut buf, Rect::new(0, 0, 80, 5), &theme, &rows, &mut state);
             let line = row_text(&buf, 2, 80);
             assert_eq!(
@@ -5533,10 +5588,7 @@ mod tests {
             );
             // With an empty draft the cursor sits immediately after
             // `rename: ` (the position typing lands at).
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: String::new(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), ""));
             assert_eq!(
                 rename_cursor_pos(&state, &rows),
                 Some((title_col + prefix_w, 2)),
@@ -5556,10 +5608,7 @@ mod tests {
         {
             let mut buf = Buffer::empty(Rect::new(0, 0, 30, 3));
             let mut state = DashboardState::new();
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: "nn".to_string(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), "nn"));
             render_narrow_rows(&mut buf, Rect::new(0, 0, 30, 3), &theme, &rows, &mut state);
             let line = row_text(&buf, 1, 30);
             assert_eq!(
@@ -5572,6 +5621,97 @@ mod tests {
                 crate::glyphs::diamond_hollow(),
                 "narrow: the state icon must stay in place while renaming",
             );
+        }
+    }
+
+    #[test]
+    fn rename_viewport_handles_long_unicode_in_wide_and_narrow_rows() {
+        use crate::app::agent::AgentId;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let id = DashboardRowId::TopLevel(AgentId(7));
+        let row = DashboardRow {
+            id: id.clone(),
+            label: "row label".to_string(),
+            subtitle: None,
+            state: RowState::Idle,
+            activity: None,
+            secondary_line: None,
+            cwd_display: String::new(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            last_change_at: std::time::SystemTime::now(),
+            pinned: false,
+            is_active: false,
+            badges: Vec::new(),
+            context_pct: None,
+            indent: 0,
+            parent_label: None,
+            is_more_placeholder: false,
+            more_count: 0,
+        };
+        let rows = vec![row];
+        let text = format!("{}中e\u{301}👩🏽\u{200d}💻", "x".repeat(90));
+        let theme = Theme::current();
+        let registry = crate::actions::ActionRegistry::defaults();
+
+        for (width, narrow, row_y) in [(80, false, 2), (30, true, 1)] {
+            let area = Rect::new(0, 0, width, if narrow { 3 } else { 5 });
+            let mut buffer = Buffer::empty(area);
+            let mut state = DashboardState::new();
+            state.rename = Some(RenameDraft::new(id.clone(), text.clone()));
+            if narrow {
+                render_narrow_rows(&mut buffer, area, &theme, &rows, &mut state);
+            } else {
+                render_rows(&mut buffer, area, &theme, &rows, &mut state);
+            }
+            let line = (0..width)
+                .map(|x| buffer[(x, row_y)].symbol().to_string())
+                .collect::<String>();
+            assert!(line.contains('中'), "CJK tail missing: {line:?}");
+            assert!(line.contains("e\u{301}"), "combining tail split: {line:?}");
+            assert!(line.contains("👩🏽\u{200d}💻"), "ZWJ tail split: {line:?}",);
+            let end_cursor = rename_cursor_pos(&state, &rows).expect("end cursor");
+
+            let _ = state.handle_input(
+                &Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+                &registry,
+            );
+            for _ in 0..20 {
+                let _ = state.handle_input(
+                    &Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                    &registry,
+                );
+            }
+            let mut middle_buffer = Buffer::empty(area);
+            if narrow {
+                render_narrow_rows(&mut middle_buffer, area, &theme, &rows, &mut state);
+            } else {
+                render_rows(&mut middle_buffer, area, &theme, &rows, &mut state);
+            }
+            let middle_cursor = rename_cursor_pos(&state, &rows).expect("middle cursor");
+            assert_ne!(
+                state.rename.as_ref().expect("rename draft").cursor_byte(),
+                text.len()
+            );
+            if !narrow {
+                assert_ne!(middle_cursor, end_cursor);
+            }
+            let prefix_x = (0..width)
+                .find(|x| middle_buffer[(*x, row_y)].symbol() == "r")
+                .expect("rename prefix");
+            let row_rect = state
+                .row_rects
+                .iter()
+                .find(|(row_id, _)| row_id == &id)
+                .map(|(_, rect)| *rect)
+                .expect("rename row rect");
+            let editor_x = prefix_x + RENAME_PREFIX.len() as u16;
+            let editor_width = row_rect
+                .x
+                .saturating_add(row_rect.width)
+                .saturating_sub(editor_x);
+            let expected_cursor = editor_x + 20u16.min(editor_width.saturating_sub(1));
+            assert_eq!(middle_cursor, (expected_cursor, row_y));
         }
     }
 
@@ -5596,6 +5736,52 @@ mod tests {
             content.contains('\u{276F}'),
             "dispatch must paint ❯ prefix inside the box, got: {content:?}",
         );
+    }
+
+    #[test]
+    fn render_search_mode_uses_textarea_cursor_not_text_end() {
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::current();
+        let mut state = DashboardState::new();
+        state.search_mode = true;
+        state.dispatch.set_text("abcdef");
+        state.dispatch.set_cursor(2);
+
+        let cursor = render_dispatch(&mut buffer, area, &theme, &mut state, None)
+            .expect("focused search cursor");
+        let prefix_x = (0..area.width)
+            .find(|x| buffer[(*x, cursor.1)].symbol() == "S")
+            .expect("Search prefix");
+        assert_eq!(cursor.0, prefix_x + "Search: ".len() as u16 + 2);
+    }
+
+    #[test]
+    fn render_search_mode_clips_prefix_and_cursor_at_widths_one_through_nine() {
+        let theme = Theme::current();
+        for width in 1..=9 {
+            let full = Rect::new(0, 0, 14, 1);
+            let area = Rect::new(2, 0, width, 1);
+            let mut buffer = Buffer::empty(full);
+            buffer.set_string(0, 0, "#".repeat(full.width as usize), Style::default());
+            let mut state = DashboardState::new();
+            state.search_mode = true;
+            state.dispatch.set_text("abcdef");
+            state.dispatch.set_cursor(2);
+
+            let cursor = render_dispatch(&mut buffer, area, &theme, &mut state, None)
+                .expect("focused narrow search cursor");
+            assert!(cursor.0 >= area.x && cursor.0 < area.x + area.width);
+            for x in 0..full.width {
+                if x < area.x || x >= area.x + area.width {
+                    assert_eq!(
+                        buffer[(x, 0)].symbol(),
+                        "#",
+                        "width {width} wrote outside at column {x}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -7340,8 +7526,7 @@ mod tests {
             std::path::PathBuf::from("/base"),
             std::collections::HashMap::new(),
         );
-        modal.picker.query = "/tmp/zzz".to_string();
-        modal.picker.query_cursor = modal.picker.query.len();
+        modal.picker.set_query("/tmp/zzz");
         render_location_picker(&mut buf, area, &theme, &mut modal);
         let content = buf_to_text(&buf);
         assert!(
@@ -8255,21 +8440,16 @@ mod tests {
         );
     }
 
-    /// An in-flight rename swaps the footer for its two actions —
-    /// Enter saves, Esc cancels — and hides the normal nav/stop chips.
+    /// Rename mode shows only save and cancel actions.
     #[test]
     fn render_footer_rename_shows_save_and_cancel() {
         use crate::app::agent::AgentId;
-        use crate::views::dashboard::state::RenameDraft;
         let theme = Theme::current();
         let registry = crate::actions::ActionRegistry::defaults();
         let mut state = DashboardState::new();
         let id = DashboardRowId::TopLevel(AgentId(0));
         state.focus_row(id.clone());
-        state.rename = Some(RenameDraft {
-            row: id,
-            draft: String::new(),
-        });
+        state.rename = Some(RenameDraft::new(id, ""));
         let mut buf = Buffer::empty(Rect::new(0, 0, 200, 1));
         render_footer(
             &mut buf,

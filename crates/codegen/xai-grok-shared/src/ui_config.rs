@@ -105,6 +105,10 @@ pub struct UiConfig {
     /// `None` = off (client default; opt-in). Written by the pager's settings modal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_timeline: Option<bool>,
+    /// Snap a just-sent prompt to the viewport top. `None` = on (default).
+    /// Written by the pager's settings modal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_flip_on_send: Option<bool>,
     /// Theme to use when the OS is in dark mode. Written by the pager's theme persist module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_dark_theme: Option<String>,
@@ -313,6 +317,7 @@ impl Default for UiConfig {
             default_selected_permission: None,
             show_timestamps: None,
             show_timeline: None,
+            page_flip_on_send: None,
             auto_dark_theme: None,
             auto_light_theme: None,
             scroll_speed: None,
@@ -362,6 +367,14 @@ impl UiConfig {
         self.show_timeline.unwrap_or(Self::SHOW_TIMELINE_DEFAULT)
     }
 
+    /// Default for [`Self::page_flip_on_send`] when unset.
+    pub const PAGE_FLIP_ON_SEND_DEFAULT: bool = true;
+
+    pub fn page_flip_on_send_enabled(&self) -> bool {
+        self.page_flip_on_send
+            .unwrap_or(Self::PAGE_FLIP_ON_SEND_DEFAULT)
+    }
+
     /// True when the highlight should not timer-dismiss (`hold` / `word_select`,
     /// or legacy duration 0).
     pub fn keep_text_selection_enabled(&self) -> bool {
@@ -409,6 +422,16 @@ mod tests {
         let error = serde_json::from_str::<UiConfig>(r#"{"code_mode":"automatic"}"#)
             .expect_err("unknown code mode must not silently become direct");
         assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn page_flip_on_send_defaults_on() {
+        assert!(UiConfig::default().page_flip_on_send_enabled());
+        let off = UiConfig {
+            page_flip_on_send: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.page_flip_on_send_enabled());
     }
 
     #[test]

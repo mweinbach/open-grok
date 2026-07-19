@@ -1122,9 +1122,24 @@ pub(super) mod paste_key_tests {
     #[test]
     fn event_paste_plan_approval_non_image_file_url_decoded_into_prompt() {
         assert_event_paste_arm_decodes_non_image("plan_approval", |agent| {
-            agent.plan_approval_view = Some(make_plan_approval_view_state());
+            let mut view = make_plan_approval_view_state();
+            view.focus = crate::views::plan_approval_view::PlanApprovalFocus::Prompt;
+            agent.plan_approval_view = Some(view);
             agent.line_viewer = None;
         });
+    }
+    #[test]
+    fn event_paste_plan_preview_does_not_mutate_hidden_prompt() {
+        let mut agent = make_agent();
+        agent.prompt.set_text("hidden prompt");
+        agent.plan_approval_view = Some(make_plan_approval_view_state());
+        agent.line_viewer = None;
+        let outcome = agent.handle_input(
+            &Event::Paste("ignored".to_owned()),
+            &ActionRegistry::defaults(),
+        );
+        assert!(matches!(outcome, InputOutcome::Unchanged));
+        assert_eq!(agent.prompt.text(), "hidden prompt");
     }
     /// Question-view `Event::Paste` arm routes through the classifier when
     /// the question view is in `InputMode` focus.

@@ -696,10 +696,17 @@ mod tests {
     #[test]
     fn recap_registered_in_builtin_commands() {
         let mut reg = CommandRegistry::new(builtin_commands());
+        assert!(reg.get("recap").is_none());
+        assert!(reg.get("summarize").is_none());
         reg.set_recap_visible(true);
         assert!(
             reg.get("recap").is_some(),
             "/recap should be registered in builtins"
+        );
+        assert_eq!(
+            reg.get("summarize").map(|c| c.name()),
+            Some("recap"),
+            "/summarize should alias /recap"
         );
     }
     #[test]

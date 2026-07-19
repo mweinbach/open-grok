@@ -808,14 +808,6 @@ impl ScrollbackState {
         None
     }
 
-    /// Whether a turn-terminal marker stamped with `prompt_id` is in scrollback.
-    pub fn has_turn_terminal_marker_with_pid(&self, prompt_id: &str) -> bool {
-        self.entries.iter().any(|(_, entry)| {
-            matches!(&entry.block, RenderBlock::SessionEvent(b)
-                if b.event.is_turn_terminal() && b.prompt_id.as_deref() == Some(prompt_id))
-        })
-    }
-
     /// Merge a stop/stop_failure hook batch into a turn-terminal marker
     /// entry and collapse it so the right-justified summary — not the
     /// fold-out detail — is the resting state. Returns `false` unless the
@@ -853,44 +845,6 @@ impl ScrollbackState {
         }
         entry.invalidate_cache();
         self.mark_structurally_dirty(id);
-        true
-    }
-
-    /// Refresh an uncommitted parked marker after a subagent completion.
-    pub(crate) fn refresh_parked_subagent_marker(
-        &mut self,
-        id: EntryId,
-        prompt_id: &str,
-        elapsed: std::time::Duration,
-        end_work: super::blocks::EndWork,
-    ) -> bool {
-        if self.is_committed(id) {
-            return false;
-        }
-        let Some(end_work) = end_work.nonzero() else {
-            return false;
-        };
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return false;
-        };
-        let RenderBlock::SessionEvent(block) = &mut entry.block else {
-            return false;
-        };
-        if !block.parked
-            || block.prompt_id.as_deref() != Some(prompt_id)
-            || !matches!(
-                &block.event,
-                super::blocks::SessionEvent::TurnCompleted { .. }
-            )
-        {
-            return false;
-        }
-        block.event = super::blocks::SessionEvent::TurnCompleted {
-            elapsed: Some(elapsed),
-        };
-        block.end_work = Some(end_work);
-        entry.invalidate_cache();
-        self.mark_height_dirty(id);
         true
     }
 
@@ -1950,12 +1904,11 @@ pub(super) mod test_util {
             self.state.set_selected(Some(idx));
         }
 
+        /// Send with page-flip on (default product behavior).
         pub(super) fn send_prompt(&mut self, text: &str) -> EntryId {
             let id = self.state.push_block(RenderBlock::user_prompt(text));
             let prompt_idx = self.state.len().saturating_sub(1);
-            self.state.set_selected(Some(prompt_idx));
-            self.state.scroll_to_entry_top(prompt_idx);
-            self.state.enable_follow_with_preserve();
+            self.state.follow_new_turn(Some(prompt_idx), true);
             self.frame();
             id
         }
@@ -2322,34 +2275,6 @@ mod tests {
             state.latest_turn_marker_accepting("stop_failure", None),
             Some(marker)
         );
-    }
-
-    #[test]
-    fn subagent_marker_refresh_does_not_mutate_terminal_marker() {
-        use crate::scrollback::blocks::{EndWork, SessionEvent, SessionEventBlock};
-
-        let mut state = ScrollbackState::new();
-        let mut block = SessionEventBlock::new(SessionEvent::TurnCompleted {
-            elapsed: Some(std::time::Duration::from_secs(1)),
-        });
-        block.prompt_id = Some("p1".into());
-        let marker = state.push_block(RenderBlock::SessionEvent(block));
-
-        assert!(!state.refresh_parked_subagent_marker(
-            marker,
-            "p1",
-            std::time::Duration::from_secs(2),
-            EndWork {
-                running_subagents: 1,
-                ..EndWork::default()
-            },
-        ));
-
-        let RenderBlock::SessionEvent(block) = &state.get_by_id(marker).unwrap().block else {
-            panic!("expected terminal marker");
-        };
-        assert_eq!(block.marker_text(), "Worked for 1.0s.");
-        assert!(block.end_work.is_none());
     }
 
     #[test]

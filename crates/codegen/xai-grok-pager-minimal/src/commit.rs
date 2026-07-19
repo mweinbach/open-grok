@@ -885,6 +885,42 @@ mod tests {
     }
 
     #[test]
+    fn btw_block_emits_once_across_repeated_frontier_passes() {
+        let mut s = ScrollbackState::new();
+        s.push(ScrollbackEntry::new(RenderBlock::Btw(
+            xai_grok_pager::scrollback::blocks::BtwBlock::new(
+                "original question",
+                "original answer",
+            ),
+        )));
+
+        let mut emitted = Vec::new();
+        assert_eq!(
+            commit_leading_run(&mut s, false, |state, i| {
+                let RenderBlock::Btw(block) = &state.get(i).unwrap().block else {
+                    panic!("expected Btw block")
+                };
+                assert_eq!(block.question, "original question");
+                assert_eq!(block.content().text(), "original answer");
+                emitted.push(i);
+                true
+            }),
+            1
+        );
+        assert!(minimal_api::is_committed(&s, s.get(0).unwrap()));
+
+        assert_eq!(
+            commit_leading_run(&mut s, false, |_, i| {
+                emitted.push(i);
+                true
+            }),
+            0
+        );
+        assert_eq!(emitted, vec![0]);
+        assert!(!scan_frontier(&s, false).will_commit);
+    }
+
+    #[test]
     fn commit_leading_run_advances_frontier_and_marks_committed_once() {
         let mut s = ScrollbackState::new();
         s.push(finalized("h1"));

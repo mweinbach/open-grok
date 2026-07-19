@@ -138,7 +138,7 @@ impl PromptOrigin {
         }
     }
     /// If this is an auto-wake prompt, returns the inner completion ID
-    /// (task or subagent ID). Used to pre-mark reported completions.
+    /// (task or subagent ID). Used by queue preemption and cancellation cleanup.
     pub fn completion_id(&self) -> Option<&str> {
         match self {
             Self::TaskCompleted { task_id } => Some(task_id),

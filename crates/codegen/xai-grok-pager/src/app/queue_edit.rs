@@ -537,7 +537,6 @@ mod tests {
     };
     use crate::app::agent_view::{AgentPane, AgentView, PromptMode};
     use crate::app::app_view::InputOutcome;
-    use crate::app::dispatch::maybe_drain_queue;
     use crate::scrollback::block::RenderBlock;
     use crate::views::modal::{ActiveModal, ModalConfirmation};
 
@@ -746,7 +745,11 @@ mod tests {
         let outcome = agent.handle_prompt_key_for_test(&enter_key());
         assert!(matches!(outcome, InputOutcome::Action(Action::DrainQueue)));
 
-        let effects = maybe_drain_queue(&mut agent);
+        let mut app = crate::app::app_view::tests::test_app();
+        let id = agent.session.id;
+        app.agents.insert(id, agent);
+        let effects = crate::app::dispatch::maybe_drain_queue_and_note_peek(&mut app, id);
+        let agent = app.agents.get(&id).unwrap();
         match &agent.scrollback.get(0).unwrap().block {
             RenderBlock::UserPrompt(b) => {
                 assert_eq!(b.text, "great /pr-workflow go");
@@ -984,11 +987,15 @@ mod tests {
         // Running server turn completed: its shared-queue row is gone, so the
         // local edited row is the next turn (server-owns-next-turn gate clears).
         agent.shared_queue.clear();
-        let effects = maybe_drain_queue(&mut agent);
+        let mut app = crate::app::app_view::tests::test_app();
+        let id = agent.session.id;
+        app.agents.insert(id, agent);
+        let effects = crate::app::dispatch::maybe_drain_queue_and_note_peek(&mut app, id);
         assert!(matches!(
             effects.as_slice(),
             [Effect::SendPromptBlocks { .. }]
         ));
+        let agent = app.agents.get(&id).unwrap();
         let in_flight = agent.session.in_flight_prompt.as_ref().unwrap();
         assert_eq!(in_flight.images.len(), 2);
         assert_eq!(in_flight.chip_elements.len(), 2);

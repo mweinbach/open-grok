@@ -9,6 +9,22 @@ own OpenTelemetry collector, so platform teams can monitor adoption, token
 consumption, tool-permission decisions, and errors across the fleet — without
 any data flowing through SpaceXAI.
 
+## Related settings
+
+These knobs are independent of each other (and of this guide's external OTEL stream):
+
+| Setting | How to set it |
+|---------|---------------|
+| Telemetry master switch | `[features] telemetry` / `GROK_TELEMETRY_ENABLED` |
+| `/privacy` | `/privacy opt-in` / `/privacy opt-out`, or Settings |
+| Trace upload | `[telemetry] trace_upload` / `GROK_TELEMETRY_TRACE_UPLOAD` |
+| External OpenTelemetry | `GROK_EXTERNAL_OTEL` / `[telemetry] otel_*` (this guide) |
+
+See also [Authentication](02-authentication.md#related-settings) and
+[Configuration](05-configuration.md#telemetry).
+
+## External OTEL stream
+
 The external stream is:
 
 - **Off by default**, and requires a *double opt-in* (a master switch **and**
@@ -19,7 +35,7 @@ The external stream is:
 - **Structurally separate** from SpaceXAI-internal telemetry: its exporters carry
   only the headers you configure, never SpaceXAI credentials.
 - **Independent of SpaceXAI data-retention opt-outs**: it works even when
-  `telemetry` is disabled and for ZDR (zero-data-retention) teams — those
+  `telemetry` is disabled and for ZDR (zero-data-retention) teams. Those
   settings govern SpaceXAI-side retention; the external stream is governed solely
   by your own OTEL configuration.
 

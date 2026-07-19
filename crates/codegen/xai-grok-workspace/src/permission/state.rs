@@ -6,7 +6,9 @@ use std::collections::HashSet;
 use xai_grok_paths::AbsPathBuf;
 use xai_grok_tools::util::grok_home::grok_home;
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+const VALIDATED_MCP_SERVER_GRANTS_VERSION: i64 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PermissionState {
     pub edit_policy: EditPolicy,
@@ -19,11 +21,47 @@ pub struct PermissionState {
     /// Exact MCP tool names (e.g. `"grok_com_notion__notion-fetch"`)
     /// the user has granted "always allow" for. Lookup is exact.
     pub allowed_mcp_tools: HashSet<String>,
-    /// MCP server prefixes (everything before the first `__`,
-    /// e.g. `"grok_com_notion"`) for which the user has granted
-    /// "always allow" to every tool. Lookup is "tool name starts with
-    /// `<prefix>__`".
+    /// Server components of valid qualified MCP IDs (e.g. `"grok_com_notion"`)
+    /// for which the user has granted "always allow" to every tool. Lookup
+    /// validates and parses the complete qualified ID before matching.
     pub allowed_mcp_servers: HashSet<String>,
+    /// Version proving server-wide grants were minted from validated qualified IDs.
+    /// Missing or malformed markers are legacy; future integer versions are preserved.
+    #[serde(
+        default = "legacy_mcp_server_grants_version",
+        deserialize_with = "deserialize_mcp_server_grants_version"
+    )]
+    pub(crate) validated_mcp_server_grants_version: i64,
+}
+
+fn legacy_mcp_server_grants_version() -> i64 {
+    0
+}
+
+fn deserialize_mcp_server_grants_version<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(match value.as_integer() {
+        Some(version) if version >= 0 => version,
+        _ => 0,
+    })
+}
+
+impl Default for PermissionState {
+    fn default() -> Self {
+        Self {
+            edit_policy: EditPolicy::default(),
+            allow_bash_execute: false,
+            allowed_bash_commands: HashSet::new(),
+            disallowed_bash_commands: HashSet::new(),
+            allowed_web_fetch_domains: HashSet::new(),
+            allowed_mcp_tools: HashSet::new(),
+            allowed_mcp_servers: HashSet::new(),
+            validated_mcp_server_grants_version: VALIDATED_MCP_SERVER_GRANTS_VERSION,
+        }
+    }
 }
 
 fn state_dir_for_cwd(cwd: &AbsPathBuf) -> std::path::PathBuf {
@@ -49,15 +87,36 @@ fn state_file_path(dir: &std::path::Path, client_identifier: Option<&str>) -> st
     }
 }
 
-async fn try_load_state(path: &std::path::Path) -> Option<PermissionState> {
+async fn try_load_state_with_writer<F>(path: &std::path::Path, writer: F) -> Option<PermissionState>
+where
+    F: FnOnce(&std::path::Path, &str) -> std::io::Result<()> + Send + 'static,
+{
     match tokio::fs::read_to_string(path).await {
-        Ok(s) => Some(toml::from_str(&s).unwrap_or_default()),
+        Ok(s) => {
+            let mut state: PermissionState = toml::from_str(&s).unwrap_or_default();
+            if state.validated_mcp_server_grants_version < VALIDATED_MCP_SERVER_GRANTS_VERSION {
+                state.allowed_mcp_servers.clear();
+                state.validated_mcp_server_grants_version = VALIDATED_MCP_SERVER_GRANTS_VERSION;
+                tracing::info!(path = %path.display(), "invalidated legacy MCP server grants");
+                if let Err(e) = persist_state_to_path_with_writer(path, &state, writer).await {
+                    tracing::warn!(?e, path = %path.display(), "failed writing permission state");
+                }
+            }
+            Some(state)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             tracing::warn!(?e, "failed reading permission state");
             None
         }
     }
+}
+
+async fn try_load_state(path: &std::path::Path) -> Option<PermissionState> {
+    try_load_state_with_writer(path, |path, contents| {
+        xai_grok_config::fs_atomic::write_atomically(path, contents, None)
+    })
+    .await
 }
 
 async fn load_state_from_dir(
@@ -69,12 +128,10 @@ async fn load_state_from_dir(
         if let Some(state) = try_load_state(&per_client).await {
             return state;
         }
-        let shared = state_file_path(dir, None);
-        try_load_state(&shared).await.unwrap_or_default()
-    } else {
-        let path = state_file_path(dir, None);
-        try_load_state(&path).await.unwrap_or_default()
     }
+    try_load_state(&state_file_path(dir, None))
+        .await
+        .unwrap_or_default()
 }
 
 pub(crate) async fn load_state_from_disk(
@@ -82,6 +139,32 @@ pub(crate) async fn load_state_from_disk(
     client_identifier: Option<&str>,
 ) -> PermissionState {
     load_state_from_dir(&state_dir_for_cwd(cwd), client_identifier).await
+}
+
+async fn persist_state_to_path_with_writer<F>(
+    path: &std::path::Path,
+    state: &PermissionState,
+    writer: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&std::path::Path, &str) -> std::io::Result<()> + Send + 'static,
+{
+    let contents = toml::to_string_pretty(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || writer(&path, &contents))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+async fn persist_state_to_path(
+    path: &std::path::Path,
+    state: &PermissionState,
+) -> std::io::Result<()> {
+    persist_state_to_path_with_writer(path, state, |path, contents| {
+        xai_grok_config::fs_atomic::write_atomically(path, contents, None)
+    })
+    .await
 }
 
 async fn persist_state_to_dir(
@@ -94,13 +177,8 @@ async fn persist_state_to_dir(
         return;
     }
     let path = state_file_path(dir, client_identifier);
-    match toml::to_string_pretty(state) {
-        Ok(s) => {
-            if let Err(e) = tokio::fs::write(&path, s).await {
-                tracing::warn!(?e, "failed writing permission state");
-            }
-        }
-        Err(e) => tracing::warn!(?e, "failed serializing permission state"),
+    if let Err(e) = persist_state_to_path(&path, state).await {
+        tracing::warn!(?e, path = %path.display(), "failed writing permission state");
     }
 }
 
@@ -161,6 +239,10 @@ mod tests {
         assert!(!restored.allow_bash_execute);
         assert!(restored.allowed_bash_commands.is_empty());
         assert!(restored.disallowed_bash_commands.is_empty());
+        assert_eq!(
+            restored.validated_mcp_server_grants_version,
+            VALIDATED_MCP_SERVER_GRANTS_VERSION
+        );
     }
 
     #[test]
@@ -251,11 +333,12 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_from_empty_toml() {
+    fn deserialize_from_empty_toml_is_legacy() {
         let state: PermissionState = toml::from_str("").unwrap();
         assert!(!state.allow_bash_execute);
         assert!(state.allowed_bash_commands.is_empty());
         assert!(state.disallowed_bash_commands.is_empty());
+        assert_eq!(state.validated_mcp_server_grants_version, 0);
     }
 
     #[test]
@@ -364,6 +447,16 @@ allowed_web_fetch_domains = ["github.com"]
         assert!(state.allowed_web_fetch_domains.contains("github.com"));
         assert!(state.allowed_mcp_tools.is_empty());
         assert!(state.allowed_mcp_servers.is_empty());
+        assert_eq!(state.validated_mcp_server_grants_version, 0);
+    }
+
+    #[test]
+    fn malformed_mcp_server_grants_version_is_legacy() {
+        for marker in ["-1", "\"invalid\""] {
+            let state: PermissionState =
+                toml::from_str(&format!("validated_mcp_server_grants_version = {marker}")).unwrap();
+            assert_eq!(state.validated_mcp_server_grants_version, 0);
+        }
     }
 
     #[test]
@@ -387,13 +480,139 @@ allowed_bash_commands = ["ls"]
 
     // ── Disk persistence roundtrip tests ─────────────────────────
 
+    async fn write_legacy_mcp_state(path: &std::path::Path) {
+        tokio::fs::write(
+            path,
+            r#"
+edit_policy = "reject"
+allow_bash_execute = true
+allowed_bash_commands = ["cargo test"]
+disallowed_bash_commands = ["rm"]
+allowed_web_fetch_domains = ["example.com"]
+allowed_mcp_tools = ["a__b__c"]
+allowed_mcp_servers = ["a"]
+"#,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn assert_legacy_mcp_state_migrated(state: &PermissionState) {
+        assert!(state.allowed_mcp_servers.is_empty());
+        assert!(state.allowed_mcp_tools.contains("a__b__c"));
+        assert!(state.allow_bash_execute);
+        assert!(state.allowed_bash_commands.contains("cargo test"));
+        assert!(state.disallowed_bash_commands.contains("rm"));
+        assert!(state.allowed_web_fetch_domains.contains("example.com"));
+        assert_eq!(state.edit_policy, EditPolicy::Reject);
+        assert_eq!(
+            state.validated_mcp_server_grants_version,
+            VALIDATED_MCP_SERVER_GRANTS_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_shared_mcp_server_grants_migrate_and_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = state_file_path(tmp.path(), None);
+        write_legacy_mcp_state(&path).await;
+
+        assert_legacy_mcp_state_migrated(&load_state_from_dir(tmp.path(), None).await);
+        let rewritten: PermissionState =
+            toml::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        assert_legacy_mcp_state_migrated(&rewritten);
+    }
+
+    #[tokio::test]
+    async fn failed_migration_rewrite_preserves_legacy_file_for_retry() {
+        fn fail_write(_: &std::path::Path, _: &str) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected write failure"))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = state_file_path(tmp.path(), None);
+        write_legacy_mcp_state(&path).await;
+        let legacy_contents = tokio::fs::read_to_string(&path).await.unwrap();
+
+        let in_memory = try_load_state_with_writer(&path, fail_write).await.unwrap();
+        assert_legacy_mcp_state_migrated(&in_memory);
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            legacy_contents
+        );
+        let still_legacy: PermissionState = toml::from_str(&legacy_contents).unwrap();
+        assert_eq!(still_legacy.validated_mcp_server_grants_version, 0);
+        assert!(still_legacy.allowed_mcp_servers.contains("a"));
+
+        assert_legacy_mcp_state_migrated(&try_load_state(&path).await.unwrap());
+        let rewritten: PermissionState =
+            toml::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        assert_legacy_mcp_state_migrated(&rewritten);
+    }
+
+    #[tokio::test]
+    async fn current_and_future_mcp_server_grants_are_retained_exactly() {
+        for version in [
+            VALIDATED_MCP_SERVER_GRANTS_VERSION,
+            VALIDATED_MCP_SERVER_GRANTS_VERSION + 1,
+            4_294_967_296,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = PermissionState::default();
+            state.validated_mcp_server_grants_version = version;
+            state.allowed_mcp_servers.insert("linear".to_owned());
+            persist_state_to_dir(tmp.path(), &state, None).await;
+
+            let loaded = load_state_from_dir(tmp.path(), None).await;
+            assert!(loaded.allowed_mcp_servers.contains("linear"));
+            assert_eq!(loaded.validated_mcp_server_grants_version, version);
+            let persisted: PermissionState = toml::from_str(
+                &tokio::fs::read_to_string(state_file_path(tmp.path(), None))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(persisted.validated_mcp_server_grants_version, version);
+        }
+    }
+
+    #[tokio::test]
+    async fn per_client_legacy_migration_rewrites_only_loaded_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = state_file_path(tmp.path(), None);
+        let per_client = state_file_path(tmp.path(), Some("desktop"));
+        let mut shared_state = PermissionState::default();
+        shared_state.allowed_mcp_servers.insert("shared".to_owned());
+        persist_state_to_dir(tmp.path(), &shared_state, None).await;
+        write_legacy_mcp_state(&per_client).await;
+
+        assert_legacy_mcp_state_migrated(&load_state_from_dir(tmp.path(), Some("desktop")).await);
+        let shared_after: PermissionState =
+            toml::from_str(&tokio::fs::read_to_string(shared).await.unwrap()).unwrap();
+        assert!(shared_after.allowed_mcp_servers.contains("shared"));
+        let client_after: PermissionState =
+            toml::from_str(&tokio::fs::read_to_string(per_client).await.unwrap()).unwrap();
+        assert_legacy_mcp_state_migrated(&client_after);
+    }
+
+    #[tokio::test]
+    async fn per_client_fallback_migrates_shared_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = state_file_path(tmp.path(), None);
+        write_legacy_mcp_state(&shared).await;
+
+        assert_legacy_mcp_state_migrated(
+            &load_state_from_dir(tmp.path(), Some("missing-client")).await,
+        );
+        let shared_after: PermissionState =
+            toml::from_str(&tokio::fs::read_to_string(shared).await.unwrap()).unwrap();
+        assert_legacy_mcp_state_migrated(&shared_after);
+        assert!(!state_file_path(tmp.path(), Some("missing-client")).exists());
+    }
+
     #[tokio::test]
     async fn persist_and_load_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let cwd_path = tmp.path().join("my-project");
-        std::fs::create_dir_all(&cwd_path).unwrap();
-        let _cwd = AbsPathBuf::new(cwd_path).unwrap();
-
         let mut state = PermissionState::default();
         state.allow_bash_execute = true;
         state
@@ -401,18 +620,8 @@ allowed_bash_commands = ["ls"]
             .insert("cargo build".to_string());
         state.disallowed_bash_commands.insert("rm -rf".to_string());
 
-        // Override the state dir to use our temp dir.
-        // We can't easily override grok_home(), so instead test
-        // the serialize/deserialize path directly with TOML.
-        let toml_str = toml::to_string_pretty(&state).unwrap();
-        let dir = tmp.path().join("sessions").join("test");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("permission.toml");
-        tokio::fs::write(&path, &toml_str).await.unwrap();
-
-        let content = tokio::fs::read_to_string(&path).await.unwrap();
-        let restored: PermissionState = toml::from_str(&content).unwrap();
-
+        persist_state_to_dir(tmp.path(), &state, None).await;
+        let restored = load_state_from_dir(tmp.path(), None).await;
         assert!(restored.allow_bash_execute);
         assert!(restored.allowed_bash_commands.contains("cargo build"));
         assert!(restored.disallowed_bash_commands.contains("rm -rf"));
@@ -492,11 +701,17 @@ allowed_bash_commands = ["ls"]
     async fn try_load_state_valid_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("permission.toml");
-        tokio::fs::write(&path, "allow_bash_execute = true")
+        let mut expected = PermissionState::default();
+        expected.allow_bash_execute = true;
+        tokio::fs::write(&path, toml::to_string_pretty(&expected).unwrap())
             .await
             .unwrap();
         let state = try_load_state(&path).await.unwrap();
         assert!(state.allow_bash_execute);
+        assert_eq!(
+            state.validated_mcp_server_grants_version,
+            VALIDATED_MCP_SERVER_GRANTS_VERSION
+        );
     }
 
     #[tokio::test]

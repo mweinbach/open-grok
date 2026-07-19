@@ -211,11 +211,17 @@ impl<'de> Deserialize<'de> for EditPolicy {
         deserializer.deserialize_str(V)
     }
 }
+#[derive(Debug, Clone)]
+pub struct EditPathContext {
+    pub real_cwd: std::path::PathBuf,
+    pub display_cwd: Option<std::path::PathBuf>,
+}
 #[allow(clippy::large_enum_variant)]
 pub enum PermissionCommand {
     Request {
         access: AccessKind,
         tool_call_update: acp::ToolCallUpdate,
+        edit_path_context: Option<EditPathContext>,
         respond_to: oneshot::Sender<Decision>,
         /// Session ID originating this request. Used to attribute
         /// permission events to child subagents.

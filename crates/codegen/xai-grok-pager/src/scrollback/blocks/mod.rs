@@ -23,7 +23,7 @@ pub use bg_task::{BgTaskBlock, BgTaskKind};
 pub use btw::BtwBlock;
 pub use context_info::ContextInfoBlock;
 pub use credit_limit::{CreditLimitBlock, CreditLimitCardAction};
-pub use session_event::{EndWork, SessionEvent, SessionEventBlock};
+pub use session_event::{SessionEvent, SessionEventBlock};
 pub use subagent::{SubagentBlock, SubagentBlockKind};
 pub use swarm::{SwarmBlock, SwarmMemberStatus};
 pub use system::SystemMessageBlock;

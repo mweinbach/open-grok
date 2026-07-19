@@ -84,10 +84,7 @@ struct BundleFile<'a> {
 }
 
 pub fn bundled_root() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".opengrok")
-        .join(BUNDLED_DIR_NAME)
+    xai_grok_config::grok_home().join(BUNDLED_DIR_NAME)
 }
 
 pub fn read_cached_manifest(root: &Path) -> Result<Option<BundleManifest>> {

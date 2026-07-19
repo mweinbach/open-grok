@@ -216,7 +216,15 @@ impl SessionActor {
         self.cancel_running_task(false, false, false, Some("send_now".to_string()))
             .await;
         // Re-enable notification drains: unlike Ctrl+C, a send-now means the user is re-engaged.
+        if let Some(gate) = &self.tool_context.task_wake_suppressed {
+            gate.set(false);
+        }
         self.state.lock().await.notifications_suppressed = false;
+        xai_grok_telemetry::unified_log::info(
+            "shell.task_wake.gate_cleared",
+            Some(self.session_info.id.0.as_ref()),
+            Some(serde_json::json!({ "reason": "send_now" })),
+        );
     }
 
     pub(super) async fn cancel_running_task(
@@ -226,6 +234,32 @@ impl SessionActor {
         rewind_if_pristine: bool,
         trigger: Option<String>,
     ) {
+        let suppress_task_wakes = trigger.as_deref() == Some("ctrl_c");
+        if suppress_task_wakes {
+            if let Some(gate) = &self.tool_context.task_wake_suppressed {
+                gate.set(true);
+            }
+            let mut state = self.state.try_lock().expect("session state is actor-owned");
+            state.notifications_suppressed = true;
+            xai_grok_telemetry::unified_log::info(
+                "shell.task_wake.cancel_barrier",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({
+                    "ctrl_c": true,
+                    "gate": self
+                        .tool_context
+                        .task_wake_suppressed
+                        .as_ref()
+                        .is_some_and(|gate| gate.get()),
+                    "state": state.notifications_suppressed,
+                })),
+            );
+            drop(state);
+            if let Some(is_turn_active) = &self.tool_context.is_turn_active {
+                is_turn_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         // Unified-log processing marker (counterpart of `shell.cancel.received`
         // in `MvpAgent::cancel`): records which prompt the cancel lands on so
         // a stuck "Cancelling…" can be attributed to delivery vs. processing.
@@ -319,8 +353,8 @@ impl SessionActor {
             // Closes the race between abort() and TurnActiveGuard drop:
             // is_turn_active may still be true, causing InjectNotification
             // to route Next-priority events to the buffer instead of
-            // pending_notifications. Moving them here ensures they survive
-            // in the notification queue (suppressed until next user prompt).
+            // pending_notifications. Moving them here ensures they survive in
+            // the queue; Ctrl+C defers their drain, while other cancels do not.
             self.sweep_monitor_buffer_into_pending(&mut state, "monitor-cancel-drain");
 
             // When killing all background tasks, also clear their pending
@@ -333,7 +367,15 @@ impl SessionActor {
                 if let Some(task) = state.running_task.take() {
                     task.abort();
                 }
+                if let Some(gate) = &self.tool_context.task_wake_suppressed {
+                    gate.set(false);
+                }
                 state.notifications_suppressed = false;
+                xai_grok_telemetry::unified_log::info(
+                    "shell.task_wake.gate_cleared",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({ "reason": "rewind" })),
+                );
                 state.rewindable = false;
                 state.pending_inputs.pop_front()
             } else {
@@ -342,9 +384,7 @@ impl SessionActor {
             let running_task = if rewound_input.is_some() {
                 None
             } else {
-                let running_task = state.running_task.take();
-                state.notifications_suppressed = true;
-                running_task
+                state.running_task.take()
             };
 
             // Decide which queued inputs get resolved with `Cancelled` now vs.
@@ -355,10 +395,10 @@ impl SessionActor {
             //   path that sends `Shutdown` next): drain the WHOLE queue — there
             //   is no point starting the next prompt and draining resolves every
             //   queued input's `respond_to` cleanly.
-            // * normal interactive cancel: remove ONLY the running turn,
-            //   PRESERVING every queued prompt so the `Cancel` handler's
-            //   follow-up `maybe_start_running_task` promotes the new front (the
-            //   user's next queued prompt) and rebroadcasts `x.ai/queue/changed`.
+            // * normal cancel: remove the running turn; only Ctrl+C also removes
+            //   queued terminal task-completion wakes. Preserve real user prompts
+            //   and unrelated synthetic entries so `maybe_start_running_task` can
+            //   promote the next genuine user turn.
             //   The cancelling client does not pull any prompt back into its
             //   input — the server queue is the single source of truth for what
             //   runs next. Previously every cancel did `std::mem::take`,
@@ -391,6 +431,13 @@ impl SessionActor {
                     let is_running_turn = idx == 0;
                     if is_running_turn {
                         cancelled.push_back(item);
+                    } else if suppress_task_wakes
+                        && matches!(&item.origin, super::PromptOrigin::TaskCompleted { .. })
+                    {
+                        if let Some(fallback) = item.task_wake_fallback {
+                            Self::push_task_wake_fallback(&mut state, fallback);
+                        }
+                        Self::respond_removed_prompt(item.respond_to);
                     } else {
                         kept.push_back(item);
                     }
@@ -490,6 +537,9 @@ impl SessionActor {
         if let Some(running_task) = running_task {
             running_task.abort();
         }
+        if let Some(is_turn_active) = &self.tool_context.is_turn_active {
+            is_turn_active.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         // The aborted turn's `BlockingWaitGuard`s drop asynchronously (they
         // live in tool futures owned by the drainer task / subagent spawn
         // task). Until they do, `queue_input` would read a stale depth > 0 and
@@ -565,19 +615,14 @@ impl SessionActor {
             return;
         }
 
-        // Un-mark cancelled synthetic IDs so TaskCompletionReminder can
-        // report them on the next pass instead of permanently suppressing them.
-        if let Some(ref auto_wake) = self.tool_context.auto_wake_delivered {
-            for input in pending_inputs.iter() {
-                if let Some(id) = input.origin.completion_id() {
-                    auto_wake.remove(id);
-                }
-            }
-        }
-
         for (idx, input) in pending_inputs.into_iter().enumerate() {
             // Running turn is idx 0; queued prompts never spent tokens.
             let is_running_turn = idx == 0;
+            if let Some(task_id) = input.origin.completion_id()
+                && let Some(reservations) = &self.tool_context.task_completion_reservations
+            {
+                reservations.release(task_id);
+            }
             let _ = input
                 .respond_to
                 .send(Ok(PromptTurnOk {

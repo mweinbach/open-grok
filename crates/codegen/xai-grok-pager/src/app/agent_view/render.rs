@@ -1054,30 +1054,17 @@ impl AgentView {
         }
         let queue_height = self.queue.desired_height();
         let drain_blocked = self.drain_blocked();
-        let watchers = turn_status::Watchers {
-            monitors: self
-                .session
-                .bg_tasks
-                .values()
-                .filter(|t| t.is_monitor && t.status == crate::app::agent::BgTaskStatus::Running)
-                .count(),
-            loops: self.session.scheduled_tasks.len(),
-            subagents: self
-                .subagent_sessions
-                .values()
-                .filter(|s| s.is_running())
-                .count(),
-        };
+        let watchers = self.watchers();
         let parked = self.renders_parked();
-        let turn_status_height = if !parked
-            && turn_status::should_show(
-                &self.session.state,
-                drain_blocked,
-                self.mcp_init_progress
-                    .as_ref()
-                    .filter(|_| !self.session.loading_replay),
-                watchers,
-            ) {
+        let turn_status_height = if turn_status::should_show(
+            &self.session.state,
+            drain_blocked,
+            self.mcp_init_progress
+                .as_ref()
+                .filter(|_| !self.session.loading_replay),
+            watchers,
+            parked,
+        ) {
             1
         } else {
             0
@@ -1541,26 +1528,47 @@ impl AgentView {
                     );
                 }
                 let query = search.query();
-                crate::views::picker::render_search_bar(
-                    buf,
-                    layout.scrollback.x,
-                    bar_y,
-                    layout.scrollback.width,
-                    &theme,
-                    query,
-                    search.is_composing(),
-                    !search.is_composing(),
-                    query.len(),
-                    None,
-                );
                 let counter = match search.current_index() {
                     Some(i) => Some(format!("{}/{}", i + 1, search.match_count())),
                     None if search.has_error() => Some("bad pattern".to_string()),
                     None if !query.is_empty() => Some("no matches".to_string()),
                     None => None,
                 };
-                if let Some(counter) = counter {
-                    let w = counter.len() as u16;
+                let counter_width = counter
+                    .as_deref()
+                    .map_or(0, |text| UnicodeWidthStr::width(text) as u16);
+                let search_layout =
+                    crate::views::picker::search_bar_layout(layout.scrollback.width, counter_width);
+                let leading_query;
+                let (rendered_query, viewport) = if search.is_composing() {
+                    (
+                        query,
+                        Some(search.query_viewport(search_layout.input_width())),
+                    )
+                } else {
+                    leading_query =
+                        crate::render::line_utils::truncate_str(query, search_layout.input_width());
+                    (leading_query.as_str(), None)
+                };
+                crate::views::picker::render_search_bar_with_viewport(
+                    buf,
+                    layout.scrollback.x,
+                    bar_y,
+                    search_layout,
+                    &theme,
+                    rendered_query,
+                    search.is_composing(),
+                    !search.is_composing(),
+                    None,
+                    viewport.unwrap_or(xai_ratatui_textarea::SingleLineViewport {
+                        visible_byte_range: 0..rendered_query.len(),
+                        cursor_display_column: 0,
+                    }),
+                );
+                if let Some(counter) = counter
+                    && search_layout.trailing_width() > 0
+                {
+                    let w = UnicodeWidthStr::width(counter.as_str()) as u16;
                     if layout.scrollback.width > w {
                         buf.set_string(
                             layout.scrollback.x + layout.scrollback.width - w,
@@ -2002,6 +2010,7 @@ impl AgentView {
                     is_pending_user_input,
                     goal_verifying,
                     watchers,
+                    parked,
                     false,
                     held_queue,
                     held_queue_top_sendable,

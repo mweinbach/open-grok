@@ -412,15 +412,20 @@ async fn run_browser_auth_flow(
     tokio::select! {
         result = callback_rx => {
             callback_server.abort();
-            let (code, csrf_state) = result
+            let callback = result
                 .map_err(|_| "Callback channel dropped".to_string())?
                 .map_err(|e| format!("OAuth callback failed: {e}"))?;
 
             // 6. Exchange code for tokens (auto-persists via CredentialStore).
+            // Pass RFC 9207 `iss` when present (required if the AS advertises it).
             let mgr = auth_manager.lock().await;
-            mgr.exchange_code_for_token(&code, &csrf_state)
-                .await
-                .map_err(|e| format!("Token exchange failed: {e}"))?;
+            mgr.exchange_code_for_token_with_issuer(
+                &callback.code,
+                &callback.state,
+                callback.issuer.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("Token exchange failed: {e}"))?;
 
             tracing::info!(server = server_name, "MCP OAuth authentication successful");
         }
@@ -444,22 +449,54 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Start a loopback HTTP server for the OAuth callback.
-///
-/// Returns the server task handle (for cleanup) and a oneshot receiver
-/// that resolves with `(code, state)` when the callback arrives.
-///
-/// The caller is responsible for aborting the server handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OAuthCallbackPayload {
+    code: String,
+    state: String,
+    /// RFC 9207 `iss` (optional; required when the AS advertises support).
+    issuer: Option<String>,
+}
+
+fn parse_oauth_callback_params(
+    params: &HashMap<String, String>,
+) -> Result<OAuthCallbackPayload, String> {
+    if let Some(error) = params.get("error") {
+        let desc = params
+            .get("error_description")
+            .cloned()
+            .unwrap_or_else(|| "Unknown error".to_string());
+        return Err(format!("OAuth error: {error} - {desc}"));
+    }
+    let code = params
+        .get("code")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .ok_or_else(|| "Missing authorization code".to_string())?;
+    let state = params
+        .get("state")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .ok_or_else(|| "Missing state parameter".to_string())?;
+    let issuer = params.get("iss").cloned();
+    Ok(OAuthCallbackPayload {
+        code,
+        state,
+        issuer,
+    })
+}
+
+/// Loopback OAuth callback server. Returns (server task, oneshot for payload).
+/// Caller must abort the server task.
 #[allow(clippy::type_complexity)]
 fn start_oauth_callback_server(
     listener: tokio::net::TcpListener,
 ) -> (
     tokio::task::JoinHandle<()>,
-    oneshot::Receiver<Result<(String, String), String>>,
+    oneshot::Receiver<Result<OAuthCallbackPayload, String>>,
 ) {
     use axum::{Router, extract::Query, response::Html, routing::get};
 
-    let (tx, rx) = oneshot::channel::<Result<(String, String), String>>();
+    let (tx, rx) = oneshot::channel::<Result<OAuthCallbackPayload, String>>();
     let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
 
     let handler = {
@@ -467,19 +504,7 @@ fn start_oauth_callback_server(
         move |Query(params): Query<HashMap<String, String>>| {
             let tx = tx.clone();
             async move {
-                let result = if let Some(error) = params.get("error") {
-                    let desc = params
-                        .get("error_description")
-                        .cloned()
-                        .unwrap_or_else(|| "Unknown error".to_string());
-                    Err(format!("OAuth error: {error} - {desc}"))
-                } else {
-                    match (params.get("code"), params.get("state")) {
-                        (Some(code), Some(state)) => Ok((code.clone(), state.clone())),
-                        (None, _) => Err("Missing authorization code".to_string()),
-                        (_, None) => Err("Missing state parameter".to_string()),
-                    }
-                };
+                let result = parse_oauth_callback_params(&params);
 
                 let html = match &result {
                     Ok(_) => {
@@ -519,4 +544,165 @@ fn start_oauth_callback_server(
     });
 
     (server, rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rmcp::transport::auth::{
+        AuthorizationManager, AuthorizationMetadata, OAuthClientConfig,
+    };
+
+    const TEST_ISSUER: &str = "https://auth.example.com";
+
+    fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn callback_parses_code_state_and_rfc9207_iss() {
+        let p = params(&[
+            ("code", "auth-code"),
+            ("state", "csrf"),
+            ("iss", TEST_ISSUER),
+        ]);
+        let got = parse_oauth_callback_params(&p).unwrap();
+        assert_eq!(got.code, "auth-code");
+        assert_eq!(got.state, "csrf");
+        assert_eq!(got.issuer.as_deref(), Some(TEST_ISSUER));
+    }
+
+    #[test]
+    fn callback_issuer_optional_for_legacy_servers() {
+        let p = params(&[("code", "c"), ("state", "s")]);
+        let got = parse_oauth_callback_params(&p).unwrap();
+        assert!(got.issuer.is_none());
+    }
+
+    #[test]
+    fn callback_requires_code_and_state() {
+        assert!(parse_oauth_callback_params(&params(&[("state", "s")])).is_err());
+        assert!(parse_oauth_callback_params(&params(&[("code", "c")])).is_err());
+    }
+
+    #[test]
+    fn callback_surfaces_oauth_error() {
+        let p = params(&[
+            ("error", "access_denied"),
+            ("error_description", "user said no"),
+        ]);
+        let err = parse_oauth_callback_params(&p).unwrap_err();
+        assert!(err.contains("access_denied"));
+        assert!(err.contains("user said no"));
+    }
+
+    fn require_iss_metadata(token_endpoint: String) -> AuthorizationMetadata {
+        // non_exhaustive: build via Default.
+        let mut meta = AuthorizationMetadata::default();
+        meta.authorization_endpoint = "https://auth.example.com/authorize".to_string();
+        meta.token_endpoint = token_endpoint;
+        meta.issuer = Some(TEST_ISSUER.to_string());
+        meta.additional_fields.insert(
+            "authorization_response_iss_parameter_supported".to_string(),
+            serde_json::json!(true),
+        );
+        meta
+    }
+
+    async fn manager_ready_for_exchange(token_endpoint: String) -> (AuthorizationManager, String) {
+        let mut mgr = AuthorizationManager::new("http://localhost/mcp")
+            .await
+            .unwrap();
+        mgr.set_metadata(require_iss_metadata(token_endpoint));
+        mgr.configure_client(
+            OAuthClientConfig::new("grok-test-client", "http://127.0.0.1:0/callback")
+                .with_application_type("native"),
+        )
+        .unwrap();
+        let auth_url = mgr.get_authorization_url(&[]).await.unwrap();
+        let state = url::Url::parse(&auth_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .expect("auth URL must include state")
+            .1
+            .into_owned();
+        (mgr, state)
+    }
+
+    async fn start_mock_token_endpoint() -> String {
+        use axum::{Router, body::Body, http::Response, routing::post};
+        let app = Router::new().route(
+            "/token",
+            post(|| async {
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"access_token":"at-ok","token_type":"Bearer","expires_in":3600,"refresh_token":"rt-ok"}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/token")
+    }
+
+    #[tokio::test]
+    async fn after_fix_passes_iss_and_token_exchange_succeeds() {
+        let token_ep = start_mock_token_endpoint().await;
+        let (mgr, state) = manager_ready_for_exchange(token_ep).await;
+
+        let callback = parse_oauth_callback_params(&params(&[
+            ("code", "auth-code"),
+            ("state", &state),
+            ("iss", TEST_ISSUER),
+        ]))
+        .unwrap();
+
+        let token = mgr
+            .exchange_code_for_token_with_issuer(
+                &callback.code,
+                &callback.state,
+                callback.issuer.as_deref(),
+            )
+            .await
+            .expect("with_issuer must succeed when callback iss matches AS");
+
+        use oauth2::TokenResponse as _;
+        assert_eq!(token.access_token().secret(), "at-ok");
+    }
+
+    #[tokio::test]
+    async fn callback_http_server_forwards_iss_query_param() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, rx) = start_oauth_callback_server(listener);
+
+        let url = format!(
+            "http://{addr}/callback?code=c1&state=s1&iss={}",
+            urlencoding_encode(TEST_ISSUER)
+        );
+        let resp = reqwest::get(&url).await.unwrap();
+        assert!(resp.status().is_success());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Authorization Complete"));
+
+        let payload = rx.await.unwrap().unwrap();
+        assert_eq!(payload.code, "c1");
+        assert_eq!(payload.state, "s1");
+        assert_eq!(payload.issuer.as_deref(), Some(TEST_ISSUER));
+        server.abort();
+    }
+
+    fn urlencoding_encode(s: &str) -> String {
+        s.replace(':', "%3A").replace('/', "%2F")
+    }
 }

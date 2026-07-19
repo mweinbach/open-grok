@@ -84,7 +84,7 @@ Anchors are valid only for the file state at read time — after any edit,
 use the fresh anchors returned by ${{ tools.by_kind.edit }} or re-read the file.${%- endif %}
 
 Usage:
-- The file_path parameter must be an absolute path, not a relative path
+- The ${{ params.read.target_file }} parameter must be an absolute path, not a relative path
 - By default reads up to {max_lines_read} lines from the beginning
 - Optionally specify offset and limit for large files
 - Can read images (PNG, JPG, etc.) and PDF files (each page rendered as an image; use `pages` parameter for PDFs with more than 10 pages, max 20 per call)

@@ -172,7 +172,7 @@ fn resume_body_rows(agent: &AgentView, width: u16) -> u16 {
     let entries_data = entries.as_deref().unwrap_or(&[]);
     let content_width = width.saturating_sub(2);
     let filtered =
-        minimal_api::filter_session_entries(entries.as_deref(), &state.query, *source_filter);
+        minimal_api::filter_session_entries(entries.as_deref(), state.query(), *source_filter);
     let built =
         minimal_api::build_session_entry_data(entries_data, &filtered, state, content_width);
     let fields_vecs: Vec<Vec<PickerField>> = built
@@ -217,7 +217,7 @@ fn render_resume(
     let entries_data = entries.as_deref().unwrap_or(&[]);
     let content_width = area.width.saturating_sub(2);
     let filtered =
-        minimal_api::filter_session_entries(entries.as_deref(), &state.query, *source_filter);
+        minimal_api::filter_session_entries(entries.as_deref(), state.query(), *source_filter);
     let built =
         minimal_api::build_session_entry_data(entries_data, &filtered, state, content_width);
     let fields_vecs: Vec<Vec<PickerField>> = built
@@ -241,16 +241,17 @@ fn render_resume(
 
     render_title(buf, title_row, theme, "Resume session");
     // Focus-aware search bar (cursor only when search is focused).
-    picker::render_search_bar(
+    minimal_api::render_picker_search_bar(
         buf,
-        search_row.x + 1,
-        search_row.y,
-        search_row.width.saturating_sub(1),
+        Rect::new(
+            search_row.x + 1,
+            search_row.y,
+            search_row.width.saturating_sub(1),
+            1,
+        ),
         theme,
-        &state.query,
-        state.search_active,
+        state,
         true,
-        state.query_cursor,
         None,
     );
     render_divider(buf, divider_row, theme);
@@ -293,7 +294,7 @@ fn mcps_body_rows(agent: &AgentView) -> u16 {
     };
     let rows = minimal_api::build_mcp_picker_rows(
         servers,
-        &s.picker_state.query,
+        s.picker_state.query(),
         s.mcps_filter,
         &s.mcps_collapsed_sections,
         &s.mcps_tools_expanded,
@@ -324,14 +325,14 @@ fn render_mcps(
     let loading;
     {
         let s = minimal_api::extensions_modal(agent)?;
-        let searching = !s.picker_state.query.is_empty();
+        let searching = !s.picker_state.query().is_empty();
         loading = matches!(s.mcps_data, TabDataState::Loading);
         match &s.mcps_data {
             TabDataState::Loaded(servers) => {
                 let (row_labels, row_group_keys, row_data_indices) =
                     minimal_api::build_mcp_picker_rows(
                         servers,
-                        &s.picker_state.query,
+                        s.picker_state.query(),
                         s.mcps_filter,
                         &s.mcps_collapsed_sections,
                         &s.mcps_tools_expanded,
@@ -674,6 +675,52 @@ mod tests {
         assert!(
             !text.contains("r refresh"),
             "resume footer must stay session-picker copy:\n{text}"
+        );
+    }
+
+    #[test]
+    fn resume_search_uses_picker_grapheme_viewport_at_narrow_width() {
+        let grapheme = "👩🏽\u{200d}💻";
+        let combining = "e\u{301}";
+        let mut agent = with_resume(vec![session_entry("match")]);
+        let Some(ActiveModal::SessionPicker { state, .. }) = &mut agent.active_modal else {
+            panic!("expected session picker");
+        };
+        state.set_query(format!("a{grapheme}{combining}"));
+        state.search_active = true;
+
+        let theme = Theme::current();
+        let area = Rect::new(0, 0, 14, 5);
+        let mut actual = Buffer::empty(area);
+        render(&mut actual, area, &mut agent, ListPanel::Resume, &theme);
+
+        let Some(ActiveModal::SessionPicker { state, .. }) = &agent.active_modal else {
+            panic!("expected session picker");
+        };
+        let mut expected = Buffer::empty(area);
+        minimal_api::render_picker_search_bar(
+            &mut expected,
+            Rect::new(1, 1, 13, 1),
+            &theme,
+            state,
+            true,
+            None,
+        );
+        for x in 1..14 {
+            let actual_cell = actual.cell((x, 1)).expect("actual search cell");
+            let expected_cell = expected.cell((x, 1)).expect("expected search cell");
+            assert_eq!(actual_cell.symbol(), expected_cell.symbol(), "column {x}");
+            assert_eq!(actual_cell.style(), expected_cell.style(), "column {x}");
+        }
+        let text = buffer_text(&actual);
+        assert!(text.contains(grapheme), "ZWJ grapheme was split: {text:?}");
+        assert!(
+            text.contains(combining),
+            "combining grapheme was split: {text:?}"
+        );
+        assert_eq!(
+            actual.cell((13, 1)).expect("cursor cell").bg,
+            theme.text_primary
         );
     }
 

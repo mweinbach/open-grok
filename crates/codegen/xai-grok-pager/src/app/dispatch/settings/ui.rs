@@ -8,12 +8,13 @@ use super::setters::{
     set_display_refresh_auto_cadence_inner, set_fork_secondary_model_inner,
     set_group_tool_verbs_inner, set_hunk_tracker_mode_inner, set_invert_scroll_inner,
     set_keep_text_selection_inner, set_max_thoughts_width_inner, set_memory_model_inner,
-    set_multiline_mode, set_prompt_suggestions_inner, set_recap_model_inner,
-    set_remember_tool_approvals_inner, set_render_mermaid_inner, set_respect_manual_folds_inner,
-    set_screen_mode_inner, set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
-    set_show_thinking_blocks_inner, set_show_tips_inner, set_simple_mode_inner, set_theme_inner,
-    set_timeline_inner, set_timestamps, set_timestamps_inner, set_vim_mode_inner,
-    set_voice_capture_mode_inner, set_voice_stt_language_inner,
+    set_multiline_mode, set_page_flip_on_send_inner, set_prompt_suggestions_inner,
+    set_recap_model_inner, set_remember_tool_approvals_inner, set_render_mermaid_inner,
+    set_respect_manual_folds_inner, set_screen_mode_inner, set_scroll_lines_inner,
+    set_scroll_mode_inner, set_scroll_speed_inner, set_show_thinking_blocks_inner,
+    set_show_tips_inner, set_simple_mode_inner, set_theme_inner, set_timeline_inner,
+    set_timestamps, set_timestamps_inner, set_vim_mode_inner, set_voice_capture_mode_inner,
+    set_voice_stt_language_inner,
 };
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
@@ -832,6 +833,7 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("compact_mode", SettingValue::Bool(b)) => Some(Action::SetCompactMode(*b)),
         ("show_timestamps", SettingValue::Bool(b)) => Some(Action::SetTimestamps(*b)),
         ("show_timeline", SettingValue::Bool(b)) => Some(Action::SetTimeline(*b)),
+        ("page_flip_on_send", SettingValue::Bool(b)) => Some(Action::SetPageFlipOnSend(*b)),
         ("simple_mode", SettingValue::Bool(b)) => Some(Action::SetSimpleMode(*b)),
         ("swarm_mode", SettingValue::Bool(b)) => Some(Action::SetSwarmMode {
             enabled: *b,
@@ -959,7 +961,7 @@ pub(in crate::app::dispatch) fn action_for_reset(
         // max_thoughts_width: direct round-trip.
         ("max_thoughts_width", SettingValue::Int(i)) => Some(Action::SetMaxThoughtsWidth(*i)),
         // coding_data_sharing: "opt-in" / "opt-out" → bool.
-        // "opt-out" arm is a skew guard (default is "opt-in").
+        // Both arms needed (registry default is "opt-out").
         ("coding_data_sharing", SettingValue::Enum("opt-in")) => {
             Some(Action::SetCodingDataSharing { opted_in: true })
         }
@@ -1075,6 +1077,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("compact_mode", SettingValue::Bool(b)) => set_compact_mode_inner(app, *b),
         ("show_timestamps", SettingValue::Bool(b)) => set_timestamps_inner(app, *b),
         ("show_timeline", SettingValue::Bool(b)) => set_timeline_inner(app, *b),
+        ("page_flip_on_send", SettingValue::Bool(b)) => set_page_flip_on_send_inner(app, *b),
         ("simple_mode", SettingValue::Bool(b)) => set_simple_mode_inner(app, *b),
         ("contextual_hints.undo", SettingValue::Bool(b)) => {
             set_contextual_hint_inner(app, |h, v| h.undo = v, *b)

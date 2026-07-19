@@ -294,8 +294,8 @@ impl SessionActor {
     /// Mark completion IDs as reported in the shared
     /// `ReportedTaskCompletions` state so the per-tool-call
     /// `TaskCompletionReminder` won't (re-)surface them. Used both to dedupe
-    /// completions the model already saw (notification-drain / auto-wake
-    /// prompts) and to drop them during the goal loop (between-turn drain).
+    /// completions the model actually saw (notification-drain / started
+    /// auto-wake prompts) and to drop them during the goal loop (between-turn drain).
     /// No-op on an empty list.
     pub(super) async fn mark_completions_reported(&self, ids: &[&str]) {
         if ids.is_empty() {
@@ -328,7 +328,13 @@ impl SessionActor {
     pub(super) async fn drain_between_turn_completions(&self) {
         let goal_loop_active = self.goal_loop_active();
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let bash_completions = bridge.drain_between_turn_bash_completions().await;
+        let reserved = self
+            .tool_context
+            .task_completion_reservations
+            .as_ref()
+            .map(|reservations| reservations.snapshot())
+            .unwrap_or_default();
+        let bash_completions = bridge.drain_between_turn_bash_completions(&reserved).await;
         if !bash_completions.is_empty() {
             let ids: Vec<&str> = bash_completions
                 .iter()
@@ -369,9 +375,9 @@ impl SessionActor {
         };
         let suppress_ids = self
             .tool_context
-            .auto_wake_delivered
+            .task_completion_reservations
             .as_ref()
-            .map(|a| a.snapshot())
+            .map(|reservations| reservations.snapshot())
             .unwrap_or_default();
         let (respond_to, rx) = tokio::sync::oneshot::channel();
         if tx

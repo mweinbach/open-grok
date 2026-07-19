@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
@@ -26,6 +27,21 @@ use super::app_view::{
     VoiceState,
 };
 use super::{PagerArgs, PagerTerminal, acp_handler, dispatch, effects};
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct TimedInputEvent {
+    pub(super) event: Event,
+    pub(super) arrived_at: std::time::Instant,
+}
+
+impl TimedInputEvent {
+    fn now(event: Event) -> Self {
+        Self {
+            event,
+            arrived_at: std::time::Instant::now(),
+        }
+    }
+}
 
 /// Values resolved before `init_terminal` and consumed by the event loop.
 ///
@@ -179,6 +195,15 @@ struct ReconnectLoadPlan {
     meta: serde_json::Value,
 }
 
+fn restore_dashboard_peek_before_reload(
+    dashboard: &mut Option<crate::views::dashboard::DashboardState>,
+    agents: &mut indexmap::IndexMap<super::agent::AgentId, super::agent_view::AgentView>,
+) {
+    if let Some(dashboard) = dashboard.as_mut() {
+        dashboard.restore_peek_viewport(agents);
+    }
+}
+
 fn plan_reconnect_load(
     agent: &super::agent_view::AgentView,
     fallback_cwd: &std::path::Path,
@@ -281,59 +306,63 @@ fn seed_trust_state(
     };
 }
 
-/// Suspend the inline TUI, run a blocking child that takes over the tty
-/// (`$EDITOR`, `$PAGER`, …), then restore. Shared by the editor and transcript
-/// suspend paths so the subtle reader-park + raw-mode + alt-screen handoff lives
-/// in one place.
-///
-/// The reader thread is parked first so the child (which inherits this tty)
-/// keeps every keystroke instead of racing the reader; on return, buffered
-/// terminal query replies and any pre-park keystroke are drained before the
-/// reader resumes.
-///
-/// The frame **writer** thread is then drained (bounded) before the child
-/// starts: frames are written to the tty asynchronously, and the frame that
-/// armed this suspend (e.g. minimal's final `/transcript` pump slice) is
-/// typically queued microseconds before we get here. Un-drained, those bytes
-/// race the child's own output — they can land on the child's alternate
-/// screen (so the main screen never receives them; on an inline viewport a
-/// commit's scroll then leaves every following row off by its height) or tear
-/// around the alt-screen switch, printing escape fragments (`[`…) that the
-/// renderer's diff can't see and thus never repairs.
-///
-/// In minimal mode the physical cursor is probed (`ESC[6n`) right before the
-/// child runs and right after it exits — while the reader thread is still
-/// parked, so the replies can't be stolen. The returned "cursor after the
-/// child, iff it moved" tells the caller whether the child *printed to the
-/// main screen* (cat-style pager: cursor left below its output) or *restored
-/// it* (less-style alt-screen pager: `rmcup` puts the cursor back exactly
-/// where it was): the caller re-anchors the live region below the new output
-/// in the first case and repaints in place in the second.
-fn suspend_for_child(
-    screen_mode: crate::app::ScreenMode,
-    writer_sync: &crate::render::draw::WriterSync,
+/// Pause terminal input and wait up to `timeout` for the reader to acknowledge.
+/// Returns with the pause still asserted; the handoff owner resumes the reader.
+fn park_input_reader(
     input_paused: &std::sync::atomic::AtomicBool,
     reader_parked: &std::sync::atomic::AtomicBool,
-    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
-    run_child: impl FnOnce(),
-) -> Option<(u16, u16)> {
+    timeout: Duration,
+) -> bool {
     use std::sync::atomic::Ordering;
-    // Pause the reader thread, then wait for a FRESH park (reader provably out of
-    // crossterm) so the main thread is the sole poll/read caller; bounded so a
-    // dead reader can't hang us.
-    input_paused.store(true, Ordering::Release);
+    // Storing `reader_parked = false` before `input_paused = true` is
+    // intentionally ordered to prevent accepting a stale parked acknowledgement.
     reader_parked.store(false, Ordering::Release);
-    let park_deadline = std::time::Instant::now() + Duration::from_millis(500);
-    while !reader_parked.load(Ordering::Acquire) && std::time::Instant::now() < park_deadline {
+    input_paused.store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + timeout;
+    while !reader_parked.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Every queued frame must be ON the tty before the child takes it (and, in
-    // fullscreen, before LeaveAlternateScreen below — mirroring teardown's
-    // "no late frame after LeaveAlternateScreen" drain). Bounded like the
-    // reader park so a wedged pty can't hang the suspend.
-    if !writer_sync.wait_drained(Duration::from_millis(750)) {
-        tracing::warn!("suspend: frame writer not drained within 750ms; proceeding");
+    reader_parked.load(Ordering::Acquire)
+}
+
+/// Suspend the TUI, let a blocking child own the tty, then restore it.
+///
+/// Input is parked before the asynchronous frame writer is drained with a
+/// bounded wait, so neither the reader nor a queued frame can race the child.
+/// A park or drain timeout returns without starting the child; the caller keeps
+/// the request pending and retries it later.
+fn suspend_for_child(
+    screen_mode: crate::app::ScreenMode,
+    terminal: &mut PagerTerminal,
+    input_paused: &std::sync::atomic::AtomicBool,
+    reader_parked: &std::sync::atomic::AtomicBool,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimedInputEvent>,
+    run_child: impl FnOnce(),
+) -> std::io::Result<Option<(u16, u16)>> {
+    use std::sync::atomic::Ordering;
+    if !park_input_reader(input_paused, reader_parked, Duration::from_millis(500)) {
+        input_paused.store(false, Ordering::Release);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "terminal input reader did not park before suspend",
+        ));
     }
+    let writer_sync = terminal.backend_mut().writer_mut().writer_sync().clone();
+    match writer_sync.wait_drained(Duration::from_millis(750)) {
+        Ok(crate::render::draw::WriterDrain::Drained) => {}
+        Ok(crate::render::draw::WriterDrain::TimedOut) => {
+            input_paused.store(false, Ordering::Release);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "terminal writer did not drain before suspend",
+            ));
+        }
+        Err(error) => {
+            input_paused.store(false, Ordering::Release);
+            return Err(error);
+        }
+    }
+
     // Pre-child cursor probe (minimal only — minimal's startup already proved
     // this terminal answers CPR). Reader is parked, so the reply is ours.
     let pre_cursor = screen_mode
@@ -359,37 +388,211 @@ fn suspend_for_child(
         let _ = crossterm::event::read();
     }
     // Post-child cursor probe: `Some` iff the child left the cursor somewhere
-    // other than where it found it (see the doc comment).
+    // other than where it found it; restore_after_child uses that to re-anchor
+    // minimal mode after main-screen output.
     let moved_cursor = pre_cursor.and_then(|pre| {
         let post = crossterm::cursor::position().ok()?;
         (post != pre).then_some(post)
     });
-    // Discard any keystroke the reader read during the brief pre-park window: it
-    // lands in the channel, not the tty.
+    // Only the pre-park race can reach this channel; later input stays in the tty.
     while input_rx.try_recv().is_ok() {}
     input_paused.store(false, Ordering::Release);
-    moved_cursor
+    Ok(moved_cursor)
 }
 
-/// Restore the inline/minimal live region after a tty-taking child exited.
+/// Coalesces draw requests, gates in-flight frames, and owns draw cadence.
+#[derive(Debug)]
+struct Presenter {
+    dirty: bool,
+    force_full_repaint: bool,
+    in_flight_target: Option<u64>,
+    last_draw_at: Instant,
+    draw_scheduled_at: Option<Instant>,
+}
+
+impl Presenter {
+    fn new() -> Self {
+        Self {
+            dirty: false,
+            force_full_repaint: false,
+            in_flight_target: None,
+            last_draw_at: Instant::now(),
+            draw_scheduled_at: None,
+        }
+    }
+
+    fn acknowledge(&mut self, sequence: u64) {
+        if self
+            .in_flight_target
+            .is_some_and(|target| sequence >= target)
+        {
+            self.in_flight_target = None;
+        }
+    }
+
+    fn try_present(
+        &mut self,
+        queued_before: u64,
+        draw: impl FnOnce(bool),
+        queued_after: impl FnOnce() -> u64,
+    ) -> bool {
+        if self.in_flight_target.is_some() || !self.dirty {
+            return false;
+        }
+        let force_full_repaint = std::mem::take(&mut self.force_full_repaint);
+        self.dirty = false;
+        draw(force_full_repaint);
+        let target = queued_after();
+        if target > queued_before {
+            self.in_flight_target = Some(target);
+        }
+        true
+    }
+
+    fn request(&mut self, force_full_repaint: bool) {
+        self.dirty = true;
+        self.force_full_repaint |= force_full_repaint;
+    }
+
+    /// Request now when cadence permits; otherwise schedule the earliest draw.
+    fn request_throttled(&mut self, now: Instant, min_draw_interval: Duration) -> bool {
+        if now.duration_since(self.last_draw_at) < min_draw_interval {
+            if self.draw_scheduled_at.is_none() {
+                self.draw_scheduled_at = Some(self.last_draw_at + min_draw_interval);
+            }
+            return false;
+        }
+        self.request(false);
+        true
+    }
+
+    fn mark_drawn(&mut self, now: Instant) {
+        self.last_draw_at = now;
+        self.draw_scheduled_at = None;
+    }
+
+    fn present_if_dirty(&mut self, app: &mut AppView, terminal: &mut PagerTerminal) {
+        let sync = terminal.backend_mut().writer_mut().writer_sync().clone();
+        let queued_before = sync.queued();
+        let drew = self.try_present(
+            queued_before,
+            |force| {
+                if force {
+                    let _ = terminal.clear();
+                }
+                app.draw(terminal);
+            },
+            || sync.queued(),
+        );
+        if drew {
+            self.mark_drawn(Instant::now());
+        }
+    }
+
+    fn request_presentation(
+        &mut self,
+        app: &mut AppView,
+        terminal: &mut PagerTerminal,
+        force_full_repaint: bool,
+    ) {
+        self.request(force_full_repaint);
+        self.present_if_dirty(app, terminal);
+    }
+}
+
+fn writer_event_sequence(event: crate::render::draw::WriterEvent) -> std::io::Result<u64> {
+    match event {
+        crate::render::draw::WriterEvent::Written(sequence) => Ok(sequence),
+        crate::render::draw::WriterEvent::Failed(error) => Err(error),
+    }
+}
+
+const SUSPEND_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+fn suspend_retry_ready(retry_after: Option<Instant>, now: Instant) -> bool {
+    retry_after.is_none_or(|deadline| now >= deadline)
+}
+
+#[derive(Debug, Default)]
+struct SuspendWaitReports {
+    editor_reported: bool,
+    pager_reported: bool,
+}
+
+impl SuspendWaitReports {
+    fn reset_missing(&mut self, editor_pending: bool, pager_pending: bool) {
+        if !editor_pending {
+            self.editor_reported = false;
+        }
+        if !pager_pending {
+            self.pager_reported = false;
+        }
+    }
+}
+
+/// Arm the deferred retry and return whether this pending handoff needs feedback.
+fn defer_suspend_retry(
+    retry_after: &mut Option<Instant>,
+    wait_reported: &mut bool,
+    now: Instant,
+) -> bool {
+    debug_assert!(retry_after.is_none());
+    *retry_after = Some(now + SUSPEND_RETRY_DELAY);
+    let should_report = !*wait_reported;
+    *wait_reported = true;
+    should_report
+}
+
+const EDITOR_SUSPEND_WAIT: &str = "Editor is waiting for a safe terminal handoff";
+const TRANSCRIPT_SUSPEND_WAIT: &str = "Transcript is waiting for a safe terminal handoff";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuspendWaitSink {
+    Toast,
+    SystemBlock,
+}
+
+fn suspend_wait_sink(screen_mode: crate::app::ScreenMode) -> SuspendWaitSink {
+    if screen_mode.is_minimal() {
+        SuspendWaitSink::SystemBlock
+    } else {
+        SuspendWaitSink::Toast
+    }
+}
+
+/// Report a handoff wait through the sink visible in the current screen mode.
+/// The caller deduplicates reports across retries per handoff request.
+fn report_suspend_wait(app: &mut AppView, message: &str) {
+    match suspend_wait_sink(app.screen_mode) {
+        SuspendWaitSink::Toast => app.show_toast(message),
+        SuspendWaitSink::SystemBlock => {
+            if let ActiveView::Agent(id) = app.active_view
+                && let Some(agent) = app.agents.get_mut(&id)
+            {
+                let block = crate::scrollback::block::RenderBlock::system(message);
+                if let Some(child_sid) = agent.active_subagent.clone()
+                    && let Some(child) = agent.subagent_views.get_mut(&child_sid)
+                {
+                    child.scrollback.push_block(block);
+                } else {
+                    agent.scrollback.push_block(block);
+                }
+            }
+        }
+    }
+}
+
+fn requeue_after_suspend_timeout<T>(pending: &mut Option<T>, request: T) {
+    // The child never started, so preserve the one-shot request.
+    *pending = Some(request);
+}
+
+/// Restore presentation after a child releases the tty.
 ///
-/// Two child behaviors, two restores (common post-suspend handling):
-///
-/// - **Screen-restoring child** (`less` & friends: alt screen + `rmcup`, or a
-///   child that printed nothing): the cursor is back where it was, the main
-///   screen still shows the pre-suspend frame. Repaint in place — `clear()`
-///   resets the back buffer so the next draw rewrites every viewport cell
-///   (the restored screen may still differ subtly, e.g. a lost cell attribute).
-/// - **Inline-printing child** (`PAGER=cat`, an editor that dumps to the tty):
-///   its output scrolled the main screen and the cursor sits below it. The old
-///   viewport rows are gone (scrolled up or overwritten) — re-anchor the
-///   viewport at the cursor row, scrolling the screen up first when there
-///   isn't a full viewport of room left (the same make-room dance as the
-///   startup inline anchor), so the live region redraws below the child's
-///   output instead of overpainting it.
-///
-/// Fullscreen mode needs neither: it re-enters the alternate screen, and
-/// `clear()` + redraw repaints the whole thing.
+/// A cat-style child leaves minimal mode's cursor below appended main-screen
+/// output, so re-anchor the live viewport there. An alternate-screen child
+/// restores the original cursor and needs no re-anchor. The caller then requests
+/// a full repaint because the child's writes bypassed ratatui's diff.
 fn restore_after_child(
     terminal: &mut PagerTerminal,
     screen_mode: crate::app::ScreenMode,
@@ -402,59 +605,81 @@ fn restore_after_child(
         let screen = terminal.last_known_area();
         let cur = terminal.viewport_area();
         let vh = cur.height.max(1).min(screen.height.max(1));
-        // Newlines printed from the cursor row scroll the screen exactly when
-        // fewer than `vh` rows remain below it (append_lines is buffered on
-        // the frame writer, so these bytes stay ordered before the clear +
-        // redraw below).
+        // Buffered append stays ordered before the gated repaint.
         let _ = terminal.backend_mut().append_lines(vh.saturating_sub(1));
         let available = screen.height.saturating_sub(y).saturating_sub(1);
-        let missing = vh.saturating_sub(1).saturating_sub(available);
-        let top = y.saturating_sub(missing);
+        let top = y.saturating_sub(vh.saturating_sub(1).saturating_sub(available));
         terminal.set_viewport_area(ratatui::layout::Rect {
             y: top,
             height: vh,
             ..cur
         });
     }
-    let _ = terminal.clear();
 }
 
 /// Consume a pending `$EDITOR` / `$PAGER` suspend request, if any.
 ///
-/// Called at the TOP of every event-loop iteration — not from one specific
-/// select arm — because the requests can be armed from ANY arm: a keypress
-/// (`$EDITOR` from the agents modal), but also an animation tick (minimal's
-/// incremental `/transcript` build finishes inside a tick-arm draw and arms
-/// `pending_pager_path`). When consumption lived only in the input arm, a
-/// build finishing on a tick sat armed until the next unrelated event — the
-/// "progress hits done, then multi-second wait before `less` opens" lag.
-#[allow(clippy::too_many_arguments)]
+/// Called at the top of every event-loop iteration because any select arm can
+/// queue one of these requests, including transcript completion during a draw.
+/// Each attempt uses a bounded safe-handoff wait; timeout leaves the one-shot
+/// request pending, reports once, and gates the next attempt behind a deferred
+/// timer so the feedback frame cannot trigger an immediate blocking retry.
 fn run_pending_suspends(
     app: &mut AppView,
     terminal: &mut PagerTerminal,
     input_paused: &std::sync::atomic::AtomicBool,
     reader_parked: &std::sync::atomic::AtomicBool,
-    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
-    last_draw_at: &mut Instant,
-    draw_scheduled_at: &mut Option<Instant>,
-) {
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimedInputEvent>,
+    presenter: &mut Presenter,
+    suspend_retry_after: &mut Option<Instant>,
+    suspend_wait_reports: &mut SuspendWaitReports,
+) -> anyhow::Result<()> {
+    let editor_pending = app.pending_editor_path.is_some();
+    let pager_pending = app.pending_pager_path.is_some();
+    suspend_wait_reports.reset_missing(editor_pending, pager_pending);
+    if !suspend_retry_ready(*suspend_retry_after, Instant::now()) {
+        return Ok(());
+    }
+    // The gate is consumed before any blocking park/drain attempt. A timeout
+    // must arm a fresh deadline before this function returns.
+    if !editor_pending && !pager_pending {
+        *suspend_retry_after = None;
+        return Ok(());
+    }
+    *suspend_retry_after = None;
+
     // $EDITOR suspend: leave alt screen, disable raw mode, spawn
     // editor, wait for exit, then restore.
     if let Some(path) = app.pending_editor_path.take() {
         let editor = std::env::var("VISUAL")
             .or_else(|_| std::env::var("EDITOR"))
             .unwrap_or_else(|_| "vi".to_string());
-        let writer_sync = terminal.backend_mut().writer_mut().writer_sync().clone();
-        let moved_cursor = suspend_for_child(
+        let moved_cursor = match suspend_for_child(
             app.screen_mode,
-            &writer_sync,
+            terminal,
             input_paused,
             reader_parked,
             input_rx,
             || {
                 let _ = std::process::Command::new(&editor).arg(&path).status();
             },
-        );
+        ) {
+            Ok(moved_cursor) => moved_cursor,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                requeue_after_suspend_timeout(&mut app.pending_editor_path, path);
+                let first_timeout = defer_suspend_retry(
+                    suspend_retry_after,
+                    &mut suspend_wait_reports.editor_reported,
+                    Instant::now(),
+                );
+                if first_timeout {
+                    report_suspend_wait(app, EDITOR_SUSPEND_WAIT);
+                    presenter.request_presentation(app, terminal, false);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         if let Some(tab) = app.pending_agents_modal_refresh.take()
             && let ActiveView::Agent(id) = app.active_view
             && let Some(agent) = app.agents.get_mut(&id)
@@ -466,9 +691,8 @@ fn run_pending_suspends(
         // repaint the full viewport rather than diffing against a screen
         // state we can no longer vouch for.
         restore_after_child(terminal, app.screen_mode, moved_cursor);
-        app.draw(terminal);
-        *last_draw_at = Instant::now();
-        *draw_scheduled_at = None;
+        presenter.request_presentation(app, terminal, true);
+        suspend_wait_reports.editor_reported = false;
     }
 
     // /transcript suspend: open the rendered transcript in $PAGER,
@@ -480,10 +704,9 @@ fn run_pending_suspends(
             .ok()
             .filter(|p| !p.trim().is_empty())
             .unwrap_or_else(|| "less".to_string());
-        let writer_sync = terminal.backend_mut().writer_mut().writer_sync().clone();
-        let moved_cursor = suspend_for_child(
+        let moved_cursor = match suspend_for_child(
             app.screen_mode,
-            &writer_sync,
+            terminal,
             input_paused,
             reader_parked,
             input_rx,
@@ -525,16 +748,33 @@ fn run_pending_suspends(
                         .status();
                 }
             },
-        );
+        ) {
+            Ok(moved_cursor) => moved_cursor,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                app.pending_pager_ansi = ansi;
+                requeue_after_suspend_timeout(&mut app.pending_pager_path, path);
+                let first_timeout = defer_suspend_retry(
+                    suspend_retry_after,
+                    &mut suspend_wait_reports.pager_reported,
+                    Instant::now(),
+                );
+                if first_timeout {
+                    report_suspend_wait(app, TRANSCRIPT_SUSPEND_WAIT);
+                    presenter.request_presentation(app, terminal, false);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let _ = std::fs::remove_file(&path);
         // The pager owned the screen; re-anchor if it printed inline (cat) and
         // repaint the full viewport rather than diffing against a screen state
         // we can no longer vouch for.
         restore_after_child(terminal, app.screen_mode, moved_cursor);
-        app.draw(terminal);
-        *last_draw_at = Instant::now();
-        *draw_scheduled_at = None;
+        presenter.request_presentation(app, terminal, true);
+        suspend_wait_reports.pager_reported = false;
     }
+    Ok(())
 }
 
 /// Run the main event loop until quit.
@@ -558,6 +798,7 @@ pub(crate) async fn run(
     bg_update_rx: Option<
         tokio::sync::oneshot::Receiver<Option<xai_grok_update::auto_update::UpdateAvailable>>,
     >,
+    mut writer_event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::render::draw::WriterEvent>,
 ) -> anyhow::Result<RunResult> {
     // Initialize tracing capture. The channel `rx` will be wired to a
     // TracingModel (and ultimately a tracing pane) once integrated.
@@ -1174,6 +1415,9 @@ pub(crate) async fn run(
     app.kimi_effective_endpoint =
         xai_grok_shell::kimi_models::effective_endpoint(configured_kimi_endpoint);
     app.kimi_confirmed_endpoint = configured_kimi_endpoint;
+    // Single-key load so a malformed unrelated `[ui]` field cannot wipe this.
+    let page_flip_on_send = crate::appearance::cache::load_page_flip_on_send();
+    app.current_ui.page_flip_on_send = Some(page_flip_on_send);
     // Disk load replaces `current_ui`. Assign one policy-clamped resolved
     // launch mode unconditionally (CLI > TOML > remote > Ask) so disk Auto
     // cannot win over `--permission-mode ask`, and a policy-clamped remote
@@ -1279,9 +1523,10 @@ pub(crate) async fn run(
     // input on an idle screen was not serviced until an unrelated arm happened
     // to re-poll (every ~20s via recap_poll). The always-on tracing_rx tick
     // used to mask this by re-polling ~30Hz; this removes that dependency.
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<TimedInputEvent>();
     // Set true around tty handoffs (e.g. $EDITOR) so the reader stops touching
-    // stdin and the inheriting child process keeps every keystroke.
+    // stdin and the inheriting child process keeps every keystroke. The handoff
+    // does not proceed until `reader_parked` acknowledges this pause.
     let input_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_paused = input_paused.clone();
     // Set by the reader once it has parked (stopped calling crossterm) so the
@@ -1323,7 +1568,8 @@ pub(crate) async fn run(
             match event {
                 Ok(ev) => {
                     consecutive_event_errors = 0;
-                    if input_tx.send(ev).is_err() {
+                    let timed = TimedInputEvent::now(ev);
+                    if input_tx.send(timed).is_err() {
                         break; // event loop has shut down
                     }
                 }
@@ -1404,8 +1650,15 @@ pub(crate) async fn run(
     // this stays `TrustState::Done`.
     seed_trust_state(&mut app, remote_settings.as_ref());
 
+    let mut presenter = Presenter::new();
+    // A timed-out handoff stays queued but cannot synchronously retry until
+    // this deadline fires. Feedback is one-shot per editor/pager request, even
+    // across multiple deferred attempts.
+    let mut suspend_retry_after: Option<Instant> = None;
+    let mut suspend_wait_reports = SuspendWaitReports::default();
+
     // Initial render
-    app.draw(terminal);
+    presenter.request_presentation(&mut app, terminal, false);
 
     // status only; shell auto-syncs post-auth
     if matches!(app.auth_state, AuthState::Done) {
@@ -1504,7 +1757,7 @@ pub(crate) async fn run(
         if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
             return Ok(make_run_result(&app));
         }
-        app.draw(terminal);
+        presenter.request_presentation(&mut app, terminal, false);
     } else if args.worktree.is_some() {
         // --worktree only: create worktree + new session.
         let effs = dispatch::dispatch(
@@ -1518,7 +1771,7 @@ pub(crate) async fn run(
         if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
             return Ok(make_run_result(&app));
         }
-        app.draw(terminal);
+        presenter.request_presentation(&mut app, terminal, false);
     }
 
     // Initial prompt from the CLI positional (`open-grok "fix the bug"`). When
@@ -1535,7 +1788,7 @@ pub(crate) async fn run(
             if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                 return Ok(make_run_result(&app));
             }
-            app.draw(terminal);
+            presenter.request_presentation(&mut app, terminal, false);
         }
     }
 
@@ -1550,7 +1803,7 @@ pub(crate) async fn run(
             if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                 return Ok(make_run_result(&app));
             }
-            app.draw(terminal);
+            presenter.request_presentation(&mut app, terminal, false);
         } else {
             // Not signed in yet — the env var is already consumed, so
             // without a stash the request would be silently dropped and
@@ -1578,7 +1831,7 @@ pub(crate) async fn run(
             if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                 return Ok(make_run_result(&app));
             }
-            app.draw(terminal);
+            presenter.request_presentation(&mut app, terminal, false);
         } else {
             // Sign-in (or folder-trust) still pending: minimal renders the
             // device / external sign-in flow in its live region. Defer the
@@ -1615,8 +1868,6 @@ pub(crate) async fn run(
     // loop-top work (suspends, deadline re-derivation) never waits on an
     // unbounded drain during a token firehose.
     const ACP_DRAIN_BATCH_MAX: usize = 32;
-    let mut last_draw_at = Instant::now();
-    let mut draw_scheduled_at: Option<Instant> = None;
 
     let mut reconnect_reinit: Option<ReconnectReinit> = None;
     let mut reconnect_abort_handle: Option<tokio::task::AbortHandle> = None;
@@ -1665,9 +1916,10 @@ pub(crate) async fn run(
             &input_paused,
             &reader_parked,
             &mut input_rx,
-            &mut last_draw_at,
-            &mut draw_scheduled_at,
-        );
+            &mut presenter,
+            &mut suspend_retry_after,
+            &mut suspend_wait_reports,
+        )?;
 
         // Lazy voice pipeline: only after `/voice` or Ctrl+Space while gates
         // allow. Consume the queued cold-start, carrying its hold-ownership and
@@ -1717,7 +1969,7 @@ pub(crate) async fn run(
             // drew (with capture still off). Render now so the recording banner
             // appears immediately instead of waiting for the next input or
             // network event to wake the select! loop.
-            app.draw(terminal);
+            presenter.request_presentation(&mut app, terminal, false);
         }
 
         // Stop voice if the user has left the recording session (see method).
@@ -1803,8 +2055,23 @@ pub(crate) async fn run(
         };
 
         // Future that sleeps until a throttled draw fires, or waits forever.
-        let deferred_draw = async {
-            match draw_scheduled_at {
+        let deferred_draw_at = presenter.draw_scheduled_at;
+        let deferred_draw = async move {
+            match deferred_draw_at {
+                Some(at) => sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+
+        // Wake a deferred suspend retry without requiring unrelated input.
+        let suspend_retry_at =
+            if app.pending_editor_path.is_some() || app.pending_pager_path.is_some() {
+                suspend_retry_after
+            } else {
+                None
+            };
+        let suspend_retry = async move {
+            match suspend_retry_at {
                 Some(at) => sleep_until(at).await,
                 None => std::future::pending().await,
             }
@@ -1863,13 +2130,18 @@ pub(crate) async fn run(
                 break;
             }
 
-            // Biased order: the ACP stream, task/progress completions, background
-            // update, terminal/keyboard input, and all render/poll timers are polled
-            // before the voice STT arm, which is deliberately LAST (see its note at
-            // the bottom of this select). A hot mic streams interim transcripts at
-            // ~5–20 Hz and can keep `voice_rx` effectively always-ready, so voice
-            // must sit below everything or it would starve keypresses, the agent
-            // stream, and animation ticks.
+            writer_event = writer_event_rx.recv() => {
+                let Some(writer_event) = writer_event else {
+                    return Err(anyhow::anyhow!("terminal writer stopped"));
+                };
+                let sequence = writer_event_sequence(writer_event)
+                    .context("terminal output failed")?;
+                presenter.acknowledge(sequence);
+            }
+
+            // Biased order: cancellation/quit, writer acks/failures, ACP,
+            // task/progress results, updates, input, and render/poll timers all
+            // precede the deliberately-last voice STT arm (see its note below).
 
             // Gated on empty terminal input: a token firehose keeps this arm
             // ready at every biased poll, so without the gate buffered
@@ -1915,13 +2187,8 @@ pub(crate) async fn run(
                     // Cap paint rate so terminal input isn't starved during
                     // heavy ACP streaming.
                     let now = Instant::now();
-                    if now.duration_since(last_draw_at) >= min_draw_interval {
+                    if presenter.request_throttled(now, min_draw_interval) {
                         app.update_notifications();
-                        app.draw(terminal);
-                        last_draw_at = now;
-                        draw_scheduled_at = None;
-                    } else if draw_scheduled_at.is_none() {
-                        draw_scheduled_at = Some(last_draw_at + min_draw_interval);
                     }
                 }
             }
@@ -1953,9 +2220,7 @@ pub(crate) async fn run(
                             gate_poll_at = None;
                         }
 
-                        app.draw(terminal);
-                        last_draw_at = Instant::now();
-                        draw_scheduled_at = None;
+                        presenter.request(false);
                     }
                     Err(join_err) => {
                         // Task was aborted (e.g., auth cancel) or panicked.
@@ -1982,9 +2247,7 @@ pub(crate) async fn run(
                 if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                     break;
                 }
-                app.draw(terminal);
-                last_draw_at = Instant::now();
-                draw_scheduled_at = None;
+                presenter.request(false);
             }
 
             // Background update check completed.
@@ -2009,9 +2272,7 @@ pub(crate) async fn run(
                     if term_state.screen_mode.is_minimal() {
                         dispatch::commit_minimal_update_notice(&mut app, &latest);
                     }
-                    app.draw(terminal);
-                    last_draw_at = Instant::now();
-                    draw_scheduled_at = None;
+                    presenter.request(false);
                 }
             }
 
@@ -2044,10 +2305,7 @@ pub(crate) async fn run(
                         // Refocus heal wins over the resize debounce: a coalesced same-size
                         // resize wouldn't autoresize-clear, so clear + full repaint now.
                         resize_debounce_at = None;
-                        let _ = terminal.clear();
-                        app.draw(terminal);
-                        last_draw_at = Instant::now();
-                        draw_scheduled_at = None;
+                        presenter.request(true);
                     } else if result.resize_only && !tip_shown {
                         // Debounce: schedule a single draw after the size stabilizes.
                         // Each new resize resets the timer so we only rebuild layout once.
@@ -2056,9 +2314,7 @@ pub(crate) async fn run(
                         // Non-resize change (or a shown tip): draw immediately
                         // (picks up any pending resize too).
                         resize_debounce_at = None;
-                        app.draw(terminal);
-                        last_draw_at = Instant::now();
-                        draw_scheduled_at = None;
+                        presenter.request(false);
                     }
                 }
 
@@ -2069,17 +2325,20 @@ pub(crate) async fn run(
             // Debounced resize: draw once the terminal size has stabilized.
             _ = resize_debounce => {
                 resize_debounce_at = None;
-                app.draw(terminal);
-                last_draw_at = Instant::now();
-                draw_scheduled_at = None;
+                presenter.request(false);
                 schedule_tick(&mut animation_tick_at, &app, tick_interval);
             }
 
             // Deferred draw: fires when an ACP-triggered draw was throttled.
             _ = deferred_draw => {
-                draw_scheduled_at = None;
-                app.draw(terminal);
-                last_draw_at = Instant::now();
+                presenter.draw_scheduled_at = None;
+                presenter.request(false);
+            }
+
+            // Only opens the gate; the next loop-top attempt owns the blocking
+            // handoff so no select arm performs it inline.
+            _ = suspend_retry => {
+                suspend_retry_after = None;
             }
 
             // Scroll clock: flush residual wheel/trackpad lines and detect
@@ -2088,9 +2347,7 @@ pub(crate) async fn run(
             // from the post-tick scroll state.
             _ = scroll_tick => {
                 if app.tick_scroll() {
-                    app.draw(terminal);
-                    last_draw_at = Instant::now();
-                    draw_scheduled_at = None;
+                    presenter.request(false);
                 }
                 // Scroll dispatch can start work that animates (e.g. viewport
                 // state), so keep the animation arm in sync too.
@@ -2114,13 +2371,9 @@ pub(crate) async fn run(
                     if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                         break;
                     }
-                    app.draw(terminal);
-                    last_draw_at = Instant::now();
-                    draw_scheduled_at = None;
+                    presenter.request(false);
                 } else if app.tick() {
-                    app.draw(terminal);
-                    last_draw_at = Instant::now();
-                    draw_scheduled_at = None;
+                    presenter.request(false);
                 }
                 // Keep ticking as long as there are running animations
                 // or pending actions waiting to expire.
@@ -2218,9 +2471,7 @@ pub(crate) async fn run(
                 // Reload the scroll settings from the pager caches (resynced
                 // when a setting changes via the settings registry).
                 app.scroll_config = crate::input::mouse::ScrollConfig::from_settings();
-                app.draw(terminal);
-                last_draw_at = Instant::now();
-                draw_scheduled_at = None;
+                presenter.request(false);
             }
 
             // System appearance changed (auto-theme mode).
@@ -2249,9 +2500,7 @@ pub(crate) async fn run(
                             previous_theme = %current.display_name(),
                             "system appearance changed, switching theme"
                         );
-                        app.draw(terminal);
-                        last_draw_at = Instant::now();
-                        draw_scheduled_at = None;
+                        presenter.request(false);
                     }
                 }
             }
@@ -2288,9 +2537,7 @@ pub(crate) async fn run(
                         app.show_toast(&format!(
                             "Disconnected. Reconnecting... (attempt {attempt})"
                         ));
-                        app.draw(terminal);
-                        last_draw_at = Instant::now();
-                        draw_scheduled_at = None;
+                        presenter.request(false);
                     }
                     ConnectionStatus::Connected { generation }
                         if generation > last_leader_generation =>
@@ -2322,6 +2569,10 @@ pub(crate) async fn run(
                             handle.abort();
                         }
                         if let Some(prev) = reconnect_reinit.take() {
+                            restore_dashboard_peek_before_reload(
+                                &mut app.dashboard,
+                                &mut app.agents,
+                            );
                             for prev_id in prev.agent_ids {
                                 if let Some(agent) = app.agents.get_mut(&prev_id) {
                                     agent.finish_session_reload(prev.generation, false);
@@ -2348,6 +2599,10 @@ pub(crate) async fn run(
                         agent_ids.sort_by_key(|id| Some(*id) != active_agent_id);
                         let mut reload_agent_ids = Vec::new();
                         let mut load_plans = Vec::new();
+                        restore_dashboard_peek_before_reload(
+                            &mut app.dashboard,
+                            &mut app.agents,
+                        );
                         for id in agent_ids {
                             let Some(agent) = app.agents.get_mut(&id) else {
                                 continue;
@@ -2468,15 +2723,11 @@ pub(crate) async fn run(
                         } else {
                             "Reconnected. Re-initializing..."
                         });
-                        app.draw(terminal);
-                        last_draw_at = Instant::now();
-                        draw_scheduled_at = None;
+                        presenter.request(false);
                     }
                     ConnectionStatus::Failed { ref error } => {
                         app.show_toast(&format!("Connection failed: {error}"));
-                        app.draw(terminal);
-                        last_draw_at = Instant::now();
-                        draw_scheduled_at = None;
+                        presenter.request(false);
                     }
                     _ => {}
                 }
@@ -2527,6 +2778,7 @@ pub(crate) async fn run(
                     &loads,
                     active_agent_id,
                 );
+                restore_dashboard_peek_before_reload(&mut app.dashboard, &mut app.agents);
                 for id in &pending.agent_ids {
                     let (ok, running_prompt_id) = loads.remove(id).unwrap_or((false, None));
                     if let Some(agent) = app.agents.get_mut(id) {
@@ -2561,9 +2813,7 @@ pub(crate) async fn run(
                     }
                 }
 
-                app.draw(terminal);
-                last_draw_at = Instant::now();
-                draw_scheduled_at = None;
+                presenter.request(false);
             }
 
             // Voice STT — DELIBERATELY THE LAST (lowest-priority) arm. In a
@@ -2587,13 +2837,8 @@ pub(crate) async fn run(
                         if needs_draw {
                             schedule_tick(&mut animation_tick_at, &app, tick_interval);
                             let now = Instant::now();
-                            if now.duration_since(last_draw_at) >= min_draw_interval {
+                            if presenter.request_throttled(now, min_draw_interval) {
                                 app.update_notifications();
-                                app.draw(terminal);
-                                last_draw_at = now;
-                                draw_scheduled_at = None;
-                            } else if draw_scheduled_at.is_none() {
-                                draw_scheduled_at = Some(last_draw_at + min_draw_interval);
                             }
                         }
                         if !app.pending_effects.is_empty() {
@@ -2613,13 +2858,13 @@ pub(crate) async fn run(
                         if was_listening {
                             app.show_toast("Voice stopped — pipeline ended");
                         }
-                        app.draw(terminal);
-                        last_draw_at = Instant::now();
-                        draw_scheduled_at = None;
+                        presenter.request(false);
                     }
                 }
             }
         }
+
+        presenter.present_if_dirty(&mut app, terminal);
     }
 
     app.notification_service.shutdown();
@@ -2627,8 +2872,6 @@ pub(crate) async fn run(
     Ok(make_run_result(&app))
 }
 
-/// Schedule the next animation tick if there are running entries and none is pending.
-///
 /// Load `UiConfig` from the shell's layered config at startup.
 /// Falls back to `UiConfig::default()` on any failure.
 pub(crate) fn load_initial_ui_config() -> xai_grok_shell::agent::config::UiConfig {
@@ -2763,6 +3006,7 @@ fn should_pregenerate_away_recap(app: &AppView) -> bool {
     })
 }
 
+/// Schedule the next animation tick when demanded and none is pending.
 fn schedule_tick(tick_at: &mut Option<Instant>, app: &AppView, interval: Duration) {
     if tick_at.is_none() {
         let interval = match app.tick_demand() {
@@ -2848,10 +3092,12 @@ struct DrainResult {
 
 struct RoutedInputEvent {
     event: Event,
+    arrived_at: std::time::Instant,
     paste_provenance: PasteProvenance,
 }
 
-fn normalize_input_event(event: Event) -> RoutedInputEvent {
+fn normalize_input_event(timed: TimedInputEvent) -> RoutedInputEvent {
+    let TimedInputEvent { event, arrived_at } = timed;
     #[cfg(target_os = "linux")]
     {
         use crossterm::event::{MouseButton, MouseEventKind};
@@ -2867,12 +3113,14 @@ fn normalize_input_event(event: Event) -> RoutedInputEvent {
         {
             return RoutedInputEvent {
                 event: Event::Paste(text),
+                arrived_at,
                 paste_provenance: PasteProvenance::X11Primary,
             };
         }
     }
     RoutedInputEvent {
         event,
+        arrived_at,
         paste_provenance: PasteProvenance::Terminal,
     }
 }
@@ -2889,8 +3137,8 @@ fn normalize_input_event(event: Event) -> RoutedInputEvent {
 /// processing to fix paste on terminals without bracketed paste (e.g.
 /// Windows PowerShell) and filter leaked CSI fragments (SGR mouse and focus reports).
 async fn drain_and_process(
-    first: Event,
-    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    first: TimedInputEvent,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimedInputEvent>,
     app: &mut AppView,
     tasks: &mut JoinSet<TaskResult>,
     progress_tx: &tokio::sync::mpsc::UnboundedSender<effects::RestoreProgressMsg>,
@@ -3073,9 +3321,11 @@ async fn drain_and_process(
             return false;
         }
         let is_resize = matches!(ev, Event::Resize(_, _));
-        match app
-            .handle_owned_input_with_paste_provenance(&mut routed.event, routed.paste_provenance)
-        {
+        match app.handle_owned_input_at_with_paste_provenance(
+            &mut routed.event,
+            routed.arrived_at,
+            routed.paste_provenance,
+        ) {
             InputOutcome::Action(action) => {
                 let effs = dispatch::dispatch(action, app);
                 if process_effects(effs, tasks, app, progress_tx) {
@@ -3093,8 +3343,9 @@ async fn drain_and_process(
                     return true;
                 }
                 if let InputOutcome::Action(follow_up) = app
-                    .handle_owned_input_with_paste_provenance(
+                    .handle_owned_input_at_with_paste_provenance(
                         &mut routed.event,
+                        routed.arrived_at,
                         routed.paste_provenance,
                     )
                 {
@@ -3171,24 +3422,26 @@ const PASTE_EXTEND_MAX_EVENTS: usize = 5_000;
 
 /// Returns `true` when the batch contains pasteable key events but no
 /// `Event::Paste` (i.e. bracketed paste is not handling it).
-fn should_extend_for_paste(events: &[Event]) -> bool {
-    !events.iter().any(|e| matches!(e, Event::Paste(_)))
-        && events.iter().any(is_pasteable_key_event)
+fn should_extend_for_paste(events: &[TimedInputEvent]) -> bool {
+    !events.iter().any(|e| matches!(e.event, Event::Paste(_)))
+        && events.iter().any(|e| is_pasteable_key_event(&e.event))
 }
 
 /// Wait [`PASTE_DETECT_TIMEOUT`] for a follow-up event.  Returns `true`
 /// if a **pasteable key event** arrives within the window.  Non-key events
 /// (mouse, focus, releases) are collected but do not count as paste evidence.
 async fn detect_paste(
-    batch: &mut Vec<Event>,
-    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    batch: &mut Vec<TimedInputEvent>,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimedInputEvent>,
 ) -> bool {
     match tokio::time::timeout(PASTE_DETECT_TIMEOUT, input_rx.recv()).await {
         Ok(Some(ev)) => {
             let prev_len = batch.len();
             batch.push(ev);
             drain_immediate(batch, input_rx);
-            batch[prev_len..].iter().any(is_pasteable_key_event)
+            batch[prev_len..]
+                .iter()
+                .any(|e| is_pasteable_key_event(&e.event))
         }
         _ => false,
     }
@@ -3198,8 +3451,8 @@ async fn detect_paste(
 /// Only pasteable key events extend the timeout; non-key events are
 /// collected but do not keep the loop alive.
 async fn collect_remaining_paste(
-    batch: &mut Vec<Event>,
-    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    batch: &mut Vec<TimedInputEvent>,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimedInputEvent>,
 ) {
     let mut extended = 0usize;
     loop {
@@ -3212,7 +3465,10 @@ async fn collect_remaining_paste(
                 batch.push(ev);
                 extended += 1;
                 drain_immediate(batch, input_rx);
-                if !batch[prev_len..].iter().any(is_pasteable_key_event) {
+                if !batch[prev_len..]
+                    .iter()
+                    .any(|e| is_pasteable_key_event(&e.event))
+                {
                     continue;
                 }
             }
@@ -3223,8 +3479,8 @@ async fn collect_remaining_paste(
 
 /// Non-blocking drain of all immediately available events.
 pub(super) fn drain_immediate(
-    batch: &mut Vec<Event>,
-    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    batch: &mut Vec<TimedInputEvent>,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimedInputEvent>,
 ) {
     while let Ok(ev) = input_rx.try_recv() {
         batch.push(ev);
@@ -3320,7 +3576,7 @@ fn is_voice_chord(ke: &KeyEvent) -> bool {
 ///    instead of a bracketed paste; this branch recovers them.
 ///
 /// No-op when bracketed paste already arrives as `Event::Paste`.
-fn coalesce_rapid_keys(events: Vec<Event>) -> Vec<Event> {
+fn coalesce_rapid_keys(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
     // Fast path: not enough events for coalescing to trigger.
     if events.len() < PASTE_COALESCE_THRESHOLD {
         return events;
@@ -3330,9 +3586,9 @@ fn coalesce_rapid_keys(events: Vec<Event>) -> Vec<Event> {
     // Terminal can split a large bracketed paste across read boundaries),
     // merge everything into a single Event::Paste.
     let (mut has_paste, mut has_keys) = (false, false);
-    for e in events.iter() {
-        has_paste |= matches!(e, Event::Paste(_));
-        has_keys |= is_pasteable_key_event(e);
+    for e in &events {
+        has_paste |= matches!(e.event, Event::Paste(_));
+        has_keys |= is_pasteable_key_event(&e.event);
     }
     if has_paste {
         return if has_keys {
@@ -3344,10 +3600,10 @@ fn coalesce_rapid_keys(events: Vec<Event>) -> Vec<Event> {
 
     // Remove Release events — handlers ignore them and they'd break run
     // detection. Exception: voice-chord releases (needed for hold-to-talk).
-    let events: Vec<Event> = events
+    let events: Vec<TimedInputEvent> = events
         .into_iter()
         .filter(|ev| {
-            !matches!(ev, Event::Key(ke)
+            !matches!(&ev.event, Event::Key(ke)
                 if ke.kind == KeyEventKind::Release && !is_voice_chord(ke))
         })
         .collect();
@@ -3356,14 +3612,15 @@ fn coalesce_rapid_keys(events: Vec<Event>) -> Vec<Event> {
     let mut i = 0;
 
     while i < events.len() {
-        if is_pasteable_key_event(&events[i]) {
+        if is_pasteable_key_event(&events[i].event) {
             let run_start = i;
+            let arrived_at = events[i].arrived_at;
             let mut text = String::new();
             let mut seen_enter = false;
             let mut has_char_after_enter = false;
 
-            while i < events.len() && is_pasteable_key_event(&events[i]) {
-                if let Event::Key(ke) = &events[i] {
+            while i < events.len() && is_pasteable_key_event(&events[i].event) {
+                if let Event::Key(ke) = &events[i].event {
                     match ke.code {
                         KeyCode::Char(c) => {
                             text.push(c);
@@ -3405,7 +3662,10 @@ fn coalesce_rapid_keys(events: Vec<Event>) -> Vec<Event> {
                     path_shape = path_shaped_drop,
                     "coalesced rapid key events into paste"
                 );
-                result.push(Event::Paste(text));
+                result.push(TimedInputEvent {
+                    event: Event::Paste(text),
+                    arrived_at,
+                });
             } else {
                 for ev in &events[run_start..i] {
                     result.push(ev.clone());
@@ -3437,20 +3697,32 @@ fn append_and_zeroize_paste_fragment(merged: &mut String, fragment: &mut String)
     fragment.zeroize();
 }
 
-fn merge_paste_fragments(events: Vec<Event>) -> Vec<Event> {
+fn merge_paste_fragments(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
     let mut result = Vec::new();
     let mut merged_text = String::new();
+    let mut merged_arrived_at = None;
 
     for ev in events {
-        let pasteable_key = is_pasteable_key_event(&ev);
-        match ev {
+        let TimedInputEvent { event, arrived_at } = ev;
+        let pasteable_key = is_pasteable_key_event(&event);
+        match event {
             Event::Paste(mut text) => {
+                merged_arrived_at.get_or_insert(arrived_at);
                 append_and_zeroize_paste_fragment(&mut merged_text, &mut text);
             }
             Event::Key(ke) if pasteable_key => match ke.code {
-                KeyCode::Char(c) => merged_text.push(c),
-                KeyCode::Enter => merged_text.push('\n'),
-                KeyCode::Tab => merged_text.push('\t'),
+                KeyCode::Char(c) => {
+                    merged_arrived_at.get_or_insert(arrived_at);
+                    merged_text.push(c);
+                }
+                KeyCode::Enter => {
+                    merged_arrived_at.get_or_insert(arrived_at);
+                    merged_text.push('\n');
+                }
+                KeyCode::Tab => {
+                    merged_arrived_at.get_or_insert(arrived_at);
+                    merged_text.push('\t');
+                }
                 _ => {}
             },
             // Non-pasteable keys (Ctrl+C, Backspace, arrows, Release
@@ -3458,15 +3730,26 @@ fn merge_paste_fragments(events: Vec<Event>) -> Vec<Event> {
             Event::Key(_) => {}
             other => {
                 if !merged_text.is_empty() {
-                    result.push(Event::Paste(std::mem::take(&mut merged_text)));
+                    result.push(TimedInputEvent {
+                        event: Event::Paste(std::mem::take(&mut merged_text)),
+                        arrived_at: merged_arrived_at
+                            .take()
+                            .expect("non-empty merged paste has an arrival time"),
+                    });
                 }
-                result.push(other);
+                result.push(TimedInputEvent {
+                    event: other,
+                    arrived_at,
+                });
             }
         }
     }
 
     if !merged_text.is_empty() {
-        result.push(Event::Paste(merged_text));
+        result.push(TimedInputEvent {
+            event: Event::Paste(merged_text),
+            arrived_at: merged_arrived_at.expect("non-empty merged paste has an arrival time"),
+        });
     }
 
     result
@@ -3817,6 +4100,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reconnect_restores_dashboard_peek_before_replacing_scrollback() {
+        use crate::scrollback::block::RenderBlock;
+        use crate::views::dashboard::{DashboardRowId, DashboardState};
+        use indexmap::IndexMap;
+
+        let id = super::super::agent::AgentId(0);
+        let mut agent = crate::test_util::make_agent_view(Some("sess-1"), "/work");
+        agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("before reconnect"));
+        agent.scrollback.prepare_layout(80, 24);
+        agent.scrollback.set_selected(Some(0));
+        agent.scrollback.set_scroll_offset(0);
+        let mut agents = IndexMap::new();
+        agents.insert(id, agent);
+        let mut dashboard = Some(DashboardState::new());
+        dashboard
+            .as_mut()
+            .unwrap()
+            .begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        assert!(dashboard.as_ref().unwrap().peek_viewport.is_some());
+        assert!(agents[&id].scrollback.is_follow_mode());
+
+        restore_dashboard_peek_before_reload(&mut dashboard, &mut agents);
+
+        assert!(dashboard.as_ref().unwrap().peek_viewport.is_none());
+        assert_eq!(agents[&id].scrollback.selected(), Some(0));
+        assert!(!agents[&id].scrollback.is_follow_mode());
+    }
+
     // ── reconnect_restore_outcome ────────────────────────────────────────
 
     /// The regression guard: one background tab fails, the active tab
@@ -3915,50 +4229,407 @@ mod tests {
         );
     }
 
-    fn press(code: KeyCode) -> Event {
-        Event::Key(KeyEvent {
-            code,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        })
+    fn timed(event: Event, arrived_at: std::time::Instant) -> TimedInputEvent {
+        TimedInputEvent { event, arrived_at }
     }
 
-    fn release(code: KeyCode) -> Event {
-        Event::Key(KeyEvent {
+    fn key_event(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> TimedInputEvent {
+        TimedInputEvent::now(Event::Key(KeyEvent {
             code,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Release,
+            modifiers,
+            kind,
             state: KeyEventState::NONE,
-        })
+        }))
     }
 
-    fn press_shift(code: KeyCode) -> Event {
-        Event::Key(KeyEvent {
-            code,
-            modifiers: KeyModifiers::SHIFT,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        })
+    fn scroll_event(
+        kind: crossterm::event::MouseEventKind,
+        arrived_at: std::time::Instant,
+    ) -> TimedInputEvent {
+        timed(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: 7,
+                row: 11,
+                modifiers: KeyModifiers::NONE,
+            }),
+            arrived_at,
+        )
     }
 
-    fn press_ctrl(code: KeyCode) -> Event {
-        Event::Key(KeyEvent {
-            code,
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        })
+    fn press(code: KeyCode) -> TimedInputEvent {
+        key_event(code, KeyModifiers::NONE, KeyEventKind::Press)
+    }
+
+    fn release(code: KeyCode) -> TimedInputEvent {
+        key_event(code, KeyModifiers::NONE, KeyEventKind::Release)
+    }
+
+    fn press_shift(code: KeyCode) -> TimedInputEvent {
+        key_event(code, KeyModifiers::SHIFT, KeyEventKind::Press)
+    }
+
+    fn press_ctrl(code: KeyCode) -> TimedInputEvent {
+        key_event(code, KeyModifiers::CONTROL, KeyEventKind::Press)
     }
 
     #[cfg(target_os = "linux")]
-    fn mouse_event(kind: crossterm::event::MouseEventKind, modifiers: KeyModifiers) -> Event {
-        Event::Mouse(crossterm::event::MouseEvent {
+    fn mouse_event(
+        kind: crossterm::event::MouseEventKind,
+        modifiers: KeyModifiers,
+    ) -> TimedInputEvent {
+        TimedInputEvent::now(Event::Mouse(crossterm::event::MouseEvent {
             kind,
             column: 7,
             row: 11,
             modifiers,
-        })
+        }))
+    }
+
+    #[test]
+    fn park_input_reader_timeout_clears_stale_acknowledgement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let input_paused = AtomicBool::new(false);
+        let reader_parked = AtomicBool::new(true);
+        let acknowledged = park_input_reader(&input_paused, &reader_parked, Duration::ZERO);
+
+        assert!(!acknowledged);
+        assert!(!reader_parked.load(Ordering::Acquire));
+        assert!(input_paused.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn suspend_retry_gate_blocks_until_deadline() {
+        let now = Instant::now();
+        let mut retry_after = None;
+        let mut wait_reported = false;
+
+        assert!(defer_suspend_retry(
+            &mut retry_after,
+            &mut wait_reported,
+            now
+        ));
+        assert!(!suspend_retry_ready(retry_after, now));
+        assert_eq!(retry_after, Some(now + SUSPEND_RETRY_DELAY));
+        assert!(suspend_retry_ready(retry_after, now + SUSPEND_RETRY_DELAY));
+        assert!(wait_reported);
+
+        // Mirrors the timer arm: expiry opens the gate for the next loop top.
+        retry_after = None;
+        assert!(suspend_retry_ready(retry_after, now));
+        assert!(!defer_suspend_retry(
+            &mut retry_after,
+            &mut wait_reported,
+            now
+        ));
+        assert_eq!(retry_after, Some(now + SUSPEND_RETRY_DELAY));
+        assert!(!suspend_retry_ready(retry_after, now));
+    }
+
+    #[test]
+    fn suspend_timeout_requeues_request() {
+        let mut pending = None;
+
+        requeue_after_suspend_timeout(&mut pending, "request");
+
+        assert_eq!(pending, Some("request"));
+    }
+
+    #[test]
+    fn suspend_wait_feedback_is_reported_only_once_across_retries() {
+        let now = Instant::now();
+        let mut retry_after = None;
+        let mut reports = SuspendWaitReports::default();
+
+        assert!(defer_suspend_retry(
+            &mut retry_after,
+            &mut reports.editor_reported,
+            now
+        ));
+        retry_after = None;
+        assert!(!defer_suspend_retry(
+            &mut retry_after,
+            &mut reports.editor_reported,
+            now
+        ));
+
+        reports.reset_missing(false, false);
+        assert!(!reports.editor_reported);
+        retry_after = None;
+        assert!(defer_suspend_retry(
+            &mut retry_after,
+            &mut reports.editor_reported,
+            now
+        ));
+    }
+
+    #[test]
+    fn editor_report_then_success_does_not_suppress_pager_first_timeout() {
+        let now = Instant::now();
+        let mut retry_after = None;
+        let mut reports = SuspendWaitReports::default();
+
+        assert!(defer_suspend_retry(
+            &mut retry_after,
+            &mut reports.editor_reported,
+            now
+        ));
+        // The editor retry succeeds while the pager request remains pending.
+        retry_after = None;
+        reports.editor_reported = false;
+
+        assert!(defer_suspend_retry(
+            &mut retry_after,
+            &mut reports.pager_reported,
+            now
+        ));
+        retry_after = None;
+        assert!(!defer_suspend_retry(
+            &mut retry_after,
+            &mut reports.pager_reported,
+            now
+        ));
+    }
+
+    #[test]
+    fn suspend_wait_sink_is_mode_appropriate() {
+        assert_eq!(
+            suspend_wait_sink(crate::app::ScreenMode::Minimal),
+            SuspendWaitSink::SystemBlock
+        );
+        assert_eq!(
+            suspend_wait_sink(crate::app::ScreenMode::Inline),
+            SuspendWaitSink::Toast
+        );
+        assert_eq!(
+            suspend_wait_sink(crate::app::ScreenMode::Fullscreen),
+            SuspendWaitSink::Toast
+        );
+    }
+
+    #[test]
+    fn suspend_wait_report_uses_system_block_in_minimal_mode() {
+        use crate::scrollback::block::RenderBlock;
+
+        let mut app = crate::app::app_view::tests::test_app();
+        let id = crate::app::agent::AgentId(0);
+        let agent = crate::test_util::make_agent_view(Some("session"), "/tmp");
+        app.agents.insert(id, agent);
+        app.active_view = ActiveView::Agent(id);
+        app.screen_mode = crate::app::ScreenMode::Minimal;
+
+        report_suspend_wait(&mut app, EDITOR_SUSPEND_WAIT);
+
+        let agent = app.agents.get(&id).expect("active agent");
+        let entry = agent.scrollback.last().expect("system block");
+        assert!(matches!(
+            &entry.block,
+            RenderBlock::System(block) if block.text == EDITOR_SUSPEND_WAIT
+        ));
+        assert!(agent.toast.is_none());
+    }
+
+    #[test]
+    fn suspend_wait_report_uses_toast_outside_minimal_mode() {
+        let mut app = crate::app::app_view::tests::test_app();
+        let id = crate::app::agent::AgentId(0);
+        let agent = crate::test_util::make_agent_view(Some("session"), "/tmp");
+        app.agents.insert(id, agent);
+        app.active_view = ActiveView::Agent(id);
+        app.screen_mode = crate::app::ScreenMode::Inline;
+
+        report_suspend_wait(&mut app, EDITOR_SUSPEND_WAIT);
+
+        let agent = app.agents.get(&id).expect("active agent");
+        assert_eq!(
+            agent.toast.as_ref().map(|(message, _)| message.as_str()),
+            Some(EDITOR_SUSPEND_WAIT)
+        );
+        assert!(agent.scrollback.last().is_none());
+    }
+
+    #[test]
+    fn writer_failure_event_returns_original_error() {
+        let error = writer_event_sequence(crate::render::draw::WriterEvent::Failed(
+            std::io::Error::other("injected writer failure"),
+        ))
+        .expect_err("writer failure must terminate the event loop");
+
+        assert_eq!(error.to_string(), "injected writer failure");
+    }
+
+    #[test]
+    fn presenter_coalesces_until_ack() {
+        let mut presenter = Presenter::new();
+        let mut draws = 0;
+
+        presenter.request(false);
+        assert!(presenter.try_present(0, |_| draws += 1, || 1));
+        assert_eq!(presenter.in_flight_target, Some(1));
+        for _ in 0..5 {
+            presenter.request(false);
+            assert!(!presenter.try_present(1, |_| draws += 1, || 2));
+        }
+        assert_eq!(draws, 1);
+        assert!(presenter.dirty);
+
+        presenter.acknowledge(1);
+        assert!(presenter.try_present(1, |_| draws += 1, || 2));
+        assert_eq!(draws, 2);
+        assert_eq!(presenter.in_flight_target, Some(2));
+    }
+
+    #[test]
+    fn presenter_no_output_does_not_wedge() {
+        let mut presenter = Presenter::new();
+        presenter.request(false);
+
+        assert!(presenter.try_present(4, |_| {}, || 4));
+        assert_eq!(presenter.in_flight_target, None);
+        assert!(!presenter.dirty);
+
+        presenter.request(false);
+        assert!(presenter.try_present(4, |_| {}, || 5));
+        assert_eq!(presenter.in_flight_target, Some(5));
+    }
+
+    #[test]
+    fn presenter_keeps_forced_repaint_sticky() {
+        let mut presenter = Presenter {
+            in_flight_target: Some(8),
+            ..Presenter::new()
+        };
+        presenter.request(false);
+        presenter.request(true);
+        let mut forced = false;
+
+        presenter.acknowledge(8);
+        assert!(presenter.try_present(8, |force| forced = force, || 9));
+        assert!(forced);
+        assert!(!presenter.force_full_repaint);
+    }
+
+    #[test]
+    fn presenter_immediate_ack_before_request_is_not_lost() {
+        let mut presenter = Presenter {
+            in_flight_target: Some(3),
+            ..Presenter::new()
+        };
+        presenter.acknowledge(3);
+        presenter.request(false);
+
+        assert!(presenter.try_present(3, |_| {}, || 4));
+        assert_eq!(presenter.in_flight_target, Some(4));
+    }
+
+    #[test]
+    fn presenter_later_ack_clears_target() {
+        let mut presenter = Presenter {
+            in_flight_target: Some(3),
+            ..Presenter::new()
+        };
+
+        presenter.acknowledge(4);
+
+        assert_eq!(presenter.in_flight_target, None);
+    }
+
+    #[test]
+    fn presenter_waits_for_last_payload_in_turn() {
+        let mut presenter = Presenter::new();
+        presenter.request(false);
+        assert!(presenter.try_present(10, |_| {}, || 13));
+        presenter.request(false);
+
+        presenter.acknowledge(11);
+        assert!(!presenter.try_present(13, |_| panic!("target not acknowledged"), || 14));
+        presenter.acknowledge(13);
+        assert!(presenter.try_present(13, |_| {}, || 14));
+        assert_eq!(presenter.in_flight_target, Some(14));
+    }
+
+    #[test]
+    fn timed_paste_uses_first_contributing_event() {
+        let start = std::time::Instant::now();
+        let events = vec![
+            timed(
+                Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+                start,
+            ),
+            timed(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                start + Duration::from_millis(4),
+            ),
+            timed(
+                Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+                start + Duration::from_millis(8),
+            ),
+        ];
+
+        let coalesced = coalesce_rapid_keys(events);
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0].arrived_at, start);
+        assert_eq!(coalesced[0].event, Event::Paste("a\nb".to_owned()));
+
+        let fragments = vec![
+            timed(Event::Paste("a".to_owned()), start),
+            timed(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                start + Duration::from_millis(4),
+            ),
+            timed(
+                Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+                start + Duration::from_millis(8),
+            ),
+        ];
+        let merged = merge_paste_fragments(fragments);
+        assert_eq!(merged[0].arrived_at, start);
+        assert_eq!(merged[0].event, Event::Paste("a\nb".to_owned()));
+    }
+
+    #[test]
+    fn delayed_scroll_batch_preserves_arrival_spacing_and_reversal() {
+        use crossterm::event::MouseEventKind::{ScrollDown, ScrollUp};
+
+        let mut app = crate::app::app_view::tests::test_app();
+        let start = std::time::Instant::now() + Duration::from_secs(1);
+        app.scroll_state = Default::default();
+        for event in [
+            scroll_event(ScrollUp, start),
+            scroll_event(ScrollUp, start + Duration::from_millis(4)),
+            scroll_event(ScrollUp, start + Duration::from_millis(12)),
+        ] {
+            let routed = normalize_input_event(event);
+            let _ = app.handle_input_at_with_paste_provenance(
+                &routed.event,
+                routed.arrived_at,
+                routed.paste_provenance,
+            );
+        }
+        let spaced = app
+            .scroll_state
+            .debug_snapshot(&app.scroll_config, start + Duration::from_millis(12));
+        assert_eq!(
+            spaced.stream.expect("up stream active").avg_interval_ms,
+            Some(8.0)
+        );
+
+        let routed =
+            normalize_input_event(scroll_event(ScrollDown, start + Duration::from_millis(40)));
+        let _ = app.handle_input_at_with_paste_provenance(
+            &routed.event,
+            routed.arrived_at,
+            routed.paste_provenance,
+        );
+
+        let snapshot = app
+            .scroll_state
+            .debug_snapshot(&app.scroll_config, start + Duration::from_millis(40));
+        let stream = snapshot.stream.expect("reversal starts a new stream");
+        assert_eq!(snapshot.last_stream.expect("up stream finalized").events, 3);
+        assert_eq!(stream.events, 1);
+        assert_eq!(stream.gap_remaining_ms, 80);
     }
 
     #[cfg(target_os = "linux")]
@@ -3972,12 +4643,15 @@ mod tests {
             ..Default::default()
         });
 
-        let normalized = normalize_input_event(mouse_event(
+        let input = mouse_event(
             MouseEventKind::Down(MouseButton::Middle),
             KeyModifiers::NONE,
-        ));
+        );
+        let arrived_at = input.arrived_at;
+        let normalized = normalize_input_event(input);
 
         assert_eq!(normalized.event, Event::Paste("PRIMARY\nexact".to_owned()));
+        assert_eq!(normalized.arrived_at, arrived_at);
         assert_eq!(normalized.paste_provenance, PasteProvenance::X11Primary);
         assert_eq!(crate::clipboard::primary_selection_read_call_count(), 1);
         crate::clipboard::clear_clipboard_probe_hook();
@@ -3995,18 +4669,18 @@ mod tests {
 
         let release = mouse_event(MouseEventKind::Up(MouseButton::Middle), KeyModifiers::NONE);
         let normalized = normalize_input_event(release.clone());
-        assert_eq!(normalized.event, release);
+        assert_eq!(normalized.event, release.event);
         assert_eq!(normalized.paste_provenance, PasteProvenance::Terminal);
         let modified = mouse_event(
             MouseEventKind::Down(MouseButton::Middle),
             KeyModifiers::SHIFT,
         );
         let normalized = normalize_input_event(modified.clone());
-        assert_eq!(normalized.event, modified);
+        assert_eq!(normalized.event, modified.event);
         assert_eq!(normalized.paste_provenance, PasteProvenance::Terminal);
         let left = mouse_event(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE);
         let normalized = normalize_input_event(left.clone());
-        assert_eq!(normalized.event, left);
+        assert_eq!(normalized.event, left.event);
         assert_eq!(normalized.paste_provenance, PasteProvenance::Terminal);
         assert_eq!(crate::clipboard::primary_selection_read_call_count(), 0);
         crate::clipboard::clear_clipboard_probe_hook();
@@ -4027,7 +4701,7 @@ mod tests {
         );
 
         let normalized = normalize_input_event(middle.clone());
-        assert_eq!(normalized.event, middle);
+        assert_eq!(normalized.event, middle.event);
         assert_eq!(normalized.paste_provenance, PasteProvenance::Terminal);
         assert_eq!(crate::clipboard::primary_selection_read_call_count(), 1);
         crate::clipboard::clear_clipboard_probe_hook();
@@ -4044,7 +4718,7 @@ mod tests {
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("ab\ncd".to_string()));
+        assert_eq!(result[0].event, Event::Paste("ab\ncd".to_string()));
     }
 
     #[test]
@@ -4062,7 +4736,7 @@ mod tests {
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("ab\nc".to_string()));
+        assert_eq!(result[0].event, Event::Paste("ab\nc".to_string()));
     }
 
     #[test]
@@ -4077,7 +4751,7 @@ mod tests {
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("Hi\nBye".to_string()));
+        assert_eq!(result[0].event, Event::Paste("Hi\nBye".to_string()));
     }
 
     #[test]
@@ -4085,8 +4759,8 @@ mod tests {
         let events = vec![press(KeyCode::Char('a')), press(KeyCode::Enter)];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 2);
-        assert!(matches!(&result[0], Event::Key(ke) if ke.code == KeyCode::Char('a')));
-        assert!(matches!(&result[1], Event::Key(ke) if ke.code == KeyCode::Enter));
+        assert!(matches!(&result[0].event, Event::Key(ke) if ke.code == KeyCode::Char('a')));
+        assert!(matches!(&result[1].event, Event::Key(ke) if ke.code == KeyCode::Enter));
     }
 
     #[test]
@@ -4102,7 +4776,7 @@ mod tests {
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 5);
         for ev in &result {
-            assert!(matches!(ev, Event::Key(_)));
+            assert!(matches!(&ev.event, Event::Key(_)));
         }
     }
 
@@ -4122,17 +4796,17 @@ mod tests {
     #[test]
     fn coalesce_preserves_non_key_events() {
         let events = vec![
-            Event::Resize(80, 24),
+            TimedInputEvent::now(Event::Resize(80, 24)),
             press(KeyCode::Char('a')),
             press(KeyCode::Enter),
             press(KeyCode::Char('b')),
-            Event::Resize(100, 30),
+            TimedInputEvent::now(Event::Resize(100, 30)),
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 3);
-        assert!(matches!(&result[0], Event::Resize(80, 24)));
-        assert_eq!(result[1], Event::Paste("a\nb".to_string()));
-        assert!(matches!(&result[2], Event::Resize(100, 30)));
+        assert!(matches!(&result[0].event, Event::Resize(80, 24)));
+        assert_eq!(result[1].event, Event::Paste("a\nb".to_string()));
+        assert!(matches!(&result[2].event, Event::Resize(100, 30)));
     }
 
     #[test]
@@ -4160,7 +4834,7 @@ mod tests {
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("if\n\tx".to_string()));
+        assert_eq!(result[0].event, Event::Paste("if\n\tx".to_string()));
     }
 
     #[test]
@@ -4172,7 +4846,7 @@ mod tests {
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("a\nb".to_string()));
+        assert_eq!(result[0].event, Event::Paste("a\nb".to_string()));
     }
 
     #[test]
@@ -4186,21 +4860,21 @@ mod tests {
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 4);
-        assert!(matches!(&result[3], Event::Key(ke) if ke.code == KeyCode::Enter));
+        assert!(matches!(&result[3].event, Event::Key(ke) if ke.code == KeyCode::Enter));
     }
 
     #[test]
     fn fragmented_paste_merged_with_keys() {
         // Event::Paste mixed with key events — merge into one paste.
         let events = vec![
-            Event::Paste("real paste".into()),
+            TimedInputEvent::now(Event::Paste("real paste".into())),
             press(KeyCode::Char('a')),
             press(KeyCode::Enter),
             press(KeyCode::Char('b')),
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("real pastea\nb".to_string()));
+        assert_eq!(result[0].event, Event::Paste("real pastea\nb".to_string()));
     }
 
     #[test]
@@ -4208,7 +4882,7 @@ mod tests {
         let events = vec![press(KeyCode::Enter)];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], Event::Key(_)));
+        assert!(matches!(&result[0].event, Event::Key(_)));
     }
 
     #[test]
@@ -4237,7 +4911,7 @@ mod tests {
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("foo\nbar\nbaz".to_string()));
+        assert_eq!(result[0].event, Event::Paste("foo\nbar\nbaz".to_string()));
     }
 
     #[test]
@@ -4255,7 +4929,7 @@ mod tests {
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("a\nb\nc\nd\n".to_string()));
+        assert_eq!(result[0].event, Event::Paste("a\nb\nc\nd\n".to_string()));
     }
 
     // ── should_extend_for_paste tests ───────────────────────────────
@@ -4275,7 +4949,7 @@ mod tests {
     #[test]
     fn extend_not_triggered_with_bracketed_paste() {
         let events = vec![
-            Event::Paste("hello".into()),
+            TimedInputEvent::now(Event::Paste("hello".into())),
             press(KeyCode::Char('a')),
             press(KeyCode::Enter),
             press(KeyCode::Char('b')),
@@ -4285,7 +4959,7 @@ mod tests {
 
     #[test]
     fn extend_not_triggered_with_only_non_pasteable() {
-        let events = vec![Event::Resize(80, 24)];
+        let events = vec![TimedInputEvent::now(Event::Resize(80, 24))];
         assert!(!should_extend_for_paste(&events));
     }
 
@@ -4306,59 +4980,59 @@ mod tests {
     fn merge_paste_and_key_fragments() {
         // Fragmented bracketed paste: Event::Paste + loose key events.
         let events = vec![
-            Event::Paste("hello\nwor".into()),
+            TimedInputEvent::now(Event::Paste("hello\nwor".into())),
             press(KeyCode::Char('l')),
             press(KeyCode::Char('d')),
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("hello\nworld".to_string()));
+        assert_eq!(result[0].event, Event::Paste("hello\nworld".to_string()));
     }
 
     #[test]
     fn merge_multiple_paste_fragments() {
         let events = vec![
-            Event::Paste("aa\n".into()),
-            Event::Paste("bb\n".into()),
+            TimedInputEvent::now(Event::Paste("aa\n".into())),
+            TimedInputEvent::now(Event::Paste("bb\n".into())),
             press(KeyCode::Char('c')),
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("aa\nbb\nc".to_string()));
+        assert_eq!(result[0].event, Event::Paste("aa\nbb\nc".to_string()));
     }
 
     #[test]
     fn merge_preserves_non_key_events() {
         let events = vec![
-            Event::Paste("hello".into()),
-            Event::Resize(80, 24),
+            TimedInputEvent::now(Event::Paste("hello".into())),
+            TimedInputEvent::now(Event::Resize(80, 24)),
             press(KeyCode::Char('x')),
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0], Event::Paste("hello".to_string()));
-        assert!(matches!(result[1], Event::Resize(80, 24)));
-        assert_eq!(result[2], Event::Paste("x".to_string()));
+        assert_eq!(result[0].event, Event::Paste("hello".to_string()));
+        assert!(matches!(result[1].event, Event::Resize(80, 24)));
+        assert_eq!(result[2].event, Event::Paste("x".to_string()));
     }
 
     #[test]
     fn merge_skips_release_events() {
         let events = vec![
-            Event::Paste("ab".into()),
+            TimedInputEvent::now(Event::Paste("ab".into())),
             press(KeyCode::Char('c')),
             release(KeyCode::Char('c')),
         ];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("abc".to_string()));
+        assert_eq!(result[0].event, Event::Paste("abc".to_string()));
     }
 
     #[test]
     fn pure_paste_no_merge_needed() {
-        let events = vec![Event::Paste("hello\nworld".into())];
+        let events = vec![TimedInputEvent::now(Event::Paste("hello\nworld".into()))];
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste("hello\nworld".to_string()));
+        assert_eq!(result[0].event, Event::Paste("hello\nworld".to_string()));
     }
 
     // ── is_pasteable_key_event filtering tests ─────────────────────────
@@ -4390,8 +5064,8 @@ mod tests {
 
     #[test]
     fn pasteable_rejects_release_events() {
-        assert!(!is_pasteable_key_event(&release(KeyCode::Char('a'))));
-        assert!(!is_pasteable_key_event(&release(KeyCode::Enter)));
+        assert!(!is_pasteable_key_event(&release(KeyCode::Char('a')).event));
+        assert!(!is_pasteable_key_event(&release(KeyCode::Enter).event));
     }
 
     #[test]
@@ -4412,23 +5086,25 @@ mod tests {
 
     #[test]
     fn pasteable_accepts_valid_key_presses() {
-        assert!(is_pasteable_key_event(&press(KeyCode::Char('a'))));
-        assert!(is_pasteable_key_event(&press_shift(KeyCode::Char('A'))));
-        assert!(is_pasteable_key_event(&press(KeyCode::Enter)));
-        assert!(is_pasteable_key_event(&press(KeyCode::Tab)));
+        assert!(is_pasteable_key_event(&press(KeyCode::Char('a')).event));
+        assert!(is_pasteable_key_event(
+            &press_shift(KeyCode::Char('A')).event
+        ));
+        assert!(is_pasteable_key_event(&press(KeyCode::Enter).event));
+        assert!(is_pasteable_key_event(&press(KeyCode::Tab).event));
     }
 
     #[test]
     fn extend_not_triggered_with_only_mouse_and_focus() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let events = vec![
-            Event::Mouse(MouseEvent {
+            TimedInputEvent::now(Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: 10,
                 row: 5,
                 modifiers: KeyModifiers::NONE,
-            }),
-            Event::FocusGained,
+            })),
+            TimedInputEvent::now(Event::FocusGained),
         ];
         assert!(!should_extend_for_paste(&events));
     }
@@ -4437,14 +5113,14 @@ mod tests {
     fn extend_triggered_only_when_key_present_in_mixed_batch() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let events = vec![
-            Event::Mouse(MouseEvent {
+            TimedInputEvent::now(Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: 0,
                 row: 0,
                 modifiers: KeyModifiers::NONE,
-            }),
+            })),
             press(KeyCode::Char('a')),
-            Event::FocusLost,
+            TimedInputEvent::now(Event::FocusLost),
         ];
         assert!(should_extend_for_paste(&events));
     }
@@ -4457,25 +5133,25 @@ mod tests {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let events = vec![
             press(KeyCode::Char('a')),
-            Event::Mouse(MouseEvent {
+            TimedInputEvent::now(Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: 10,
                 row: 5,
                 modifiers: KeyModifiers::NONE,
-            }),
-            Event::Mouse(MouseEvent {
+            })),
+            TimedInputEvent::now(Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: 11,
                 row: 5,
                 modifiers: KeyModifiers::NONE,
-            }),
+            })),
         ];
         let result = coalesce_rapid_keys(events);
         // Below coalesce threshold, all events pass through unchanged.
         assert_eq!(result.len(), 3);
-        assert!(matches!(&result[0], Event::Key(ke) if ke.code == KeyCode::Char('a')));
-        assert!(matches!(&result[1], Event::Mouse(_)));
-        assert!(matches!(&result[2], Event::Mouse(_)));
+        assert!(matches!(&result[0].event, Event::Key(ke) if ke.code == KeyCode::Char('a')));
+        assert!(matches!(&result[1].event, Event::Mouse(_)));
+        assert!(matches!(&result[2].event, Event::Mouse(_)));
     }
 
     #[test]
@@ -4487,12 +5163,12 @@ mod tests {
             press(KeyCode::Char('a')),
             press(KeyCode::Char('b')),
             press(KeyCode::Enter),
-            Event::Mouse(MouseEvent {
+            TimedInputEvent::now(Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: 5,
                 row: 3,
                 modifiers: KeyModifiers::NONE,
-            }),
+            })),
             press(KeyCode::Char('c')),
         ];
         let result = coalesce_rapid_keys(events);
@@ -4508,7 +5184,7 @@ mod tests {
     // (other platforms reliably get bracketed paste for drag-drop).
 
     #[cfg(target_os = "windows")]
-    fn press_run(text: &str) -> Vec<Event> {
+    fn press_run(text: &str) -> Vec<TimedInputEvent> {
         text.chars().map(|c| press(KeyCode::Char(c))).collect()
     }
 
@@ -4528,7 +5204,7 @@ mod tests {
         ] {
             let result = coalesce_rapid_keys(press_run(input));
             assert_eq!(result.len(), 1, "input {input:?} should coalesce");
-            assert_eq!(result[0], Event::Paste(input.to_string()));
+            assert_eq!(result[0].event, Event::Paste(input.to_string()));
         }
     }
 
@@ -4541,13 +5217,13 @@ mod tests {
         assert!(
             coalesce_rapid_keys(press_run(short))
                 .iter()
-                .all(|e| matches!(e, Event::Key(_)))
+                .all(|e| matches!(e.event, Event::Key(_)))
         );
         let prose = "helloworld"; // 10 chars, no path anchor
         assert!(
             coalesce_rapid_keys(press_run(prose))
                 .iter()
-                .all(|e| matches!(e, Event::Key(_)))
+                .all(|e| matches!(e.event, Event::Key(_)))
         );
     }
 
@@ -4562,7 +5238,7 @@ mod tests {
         events.extend(press_run(r"\foo.png"));
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], Event::Paste(r"C:\foo.png".to_string()));
+        assert_eq!(result[0].event, Event::Paste(r"C:\foo.png".to_string()));
     }
 
     // ── make_run_result exit info ────────────────────────────────────────

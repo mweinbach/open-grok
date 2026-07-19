@@ -2879,6 +2879,45 @@ async fn prepare_image_gen_config_fails_open_without_auth() {
         "no resolved auth ⇒ fail open (tools not tier-restricted)"
     );
 }
+/// The imagine tools bypass cli-chat-proxy (direct API calls), so the server
+/// can only scope the coding data-retention opt-out (`/privacy opt-out`) to
+/// Build traffic via the `x-grok-client-identifier` header. If this header is
+/// dropped, opted-out users' imagine prompts are logged/retained server-side.
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_image_gen_config_sends_client_identifier_header() {
+    use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
+    let agent = build_minimal_agent_for_tests();
+    agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
+    let ImageGenConfig::Enabled { extra_headers, .. } = agent.prepare_image_gen_config() else {
+        panic!("expected Enabled");
+    };
+    assert_eq!(
+        extra_headers
+            .get("x-grok-client-identifier")
+            .map(String::as_str),
+        Some(crate::http::process_client_identifier().as_str()),
+        "imagine API calls must carry the client identifier so the server \
+         applies the coding ZDR opt-out to Build traffic"
+    );
+}
+/// Same contract for video generation (also a direct API call).
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_video_gen_config_sends_client_identifier_header() {
+    use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
+    let agent = build_minimal_agent_for_tests();
+    agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
+    let VideoGenConfig::Enabled { extra_headers, .. } = agent.prepare_video_gen_config() else {
+        panic!("expected Enabled");
+    };
+    assert_eq!(
+        extra_headers
+            .get("x-grok-client-identifier")
+            .map(String::as_str),
+        Some(crate::http::process_client_identifier().as_str()),
+        "video gen API calls must carry the client identifier so the server \
+         applies the coding ZDR opt-out to Build traffic"
+    );
+}
 #[tokio::test]
 async fn data_collection_enabled_for_normal_user() {
     let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
@@ -3970,6 +4009,18 @@ fn repo_with_project_mcp_server() -> tempfile::TempDir {
     .unwrap();
     tmp
 }
+fn write_project_subagent_definitions(cwd: &std::path::Path) {
+    let roles = cwd.join(".opengrok/roles");
+    let personas = cwd.join(".opengrok/personas");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::create_dir_all(&personas).unwrap();
+    std::fs::write(roles.join("probe.toml"), "description = \"Project role\"").unwrap();
+    std::fs::write(
+        personas.join("probe.toml"),
+        "instructions = \"Project persona\"",
+    )
+    .unwrap();
+}
 fn folder_trust_on() -> crate::util::config::RemoteSettings {
     crate::util::config::RemoteSettings {
         folder_trust_enabled: Some(true),
@@ -4018,6 +4069,130 @@ async fn assert_no_folder_trust_request(
     }
 }
 
+#[test]
+#[serial_test::serial]
+fn subagent_spawn_context_reloads_project_definitions_after_trust_changes() {
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    write_project_subagent_definitions(repo.path());
+    run_local_for_bridge_test(|| async {
+        let (agent, _rx) = build_agent_with_gateway_rx();
+        let sid = acp::SessionId::new("roles-personas-trust-transition");
+        let (mut handle, _tx, _cmd_rx) = make_live_session_handle(&sid, None);
+        handle.info.cwd = repo.path().display().to_string();
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        {
+            let mut cfg = agent.cfg.borrow_mut();
+            cfg.subagent_roles.insert(
+                "refreshed".into(),
+                xai_grok_subagent_resolution::config::SubagentRole {
+                    description: "Refreshed user role".into(),
+                    source_dir: Some(repo.path().join("user-roles")),
+                    ..Default::default()
+                },
+            );
+            cfg.subagent_model_overrides
+                .insert("probe".into(), "refreshed-model".into());
+            cfg.subagent_toggle.insert("probe".into(), false);
+        }
+        crate::agent::folder_trust::record_for_test(repo.path(), false);
+        let untrusted = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert!(!untrusted.subagent_roles.contains_key("probe"));
+        assert!(!untrusted.subagent_personas.contains_key("probe"));
+        assert_eq!(
+            untrusted
+                .subagent_roles
+                .get("refreshed")
+                .map(|role| role.description.as_str()),
+            Some("Refreshed user role")
+        );
+        assert_eq!(
+            untrusted
+                .subagent_model_overrides
+                .get("probe")
+                .map(String::as_str),
+            Some("refreshed-model")
+        );
+        assert_eq!(untrusted.subagent_toggle.get("probe"), Some(&false));
+        crate::agent::folder_trust::record_for_test(repo.path(), true);
+        let trusted = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert_eq!(
+            trusted
+                .subagent_roles
+                .get("probe")
+                .map(|role| role.description.as_str()),
+            Some("Project role")
+        );
+        assert!(trusted.subagent_personas.contains_key("probe"));
+        crate::agent::folder_trust::record_for_test(repo.path(), false);
+        let revoked = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert!(!revoked.subagent_roles.contains_key("probe"));
+        assert!(!revoked.subagent_personas.contains_key("probe"));
+    });
+}
+/// End-to-end gate wiring: project `.opengrok/roles` / `personas` alone must drive
+/// real `resolve_and_record` untrusted (not a forced `record_for_test` verdict),
+/// keep project defs out of Task spawn context, then re-admit them after grant.
+#[test]
+#[serial_test::serial]
+fn project_roles_personas_gated_via_resolve_and_record_chain() {
+    use xai_grok_test_support::EnvGuard;
+    let home = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set("OPENGROK_HOME", home.path());
+    let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
+    let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    write_project_subagent_definitions(repo.path());
+    run_local_for_bridge_test(|| async {
+        let (agent, _rx) = build_agent_with_gateway_rx();
+        let sid = acp::SessionId::new("roles-personas-resolve-chain");
+        let (mut handle, _tx, _cmd_rx) = make_live_session_handle(&sid, None);
+        handle.info.cwd = repo.path().display().to_string();
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        let allowed = crate::agent::folder_trust::resolve_and_record(
+            repo.path(),
+            Some(&folder_trust_on()),
+            false,
+        );
+        assert!(
+            !allowed,
+            "roles/personas markers alone must resolve untrusted without a grant"
+        );
+        assert!(
+            !crate::agent::folder_trust::project_scope_allowed(repo.path()),
+            "cached verdict after resolve_and_record must stay untrusted"
+        );
+        let untrusted = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert!(
+            !untrusted.subagent_roles.contains_key("probe"),
+            "untrusted: project role must stay out of spawn context"
+        );
+        assert!(
+            !untrusted.subagent_personas.contains_key("probe"),
+            "untrusted: project persona must stay out of spawn context"
+        );
+        crate::agent::folder_trust::grant_folder_trust(repo.path());
+        let allowed = crate::agent::folder_trust::resolve_and_record(
+            repo.path(),
+            Some(&folder_trust_on()),
+            false,
+        );
+        assert!(allowed, "store-granted folder must resolve trusted");
+        let trusted = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert_eq!(
+            trusted
+                .subagent_roles
+                .get("probe")
+                .map(|role| role.description.as_str()),
+            Some("Project role")
+        );
+        assert!(
+            trusted.subagent_personas.contains_key("probe"),
+            "trusted: project persona must enter spawn context after grant"
+        );
+    });
+}
 /// Pull the next `x.ai/folder_trust/request` reverse-request off the gateway and
 /// answer it with `outcome`. Returns the request's decoded params.
 async fn answer_folder_trust_request(
@@ -4903,3 +5078,5 @@ mod soft_default_settings_emit {
             .await;
     }
 }
+#[cfg(feature = "dhat-heap")]
+mod dhat_soak;

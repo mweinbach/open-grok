@@ -51,6 +51,60 @@ use crate::views::rewind::RewindState;
 use crate::views::session_picker::{SessionEntryData, SourceFilter};
 use crate::views::suggestion_controller::SuggestionController;
 
+/// The shared renderer's minimum `/btw` panel dimensions.
+pub const MINIMAL_BTW_MIN_WIDTH: u16 = 12;
+pub const MINIMAL_BTW_MIN_HEIGHT: u16 = 3;
+
+/// Whether minimal can paint and expose input geometry for this panel size.
+pub fn minimal_btw_size_is_paintable(width: u16, height: u16) -> bool {
+    width >= MINIMAL_BTW_MIN_WIDTH && height >= MINIMAL_BTW_MIN_HEIGHT
+}
+
+/// Whether cached minimal input geometry represents a painted panel.
+pub fn minimal_btw_geometry_is_paintable(area: Rect) -> bool {
+    minimal_btw_size_is_paintable(area.width, area.height)
+}
+
+/// Clamp desired `/btw` rows to the available minimal live-region rows.
+pub fn minimal_btw_visible_height(desired: u16, width: u16, available: u16) -> u16 {
+    if desired == 0 || !minimal_btw_size_is_paintable(width, available) {
+        0
+    } else {
+        desired.min(available)
+    }
+}
+
+/// Typed result of the minimal-only `/btw` pre-router.
+#[derive(Debug)]
+pub enum MinimalBtwInput {
+    /// Minimal consumed the event; the shared/fullscreen router must not run.
+    Handled(Box<crate::app::app_view::InputOutcome>),
+    /// Another minimal surface owns the event; delegate to its shared handler.
+    Occluded,
+    /// The plain live surface is active but `/btw` declined the event.
+    Delegate,
+}
+
+/// Per-agent ownership of a minimal `/btw` panel and its in-flight response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MinimalBtwLifecycle {
+    Active {
+        request_id: Option<uuid::Uuid>,
+        revision: uuid::Uuid,
+    },
+    Suspended {
+        revision: uuid::Uuid,
+    },
+}
+
+/// Complete minimal lifecycle moved aside while a painted modal handles input.
+pub(crate) struct SuspendedMinimalBtwLifecycle {
+    state: crate::views::btw_overlay::BtwOverlayState,
+    request_id: Option<uuid::Uuid>,
+    revision: uuid::Uuid,
+    focused: bool,
+}
+
 // ── Consolidated minimal-mode state (AppView::minimal_state) ─────────────────
 //
 // Minimal's private per-session state, consolidated into a single field on the
@@ -333,6 +387,158 @@ pub fn plan_approval_view(v: &AgentView) -> Option<&PlanApprovalViewState> {
     v.plan_approval_view.as_ref()
 }
 
+/// Whether the minimal `/btw` panel is the painted input owner.
+///
+/// This mirrors the shared router's surface cascade: everything that handles
+/// input before `/btw`, plus the later prompt-replacing surfaces that minimal
+/// paints in place of the panel, takes precedence here. Keeping the complete
+/// owner predicate at the minimal facade gives paint and minimal input one
+/// canonical answer without changing the fullscreen router.
+pub fn minimal_btw_surface_available(v: &AgentView) -> bool {
+    v.active_subagent.is_none()
+        && v.image_viewer.is_none()
+        && v.video_viewer.is_none()
+        && v.gboom.is_none()
+        && !(v.show_goal_detail && v.goal_state.is_some())
+        && v.line_viewer.is_none()
+        && v.extensions_modal.is_none()
+        && v.persona_detail.is_none()
+        && v.agents_modal.is_none()
+        && v.block_viewer.is_none()
+        && v.active_modal.is_none()
+        && v.no_input_overlay_pending()
+        && v.rewind_state.is_none()
+}
+
+/// Start a correlated minimal `/btw` loading panel on this agent.
+pub fn start_minimal_btw(v: &mut AgentView, question: String) -> uuid::Uuid {
+    let request_id = uuid::Uuid::new_v4();
+    v.minimal_btw_lifecycle = Some(MinimalBtwLifecycle::Active {
+        request_id: Some(request_id),
+        revision: uuid::Uuid::new_v4(),
+    });
+    v.btw_state = Some(crate::views::btw_overlay::BtwOverlayState::Loading { question });
+    v.btw_focused = false;
+    request_id
+}
+
+/// Apply a minimal `/btw` response only when it still owns the loading panel.
+pub fn finish_minimal_btw(
+    v: &mut AgentView,
+    request_id: uuid::Uuid,
+    result: Result<String, String>,
+) -> bool {
+    let Some(MinimalBtwLifecycle::Active {
+        request_id: Some(active_id),
+        ..
+    }) = v.minimal_btw_lifecycle
+    else {
+        return false;
+    };
+    if active_id != request_id {
+        return false;
+    }
+    let Some(crate::views::btw_overlay::BtwOverlayState::Loading { question }) = v.btw_state.take()
+    else {
+        return false;
+    };
+    v.minimal_btw_lifecycle = Some(MinimalBtwLifecycle::Active {
+        request_id: None,
+        revision: uuid::Uuid::new_v4(),
+    });
+    match result {
+        Ok(response) => {
+            v.btw_state = Some(crate::views::btw_overlay::BtwOverlayState::done(
+                question, response,
+            ));
+            v.btw_focused = true;
+        }
+        Err(error) => {
+            v.btw_state =
+                Some(crate::views::btw_overlay::BtwOverlayState::Error { question, error });
+            v.btw_focused = false;
+        }
+    }
+    true
+}
+
+/// Invalidate and clear the complete minimal `/btw` lifecycle.
+pub fn clear_minimal_btw(v: &mut AgentView) {
+    if v.minimal_btw_lifecycle.is_none() {
+        return;
+    }
+    v.minimal_btw_lifecycle = None;
+    v.btw_state = None;
+    v.btw_focused = false;
+    v.last_btw_area = Rect::default();
+    v.last_btw_selection_model = Default::default();
+    v.hit_btw_close.clear();
+    clear_btw_drag_state(v);
+}
+
+/// Clear text-drag state only when it belongs to the minimal `/btw` surface.
+///
+/// Kept in this facade rather than widening the viewer module's private helper:
+/// minimal already owns this lifecycle reset and is the only cross-module caller.
+fn clear_btw_drag_state(v: &mut AgentView) {
+    let is_btw = v
+        .pending_text_drag
+        .is_some_and(|p| p.anchor.entry_idx == crate::views::btw_overlay::BTW_OVERLAY_ENTRY_IDX)
+        || v.drag_selection.as_ref().is_some_and(|d| {
+            d.anchor.entry_idx == crate::views::btw_overlay::BTW_OVERLAY_ENTRY_IDX
+        });
+    if is_btw {
+        v.pending_text_drag = None;
+        v.drag_selection = None;
+        v.drag_autoscroll = None;
+        v.last_drag_mouse = None;
+    }
+}
+
+/// Atomically suspend the complete lifecycle while another surface handles input.
+pub(crate) fn suspend_minimal_btw(v: &mut AgentView) -> Option<SuspendedMinimalBtwLifecycle> {
+    let MinimalBtwLifecycle::Active {
+        request_id,
+        revision,
+    } = v.minimal_btw_lifecycle?
+    else {
+        return None;
+    };
+    let state = v.btw_state.take()?;
+    v.minimal_btw_lifecycle = Some(MinimalBtwLifecycle::Suspended { revision });
+    let focused = std::mem::replace(&mut v.btw_focused, false);
+    Some(SuspendedMinimalBtwLifecycle {
+        state,
+        request_id,
+        revision,
+        focused,
+    })
+}
+
+/// Restore only if delegated handling left the same suspension marker intact.
+pub(crate) fn restore_minimal_btw(v: &mut AgentView, suspended: SuspendedMinimalBtwLifecycle) {
+    if v.minimal_btw_lifecycle
+        != Some(MinimalBtwLifecycle::Suspended {
+            revision: suspended.revision,
+        })
+    {
+        return;
+    }
+    v.btw_state = Some(suspended.state);
+    v.btw_focused = suspended.focused;
+    v.minimal_btw_lifecycle = Some(MinimalBtwLifecycle::Active {
+        request_id: suspended.request_id,
+        revision: suspended.revision,
+    });
+}
+
+/// `AgentView::btw_focused` — whether Up/Down/PgUp/PgDn scroll the `/btw`
+/// panel (set when a Done answer arrives; cleared when the user returns to
+/// the prompt). Minimal paints the focus ring / ↑↓ hint from this flag.
+pub fn btw_focused(v: &AgentView) -> bool {
+    v.btw_focused
+}
+
 /// `AgentView::cancel_turn_view`.
 pub fn cancel_turn_view(v: &AgentView) -> Option<&CancelTurnViewState> {
     v.cancel_turn_view.as_ref()
@@ -356,12 +562,19 @@ pub fn resolve_turn_activity(v: &AgentView) -> Option<TurnActivity> {
     v.resolve_turn_activity()
 }
 
-/// [`AgentView::renders_parked`] — minimal renders the idle hint (not the
-/// turn-status row) while the parked-wait marker's turn is parked, mirroring
-/// the full TUI. The marker itself is pushed by the shared ACP notification
-/// path, so minimal's scrollback carries it too.
+/// [`AgentView::renders_parked`] — while the parked-wait marker's turn is
+/// parked, minimal renders the "watching · …" cue (watchers running) or the
+/// idle hint (none), mirroring the full TUI. The marker itself is pushed by
+/// the shared ACP notification path, so minimal's scrollback carries it too.
 pub fn renders_parked(v: &AgentView) -> bool {
     v.renders_parked()
+}
+
+/// [`AgentView::watchers`] — idle-surviving background work (running
+/// commands / monitors / loops / subagents) for the shared turn-status
+/// widget's "watching · …" cue.
+pub fn watchers(v: &AgentView) -> crate::views::turn_status::Watchers {
+    v.watchers()
 }
 
 /// [`AgentView::held_queue_count`].
@@ -482,6 +695,28 @@ pub fn mcp_status_label(status: &McpServerDisplayStatus) -> &'static str {
 }
 
 // ── Session picker builders ──────────────────────────────────────────────────
+
+/// Render a search bar from a [`PickerState`] using its grapheme-safe viewport.
+pub fn render_picker_search_bar(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    state: &PickerState,
+    show_hint: bool,
+    bg: Option<Color>,
+) {
+    crate::views::picker::render_picker_search_bar(
+        buf,
+        area.x,
+        area.y,
+        area.width,
+        theme,
+        state,
+        state.search_active,
+        show_hint,
+        bg,
+    );
+}
 
 /// [`crate::views::session_picker::repo_name_from_cwd`].
 pub fn repo_name_from_cwd(cwd: &str) -> String {
