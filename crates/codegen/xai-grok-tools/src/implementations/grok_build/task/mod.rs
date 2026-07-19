@@ -300,6 +300,7 @@ impl xai_tool_runtime::Tool for TaskTool {
             subagent_type: input.subagent_type.clone(),
             parent_session_id,
             parent_prompt_id,
+            swarm: None,
             resume_from,
             cwd,
             runtime_overrides: SubagentRuntimeOverrides {

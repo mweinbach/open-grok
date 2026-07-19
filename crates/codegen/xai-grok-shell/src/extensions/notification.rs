@@ -359,6 +359,11 @@ pub struct HookRunEntryDto {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "sessionUpdate")]
 pub enum SessionUpdate {
+    /// Swarm-mode state changed. Persisted through the normal xAI session-update path.
+    SwarmModeChanged {
+        enabled: bool,
+        trigger: Option<String>,
+    },
     /// A diff review request containing one or more file diffs for user review.
     DiffReview {
         /// The diff content to be reviewed.
@@ -592,6 +597,17 @@ pub enum SessionUpdate {
         /// ID of the source subagent this session was resumed from.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resumed_from: Option<String>,
+        /// Swarm grouping metadata. Absent for ordinary task subagents.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        swarm_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        swarm_description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        swarm_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        swarm_item: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        swarm_expected_members: Option<u32>,
     },
     /// Periodic progress update for a running subagent.
     ///
@@ -622,6 +638,20 @@ pub enum SessionUpdate {
         tools_used: Vec<String>,
         /// Number of errors encountered so far.
         error_count: u32,
+    },
+    /// Transient runtime status for a coordinated swarm member.
+    ///
+    /// Currently used for provider rate-limit backoff and retry attempts.
+    /// This update is never persisted to session history.
+    SubagentStatus {
+        subagent_id: String,
+        parent_session_id: String,
+        child_session_id: String,
+        /// "rate_limit_waiting" or "rate_limit_retrying".
+        status: String,
+        attempt: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
     },
     /// A subagent session has finished (success, failure, or cancellation).
     ///
@@ -1402,6 +1432,23 @@ mod tests {
     }
 
     #[test]
+    fn subagent_status_roundtrips_with_optional_retry_delay() {
+        let update = SessionUpdate::SubagentStatus {
+            subagent_id: "sub-rt".into(),
+            parent_session_id: "p".into(),
+            child_session_id: "c".into(),
+            status: "rate_limit_waiting".into(),
+            attempt: 2,
+            retry_after_ms: Some(6_000),
+        };
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(json["sessionUpdate"], "subagent_status");
+        assert_eq!(json["retry_after_ms"], 6_000);
+        let parsed: SessionUpdate = serde_json::from_value(json).unwrap();
+        assert_eq!(update, parsed);
+    }
+
+    #[test]
     fn subagent_progress_orders_after_spawned_before_finished() {
         // Verify that SubagentProgress appears between SubagentSpawned
         // and SubagentFinished in the enum definition (important for
@@ -1420,6 +1467,11 @@ mod tests {
             role: None,
             model: None,
             resumed_from: None,
+            swarm_id: None,
+            swarm_description: None,
+            swarm_index: None,
+            swarm_item: None,
+            swarm_expected_members: None,
         })
         .unwrap();
         let progress = serde_json::to_value(SessionUpdate::SubagentProgress {

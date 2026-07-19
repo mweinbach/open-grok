@@ -220,6 +220,7 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub session_model_id: acp::ModelId,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
+    pub session_swarm_mode: bool,
     pub prompt_display_cwd: Option<String>,
 }
 #[derive(Clone, Copy)]
@@ -359,6 +360,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         session_model_id,
         session_yolo_mode,
         session_auto_mode: false,
+        session_swarm_mode: false,
         prompt_display_cwd: None,
     }
 }
@@ -396,6 +398,12 @@ pub(crate) fn resolve_session_auto_mode(
     meta.and_then(|m| m.get("autoMode").or_else(|| m.get("auto_mode")))
         .and_then(|v| v.as_bool())
         .unwrap_or(default_auto_mode && !session_yolo_mode)
+}
+/// Resolve the requested manual swarm-mode seed from session metadata.
+pub(crate) fn resolve_session_swarm_mode(meta: Option<&acp::Meta>) -> bool {
+    meta.and_then(|m| m.get("swarmMode").or_else(|| m.get("swarm_mode")))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 /// Typed `_meta` payload for `PromptResponse`.
 /// camelCase keys match the bot's `_META_TOKEN_KEY_MAP`.

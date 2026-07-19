@@ -8,6 +8,7 @@ pub mod merge;
 pub mod notifications;
 pub mod pending_interaction;
 pub mod prompt_queue;
+pub(crate) mod swarm_mode;
 pub mod two_pass;
 pub use self::acp_session::*;
 pub use self::acp_types::*;

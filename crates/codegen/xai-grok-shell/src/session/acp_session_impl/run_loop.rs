@@ -210,7 +210,7 @@ pub(super) async fn run_session(
             return; }; if let Some(notification) = replay_buffer.flush() {
             session.emit_buffered(notification). await; } let (turn_succeeded,
             infra_pause_message) = SessionActor::post_turn_goal_degradation_plan(&
-            result); session.handle_completion(prompt_id, result). await; session
+            result); session.handle_completion(prompt_id, result). await; session.auto_exit_swarm_mode().await; session
             .maybe_apply_pending_web_search_reload().await; session
             .drain_monitor_buffer_to_pending(). await; if let Some(message) =
             infra_pause_message { session.apply_infra_pause_after_turn_err(message).
@@ -300,6 +300,7 @@ pub(super) async fn run_session(
             xai_file_utils::trace_context::link_current_span_to_meta(& meta); } let
             (trace_gcs_config, artifact_tracker) = match artifact_upload_ctx { Some(tu)
             => (Some(tu.gcs_config), Some(tu.artifact_tracker)), None => (None, None), };
+            session.maybe_inject_swarm_reminder().await;
             let cancel_for_send_now = session.queue_input(prompt_blocks, prompt_id,
             prompt_mode, trace_gcs_config, artifact_tracker, client_identifier,
             screen_mode, verbatim, json_schema, send_now, respond_to, persist_ack,
@@ -472,7 +473,7 @@ pub(super) async fn run_session(
             tracing::info!("Session received SetAutoMode: {}", enabled); session
             .permissions.set_auto_mode(enabled); if enabled { session
             .wire_permission_auto_llm_classifier(). await; } else { session.permissions
-            .set_llm_side_query_wired(false); } } SessionCommand::ResetPermissionState =>
+            .set_llm_side_query_wired(false); } } SessionCommand::SetSwarmMode { enabled, trigger } => { if enabled { session.enter_swarm_mode(trigger).await; } else { let exited = { let mut state = session.state.lock().await; if trigger == crate::session::swarm_mode::SwarmModeTrigger::Task { state.swarm_mode.exit_if_trigger(trigger) } else { let was_enabled = state.swarm_mode.enabled(); state.swarm_mode.exit(); was_enabled } }; if exited { session.send_xai_notification(crate::extensions::notification::SessionUpdate::SwarmModeChanged { enabled: false, trigger: None }).await; } } } SessionCommand::ResetPermissionState =>
             { session.permissions.reset_state(); tracing::info!(session_id = % session
             .session_info.id, "Permission state reset via notification"); }
             SessionCommand::Rewind { request, respond_to } => { let result = session

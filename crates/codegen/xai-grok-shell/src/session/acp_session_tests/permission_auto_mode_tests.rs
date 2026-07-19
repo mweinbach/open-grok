@@ -186,6 +186,19 @@ fn session_meta_auto_mode_key_resolution() {
     );
 }
 
+#[test]
+fn session_meta_swarm_mode_key_resolution() {
+    use crate::agent::mvp_agent::resolve_session_swarm_mode;
+
+    let camel = serde_json::json!({"swarmMode": true});
+    assert!(resolve_session_swarm_mode(camel.as_object()));
+
+    let snake = serde_json::json!({"swarm_mode": true});
+    assert!(resolve_session_swarm_mode(snake.as_object()));
+
+    assert!(!resolve_session_swarm_mode(None));
+}
+
 // ── neutralize_transcript_user_text (transcript injection defense) ──────────
 
 /// A newline + forged `user:` line in the user's own text must collapse to one

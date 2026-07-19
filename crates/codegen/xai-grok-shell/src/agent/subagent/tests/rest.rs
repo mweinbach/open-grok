@@ -354,6 +354,7 @@ fn resumable_source_returns_info_for_completed_subagent() {
                 worktree_path: Some(PathBuf::from("/tmp/worktree-1")),
                 snapshot_ref: None,
                 effective_model_id: "grok-3".into(),
+                model_route: None,
                 block_waited: false,
                 explicitly_killed: false,
                 persisted_output_dir: None,
@@ -418,6 +419,7 @@ fn resumed_from_field_in_meta_roundtrips() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("resumed_from"));
@@ -465,6 +467,7 @@ fn resumed_from_none_not_serialized_in_meta() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(! json.contains("resumed_from"), "None resumed_from should be omitted");
@@ -509,6 +512,7 @@ fn snapshot_ref_field_in_meta_roundtrips() {
         worktree_path: Some("/tmp/grok-wt/sa-snap".into()),
         snapshot_ref: Some("refs/open-grok/subagent-snapshots/sa-snap".into()),
         effective_model_id: None,
+        model_route: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("snapshot_ref"));
@@ -558,6 +562,7 @@ fn snapshot_test_meta(id: &str) -> SubagentMeta {
         worktree_path: Some("/tmp/grok-wt/subagent-x".into()),
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     }
 }
 /// The follow-up writer persists `snapshot_ref` into an already-finalized
@@ -919,6 +924,7 @@ fn subagent_session_metadata_roundtrip() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -979,6 +985,7 @@ fn subagent_session_metadata_non_forked() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -1043,6 +1050,7 @@ fn upload_lifecycle_spawn_then_completion_preserves_fields() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     };
     let spawn_gcs = SubagentSessionMetadata::from_meta(
         &spawn_meta,
@@ -1120,6 +1128,7 @@ fn upload_lifecycle_failure_preserves_error() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -1168,6 +1177,7 @@ fn session_metadata_session_kind_for_resumed() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -1247,6 +1257,7 @@ fn resume_source_worktree_reuse() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_route: None,
     };
     let worktree = source_with_worktree.worktree_path.clone();
     assert_eq!(
@@ -1263,6 +1274,7 @@ fn resume_source_worktree_reuse() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_route: None,
     };
     assert!(source_without_worktree.worktree_path.is_none(), "no worktree to reuse");
 }
@@ -1304,6 +1316,7 @@ fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_route: None,
     };
     assert_eq!(resume_inherited_cwd(Some(& present)), Some(existing.as_str()));
     let missing = ResumeSourceData {
@@ -1332,6 +1345,7 @@ fn select_override_cwd_resume_never_falls_through_to_request_cwd() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_route: None,
     };
     assert_eq!(select_override_cwd(Some(& source), Some("/x")), None);
 }
@@ -1365,6 +1379,7 @@ fn resumable_source_rejects_cross_session_lookup() {
                 worktree_path: None,
                 snapshot_ref: None,
                 effective_model_id: String::new(),
+                model_route: None,
                 block_waited: false,
                 explicitly_killed: false,
                 persisted_output_dir: None,
@@ -1465,6 +1480,7 @@ fn durable_fallback_roundtrips_child_cwd_and_worktree() {
         worktree_path: Some("/tmp/grok-wt/sa-dur".into()),
         snapshot_ref: None,
         effective_model_id: Some("grok-3".into()),
+        model_route: None,
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();
@@ -1504,6 +1520,7 @@ fn durable_fallback_rejects_running_status() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     };
     write_subagent_meta(&parent_dir, &meta);
     let data = std::fs::read_to_string(parent_dir.join("meta.json")).unwrap();
@@ -1585,6 +1602,7 @@ fn running_test_meta(id: &str, parent_session_id: &str) -> SubagentMeta {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        model_route: None,
     }
 }
 #[test]
@@ -1955,6 +1973,7 @@ fn resume_rejects_conflicting_subagent_type() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: None,
+        model_route: None,
     };
     let request_type = "explore";
     assert_ne!(
@@ -1972,6 +1991,7 @@ fn resume_rejects_conflicting_persona() {
         subagent_type: "general-purpose".into(),
         persona: Some("implementer".into()),
         model_id: None,
+        model_route: None,
     };
     let request_persona = Some("reviewer".to_string());
     let conflict = request_persona.as_deref() != source.persona.as_deref();
@@ -1988,6 +2008,7 @@ fn resume_allows_matching_identity() {
         subagent_type: "general-purpose".into(),
         persona: Some("implementer".into()),
         model_id: Some("grok-3".into()),
+        model_route: None,
     };
     assert_eq!("general-purpose", source.subagent_type);
     assert_eq!(Some("implementer"), source.persona.as_deref());
@@ -2004,6 +2025,7 @@ fn resume_identity_does_not_gate_on_model() {
         subagent_type: "general-purpose".into(),
         persona: None,
         model_id: Some("grok-3".into()),
+        model_route: None,
     };
     assert!(
         xai_grok_subagent_resolution::validate_resume_identity("general-purpose", None, &
@@ -2043,6 +2065,10 @@ fn durable_meta_roundtrips_effective_model_id() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: Some("grok-3".into()),
+        model_route: Some(xai_grok_subagent_resolution::SubagentModelRoute {
+            configured_model_id: "codex-grok-3".into(),
+            provider: xai_grok_sampling_types::ModelProvider::Codex,
+        }),
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();
@@ -2050,6 +2076,11 @@ fn durable_meta_roundtrips_effective_model_id() {
     assert_eq!(
         loaded.effective_model_id.as_deref(), Some("grok-3"),
         "model ID should round-trip through meta.json"
+    );
+    assert_eq!(
+        loaded.model_route.as_ref().map(|route| (&*route.configured_model_id, route.provider)),
+        Some(("codex-grok-3", xai_grok_sampling_types::ModelProvider::Codex)),
+        "configured provider route should round-trip through meta.json"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2062,6 +2093,56 @@ fn resume_model_pinning_overrides_default_resolution() {
     let resolved_same = "grok-3";
     let no_pin = source_model.as_deref() == Some(resolved_same);
     assert!(no_pin, "same model — no pinning needed");
+}
+#[test]
+fn resume_route_pins_overlapping_slug_to_its_provider_profile() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    let mut xai = byok_model_entry("shared-slug");
+    xai.info.provider = xai_grok_sampling_types::ModelProvider::Xai;
+    xai.info.base_url = "https://api.x.ai/v1".into();
+    let mut codex = byok_model_entry("shared-slug");
+    codex.info.provider = xai_grok_sampling_types::ModelProvider::Codex;
+    codex.info.base_url = "https://chatgpt.com/backend-api/codex".into();
+    ctx.available_models = indexmap::IndexMap::from([
+        ("xai-shared".into(), xai),
+        ("codex-shared".into(), codex),
+    ]);
+
+    let source = ResumeSourceData {
+        subagent_id: "source".into(),
+        child_session_id: "child".into(),
+        child_cwd: "/workspace".into(),
+        worktree_path: None,
+        snapshot_ref: None,
+        subagent_type: "general-purpose".into(),
+        persona: None,
+        model_id: Some("shared-slug".into()),
+        model_route: Some(xai_grok_subagent_resolution::SubagentModelRoute {
+            configured_model_id: "codex-shared".into(),
+            provider: xai_grok_sampling_types::ModelProvider::Codex,
+        }),
+    };
+    let (config, model_id) = resolve_resume_model_route(&source, &ctx).expect("route resolves");
+    assert_eq!(model_id.0.as_ref(), "codex-shared");
+    assert_eq!(config.provider, xai_grok_sampling_types::ModelProvider::Codex);
+
+    let legacy_ambiguous = ResumeSourceData { model_route: None, ..source.clone() };
+    assert!(
+        resolve_resume_model_route(&legacy_ambiguous, &ctx).is_none(),
+        "legacy slug-only metadata must fail closed when provider profiles overlap"
+    );
+
+    let unavailable = ResumeSourceData {
+        model_route: Some(xai_grok_subagent_resolution::SubagentModelRoute {
+            configured_model_id: "missing-route".into(),
+            provider: xai_grok_sampling_types::ModelProvider::Codex,
+        }),
+        ..source
+    };
+    assert!(
+        resolve_resume_model_route(&unavailable, &ctx).is_none(),
+        "an unavailable persisted route must fail closed"
+    );
 }
 #[test]
 fn resume_window_safety_rejects_instead_of_swapping() {
@@ -2104,6 +2185,11 @@ fn notification_subagent_spawned_includes_resumed_from() {
         role: None,
         model: None,
         resumed_from: Some("prev-agent-id".into()),
+        swarm_id: None,
+        swarm_description: None,
+        swarm_index: None,
+        swarm_item: None,
+        swarm_expected_members: None,
     };
     let json = serde_json::to_value(&notification).unwrap();
     assert_eq!(json["resumed_from"], "prev-agent-id");
@@ -2124,6 +2210,11 @@ fn notification_subagent_spawned_includes_resumed_from() {
         role: None,
         model: None,
         resumed_from: None,
+        swarm_id: None,
+        swarm_description: None,
+        swarm_index: None,
+        swarm_item: None,
+        swarm_expected_members: None,
     };
     let json = serde_json::to_value(&fresh).unwrap();
     assert!(json.get("resumed_from").is_none());
@@ -2183,6 +2274,7 @@ fn completed_subagent_propagates_resumed_from() {
                 worktree_path: None,
                 snapshot_ref: None,
                 effective_model_id: "grok-3".into(),
+                model_route: None,
                 block_waited: false,
                 explicitly_killed: false,
                 persisted_output_dir: None,

@@ -3198,6 +3198,11 @@ fn spawn_notif(subagent_id: &str, resumed_from: Option<&str>) -> XaiSessionNotif
             role: None,
             model: None,
             resumed_from: resumed_from.map(str::to_string),
+            swarm_id: None,
+            swarm_description: None,
+            swarm_index: None,
+            swarm_item: None,
+            swarm_expected_members: None,
         },
         meta: None,
     }

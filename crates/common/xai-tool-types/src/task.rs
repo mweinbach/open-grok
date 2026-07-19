@@ -2,7 +2,10 @@
 //! (`task`, `get_task_output`, `wait_tasks`).
 
 use schemars::JsonSchema;
+use serde::de::{MapAccess, Visitor};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 // ───────────────────────────────────────────────────────────────────────────
 // `task` (spawn) tool — Input
@@ -114,6 +117,100 @@ pub struct TaskToolInput {
 /// Default `subagent_type` for [`TaskToolInput`] when the caller omits it.
 pub fn default_subagent_type() -> String {
     "general-purpose".to_string()
+}
+
+/// Input for `agent_swarm`, which launches a bounded foreground cohort of
+/// subagents and returns their ordered results.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentSwarmToolInput {
+    /// Shared short description for every swarm member.
+    pub description: String,
+
+    /// Name of the subagent type to launch.
+    #[serde(default = "default_subagent_type")]
+    pub subagent_type: String,
+
+    /// Template used to construct each item member prompt. It must contain the
+    /// literal `{{item}}` placeholder when `items` is supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_template: Option<String>,
+
+    /// Ordered work items. At most 128 members are permitted in a swarm.
+    #[schemars(length(max = 128))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<String>>,
+
+    /// Ordered completed child IDs to resume before launching item members.
+    /// Each JSON-object key is a prior agent ID and its value is the exact
+    /// prompt appended to that resumed conversation.
+    #[schemars(with = "std::collections::BTreeMap<String, String>")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_agent_ids: Option<OrderedResumeAgentMap>,
+}
+
+/// An insertion-ordered JSON object used for `AgentSwarm.resume_agent_ids`.
+///
+/// JSON objects are model-facing maps, but swarm launch order is observable;
+/// this wrapper preserves the deserializer's member order rather than sorting
+/// keys. Duplicate keys use normal map semantics: the last supplied value wins
+/// while retaining its original slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrderedResumeAgentMap(Vec<(String, String)>);
+
+impl OrderedResumeAgentMap {
+    pub fn into_entries(self) -> Vec<(String, String)> {
+        self.0
+    }
+}
+
+impl FromIterator<(String, String)> for OrderedResumeAgentMap {
+    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
+        let mut entries = Vec::new();
+        for (key, value) in iter {
+            if let Some((_, existing)) = entries.iter_mut().find(|(existing, _)| existing == &key) {
+                *existing = value;
+            } else {
+                entries.push((key, value));
+            }
+        }
+        Self(entries)
+    }
+}
+
+impl Serialize for OrderedResumeAgentMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedResumeAgentMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OrderedMapVisitor;
+        impl<'de> Visitor<'de> for OrderedMapVisitor {
+            type Value = OrderedResumeAgentMap;
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an object mapping resume agent IDs to prompts")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or_default());
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if let Some((_, existing)) =
+                        entries.iter_mut().find(|(existing, _)| existing == &key)
+                    {
+                        *existing = value;
+                    } else {
+                        entries.push((key, value));
+                    }
+                }
+                Ok(OrderedResumeAgentMap(entries))
+            }
+        }
+        deserializer.deserialize_map(OrderedMapVisitor)
+    }
 }
 
 /// True when `s` is not a model-emitted placeholder (`""`, `"null"`, `"none"`,

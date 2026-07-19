@@ -358,6 +358,26 @@ impl SessionActor {
         if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {
             tracing::Span::current().record("model_id", cfg.model.as_str());
         }
+        let swarm_call = tool_calls
+            .iter()
+            .any(|call| call.function.name == "agent_swarm");
+        if swarm_call && tool_calls.len() != 1 {
+            const ERROR: &str = "`agent_swarm` must be the only tool call in its batch. Inspect briefly, then make one exclusive agent_swarm call for independent work; use ordinary task calls for heterogeneous small work.";
+            for call in tool_calls {
+                if records_model_tool_results() {
+                    self.chat_state_handle
+                        .push_tool_result(ConversationItem::tool_result(call.id, ERROR));
+                }
+            }
+            return Ok(ToolLoop::Continue);
+        }
+        if swarm_call {
+            let inactive = !self.state.lock().await.swarm_mode.enabled();
+            if inactive {
+                self.enter_swarm_mode(crate::session::swarm_mode::SwarmModeTrigger::Tool)
+                    .await;
+            }
+        }
         let mut final_result: Option<ToolLoop> = None;
         let mut deferred_followups: Vec<ConversationItem> = Vec::new();
         let mut approved: Vec<PreparedToolCall> = Vec::new();
@@ -1326,14 +1346,15 @@ impl SessionActor {
         } else {
             false
         };
-        if plan_file_auto_approve {
+        let swarm_parent_auto_approve = resolved_tool_name == "agent_swarm";
+        if plan_file_auto_approve || swarm_parent_auto_approve {
             tracing::info_span!(
                 "tool.decision", tool_name = % call.function.name, tool_use_id = % call
                 .id, decision = "allow", source = "config", wait_ms = 0_i64,
             )
             .in_scope(|| {});
         }
-        if !plan_file_auto_approve {
+        if !plan_file_auto_approve && !swarm_parent_auto_approve {
             let (perm_title, perm_kind, perm_raw_input) = tool_call_display
                 .as_ref()
                 .map(|(t, k, r)| (Some(t.clone()), Some(*k), Some(r.clone())))

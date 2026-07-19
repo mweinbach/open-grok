@@ -396,6 +396,11 @@ async fn test_subagent_notifications_round_trip() {
             role: None,
             model: None,
             resumed_from: None,
+            swarm_id: None,
+            swarm_description: None,
+            swarm_index: None,
+            swarm_item: None,
+            swarm_expected_members: None,
         },
         meta: None,
     };
@@ -511,6 +516,11 @@ async fn test_subagent_spawned_resumed_roundtrip() {
             role: None,
             model: None,
             resumed_from: Some("source-agent-id".to_string()),
+            swarm_id: None,
+            swarm_description: None,
+            swarm_index: None,
+            swarm_item: None,
+            swarm_expected_members: None,
         },
         meta: None,
     };

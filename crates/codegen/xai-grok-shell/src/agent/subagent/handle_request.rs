@@ -65,6 +65,43 @@ pub(crate) async fn handle_subagent_request(
     gateway: &GatewaySender,
 ) {
     let start = std::time::Instant::now();
+    let swarm_resume_id = request
+        .swarm
+        .as_ref()
+        .and_then(|_| request.resume_from.as_deref())
+        .filter(|id| is_valid_resume_id(id))
+        .map(str::to_string);
+    let pre_resolved_resume_source = if let Some(resume_id) = swarm_resume_id {
+        let coord = coordinator.borrow();
+        if coord.is_active(&resume_id) {
+            let msg = format!(
+                "Cannot resume from subagent '{resume_id}': it is still running. \
+                 Wait for it to complete before resuming."
+            );
+            drop(coord);
+            send_pre_spawn_failure(request, &msg, coordinator, &ctx, gateway);
+            return;
+        }
+        match coord.resumable_source_for(&resume_id, &ctx.parent_session_id, &ctx.parent_cwd) {
+            Some(source) => {
+                drop(coord);
+                request.subagent_type = source.subagent_type.clone();
+                request.runtime_overrides.persona = source.persona.clone();
+                Some(source)
+            }
+            None => {
+                let msg = format!(
+                    "Cannot resume from subagent '{resume_id}': not found. \
+                     The subagent may have been evicted or the ID is invalid."
+                );
+                drop(coord);
+                send_pre_spawn_failure(request, &msg, coordinator, &ctx, gateway);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let mut parent_wait_guard = (!request.run_in_background)
         .then(|| crate::tools::tool_context::BlockingWaitGuard::enter(
             ctx.parent_blocking_wait_depth.clone(),
@@ -182,7 +219,9 @@ pub(crate) async fn handle_subagent_request(
             "Role prompt_file degraded, continuing without role prompt"
         );
     }
-    let resume_source = if let Some(resume_id) = request
+    let resume_source = if pre_resolved_resume_source.is_some() {
+        pre_resolved_resume_source
+    } else if let Some(resume_id) = request
         .resume_from
         .as_deref()
         .filter(|s| is_valid_resume_id(s))
@@ -413,11 +452,13 @@ pub(crate) async fn handle_subagent_request(
         let child_depth = ctx.parent_depth + 1;
         if child_depth >= MAX_SUBAGENT_DEPTH {
             let before = definition.tool_config.tools.len();
-            definition.tool_config.tools.retain(|tc| tc.kind != Some(ToolKind::Task));
+            definition.tool_config.tools.retain(|tc| {
+                !matches!(tc.kind, Some(ToolKind::Task | ToolKind::AgentSwarm))
+            });
             if definition.tool_config.tools.len() < before {
                 tracing::info!(
-                    subagent_id = % request.id, child_depth, max_depth =
-                    MAX_SUBAGENT_DEPTH, "Stripped task tool from child at max depth"
+                    subagent_id = % request.id, child_depth, max_depth = MAX_SUBAGENT_DEPTH,
+                    "Stripped task and agent_swarm tools from child at max depth"
                 );
             }
             prune_orphaned_background_task_tools(&mut definition.tool_config);
@@ -454,21 +495,20 @@ pub(crate) async fn handle_subagent_request(
             effective_model_id = parent_mid;
         }
     }
-    if let Some(ref source) = resume_source
-        && let Some(ref source_model) = source.model_id
-        && effective_model_id.0.as_ref() != source_model.as_str()
-    {
-        if let Some(resolved) = resolve_model_override_to_config(source_model, &ctx) {
+    if let Some(ref source) = resume_source {
+        if let Some(resolved) = resolve_resume_model_route(source, &ctx) {
             tracing::info!(
                 subagent_id = % request.id, resolved_model = % effective_model_id.0,
-                source_model = source_model, "Pinning resumed child to source model"
+                source_model = ? source.model_id,
+                source_route = ? source.model_route,
+                "Pinning resumed child to source model route"
             );
             effective_sampling_config = resolved.0;
             effective_model_id = resolved.1;
         } else {
             let msg = format!(
-                "Cannot resume from subagent '{}': source model '{source_model}' \
-                 is no longer available in the model catalogue.",
+                "Cannot resume from subagent '{}': source model route is unavailable \
+                 or ambiguous in the model catalogue.",
                 source.subagent_id,
             );
             send_failure(request, &msg);
@@ -591,6 +631,11 @@ pub(crate) async fn handle_subagent_request(
         InitialContextSource::Forked => "forked",
         InitialContextSource::Resumed => "resumed",
     };
+    let meta_model_route = resolved_model_route(
+        &effective_sampling_config,
+        &effective_model_id,
+        &ctx,
+    );
     let subagent_meta = SubagentMeta {
         subagent_id: subagent_id.clone(),
         parent_session_id: ctx.parent_session_id.clone(),
@@ -617,6 +662,7 @@ pub(crate) async fn handle_subagent_request(
         worktree_path: worktree_path.as_ref().map(|p| p.to_string_lossy().to_string()),
         snapshot_ref: None,
         effective_model_id: Some(effective_model_id.0.to_string()),
+        model_route: meta_model_route,
     };
     let child_allows_xai_export = effective_sampling_config
         .provider
@@ -701,6 +747,11 @@ pub(crate) async fn handle_subagent_request(
             role: effective_runtime.role_name.clone(),
             model: Some(effective_model_id.0.to_string()),
             resumed_from: request.resume_from.clone(),
+            swarm_id: request.swarm.as_ref().map(|swarm| swarm.swarm_id.clone()),
+            swarm_description: request.swarm.as_ref().map(|swarm| swarm.description.clone()),
+            swarm_index: request.swarm.as_ref().map(|swarm| swarm.index),
+            swarm_item: request.swarm.as_ref().and_then(|swarm| swarm.item.clone()),
+            swarm_expected_members: request.swarm.as_ref().map(|swarm| swarm.expected_members),
         },
         ctx.parent_cmd_tx.as_ref(),
     );
@@ -806,6 +857,11 @@ pub(crate) async fn handle_subagent_request(
     let parent_traceparent = xai_file_utils::trace_context::current_traceparent();
     let tracker_child_cwd = child_session_info.cwd.clone();
     let tracker_model_id = effective_model_id.0.to_string();
+    let tracker_model_route = resolved_model_route(
+        &effective_sampling_config,
+        &effective_model_id,
+        &ctx,
+    );
     let initial_child_tokens = xai_chat_state::estimate_conversation_tokens(
         &forked_conversation,
     );
@@ -1111,6 +1167,16 @@ pub(crate) async fn handle_subagent_request(
         .agent_config
         .as_ref()
         .and_then(|config| config.ui.code_mode);
+    let scheduler_status_tx = request
+        .swarm
+        .as_ref()
+        .and_then(|swarm| swarm.status_tx.clone());
+    let (child_status_tx, child_status_rx) = if scheduler_status_tx.is_some() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let spawn_result = session::spawn_session_on_thread(
             child_session_info,
             gateway.clone(),
@@ -1141,6 +1207,7 @@ pub(crate) async fn handle_subagent_request(
                 parent_session_id: Some(ctx.parent_session_id.clone()),
                 subagent_type: Some(request.subagent_type.clone()),
                 preserve_inherited_system: verbatim_mirror_fork,
+                subagent_status_tx: child_status_tx,
                 ..Default::default()
             },
             xai_grok_workspace::permission::ClientType::Generic,
@@ -1212,7 +1279,8 @@ pub(crate) async fn handle_subagent_request(
                 || matches!(
                     agent_permission_mode,
                     xai_grok_agent::config::PermissionMode::BypassPermissions
-                ),
+            ),
+            false,
             false,
             None,
             ctx.inference_idle_timeout_secs,
@@ -1300,6 +1368,16 @@ pub(crate) async fn handle_subagent_request(
         return;
     }
     pending_guard.defuse();
+    if let (Some(status_rx), Some(status_tx)) = (child_status_rx, scheduler_status_tx) {
+        spawn_swarm_status_relay(
+            status_rx,
+            status_tx,
+            gateway.clone(),
+            ctx.parent_session_id.clone(),
+            child_session_id.0.to_string(),
+            ctx.parent_cmd_tx.clone(),
+        );
+    }
     coordinator
         .borrow_mut()
         .insert(SubagentTracker {
@@ -1318,6 +1396,7 @@ pub(crate) async fn handle_subagent_request(
             child_cwd: tracker_child_cwd,
             worktree_path: worktree_path.clone(),
             effective_model_id: tracker_model_id,
+            model_route: tracker_model_route,
             effective_provider: tracker_provider,
             run_in_background,
             surface_completion: request.surface_completion,
@@ -1389,14 +1468,21 @@ pub(crate) async fn handle_subagent_request(
         let (dummy_tx, _) = oneshot::channel();
         Some(std::mem::replace(&mut request.result_tx, dummy_tx))
     };
-    let wait_outcome = {
-        let fut = await_subagent_turn_or_cancellation(prompt_rx, cancel_token.clone());
+    let SubagentWaitResult {
+        outcome: wait_outcome,
+        final_text_override,
+    } = {
+        let fut = await_subagent_turn_with_summary_floor(
+            &child_handle,
+            prompt_rx,
+            cancel_token.clone(),
+        );
         tokio::pin!(fut);
-        if !request.run_in_background {
+        if !request.run_in_background && request.swarm.is_none() {
             /// How the bounded foreground wait ended.
             enum ForegroundWait {
                 /// The child finished (or was cancelled) within the budget.
-                Done(SubagentWaitOutcome),
+                Done(SubagentWaitResult),
                 /// The spawning tool's `result_rx` was dropped — parent turn died mid-await.
                 ParentGone,
                 /// `subagent_await_budget()` expired.
@@ -1418,7 +1504,7 @@ pub(crate) async fn handle_subagent_request(
             };
             match first {
                 ForegroundWait::Done(outcome) => {
-                    if matches!(outcome, SubagentWaitOutcome::Cancelled) {
+                    if matches!(&outcome.outcome, SubagentWaitOutcome::Cancelled) {
                         parent_wait_guard.take();
                     }
                     outcome
@@ -1500,11 +1586,14 @@ pub(crate) async fn handle_subagent_request(
                 }
                 _ => signals_snapshot_counts(&child_handle).await,
             };
-            let final_text = child_handle
-                .chat_state_handle
-                .get_last_assistant_text()
-                .await
-                .unwrap_or_default();
+            let final_text = match final_text_override {
+                Some(final_text) => final_text,
+                None => child_handle
+                    .chat_state_handle
+                    .get_last_assistant_text()
+                    .await
+                    .unwrap_or_default(),
+            };
             let result_tokens = child_handle.chat_state_handle.get_total_tokens().await;
             match *turn_result {
                 Ok(

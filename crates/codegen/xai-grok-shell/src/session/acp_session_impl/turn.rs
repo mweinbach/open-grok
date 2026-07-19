@@ -1,6 +1,9 @@
 //! Turn-execution concern for `SessionActor` (`handle_prompt`, turn-end,
 //! sampling loop).
 use super::*;
+use xai_grok_tools::implementations::grok_build::task::types::{
+    SubagentRateLimitDecision, SubagentStatusEvent,
+};
 /// Synthetic tool the model calls to return its schema-constrained final answer
 /// on backends that can't constrain output natively (Messages API). Intercepted
 /// in the loop, never executed as a real tool.
@@ -8,6 +11,31 @@ const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
 /// Max times the model may re-call `StructuredOutput` with non-conforming args
 /// before the turn ends with the last validation error.
 const STRUCTURED_OUTPUT_MAX_RETRIES: u32 = 3;
+fn is_rate_limited_turn_result(result: &Result<TurnOutcome, acp::Error>) -> bool {
+    matches!(
+        result,
+        Err(error)
+            if i32::from(error.code) == crate::sampling::error::RATE_LIMITED_ERROR_CODE
+    )
+}
+
+#[cfg(test)]
+mod swarm_rate_limit_tests {
+    use super::{TurnOutcome, is_rate_limited_turn_result};
+
+    #[test]
+    fn only_typed_rate_limit_errors_retry() {
+        let rate_limited: Result<TurnOutcome, agent_client_protocol::Error> =
+            Err(agent_client_protocol::Error::new(
+                crate::sampling::error::RATE_LIMITED_ERROR_CODE,
+                "rate limited",
+            ));
+        let other: Result<TurnOutcome, agent_client_protocol::Error> =
+            Err(agent_client_protocol::Error::internal_error());
+        assert!(is_rate_limited_turn_result(&rate_limited));
+        assert!(!is_rate_limited_turn_result(&other));
+    }
+}
 /// What a `StructuredOutput` tool call means for the turn (see
 /// `handle_structured_output_tool_call`).
 enum StructuredOutputStep {
@@ -368,6 +396,11 @@ impl SessionActor {
                     }
                     _ => return self.execute_builtin_slash_command(action).await,
                 }
+            }
+            Err(SlashCommandOutcome::SwarmPrompt { blocks }) => {
+                self.enter_swarm_mode(crate::session::swarm_mode::SwarmModeTrigger::Task)
+                    .await;
+                blocks
             }
             Err(SlashCommandOutcome::InvokeSkill {
                 blocks: original_blocks,
@@ -807,6 +840,7 @@ impl SessionActor {
         let result = {
             let mut round_trace = trace_gcs_config;
             let mut round_artifact = artifact_tracker;
+            let mut swarm_rate_limit_attempt = 0u32;
             loop {
                 if self.goal_harness_enabled() {
                     let goal_loop_active = self.goal_tracker.lock().status()
@@ -821,6 +855,38 @@ impl SessionActor {
                         json_schema.clone(),
                     )
                     .await;
+                if is_rate_limited_turn_result(&round)
+                    && let Some(status_tx) = self.startup_hints.subagent_status_tx.clone()
+                {
+                    swarm_rate_limit_attempt = swarm_rate_limit_attempt.saturating_add(1);
+                    let subagent_id = self.session_info.id.0.to_string();
+                    let (decision_tx, mut decision_rx) = mpsc::unbounded_channel();
+                    if status_tx
+                        .send(SubagentStatusEvent::RateLimitWaiting {
+                            subagent_id: subagent_id.clone(),
+                            attempt: swarm_rate_limit_attempt,
+                            decision_tx,
+                        })
+                        .is_err()
+                    {
+                        break round;
+                    }
+                    tracing::warn!(
+                        session_id = % self.session_info.id.0,
+                        attempt = swarm_rate_limit_attempt,
+                        "swarm subagent rate limited; awaiting scheduler decision"
+                    );
+                    match decision_rx.recv().await {
+                        Some(SubagentRateLimitDecision::Retry) => {
+                            let _ = status_tx.send(SubagentStatusEvent::RateLimitRetrying {
+                                subagent_id,
+                                attempt: swarm_rate_limit_attempt,
+                            });
+                            continue;
+                        }
+                        Some(SubagentRateLimitDecision::Fail) | None => break round,
+                    }
+                }
                 if !matches!(round, Ok(TurnOutcome::Completed { .. })) {
                     break round;
                 }

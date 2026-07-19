@@ -45,6 +45,16 @@ pub struct EffectiveRuntimeConfig {
     pub isolation: xai_tool_types::SubagentIsolationMode,
 }
 
+/// Exact provider/configured model route selected for a source child.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubagentModelRoute {
+    /// Catalog/configured model ID selected for the source child.
+    pub configured_model_id: String,
+    /// Provider profile declared by that catalog entry. This is deliberately
+    /// independent of the model slug because slugs can overlap across profiles.
+    pub provider: xai_grok_sampling_types::ModelProvider,
+}
+
 /// Data about a completed source subagent, needed for resume validation
 /// and downstream spawn orchestration.
 #[derive(Debug, Clone)]
@@ -61,6 +71,9 @@ pub struct ResumeSourceData {
     /// Used by the shell for resume model pinning (model overrides on
     /// resume are soft-ignored, not identity-gated).
     pub model_id: Option<String>,
+    /// Exact configured route for the source child. New metadata always stores
+    /// this; absent values are legacy metadata and must be resolved safely.
+    pub model_route: Option<SubagentModelRoute>,
     /// Effective cwd the source child used. Consumed by the shell's
     /// spawn orchestration to reconstruct `SessionInfo` for raw
     /// transcript continuation and worktree reuse.

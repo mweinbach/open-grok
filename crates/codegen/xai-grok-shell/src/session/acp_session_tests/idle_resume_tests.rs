@@ -99,6 +99,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 notifications_suppressed: false,
                 rewindable: false,
                 nudges_used_this_session: 0,
+                swarm_mode: crate::session::swarm_mode::SwarmModeTracker::default(),
             });
             let (chat_event_tx, _) = tokio::sync::mpsc::unbounded_channel();
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();

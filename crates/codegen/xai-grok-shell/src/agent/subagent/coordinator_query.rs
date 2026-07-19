@@ -239,6 +239,7 @@ impl SubagentCoordinator {
                 subagent_type: completed.subagent_type.clone(),
                 persona: completed.persona.clone(),
                 model_id: Some(completed.effective_model_id.clone()),
+                model_route: completed.model_route.clone(),
             });
         }
         let parent_info = SessionInfo {
@@ -267,6 +268,7 @@ impl SubagentCoordinator {
             subagent_type: meta.subagent_type,
             persona: meta.persona,
             model_id: meta.effective_model_id,
+            model_route: meta.model_route,
         })
     }
     /// Check whether an ID refers to a currently-active (running) subagent.

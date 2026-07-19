@@ -80,6 +80,9 @@ pub(crate) struct SubagentTracker {
     pub worktree_path: Option<PathBuf>,
     /// Effective model ID used by the child session.
     pub effective_model_id: String,
+    /// Exact configured model route used by the child session. This prevents
+    /// resume from selecting a different provider when model slugs overlap.
+    pub model_route: Option<xai_grok_subagent_resolution::SubagentModelRoute>,
     /// Provider resolved for the child's live sampler. Kept separately from
     /// the model ID so credential revocation never relies on slug heuristics.
     pub effective_provider: xai_grok_sampling_types::ModelProvider,
@@ -497,6 +500,8 @@ pub(crate) struct CompletedSubagent {
     pub snapshot_ref: Option<String>,
     /// Effective model ID used by the child session.
     pub effective_model_id: String,
+    /// Exact configured model route used by the child session.
+    pub model_route: Option<xai_grok_subagent_resolution::SubagentModelRoute>,
     /// Set when a `block=true` waiter consumed this subagent's result.
     pub block_waited: bool,
     /// Set when the model explicitly killed this subagent via the kill tool.
@@ -1124,6 +1129,69 @@ fn resolve_model_override_to_config(
     );
     Some((config, canonical_model_id))
 }
+
+/// Capture a stable catalog route for a resolved child model. Prefer the
+/// catalog key returned by resolution; only fall back to a unique exact
+/// provider/model/endpoint match when the live parent route lacks that key.
+fn resolved_model_route(
+    config: &xai_grok_sampler::SamplerConfig,
+    model_id: &acp::ModelId,
+    ctx: &SubagentSpawnContext,
+) -> Option<xai_grok_subagent_resolution::SubagentModelRoute> {
+    let candidate = ctx
+        .available_models
+        .get(model_id.0.as_ref())
+        .and_then(|entry| {
+            (entry.info().provider == config.provider).then(|| model_id.0.to_string())
+        });
+    let configured_model_id = candidate.or_else(|| {
+        let mut matches = ctx.available_models.iter().filter(|(_, entry)| {
+            let info = entry.info();
+            info.provider == config.provider
+                && info.model == config.model
+                && info.base_url == config.base_url
+        });
+        let (id, _) = matches.next()?;
+        matches.next().is_none().then(|| id.clone())
+    })?;
+    Some(xai_grok_subagent_resolution::SubagentModelRoute {
+        configured_model_id,
+        provider: config.provider,
+    })
+}
+
+/// Resolve a stored resume route without falling back across provider
+/// profiles. Legacy slug-only metadata remains supported only when it maps to
+/// a single catalog entry.
+fn resolve_resume_model_route(
+    source: &xai_grok_subagent_resolution::ResumeSourceData,
+    ctx: &SubagentSpawnContext,
+) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
+    if let Some(route) = &source.model_route {
+        let entry = ctx.available_models.get(&route.configured_model_id)?;
+        if entry.info().provider != route.provider {
+            return None;
+        }
+        return resolve_model_override_to_config(&route.configured_model_id, ctx)
+            .filter(|(config, _)| config.provider == route.provider);
+    }
+
+    let legacy_model_id = source.model_id.as_deref()?;
+    if ctx.available_models.contains_key(legacy_model_id) {
+        return resolve_model_override_to_config(legacy_model_id, ctx);
+    }
+    let mut matches = ctx
+        .available_models
+        .iter()
+        .filter(|(_, entry)| entry.info().model == legacy_model_id);
+    let (configured_model_id, _) = matches.next()?;
+    matches
+        .next()
+        .is_none()
+        .then(|| resolve_model_override_to_config(configured_model_id, ctx))
+        .flatten()
+}
+
 /// Re-resolve a Kimi child's endpoint and credential immediately before its
 /// sampling client is built.
 ///
@@ -2018,6 +2086,139 @@ enum SubagentWaitOutcome {
     Cancelled,
     TurnResult(Box<Result<SubagentPromptTurnResult, oneshot::error::RecvError>>),
 }
+
+struct SubagentWaitResult {
+    outcome: SubagentWaitOutcome,
+    final_text_override: Option<String>,
+}
+
+impl SubagentWaitResult {
+    fn new(outcome: SubagentWaitOutcome) -> Self {
+        Self {
+            outcome,
+            final_text_override: None,
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self::new(SubagentWaitOutcome::Cancelled)
+    }
+}
+
+const SUBAGENT_FINAL_SUMMARY_MIN_CHARS: usize = 200;
+const SUBAGENT_FINAL_SUMMARY_CONTINUATION_PROMPT: &str = concat!(
+    "Your previous final response is too brief for a parent-agent handoff. Continue with a ",
+    "technically complete handoff summary covering the work performed, key files or components ",
+    "touched or inspected, decisions made, verification status, remaining risks, and exact next ",
+    "steps. Be concise but complete."
+);
+
+fn should_request_final_summary_continuation(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && trimmed.chars().count() < SUBAGENT_FINAL_SUMMARY_MIN_CHARS
+}
+
+fn is_completed_subagent_wait_outcome(outcome: &SubagentWaitOutcome) -> bool {
+    matches!(
+        outcome,
+        SubagentWaitOutcome::TurnResult(result)
+            if matches!(
+                &**result,
+                Ok(Ok(crate::session::commands::PromptTurnOk {
+                    completion_kind: crate::session::commands::PromptCompletionKind::Completed,
+                    ..
+                }))
+            )
+    )
+}
+
+fn select_final_summary_wait_result(
+    initial: SubagentWaitOutcome,
+    initial_text: String,
+    continuation: SubagentWaitOutcome,
+    continuation_text: &str,
+) -> SubagentWaitResult {
+    if matches!(&continuation, SubagentWaitOutcome::Cancelled) {
+        return SubagentWaitResult::cancelled();
+    }
+    if is_completed_subagent_wait_outcome(&continuation)
+        && continuation_text.trim().chars().count() > initial_text.trim().chars().count()
+    {
+        return SubagentWaitResult::new(continuation);
+    }
+    SubagentWaitResult {
+        outcome: initial,
+        final_text_override: Some(initial_text),
+    }
+}
+
+async fn await_subagent_turn_with_summary_floor(
+    child_handle: &crate::session::SessionHandle,
+    prompt_rx: oneshot::Receiver<SubagentPromptTurnResult>,
+    cancel_token: CancellationToken,
+) -> SubagentWaitResult {
+    let initial = await_subagent_turn_or_cancellation(prompt_rx, cancel_token.clone()).await;
+    if cancel_token.is_cancelled() {
+        return SubagentWaitResult::cancelled();
+    }
+    if !is_completed_subagent_wait_outcome(&initial) {
+        return SubagentWaitResult::new(initial);
+    }
+    let initial_text = child_handle
+        .chat_state_handle
+        .get_last_assistant_text()
+        .await
+        .unwrap_or_default();
+    if !should_request_final_summary_continuation(&initial_text) {
+        return SubagentWaitResult::new(initial);
+    }
+    if cancel_token.is_cancelled() {
+        return SubagentWaitResult::cancelled();
+    }
+    let (respond_to, continuation_rx) = oneshot::channel();
+    if child_handle
+        .cmd_tx
+        .send(crate::session::commands::SessionCommand::Prompt {
+            prompt_id: format!("subagent-summary-floor-{}", uuid::Uuid::now_v7()),
+            prompt_blocks: vec![agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent::new(SUBAGENT_FINAL_SUMMARY_CONTINUATION_PROMPT),
+            )],
+            prompt_mode: crate::session::plan_mode::PromptMode::Agent,
+            artifact_upload_ctx: None,
+            client_identifier: None,
+            screen_mode: None,
+            verbatim: true,
+            traceparent: xai_file_utils::trace_context::current_traceparent(),
+            json_schema: None,
+            send_now: false,
+            respond_to,
+            persist_ack: None,
+            parsed_prompt_tx: None,
+        })
+        .is_err()
+    {
+        return SubagentWaitResult::new(initial);
+    }
+    let continuation =
+        await_subagent_turn_or_cancellation(continuation_rx, cancel_token.clone()).await;
+    if cancel_token.is_cancelled() {
+        return SubagentWaitResult::cancelled();
+    }
+    let continuation_text = if is_completed_subagent_wait_outcome(&continuation) {
+        child_handle
+            .chat_state_handle
+            .get_last_assistant_text()
+            .await
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if cancel_token.is_cancelled() {
+        return SubagentWaitResult::cancelled();
+    }
+    select_final_summary_wait_result(initial, initial_text, continuation, &continuation_text)
+}
+
 async fn await_subagent_turn_or_cancellation(
     prompt_rx: oneshot::Receiver<SubagentPromptTurnResult>,
     cancel_token: CancellationToken,
@@ -2387,6 +2588,60 @@ fn emit_subagent_notification(
         gateway.forward_fire_and_forget(ext_notification);
     }
 }
+fn spawn_swarm_status_relay(
+    mut status_rx: mpsc::UnboundedReceiver<SubagentStatusEvent>,
+    scheduler_status_tx: mpsc::UnboundedSender<SubagentStatusEvent>,
+    gateway: GatewaySender,
+    parent_session_id: String,
+    child_session_id: String,
+    parent_cmd_tx: Option<mpsc::UnboundedSender<SessionCommand>>,
+) {
+    tokio::task::spawn_local(async move {
+        while let Some(event) = status_rx.recv().await {
+            let _ = scheduler_status_tx.send(event.clone());
+            let (subagent_id, status, attempt, retry_after_ms) = match event {
+                SubagentStatusEvent::ProviderRequestStarted { .. } => continue,
+                SubagentStatusEvent::RateLimitWaiting {
+                    subagent_id,
+                    attempt,
+                    ..
+                } => (
+                    subagent_id,
+                    "rate_limit_waiting".to_string(),
+                    attempt,
+                    Some(
+                        xai_grok_tools::implementations::grok_build::task::types::swarm_rate_limit_backoff(
+                            attempt,
+                        )
+                        .as_millis() as u64,
+                    ),
+                ),
+                SubagentStatusEvent::RateLimitRetrying {
+                    subagent_id,
+                    attempt,
+                } => (
+                    subagent_id,
+                    "rate_limit_retrying".to_string(),
+                    attempt,
+                    None,
+                ),
+            };
+            emit_subagent_notification(
+                &gateway,
+                &parent_session_id,
+                SessionUpdate::SubagentStatus {
+                    subagent_id,
+                    parent_session_id: parent_session_id.clone(),
+                    child_session_id: child_session_id.clone(),
+                    status,
+                    attempt,
+                    retry_after_ms,
+                },
+                parent_cmd_tx.as_ref(),
+            );
+        }
+    });
+}
 /// Progress notification emission interval.
 const PROGRESS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Change signature for the progress-publisher dedupe:
@@ -2583,6 +2838,10 @@ pub(crate) struct SubagentMeta {
     /// durable `resume_from` identity validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_model_id: Option<String>,
+    /// Exact configured model route used by the child session. Persisted so
+    /// resume can retain provider identity even when slugs overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_route: Option<xai_grok_subagent_resolution::SubagentModelRoute>,
 }
 /// Canonical subagent metadata for GCS persistence (`subagent.json`).
 ///

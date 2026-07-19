@@ -27,6 +27,7 @@ SubagentEvent mpsc  ──►  MvpAgent::start_subagent_coordinator (spawn_local
 | Piece | Path |
 | --- | --- |
 | `task` tool | `xai-grok-tools/src/implementations/grok_build/task/` |
+| `agent_swarm` tool | `xai-grok-tools/src/implementations/grok_build/agent_swarm/` |
 | Input / capability / isolation types | `crates/common/xai-tool-types/src/task.rs` |
 | Backend + events | `…/task/backend.rs`, `…/task/types.rs` |
 | Coordinator + drain | `xai-grok-shell/src/agent/subagent/`, `mvp_agent/subagent_coordinator.rs` |
@@ -51,6 +52,31 @@ SubagentEvent mpsc  ──►  MvpAgent::start_subagent_coordinator (spawn_local
 Related tools: `get_command_or_subagent_output` / background task action, `kill_task`. Task tool **requires** those kinds in the toolset (`requires_expr`).
 
 Dynamic tool description is **not** the static template on `TaskTool`; it is built in `xai-grok-agent` (`build_task_description` / `builder.rs`) from available agent types.
+
+## Agent swarm flow
+
+`agent_swarm` is a foreground-only orchestration tool for homogeneous, independent work. The shell treats it as an exclusive tool call: if a model batches it with another tool, the batch is rejected before execution.
+
+Input rules:
+
+- `description` is shared by every member; `subagent_type` defaults to `general-purpose` for newly spawned members.
+- `items` requires at least two entries unless `resume_agent_ids` is also supplied. Total members are capped at 128.
+- When `items` is present, `prompt_template` is required, must contain literal `{{item}}`, and must expand to distinct prompts.
+- `resume_agent_ids` is an insertion-ordered object of completed child IDs to continuation prompts. Resume members launch first and preserve the source child profile (type/persona/model) rather than applying the new-member default.
+
+Scheduling and output:
+
+- Validate the full call before spawning anything, including new-member type validation.
+- Launch up to five members immediately, then at most one additional member every 700 ms. `OPENGROK_AGENT_SWARM_MAX_CONCURRENCY` can apply a positive active-member cap.
+- Launch priority is a suspended same-agent retry, then an explicit resume, then a new member. A retry resumes the live child turn through its scheduler decision lane; the child does not sleep or create a replacement session.
+- The first provider 429 enters rate-limit phase. The affected member is requeued at the front with per-member eligibility of 3 s, 6 s, 12 s, 24 s, and so on. If it is already the only unfinished member, the scheduler fails it instead of leaving the swarm suspended indefinitely.
+- Rate-limit capacity starts from the number of normal members that reached their first provider request, minus one, with a minimum of one. Later 429s shrink capacity by one at most every two seconds. While rate-limited, a scheduling pass starts at most one retry/resume/new member and requires both the global launch gate and the selected member's eligibility deadline to have elapsed.
+- A provider-ready attempt resets the global retry interval to three seconds. If work remains queued and no 429 occurs for three minutes, capacity recovers by one once for that quiet window; another 429 starts a new window.
+- Each member has a two-hour default timeout (`OPENGROK_SUBAGENT_TIMEOUT_MS`; `0` disables it).
+- Results are collected into fixed input-order slots and returned under `<agent_swarm_result>`, including resumable agent IDs for unfinished work.
+- Swarm metadata rides on ordinary `SubagentSpawned` / progress / finish notifications, so coordinator lifecycle, usage fold-back, permissions, resume identity, and worktree handling remain the normal subagent paths.
+
+Swarm mode can be entered manually (`/swarm`, `/swarm on`) or for one turn (`/swarm <task>` / direct `agent_swarm`). Manual mode survives turns and takes precedence over one-shot triggers; task/tool activation auto-exits at the turn boundary.
 
 ## SubagentCoordinator lifecycle
 
@@ -147,13 +173,13 @@ Additionally, if effective isolation is still `none` but `AgentDefinition.isolat
 
 ```text
 Parent session depth 0  →  may call task
-Child  session depth 1  →  task tool stripped / call rejected
+Child  session depth 1  →  task + agent_swarm stripped / calls rejected
 ```
 
 Two complementary guards:
 
 1. **Call-time reject** in `TaskTool::run` when `SubagentDepthCounter >= 1`.
-2. **Toolset strip** in `handle_subagent_request`: if `parent_depth + 1 >= MAX_SUBAGENT_DEPTH`, remove all `ToolKind::Task` entries and prune orphaned background task tools so the model never sees a nested spawn tool.
+2. **Toolset strip** in `handle_subagent_request`: if `parent_depth + 1 >= MAX_SUBAGENT_DEPTH`, remove `ToolKind::Task` and `ToolKind::AgentSwarm`, then prune orphaned background task tools so the model never sees a nested spawn surface.
 
 Child `tool_context.subagent_depth` and shared `SubagentDepthCounter` are set to `parent_depth + 1` at spawn. Nested depth > 1 is unsupported by design (flat tree).
 

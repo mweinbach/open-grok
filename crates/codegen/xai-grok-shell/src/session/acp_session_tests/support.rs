@@ -184,6 +184,7 @@ pub(crate) async fn create_test_actor_ex(
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,
+        swarm_mode: crate::session::swarm_mode::SwarmModeTracker::default(),
     });
     let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();

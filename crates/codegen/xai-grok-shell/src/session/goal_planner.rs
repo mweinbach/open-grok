@@ -341,6 +341,7 @@ impl ChannelSpawner {
             subagent_type: GOAL_PLANNER_SUBAGENT_TYPE.to_string(),
             parent_session_id: self.parent_session_id.clone(),
             parent_prompt_id: self.parent_prompt_id.clone(),
+            swarm: None,
             resume_from: None,
             cwd: self.cwd.clone(),
             runtime_overrides: SubagentRuntimeOverrides {

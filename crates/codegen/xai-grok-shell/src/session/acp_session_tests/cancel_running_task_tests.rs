@@ -125,6 +125,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     notifications_suppressed: false,
                     rewindable: false,
                     nudges_used_this_session: 0,
+                    swarm_mode: crate::session::swarm_mode::SwarmModeTracker::default(),
                 }),
                 notifications: NotificationSender {
                     gateway: GatewaySender::new(gateway_tx),
@@ -591,6 +592,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     notifications_suppressed: false,
                     rewindable: false,
                     nudges_used_this_session: 0,
+                    swarm_mode: crate::session::swarm_mode::SwarmModeTracker::default(),
                 }),
                 notifications: NotificationSender {
                     gateway: GatewaySender::new(gateway_tx),
@@ -840,6 +842,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 notifications_suppressed: false,
                 rewindable: false,
                 nudges_used_this_session: 0,
+            swarm_mode: crate::session::swarm_mode::SwarmModeTracker::default(),
             });
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<
                 SessionEvent,
@@ -1893,6 +1896,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 notifications_suppressed: false,
                 rewindable: false,
                 nudges_used_this_session: 0,
+            swarm_mode: crate::session::swarm_mode::SwarmModeTracker::default(),
             });
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<
                 SessionEvent,

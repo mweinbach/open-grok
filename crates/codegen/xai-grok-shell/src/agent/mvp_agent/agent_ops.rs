@@ -2973,6 +2973,7 @@ impl MvpAgent {
             session_model_id,
             session_yolo_mode,
             session_auto_mode,
+            session_swarm_mode,
             prompt_display_cwd,
         } = spec;
         let _timer = crate::instrumentation_timer!("session.spawn_and_register");
@@ -3671,6 +3672,7 @@ impl MvpAgent {
                     session_model_id,
                     session_yolo_mode,
                     session_auto_mode,
+                    session_swarm_mode,
                     origin_client.as_ref().map(|o| o.product.clone()),
                     inference_idle_timeout_secs,
                     model_max_retries,

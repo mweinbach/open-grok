@@ -321,6 +321,7 @@ impl SubagentCoordinator {
                     worktree_path: None,
                     snapshot_ref: None,
                     effective_model_id: String::new(),
+                    model_route: None,
                     block_waited: false,
                     explicitly_killed: false,
                     persisted_output_dir: None,
@@ -383,6 +384,7 @@ impl SubagentCoordinator {
             .as_ref()
             .map(|t| t.effective_model_id.clone())
             .unwrap_or_default();
+        let model_route = tracker.as_ref().and_then(|t| t.model_route.clone());
         let block_waited = tracker.as_ref().is_some_and(|t| t.block_waited);
         let explicitly_killed = tracker.as_ref().is_some_and(|t| t.explicitly_killed);
         let surface_completion = tracker.as_ref().is_none_or(|t| t.surface_completion);
@@ -402,6 +404,7 @@ impl SubagentCoordinator {
             worktree_path,
             snapshot_ref: None,
             effective_model_id,
+            model_route,
             block_waited,
             explicitly_killed,
             persisted_output_dir,

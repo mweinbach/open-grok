@@ -308,6 +308,7 @@ pub(crate) async fn spawn_session_actor(
     session_model_id: acp::ModelId,
     session_yolo_mode: bool,
     session_auto_mode: bool,
+    session_swarm_mode: bool,
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
@@ -640,6 +641,10 @@ pub(crate) async fn spawn_session_actor(
         }
     }
     chat_state_handle.update_credentials(credentials);
+    let mut swarm_mode = crate::session::swarm_mode::SwarmModeTracker::default();
+    if session_swarm_mode {
+        swarm_mode.enter(crate::session::swarm_mode::SwarmModeTrigger::Manual);
+    }
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
@@ -649,6 +654,7 @@ pub(crate) async fn spawn_session_actor(
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,
+        swarm_mode,
     });
     let mcp_strategy = match std::env::var("MCP_INIT_STRATEGY") {
         Ok(v) if !v.trim().is_empty() => McpInitStrategy::from(v),
@@ -1979,6 +1985,7 @@ pub(crate) async fn spawn_session_on_thread(
     session_model_id: acp::ModelId,
     session_yolo_mode: bool,
     session_auto_mode: bool,
+    session_swarm_mode: bool,
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
@@ -2145,6 +2152,7 @@ pub(crate) async fn spawn_session_on_thread(
                         session_model_id,
                         session_yolo_mode,
                         session_auto_mode,
+                        session_swarm_mode,
                         session_client_identifier,
                         inference_idle_timeout_secs,
                         max_retries,

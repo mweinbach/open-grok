@@ -172,6 +172,7 @@ pub(crate) fn make_request(
         subagent_type: subagent_type.into(),
         parent_session_id: "test-parent".into(),
         parent_prompt_id: Some("parent-prompt".into()),
+        swarm: None,
         resume_from: None,
         cwd: None,
         runtime_overrides: Default::default(),

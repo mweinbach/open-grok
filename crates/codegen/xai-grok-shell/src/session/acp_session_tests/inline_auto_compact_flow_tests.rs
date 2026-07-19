@@ -43,6 +43,7 @@ async fn create_test_actor(
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,
+        swarm_mode: crate::session::swarm_mode::SwarmModeTracker::default(),
     });
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
@@ -477,6 +478,7 @@ async fn create_test_actor_with_memory(
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,
+        swarm_mode: crate::session::swarm_mode::SwarmModeTracker::default(),
     });
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn(

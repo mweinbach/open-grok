@@ -596,6 +596,7 @@ pub(super) enum SlashCommandOutcome {
     /// rewritten. The shell's prompt assembly layer will read each skill's
     /// SKILL.md, apply substitutions, and build the `<skill_information>`
     /// envelope alongside the `<user_query>` block.
+    SwarmPrompt { blocks: Vec<acp::ContentBlock> },
     InvokeSkill {
         /// The original, unmodified prompt blocks.
         blocks: Vec<acp::ContentBlock>,
@@ -609,6 +610,10 @@ pub(super) enum BuiltinAction {
         user_context: Option<String>,
     },
     SetYolo {
+        enabled: bool,
+    },
+    ToggleSwarm,
+    SetSwarm {
         enabled: bool,
     },
     FlushMemory,
@@ -666,6 +671,7 @@ impl BuiltinAction {
         match self {
             BuiltinAction::Compact { .. } => "compact",
             BuiltinAction::SetYolo { .. } => "yolo",
+            BuiltinAction::ToggleSwarm | BuiltinAction::SetSwarm { .. } => "swarm",
             BuiltinAction::FlushMemory => "flush",
             BuiltinAction::Dream => "dream",
             BuiltinAction::ContextInfo => "context",
@@ -698,6 +704,8 @@ impl BuiltinAction {
         match self {
             BuiltinAction::Compact { user_context } => user_context.is_some(),
             BuiltinAction::SetYolo { .. } => true,
+            BuiltinAction::ToggleSwarm => false,
+            BuiltinAction::SetSwarm { .. } => true,
             BuiltinAction::FlushMemory => false,
             BuiltinAction::Dream => false,
             BuiltinAction::ContextInfo => false,
@@ -1009,6 +1017,31 @@ pub(super) fn resolve(
         });
     }
 
+    if command_name == "swarm" {
+        match args.trim() {
+            "" => {
+                return Err(SlashCommandOutcome::Builtin(BuiltinAction::ToggleSwarm));
+            }
+            "on" => {
+                return Err(SlashCommandOutcome::Builtin(BuiltinAction::SetSwarm {
+                    enabled: true,
+                }));
+            }
+            "off" => {
+                return Err(SlashCommandOutcome::Builtin(BuiltinAction::SetSwarm {
+                    enabled: false,
+                }));
+            }
+            prompt => {
+                return Err(SlashCommandOutcome::SwarmPrompt {
+                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        prompt.to_string(),
+                    ))],
+                });
+            }
+        }
+    }
+
     // Check if the leading /command is a builtin.
     let commands = all_commands(skills, availability);
     let builtin_match = commands
@@ -1258,6 +1291,31 @@ mod tests {
         assert!(matches!(
             outcome,
             SlashCommandOutcome::Builtin(BuiltinAction::SetYolo { enabled: true })
+        ));
+    }
+
+    #[test]
+    fn bare_swarm_toggles_while_on_off_remain_explicit() {
+        let resolve_swarm = |text: &str| {
+            resolve(
+                vec![text_block(text)],
+                &[],
+                all_gated(),
+                SkillSlashRewrite::default(),
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(
+            resolve_swarm("/swarm"),
+            SlashCommandOutcome::Builtin(BuiltinAction::ToggleSwarm)
+        ));
+        assert!(matches!(
+            resolve_swarm("/swarm on"),
+            SlashCommandOutcome::Builtin(BuiltinAction::SetSwarm { enabled: true })
+        ));
+        assert!(matches!(
+            resolve_swarm("/swarm off"),
+            SlashCommandOutcome::Builtin(BuiltinAction::SetSwarm { enabled: false })
         ));
     }
 

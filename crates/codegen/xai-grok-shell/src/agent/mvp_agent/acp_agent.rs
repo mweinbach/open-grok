@@ -994,6 +994,7 @@ impl acp::Agent for MvpAgent {
             self.default_auto_mode,
             session_yolo_mode,
         );
+        let session_swarm_mode = resolve_session_swarm_mode(arguments.meta.as_ref());
         let session_id = match client_session_id {
             Some(s) => {
                 uuid::Uuid::try_parse(s)
@@ -1205,6 +1206,7 @@ impl acp::Agent for MvpAgent {
                         session_model_id,
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
+                        session_swarm_mode,
                         prompt_display_cwd: None,
                     }
             };
@@ -1638,6 +1640,7 @@ impl acp::Agent for MvpAgent {
             self.default_auto_mode,
             session_yolo_mode,
         );
+        let session_swarm_mode = resolve_session_swarm_mode(request_meta.as_ref());
         #[allow(unused_variables)]
         let session_computer_sessions = parse_session_computer_sessions(
             request_meta.as_ref(),
@@ -1851,6 +1854,7 @@ impl acp::Agent for MvpAgent {
                         session_model_id: startup_auth_model_id.clone(),
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
+                        session_swarm_mode,
                         prompt_display_cwd,
                     },
                 )
@@ -4020,6 +4024,22 @@ impl acp::Agent for MvpAgent {
                     auto_mode = enabled, sender = ? sender_id, target_sessions = updated,
                     total_sessions, "Setting auto permission mode for matching sessions"
                 );
+            }
+        }
+        if args.method.as_ref() == "x.ai/swarm_mode_changed"
+            && let Ok(params) = serde_json::from_str::<serde_json::Value>(args.params.get())
+        {
+            let session_id = params.get("sessionId").and_then(|v| v.as_str());
+            let enabled = params.get("enabled").and_then(|v| v.as_bool());
+            let trigger = match params.get("trigger").and_then(|v| v.as_str()) {
+                Some("manual") => Some(crate::session::swarm_mode::SwarmModeTrigger::Manual),
+                Some("task") => Some(crate::session::swarm_mode::SwarmModeTrigger::Task),
+                _ => None,
+            };
+            if let (Some(session_id), Some(enabled), Some(trigger)) = (session_id, enabled, trigger)
+                && let Some(handle) = self.sessions.borrow().get(&acp::SessionId::new(session_id))
+            {
+                let _ = handle.cmd_tx.send(crate::session::SessionCommand::SetSwarmMode { enabled, trigger });
             }
         }
         if args.method.as_ref() == "x.ai/permissions/reset" {

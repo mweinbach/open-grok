@@ -1042,20 +1042,22 @@ impl SessionActor {
             return Err(acp::Error::invalid_params().data(friendly));
         }
         if matches!(error.kind, SamplingErrorKind::RateLimited) {
-            self.log_terminal_failure(
-                "rate_limited",
-                error.status_code,
-                &detailed_message,
-                request_provider,
-            );
-            self.send_xai_notification(XaiSessionUpdate::RetryState(
-                crate::extensions::notification::RetryState::Exhausted {
-                    attempts: 0,
-                    reason: detailed_message.clone(),
-                    is_rate_limited: true,
-                },
-            ))
-            .await;
+            if self.startup_hints.subagent_status_tx.is_none() {
+                self.log_terminal_failure(
+                    "rate_limited",
+                    error.status_code,
+                    &detailed_message,
+                    request_provider,
+                );
+                self.send_xai_notification(XaiSessionUpdate::RetryState(
+                    crate::extensions::notification::RetryState::Exhausted {
+                        attempts: 0,
+                        reason: detailed_message.clone(),
+                        is_rate_limited: true,
+                    },
+                ))
+                .await;
+            }
             let acp_err = acp::Error::new(
                 crate::sampling::error::RATE_LIMITED_ERROR_CODE,
                 "Rate limited".to_string(),
@@ -1371,6 +1373,13 @@ impl SessionActor {
         };
         let request_id = xai_grok_sampler::RequestId::random();
         let request_id_str = request_id.as_str().to_string();
+        if let Some(status_tx) = self.startup_hints.subagent_status_tx.clone() {
+            let _ = status_tx.send(
+                xai_grok_tools::implementations::grok_build::task::types::SubagentStatusEvent::ProviderRequestStarted {
+                    subagent_id: self.session_info.id.0.to_string(),
+                },
+            );
+        }
         match self
             .sampler_handle
             .submit_and_collect(request_id, request)

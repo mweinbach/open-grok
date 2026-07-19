@@ -314,6 +314,11 @@ pub enum SessionCommand {
     SetAutoMode {
         enabled: bool,
     },
+    /// Live pager/headless swarm-mode control. Task mode applies to one submitted turn.
+    SetSwarmMode {
+        enabled: bool,
+        trigger: crate::session::swarm_mode::SwarmModeTrigger,
+    },
     ResetPermissionState,
     Rewind {
         request: RewindRequest,

@@ -293,6 +293,9 @@ pub(crate) struct State {
     /// switching models is a deliberate user action that resets
     /// expectations.
     pub(crate) nudges_used_this_session: u32,
+    /// Per-session swarm activation. Deliberately excluded from summary persistence:
+    /// only manual mode may be restored once a stable storage field is available.
+    pub(crate) swarm_mode: crate::session::swarm_mode::SwarmModeTracker,
 }
 impl State {
     pub(crate) fn clear_pending_notifications(&mut self) {

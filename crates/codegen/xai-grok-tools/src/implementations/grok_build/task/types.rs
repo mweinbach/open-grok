@@ -16,7 +16,7 @@
 //! All coordinator messages are funnelled through a single
 //! `SubagentEventSender` / `SubagentEvent` enum channel.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc, time::Duration};
 
 use educe::Educe;
 use tokio::sync::{mpsc, oneshot};
@@ -25,6 +25,76 @@ use xai_tool_types::{SubagentCapabilityMode, SubagentIsolationMode, WaitMode};
 use crate::register_resource;
 
 // Request / Response
+
+/// Scheduler decision for a live AgentSwarm turn paused after a provider rate limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentRateLimitDecision {
+    Retry,
+    Fail,
+}
+
+pub const SWARM_RATE_LIMIT_RETRY_BASE_MS: u64 = 3_000;
+
+pub fn swarm_rate_limit_backoff(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(u64::BITS - 1);
+    let multiplier = 1u64 << exponent;
+    Duration::from_millis(SWARM_RATE_LIMIT_RETRY_BASE_MS.saturating_mul(multiplier))
+}
+
+/// Runtime status emitted by an AgentSwarm child session.
+#[derive(Debug, Clone)]
+pub enum SubagentStatusEvent {
+    ProviderRequestStarted {
+        subagent_id: String,
+    },
+    RateLimitWaiting {
+        subagent_id: String,
+        attempt: u32,
+        decision_tx: mpsc::UnboundedSender<SubagentRateLimitDecision>,
+    },
+    RateLimitRetrying {
+        subagent_id: String,
+        attempt: u32,
+    },
+}
+
+/// Metadata that lets the shell group individual child sessions into one
+/// model-facing AgentSwarm invocation.
+#[derive(Clone)]
+pub struct SwarmMemberMeta {
+    pub swarm_id: String,
+    pub description: String,
+    pub index: u32,
+    pub item: Option<String>,
+    pub expected_members: u32,
+    /// Runtime-only status channel back to the swarm scheduler.
+    pub status_tx: Option<mpsc::UnboundedSender<SubagentStatusEvent>>,
+}
+
+impl fmt::Debug for SwarmMemberMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SwarmMemberMeta")
+            .field("swarm_id", &self.swarm_id)
+            .field("description", &self.description)
+            .field("index", &self.index)
+            .field("item", &self.item)
+            .field("expected_members", &self.expected_members)
+            .field("has_status_tx", &self.status_tx.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for SwarmMemberMeta {
+    fn eq(&self, other: &Self) -> bool {
+        self.swarm_id == other.swarm_id
+            && self.description == other.description
+            && self.index == other.index
+            && self.item == other.item
+            && self.expected_members == other.expected_members
+    }
+}
+
+impl Eq for SwarmMemberMeta {}
 
 /// Request emitted by TaskTool, received by MvpAgent coordinator.
 #[derive(Educe)]
@@ -41,6 +111,8 @@ pub struct SubagentRequest {
     /// Used to cancel only the subagents spawned by the currently-cancelled turn,
     /// without affecting background subagents from earlier turns.
     pub parent_prompt_id: Option<String>,
+    /// Present only for children launched by `agent_swarm`.
+    pub swarm: Option<SwarmMemberMeta>,
     /// Resume from a previously completed subagent's conversation.
     /// Inherits raw transcript, tool state, and model. System prompt is
     /// freshly rendered.

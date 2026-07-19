@@ -3,6 +3,66 @@ use super::*;
 use crate::test_support::lsp_runtime::{
     DummyLspDispatch, ctx_with_toggle, make_request, test_gateway,
 };
+
+#[test]
+fn final_summary_floor_uses_trimmed_unicode_character_count() {
+    assert!(!should_request_final_summary_continuation("   \n\t"));
+    assert!(should_request_final_summary_continuation("short handoff"));
+    assert!(!should_request_final_summary_continuation(&"a".repeat(200)));
+    assert!(should_request_final_summary_continuation(&"é".repeat(199)));
+    assert!(!should_request_final_summary_continuation(&"é".repeat(200)));
+}
+
+fn summary_wait_outcome(
+    completion_kind: crate::session::commands::PromptCompletionKind,
+    total_tokens: u64,
+) -> SubagentWaitOutcome {
+    SubagentWaitOutcome::TurnResult(Box::new(Ok(Ok(
+        crate::session::commands::PromptTurnOk {
+            stop_reason: acp::StopReason::EndTurn,
+            total_tokens,
+            turn_snapshot: None,
+            completion_kind,
+            structured_output: None,
+            usage: None,
+        },
+    ))))
+}
+
+#[test]
+fn final_summary_floor_preserves_initial_success_when_continuation_fails() {
+    let selected = select_final_summary_wait_result(
+        summary_wait_outcome(crate::session::commands::PromptCompletionKind::Completed, 10),
+        "short but successful".into(),
+        summary_wait_outcome(
+            crate::session::commands::PromptCompletionKind::MaxTurnsReached { limit: 1 },
+            20,
+        ),
+        "partial",
+    );
+    assert!(is_completed_subagent_wait_outcome(&selected.outcome));
+    assert_eq!(selected.final_text_override.as_deref(), Some("short but successful"));
+}
+
+#[test]
+fn final_summary_floor_accepts_better_completion_and_keeps_cancellation_terminal() {
+    let selected = select_final_summary_wait_result(
+        summary_wait_outcome(crate::session::commands::PromptCompletionKind::Completed, 10),
+        "short".into(),
+        summary_wait_outcome(crate::session::commands::PromptCompletionKind::Completed, 20),
+        "a substantially longer and more useful handoff",
+    );
+    assert!(is_completed_subagent_wait_outcome(&selected.outcome));
+    assert!(selected.final_text_override.is_none());
+
+    let cancelled = select_final_summary_wait_result(
+        summary_wait_outcome(crate::session::commands::PromptCompletionKind::Completed, 10),
+        "short".into(),
+        SubagentWaitOutcome::Cancelled,
+        "",
+    );
+    assert!(matches!(cancelled.outcome, SubagentWaitOutcome::Cancelled));
+}
 /// Invariant: resolving a subagent applies the parent session's
 /// `--tools`/`--disallowed-tools`/`--permission-mode` — driven through
 /// `resolve_agent_definition` so the spawn path can't skip them.
@@ -576,6 +636,7 @@ fn auto_wake_test_request(id: &str) -> SubagentRequest {
         subagent_type: "general-purpose".into(),
         parent_session_id: "parent".into(),
         parent_prompt_id: None,
+        swarm: None,
         resume_from: None,
         cwd: None,
         runtime_overrides: Default::default(),
@@ -893,6 +954,7 @@ fn completed_with_output(
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: String::new(),
+        model_route: None,
         block_waited: false,
         explicitly_killed: false,
         persisted_output_dir,
@@ -1278,6 +1340,7 @@ fn dummy_tracker(
         child_cwd: String::new(),
         worktree_path: None,
         effective_model_id: String::new(),
+        model_route: None,
         effective_provider: xai_grok_sampling_types::ModelProvider::Xai,
         run_in_background: false,
         surface_completion: true,
@@ -2204,6 +2267,7 @@ fn bootstrap_test_request(fork_context: bool) -> SubagentRequest {
         subagent_type: "general-purpose".into(),
         parent_session_id: "parent".into(),
         parent_prompt_id: None,
+        swarm: None,
         resume_from: None,
         cwd: None,
         runtime_overrides: Default::default(),

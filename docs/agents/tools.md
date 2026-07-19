@@ -283,7 +283,7 @@ Paths under `xai-grok-tools/src/implementations/` unless noted.
 - Enabling without a key is valid configuration but leaves the tool unavailable and displays **API key required**.
 - `--disable-web-search` remains the top-level kill switch for both native declarations and this fallback.
 - Settings changes apply live. The pager pauses new Kimi sends and queue draining until persistence and every resident-session rebuild are confirmed; failures restore durable state and reconcile the runtime before releasing the queue.
-| Subagents | `task`, wait/kill helpers | `grok_build/task/`, `task_output/`, `kill_task/` | `MAX_SUBAGENT_DEPTH = 1` |
+| Subagents | `task`, `agent_swarm`, wait/kill helpers | `grok_build/task/`, `grok_build/agent_swarm/`, `task_output/`, `kill_task/` | Flat tree; swarm calls are foreground + batch-exclusive |
 | Background I/O | `get_task_output` / wait / kill | `task_output/`, `kill_task/` | Terminal + subagent tasks |
 | Monitor | `monitor` | `grok_build/monitor/` | Line → notifications; rate limited |
 | Scheduler / loop | `scheduler_*` | `grok_build/scheduler/` | Parent handle shared with subagents when set |
@@ -297,6 +297,13 @@ Paths under `xai-grok-tools/src/implementations/` unless noted.
 | Skills | skill invoke + discovery | `skills/`, `opencode/skill/` | Discovery reminder; types in `skills/types.rs` |
 | MCP meta | `search_tool`, `use_tool` | `search_tool/`, `use_tool/` | BM25 discover + dispatch; stable top-level set |
 | Deploy | `deploy_app` | `grok_build/deploy_app_stub.rs` | Service-gated stub |
+
+### Agent swarms
+
+- `agent_swarm` launches an ordered foreground cohort through the same `SubagentBackend` as `task`; it is not a separate child runtime.
+- Item mode requires `prompt_template` with literal `{{item}}`; resume mode accepts an ordered `resume_agent_ids` object. Resume slots run before item slots and retain the source child profile.
+- The call validates completely before spawning, caps total members at 128, bursts five immediately, then ramps one launch per 700 ms. Optional concurrency and timeout overrides use `OPENGROK_AGENT_SWARM_MAX_CONCURRENCY` and `OPENGROK_SUBAGENT_TIMEOUT_MS`.
+- The shell enforces hard exclusivity: `agent_swarm` cannot share a model tool-call batch. Child toolsets strip both `task` and `agent_swarm` at depth 1.
 
 ### MCP tools (`search_tool` / `use_tool`)
 

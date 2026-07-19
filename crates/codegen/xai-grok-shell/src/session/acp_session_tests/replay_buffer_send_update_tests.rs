@@ -71,6 +71,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,
+        swarm_mode: crate::session::swarm_mode::SwarmModeTracker::default(),
     });
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let actor = SessionActor {

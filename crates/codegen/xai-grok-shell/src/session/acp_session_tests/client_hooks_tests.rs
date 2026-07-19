@@ -1,6 +1,91 @@
 use super::support::*;
 use super::*;
 
+const AGENT_SWARM_EXCLUSIVITY_ERROR: &str = "`agent_swarm` must be the only tool call in its batch. Inspect briefly, then make one exclusive agent_swarm call for independent work; use ordinary task calls for heterogeneous small work.";
+
+#[derive(Default)]
+struct RecordingPermissionClient {
+    prompts: std::rc::Rc<std::cell::RefCell<Vec<acp::RequestPermissionRequest>>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl acp::Client for RecordingPermissionClient {
+    async fn request_permission(
+        &self,
+        args: acp::RequestPermissionRequest,
+    ) -> acp::Result<acp::RequestPermissionResponse> {
+        let selected = args
+            .options
+            .iter()
+            .find(|option| option.kind == acp::PermissionOptionKind::RejectOnce)
+            .cloned()
+            .unwrap_or_else(|| {
+                args.options
+                    .first()
+                    .cloned()
+                    .expect("permission prompt must expose at least one option")
+            });
+        self.prompts.borrow_mut().push(args);
+        Ok(acp::RequestPermissionResponse::new(
+            acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                selected.option_id,
+            )),
+        ))
+    }
+
+    async fn session_notification(&self, _: acp::SessionNotification) -> acp::Result<()> {
+        Ok(())
+    }
+}
+
+fn install_recording_permissions(
+    actor: &mut SessionActor,
+) -> std::rc::Rc<std::cell::RefCell<Vec<acp::RequestPermissionRequest>>> {
+    let prompts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (gateway, receiver) =
+        xai_acp_lib::acp_gateway::<acp::AgentSide, _>(RecordingPermissionClient {
+            prompts: prompts.clone(),
+        });
+    tokio::task::spawn_local(receiver.run());
+
+    let cwd =
+        xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from(actor.session_info.cwd.clone()))
+            .unwrap_or_else(|_| {
+                xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp"))
+                    .expect("fallback /tmp")
+            });
+    let (handle, _events) = xai_grok_workspace::permission::spawn_permission_manager(
+        actor.session_info.id.clone(),
+        gateway,
+        cwd,
+        xai_grok_workspace::permission::ClientType::Generic,
+        Some(xai_grok_workspace::permission::types::PermissionConfig::new(vec![])),
+        vec![],
+        vec![],
+        false,
+        None,
+    );
+    actor.permissions = handle;
+    prompts
+}
+
+fn tool_result_for_call(conversation: &[ConversationItem], call_id: &str) -> Option<String> {
+    conversation.iter().find_map(|item| match item {
+        xai_grok_sampling_types::ConversationItem::ToolResult(tr) if tr.tool_call_id == call_id => {
+            Some(tr.content.to_string())
+        }
+        _ => None,
+    })
+}
+
+fn batch_call(id: &str, name: &str, arguments: &str) -> ToolCallResponse {
+    ToolCallResponse {
+        id: id.to_string(),
+        kind: "function".to_string(),
+        function: crate::sampling::types::ToolCallFunction::new(name, arguments),
+    }
+}
+
 /// Client hooks must fire even with no on-disk hook registry: `notify_client_hooks`
 /// reads `client_hooks` (never `hook_registry`) and its call sites sit outside the
 /// file-registry guard.
@@ -611,6 +696,147 @@ async fn pre_tool_use_deny_feeds_reason_back_and_continues_turn() {
                 conv.iter()
                     .any(|c| c.text_content().contains("use read_file instead")),
                 "the deny reason must be fed back as the tool_result"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn agent_swarm_batch_rejects_mixed_calls_and_records_error_for_each_tool() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            let calls = vec![
+                batch_call(
+                    "call_swarm",
+                    "agent_swarm",
+                    r#"{"description":"parallel checks","subagent_type":"general-purpose","prompt_template":"{{item}}","items":["a","b"]}"#,
+                ),
+                batch_call("call_bash", "run_terminal_command", r#"{"command":"echo done"}"#),
+            ];
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                actor.execute_tool_calls(calls),
+            )
+            .await
+            .expect("execute_tool_calls should not hang")
+            .expect("execute_tool_calls must return a ToolLoop");
+
+            assert!(matches!(result, ToolLoop::Continue));
+
+            let conv = actor.chat_state_handle.get_conversation().await;
+            assert_eq!(
+                conv.iter()
+                    .filter(|item| matches!(item, ConversationItem::ToolResult(_)))
+                    .count(),
+                2,
+                "an exclusivity failure must post one error tool_result per call",
+            );
+
+            let swarm_result = tool_result_for_call(&conv, "call_swarm")
+                .expect("agent_swarm call should have a result entry with exclusivity error");
+            let bash_result = tool_result_for_call(&conv, "call_bash")
+                .expect("non-agent_swarm call should also have an exclusivity result");
+            assert!(
+                swarm_result.contains(AGENT_SWARM_EXCLUSIVITY_ERROR),
+                "swarm batch violation must cite the exclusivity message: {swarm_result}"
+            );
+            assert!(
+                bash_result.contains(AGENT_SWARM_EXCLUSIVITY_ERROR),
+                "swarm batch violation must cite the exclusivity message for every call: {bash_result}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn agent_swarm_parent_bypasses_permission_and_child_tool_still_prompts() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor =
+                create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let mut bash = xai_grok_tools::registry::types::ToolConfig::for_tool::<
+                xai_grok_tools::implementations::grok_build::bash::BashTool,
+            >();
+            bash.params = Some(
+                serde_json::json!({ "enabled_background": false })
+                    .as_object()
+                    .expect("bash params object")
+                    .clone(),
+            );
+            *actor.agent.borrow_mut() = test_agent_with_tools(vec![
+                xai_grok_tools::registry::types::ToolConfig::for_tool::<
+                    xai_grok_tools::implementations::grok_build::task_output::TaskOutputTool,
+                >(),
+                xai_grok_tools::registry::types::ToolConfig::for_tool::<
+                    xai_grok_tools::implementations::grok_build::kill_task::KillTaskTool,
+                >(),
+                xai_grok_tools::registry::types::ToolConfig::for_tool::<
+                    xai_grok_tools::implementations::grok_build::task::TaskTool,
+                >(),
+                xai_grok_tools::registry::types::ToolConfig::for_tool::<
+                    xai_grok_tools::implementations::grok_build::agent_swarm::AgentSwarmTool,
+                >(),
+                bash,
+            ])
+            .await;
+
+            let permission_prompts = install_recording_permissions(&mut actor);
+
+            let swarm_call = batch_call(
+                "parent_swarm",
+                "agent_swarm",
+                r#"{"description":"parallel work","subagent_type":"general-purpose","prompt_template":"{{item}}","items":["first","second"]}"#,
+            );
+            let mut deferred = Vec::new();
+            let parent_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                actor.prepare_tool_call(swarm_call, &mut deferred),
+            )
+            .await
+            .expect("prepare_tool_call should not hang")
+            .expect("prepare_tool_call should not error");
+
+            assert!(parent_result.is_ok(), "agent_swarm parent call should prepare successfully");
+            assert!(
+                permission_prompts.borrow().is_empty(),
+                "single parent agent_swarm call should bypass permission check",
+            );
+
+            let child_call = batch_call(
+                "child_bash",
+                "run_terminal_cmd",
+                r#"{"command":"rm -rf /","description":"destructive test"}"#,
+            );
+            let mut child_deferred = Vec::new();
+            let child_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                actor.prepare_tool_call(child_call, &mut child_deferred),
+            )
+            .await
+            .expect("prepare_tool_call should not hang")
+            .expect("prepare_tool_call should return a ToolLoop decision");
+
+            assert!(
+                matches!(child_result, Err(ToolLoop::PermissionReject { .. })),
+                "child non-swarm tool should still be permission-checked; got {child_result:?}",
+            );
+            assert_eq!(
+                permission_prompts.borrow().len(),
+                1,
+                "exactly one permission prompt should occur for the child call",
             );
         })
         .await;

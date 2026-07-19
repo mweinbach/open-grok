@@ -15,6 +15,46 @@ impl SessionActor {
                 self.run_compact(user_context).await?;
                 ok_end_turn(0, None)
             }
+            BuiltinAction::ToggleSwarm => {
+                let enabled = {
+                    let state = self.state.lock().await;
+                    !state.swarm_mode.enabled()
+                };
+                if enabled {
+                    self.enter_swarm_mode(crate::session::swarm_mode::SwarmModeTrigger::Manual)
+                        .await;
+                } else {
+                    let mut state = self.state.lock().await;
+                    state.swarm_mode.exit();
+                    drop(state);
+                    self.send_xai_notification(
+                        crate::extensions::notification::SessionUpdate::SwarmModeChanged {
+                            enabled: false,
+                            trigger: None,
+                        },
+                    )
+                    .await;
+                }
+                ok_end_turn(0, None)
+            }
+            BuiltinAction::SetSwarm { enabled } => {
+                if enabled {
+                    self.enter_swarm_mode(crate::session::swarm_mode::SwarmModeTrigger::Manual)
+                        .await;
+                } else {
+                    let mut state = self.state.lock().await;
+                    state.swarm_mode.exit();
+                    drop(state);
+                    self.send_xai_notification(
+                        crate::extensions::notification::SessionUpdate::SwarmModeChanged {
+                            enabled: false,
+                            trigger: None,
+                        },
+                    )
+                    .await;
+                }
+                ok_end_turn(0, None)
+            }
             BuiltinAction::SetYolo { enabled } => {
                 let was = self.permissions.is_yolo_mode();
                 self.permissions.set_yolo_mode(enabled);

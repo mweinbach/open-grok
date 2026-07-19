@@ -620,6 +620,14 @@ pub struct StartupHints {
     /// holds the parent's System and overwriting it would bust the cache prefix.
     #[serde(default)]
     pub preserve_inherited_system: bool,
+    /// Runtime-only status sink used by AgentSwarm children to report
+    /// provider rate-limit backoff without exposing nested swarm tools.
+    #[serde(skip)]
+    pub subagent_status_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<
+            xai_grok_tools::implementations::grok_build::task::types::SubagentStatusEvent,
+        >,
+    >,
 }
 
 #[cfg(test)]

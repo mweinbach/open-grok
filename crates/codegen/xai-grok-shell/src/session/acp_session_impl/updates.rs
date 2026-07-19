@@ -400,14 +400,14 @@ impl SessionActor {
     }
     /// Handle xAI session notifications - store them in persistence
     /// These are client-side events (like diff reviews) that should be part of session history.
-    /// Exception: `SubagentProgress` ticks are transient and return before the store.
+    /// Exception: live subagent progress/status updates are transient and return before the store.
     pub(super) async fn handle_xai_session_notification(
         &self,
         mut notification: XaiSessionNotification,
     ) {
         if !matches!(
             notification.update,
-            XaiSessionUpdate::SubagentProgress { .. }
+            XaiSessionUpdate::SubagentProgress { .. } | XaiSessionUpdate::SubagentStatus { .. }
         ) {
             tracing::debug!("storing xAI session notification");
         }
@@ -636,6 +636,7 @@ impl SessionActor {
                 }
                 return;
             }
+            XaiSessionUpdate::SubagentStatus { .. } => return,
             _ => {}
         }
         let _ = self

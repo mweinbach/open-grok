@@ -236,6 +236,51 @@ impl SessionActor {
     pub(super) fn push_system_reminder(&self, content: &str) {
         self.push_system_reminder_with_tag(content, "system-reminder");
     }
+
+    pub(super) async fn enter_swarm_mode(
+        &self,
+        trigger: crate::session::swarm_mode::SwarmModeTrigger,
+    ) {
+        let mut state = self.state.lock().await;
+        let effective_trigger = state.swarm_mode.enter(trigger);
+        drop(state);
+        self.send_xai_notification(
+            crate::extensions::notification::SessionUpdate::SwarmModeChanged {
+                enabled: true,
+                trigger: Some(format!("{effective_trigger:?}").to_lowercase()),
+            },
+        )
+        .await;
+    }
+
+    pub(super) async fn maybe_inject_swarm_reminder(&self) {
+        let (exit, inject) = {
+            let mut state = self.state.lock().await;
+            (
+                state.swarm_mode.take_exit_reminder(),
+                state.swarm_mode.take_reminder(),
+            )
+        };
+        if exit {
+            self.push_system_reminder("Swarm mode is no longer active. Resume normal tool selection; do not treat the previous swarm-only instruction as active.");
+        }
+        if inject {
+            self.push_system_reminder(crate::session::swarm_mode::SWARM_MODE_REMINDER);
+        }
+    }
+
+    pub(super) async fn auto_exit_swarm_mode(&self) {
+        let exited = { self.state.lock().await.swarm_mode.auto_exit_turn() };
+        if exited {
+            self.send_xai_notification(
+                crate::extensions::notification::SessionUpdate::SwarmModeChanged {
+                    enabled: false,
+                    trigger: None,
+                },
+            )
+            .await;
+        }
+    }
     /// The active reminder wrapper tag, backed by the canonical tag constants
     /// in `xai_grok_tools::reminders`.
     pub(super) fn reminder_wrapper_tag(&self) -> &'static str {
