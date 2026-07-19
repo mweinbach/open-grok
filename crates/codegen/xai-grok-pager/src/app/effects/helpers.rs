@@ -809,6 +809,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "swarm_mode" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("swarm_mode", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_swarm_mode(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "contextual_hints.undo" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("contextual_hints.undo", "Bool", &value));

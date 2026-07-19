@@ -696,6 +696,18 @@ async fn persist_setting_type_mismatch_errors_simple_mode() {
     );
 }
 
+/// `swarm_mode` is a registered persistence key and requires a bool payload.
+#[tokio::test]
+async fn persist_setting_type_mismatch_errors_swarm_mode() {
+    use crate::settings::SettingValue;
+    let r = persist_setting("swarm_mode", SettingValue::Int(42)).await;
+    let err = r.expect_err("swarm_mode with Int payload must return Err");
+    assert!(
+        err.contains("persist_setting(swarm_mode) expected Bool"),
+        "error message must mention key + expected kind, got: {err}",
+    );
+}
+
 /// Type-mismatch for the restart-required Code mode selector.
 #[tokio::test]
 async fn persist_setting_type_mismatch_errors_code_mode() {

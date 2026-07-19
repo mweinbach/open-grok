@@ -34,6 +34,12 @@ pub async fn set_simple_mode(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.simple_mode = Some(value)).await
 }
 
+/// Persist `[ui].swarm_mode` via `update_config`. `None` means the default is off,
+/// so explicit settings changes are stored as `Some(value)`.
+pub async fn set_swarm_mode(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.swarm_mode = Some(value)).await
+}
+
 /// Persist `[ui.contextual_hints].undo` via `update_config`. The nested struct
 /// stays out of `config.toml` until a tip is toggled (`skip_serializing_if`).
 pub async fn set_contextual_hint_undo(value: bool) -> Result<()> {
