@@ -16,7 +16,7 @@ use xai_grok_update::auto_update::{
 use common::{make_update_config, reset_home, set_test_version, test_home};
 
 const OLD_VERSION: &str = "0.1.220-open-grok.3";
-const NEW_VERSION: &str = "0.1.220-open-grok.13";
+const NEW_VERSION: &str = "0.1.220-open-grok.14";
 const ASSET: &str = "open-grok-macos-aarch64";
 
 fn executable(version: &str) -> Vec<u8> {

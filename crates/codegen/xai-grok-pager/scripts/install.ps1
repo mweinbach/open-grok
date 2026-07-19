@@ -2,7 +2,7 @@
 #
 # Usage:
 #   irm https://raw.githubusercontent.com/mweinbach/open-grok/main/crates/codegen/xai-grok-pager/scripts/install.ps1 | iex
-#   $env:OPEN_GROK_VERSION = '0.1.220-open-grok.13'; irm <url> | iex
+#   $env:OPEN_GROK_VERSION = '0.1.220-open-grok.14'; irm <url> | iex
 #
 # Environment:
 #   OPENGROK_HOME               Runtime home (default: %USERPROFILE%\.opengrok)
