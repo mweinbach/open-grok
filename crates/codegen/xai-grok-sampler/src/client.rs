@@ -354,6 +354,7 @@ fn normalize_response_output_item(item: &mut serde_json::Value) {
     normalize_x_search_call(item);
     fill_missing_custom_tool_call_id(item);
     fill_missing_compaction_output_id(item);
+    fill_missing_web_search_action(item);
 }
 
 /// async-openai 0.33.1 requires `CompactionBody.id`, while the Responses
@@ -368,6 +369,27 @@ fn fill_missing_compaction_output_id(item: &mut serde_json::Value) {
         && !item.contains_key("id")
     {
         item.insert("id".to_owned(), serde_json::Value::String(String::new()));
+    }
+}
+
+/// async-openai 0.33.1 requires `action` on every `WebSearchToolCall`, but
+/// Codex can omit it on any frame that carries the item — terminal
+/// `response.output_item.done` and `response.completed` outputs included, not
+/// just the nonterminal announcements projected to progress events above.
+/// Fill the shared empty-search sentinel so the frame parses instead of
+/// failing the whole turn; request serialization strips this exact sentinel
+/// before provider replay.
+fn fill_missing_web_search_action(item: &mut serde_json::Value) {
+    let Some(item) = item.as_object_mut() else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) == Some("web_search_call")
+        && item.get("action").is_none_or(serde_json::Value::is_null)
+    {
+        item.insert(
+            "action".to_owned(),
+            xai_grok_sampling_types::sentinel_web_search_action_json(),
+        );
     }
 }
 
@@ -1930,6 +1952,7 @@ impl SamplingClient {
             }
         }
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        xai_grok_sampling_types::strip_sentinel_web_search_actions(&mut request_body);
         patch_custom_tool_output_wire_fields(
             &mut request_body,
             &named_custom_tool_outputs,
@@ -2296,6 +2319,7 @@ impl SamplingClient {
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        xai_grok_sampling_types::strip_sentinel_web_search_actions(&mut request_body);
         patch_custom_tool_output_wire_fields(
             &mut request_body,
             &request.named_custom_tool_outputs,
@@ -2467,6 +2491,7 @@ impl SamplingClient {
             }
         }
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        xai_grok_sampling_types::strip_sentinel_web_search_actions(&mut request_body);
         patch_custom_tool_output_wire_fields(
             &mut request_body,
             &request.named_custom_tool_outputs,
@@ -4987,7 +5012,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_actionless_web_search_item_done_remains_invalid() {
+    fn codex_actionless_web_search_item_done_parses_with_sentinel_action() {
         let sse = r#"{
             "type": "response.output_item.done",
             "sequence_number": 3,
@@ -4998,11 +5023,90 @@ mod tests {
                 "status": "completed"
             }
         }"#;
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(sse).is_err());
 
-        let error =
+        let event =
             deserialize_response_event_for_adapter(sse, provider_adapter(ModelProvider::Codex))
-                .expect_err("a completed web search item must retain its action payload");
-        assert!(matches!(error, SamplingError::Serialization(_)));
+                .expect("an actionless completed web search item should parse with the sentinel");
+        let rs::ResponseStreamEvent::ResponseOutputItemDone(event) = event else {
+            panic!("expected ResponseOutputItemDone");
+        };
+        let rs::OutputItem::WebSearchCall(call) = event.item else {
+            panic!("expected WebSearchCall");
+        };
+        assert_eq!(call.id, "ws_123");
+        assert_eq!(call.status, rs::WebSearchToolCallStatus::Completed);
+        assert!(xai_grok_sampling_types::is_sentinel_web_search_action(
+            &call.action
+        ));
+    }
+
+    #[test]
+    fn codex_actionless_web_search_item_added_completed_parses_with_sentinel_action() {
+        // A terminal-status added frame bypasses the in-progress/searching
+        // projection above, so it must parse through the sentinel fill.
+        let sse = r#"{
+            "type": "response.output_item.added",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": {
+                "id": "ws_123",
+                "type": "web_search_call",
+                "status": "completed"
+            }
+        }"#;
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(sse).is_err());
+
+        let event =
+            deserialize_response_event_for_adapter(sse, provider_adapter(ModelProvider::Codex))
+                .expect("an actionless completed web search item should parse with the sentinel");
+        let rs::ResponseStreamEvent::ResponseOutputItemAdded(event) = event else {
+            panic!("expected ResponseOutputItemAdded");
+        };
+        let rs::OutputItem::WebSearchCall(call) = event.item else {
+            panic!("expected WebSearchCall");
+        };
+        assert!(xai_grok_sampling_types::is_sentinel_web_search_action(
+            &call.action
+        ));
+    }
+
+    #[test]
+    fn codex_actionless_web_search_in_completed_output_parses_with_sentinel_action() {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 9,
+            "response": {
+                "created_at": 0,
+                "id": "resp_ws",
+                "model": "gpt-5.3-codex-spark",
+                "object": "response",
+                "output": [
+                    {
+                        "id": "ws_123",
+                        "type": "web_search_call",
+                        "status": "completed"
+                    }
+                ],
+                "status": "completed"
+            }
+        })
+        .to_string();
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&event).is_err());
+
+        let typed =
+            deserialize_response_event_for_adapter(&event, provider_adapter(ModelProvider::Codex))
+                .expect("an actionless web search item in the final output should parse");
+        let rs::ResponseStreamEvent::ResponseCompleted(completed) = typed else {
+            panic!("expected response.completed");
+        };
+        let [rs::OutputItem::WebSearchCall(call)] = completed.response.output.as_slice() else {
+            panic!("expected a single WebSearchCall output item");
+        };
+        assert_eq!(call.id, "ws_123");
+        assert!(xai_grok_sampling_types::is_sentinel_web_search_action(
+            &call.action
+        ));
     }
 
     #[test]

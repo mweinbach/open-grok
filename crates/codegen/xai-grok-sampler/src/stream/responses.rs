@@ -19,6 +19,16 @@ use crate::metrics::InferenceLatencyStats;
 use crate::stream::display_citations::{DisplayCitationFilter, strip_display_citations_in_items};
 use crate::types::RequestId;
 
+/// Identity of the reasoning unit last emitted on the Reasoning display
+/// channel: a summary part or a raw-text content block, keyed by
+/// `(output_index, item_id, summary/content index)`. Used to place a
+/// markdown paragraph break exactly when the stream switches units.
+#[derive(Clone, PartialEq, Eq)]
+enum ReasoningUnitKey {
+    Summary(u32, String, u32),
+    RawText(u32, String, u32),
+}
+
 /// Returns whether a Responses API event reflects real model progress
 /// rather than a liveness-only heartbeat / status transition.
 pub(crate) fn responses_event_has_meaningful_content(event: &rs::ResponseStreamEvent) -> bool {
@@ -144,6 +154,14 @@ pub fn stream_responses_with_client_custom_tools<'a>(
         let mut first_token_emitted = false;
         let mut reasoning_text_acc = String::new();
         let mut reasoning_summary_parts: BTreeMap<(u32, String, u32), String> = BTreeMap::new();
+        // Reasoning arrives as discrete units — summary parts (each its own
+        // headline paragraph) and raw-text content blocks. Display consumers
+        // concatenate Reasoning channel tokens verbatim, so emit a markdown
+        // paragraph break when the unit changes or consecutive parts render
+        // on one line (`**A****B**`). The break is display-only: stored
+        // parts and `reasoning_text_acc` stay separator-free because they
+        // feed the durable item replayed to the provider.
+        let mut last_reasoning_unit: Option<ReasoningUnitKey> = None;
         // Codex treats `response.output_item.done` as the durable output
         // carrier. Its terminal `response.completed` frame can contain only
         // response metadata and usage, with an empty `response.output`.
@@ -252,6 +270,14 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                             };
                         }
                         chunk_index += 1;
+                        let unit = ReasoningUnitKey::Summary(
+                            summary_event.output_index,
+                            summary_event.item_id.clone(),
+                            summary_event.summary_index,
+                        );
+                        let needs_break = last_reasoning_unit
+                            .replace(unit.clone())
+                            .is_some_and(|prev| prev != unit);
                         reasoning_summary_parts
                             .entry((
                                 summary_event.output_index,
@@ -263,13 +289,22 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                         yield SamplingEvent::ChannelToken {
                             request_id: request_id.clone(),
                             channel: SamplingChannel::Reasoning,
-                            text: delta,
+                            text: if needs_break {
+                                format!("\n\n{delta}")
+                            } else {
+                                delta
+                            },
                             chunk_index,
                         };
                     }
                 }
 
                 ResponseStreamEvent::ResponseReasoningSummaryTextDone(summary_event) => {
+                    let unit = ReasoningUnitKey::Summary(
+                        summary_event.output_index,
+                        summary_event.item_id.clone(),
+                        summary_event.summary_index,
+                    );
                     let summary = reasoning_summary_parts
                         .entry((
                             summary_event.output_index,
@@ -290,10 +325,17 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                         }
                         chunk_index += 1;
                         *summary = summary_event.text.clone();
+                        let needs_break = last_reasoning_unit
+                            .replace(unit.clone())
+                            .is_some_and(|prev| prev != unit);
                         yield SamplingEvent::ChannelToken {
                             request_id: request_id.clone(),
                             channel: SamplingChannel::Reasoning,
-                            text: summary_event.text,
+                            text: if needs_break {
+                                format!("\n\n{}", summary_event.text)
+                            } else {
+                                summary_event.text
+                            },
                             chunk_index,
                         };
                     }
@@ -309,11 +351,23 @@ pub fn stream_responses_with_client_custom_tools<'a>(
                             };
                         }
                         chunk_index += 1;
+                        let unit = ReasoningUnitKey::RawText(
+                            reasoning_event.output_index,
+                            reasoning_event.item_id.clone(),
+                            reasoning_event.content_index,
+                        );
+                        let needs_break = last_reasoning_unit
+                            .replace(unit.clone())
+                            .is_some_and(|prev| prev != unit);
                         reasoning_text_acc.push_str(&delta);
                         yield SamplingEvent::ChannelToken {
                             request_id: request_id.clone(),
                             channel: SamplingChannel::Reasoning,
-                            text: delta,
+                            text: if needs_break {
+                                format!("\n\n{delta}")
+                            } else {
+                                delta
+                            },
                             chunk_index,
                         };
                     }
@@ -1089,7 +1143,10 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(reasoning_tokens, vec!["First part.", "Second part."]);
+        // The display stream separates summary parts with a paragraph break
+        // (each part is its own markdown paragraph); stored parts below
+        // remain separator-free.
+        assert_eq!(reasoning_tokens, vec!["First part.", "\n\nSecond part."]);
 
         let SamplingEvent::Completed { response, .. } = events.last().unwrap() else {
             panic!("expected completed response, got {:?}", events.last());
@@ -1159,6 +1216,78 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(summaries.get("reasoning-a"), Some(&Some("Summary A")));
         assert_eq!(summaries.get("reasoning-b"), Some(&Some("Summary B")));
+    }
+
+    /// Codex emits each summary part as a separate paragraph opening with a
+    /// bolded headline. Without a break between parts the concatenated
+    /// display stream renders `**A****B**` on one line.
+    #[tokio::test]
+    async fn done_only_summary_parts_get_paragraph_breaks_on_display_stream() {
+        let raw = stream::iter(vec![
+            Ok(reasoning_summary_done_event(
+                0,
+                "reasoning-multi",
+                0,
+                "**First headline**",
+            )),
+            Ok(reasoning_summary_done_event(
+                0,
+                "reasoning-multi",
+                1,
+                "**Second headline**",
+            )),
+            Ok(completed_event_with_output(vec![empty_reasoning_output(
+                "reasoning-multi",
+            )])),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let tokens = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Reasoning,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tokens,
+            vec!["**First headline**", "\n\n**Second headline**"]
+        );
+
+        // Stored parts stay separator-free: they feed the durable item
+        // replayed to the provider, not the display stream.
+        let SamplingEvent::Completed { response, .. } = events.last().unwrap() else {
+            panic!("expected completed response, got {:?}", events.last());
+        };
+        let summary_parts = response.items.iter().find_map(|item| match item {
+            ConversationItem::Reasoning(reasoning) if reasoning.id == "reasoning-multi" => Some(
+                reasoning
+                    .summary
+                    .iter()
+                    .map(|part| {
+                        let rs::SummaryPart::SummaryText(text) = part;
+                        text.text.as_str()
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        });
+        assert_eq!(
+            summary_parts,
+            Some(vec!["**First headline**", "**Second headline**"])
+        );
     }
 
     #[tokio::test]

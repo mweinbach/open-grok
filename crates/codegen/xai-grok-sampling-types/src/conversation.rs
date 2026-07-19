@@ -374,6 +374,11 @@ impl BackendToolCallItem {
     pub fn text_summary(&self) -> String {
         match &self.kind {
             BackendToolKind::WebSearch(ws) => {
+                // The sentinel stands in for an action Codex never sent;
+                // there is no query or URL worth rendering.
+                if is_sentinel_web_search_action(&ws.action) {
+                    return "[backend web_search]".to_owned();
+                }
                 let action_desc = match &ws.action {
                     rs::WebSearchToolCallAction::Search(s) => format!("search: {}", s.query),
                     rs::WebSearchToolCallAction::OpenPage(o) => {
@@ -742,13 +747,16 @@ impl ReasoningContent {
         self.text.is_none() && self.encrypted.is_none()
     }
 
+    // Parts are separate paragraphs (Codex summary parts each open with a
+    // bolded headline); join with a blank line so markdown renders them as
+    // paragraphs instead of one run-on line.
     fn join_content(content: &Option<Vec<rs::ReasoningTextContent>>) -> Option<Arc<str>> {
         let parts = content.as_ref()?;
         let joined: String = parts
             .iter()
             .map(|p| p.text.as_str())
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n\n");
         (!joined.is_empty()).then_some(Arc::<str>::from(joined))
     }
 
@@ -760,7 +768,7 @@ impl ReasoningContent {
                 st.text.as_str()
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n\n");
         (!joined.is_empty()).then_some(Arc::<str>::from(joined))
     }
 }
@@ -2780,7 +2788,9 @@ pub fn reasoning_item_text(r: &rs::ReasoningItem) -> String {
             parts.push(c.text.clone());
         }
     }
-    parts.join("\n")
+    // Blank-line join: each part is its own paragraph and must render as
+    // one in markdown (a single `\n` is only a soft break).
+    parts.join("\n\n")
 }
 
 /// Construct an `rs::ReasoningItem` carrying a single `SummaryText`
@@ -3485,7 +3495,7 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
             ConversationItem::Assistant(_) => {
                 let mut msg = conversation_item_to_chat_message(item);
                 if !pending_reasoning.is_empty() {
-                    msg.reasoning_content = Some(pending_reasoning.join("\n"));
+                    msg.reasoning_content = Some(pending_reasoning.join("\n\n"));
                     pending_reasoning.clear();
                 }
                 out.push(msg);
@@ -3975,6 +3985,52 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
                 obj.entry("type")
                     .or_insert_with(|| serde_json::Value::String("reasoning_text".into()));
             }
+        }
+    }
+}
+
+/// Typed-boundary sentinel `action` for `web_search_call` items that arrive
+/// without one. async-openai 0.33.1 requires `action` on every
+/// `WebSearchToolCall`, while Codex can omit it — including on terminal
+/// `response.output_item.done` frames. The sampler fills this exact sentinel
+/// at the deserialization boundary; [`strip_sentinel_web_search_actions`]
+/// removes it again before a request body reaches the wire, so the fabricated
+/// action never replays to the provider.
+pub fn sentinel_web_search_action_json() -> serde_json::Value {
+    serde_json::json!({"type": "search", "query": ""})
+}
+
+/// True when a typed web-search action is the empty-search sentinel from
+/// [`sentinel_web_search_action_json`]. An empty query carries no user-facing
+/// or provider-facing signal, so misclassifying a genuine empty search is
+/// harmless: replay strips a field the provider tolerates omitting.
+pub fn is_sentinel_web_search_action(action: &rs::WebSearchToolCallAction) -> bool {
+    matches!(
+        action,
+        rs::WebSearchToolCallAction::Search(search)
+            if search.query.is_empty()
+                && search.sources.as_ref().is_none_or(|sources| sources.is_empty())
+    )
+}
+
+/// Remove the sentinel `action` from replayed `web_search_call` input items
+/// after request serialization. Codex sent these items without an action;
+/// round-tripping them the same way preserves wire fidelity, and the backend
+/// accepts actionless items (it produced them).
+pub fn strip_sentinel_web_search_actions(body: &mut serde_json::Value) {
+    let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for item in input.iter_mut() {
+        if item.get("type").and_then(|t| t.as_str()) != Some("web_search_call") {
+            continue;
+        }
+        let is_sentinel = item.get("action").is_some_and(|action| {
+            serde_json::from_value::<rs::WebSearchToolCallAction>(action.clone())
+                .is_ok_and(|action| is_sentinel_web_search_action(&action))
+        });
+        if is_sentinel && let Some(obj) = item.as_object_mut() {
+            obj.remove("action");
         }
     }
 }
@@ -11607,8 +11663,8 @@ mod tests {
         assert_eq!(msgs[1].text_content(), "answer");
         assert_eq!(
             msgs[1].reasoning_content.as_deref(),
-            Some("thinking step 1\nthinking step 2"),
-            "reasoning text joined and attached to the assistant"
+            Some("thinking step 1\n\nthinking step 2"),
+            "reasoning text joined as paragraphs and attached to the assistant"
         );
     }
 
@@ -12116,6 +12172,57 @@ mod tests {
             let obj = item.as_object().expect("content item is an object");
             assert!(obj.contains_key("type") && obj.contains_key("text"));
         }
+    }
+
+    /// Round-trip contract for the actionless web-search sentinel: the
+    /// sampler fills [`sentinel_web_search_action_json`] at the typed
+    /// deserialization boundary, and request serialization must strip that
+    /// exact sentinel — and only it — so the fabricated action never reaches
+    /// the provider while genuine actions replay untouched.
+    #[test]
+    fn strip_sentinel_web_search_actions_removes_only_the_sentinel() {
+        let sentinel_call = rs::WebSearchToolCall {
+            action: serde_json::from_value(sentinel_web_search_action_json())
+                .expect("sentinel parses as a typed action"),
+            id: "ws_sentinel".to_owned(),
+            status: rs::WebSearchToolCallStatus::Completed,
+        };
+        assert!(is_sentinel_web_search_action(&sentinel_call.action));
+
+        let real_call = rs::WebSearchToolCall {
+            action: rs::WebSearchToolCallAction::Search(rs::WebSearchActionSearch {
+                query: "open grok logs".to_owned(),
+                sources: None,
+            }),
+            id: "ws_real".to_owned(),
+            status: rs::WebSearchToolCallStatus::Completed,
+        };
+        assert!(!is_sentinel_web_search_action(&real_call.action));
+
+        let mut body = serde_json::json!({
+            "input": [
+                serde_json::to_value(&sentinel_call).unwrap(),
+                serde_json::to_value(&real_call).unwrap(),
+                { "type": "message", "role": "user", "content": "hi" }
+            ]
+        });
+        // The bare struct serializes without the `Item` enum's `type` tag;
+        // add it to mirror the real request wire shape.
+        body["input"][0]["type"] = serde_json::json!("web_search_call");
+        body["input"][1]["type"] = serde_json::json!("web_search_call");
+
+        strip_sentinel_web_search_actions(&mut body);
+
+        assert!(
+            body["input"][0].get("action").is_none(),
+            "sentinel action must be stripped before replay"
+        );
+        assert_eq!(
+            body["input"][1]["action"]["query"],
+            serde_json::json!("open grok logs"),
+            "a genuine action must replay untouched"
+        );
+        assert_eq!(body["input"][2]["content"], serde_json::json!("hi"));
     }
 
     // ========================================================================
