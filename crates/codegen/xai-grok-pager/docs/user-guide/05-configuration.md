@@ -375,7 +375,7 @@ provider = "fireworks"
 base_url = "https://api.fireworks.ai/inference/v1"
 api_backend = "chat_completions"
 env_key = "FIREWORKS_API_KEY"
-context_window = 200000
+context_window = 1040000
 ```
 
 API-key-only custom providers require an explicit `base_url`; they never

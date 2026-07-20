@@ -38,28 +38,28 @@ pub const CURATED_FIREWORKS_MODELS: [CuratedFireworksModel; 4] = [
         slug: "accounts/fireworks/models/glm-5p2",
         name: "GLM 5.2",
         description: "Zhipu's GLM 5.2 frontier model on Fireworks AI",
-        fallback_context_window: 200_000,
+        fallback_context_window: 1_040_000,
     },
     CuratedFireworksModel {
         key: "glm-5.2-fast",
         slug: "accounts/fireworks/routers/glm-5p2-fast",
         name: "GLM 5.2 Fast",
         description: "GLM 5.2 on Fireworks AI's low-latency router",
-        fallback_context_window: 200_000,
+        fallback_context_window: 1_040_000,
     },
     CuratedFireworksModel {
         key: "deepseek-v4-pro",
         slug: "accounts/fireworks/models/deepseek-v4-pro",
         name: "DeepSeek V4 Pro",
         description: "DeepSeek V4 Pro on Fireworks AI",
-        fallback_context_window: 160_000,
+        fallback_context_window: 1_040_000,
     },
     CuratedFireworksModel {
         key: "kimi-k2.7-code",
         slug: "accounts/fireworks/models/kimi-k2p7-code",
         name: "Kimi K2.7 Code",
         description: "Moonshot's Kimi K2.7 coding model on Fireworks AI",
-        fallback_context_window: 256_000,
+        fallback_context_window: 262_144,
     },
 ];
 
