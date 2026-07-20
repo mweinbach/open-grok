@@ -33,6 +33,7 @@ pub mod update_goal;
 pub mod video_gen;
 pub mod web_fetch;
 pub mod web_search;
+pub mod x_search;
 pub use agent_swarm::AgentSwarmTool;
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;
@@ -67,3 +68,4 @@ pub use video_gen::{
 };
 pub use web_fetch::{WebFetchClient, WebFetchConfig, WebFetchParams, WebFetchTool};
 pub use web_search::WebSearchTool;
+pub use x_search::XSearchTool;

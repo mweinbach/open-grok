@@ -292,6 +292,102 @@ impl WebSearchClient {
         Ok((content, pairs))
     }
 
+    /// Perform an X (Twitter) search via the xAI Responses API.
+    ///
+    /// The `x_search` tool is an xAI extension with no typed representation
+    /// in async-openai, so the typed request is serialized and the raw
+    /// `{"type": "x_search"}` declaration is spliced into `tools` — the same
+    /// shape the sampler uses for hosted X search. Only valid on the
+    /// Responses backend; the Perplexity backend has no X search.
+    pub async fn x_search(
+        &self,
+        query: &str,
+    ) -> Result<(String, Vec<String>), xai_tool_runtime::ToolError> {
+        if self.backend == WebSearchBackend::Perplexity {
+            return Err(xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("x_search").expect("valid"),
+                "X search requires the xAI backend".to_string(),
+            ));
+        }
+        let request = rs::CreateResponseArgs::default()
+            .model(self.model.clone())
+            .input(query.to_string())
+            .store(false)
+            .temperature(0.1)
+            .top_p(0.95)
+            .max_output_tokens(8192u32)
+            .build()
+            .map_err(|e| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("x_search").expect("valid"),
+                    format!("Failed to build request: {e}"),
+                )
+            })?;
+        let mut request = serde_json::to_value(&request).map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("x_search").expect("valid"),
+                format!("Failed to serialize request: {e}"),
+            )
+        })?;
+        if let Some(map) = request.as_object_mut() {
+            map.insert(
+                "tools".to_string(),
+                serde_json::json!([{ "type": "x_search" }]),
+            );
+        }
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let sent_bearer = self.current_bearer().await;
+        let mut req = self.http.post(&url).json(&request);
+        if let Some(ref key) = sent_bearer {
+            req = req.header(AUTHORIZATION, format!("Bearer {key}"));
+        }
+        let response = req.send().await.map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("x_search").expect("valid"),
+                format!("HTTP request failed: {e}"),
+            )
+        })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            self.record_401_attribution(sent_bearer.as_deref());
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Failed to read error body".to_string());
+            return Err(xai_tool_runtime::ToolError::unauthorized(format!(
+                "Responses API returned 401 Unauthorized: {body}"
+            ))
+            .with_details(serde_json::json!({ "tool_id" : "x_search", "status" : 401, })));
+        }
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Failed to read error body".to_string());
+            return Err(xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("x_search").expect("valid"),
+                format!("Responses API returned {status}: {body}"),
+            ));
+        }
+        let bytes = response.bytes().await.map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("x_search").expect("valid"),
+                format!("Failed to read response body: {e}"),
+            )
+        })?;
+        let response_obj: rs::Response = serde_json::from_slice(&bytes).map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("x_search").expect("valid"),
+                format!("Failed to parse response: {e}"),
+            )
+        })?;
+        let content = response_obj
+            .output_text()
+            .unwrap_or_else(|| "No search results found.".to_string());
+        let citations = extract_citations(&response_obj);
+        Ok((content, citations))
+    }
+
     async fn search_perplexity(
         &self,
         query: &str,

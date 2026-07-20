@@ -255,6 +255,10 @@ pub struct SessionContext {
     /// call the Responses API. When `Disabled` (default), the tool returns a
     /// graceful error if invoked.
     pub web_search_config: crate::implementations::web_search::WebSearchConfig,
+    /// xAI-backed config for the client `x_search` tool. Independent of
+    /// `web_search_config`: web search may be routed to another backend
+    /// while X search stays on xAI.
+    pub x_search_config: crate::implementations::web_search::WebSearchConfig,
     /// Optional web fetch configuration. When `Enabled`, a `WebFetchClient`
     /// is created and injected into `Resources` so the `web_fetch` tool can
     /// fetch URLs. When `Disabled` (default), the tool is not registered.
@@ -1000,6 +1004,15 @@ impl ToolRegistryBuilder {
         ) {
             let client = client.with_attribution_callback(ctx.attribution_callback.clone());
             resources.insert(client);
+        }
+        if let Ok(client) = crate::implementations::web_search::client::WebSearchClient::new(
+            &ctx.x_search_config,
+            ctx.api_key_provider.clone(),
+        ) {
+            let client = client.with_attribution_callback(ctx.attribution_callback.clone());
+            resources.insert(crate::implementations::grok_build::x_search::XSearchClient(
+                client,
+            ));
         }
         if let Some(lsp) = ctx.lsp {
             resources.insert(lsp);
@@ -2006,6 +2019,7 @@ mod tests {
             state_path: tmp.path().join("state.json"),
             memory_backend: None,
             web_search_config: crate::implementations::web_search::WebSearchConfig::default(),
+            x_search_config: crate::implementations::web_search::WebSearchConfig::default(),
             web_fetch_config:
                 crate::implementations::grok_build::web_fetch::WebFetchConfig::default(),
             lsp: None,

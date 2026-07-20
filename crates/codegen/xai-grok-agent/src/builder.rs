@@ -87,6 +87,7 @@ pub struct AgentBuilder {
     state_path: Option<PathBuf>,
     memory_backend: Option<Arc<dyn xai_grok_tools::types::memory_backend::MemoryBackend>>,
     web_search_config: xai_grok_tools::implementations::web_search::WebSearchConfig,
+    x_search_config: xai_grok_tools::implementations::web_search::WebSearchConfig,
     /// When true, web search and X search are sent as native server-side
     /// tools for execution by the agentic sampler, instead of being
     /// registered as local Function tools.
@@ -215,6 +216,7 @@ impl AgentBuilder {
             state_path: None,
             memory_backend: None,
             web_search_config: Default::default(),
+            x_search_config: Default::default(),
             backend_search: false,
             web_fetch_config: Default::default(),
             lsp: None,
@@ -421,6 +423,16 @@ impl AgentBuilder {
         config: xai_grok_tools::implementations::web_search::WebSearchConfig,
     ) -> Self {
         self.web_search_config = config;
+        self
+    }
+
+    /// xAI-backed config for the client `x_search` tool. When `Disabled`
+    /// (default), the tool is not registered.
+    pub fn with_x_search_config(
+        mut self,
+        config: xai_grok_tools::implementations::web_search::WebSearchConfig,
+    ) -> Self {
+        self.x_search_config = config;
         self
     }
     /// When true, web search and X search are sent as native server-side
@@ -705,6 +717,10 @@ impl AgentBuilder {
             if self.web_search_config.is_enabled() {
                 use xai_grok_tools::implementations::grok_build;
                 tool_config.tools.push((&grok_build::WebSearchTool).into());
+            }
+            if self.x_search_config.is_enabled() {
+                use xai_grok_tools::implementations::grok_build;
+                tool_config.tools.push((&grok_build::XSearchTool).into());
             }
             if self.web_fetch_config.is_enabled() {
                 use xai_grok_tools::implementations::grok_build;
@@ -1036,6 +1052,7 @@ impl AgentBuilder {
                 state_path,
                 memory_backend: self.memory_backend,
                 web_search_config: self.web_search_config,
+                x_search_config: self.x_search_config,
                 web_fetch_config: self.web_fetch_config,
                 lsp: self.lsp,
                 image_gen_config: self.image_gen_config,

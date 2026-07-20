@@ -142,6 +142,7 @@ async fn test_agent_from_config(
         state_path: std::path::PathBuf::from("/tmp/tool_state.json"),
         memory_backend: None,
         web_search_config: Default::default(),
+        x_search_config: Default::default(),
         web_fetch_config: Default::default(),
         lsp: None,
         image_gen_config: Default::default(),

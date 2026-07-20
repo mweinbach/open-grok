@@ -109,6 +109,7 @@ async fn web_search_uses_model_override_from_config_end_to_end() {
             // test fixture there's no extra access key in scope.
             alpha_test_key: None,
         },
+        x_search_config: Default::default(),
         web_fetch_config: Default::default(),
         lsp: None,
         image_gen_config: Default::default(),
@@ -178,6 +179,7 @@ async fn web_search_errors_when_configured_model_cannot_be_resolved() {
         state_path: std::env::temp_dir().join("grok-web-search-disabled/state.json"),
         memory_backend: None,
         web_search_config: xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled,
+        x_search_config: Default::default(),
         web_fetch_config: Default::default(),
         lsp: None,
         image_gen_config: Default::default(),
