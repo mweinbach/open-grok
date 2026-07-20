@@ -2223,7 +2223,7 @@ mod tests {
         }
     }
     /// Regression: an enabled x_search config must produce a BUILDABLE agent.
-    /// v0.1.220-open-grok.16 shipped the builder push without registering
+    /// v0.1.220-open-grok.17 shipped the builder push without registering
     /// `XSearchTool` in the tool registry, so every session with xAI signed
     /// in (x_search defaults on) failed agent construction outright —
     /// "Requirements unsatisfied: GrokBuild:x_search not found in registry".
