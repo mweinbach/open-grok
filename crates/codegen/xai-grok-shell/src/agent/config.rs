@@ -3317,7 +3317,9 @@ pub fn resolve_model_list(
     cfg: &Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
-    resolve_model_list_with_provider_catalogs(cfg, prefetched, None, false, None, false)
+    resolve_model_list_with_provider_catalogs(
+        cfg, prefetched, None, false, None, false, None, false,
+    )
 }
 
 /// Assemble the combined provider catalog. The xAI and Codex remote catalogs
@@ -3341,6 +3343,8 @@ pub fn resolve_model_list_with_codex(
         codex_authoritative,
         None,
         false,
+        None,
+        false,
     )
 }
 
@@ -3354,6 +3358,8 @@ pub fn resolve_model_list_with_provider_catalogs(
     codex_authoritative: bool,
     kimi_remote: Option<IndexMap<String, ModelEntry>>,
     kimi_authoritative: bool,
+    fireworks_remote: Option<IndexMap<String, ModelEntry>>,
+    fireworks_authoritative: bool,
 ) -> IndexMap<String, ModelEntry> {
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
     let defaults =
@@ -3465,6 +3471,13 @@ pub fn resolve_model_list_with_provider_catalogs(
         kimi_live_discovery_enabled.then_some(kimi_remote).flatten(),
         ModelProvider::Kimi,
         kimi_live_discovery_enabled && kimi_authoritative,
+    );
+    merge_remote_provider_partition(
+        &mut resolved,
+        &defaults,
+        fireworks_remote,
+        ModelProvider::Fireworks,
+        fireworks_authoritative,
     );
     for (key, model_override) in &cfg.config_models {
         let had_base = resolved.contains_key(key);
@@ -3738,6 +3751,12 @@ fn default_models(
                 }
                 m.base_url = Some(kimi_base_url.clone());
                 m.env_key = Some(EnvKeys::single(kimi_endpoint.api_key_env()));
+            }
+            if m.provider == ModelProvider::Fireworks {
+                m.base_url = Some(crate::fireworks_models::api_base_url());
+                m.env_key = Some(EnvKeys::single(
+                    crate::fireworks_models::FIREWORKS_API_KEY_ENV,
+                ));
             }
             let key = m.id.clone().unwrap_or_else(|| m.model.clone());
             let context_window = m
@@ -4065,7 +4084,9 @@ impl ConfigModelOverride {
             // into values valid for the newly selected provider.
             entry.info.api_backend = match entry.info.provider {
                 ModelProvider::Codex => ApiBackend::Responses,
-                ModelProvider::Xai | ModelProvider::Kimi => ApiBackend::ChatCompletions,
+                ModelProvider::Xai | ModelProvider::Kimi | ModelProvider::Fireworks => {
+                    ApiBackend::ChatCompletions
+                }
             };
             if self.base_url.is_none() {
                 entry.info.base_url.clear();
@@ -4865,7 +4886,9 @@ pub fn effective_auth_scheme(provider: ModelProvider, configured: AuthScheme) ->
 fn trusted_built_in_session_endpoint(provider: ModelProvider, base_url: &str) -> bool {
     match provider.profile().session_auth {
         xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => {
-            provider.is_kimi() && crate::kimi_models::is_trusted_api_base_url(base_url)
+            (provider.is_kimi() && crate::kimi_models::is_trusted_api_base_url(base_url))
+                || (provider.is_fireworks()
+                    && crate::fireworks_models::is_trusted_api_base_url(base_url))
         }
         xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
             crate::util::is_xai_api_bearer_url(base_url)
@@ -12468,6 +12491,68 @@ default = "grok-4.5"
     }
 
     #[test]
+    fn embedded_fireworks_models_are_curated_chat_only_with_provider_owned_credentials() {
+        let defaults = default_model_entries(&EndpointsConfig::default());
+        for (key, slug) in [
+            ("glm-5.2", "accounts/fireworks/models/glm-5p2"),
+            ("glm-5.2-fast", "accounts/fireworks/routers/glm-5p2-fast"),
+            (
+                "deepseek-v4-pro",
+                "accounts/fireworks/models/deepseek-v4-pro",
+            ),
+            ("kimi-k2.7-code", "accounts/fireworks/models/kimi-k2p7-code"),
+        ] {
+            let entry = defaults.get(key).expect("embedded Fireworks model");
+            assert_eq!(entry.info.provider, ModelProvider::Fireworks);
+            assert_eq!(entry.info.model, slug);
+            assert_eq!(entry.info.api_backend, ApiBackend::ChatCompletions);
+            assert_eq!(
+                entry.info.base_url,
+                crate::fireworks_models::FIREWORKS_API_BASE_URL
+            );
+            assert_eq!(entry.info.tool_mode, Some(ToolMode::Direct));
+            assert!(!entry.info.supports_reasoning_effort);
+            assert_eq!(
+                entry.env_key.as_ref().and_then(EnvKeys::primary),
+                Some(crate::fireworks_models::FIREWORKS_API_KEY_ENV)
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_fireworks_catalog_replaces_only_fireworks_partition() {
+        let cfg = Config::default();
+        let mut fireworks = IndexMap::new();
+        let mut entry = kimi_model_entry("accounts/fireworks/models/glm-5p2", 262_144);
+        entry.info.provider = ModelProvider::Fireworks;
+        entry.info.base_url = crate::fireworks_models::FIREWORKS_API_BASE_URL.to_string();
+        entry.env_key = Some(EnvKeys::single(
+            crate::fireworks_models::FIREWORKS_API_KEY_ENV,
+        ));
+        fireworks.insert("glm-5.2".to_string(), entry);
+
+        let resolved = resolve_model_list_with_provider_catalogs(
+            &cfg,
+            None,
+            None,
+            false,
+            None,
+            false,
+            Some(fireworks),
+            true,
+        );
+        assert!(resolved.contains_key("grok-4.5"));
+        assert!(resolved.contains_key("kimi-k3"));
+        assert!(resolved.contains_key("glm-5.2"));
+        assert!(
+            !resolved.contains_key("deepseek-v4-pro"),
+            "an authoritative Fireworks catalog replaces the embedded Fireworks partition"
+        );
+        assert_eq!(resolved["glm-5.2"].info.provider, ModelProvider::Fireworks);
+        assert_eq!(resolved["glm-5.2"].info.context_window.get(), 262_144);
+    }
+
+    #[test]
     fn models_config_defaults_to_platform_and_parses_code_canonically() {
         assert_eq!(
             ModelsConfig::default().kimi_endpoint,
@@ -12726,6 +12811,8 @@ default = "grok-4.5"
             false,
             Some(kimi),
             true,
+            None,
+            false,
         );
         assert!(resolved.contains_key("grok-live"));
         assert!(resolved.contains_key("gpt-5.6-sol"));
@@ -12744,8 +12831,16 @@ default = "grok-4.5"
         remote.info.supports_reasoning_effort = false;
         kimi.insert("kimi-k3".to_string(), remote);
 
-        let resolved =
-            resolve_model_list_with_provider_catalogs(&cfg, None, None, false, Some(kimi), true);
+        let resolved = resolve_model_list_with_provider_catalogs(
+            &cfg,
+            None,
+            None,
+            false,
+            Some(kimi),
+            true,
+            None,
+            false,
+        );
         let entry = &resolved["kimi-k3"];
         assert_eq!(entry.info.context_window.get(), 1_048_576);
         assert_eq!(entry.info.reasoning_effort, Some(ReasoningEffort::Max));

@@ -1121,6 +1121,13 @@ impl SessionActor {
                     );
                     false
                 }
+                xai_grok_sampling_types::ModelProvider::Fireworks => {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        "Fireworks AI API-key authentication cannot be refreshed; surfacing 401",
+                    );
+                    false
+                }
             };
         if !matches!(error.kind, SamplingErrorKind::Auth) && error.status_code == Some(401) {
             xai_grok_telemetry::unified_log::warn(

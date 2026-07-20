@@ -356,6 +356,7 @@ pub enum WebSearchSourceTarget {
     Codex,
     KimiPlatform,
     KimiCode,
+    Fireworks,
 }
 
 impl WebSearchSourceTarget {
@@ -372,6 +373,7 @@ impl WebSearchSourceTarget {
                 crate::kimi_models::KimiApiEndpoint::Platform => Self::KimiPlatform,
                 crate::kimi_models::KimiApiEndpoint::Code => Self::KimiCode,
             },
+            ModelProvider::Fireworks => Self::Fireworks,
         }
     }
 }
@@ -386,6 +388,7 @@ pub struct WebSearchSourceConfig {
     pub codex: Option<WebSearchSource>,
     pub kimi_platform: Option<WebSearchSource>,
     pub kimi_code: Option<WebSearchSource>,
+    pub fireworks: Option<WebSearchSource>,
 }
 
 impl WebSearchSourceConfig {
@@ -396,6 +399,7 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::Codex => self.codex,
             WebSearchSourceTarget::KimiPlatform => self.kimi_platform,
             WebSearchSourceTarget::KimiCode => self.kimi_code,
+            WebSearchSourceTarget::Fireworks => self.fireworks,
         }
     }
 
@@ -406,7 +410,8 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::Codex => WebSearchSource::Native,
             WebSearchSourceTarget::Xai
             | WebSearchSourceTarget::KimiPlatform
-            | WebSearchSourceTarget::KimiCode => WebSearchSource::Xai,
+            | WebSearchSourceTarget::KimiCode
+            | WebSearchSourceTarget::Fireworks => WebSearchSource::Xai,
         }
     }
 
@@ -423,6 +428,7 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::Codex => self.codex = source,
             WebSearchSourceTarget::KimiPlatform => self.kimi_platform = source,
             WebSearchSourceTarget::KimiCode => self.kimi_code = source,
+            WebSearchSourceTarget::Fireworks => self.fireworks = source,
         }
     }
 }
@@ -505,7 +511,9 @@ impl WebSearchCandidates {
                     WebSearchSource::Native
                 }
             }
-            WebSearchSourceTarget::Xai => WebSearchSource::Xai,
+            // The legacy Perplexity toggle is a Kimi-only alias; Fireworks
+            // requires an explicit Perplexity selection.
+            WebSearchSourceTarget::Xai | WebSearchSourceTarget::Fireworks => WebSearchSource::Xai,
         }
     }
 
@@ -529,8 +537,10 @@ impl WebSearchCandidates {
         match self.effective_source_for(target) {
             WebSearchSource::Native => match provider {
                 // Codex native search is the hosted server-side declaration;
-                // no client tool. Kimi has no native search.
-                ModelProvider::Codex | ModelProvider::Kimi => WebSearchConfig::Disabled,
+                // no client tool. Kimi and Fireworks have no native search.
+                ModelProvider::Codex | ModelProvider::Kimi | ModelProvider::Fireworks => {
+                    WebSearchConfig::Disabled
+                }
                 // For xAI, "native" and the xAI client tool are the same
                 // service — keep the client declaration as today.
                 ModelProvider::Xai => self.xai.clone(),

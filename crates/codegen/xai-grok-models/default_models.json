@@ -78,6 +78,58 @@
       "supported_in_api": true
     },
     {
+      "id": "glm-5.2",
+      "model": "accounts/fireworks/models/glm-5p2",
+      "name": "GLM 5.2",
+      "description": "Zhipu's GLM 5.2 frontier model on Fireworks AI",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 200000,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "glm-5.2-fast",
+      "model": "accounts/fireworks/routers/glm-5p2-fast",
+      "name": "GLM 5.2 Fast",
+      "description": "GLM 5.2 on Fireworks AI's low-latency router",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 200000,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "model": "accounts/fireworks/models/deepseek-v4-pro",
+      "name": "DeepSeek V4 Pro",
+      "description": "DeepSeek V4 Pro on Fireworks AI",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 160000,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
+      "id": "kimi-k2.7-code",
+      "model": "accounts/fireworks/models/kimi-k2p7-code",
+      "name": "Kimi K2.7 Code",
+      "description": "Moonshot's Kimi K2.7 coding model on Fireworks AI",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "context_window": 256000,
+      "api_backend": "chat_completions",
+      "provider": "fireworks",
+      "env_key": "FIREWORKS_API_KEY",
+      "tool_mode": "direct",
+      "supported_in_api": true
+    },
+    {
       "model": "gpt-5.6-sol",
       "name": "GPT-5.6 Sol",
       "description": "Latest frontier agentic coding model",

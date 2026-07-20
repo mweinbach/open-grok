@@ -1201,14 +1201,15 @@ fn resolve_resume_model_route(
         .flatten()
 }
 
-/// Re-resolve a Kimi child's endpoint and credential immediately before its
-/// sampling client is built.
+/// Re-resolve an API-key provider child's service and credential immediately
+/// before its sampling client is built. Covers Kimi (endpoint + key) and
+/// Fireworks AI (key).
 ///
 /// `SubagentSpawnContext.available_models` is intentionally a launch snapshot.
 /// The endpoint/key settings flow can mutate the resident model manager while
 /// earlier spawn setup awaits filesystem work, so using only that snapshot
-/// could resurrect a credential that was just replaced or cleared. Non-Kimi
-/// providers retain their existing snapshot semantics.
+/// could resurrect a credential that was just replaced or cleared. Providers
+/// with built-in session auth retain their existing snapshot semantics.
 fn refresh_kimi_sampling_config_for_spawn(
     config: &mut xai_grok_sampler::SamplerConfig,
     model_id: &acp::ModelId,
@@ -1217,21 +1218,25 @@ fn refresh_kimi_sampling_config_for_spawn(
     use crate::agent::config::{resolve_credentials, sampling_config_for_model};
     use xai_grok_sampling_types::ModelProvider;
 
-    if config.provider != ModelProvider::Kimi {
+    let provider = config.provider;
+    if !matches!(provider, ModelProvider::Kimi | ModelProvider::Fireworks) {
         return Ok(());
     }
+    let provider_name = provider.name();
 
     let live_models = ctx.models_manager.models();
     let entry = crate::agent::config::find_model_by_id(&live_models, model_id.0.as_ref())
         .cloned()
         .ok_or_else(|| {
             format!(
-                "Kimi service changed while subagent was starting; model '{}' is no longer available",
+                "{provider_name} service changed while subagent was starting; model '{}' is no longer available",
                 model_id.0
             )
         })?;
-    if entry.info().provider != ModelProvider::Kimi {
-        return Err("Kimi service changed while subagent was starting".to_owned());
+    if entry.info().provider != provider {
+        return Err(format!(
+            "{provider_name} service changed while subagent was starting"
+        ));
     }
 
     let mut credentials = resolve_credentials(&entry, None);
@@ -1249,10 +1254,13 @@ fn refresh_kimi_sampling_config_for_spawn(
         .as_deref()
         .is_none_or(|key| key.trim().is_empty())
     {
-        return Err(format!(
-            "{} API key is required before starting this Kimi subagent",
-            crate::kimi_models::effective_endpoint(ctx.models_manager.kimi_endpoint())
-        ));
+        return Err(match provider {
+            ModelProvider::Kimi => format!(
+                "{} API key is required before starting this Kimi subagent",
+                crate::kimi_models::effective_endpoint(ctx.models_manager.kimi_endpoint())
+            ),
+            _ => format!("A {provider_name} API key is required before starting this subagent"),
+        });
     }
     if config.reasoning_effort.is_some() {
         refreshed.reasoning_effort = config.reasoning_effort;

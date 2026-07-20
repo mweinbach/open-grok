@@ -53,6 +53,19 @@ pub(super) fn kimi_models_query_payload(
     }
 }
 
+pub(super) fn fireworks_models_apply_payload(
+    refreshed: Result<bool, String>,
+    models: acp::SessionModelState,
+) -> serde_json::Value {
+    match refreshed {
+        Ok(refreshed) => serde_json::json!({ "refreshed": refreshed, "models": models }),
+        Err(warning) => {
+            tracing::warn!(%warning, "Fireworks model query failed; returning embedded models");
+            serde_json::json!({ "refreshed": false, "warning": warning, "models": models })
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct KimiEndpointApplyParams {
     endpoint: crate::kimi_models::KimiApiEndpoint,
@@ -3513,6 +3526,36 @@ impl acp::Agent for MvpAgent {
                     "cleared": self.models_manager.clear_kimi_models(),
                 }),
             )),
+            "open-grok/fireworks/models/apply" => {
+                // Fireworks credentials are captured in each child sampler at
+                // spawn. Stop resident Fireworks children (and every
+                // initializing child whose provider is not resolved yet)
+                // before mutating the live credential so no later child turn
+                // can use stale auth.
+                let cancelled_subagents = self
+                    .subagent_coordinator
+                    .borrow_mut()
+                    .cancel_for_fireworks_runtime_change();
+                if cancelled_subagents > 0 {
+                    tracing::warn!(
+                        cancelled_subagents,
+                        "cancelled subagents before Fireworks runtime credential change"
+                    );
+                }
+                let refreshed = self
+                    .models_manager
+                    .apply_fireworks_credential_change()
+                    .await
+                    .map_err(|error| error.to_string());
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(fireworks_models_apply_payload(
+                    refreshed, models,
+                )))
+            }
             "open-grok/kimi/endpoint/apply" => {
                 let params = crate::extensions::parse_params::<KimiEndpointApplyParams>(&args)?;
                 // Kimi credentials are captured in each child sampler at

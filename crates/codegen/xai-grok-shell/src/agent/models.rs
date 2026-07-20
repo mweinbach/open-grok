@@ -12,6 +12,7 @@ use indexmap::IndexMap;
 use crate::agent::config::{self, ModelEntry, resolve_credentials, sampling_config_for_model};
 use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
 use crate::codex_models::{CodexCompactionMetadata, CodexModelsCatalog, CodexModelsClient};
+use crate::fireworks_models::{FireworksModelsCatalog, FireworksModelsClient};
 use crate::kimi_models::{KimiApiEndpoint, KimiModelsCatalog, KimiModelsClient};
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::sampling::SamplerConfig as SamplingConfig;
@@ -116,6 +117,9 @@ struct Inner {
     codex_catalog: RwLock<Option<CodexModelsCatalog>>,
     /// Provider-isolated Kimi catalog queried with only the Kimi API key.
     kimi_catalog: RwLock<Option<KimiModelsCatalog>>,
+    /// Provider-isolated Fireworks catalog queried with only the Fireworks
+    /// API key. The queried catalog only enriches the curated model list.
+    fireworks_catalog: RwLock<Option<FireworksModelsCatalog>>,
     models: RwLock<IndexMap<String, ModelEntry>>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
@@ -133,17 +137,22 @@ struct Inner {
     cache: ModelsCacheManager,
     codex_client: CodexModelsClient,
     kimi_client: RwLock<KimiModelsClient>,
+    fireworks_client: FireworksModelsClient,
     /// Serialize Codex cache/network refreshes. Session startup waits for an
     /// already-running refresh so it resolves against the same catalog rather
     /// than racing past the initial `OnlineIfUncached` request.
     codex_refresh_lock: tokio::sync::Mutex<()>,
     kimi_refresh_lock: tokio::sync::Mutex<()>,
+    fireworks_refresh_lock: tokio::sync::Mutex<()>,
     /// Invalidates a refresh result when Codex logout races an in-flight
     /// `/models` request. Logout increments this before clearing the cache;
     /// only a refresh that started in the current generation may publish.
     codex_catalog_generation: AtomicU64,
     /// Invalidates a Kimi model query when a catalog clear races its response.
     kimi_catalog_generation: AtomicU64,
+    /// Invalidates a Fireworks model query when a catalog clear races its
+    /// response.
+    fireworks_catalog_generation: AtomicU64,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// `allowed_models` matched nothing in the fetched catalog; the prompt path
@@ -228,6 +237,7 @@ impl ModelsManager {
                 prefetched: RwLock::new(prefetched),
                 codex_catalog: RwLock::new(codex_catalog),
                 kimi_catalog: RwLock::new(kimi_catalog),
+                fireworks_catalog: RwLock::new(None),
                 models: RwLock::new(models),
                 current_model_id: RwLock::new(current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
@@ -240,10 +250,13 @@ impl ModelsManager {
                 cache: ModelsCacheManager::new(),
                 codex_client,
                 kimi_client: RwLock::new(kimi_client),
+                fireworks_client: FireworksModelsClient::new(),
                 codex_refresh_lock: tokio::sync::Mutex::new(()),
                 kimi_refresh_lock: tokio::sync::Mutex::new(()),
+                fireworks_refresh_lock: tokio::sync::Mutex::new(()),
                 codex_catalog_generation: AtomicU64::new(0),
                 kimi_catalog_generation: AtomicU64::new(0),
+                fireworks_catalog_generation: AtomicU64::new(0),
                 retry_in_flight: AtomicBool::new(false),
                 allowlist_excludes_all: AtomicBool::new(false),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
@@ -303,6 +316,7 @@ impl ModelsManager {
             prefetched_models.clone(),
             codex_catalog.as_ref(),
             kimi_catalog.as_ref(),
+            None,
         );
 
         // Validate only against a real catalog; a bundled-only first run defers
@@ -348,6 +362,7 @@ impl ModelsManager {
         *self.inner.gateway.write() = Some(gateway);
         self.start_codex_models_refresh();
         self.start_kimi_models_query();
+        self.start_fireworks_models_query();
     }
 
     /// Refresh the authenticated ChatGPT Codex catalog after the agent has a
@@ -502,6 +517,86 @@ impl ModelsManager {
         had_catalog
     }
 
+    fn start_fireworks_models_query(&self) {
+        if !self.inner.fireworks_client.has_usable_api_key() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("Fireworks model query deferred: no Tokio runtime");
+            return;
+        };
+        let manager = self.clone();
+        runtime.spawn(async move {
+            if let Err(error) = manager.refresh_fireworks_models().await {
+                tracing::warn!(%error, "Fireworks model query failed; keeping embedded models");
+            }
+        });
+    }
+
+    /// Query Fireworks' provider-owned `/models` endpoint and publish only its
+    /// curated catalog partition. Failures preserve the embedded catalog.
+    pub(crate) async fn refresh_fireworks_models(&self) -> anyhow::Result<bool> {
+        let _refresh_guard = self.inner.fireworks_refresh_lock.lock().await;
+        let generation = self
+            .inner
+            .fireworks_catalog_generation
+            .load(Ordering::Acquire);
+        let client = self.inner.fireworks_client.clone();
+        let Some(refreshed) = client.query().await? else {
+            tracing::debug!("Fireworks model query skipped: no Fireworks API key");
+            return Ok(false);
+        };
+        if generation
+            != self
+                .inner
+                .fireworks_catalog_generation
+                .load(Ordering::Acquire)
+            || !client.catalog_matches_current_credential(&refreshed)
+        {
+            tracing::debug!(
+                "discarded Fireworks model query completed after catalog clear or credential change"
+            );
+            return Ok(false);
+        }
+        let count = refreshed.entries().len();
+        let authoritative = refreshed.is_authoritative();
+        *self.inner.fireworks_catalog.write() = Some(refreshed);
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.prefetched.read().clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        tracing::info!(count, authoritative, "Fireworks model catalog refreshed");
+        Ok(true)
+    }
+
+    /// Drop queried Fireworks entries after its key is cleared. The embedded
+    /// curated entries remain available so the UI can accept a replacement key.
+    pub(crate) fn clear_fireworks_models(&self) -> bool {
+        self.inner
+            .fireworks_catalog_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let had_catalog = self.inner.fireworks_catalog.write().take().is_some();
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.prefetched.read().clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        had_catalog
+    }
+
+    /// Apply a Fireworks credential change to the resident model manager:
+    /// refresh the curated partition when a usable key exists, otherwise drop
+    /// any credential-derived entries back to the embedded fallback.
+    pub(crate) async fn apply_fireworks_credential_change(&self) -> anyhow::Result<bool> {
+        if self.inner.fireworks_client.has_usable_api_key() {
+            self.refresh_fireworks_models().await
+        } else {
+            self.clear_fireworks_models();
+            Ok(false)
+        }
+    }
+
     /// Apply a Kimi service selection to the resident model manager. The
     /// embedded partition is rebuilt synchronously; Platform then attempts a
     /// live `/models` refresh, while Code deliberately keeps its embedded
@@ -539,6 +634,7 @@ impl ModelsManager {
         let new_catalog = {
             let codex_catalog = self.inner.codex_catalog.read();
             let kimi_catalog = self.inner.kimi_catalog.read();
+            let fireworks_catalog = self.inner.fireworks_catalog.read();
             resolve_model_catalog_with_provider_catalogs(
                 &new_config,
                 prefetched,
@@ -548,6 +644,7 @@ impl ModelsManager {
                 } else {
                     kimi_catalog.as_ref()
                 },
+                fireworks_catalog.as_ref(),
             )
         };
         let has_real_catalog = *self.inner.has_fetched_real_catalog.read();
@@ -916,11 +1013,13 @@ impl ModelsManager {
         let catalog = {
             let codex_catalog = self.inner.codex_catalog.read();
             let kimi_catalog = self.inner.kimi_catalog.read();
+            let fireworks_catalog = self.inner.fireworks_catalog.read();
             resolve_model_catalog_with_provider_catalogs(
                 cfg,
                 prefetched,
                 codex_catalog.as_ref(),
                 kimi_catalog.as_ref(),
+                fireworks_catalog.as_ref(),
             )
         };
         *self.inner.models.write() = catalog;
@@ -2275,7 +2374,7 @@ pub fn resolve_model_catalog(
     cfg: &config::Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
-    resolve_model_catalog_with_provider_catalogs(cfg, prefetched, None, None)
+    resolve_model_catalog_with_provider_catalogs(cfg, prefetched, None, None, None)
 }
 
 /// Resolve the combined catalog while preserving each provider's independently
@@ -2285,11 +2384,15 @@ fn resolve_model_catalog_with_provider_catalogs(
     prefetched: Option<IndexMap<String, ModelEntry>>,
     codex_catalog: Option<&CodexModelsCatalog>,
     kimi_catalog: Option<&KimiModelsCatalog>,
+    fireworks_catalog: Option<&FireworksModelsCatalog>,
 ) -> IndexMap<String, ModelEntry> {
     let codex_entries = codex_catalog.map(CodexModelsCatalog::entries);
     let codex_authoritative = codex_catalog.is_some_and(CodexModelsCatalog::is_authoritative);
     let kimi_entries = kimi_catalog.map(KimiModelsCatalog::entries);
     let kimi_authoritative = kimi_catalog.is_some_and(KimiModelsCatalog::is_authoritative);
+    let fireworks_entries = fireworks_catalog.map(FireworksModelsCatalog::entries);
+    let fireworks_authoritative =
+        fireworks_catalog.is_some_and(FireworksModelsCatalog::is_authoritative);
     let mut catalog: IndexMap<String, ModelEntry> =
         config::resolve_model_list_with_provider_catalogs(
             cfg,
@@ -2298,6 +2401,8 @@ fn resolve_model_catalog_with_provider_catalogs(
             codex_authoritative,
             kimi_entries,
             kimi_authoritative,
+            fireworks_entries,
+            fireworks_authoritative,
         );
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {

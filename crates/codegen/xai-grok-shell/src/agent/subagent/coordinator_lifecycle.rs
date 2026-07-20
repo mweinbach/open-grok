@@ -484,12 +484,25 @@ impl SubagentCoordinator {
     /// resolved provider. The promote checkpoint shuts a cancelled child down
     /// before its first prompt reaches inference.
     pub fn cancel_for_kimi_runtime_change(&mut self) -> usize {
+        self.cancel_for_provider_runtime_change(xai_grok_sampling_types::ModelProvider::Kimi)
+    }
+
+    /// Stop every child that could retain a stale Fireworks AI key.
+    pub fn cancel_for_fireworks_runtime_change(&mut self) -> usize {
+        self.cancel_for_provider_runtime_change(xai_grok_sampling_types::ModelProvider::Fireworks)
+    }
+
+    /// Stop every child that could retain a stale credential for one API-key
+    /// provider, plus every initializing child whose provider is not yet
+    /// safely resolved.
+    fn cancel_for_provider_runtime_change(
+        &mut self,
+        provider: xai_grok_sampling_types::ModelProvider,
+    ) -> usize {
         let mut ids = self
             .active
             .values()
-            .filter(|tracker| {
-                tracker.effective_provider == xai_grok_sampling_types::ModelProvider::Kimi
-            })
+            .filter(|tracker| tracker.effective_provider == provider)
             .map(|tracker| tracker.subagent_id.clone())
             .collect::<Vec<_>>();
         ids.extend(self.pending.keys().cloned());
