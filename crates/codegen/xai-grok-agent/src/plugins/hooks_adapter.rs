@@ -172,23 +172,28 @@ fn process_hooks_content(
         // that hooks like `${CLAUDE_PLUGIN_ROOT}/hooks/foo.sh` resolve to the
         // real plugin directory regardless of which spawn branch the runner
         // takes (mirrors what managed_mcp does for MCP server commands).
-        if let Some(cmd) = &spec.command {
-            let cmd_str = cmd.to_string_lossy();
-            // Mirror what `managed_mcp::load_plugin_mcp_servers_from_config`
-            // does for plugin MCP server commands: first substitute the
-            // plugin-specific placeholders (`${CLAUDE_PLUGIN_ROOT}` and
-            // friends), then run the result through the generic
-            // `${VAR}` / `$VAR` env expansion. Doing both passes at
-            // config-load time keeps hook env var resolution consistent
-            // with managed MCP server resolution and avoids relying on
-            // the runtime `sh -c` shell-metachar heuristic in
-            // `xai-grok-hooks::runner::command` for env vars whose
-            // values are already known at load time.
+        // `parse_hook_file` already ran a generic env expansion over the
+        // command using the hook's own `extra_env` with a process-env
+        // fallback. When the open-grok process itself runs inside a
+        // plugin-style environment that exports a plugin-owned name (e.g.
+        // launched from another agent's plugin context with
+        // `CLAUDE_PLUGIN_DATA` set), that pass resolves the placeholder to
+        // the HOST's directory before this adapter can substitute the
+        // plugin's own path. Recompute from the unexpanded `command_raw`:
+        // substitute the plugin-owned tokens first (authoritative), then
+        // re-run the same expansion the parser used — with `extra_env` now
+        // carrying the plugin env merged above — so user-declared and
+        // generic env references behave exactly as at parse time.
+        let raw_command = spec.command_raw.clone().or_else(|| {
+            spec.command
+                .as_ref()
+                .map(|cmd| cmd.to_string_lossy().into_owned())
+        });
+        if let Some(cmd_str) = raw_command {
             let substituted = substitute_env_vars(&cmd_str, plugin_root, plugin_data);
-            let expanded = xai_grok_config::expand_env_vars_in_string(&substituted);
-            if expanded != cmd_str {
-                spec.command = Some(PathBuf::from(expanded));
-            }
+            let expanded =
+                xai_grok_hooks::expand_env_vars_with_extra(&substituted, &spec.extra_env);
+            spec.command = Some(PathBuf::from(expanded));
         }
     }
 
@@ -498,14 +503,10 @@ mod tests {
     /// whose handler doesn't otherwise contain shell metacharacters.
     /// Plugin hooks must not be double-expanded: a `${CLAUDE_PLUGIN_ROOT}`
     /// reference resolves to the plugin root exactly once, and the result
-    /// contains no leftover `$` placeholders. This is the contract the
-    /// hooks_adapter has long held, and it must continue to hold
-    /// now that `parse_hook_file` itself does an env-expansion pass with
-    /// the per-hook `extra_env`. The first pass (in `parse_hook_file`)
-    /// runs against an EMPTY `extra_env` for plugin hooks (the adapter
-    /// only fills it in afterwards), so the placeholder survives that
-    /// pass and the second pass (here, after `extra_env` is wired in)
-    /// resolves it.
+    /// contains no leftover `$` placeholders. The adapter recomputes the
+    /// command from the unexpanded `command_raw` (substituting plugin
+    /// tokens before the generic env pass), so the parser's own expansion
+    /// pass — whatever it resolved — never stacks with the adapter's.
     #[test]
     fn parse_plugin_hooks_resolves_plugin_root_exactly_once() {
         let value = serde_json::json!({
@@ -538,6 +539,79 @@ mod tests {
             !cmd.contains('$'),
             "command must not contain leftover $: {cmd}"
         );
+    }
+
+    /// Run `f` with the env var set, restoring the prior value on return.
+    /// Copy of `xai-grok-hooks`' test-only helper (not exported across
+    /// crates). Env writes are process-global; the plugin-owned names used
+    /// below are safe because every adapter test resolves through
+    /// `command_raw`, which is immune to ambient values by design.
+    fn with_env_var<R>(name: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+        let previous = std::env::var_os(name);
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        let result = catch_unwind(AssertUnwindSafe(f));
+        unsafe {
+            match &previous {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        match result {
+            Ok(r) => r,
+            Err(panic) => resume_unwind(panic),
+        }
+    }
+
+    /// Regression for the ambient-environment collision: when the open-grok
+    /// process itself runs where a plugin-owned name is exported (e.g.
+    /// launched from another agent's plugin context that sets
+    /// `CLAUDE_PLUGIN_DATA`), `parse_hook_file`'s process-env fallback used
+    /// to resolve the placeholder to the HOST's directory before the
+    /// adapter could substitute this plugin's own path. The adapter now
+    /// recomputes from `command_raw`, so the plugin's value always wins.
+    #[test]
+    fn plugin_tokens_beat_ambient_process_environment() {
+        with_env_var("CLAUDE_PLUGIN_DATA", Some("/ambient/host/data"), || {
+            with_env_var("CLAUDE_PLUGIN_ROOT", Some("/ambient/host/root"), || {
+                let value = serde_json::json!({
+                    "hooks": {
+                        "PreToolUse": [
+                            {"hooks": [
+                                {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pre.sh"},
+                                {"type": "command", "command": "${CLAUDE_PLUGIN_DATA}/cache/post.sh"}
+                            ]}
+                        ]
+                    }
+                });
+
+                let (specs, warnings) = parse_plugin_hooks_from_value(
+                    &value,
+                    "ambient-collision",
+                    "/real/plugin/root",
+                    "/real/plugin/data",
+                );
+
+                assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+                let commands: Vec<String> = specs
+                    .iter()
+                    .map(|s| s.command.as_ref().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                assert!(
+                    commands.contains(&"/real/plugin/root/hooks/pre.sh".to_string()),
+                    "plugin root must beat ambient env: {commands:?}"
+                );
+                assert!(
+                    commands.contains(&"/real/plugin/data/cache/post.sh".to_string()),
+                    "plugin data must beat ambient env: {commands:?}"
+                );
+            })
+        })
     }
 
     /// Plugin hook JSON may declare its own `env` map. The user-declared

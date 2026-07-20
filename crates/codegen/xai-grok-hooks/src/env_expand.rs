@@ -116,7 +116,7 @@ fn make_sentinel() -> String {
 ///
 /// Parameter-expansion-modifier forms (`${VAR:-x}`, `${VAR%pat}`, etc.)
 /// are ALSO preserved verbatim; see the module-level rustdoc for why.
-pub(crate) fn expand_env_vars_with_extra(input: &str, extra: &HashMap<String, String>) -> String {
+pub fn expand_env_vars_with_extra(input: &str, extra: &HashMap<String, String>) -> String {
     // Generate a fresh per-call sentinel. 128 bits of entropy means a
     // natural collision with any input substring or extra-env value is
     // ~2^-128 probability. See `make_sentinel` rustdoc.

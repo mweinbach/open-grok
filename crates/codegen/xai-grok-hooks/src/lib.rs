@@ -40,6 +40,7 @@ pub mod config;
 pub mod discovery;
 pub mod dispatcher;
 mod env_expand;
+pub use env_expand::expand_env_vars_with_extra;
 pub mod error;
 pub mod event;
 pub mod matcher;
