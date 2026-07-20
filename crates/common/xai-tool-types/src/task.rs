@@ -211,6 +211,27 @@ pub struct WorkflowToolInput {
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_from_run_id: Option<String>,
+
+    /// How journaled results are matched when resuming.
+    #[schemars(
+        description = "How journaled results are matched when resuming: \"exact\" (default — a \
+            call replays only when its prompt and behavioral options are unchanged) or \
+            \"positional\" (replay by call position even where wording was edited; use after \
+            editing a script when the call structure is unchanged). Requires \
+            resume_from_run_id."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_mode: Option<String>,
+
+    /// Last trusted point of the source run to replay through.
+    #[schemars(
+        description = "Go back to a specific point: the last trusted point of the source run, \
+            as a phase title, an agent label, or a numeric call index. Journaled results up \
+            through this point replay; everything after it re-runs fresh. Requires \
+            resume_from_run_id."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_through: Option<serde_json::Value>,
 }
 
 /// An insertion-ordered JSON object used for `AgentSwarm.resume_agent_ids`.

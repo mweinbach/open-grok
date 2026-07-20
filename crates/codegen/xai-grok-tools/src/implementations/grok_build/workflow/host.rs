@@ -168,6 +168,149 @@ impl ProgressState {
     }
 }
 
+/// How journaled results from a prior run are matched to this run's calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResumeMode {
+    /// Replay a call only when its `(prompt, behavioral opts)` key is
+    /// unchanged. Safe default: any semantic edit re-runs the call.
+    #[default]
+    Exact,
+    /// Replay by call position (the prelude's sequence index), trusting the
+    /// operator that the script's call structure is unchanged even where the
+    /// wording was edited. This is how "go back to a specific point" works
+    /// after editing a script: earlier positions replay, later ones re-run.
+    Positional,
+}
+
+/// Replay boundary: the last prior-run point that is still trusted.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResumeBoundary {
+    /// Replay journal entries with `index <= n`.
+    Index(u32),
+    /// Replay through the last journaled entry of the named phase (falling
+    /// back to an agent-label match), resolved against the source journal.
+    Point(String),
+}
+
+/// Journal entries from a prior run, indexed for the chosen resume mode.
+#[derive(Debug, Default)]
+pub struct ReplayPlan {
+    mode: ResumeMode,
+    by_key: HashMap<String, VecDeque<JournalEntry>>,
+    by_index: HashMap<u32, JournalEntry>,
+}
+
+impl ReplayPlan {
+    /// Build a plan from a prior run's successful entries. `boundary`
+    /// restricts which entries are trusted for replay; entries past it are
+    /// dropped so their calls run fresh.
+    pub fn build(
+        entries: Vec<JournalEntry>,
+        mode: ResumeMode,
+        boundary: Option<ResumeBoundary>,
+    ) -> Result<Self, String> {
+        let max_index = match boundary {
+            None => None,
+            Some(ResumeBoundary::Index(index)) => Some(index),
+            Some(ResumeBoundary::Point(ref point)) => {
+                let wanted = point.trim().to_lowercase();
+                let matches = |candidate: &Option<String>| {
+                    candidate
+                        .as_deref()
+                        .is_some_and(|value| value.trim().to_lowercase() == wanted)
+                };
+                let phase_max = entries
+                    .iter()
+                    .filter(|entry| matches(&entry.phase))
+                    .map(|entry| entry.index)
+                    .max();
+                let label_max = entries
+                    .iter()
+                    .filter(|entry| matches(&entry.label))
+                    .map(|entry| entry.index)
+                    .max();
+                let resolved = phase_max.or(label_max);
+                let Some(resolved) = resolved else {
+                    let mut known: Vec<String> = entries
+                        .iter()
+                        .flat_map(|entry| entry.phase.iter().chain(entry.label.iter()).cloned())
+                        .collect();
+                    known.sort();
+                    known.dedup();
+                    return Err(format!(
+                        "resume_through `{point}` matches no phase or agent label in the \
+                         source journal. Known points: {}",
+                        if known.is_empty() {
+                            "(none journaled)".to_string()
+                        } else {
+                            known.join(", ")
+                        }
+                    ));
+                };
+                Some(resolved)
+            }
+        };
+
+        let mut plan = Self {
+            mode,
+            ..Self::default()
+        };
+        for entry in entries {
+            if !entry.ok {
+                continue;
+            }
+            if let Some(max_index) = max_index
+                && entry.index > max_index
+            {
+                continue;
+            }
+            let migrated_key = migrate_journal_key(&entry.key);
+            plan.by_index.entry(entry.index).or_insert_with(|| {
+                let mut indexed = entry.clone();
+                indexed.key = migrated_key.clone();
+                indexed
+            });
+            let mut keyed = entry;
+            keyed.key = migrated_key.clone();
+            plan.by_key
+                .entry(migrated_key)
+                .or_default()
+                .push_back(keyed);
+        }
+        Ok(plan)
+    }
+
+    fn take(&mut self, call: &AgentCallInput, key: &str) -> Option<JournalEntry> {
+        match self.mode {
+            ResumeMode::Exact => self.by_key.get_mut(key).and_then(VecDeque::pop_front),
+            ResumeMode::Positional => self.by_index.remove(&call.index),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_index.is_empty()
+    }
+}
+
+/// Re-key a journal entry written by an older binary whose keys still carried
+/// the display-only `label`/`phase` fields. Produces exactly the serialization
+/// of [`WorkflowHost::journal_key`] for any serde_json configuration.
+fn migrate_journal_key(old: &str) -> String {
+    let Ok(value) = serde_json::from_str::<JsonValue>(old) else {
+        return old.to_string();
+    };
+    let field = |name: &str| value.get(name).cloned().unwrap_or(JsonValue::Null);
+    json!({
+        "prompt": field("prompt"),
+        "schema": field("schema"),
+        "model": field("model"),
+        "effort": field("effort"),
+        "isolation": field("isolation"),
+        "agent_type": field("agent_type"),
+    })
+    .to_string()
+}
+
 /// Everything the workflow tool wires into the host at run start.
 pub struct WorkflowHostConfig {
     pub backend: Arc<dyn SubagentBackend>,
@@ -182,7 +325,7 @@ pub struct WorkflowHostConfig {
     pub per_agent_timeout: Option<Duration>,
     pub token_budget: Option<u64>,
     pub journal_path: Option<std::path::PathBuf>,
-    pub replay: HashMap<String, VecDeque<JournalEntry>>,
+    pub replay: ReplayPlan,
 }
 
 pub struct WorkflowHost {
@@ -202,7 +345,7 @@ pub struct WorkflowHost {
     validated_types: parking_lot::Mutex<HashSet<String>>,
     state: parking_lot::Mutex<ProgressState>,
     journal: parking_lot::Mutex<Option<std::fs::File>>,
-    replay: parking_lot::Mutex<HashMap<String, VecDeque<JournalEntry>>>,
+    replay: parking_lot::Mutex<ReplayPlan>,
 }
 
 impl WorkflowHost {
@@ -289,12 +432,12 @@ impl WorkflowHost {
 
     /// Canonical journal key for one `agent()` call: prompt + every behavioral
     /// option, serialized with a fixed field order. `index` is deliberately
-    /// excluded so reordered-but-unchanged calls still replay.
+    /// excluded so reordered-but-unchanged calls still replay, and `label` /
+    /// `phase` are excluded because they are display-only — renaming a label
+    /// or regrouping phases must not invalidate journaled results.
     fn journal_key(call: &AgentCallInput) -> String {
         json!({
             "prompt": call.prompt,
-            "label": call.label,
-            "phase": call.phase,
             "schema": call.schema,
             "model": call.model,
             "effort": call.effort,
@@ -345,13 +488,10 @@ impl WorkflowHost {
         let label = Self::display_label(&call);
         let key = Self::journal_key(&call);
 
-        // Journal replay: an unchanged, previously successful call resolves
-        // instantly from the journal instead of spawning.
-        let replayed = self
-            .replay
-            .lock()
-            .get_mut(&key)
-            .and_then(VecDeque::pop_front);
+        // Journal replay: a trusted prior result (unchanged key, or same
+        // position under positional resume) resolves instantly instead of
+        // spawning.
+        let replayed = self.replay.lock().take(&call, &key);
         if let Some(entry) = replayed {
             self.record_agent(
                 AgentProgressEntry {
@@ -911,24 +1051,21 @@ impl CodeModeSessionDelegate for WorkflowHost {
     fn cell_closed(&self, _cell_id: &CellId) {}
 }
 
-/// Load a journal file into the replay map used by `resume_from_run_id`.
-pub fn load_replay_map(path: &std::path::Path) -> HashMap<String, VecDeque<JournalEntry>> {
-    let mut map: HashMap<String, VecDeque<JournalEntry>> = HashMap::new();
+/// Load a prior run's journal entries for `resume_from_run_id`.
+pub fn load_journal_entries(path: &std::path::Path) -> Vec<JournalEntry> {
     let Ok(contents) = std::fs::read_to_string(path) else {
-        return map;
+        return Vec::new();
     };
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<JournalEntry>(line)
-            && entry.ok
-        {
-            map.entry(entry.key.clone()).or_default().push_back(entry);
-        }
-    }
-    map
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<JournalEntry>(line).ok()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -951,18 +1088,159 @@ mod tests {
     }
 
     #[test]
-    fn journal_key_ignores_index_but_not_prompt_or_opts() {
+    fn journal_key_ignores_index_label_and_phase_but_not_prompt_or_opts() {
         let mut a = call("find bugs");
         a.index = 1;
         let mut b = call("find bugs");
         b.index = 7;
-        assert_eq!(WorkflowHost::journal_key(&a), WorkflowHost::journal_key(&b));
+        b.label = Some("renamed".to_string());
+        b.phase = Some("Regrouped".to_string());
+        assert_eq!(
+            WorkflowHost::journal_key(&a),
+            WorkflowHost::journal_key(&b),
+            "display-only fields must not invalidate journaled results"
+        );
 
         let mut c = call("find bugs");
         c.model = Some("some-model".to_string());
         assert_ne!(WorkflowHost::journal_key(&a), WorkflowHost::journal_key(&c));
         let d = call("find other bugs");
         assert_ne!(WorkflowHost::journal_key(&a), WorkflowHost::journal_key(&d));
+    }
+
+    fn entry(index: u32, prompt: &str, phase: Option<&str>, label: Option<&str>) -> JournalEntry {
+        JournalEntry {
+            index,
+            key: WorkflowHost::journal_key(&AgentCallInput {
+                prompt: prompt.to_string(),
+                ..call(prompt)
+            }),
+            ok: true,
+            value: json!(format!("result-{index}")),
+            error: None,
+            label: label.map(str::to_string),
+            phase: phase.map(str::to_string),
+            tokens_used: 1,
+            duration_ms: 1,
+            agent_id: Some(format!("agent-{index}")),
+        }
+    }
+
+    #[test]
+    fn positional_plan_replays_by_index_despite_reworded_prompts() {
+        let entries = vec![
+            entry(0, "old wording A", Some("P1"), None),
+            entry(1, "old wording B", Some("P2"), None),
+        ];
+        let mut plan =
+            ReplayPlan::build(entries, ResumeMode::Positional, None).expect("plan builds");
+
+        let mut reworded = call("completely new wording");
+        reworded.index = 0;
+        let key = WorkflowHost::journal_key(&reworded);
+        let hit = plan.take(&reworded, &key).expect("index 0 replays");
+        assert_eq!(hit.value, json!("result-0"));
+
+        let mut gap = call("whatever");
+        gap.index = 5;
+        assert!(
+            plan.take(&gap, &key).is_none(),
+            "unjournaled index runs fresh"
+        );
+    }
+
+    #[test]
+    fn exact_plan_requires_matching_key() {
+        let source = call("stable prompt");
+        let mut journaled = entry(0, "stable prompt", None, None);
+        journaled.key = WorkflowHost::journal_key(&source);
+        let mut plan =
+            ReplayPlan::build(vec![journaled], ResumeMode::Exact, None).expect("plan builds");
+
+        let mut reworded = call("different prompt");
+        reworded.index = 0;
+        let miss_key = WorkflowHost::journal_key(&reworded);
+        assert!(plan.take(&reworded, &miss_key).is_none());
+
+        let mut same = call("stable prompt");
+        same.index = 3;
+        let hit_key = WorkflowHost::journal_key(&same);
+        assert!(
+            plan.take(&same, &hit_key).is_some(),
+            "key match replays at any index"
+        );
+    }
+
+    #[test]
+    fn resume_boundary_by_phase_label_and_index() {
+        let entries = || {
+            vec![
+                entry(0, "plan", Some("Plan"), Some("sol-plan")),
+                entry(1, "bootstrap", Some("Bootstrap"), Some("glm-bootstrap")),
+                entry(2, "wave", Some("Waves"), Some("glm-w0")),
+            ]
+        };
+
+        let plan = ReplayPlan::build(
+            entries(),
+            ResumeMode::Positional,
+            Some(ResumeBoundary::Point("bootstrap".to_string())),
+        )
+        .expect("phase boundary resolves case-insensitively");
+        assert_eq!(plan.by_index.len(), 2, "entries past the boundary drop");
+
+        let plan = ReplayPlan::build(
+            entries(),
+            ResumeMode::Positional,
+            Some(ResumeBoundary::Point("sol-plan".to_string())),
+        )
+        .expect("label fallback resolves");
+        assert_eq!(plan.by_index.len(), 1);
+
+        let plan = ReplayPlan::build(
+            entries(),
+            ResumeMode::Positional,
+            Some(ResumeBoundary::Index(1)),
+        )
+        .expect("index boundary");
+        assert_eq!(plan.by_index.len(), 2);
+
+        let err = ReplayPlan::build(
+            entries(),
+            ResumeMode::Positional,
+            Some(ResumeBoundary::Point("no-such-point".to_string())),
+        )
+        .unwrap_err();
+        assert!(err.contains("Known points"), "{err}");
+        assert!(err.contains("Bootstrap"), "{err}");
+    }
+
+    #[test]
+    fn old_format_keys_with_label_and_phase_migrate() {
+        // A .20/.21-era journal key that still embeds label/phase.
+        let old_key = json!({
+            "prompt": "stable prompt",
+            "label": "old-label",
+            "phase": "Old Phase",
+            "schema": null,
+            "model": null,
+            "effort": null,
+            "isolation": null,
+            "agent_type": null,
+        })
+        .to_string();
+        let mut journaled = entry(0, "stable prompt", Some("Old Phase"), Some("old-label"));
+        journaled.key = old_key;
+        let mut plan =
+            ReplayPlan::build(vec![journaled], ResumeMode::Exact, None).expect("plan builds");
+
+        let mut same = call("stable prompt");
+        same.index = 0;
+        let new_key = WorkflowHost::journal_key(&same);
+        assert!(
+            plan.take(&same, &new_key).is_some(),
+            "migrated key must match the new key format"
+        );
     }
 
     #[test]
@@ -996,22 +1274,11 @@ mod tests {
     }
 
     #[test]
-    fn replay_map_only_replays_successes() {
+    fn journal_load_and_plan_skip_failures_and_garbage() {
         let dir = std::env::temp_dir().join(format!("wf-journal-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("journal.jsonl");
-        let ok = JournalEntry {
-            index: 0,
-            key: "k1".into(),
-            ok: true,
-            value: json!("result"),
-            error: None,
-            label: None,
-            phase: None,
-            tokens_used: 10,
-            duration_ms: 5,
-            agent_id: Some("a".into()),
-        };
+        let ok = entry(0, "good", None, None);
         let failed = JournalEntry {
             index: 1,
             key: "k2".into(),
@@ -1030,9 +1297,10 @@ mod tests {
             serde_json::to_string(&failed).unwrap()
         );
         std::fs::write(&path, lines).unwrap();
-        let map = load_replay_map(&path);
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["k1"].len(), 1);
+        let entries = load_journal_entries(&path);
+        assert_eq!(entries.len(), 2, "loader keeps parseable entries");
+        let plan = ReplayPlan::build(entries, ResumeMode::Positional, None).expect("plan builds");
+        assert_eq!(plan.by_index.len(), 1, "failed entries never replay");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -204,7 +204,18 @@ fn script_input(script: &str) -> WorkflowToolInput {
         args: None,
         token_budget: None,
         resume_from_run_id: None,
+        resume_mode: None,
+        resume_through: None,
     }
+}
+
+fn run_id_of(output: &str) -> String {
+    output
+        .split("<run_id>")
+        .nth(1)
+        .and_then(|rest| rest.split("</run_id>").next())
+        .expect("run id in output")
+        .to_string()
 }
 
 const META: &str = "export const meta = { name: 'test-flow', description: 'test workflow' };\n";
@@ -522,6 +533,106 @@ async fn journal_replay_skips_unchanged_agents() {
     assert!(third.contains("ECHO:cache me"), "{third}");
 
     let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[tokio::test]
+async fn positional_resume_replays_reworded_script_and_reruns_past_boundary() {
+    let folder = std::env::temp_dir().join(format!("wf-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&folder).unwrap();
+
+    let original = with_meta(
+        "phase('Plan');\n\
+         const plan = await agent('make the plan', { label: 'planner' });\n\
+         phase('Build');\n\
+         const build = await agent('do the build using ' + plan, { label: 'builder' });\n\
+         return { plan, build };",
+    );
+    let first_backend = StubBackend::echo();
+    let first = TestRun::new(first_backend.clone())
+        .with_session_folder(folder.clone())
+        .run(script_input(&original))
+        .await
+        .expect("first run");
+    assert_eq!(first_backend.spawn_count(), 2);
+    let first_run_id = run_id_of(&first);
+
+    // The script is REWRITTEN (different prompts) — exact resume would replay
+    // nothing. Positional resume through the Plan phase keeps the planner
+    // result and re-runs the builder fresh.
+    let edited = with_meta(
+        "phase('Plan');\n\
+         const plan = await agent('make the plan v2 with different wording', { label: 'planner' });\n\
+         phase('Build');\n\
+         const build = await agent('rebuild differently using ' + plan, { label: 'builder' });\n\
+         return { plan, build };",
+    );
+    let second_backend = StubBackend::echo();
+    let mut input = script_input(&edited);
+    input.resume_from_run_id = Some(first_run_id);
+    input.resume_mode = Some("positional".to_string());
+    input.resume_through = Some(serde_json::json!("Plan"));
+    let second = TestRun::new(second_backend.clone())
+        .with_session_folder(folder.clone())
+        .run(input)
+        .await
+        .expect("second run");
+    assert_eq!(
+        second_backend.spawn_count(),
+        1,
+        "planner replays positionally; only the builder re-runs"
+    );
+    assert!(
+        second.contains("ECHO:make the plan"),
+        "planner result kept: {second}"
+    );
+    assert!(
+        second.contains("ECHO:rebuild differently"),
+        "builder re-ran with the edited prompt: {second}"
+    );
+    assert!(second.contains("<status>completed</status>"), "{second}");
+
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[tokio::test]
+async fn resume_through_unknown_point_is_rejected_with_known_points() {
+    let folder = std::env::temp_dir().join(format!("wf-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&folder).unwrap();
+    let script = with_meta(
+        "phase('Scan');\n\
+         return await agent('scan it', { label: 'scanner' });",
+    );
+    let backend = StubBackend::echo();
+    let first = TestRun::new(backend)
+        .with_session_folder(folder.clone())
+        .run(script_input(&script))
+        .await
+        .expect("first run");
+    let run_id = run_id_of(&first);
+
+    let mut input = script_input(&script);
+    input.resume_from_run_id = Some(run_id);
+    input.resume_through = Some(serde_json::json!("Verify"));
+    let err = TestRun::new(StubBackend::echo())
+        .with_session_folder(folder.clone())
+        .run(input)
+        .await
+        .expect_err("unknown point must reject");
+    assert!(err.contains("Known points"), "{err}");
+    assert!(err.contains("Scan"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[tokio::test]
+async fn resume_options_require_resume_from_run_id() {
+    let mut input = script_input(&with_meta("return 1;"));
+    input.resume_mode = Some("positional".to_string());
+    let err = TestRun::new(StubBackend::echo())
+        .run(input)
+        .await
+        .expect_err("must reject");
+    assert!(err.contains("require resume_from_run_id"), "{err}");
 }
 
 #[tokio::test]

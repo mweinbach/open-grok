@@ -16,7 +16,6 @@
 pub mod host;
 pub mod meta;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +39,10 @@ use crate::types::output::ToolOutput;
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::{NotificationHandle, SessionFolder};
 use crate::types::tool::{ToolKind, ToolNamespace};
-use host::{WORKFLOW_AGENT_NESTED_TOOL, WorkflowHost, WorkflowHostConfig};
+use host::{
+    ReplayPlan, ResumeBoundary, ResumeMode, WORKFLOW_AGENT_NESTED_TOOL, WorkflowHost,
+    WorkflowHostConfig,
+};
 use meta::SplitScript;
 
 /// JS prelude installed ahead of every workflow script body.
@@ -104,7 +106,11 @@ impl crate::types::tool_metadata::ToolMetadata for WorkflowTool {
             "Scripts are plain JavaScript (no TypeScript, no imports). Date.now(), ",
             "Math.random(), and argless new Date() throw — pass timestamps via args and vary ",
             "prompts by item index; runs are journaled and resumable via resume_from_run_id ",
-            "(unchanged agent() calls replay instantly from the journal). Concurrent agents ",
+            "(unchanged agent() calls replay instantly from the journal; prefer script_path ",
+            "over regenerating the script so prompts stay identical). To resume an EDITED ",
+            "script, set resume_mode=\"positional\" (replay by call position). To go back to a ",
+            "specific point, set resume_through to a phase title, agent label, or call index — ",
+            "results through that point replay, everything after re-runs. Concurrent agents ",
             "are capped and queue transparently; at most 1000 agents per run. agentType ",
             "accepts the same types as the task tool. workflow must be the only tool call in ",
             "the model response, and workflow agents cannot spawn further task, agent_swarm, ",
@@ -209,9 +215,24 @@ impl xai_tool_runtime::Tool for WorkflowTool {
         let script_path = persist_script(run_dir.as_deref(), &source);
         let journal_path = run_dir.as_deref().map(|dir| dir.join("journal.jsonl"));
 
+        let resume_mode = parse_resume_mode(input.resume_mode.as_deref())
+            .map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
+        let resume_boundary = parse_resume_boundary(input.resume_through.as_ref())
+            .map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
+        if input.resume_from_run_id.is_none()
+            && (resume_mode != ResumeMode::Exact || resume_boundary.is_some())
+        {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                "resume_mode / resume_through require resume_from_run_id",
+            ));
+        }
         let replay = match input.resume_from_run_id.as_deref() {
-            Some(resume_id) => load_resume_journal(session_folder.as_deref(), resume_id)?,
-            None => HashMap::new(),
+            Some(resume_id) => {
+                let entries = load_resume_journal(session_folder.as_deref(), resume_id)?;
+                ReplayPlan::build(entries, resume_mode, resume_boundary)
+                    .map_err(xai_tool_runtime::ToolError::invalid_arguments)?
+            }
+            None => ReplayPlan::default(),
         };
 
         let cancellation = ctx
@@ -443,10 +464,7 @@ fn persist_script(run_dir: Option<&Path>, source: &str) -> Option<PathBuf> {
 fn load_resume_journal(
     session_folder: Option<&Path>,
     resume_id: &str,
-) -> Result<
-    HashMap<String, std::collections::VecDeque<host::JournalEntry>>,
-    xai_tool_runtime::ToolError,
-> {
+) -> Result<Vec<host::JournalEntry>, xai_tool_runtime::ToolError> {
     if resume_id.is_empty()
         || !resume_id
             .chars()
@@ -471,7 +489,34 @@ fn load_resume_journal(
             journal.display()
         )));
     }
-    Ok(host::load_replay_map(&journal))
+    Ok(host::load_journal_entries(&journal))
+}
+
+fn parse_resume_mode(raw: Option<&str>) -> Result<ResumeMode, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("exact") => Ok(ResumeMode::Exact),
+        Some("positional") => Ok(ResumeMode::Positional),
+        Some(other) => Err(format!(
+            "invalid resume_mode `{other}` (expected \"exact\" or \"positional\")"
+        )),
+    }
+}
+
+fn parse_resume_boundary(raw: Option<&JsonValue>) -> Result<Option<ResumeBoundary>, String> {
+    match raw {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Number(number)) => number
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(|index| Some(ResumeBoundary::Index(index)))
+            .ok_or_else(|| format!("invalid resume_through index `{number}`")),
+        Some(JsonValue::String(text)) if !text.trim().is_empty() => {
+            Ok(Some(ResumeBoundary::Point(text.clone())))
+        }
+        Some(other) => Err(format!(
+            "invalid resume_through `{other}` (expected a phase title, agent label, or call index)"
+        )),
+    }
 }
 
 /// Assemble the executable ES module: prelude, injected globals, then the
@@ -610,9 +655,16 @@ fn render_output(
     }
     out.push_str(&format!(
         "<resume_hint>To resume with journal replay, call workflow again with \
-         resume_from_run_id=\"{run_id}\"{}.</resume_hint>\n",
+         resume_from_run_id=\"{run_id}\"{}. Unchanged agent() calls replay for free. If you \
+         edit the script, add resume_mode=\"positional\" so completed positions still replay, \
+         and use resume_through=\"<phase, label, or index>\" to go back to a specific point \
+         and re-run everything after it.</resume_hint>\n",
         script_path
-            .map(|path| format!(" and script_path=\"{}\"", path.display()))
+            .map(|path| format!(
+                " and script_path=\"{}\" (edit that file in place rather than \
+                 regenerating the script — reworded prompts do not replay under exact mode)",
+                path.display()
+            ))
             .unwrap_or_default()
     ));
     out.push_str("</workflow_result>");
