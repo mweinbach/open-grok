@@ -1,6 +1,6 @@
 {
     "name": "@mweinbach/open-grok-darwin-x64",
-    "version": "0.1.220-open-grok.15",
+    "version": "0.1.220-open-grok.16",
     "description": "darwin-x64 binary package for @mweinbach/open-grok.",
     "license": "Apache-2.0",
     "files": [
