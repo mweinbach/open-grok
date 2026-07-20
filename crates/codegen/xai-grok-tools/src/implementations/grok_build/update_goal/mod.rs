@@ -105,6 +105,12 @@ pub enum RejectReason {
     BlockSeenInDrain,
     /// `blocked_reason` set but the goal was not Active.
     BlockedAgainstNonActive,
+    /// A progress `message` (no `completed`, no `blocked_reason`) arrived
+    /// while the goal was not Active — or no goal exists at all. Mirrors
+    /// [`Self::BlockedAgainstNonActive`]: acking success here would teach
+    /// the model that a goal is active, priming a doomed
+    /// `completed: true` follow-up.
+    MessageAgainstNonActive,
     /// `completed: true` arrived after the classifier cap auto-paused
     /// the goal — model must wait for user resume.
     PostCap,
@@ -143,6 +149,7 @@ impl RejectReason {
         match self {
             Self::BlockSeenInDrain => "goal_update_block_seen",
             Self::BlockedAgainstNonActive => "goal_update_blocked_against_non_active",
+            Self::MessageAgainstNonActive => "goal_update_message_against_non_active",
             Self::PostCap => "goal_update_post_cap",
             Self::NonActive => "goal_update_non_active",
             Self::HarnessDisabled => "goal_update_harness_disabled",

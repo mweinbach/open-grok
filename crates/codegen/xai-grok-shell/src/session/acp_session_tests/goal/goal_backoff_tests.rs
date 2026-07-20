@@ -4,6 +4,7 @@
 use super::support::*;
 use super::*;
 use std::sync::atomic::Ordering;
+use xai_grok_tools::implementations::grok_build::update_goal::{RejectReason, UpdateGoalAck};
 
 async fn make_test_actor_with_active_goal() -> SessionActor {
     let (gateway_tx, _gateway_rx) =
@@ -1613,6 +1614,107 @@ async fn drain_goal_updates_blocked_reason_against_non_active_does_not_stash_pau
             // state. This is intentional: the model's blocked
             // attempts count regardless of the goal's current status.
             assert_eq!(actor.goal_blocked_streak.load(Ordering::Relaxed), 1);
+        })
+        .await;
+}
+
+/// Send one message-only `update_goal` through the drain and return its ack.
+async fn drain_message_only_update(actor: &SessionActor) -> UpdateGoalAck {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    *actor.goal_update_rx.borrow_mut() = Some(rx);
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    tx.send((
+        xai_grok_tools::implementations::grok_build::update_goal::UpdateGoalInput {
+            completed: None,
+            message: Some("Starting the work".into()),
+            blocked_reason: None,
+        },
+        ack_tx,
+    ))
+    .unwrap();
+    drop(tx);
+    actor.drain_goal_updates(0, DrainPurpose::TurnEnd).await;
+    ack_rx.await.expect("drain must resolve the ack")
+}
+
+/// The incident shape: goal harness enabled but no goal ever created
+/// (`/goal` never run). A message-only update must NOT ack success —
+/// that taught the model a goal was active, and its `completed: true`
+/// follow-up then failed with NonActive, which it retried in confusion.
+#[tokio::test(flavor = "current_thread")]
+async fn drain_goal_updates_message_only_without_goal_rejects() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.goal_enabled = true;
+            set_goal_harness_for_tests(&actor);
+
+            let ack = drain_message_only_update(&actor).await;
+            match ack {
+                UpdateGoalAck::Rejected { reason, detail } => {
+                    assert_eq!(reason, RejectReason::MessageAgainstNonActive);
+                    assert!(detail.contains("not Active"), "detail: {detail}");
+                }
+                other => panic!("message-only update with no goal must reject, got {other:?}"),
+            }
+        })
+        .await;
+}
+
+/// Message-only updates against a paused goal reject the same way —
+/// mirroring the blocked_reason treatment for non-Active goals.
+#[tokio::test(flavor = "current_thread")]
+async fn drain_goal_updates_message_only_against_paused_goal_rejects() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let actor = make_test_actor_with_active_goal().await;
+            actor
+                .goal_tracker
+                .lock()
+                .pause(crate::session::goal_tracker::GoalPauseReason::User);
+
+            let ack = drain_message_only_update(&actor).await;
+            assert!(
+                matches!(
+                    ack,
+                    UpdateGoalAck::Rejected {
+                        reason: RejectReason::MessageAgainstNonActive,
+                        ..
+                    }
+                ),
+                "message-only update against a paused goal must reject, got {ack:?}"
+            );
+            assert_eq!(
+                actor.goal_tracker.lock().status(),
+                Some(crate::session::goal_tracker::GoalStatus::UserPaused),
+                "rejection must not mutate goal status"
+            );
+        })
+        .await;
+}
+
+/// Guard the happy path: with an Active goal, message-only updates
+/// still ack success with the echoed summary.
+#[tokio::test(flavor = "current_thread")]
+async fn drain_goal_updates_message_only_against_active_goal_accepts() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let actor = make_test_actor_with_active_goal().await;
+
+            let ack = drain_message_only_update(&actor).await;
+            match ack {
+                UpdateGoalAck::Accepted { summary } => {
+                    assert_eq!(summary, "Starting the work.");
+                }
+                other => panic!("message-only update on an Active goal must accept, got {other:?}"),
+            }
         })
         .await;
 }

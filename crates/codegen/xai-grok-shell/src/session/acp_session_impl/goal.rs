@@ -276,6 +276,26 @@ impl SessionActor {
             // scratch root); this drain never gates `completed: true` on
             // verdict-file state.
             if cmd.completed != Some(true) {
+                // Message-only updates only make sense against an Active
+                // goal. Acking success when none is Active (or none exists)
+                // teaches the model a goal is live; its `completed: true`
+                // follow-up then rejects with NonActive and it retries in
+                // confusion. Mirror the blocked_reason treatment above and
+                // reject with an accurate reply instead.
+                let goal_active = self.goal_tracker.lock().status()
+                    == Some(crate::session::goal_tracker::GoalStatus::Active);
+                if !goal_active {
+                    try_send_ack(
+                        ack_tx,
+                        UpdateGoalAck::Rejected {
+                            reason: RejectReason::MessageAgainstNonActive,
+                            detail: "Goal is not Active; progress message not recorded. Do not \
+                                     call update_goal unless a goal is active."
+                                .to_string(),
+                        },
+                    );
+                    continue;
+                }
                 // Message-only updates emit a refreshed `GoalUpdated`
                 // without status mutation — preserves today's behaviour
                 // for tool calls that carry neither `completed` nor

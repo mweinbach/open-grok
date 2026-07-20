@@ -2632,6 +2632,10 @@ fn all_reject_reasons() -> &'static [(RejectReason, &'static str)] {
             RejectReason::BlockedAgainstNonActive,
             "goal_update_blocked_against_non_active",
         ),
+        (
+            RejectReason::MessageAgainstNonActive,
+            "goal_update_message_against_non_active",
+        ),
         (RejectReason::PostCap, "goal_update_post_cap"),
         (RejectReason::NonActive, "goal_update_non_active"),
         (RejectReason::PendingQueueEvicted, "goal_update_evicted"),
@@ -2663,6 +2667,7 @@ fn reject_reasons_complete_matrix() {
         match variant {
             RejectReason::BlockSeenInDrain
             | RejectReason::BlockedAgainstNonActive
+            | RejectReason::MessageAgainstNonActive
             | RejectReason::PostCap
             | RejectReason::NonActive
             | RejectReason::PendingQueueEvicted
@@ -2675,7 +2680,7 @@ fn reject_reasons_complete_matrix() {
     }
     assert_eq!(
         all_reject_reasons().len(),
-        10,
+        11,
         "all_reject_reasons must contain every RejectReason variant",
     );
     let mut codes: Vec<&'static str> = all_reject_reasons().iter().map(|(_, c)| *c).collect();
