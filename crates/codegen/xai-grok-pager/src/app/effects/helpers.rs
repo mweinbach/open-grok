@@ -777,6 +777,35 @@ pub(crate) async fn persist_setting(
         format!("persist_setting({key}) expected {expected}, got {got:?}")
     }
     match key {
+        "toolset.web_search_source.xai"
+        | "toolset.web_search_source.codex"
+        | "toolset.web_search_source.kimi_platform"
+        | "toolset.web_search_source.kimi_code" => {
+            use xai_grok_shell::tools::config::{WebSearchSource, WebSearchSourceTarget};
+            let SettingValue::Enum(choice) = value else {
+                return Err(kind_mismatch(key, "Enum", &value));
+            };
+            let Some(source) = WebSearchSource::from_str_opt(choice) else {
+                return Err(format!("persist_setting({key}) unknown source {choice:?}"));
+            };
+            let target = match key {
+                "toolset.web_search_source.xai" => WebSearchSourceTarget::Xai,
+                "toolset.web_search_source.codex" => WebSearchSourceTarget::Codex,
+                "toolset.web_search_source.kimi_platform" => WebSearchSourceTarget::KimiPlatform,
+                _ => WebSearchSourceTarget::KimiCode,
+            };
+            xai_grok_shell::util::config::set_web_search_source(target, source)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "toolset.x_search.enabled" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("toolset.x_search.enabled", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_x_search_enabled(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "compact_mode" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("compact_mode", "Bool", &value));

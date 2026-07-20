@@ -987,6 +987,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
             Some(Action::SetAskUserQuestionTimeoutEnabled(new))
         }
         "toolset.perplexity_web_search.enabled" => Some(Action::SetPerplexityWebSearch(new)),
+        "toolset.x_search.enabled" => Some(Action::SetXSearchEnabled(new)),
         "show_thinking_blocks" => Some(Action::SetShowThinkingBlocks(new)),
         "group_tool_verbs" => Some(Action::SetGroupToolVerbs(new)),
         "collapsed_edit_blocks" => Some(Action::SetCollapsedEditBlocks(new)),
@@ -1067,6 +1068,10 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
         "hunk_tracker_mode" => Some(Action::SetHunkTrackerMode(choice.to_string())),
         "screen_mode" => Some(Action::SetScreenMode(choice.to_string())),
         "kimi_api_endpoint" => Some(Action::SetKimiApiEndpoint(choice.to_string())),
+        "toolset.web_search_source.xai"
+        | "toolset.web_search_source.codex"
+        | "toolset.web_search_source.kimi_platform"
+        | "toolset.web_search_source.kimi_code" => Some(Action::SetWebSearchSource { key, choice }),
         "voice_capture_mode" => Some(Action::SetVoiceCaptureMode(choice.to_string())),
         "voice_stt_language" => Some(Action::SetVoiceSttLanguage(choice.to_string())),
         "render_mermaid" => {

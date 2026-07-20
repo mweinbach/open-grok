@@ -1666,6 +1666,29 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
                 app,
             );
         }
+        "toolset.web_search_source.xai"
+        | "toolset.web_search_source.codex"
+        | "toolset.web_search_source.kimi_platform"
+        | "toolset.web_search_source.kimi_code" => {
+            // "perplexity" is a valid non-default choice for every target.
+            let _ = dispatch(
+                Action::SetWebSearchSource {
+                    key: match key {
+                        "toolset.web_search_source.xai" => "toolset.web_search_source.xai",
+                        "toolset.web_search_source.codex" => "toolset.web_search_source.codex",
+                        "toolset.web_search_source.kimi_platform" => {
+                            "toolset.web_search_source.kimi_platform"
+                        }
+                        _ => "toolset.web_search_source.kimi_code",
+                    },
+                    choice: "perplexity",
+                },
+                app,
+            );
+        }
+        "toolset.x_search.enabled" => {
+            let _ = dispatch(Action::SetXSearchEnabled(false), app);
+        }
         other => {
             panic!(
                 "move_setting_away_from_default: no arm for `{other}`. \

@@ -847,6 +847,11 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "kimi_code_api_key",
             "toolset.perplexity_web_search.enabled",
             "perplexity_api_key",
+            "toolset.web_search_source.xai",
+            "toolset.web_search_source.codex",
+            "toolset.web_search_source.kimi_platform",
+            "toolset.web_search_source.kimi_code",
+            "toolset.x_search.enabled",
             // Auxiliary model selectors persist IDs while rendering names.
             "recap_model",
             "memory_model",

@@ -305,6 +305,10 @@ pub struct PagerLocalSnapshot {
     /// Status-only mirror for the Kimi Code API-key source.
     pub kimi_code_api_key_status: SecretStatus,
     pub perplexity_web_search_enabled: bool,
+    /// `[toolset.web_search_source]` selections (effective TOML merge).
+    pub web_search_source: xai_grok_shell::tools::config::WebSearchSourceConfig,
+    /// `[toolset.x_search].enabled` (effective TOML merge; default on).
+    pub x_search_enabled: bool,
     pub perplexity_api_key_status: SecretStatus,
     /// Active Kimi service profile (`platform` | `code`).
     pub kimi_api_endpoint: String,
@@ -359,6 +363,8 @@ impl Default for PagerLocalSnapshot {
             kimi_api_key_status: SecretStatus::Missing,
             kimi_code_api_key_status: SecretStatus::Missing,
             perplexity_web_search_enabled: false,
+            web_search_source: Default::default(),
+            x_search_enabled: true,
             perplexity_api_key_status: SecretStatus::Missing,
             kimi_api_endpoint: "platform".to_owned(),
             coding_data_sharing_opt_out: true,
@@ -761,6 +767,22 @@ pub fn current_value_for(
         "toolset.perplexity_web_search.enabled" => {
             Some(SettingValue::Bool(pager.perplexity_web_search_enabled))
         }
+        "toolset.web_search_source.xai"
+        | "toolset.web_search_source.codex"
+        | "toolset.web_search_source.kimi_platform"
+        | "toolset.web_search_source.kimi_code" => {
+            use xai_grok_shell::tools::config::WebSearchSourceTarget;
+            let target = match key {
+                "toolset.web_search_source.xai" => WebSearchSourceTarget::Xai,
+                "toolset.web_search_source.codex" => WebSearchSourceTarget::Codex,
+                "toolset.web_search_source.kimi_platform" => WebSearchSourceTarget::KimiPlatform,
+                _ => WebSearchSourceTarget::KimiCode,
+            };
+            Some(SettingValue::Enum(
+                pager.web_search_source.source_for(target).as_str(),
+            ))
+        }
+        "toolset.x_search.enabled" => Some(SettingValue::Bool(pager.x_search_enabled)),
         "perplexity_api_key" => Some(SettingValue::SecretStatus(pager.perplexity_api_key_status)),
         // max_thoughts_width: `u16` widened to `i64`.
         "max_thoughts_width" => Some(SettingValue::Int(ui.max_thoughts_width as i64)),
@@ -1327,6 +1349,28 @@ mod tests {
                 }
                 ("toolset.perplexity_web_search.enabled", SettingKind::Bool { default }) => {
                     assert!(!default, "Perplexity web search must remain opt-in");
+                }
+                ("toolset.web_search_source.xai", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(*default, "xai", "xAI sessions default to xAI search");
+                }
+                ("toolset.web_search_source.codex", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(
+                        *default, "native",
+                        "Codex sessions default to native search"
+                    );
+                }
+                (
+                    "toolset.web_search_source.kimi_platform"
+                    | "toolset.web_search_source.kimi_code",
+                    SettingKind::Enum { default, .. },
+                ) => {
+                    assert_eq!(*default, "xai", "Kimi sessions default to xAI search");
+                }
+                ("toolset.x_search.enabled", SettingKind::Bool { default }) => {
+                    assert!(
+                        default,
+                        "X search defaults on (registered only when xAI signed in)"
+                    );
                 }
 
                 _ => panic!(

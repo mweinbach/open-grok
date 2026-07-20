@@ -568,6 +568,14 @@ pub enum Action {
     SetDefaultModel(acp::ModelId),
     /// Select the active Kimi service profile (`platform` | `code`).
     SetKimiApiEndpoint(String),
+    /// Commit one `[toolset.web_search_source].<target>` selection. `key` is
+    /// the full registry setting key; `choice` a canonical source string.
+    SetWebSearchSource {
+        key: &'static str,
+        choice: &'static str,
+    },
+    /// Commit `[toolset.x_search].enabled`.
+    SetXSearchEnabled(bool),
     /// Save a service-specific Kimi API key from the dedicated masked editor.
     /// `SecretInput` redacts `Debug` and zeroizes its allocation on drop.
     SetKimiApiKey {

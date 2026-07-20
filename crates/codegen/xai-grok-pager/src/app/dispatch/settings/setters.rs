@@ -483,6 +483,61 @@ pub(super) fn set_vim_mode_inner(app: &mut AppView, new: bool) {
     crate::appearance::cache::set_vim_mode(new);
 }
 
+/// Commit one `[toolset.web_search_source]` selection (registry-driven path).
+///
+/// SHELL-OWNED: persisted via `Effect::PersistSetting`; the shell reads the
+/// selection fresh from disk at session spawn, so it applies to new sessions
+/// without a live rebind.
+pub(in crate::app::dispatch) fn set_web_search_source(
+    app: &mut AppView,
+    key: &'static str,
+    choice: &'static str,
+) -> Vec<Effect> {
+    let prev = {
+        use xai_grok_shell::tools::config::WebSearchSourceTarget;
+        let target = match key {
+            "toolset.web_search_source.xai" => WebSearchSourceTarget::Xai,
+            "toolset.web_search_source.codex" => WebSearchSourceTarget::Codex,
+            "toolset.web_search_source.kimi_platform" => WebSearchSourceTarget::KimiPlatform,
+            _ => WebSearchSourceTarget::KimiCode,
+        };
+        xai_grok_shell::util::config::load_web_search_source_sync()
+            .source_for(target)
+            .as_str()
+    };
+    refresh_open_settings_modals(app);
+    tracing::info!(
+        target: "settings",
+        key,
+        value = choice,
+        "setting changed",
+    );
+    app.show_toast(&format!("Web search source saved: {choice}"));
+    vec![Effect::PersistSetting {
+        key,
+        value: crate::settings::SettingValue::Enum(choice),
+        rollback_value: crate::settings::SettingValue::Enum(prev),
+    }]
+}
+
+/// Commit `[toolset.x_search].enabled` (registry-driven path).
+pub(in crate::app::dispatch) fn set_x_search_enabled(app: &mut AppView, new: bool) -> Vec<Effect> {
+    let prev = xai_grok_shell::util::config::load_x_search_config_sync().enabled;
+    refresh_open_settings_modals(app);
+    tracing::info!(
+        target: "settings",
+        key = "toolset.x_search.enabled",
+        value = new,
+        "setting changed",
+    );
+    app.show_toast(&save_success_toast("X search", new));
+    vec![Effect::PersistSetting {
+        key: "toolset.x_search.enabled",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
 /// Set vim-mode scrollback keybindings (registry-driven path).
 ///
 /// SHELL-OWNED: persisted to `[ui].vim_mode` in config.toml via

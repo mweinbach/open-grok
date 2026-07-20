@@ -511,6 +511,9 @@ pub(super) fn dispatch_send_prompt_inner(
                     kimi_api_key_status: crate::settings::SecretStatus::Missing,
                     kimi_code_api_key_status: crate::settings::SecretStatus::Missing,
                     perplexity_web_search_enabled: app.perplexity_web_search_enabled,
+                    web_search_source: xai_grok_shell::util::config::load_web_search_source_sync(),
+                    x_search_enabled: xai_grok_shell::util::config::load_x_search_config_sync()
+                        .enabled,
                     perplexity_api_key_status:
                         crate::app::dispatch::settings::ui::perplexity_api_key_status(),
                     kimi_api_endpoint: app.kimi_api_endpoint.clone(),

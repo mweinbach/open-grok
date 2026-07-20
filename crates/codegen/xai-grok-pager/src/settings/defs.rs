@@ -555,6 +555,39 @@ const CONTEXTUAL_HINTS_CHILDREN: &[&str] = &[
     "contextual_hints.ssh_wrap",
 ];
 
+/// Web-search-source choices for providers whose default is xAI search.
+const WEB_SEARCH_SOURCE_XAI_DEFAULT_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "xai",
+        display: "xAI",
+        description: "xAI web search via the client tool (requires xAI sign-in)",
+    },
+    EnumChoice {
+        canonical: "perplexity",
+        display: "Perplexity",
+        description: "Perplexity Search API (requires Perplexity API key)",
+    },
+];
+
+/// Web-search-source choices for Codex (native default).
+const WEB_SEARCH_SOURCE_CODEX_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "native",
+        display: "Native",
+        description: "OpenAI's built-in web search",
+    },
+    EnumChoice {
+        canonical: "xai",
+        display: "xAI",
+        description: "xAI web search via the client tool (requires xAI sign-in)",
+    },
+    EnumChoice {
+        canonical: "perplexity",
+        display: "Perplexity",
+        description: "Perplexity Search API (requires Perplexity API key)",
+    },
+];
+
 /// Build the catalog. Called once at process start via
 /// `SettingsRegistry::defaults()`.
 pub fn default_settings() -> Vec<SettingMeta> {
@@ -996,6 +1029,106 @@ pub fn default_settings() -> Vec<SettingMeta> {
             description: "API key for the Perplexity Search API. Stored only in owner-protected auth.json and applied live to Kimi sessions.",
             keywords: &["perplexity", "api", "key", "credential", "search", "kimi"],
             kind: SettingKind::Secret,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        // Per-provider web search source. The xAI web/X search tools are
+        // client-executed (not provider server tools), so they can be handed
+        // to any model. Selections are read at session spawn — they apply to
+        // new sessions without a restart.
+        SettingMeta {
+            key: "toolset.web_search_source.xai",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Web search — xAI models",
+            description: "Search backend for xAI (Grok) sessions. Applies to new sessions.",
+            keywords: &["web", "search", "source", "xai", "grok", "perplexity"],
+            kind: SettingKind::Enum {
+                default: "xai",
+                choices: WEB_SEARCH_SOURCE_XAI_DEFAULT_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "toolset.web_search_source.codex",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Web search — Codex models",
+            description: "Search backend for OpenAI Codex sessions. Non-native choices replace the native declaration when their credentials resolve. Applies to new sessions.",
+            keywords: &[
+                "web",
+                "search",
+                "source",
+                "codex",
+                "openai",
+                "native",
+                "xai",
+                "perplexity",
+            ],
+            kind: SettingKind::Enum {
+                default: "native",
+                choices: WEB_SEARCH_SOURCE_CODEX_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "toolset.web_search_source.kimi_platform",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Web search — Kimi Platform",
+            description: "Search backend for Kimi Platform sessions. Falls back to none when neither xAI nor Perplexity is signed in. Applies to new sessions.",
+            keywords: &[
+                "web",
+                "search",
+                "source",
+                "kimi",
+                "platform",
+                "xai",
+                "perplexity",
+            ],
+            kind: SettingKind::Enum {
+                default: "xai",
+                choices: WEB_SEARCH_SOURCE_XAI_DEFAULT_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "toolset.web_search_source.kimi_code",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Web search — Kimi Code",
+            description: "Search backend for Kimi Code sessions. Falls back to none when neither xAI nor Perplexity is signed in. Applies to new sessions.",
+            keywords: &[
+                "web",
+                "search",
+                "source",
+                "kimi",
+                "code",
+                "xai",
+                "perplexity",
+            ],
+            kind: SettingKind::Enum {
+                default: "xai",
+                choices: WEB_SEARCH_SOURCE_XAI_DEFAULT_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "toolset.x_search.enabled",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "X search",
+            description: "Give every model the client x_search tool for posts on X, backed by the xAI API. Only registered when xAI is signed in; xAI sessions keep their native declaration. Applies to new sessions.",
+            keywords: &["x", "twitter", "search", "xai", "tool"],
+            kind: SettingKind::Bool { default: true },
             restart_required: false,
             hidden_in_minimal: false,
         },

@@ -101,6 +101,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let perplexity_api_key_status = perplexity_api_key_status();
     let kimi_api_endpoint = app.kimi_api_endpoint.clone();
     let perplexity_web_search_enabled = app.perplexity_web_search_enabled;
+    let web_search_source = xai_grok_shell::util::config::load_web_search_source_sync();
+    let x_search_enabled = xai_grok_shell::util::config::load_x_search_config_sync().enabled;
     for agent in app.agents.values_mut() {
         // Walk both `Settings` and `ResetSettingsConfirm` — the
         // confirm dialog embeds settings state that must stay fresh
@@ -132,6 +134,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 kimi_api_key_status,
                 kimi_code_api_key_status,
                 perplexity_web_search_enabled,
+                web_search_source,
+                x_search_enabled,
                 perplexity_api_key_status,
                 kimi_api_endpoint: kimi_api_endpoint.clone(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
@@ -267,6 +271,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
         kimi_api_key_status,
         kimi_code_api_key_status,
         perplexity_web_search_enabled: app.perplexity_web_search_enabled,
+        web_search_source: xai_grok_shell::util::config::load_web_search_source_sync(),
+        x_search_enabled: xai_grok_shell::util::config::load_x_search_config_sync().enabled,
         perplexity_api_key_status: perplexity_api_key_status(),
         kimi_api_endpoint,
         coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
@@ -804,6 +810,8 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         kimi_api_key_status: kimi_api_key_status(),
         kimi_code_api_key_status: kimi_code_api_key_status(),
         perplexity_web_search_enabled: app.perplexity_web_search_enabled,
+        web_search_source: xai_grok_shell::util::config::load_web_search_source_sync(),
+        x_search_enabled: xai_grok_shell::util::config::load_x_search_config_sync().enabled,
         perplexity_api_key_status: perplexity_api_key_status(),
         kimi_api_endpoint: app.kimi_api_endpoint.clone(),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
@@ -830,6 +838,14 @@ pub(in crate::app::dispatch) fn action_for_reset(
 ) -> Option<Action> {
     use crate::settings::SettingValue;
     match (key, value) {
+        (
+            "toolset.web_search_source.xai"
+            | "toolset.web_search_source.codex"
+            | "toolset.web_search_source.kimi_platform"
+            | "toolset.web_search_source.kimi_code",
+            SettingValue::Enum(choice),
+        ) => Some(Action::SetWebSearchSource { key, choice }),
+        ("toolset.x_search.enabled", SettingValue::Bool(b)) => Some(Action::SetXSearchEnabled(*b)),
         ("compact_mode", SettingValue::Bool(b)) => Some(Action::SetCompactMode(*b)),
         ("show_timestamps", SettingValue::Bool(b)) => Some(Action::SetTimestamps(*b)),
         ("show_timeline", SettingValue::Bool(b)) => Some(Action::SetTimeline(*b)),
@@ -1074,6 +1090,17 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
     use crate::settings::SettingValue;
     let mut companion_effects: Vec<Effect> = Vec::new();
     match (key, rollback_value) {
+        // Web-search source + X search hold no in-memory pager state — the
+        // modal reads them fresh from disk at snapshot time, so rolling back
+        // is just a modal refresh (done unconditionally below).
+        (
+            "toolset.web_search_source.xai"
+            | "toolset.web_search_source.codex"
+            | "toolset.web_search_source.kimi_platform"
+            | "toolset.web_search_source.kimi_code",
+            SettingValue::Enum(_),
+        )
+        | ("toolset.x_search.enabled", SettingValue::Bool(_)) => {}
         ("compact_mode", SettingValue::Bool(b)) => set_compact_mode_inner(app, *b),
         ("show_timestamps", SettingValue::Bool(b)) => set_timestamps_inner(app, *b),
         ("show_timeline", SettingValue::Bool(b)) => set_timeline_inner(app, *b),
