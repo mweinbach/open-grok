@@ -20,7 +20,7 @@ curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/insta
 Install a specific version:
 
 ```bash
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash -s 0.1.220-open-grok.22
+curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash -s 0.1.220-open-grok.23
 ```
 
 The installer writes only `open-grok` under

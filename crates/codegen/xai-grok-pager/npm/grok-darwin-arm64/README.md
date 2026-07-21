@@ -3,5 +3,5 @@
 Source package for the `darwin-arm64` binary used by
 `@mweinbach/open-grok`.
 
-The `v0.1.220-open-grok.22` GitHub release does not publish npm packages. Use the
+The `v0.1.220-open-grok.23` GitHub release does not publish npm packages. Use the
 [GitHub release installer](https://github.com/mweinbach/open-grok#install).
