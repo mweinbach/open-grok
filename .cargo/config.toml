@@ -59,9 +59,13 @@ rustflags = [
 ]
 
 [target.x86_64-pc-windows-msvc]
+# The toolchain-bundled LLVM linker is faster and avoids link.exe's PDB symbol limit.
+linker = "rust-lld.exe"
 rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-msvc]
+# The toolchain-bundled LLVM linker is faster and avoids link.exe's PDB symbol limit.
+linker = "rust-lld.exe"
 rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"]
 
 
