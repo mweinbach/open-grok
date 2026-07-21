@@ -203,6 +203,20 @@ pub struct WorkflowToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
 
+    /// Whether to run the workflow in the background.
+    #[schemars(
+        description = "Run the workflow in the background (default true): returns immediately \
+            with a run id; progress is pollable via the task output tool, the run is \
+            interruptible via the kill tool, and completion wakes the session with the result. \
+            The conversation stays free while agents run. Set false to block the turn until \
+            the workflow finishes and get the result inline."
+    )]
+    #[serde(
+        default = "default_true",
+        deserialize_with = "crate::serde_lenient::deserialize_lenient_bool"
+    )]
+    pub run_in_background: bool,
+
     /// Run ID of a prior workflow invocation to resume from.
     #[schemars(
         description = "Run ID of a prior workflow invocation to resume from. Completed agent() \

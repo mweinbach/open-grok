@@ -226,7 +226,18 @@ Key behaviors:
 | `phase(title)` / `log(msg)` | Progress grouping and narration on the workflow card. |
 | `args`, `meta`, `budget` | Tool-call input, parsed meta, and `{total, spent(), remaining()}` token tracking. |
 
-Workflow children appear as a grouped cohort card (like a swarm) with live per-agent progress, and the workflow tool card streams phase/log lines while the script runs. Runs are journaled under the session directory; calling `workflow` again with `resume_from_run_id` replays unchanged `agent()` calls instantly and re-runs only what changed. `Date.now()`, `Math.random()`, and argless `new Date()` are unavailable inside scripts so replays stay deterministic — pass timestamps through `args`.
+Workflow children appear as a grouped cohort card (like a swarm) with live per-agent progress, and the workflow tool card streams phase/log lines while the script runs.
+
+Workflows run **in the background by default**: the launch returns immediately with a run id, the conversation stays free while agents work, and completion wakes the session with the result. A background run behaves like any other background task — poll it with the task output tool, watch it in the tasks pane, and interrupt it with the kill tool or the tasks-pane kill button. Sending a follow-up message never ends a running workflow.
+
+Runs are journaled under the session directory; calling `workflow` again with `resume_from_run_id` replays unchanged `agent()` calls instantly and re-runs only what changed. After interrupting (or when the agent edits the script), two controls make partial reruns precise:
+
+| Control | Effect |
+| --- | --- |
+| `resume_mode: "positional"` | Replay by call position rather than exact prompt text — completed steps still replay after the script's wording was edited, as long as the call structure is unchanged. |
+| `resume_through: <point>` | Go back to a specific point: a phase title, an agent label, or a call index. Results through that point replay; everything after re-runs fresh. |
+
+`Date.now()`, `Math.random()`, and argless `new Date()` are unavailable inside scripts so replays stay deterministic — pass timestamps through `args`.
 
 Concurrency is capped automatically (`OPENGROK_WORKFLOW_MAX_CONCURRENCY` overrides; per-agent timeouts honor `OPENGROK_SUBAGENT_TIMEOUT_MS`), a run is limited to 1000 agents, and workflow members follow the same flat tree: they cannot spawn `task`, `agent_swarm`, or another `workflow`.
 

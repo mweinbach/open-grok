@@ -158,6 +158,8 @@ impl SubagentBackend for StubBackend {
 struct TestRun {
     backend: Arc<StubBackend>,
     session_folder: Option<std::path::PathBuf>,
+    terminal: Option<Arc<dyn crate::computer::types::TerminalBackend>>,
+    notifications: Option<crate::notification::handle::ToolNotificationHandle>,
 }
 
 impl TestRun {
@@ -165,11 +167,26 @@ impl TestRun {
         Self {
             backend,
             session_folder: None,
+            terminal: None,
+            notifications: None,
         }
     }
 
     fn with_session_folder(mut self, folder: std::path::PathBuf) -> Self {
         self.session_folder = Some(folder);
+        self
+    }
+
+    fn with_terminal(mut self, terminal: Arc<dyn crate::computer::types::TerminalBackend>) -> Self {
+        self.terminal = Some(terminal);
+        self
+    }
+
+    fn with_notifications(
+        mut self,
+        notifications: crate::notification::handle::ToolNotificationHandle,
+    ) -> Self {
+        self.notifications = Some(notifications);
         self
     }
 
@@ -185,6 +202,14 @@ impl TestRun {
         resources.insert(Cwd(std::env::temp_dir()));
         if let Some(folder) = &self.session_folder {
             resources.insert(SessionFolder(folder.clone()));
+        }
+        if let Some(terminal) = &self.terminal {
+            resources.insert(crate::types::resources::Terminal(terminal.clone()));
+        }
+        if let Some(notifications) = &self.notifications {
+            resources.insert(crate::types::resources::NotificationHandle(
+                notifications.clone(),
+            ));
         }
         let result =
             xai_tool_runtime::Tool::run(&WorkflowTool, test_ctx(resources.into_shared()), input)
@@ -203,6 +228,7 @@ fn script_input(script: &str) -> WorkflowToolInput {
         script_path: None,
         args: None,
         token_budget: None,
+        run_in_background: false,
         resume_from_run_id: None,
         resume_mode: None,
         resume_through: None,
@@ -671,6 +697,200 @@ async fn script_error_reports_failed_status_with_partial_progress() {
     assert!(output.contains("script exploded"), "{output}");
     assert!(output.contains("ok-one"), "{output}");
     assert_eq!(backend.spawn_count(), 1);
+}
+
+struct NoopTerminal;
+
+#[async_trait::async_trait]
+impl crate::computer::types::TerminalBackend for NoopTerminal {
+    async fn run(
+        &self,
+        _request: crate::computer::types::TerminalRunRequest,
+    ) -> Result<crate::computer::types::TerminalRunResult, crate::computer::types::ComputerError>
+    {
+        Err(crate::computer::types::ComputerError::io("noop"))
+    }
+    async fn run_background(
+        &self,
+        _request: crate::computer::types::TerminalRunRequest,
+    ) -> Result<crate::computer::types::BackgroundHandle, crate::computer::types::ComputerError>
+    {
+        Err(crate::computer::types::ComputerError::io("noop"))
+    }
+    async fn get_task(&self, _task_id: &str) -> Option<crate::computer::types::TaskSnapshot> {
+        None
+    }
+    async fn kill_task(&self, _task_id: &str) -> crate::computer::types::KillOutcome {
+        crate::computer::types::KillOutcome::NotFound
+    }
+    async fn wait_for_completion(
+        &self,
+        _task_id: &str,
+        _timeout: Option<Duration>,
+    ) -> Option<crate::computer::types::TaskSnapshot> {
+        None
+    }
+    async fn list_tasks(&self) -> Vec<crate::computer::types::TaskSnapshot> {
+        Vec::new()
+    }
+}
+
+fn virtual_terminal() -> Arc<dyn crate::computer::types::TerminalBackend> {
+    Arc::new(
+        crate::computer::virtual_tasks::VirtualTaskTerminalBackend::new(Arc::new(NoopTerminal)),
+    )
+}
+
+#[tokio::test]
+async fn background_run_registers_completes_and_wakes() {
+    let folder = std::env::temp_dir().join(format!("wf-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&folder).unwrap();
+    let terminal = virtual_terminal();
+    let (notifications, mut notification_rx) =
+        crate::notification::handle::ToolNotificationHandle::channel();
+    let backend = StubBackend::echo();
+
+    let mut input = script_input(&with_meta(
+        "log('background says hi');\nreturn await agent('bg work', { label: 'bg' });",
+    ));
+    input.run_in_background = true;
+    let started = TestRun::new(backend.clone())
+        .with_session_folder(folder.clone())
+        .with_terminal(terminal.clone())
+        .with_notifications(notifications)
+        .run(input)
+        .await
+        .expect("background launch returns immediately");
+    assert!(started.contains("<workflow_started>"), "{started}");
+    assert!(started.contains("running in background"), "{started}");
+    let run_id = run_id_of(&started);
+
+    let final_snapshot = terminal
+        .wait_for_completion(&run_id, Some(Duration::from_secs(30)))
+        .await
+        .expect("virtual task resolves");
+    assert!(final_snapshot.completed, "run must complete");
+    assert_eq!(final_snapshot.exit_code, Some(0));
+    assert!(
+        final_snapshot.output.contains("ECHO:bg work"),
+        "{}",
+        final_snapshot.output
+    );
+    assert!(
+        final_snapshot.output.contains("<status>completed</status>"),
+        "{}",
+        final_snapshot.output
+    );
+    assert_eq!(backend.spawn_count(), 1);
+
+    // Progress log exists and carries the script's narration.
+    let progress = std::fs::read_to_string(&final_snapshot.output_file).expect("progress log");
+    assert!(progress.contains("background says hi"), "{progress}");
+
+    // A TaskCompleted notification fired for the auto-wake path.
+    let mut saw_completion = false;
+    while let Ok(notification) = notification_rx.try_recv() {
+        if let crate::notification::types::ToolNotification::TaskCompleted(snapshot) = notification
+            && snapshot.task_id == run_id
+        {
+            saw_completion = true;
+        }
+    }
+    assert!(
+        saw_completion,
+        "completion must emit the task-completed wake"
+    );
+
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[tokio::test]
+async fn background_kill_interrupts_then_journal_resume_recovers() {
+    let folder = std::env::temp_dir().join(format!("wf-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&folder).unwrap();
+    let terminal = virtual_terminal();
+    // Every agent takes ~50ms, long enough to land the kill while the second
+    // one is in flight.
+    let slow_backend = StubBackend::with_responder(Some(Duration::from_millis(50)), |request| {
+        echo_result(request, 10)
+    });
+
+    let script = with_meta(
+        "const first = await agent('quick step', { label: 'quick' });\n\
+         const second = await agent('slow step that will be interrupted', { label: 'slow' });\n\
+         return { first, second };",
+    );
+    let mut input = script_input(&script);
+    input.run_in_background = true;
+    let started = TestRun::new(slow_backend.clone())
+        .with_session_folder(folder.clone())
+        .with_terminal(terminal.clone())
+        .run(input)
+        .await
+        .expect("launch");
+    let run_id = run_id_of(&started);
+
+    // Wait until the second (slow) agent is actually in flight, then kill.
+    for _ in 0..200 {
+        if slow_backend.spawn_count() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        matches!(
+            terminal.kill_task(&run_id).await,
+            crate::computer::types::KillOutcome::Killed
+        ),
+        "kill must land while running"
+    );
+
+    let final_snapshot = terminal
+        .wait_for_completion(&run_id, Some(Duration::from_secs(30)))
+        .await
+        .expect("resolves");
+    assert!(final_snapshot.completed);
+    assert!(final_snapshot.explicitly_killed);
+    assert_eq!(final_snapshot.exit_code, Some(1));
+    assert!(
+        final_snapshot.output.contains("cancelled"),
+        "{}",
+        final_snapshot.output
+    );
+
+    // The interrupted run's journal still holds the completed first step:
+    // a foreground resume replays it without respawning.
+    let resume_backend = StubBackend::echo();
+    let mut resume = script_input(&script);
+    resume.resume_from_run_id = Some(run_id);
+    let resumed = TestRun::new(resume_backend.clone())
+        .with_session_folder(folder.clone())
+        .run(resume)
+        .await
+        .expect("resume");
+    assert!(resumed.contains("<status>completed</status>"), "{resumed}");
+    assert_eq!(
+        resume_backend.spawn_count(),
+        1,
+        "quick step replays from the interrupted run's journal; only the slow step re-runs"
+    );
+
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[tokio::test]
+async fn background_without_terminal_backend_is_rejected() {
+    let folder = std::env::temp_dir().join(format!("wf-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut input = script_input(&with_meta("return 1;"));
+    input.run_in_background = true;
+    let err = TestRun::new(StubBackend::echo())
+        .with_session_folder(folder.clone())
+        .run(input)
+        .await
+        .expect_err("no terminal backend registered");
+    assert!(err.contains("run_in_background: false"), "{err}");
+    let _ = std::fs::remove_dir_all(&folder);
 }
 
 #[tokio::test]

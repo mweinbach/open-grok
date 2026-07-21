@@ -766,26 +766,38 @@ pub(crate) async fn spawn_session_actor(
     );
     let terminal_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend> =
         match terminal_backend_kind {
+            // The parent's backend is already wrapped for virtual tasks.
             TerminalBackendKind::ReuseParent => parent_terminal_backend
                 .expect("ReuseParent is only selected when a parent backend is present"),
-            TerminalBackendKind::AcpClient => {
-                std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
-                    tool_context.gateway.clone().unwrap(),
-                    tool_context.session_id.clone().unwrap(),
-                ))
-                    as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>
-            }
+            TerminalBackendKind::AcpClient => std::sync::Arc::new(
+                xai_grok_tools::computer::virtual_tasks::VirtualTaskTerminalBackend::new(
+                    std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
+                        tool_context.gateway.clone().unwrap(),
+                        tool_context.session_id.clone().unwrap(),
+                    )),
+                ),
+            ),
             TerminalBackendKind::LocalPersistent => std::sync::Arc::new(
-                LocalTerminalBackend::new_local_with_persistent_shell(resolve_search_shadows()),
+                xai_grok_tools::computer::virtual_tasks::VirtualTaskTerminalBackend::new(
+                    std::sync::Arc::new(LocalTerminalBackend::new_local_with_persistent_shell(
+                        resolve_search_shadows(),
+                    )),
+                ),
             ),
             TerminalBackendKind::LocalNonPersistent => {
                 let login_shell_capture = crate::util::config::resolve_login_shell_capture(
                     remote_settings.as_ref().and_then(|r| r.login_shell_capture),
                 );
-                std::sync::Arc::new(LocalTerminalBackend::new_local_with_login_shell_capture(
-                    resolve_search_shadows(),
-                    login_shell_capture,
-                ))
+                std::sync::Arc::new(
+                    xai_grok_tools::computer::virtual_tasks::VirtualTaskTerminalBackend::new(
+                        std::sync::Arc::new(
+                            LocalTerminalBackend::new_local_with_login_shell_capture(
+                                resolve_search_shadows(),
+                                login_shell_capture,
+                            ),
+                        ),
+                    ),
+                )
             }
         };
     if matches!(

@@ -112,9 +112,12 @@ impl crate::types::tool_metadata::ToolMetadata for WorkflowTool {
             "specific point, set resume_through to a phase title, agent label, or call index — ",
             "results through that point replay, everything after re-runs. Concurrent agents ",
             "are capped and queue transparently; at most 1000 agents per run. agentType ",
-            "accepts the same types as the task tool. workflow must be the only tool call in ",
-            "the model response, and workflow agents cannot spawn further task, agent_swarm, ",
-            "or workflow calls."
+            "accepts the same types as the task tool. Workflows run in the background by ",
+            "default: the call returns a run id immediately, progress is pollable via the ",
+            "task output tool, the run is interruptible via the kill tool, and completion ",
+            "wakes the session with the result (set run_in_background: false to block for ",
+            "the result inline). workflow must be the only tool call in the model response, ",
+            "and workflow agents cannot spawn further task, agent_swarm, or workflow calls."
         )
     }
 
@@ -172,6 +175,8 @@ impl xai_tool_runtime::Tool for WorkflowTool {
             parent_prompt_id,
             session_folder,
             notifications,
+            terminal,
+            owner_session_id,
         ) = {
             let res = resources.lock().await;
             (
@@ -195,6 +200,10 @@ impl xai_tool_runtime::Tool for WorkflowTool {
                 res.get::<NotificationHandle>()
                     .map(|handle| handle.0.clone())
                     .unwrap_or_default(),
+                res.get::<crate::types::resources::Terminal>()
+                    .map(|terminal| terminal.0.clone()),
+                res.get::<crate::types::resources::OwnerSessionId>()
+                    .map(|owner| owner.0.clone()),
             )
         };
         if depth >= MAX_SUBAGENT_DEPTH {
@@ -235,11 +244,10 @@ impl xai_tool_runtime::Tool for WorkflowTool {
             None => ReplayPlan::default(),
         };
 
-        let cancellation = ctx
-            .extensions
-            .get::<xai_tool_runtime::Cancellation>()
-            .map(|c| c.0.clone())
-            .unwrap_or_default();
+        let progress_path = input
+            .run_in_background
+            .then(|| run_dir.as_deref().map(|dir| dir.join("progress.log")))
+            .flatten();
 
         let host = WorkflowHost::new(WorkflowHostConfig {
             backend: backend.0.clone(),
@@ -249,18 +257,44 @@ impl xai_tool_runtime::Tool for WorkflowTool {
             run_id: run_id.clone(),
             workflow_name: meta.name.clone(),
             tool_call_id: ctx.call_id.to_string(),
-            notifications,
+            notifications: notifications.clone(),
             concurrency: workflow_concurrency_from_env()
                 .map_err(xai_tool_runtime::ToolError::invalid_arguments)?,
             per_agent_timeout: agent_timeout_from_env()
                 .map_err(xai_tool_runtime::ToolError::invalid_arguments)?,
             token_budget: input.token_budget,
             journal_path,
+            progress_path: progress_path.clone(),
             replay,
         });
 
         let module = assemble_module(&meta.value, input.args.as_ref(), input.token_budget, &body);
-        let outcome = drive_script(host.clone(), &ctx, module, &cancellation).await?;
+
+        if input.run_in_background {
+            let launch = BackgroundLaunch {
+                terminal,
+                notifications,
+                owner_session_id,
+                cwd,
+                progress_path,
+                tool_call_id: ctx.call_id.to_string(),
+            };
+            let renderer = {
+                let res = resources.lock().await;
+                res.get::<crate::types::template_renderer::TemplateRenderer>()
+                    .cloned()
+            };
+            return launch_background(launch, renderer, meta, run_id, script_path, host, module)
+                .await;
+        }
+
+        let cancellation = ctx
+            .extensions
+            .get::<xai_tool_runtime::Cancellation>()
+            .map(|c| c.0.clone())
+            .unwrap_or_default();
+        let outcome =
+            drive_script(host.clone(), ctx.call_id.to_string(), module, &cancellation).await?;
 
         Ok(ToolOutput::Text(
             render_output(
@@ -275,6 +309,156 @@ impl xai_tool_runtime::Tool for WorkflowTool {
     }
 }
 
+/// Session surfaces a background launch needs beyond the host itself.
+struct BackgroundLaunch {
+    terminal: Option<Arc<dyn crate::computer::types::TerminalBackend>>,
+    notifications: crate::notification::handle::ToolNotificationHandle,
+    owner_session_id: Option<String>,
+    cwd: PathBuf,
+    progress_path: Option<PathBuf>,
+    tool_call_id: String,
+}
+
+/// Launch the run as a virtual background task: register with the terminal
+/// backend (poll/kill/wait parity with process tasks), announce it to the
+/// tasks pane, detach the driver, and return the started notice. Completion
+/// finalizes the virtual task and fires the standard task-completed
+/// auto-wake.
+async fn launch_background(
+    launch: BackgroundLaunch,
+    renderer: Option<crate::types::template_renderer::TemplateRenderer>,
+    meta: meta::WorkflowMeta,
+    run_id: String,
+    script_path: Option<PathBuf>,
+    host: Arc<WorkflowHost>,
+    module: String,
+) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+    let Some(terminal) = launch.terminal else {
+        return Err(xai_tool_runtime::ToolError::custom(
+            "missing_resource",
+            "background workflow execution needs the terminal backend; retry with \
+             run_in_background: false",
+        ));
+    };
+    let Some(progress_path) = launch.progress_path else {
+        return Err(xai_tool_runtime::ToolError::custom(
+            "missing_resource",
+            "background workflow execution needs session persistence for its progress log; \
+             retry with run_in_background: false",
+        ));
+    };
+
+    let command = format!("workflow {}", meta.name);
+    let snapshot = crate::computer::types::TaskSnapshot {
+        task_id: run_id.clone(),
+        command: command.clone(),
+        display_command: Some(format!("workflow: {}", meta.name)),
+        cwd: launch.cwd.display().to_string(),
+        start_time: std::time::SystemTime::now(),
+        end_time: None,
+        output: String::new(),
+        output_file: progress_path.clone(),
+        truncated: false,
+        exit_code: None,
+        signal: None,
+        completed: false,
+        kind: crate::computer::types::TaskKind::Bash,
+        block_waited: false,
+        explicitly_killed: false,
+        owner_session_id: launch.owner_session_id,
+    };
+    let Some(handle) = terminal.register_virtual_task(snapshot).await else {
+        return Err(xai_tool_runtime::ToolError::custom(
+            "unsupported",
+            "this terminal backend does not support background workflow runs; retry with \
+             run_in_background: false",
+        ));
+    };
+
+    launch
+        .notifications
+        .send_backgrounded(crate::notification::types::BashExecutionBackgrounded {
+            base: crate::notification::types::BashNotificationBase {
+                tool_call_id: launch.tool_call_id.clone(),
+                command: command.clone(),
+                output: Vec::new(),
+                total_bytes: 0,
+                truncated: false,
+                cwd: launch.cwd.clone(),
+            },
+            output_file: progress_path.clone(),
+            task_id: run_id.clone(),
+            monitor_description: None,
+            description: Some(format!("workflow: {}", meta.name)),
+        });
+
+    let render_tool = |template: &str, fallback: &str| {
+        renderer
+            .as_ref()
+            .and_then(|renderer| renderer.render(template).ok())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    let get_output_tool = render_tool(
+        "${{ tools.by_kind.background_task_action }}",
+        "get_command_or_subagent_output",
+    );
+    let kill_tool = render_tool(
+        "${{ tools.by_kind.kill_task_action }}",
+        "kill_command_or_subagent",
+    );
+
+    let detached_meta = meta.clone();
+    let detached_run_id = run_id.clone();
+    let detached_script_path = script_path.clone();
+    let notifications = launch.notifications.clone();
+    let tool_call_id = launch.tool_call_id.clone();
+    tokio::spawn(async move {
+        let outcome = drive_script(host.clone(), tool_call_id, module, &handle.cancellation)
+            .await
+            .unwrap_or_else(|error| ScriptOutcome {
+                return_value: None,
+                error_text: Some(error.to_string()),
+            });
+        let rendered = render_output(
+            &detached_meta,
+            &detached_run_id,
+            detached_script_path.as_deref(),
+            host.as_ref(),
+            &outcome,
+        );
+        let exit_code = Some(i32::from(outcome.error_text.is_some()));
+        if let Some(final_snapshot) = terminal
+            .complete_virtual_task(&detached_run_id, rendered, exit_code)
+            .await
+        {
+            // The bridge suppresses the wake for explicitly killed or
+            // block-waited runs; otherwise the session wakes with the result.
+            notifications.send_task_complete(final_snapshot);
+        }
+    });
+
+    let script_line = script_path
+        .as_deref()
+        .map(|path| format!("<script_path>{}</script_path>\n", path.display()))
+        .unwrap_or_default();
+    Ok(ToolOutput::Text(
+        format!(
+            "<workflow_started>\n<name>{}</name>\n<run_id>{run_id}</run_id>\n{script_line}\
+             <output_file>{}</output_file>\n<status>running in background</status>\n\
+             The conversation stays free while agents run; completion wakes this session with \
+             the result. Use {get_output_tool} with task_ids=[\"{run_id}\"] (optionally \
+             timeout_ms to block) for progress, or {kill_tool} with task_id=\"{run_id}\" to \
+             interrupt. After interrupting or editing the script, resume with \
+             workflow(script_path=..., resume_from_run_id=\"{run_id}\") — add \
+             resume_mode=\"positional\" and resume_through=<phase|label|index> to go back to a \
+             specific point; completed agents replay from the journal.\n</workflow_started>",
+            meta.name,
+            progress_path.display(),
+        )
+        .into(),
+    ))
+}
+
 /// Terminal state of one script execution.
 struct ScriptOutcome {
     /// JSON-encoded script return value (absent when the script errored or
@@ -286,7 +470,7 @@ struct ScriptOutcome {
 
 async fn drive_script(
     host: Arc<WorkflowHost>,
-    ctx: &xai_tool_runtime::ToolCallContext,
+    tool_call_id: String,
     module: String,
     cancellation: &CancellationToken,
 ) -> Result<ScriptOutcome, xai_tool_runtime::ToolError> {
@@ -296,7 +480,7 @@ async fn drive_script(
     };
 
     let request = ExecuteRequest {
-        tool_call_id: ctx.call_id.to_string(),
+        tool_call_id,
         enabled_tools: vec![CodeModeToolDefinition {
             name: WORKFLOW_AGENT_NESTED_TOOL.to_string(),
             tool_name: CodeModeToolName::plain(WORKFLOW_AGENT_NESTED_TOOL),

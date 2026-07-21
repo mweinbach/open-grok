@@ -325,6 +325,9 @@ pub struct WorkflowHostConfig {
     pub per_agent_timeout: Option<Duration>,
     pub token_budget: Option<u64>,
     pub journal_path: Option<std::path::PathBuf>,
+    /// When set (background runs), every progress line is also appended
+    /// here so the run reads like any other background task's output file.
+    pub progress_path: Option<std::path::PathBuf>,
     pub replay: ReplayPlan,
 }
 
@@ -345,18 +348,21 @@ pub struct WorkflowHost {
     validated_types: parking_lot::Mutex<HashSet<String>>,
     state: parking_lot::Mutex<ProgressState>,
     journal: parking_lot::Mutex<Option<std::fs::File>>,
+    progress_file: parking_lot::Mutex<Option<std::fs::File>>,
     replay: parking_lot::Mutex<ReplayPlan>,
 }
 
 impl WorkflowHost {
     pub fn new(config: WorkflowHostConfig) -> Arc<Self> {
-        let journal = config.journal_path.as_ref().and_then(|path| {
+        let append = |path: &std::path::PathBuf| {
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
                 .ok()
-        });
+        };
+        let journal = config.journal_path.as_ref().and_then(append);
+        let progress_file = config.progress_path.as_ref().and_then(append);
         Arc::new(Self {
             backend: config.backend,
             model_validator: config.model_validator,
@@ -374,6 +380,7 @@ impl WorkflowHost {
             validated_types: parking_lot::Mutex::new(HashSet::new()),
             state: parking_lot::Mutex::new(ProgressState::default()),
             journal: parking_lot::Mutex::new(journal),
+            progress_file: parking_lot::Mutex::new(progress_file),
             replay: parking_lot::Mutex::new(config.replay),
         })
     }
@@ -393,11 +400,18 @@ impl WorkflowHost {
     fn emit_progress(&self, line: Option<String>) {
         let text = {
             let mut state = self.state.lock();
-            if let Some(line) = line {
-                state.push_line(line);
+            if let Some(line) = &line {
+                state.push_line(line.clone());
             }
             format!("{}\n{}", state.summary_line(), state.render_tail())
         };
+        if let Some(line) = &line {
+            use std::io::Write as _;
+            let mut progress_file = self.progress_file.lock();
+            if let Some(file) = progress_file.as_mut() {
+                let _ = writeln!(file, "{line}");
+            }
+        }
         self.notifications.send_workflow_progress(WorkflowProgress {
             tool_call_id: self.tool_call_id.clone(),
             run_id: self.run_id.clone(),
