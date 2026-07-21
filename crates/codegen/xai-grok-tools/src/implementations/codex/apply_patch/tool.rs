@@ -150,18 +150,24 @@ async fn ensure_parent_dirs(path: &std::path::Path) -> Result<(), xai_tool_runti
 }
 
 /// Compute all file changes in memory without writing anything.
-/// Returns an error string if any hunk can't be applied.
+///
+/// Validates every hunk (rather than stopping at the first failure) so a
+/// multi-file patch reports all bad hunks in one round trip, then appends a
+/// footer stating that nothing was applied and which hunks were valid.
 async fn compute_all_changes(
     cwd: &std::path::Path,
     fs: &Arc<dyn AsyncFileSystem>,
     hunks: &[Hunk],
 ) -> Result<Vec<FileChange>, String> {
     let mut changes = Vec::new();
+    let mut valid_paths: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
 
     for hunk in hunks {
         match hunk {
             Hunk::AddFile { path, contents } => {
                 let resolved = cwd.join(path);
+                valid_paths.push(path.display().to_string());
                 changes.push(FileChange::Add {
                     path: resolved,
                     content: contents.clone(),
@@ -169,13 +175,18 @@ async fn compute_all_changes(
             }
             Hunk::DeleteFile { path } => {
                 let resolved = cwd.join(path);
-                let original_content = read_file_as_string(fs, &resolved)
-                    .await
-                    .map_err(|e| format!("Failed to read file: {}, {e}", resolved.display()))?;
-                changes.push(FileChange::Delete {
-                    path: resolved,
-                    original_content,
-                });
+                match read_file_as_string(fs, &resolved).await {
+                    Ok(original_content) => {
+                        valid_paths.push(path.display().to_string());
+                        changes.push(FileChange::Delete {
+                            path: resolved,
+                            original_content,
+                        });
+                    }
+                    Err(e) => {
+                        errors.push(format!("Failed to read file: {}, {e}", resolved.display()));
+                    }
+                }
             }
             Hunk::UpdateFile {
                 path,
@@ -183,36 +194,86 @@ async fn compute_all_changes(
                 chunks,
             } => {
                 let resolved = cwd.join(path);
-                let original_content = read_file_as_string(fs, &resolved).await.map_err(|e| {
-                    format!("Failed to read file to update: {}, {e}", resolved.display())
-                })?;
+                let original_content = match read_file_as_string(fs, &resolved).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        errors.push(format!(
+                            "Failed to read file to update: {}, {e}",
+                            resolved.display()
+                        ));
+                        continue;
+                    }
+                };
 
-                let new_content = apply::derive_new_contents(&original_content, &resolved, chunks)
-                    .map_err(|e| match e {
-                        ApplyPatchError::ComputeReplacements(msg) => msg,
-                        other => other.to_string(),
-                    })?;
-
-                if let Some(dest) = move_path {
-                    let resolved_dest = cwd.join(dest);
-                    changes.push(FileChange::Move {
-                        source_path: resolved,
-                        dest_path: resolved_dest,
-                        original_content,
-                        new_content,
-                    });
-                } else {
-                    changes.push(FileChange::Update {
-                        path: resolved,
-                        original_content,
-                        new_content,
-                    });
+                match apply::derive_new_contents(&original_content, &resolved, chunks) {
+                    Ok(new_content) => {
+                        valid_paths.push(path.display().to_string());
+                        if let Some(dest) = move_path {
+                            let resolved_dest = cwd.join(dest);
+                            changes.push(FileChange::Move {
+                                source_path: resolved,
+                                dest_path: resolved_dest,
+                                original_content,
+                                new_content,
+                            });
+                        } else {
+                            changes.push(FileChange::Update {
+                                path: resolved,
+                                original_content,
+                                new_content,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(match e {
+                            ApplyPatchError::ComputeReplacements(msg) => msg,
+                            other => other.to_string(),
+                        });
+                    }
                 }
             }
         }
     }
 
-    Ok(changes)
+    if errors.is_empty() {
+        return Ok(changes);
+    }
+    Err(build_failure_message(errors, &valid_paths, hunks.len()))
+}
+
+/// Join per-hunk failures and append the patch-level status footer.
+fn build_failure_message(
+    errors: Vec<String>,
+    valid_paths: &[String],
+    total_hunks: usize,
+) -> String {
+    let mut msg = errors.join("\n\n");
+    msg.push_str(
+        "\n\nNo changes were applied to any file: apply_patch validates the entire patch before writing anything.",
+    );
+    if total_hunks > 1 {
+        let _ = write!(
+            msg,
+            " {} of {total_hunks} hunks were valid",
+            valid_paths.len()
+        );
+        if !valid_paths.is_empty() {
+            const MAX_LISTED: usize = 8;
+            let mut list = valid_paths
+                .iter()
+                .take(MAX_LISTED)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if valid_paths.len() > MAX_LISTED {
+                let _ = write!(list, ", … {} more", valid_paths.len() - MAX_LISTED);
+            }
+            let _ = write!(msg, " ({list})");
+        }
+        msg.push('.');
+    }
+    msg.push_str(" Re-read the failing file(s) and re-send the corrected patch.");
+    msg
 }
 
 /// Read a file via AsyncFileSystem and convert to String.
@@ -720,6 +781,70 @@ mod tests {
         match result {
             ApplyPatchOutput::ApplicationError(msg) => {
                 assert!(msg.contains("Failed to find expected lines"));
+                assert!(msg.contains("No changes were applied to any file"), "{msg}");
+            }
+            other => panic!("Expected ApplicationError, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_hunk_failure_is_atomic_and_reports_valid_hunks() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("good.txt"), "old\n").unwrap();
+        std::fs::write(tmp.path().join("bad.txt"), "actual\n").unwrap();
+
+        let tool = ApplyPatchTool;
+        let resources = test_resources(tmp.path());
+        let shared = resources.into_shared();
+
+        let patch = wrap_patch(
+            "*** Update File: good.txt\n@@\n-old\n+new\n\
+             *** Update File: bad.txt\n@@\n-nonexistent\n+replacement",
+        );
+        let result =
+            xai_tool_runtime::Tool::run(&tool, test_ctx(shared.clone()), make_input(&patch))
+                .await
+                .unwrap();
+
+        match result {
+            ApplyPatchOutput::ApplicationError(msg) => {
+                assert!(msg.contains("Failed to find expected lines"), "{msg}");
+                assert!(msg.contains("1 of 2 hunks were valid (good.txt)"), "{msg}");
+                assert!(msg.contains("No changes were applied to any file"), "{msg}");
+            }
+            other => panic!("Expected ApplicationError, got: {other:?}"),
+        }
+        // Atomic: the valid hunk must not have been written.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("good.txt")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_failing_hunks_are_reported_together() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("bad1.txt"), "one\n").unwrap();
+        std::fs::write(tmp.path().join("bad2.txt"), "two\n").unwrap();
+
+        let tool = ApplyPatchTool;
+        let resources = test_resources(tmp.path());
+        let shared = resources.into_shared();
+
+        let patch = wrap_patch(
+            "*** Update File: bad1.txt\n@@\n-missing1\n+x\n\
+             *** Update File: bad2.txt\n@@\n-missing2\n+y",
+        );
+        let result =
+            xai_tool_runtime::Tool::run(&tool, test_ctx(shared.clone()), make_input(&patch))
+                .await
+                .unwrap();
+
+        match result {
+            ApplyPatchOutput::ApplicationError(msg) => {
+                assert!(msg.contains("bad1.txt"), "{msg}");
+                assert!(msg.contains("bad2.txt"), "{msg}");
+                assert!(msg.contains("0 of 2 hunks were valid"), "{msg}");
             }
             other => panic!("Expected ApplicationError, got: {other:?}"),
         }

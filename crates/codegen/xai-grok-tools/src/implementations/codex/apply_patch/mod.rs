@@ -8,11 +8,13 @@
 //!
 //! - [`apply`] — `derive_new_contents()`, `compute_replacements()`,
 //!   `apply_replacements()` — all accept `&str` input.
+//! - [`diagnostics`] — closest-match reporting for failed hunks.
 //! - [`errors`] — `ApplyPatchError`, `ParseError`.
 //! - [`parser`] — `parse_patch()`, `Hunk`, `UpdateFileChunk`.
 //! - [`seek_sequence`] — 4-tier fuzzy line matcher.
 
 pub mod apply;
+pub mod diagnostics;
 pub mod errors;
 pub mod parser;
 pub mod seek_sequence;

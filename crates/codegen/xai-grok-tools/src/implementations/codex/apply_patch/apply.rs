@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use super::diagnostics;
 use super::errors::ApplyPatchError;
 use super::parser::UpdateFileChunk;
 use super::seek_sequence::seek_sequence;
@@ -62,10 +63,19 @@ pub fn compute_replacements(
             ) {
                 line_index = idx + 1;
             } else {
+                // First line stays byte-identical to codex; diagnostics are
+                // appended so a failed match points at the file's actual
+                // content instead of only echoing the patch back.
                 return Err(ApplyPatchError::ComputeReplacements(format!(
-                    "Failed to find context '{}' in {}",
+                    "Failed to find context '{}' in {}\n\n{}",
                     ctx_line,
-                    path.display()
+                    path.display(),
+                    diagnostics::diagnose_missing_lines(
+                        original_lines,
+                        std::slice::from_ref(ctx_line),
+                        path,
+                        line_index,
+                    )
                 )));
             }
         }
@@ -102,10 +112,18 @@ pub fn compute_replacements(
             replacements.push((start_idx, pattern.len(), new_slice.to_vec()));
             line_index = start_idx + pattern.len();
         } else {
+            // First line stays byte-identical to codex; diagnostics are
+            // appended (closest matching region, line numbers, similarity).
             return Err(ApplyPatchError::ComputeReplacements(format!(
-                "Failed to find expected lines in {}:\n{}",
+                "Failed to find expected lines in {}:\n{}\n\n{}",
                 path.display(),
                 chunk.old_lines.join("\n"),
+                diagnostics::diagnose_missing_lines(
+                    original_lines,
+                    &chunk.old_lines,
+                    path,
+                    line_index,
+                )
             )));
         }
     }
@@ -298,6 +316,87 @@ mod tests {
             }
             other => panic!("expected ComputeReplacements, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_missing_lines_error_includes_closest_match() {
+        // The hunk assumes three existing lines are adjacent when the file
+        // has another line between them — the real-world failure shape.
+        let original = "var errorMessage: String?\n\
+                        var showingRestPicker = false\n\
+                        var currentRestDuration: TimeInterval = 0\n\
+                        var showingExerciseEditor = false\n\
+                        var isSavingHistory = false\n";
+        let path = PathBuf::from("vm.swift");
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}\n@@\n var showingRestPicker = false\n var showingExerciseEditor = false\n-var isSavingHistory = false\n+var isSaving = false",
+            path.display()
+        ));
+        let parsed = parse_patch(&patch).unwrap();
+        let chunks = match &parsed.hunks[0] {
+            Hunk::UpdateFile { chunks, .. } => chunks,
+            _ => panic!("expected UpdateFile"),
+        };
+        let err = derive_new_contents(original, &path, chunks).unwrap_err();
+        let ApplyPatchError::ComputeReplacements(msg) = err else {
+            panic!("expected ComputeReplacements");
+        };
+        assert!(
+            msg.starts_with("Failed to find expected lines in vm.swift:\n"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Closest match in vm.swift at lines 3-5"),
+            "{msg}"
+        );
+        assert!(msg.contains("(similarity:"), "{msg}");
+        assert!(
+            msg.contains("4\tvar showingExerciseEditor = false"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_out_of_order_hunks_error_notes_ordering() {
+        let original = "a\nb\nc\nd\n";
+        let path = PathBuf::from("order.txt");
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}\n@@\n-c\n+C\n@@\n-a\n+A",
+            path.display()
+        ));
+        let parsed = parse_patch(&patch).unwrap();
+        let chunks = match &parsed.hunks[0] {
+            Hunk::UpdateFile { chunks, .. } => chunks,
+            _ => panic!("expected UpdateFile"),
+        };
+        let err = derive_new_contents(original, &path, chunks).unwrap_err();
+        let ApplyPatchError::ComputeReplacements(msg) = err else {
+            panic!("expected ComputeReplacements");
+        };
+        assert!(msg.contains("Failed to find expected lines"), "{msg}");
+        assert!(msg.contains("BEFORE"), "{msg}");
+        assert!(msg.contains("ordered top-to-bottom"), "{msg}");
+    }
+
+    #[test]
+    fn test_context_not_found_error_includes_closest_match() {
+        let original = "fn helper_one() {\nfn helper_two() {\n";
+        let path = PathBuf::from("ctx.rs");
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}\n@@ fn helper_onee() {{\n-fn helper_two() {{\n+fn helper_2() {{",
+            path.display()
+        ));
+        let parsed = parse_patch(&patch).unwrap();
+        let chunks = match &parsed.hunks[0] {
+            Hunk::UpdateFile { chunks, .. } => chunks,
+            _ => panic!("expected UpdateFile"),
+        };
+        let err = derive_new_contents(original, &path, chunks).unwrap_err();
+        let ApplyPatchError::ComputeReplacements(msg) = err else {
+            panic!("expected ComputeReplacements");
+        };
+        assert!(msg.starts_with("Failed to find context"), "{msg}");
+        assert!(msg.contains("Closest match in ctx.rs"), "{msg}");
     }
 
     #[test]
