@@ -112,11 +112,23 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
             return;
         }
 
-        insert_optional_header(
-            headers,
-            "x-grok-client-version",
-            config.client_version.as_deref(),
-        );
+        // xAI's API gates requests on a parseable client version and rejects
+        // absent/unparseable ones with 426 ("version (none)"). The session's
+        // configured client_version can legitimately be None on cross-provider
+        // paths (e.g. a Codex-parented subagent overriding to a Grok model),
+        // so fall back to this build's own version, normalized to its base
+        // semver (the fork's `-open-grok.N` pre-release suffix is not part of
+        // the upstream version grammar the gate parses).
+        let client_version = config
+            .client_version
+            .as_deref()
+            .unwrap_or(xai_grok_version::VERSION);
+        let client_version = client_version
+            .split(['-', '+'])
+            .next()
+            .filter(|base| !base.is_empty())
+            .unwrap_or(client_version);
+        insert_optional_header(headers, "x-grok-client-version", Some(client_version));
         insert_optional_header(
             headers,
             "x-grok-deployment-id",
@@ -664,6 +676,67 @@ mod tests {
         provider_adapter(ModelProvider::Fireworks).sanitize_chat_request(&mut request);
         assert_eq!(request.temperature, Some(0.7));
         assert_eq!(request.top_p, Some(0.95));
+    }
+
+    #[test]
+    fn xai_client_version_header_always_present_and_base_semver() {
+        fn config_with_version(client_version: Option<&str>) -> SamplerConfig {
+            SamplerConfig {
+                api_key: Some("test-key".to_string()),
+                base_url: "https://api.x.ai".to_string(),
+                model: "grok-4.5".to_string(),
+                max_completion_tokens: None,
+                temperature: None,
+                top_p: None,
+                api_backend: ApiBackend::ChatCompletions,
+                provider: ModelProvider::Xai,
+                auth_scheme: crate::config::AuthScheme::Bearer,
+                extra_headers: indexmap::IndexMap::new(),
+                context_window: 8192,
+                force_http1: false,
+                max_retries: None,
+                stream_tool_calls: false,
+                idle_timeout_secs: None,
+                reasoning_effort: None,
+                reasoning_summary: None,
+                origin_client: None,
+                client_identifier: None,
+                deployment_id: None,
+                user_id: None,
+                client_version: client_version.map(str::to_string),
+                attribution_callback: None,
+                bearer_resolver: None,
+                supports_backend_search: false,
+                codex_multi_agent_v2: false,
+                compactions_remaining: None,
+                compaction_at_tokens: None,
+                doom_loop_recovery: None,
+                header_injector: None,
+            }
+        }
+        let header_for = |client_version: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            provider_adapter(ModelProvider::Xai)
+                .apply_default_headers(&mut headers, &config_with_version(client_version));
+            headers
+                .get("x-grok-client-version")
+                .expect("xAI requests must always carry a client version (426 gate)")
+                .to_str()
+                .expect("ascii")
+                .to_string()
+        };
+
+        // Cross-provider paths (Codex parent → Grok child) resolve no session
+        // client_version; the build's own version must be sent, not nothing.
+        let fallback = header_for(None);
+        assert!(!fallback.is_empty());
+        assert!(
+            !fallback.contains('-'),
+            "fork pre-release suffix must be stripped for the gate parser: {fallback}"
+        );
+
+        assert_eq!(header_for(Some("0.1.220-open-grok.23")), "0.1.220");
+        assert_eq!(header_for(Some("0.1.230")), "0.1.230");
     }
 
     #[test]
