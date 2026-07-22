@@ -1278,10 +1278,7 @@ mod tests {
             "A test subagent",
         );
 
-        let entries = merge_subagents(
-            discover_with_home(tmp.path(), None, None),
-            &HashMap::new(),
-        );
+        let entries = merge_subagents(discover_with_home(tmp.path(), None, None), &HashMap::new());
         assert_eq!(entries.len(), 4);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
