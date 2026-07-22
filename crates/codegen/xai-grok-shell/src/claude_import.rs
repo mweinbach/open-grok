@@ -2187,6 +2187,7 @@ extra_rule_dirs = ["/c/rules"]
         let resolved =
             xai_grok_workspace::permission::resolution::resolve_permissions_with_provenance(
                 dir.path(),
+                true,
             )
             .await;
         if let Some(r) = resolved {

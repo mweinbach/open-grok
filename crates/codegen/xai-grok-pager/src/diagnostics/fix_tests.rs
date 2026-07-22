@@ -4,7 +4,7 @@ use crate::diagnostics::{DiagnosticFinding, FindingDisposition, ManualRemediatio
 use crate::host::DisplayServer;
 use crate::terminal::{MultiplexerKind, TerminalName};
 
-fn report() -> DiagnosticReport {
+pub(super) fn report() -> DiagnosticReport {
     let mut report = DiagnosticReport {
         facts: crate::diagnostics::DiagnosticFacts {
             terminal: TerminalName::Ghostty,
@@ -70,7 +70,7 @@ fn terminal() -> TerminalContext {
     }
 }
 
-fn request(home: &Path, shell: &str) -> FixRequest {
+pub(super) fn request(home: &Path, shell: &str) -> FixRequest {
     FixRequest {
         id: SSH_WRAP_ID,
         home: home.to_path_buf(),
@@ -96,15 +96,52 @@ fn canonical_and_short_ids_resolve_to_canonical_id() {
 }
 
 #[test]
+fn applicable_fix_listing_uses_report_metadata_and_planner_availability() {
+    let temp = tempfile::tempdir().unwrap();
+    let report = report();
+    let local = terminal();
+    let local_fixes = applicable_automatic_fixes_with(&report, &local, |id| {
+        Ok(FixRequest {
+            id,
+            ..request(temp.path(), "/bin/bash")
+        })
+    });
+    assert_eq!(
+        local_fixes,
+        vec![(SSH_WRAP_ID, "ssh-wrap", AutomaticFixAvailability::Here)]
+    );
+
+    let mut remote = local.clone();
+    remote.is_ssh = true;
+    assert_eq!(
+        applicable_automatic_fixes_with(&report, &remote, |_| { Err(FixError::HomeUnavailable) }),
+        vec![(
+            SSH_WRAP_ID,
+            "ssh-wrap",
+            AutomaticFixAvailability::RunLocally
+        )]
+    );
+
+    let mut manual_only = report;
+    manual_only.findings[0].automatic_remediation = None;
+    assert!(
+        applicable_automatic_fixes_with(&manual_only, &local, |_| {
+            Err(FixError::HomeUnavailable)
+        })
+        .is_empty()
+    );
+}
+
+#[test]
 fn bash_zsh_and_fish_plans_use_exact_paths_and_aliases() {
     let temp = tempfile::tempdir().unwrap();
     for (shell, relative, alias) in [
-        ("/bin/bash", ".bashrc", "alias ssh='grok wrap ssh'"),
-        ("/bin/zsh", ".zshrc", "alias ssh='grok wrap ssh'"),
+        ("/bin/bash", ".bashrc", "alias ssh='open-grok wrap ssh'"),
+        ("/bin/zsh", ".zshrc", "alias ssh='open-grok wrap ssh'"),
         (
             "/usr/local/bin/fish",
             ".config/fish/config.fish",
-            "alias ssh 'grok wrap ssh'",
+            "alias ssh 'open-grok wrap ssh'",
         ),
     ] {
         let plan = plan_fix(request(temp.path(), shell), &report(), &terminal()).unwrap();
@@ -325,7 +362,7 @@ fn comments_and_managed_alias_do_not_create_false_conflicts() {
     let path = temp.path().join(".zshrc");
     std::fs::write(
         &path,
-        "# alias ssh='ssh -A'\n# >>> grok doctor >>>\n# >>> terminal.ssh-wrap >>>\nalias ssh='grok wrap ssh'\n# <<< terminal.ssh-wrap <<<\n# <<< grok doctor <<<\n",
+        "# alias ssh='ssh -A'\n# >>> grok doctor >>>\n# >>> terminal.ssh-wrap >>>\nalias ssh='open-grok wrap ssh'\n# <<< terminal.ssh-wrap <<<\n# <<< grok doctor <<<\n",
     )
     .unwrap();
     let plan = plan_fix(request(temp.path(), "/bin/zsh"), &report(), &terminal()).unwrap();
@@ -339,11 +376,11 @@ fn managed_alias_with_later_unmanaged_conflict_is_not_configured() {
     let cases = [
         (
             ShellKind::Bash,
-            "# >>> grok doctor >>>\n# >>> terminal.ssh-wrap >>>\nalias ssh='grok wrap ssh'\n# <<< terminal.ssh-wrap <<<\n# <<< grok doctor <<<\nalias ssh='ssh -A'\n",
+            "# >>> grok doctor >>>\n# >>> terminal.ssh-wrap >>>\nalias ssh='open-grok wrap ssh'\n# <<< terminal.ssh-wrap <<<\n# <<< grok doctor <<<\nalias ssh='ssh -A'\n",
         ),
         (
             ShellKind::Fish,
-            "# >>> grok doctor >>>\n# >>> terminal.ssh-wrap >>>\nalias ssh 'grok wrap ssh'\n# <<< terminal.ssh-wrap <<<\n# <<< grok doctor <<<\nfunction ssh\n  command ssh -A $argv\nend\n",
+            "# >>> grok doctor >>>\n# >>> terminal.ssh-wrap >>>\nalias ssh 'open-grok wrap ssh'\n# <<< terminal.ssh-wrap <<<\n# <<< grok doctor <<<\nfunction ssh\n  command ssh -A $argv\nend\n",
         ),
     ];
     for (shell, content) in cases {
@@ -534,7 +571,7 @@ fn shell_aliases_expand_to_exact_argv_and_bypass_is_explicit() {
         .unwrap();
         std::fs::set_permissions(&fish_grok, std::fs::Permissions::from_mode(0o755)).unwrap();
         let rc = temp.path().join("config.fish");
-        std::fs::write(&rc, "alias ssh 'fish-grok wrap ssh'\n").unwrap();
+        std::fs::write(&rc, "alias ssh 'fish-open-grok wrap ssh'\n").unwrap();
         let command = format!(
             "source '{}'; source '{}'; ssh -p 2222 host; env | string match -rq '^ssh='; and exit 9; or exit 0",
             rc.display(),

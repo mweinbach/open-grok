@@ -1,10 +1,10 @@
-//! Shared environment helpers: binary resolution, git workdirs, env var setup.
+//! Binary resolution, serial env guards, and git sandbox creation.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tempfile::TempDir;
+use crate::sandbox::TestSandbox;
 
 /// RAII guard for a single environment variable in `#[serial]` tests: snapshots
 /// the prior value on construction, applies the change, then restores the prior
@@ -75,9 +75,13 @@ fn ensure_local_grok_binary(binary: &Path) {
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let output = Command::new(&cargo)
-        .current_dir(workspace_root())
+    let mut cmd = Command::new(&cargo);
+    cmd.current_dir(workspace_root())
         .args(["build", "-p", "xai-grok-pager-bin", "--bin", "open-grok"])
+        .stdin(std::process::Stdio::null())
+        .envs(xai_tty_utils::pager_env());
+    xai_tty_utils::detach_std_command(&mut cmd);
+    let output = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build open-grok: {e}"));
 
@@ -115,71 +119,7 @@ pub fn grok_binary() -> PathBuf {
     binary
 }
 
-/// Temp dir with a git repo + one committed file.
-/// Forces libgit2 to fully init (the codepath that breaks with bad OpenSSL linking).
-pub fn git_workdir() -> TempDir {
-    let dir = TempDir::new().expect("create temp dir");
-    let path = dir.path();
-
-    fn run_git(args: &[&str], dir: &Path) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn git {}: {e}", args.join(" ")));
-        assert!(
-            output.status.success(),
-            "git {} failed (exit {:?}):\n{}",
-            args.join(" "),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
-    run_git(&["init"], path);
-    // Configure git user for commits (required in CI where no global config exists)
-    run_git(&["config", "user.email", "test@test.com"], path);
-    run_git(&["config", "user.name", "Test"], path);
-
-    std::fs::write(path.join("README.md"), "test file\n").expect("write test file");
-
-    run_git(&["add", "-A"], path);
-    run_git(&["commit", "-m", "init", "--no-gpg-sign"], path);
-
-    dir
-}
-
-/// Point grok at the mock server with a fake API key and telemetry disabled.
-pub fn test_env_cmd_tokio(
-    cmd: &mut tokio::process::Command,
-    mock_url: &str,
-    home: &std::path::Path,
-) {
-    for key in [
-        "MOONSHOT_API_KEY",
-        "KIMI_CODE_API_KEY",
-        "KIMI_API_KEY",
-        "OPENAI_API_KEY",
-    ] {
-        cmd.env_remove(key);
-    }
-    cmd.env("HOME", home)
-        // HOME alone does not sandbox grok on Windows: the product resolves
-        // `~` via `USERPROFILE`/Known Folders (`std::env::home_dir()`), so
-        // without an explicit OPENGROK_HOME every spawned child shares the real
-        // `%USERPROFILE%\.opengrok` — test 1's models_cache.json (which embeds
-        // its per-test mock-server URL) then poisons every later test's
-        // prompt (the windows-x86_64 lifecycle "prompt timed out" failure).
-        // Mirrors `leader.rs` and the pty-harness `env_for_pager`.
-        .env("OPENGROK_HOME", home.join(".opengrok"))
-        .env("GROK_CLI_CHAT_PROXY_BASE_URL", mock_url)
-        .env("GROK_XAI_API_BASE_URL", mock_url)
-        .env("XAI_API_KEY", "test-key-for-ci")
-        .env("GROK_TELEMETRY_ENABLED", "false")
-        .env("GROK_FEEDBACK_ENABLED", "false")
-        .env("GROK_TRACE_UPLOAD", "false")
-        .env("GROK_INSTRUMENTATION", "disabled")
-        // Release binaries (CI lifecycle tests) otherwise spawn a background
-        // update check that hits the network and can add latency under Rosetta.
-        .env("GROK_DISABLE_AUTOUPDATER", "1");
+/// Create an owned, git-initialized [`TestSandbox`].
+pub fn git_workdir() -> TestSandbox {
+    TestSandbox::builder().git().build()
 }

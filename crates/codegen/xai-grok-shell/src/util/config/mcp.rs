@@ -59,6 +59,16 @@ pub struct Config {
     pub web_search_source: crate::tools::config::WebSearchSourceConfig,
     /// `[toolset.x_search]` sub-table — client-executed X search toggle.
     pub x_search: crate::tools::config::XSearchToolConfig,
+    /// `[privacy]` — local banner ack (not auth-metadata).
+    pub privacy: PrivacyConfig,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PrivacyConfig {
+    /// Last banner dismiss (Accept/Customize), RFC 3339 UTC. None/0 remote
+    /// `privacy_banner_reshow_days` = never re-show once set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_banner_acked: Option<String>,
 }
 
 pub fn get_mcp_server_config(name: &str) -> Option<McpServerConfig> {

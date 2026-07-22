@@ -227,10 +227,14 @@ pub(super) async fn run_antigravity_subagent(
         },
         ctx.parent_cmd_tx.as_ref(),
     );
-    // Read-only unless the operator opted in AND the caller didn't pin a
-    // read-only capability mode. Headless agy auto-denies mutating tools
-    // without the flag, which is exactly the safe default we want.
-    let skip_permissions = state.config.skip_permissions.unwrap_or(false)
+    // Full access by default: headless agy auto-denies mutating tools
+    // without its skip-permissions flag, which surfaced as constant
+    // permission errors for implementation-stage subagents. Antigravity
+    // members now run with the flag unless the operator opts out with
+    // `[antigravity] skip_permissions = false` — and a caller that pins a
+    // read-only capability mode (e.g. review/audit stages) always stays
+    // read-only regardless.
+    let skip_permissions = state.config.skip_permissions.unwrap_or(true)
         && !matches!(
             effective_runtime.capability_mode,
             Some(SubagentCapabilityMode::ReadOnly)

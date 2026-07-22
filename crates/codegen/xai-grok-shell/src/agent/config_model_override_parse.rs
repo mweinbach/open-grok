@@ -658,10 +658,9 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].kind, ConfigWarningKind::NotATable);
         assert!(matches!(
-                    &warnings[0].target,
-                    WarningTarget::Model { key, field: None }
-        if key == "oops"
-                ));
+            &warnings[0].target,
+            WarningTarget::Model { key, field: None } if key == "oops"
+        ));
     }
 
     /// Exhaustive literal (no `..`): a new struct field is a compile error

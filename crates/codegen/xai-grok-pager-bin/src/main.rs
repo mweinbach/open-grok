@@ -466,10 +466,15 @@ fn render_workspace_payload(payload: &ControlPayload, json: bool) {
         return;
     };
     if json {
-        let value = serde_json::json!(
-            { "state" : state, "hubUrl" : hub_url, "cwd" : cwd, "uptimeMs" : uptime_ms,
-            "activeToolCalls" : active_tool_calls, "sessions" : sessions, "pid" : pid, }
-        );
+        let value = serde_json::json!({
+            "state": state,
+            "hubUrl": hub_url,
+            "cwd": cwd,
+            "uptimeMs": uptime_ms,
+            "activeToolCalls": active_tool_calls,
+            "sessions": sessions,
+            "pid": pid,
+        });
         println!("{}", serde_json::to_string(&value).unwrap_or_default());
         return;
     }
@@ -736,17 +741,22 @@ fn replay_load_json(sid: &str, cached: &CachedSession) -> Option<String> {
         return Some(verbatim.clone());
     }
     let cwd = cached.cwd.as_deref()?;
-    let mut params = serde_json::json!({ "sessionId" : sid, "cwd" : cwd, });
+    let mut params = serde_json::json!({
+        "sessionId": sid,
+        "cwd": cwd,
+    });
     if let Some(ref mcp_raw) = cached.mcp_servers_json
         && let Ok(mcp_val) = serde_json::from_str::<serde_json::Value>(mcp_raw)
     {
         params["mcpServers"] = mcp_val;
     }
     Some(
-        serde_json::json!(
-            { "jsonrpc" : "2.0", "id" : REPLAY_LOAD_REQUEST_ID, "method" :
-            "session/load", "params" : params, }
-        )
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": REPLAY_LOAD_REQUEST_ID,
+            "method": "session/load",
+            "params": params,
+        })
         .to_string(),
     )
 }
@@ -786,24 +796,23 @@ async fn replay_acp_state_after_reconnect(
     let mut restored: Vec<String> = Vec::new();
     for (sid, cached) in &state.sessions {
         let Some(load_json) = replay_load_json(sid, cached) else {
-            tracing::warn!(
-                session_id = % sid, "replay: no way to rebuild session/load; skipping"
-            );
+            tracing::warn!(session_id = %sid, "replay: no way to rebuild session/load; skipping");
             continue;
         };
         match replay_request_until_response(tx, rx, stdout, &load_json, "session/load").await {
             ReplayOutcome::ResponseOk => {
-                tracing::info!(session_id = % sid, "replay: session restored");
+                tracing::info!(session_id = %sid, "replay: session restored");
                 restored.push(sid.clone());
             }
             ReplayOutcome::ResponseErr => {
                 tracing::warn!(
-                    session_id = % sid, "replay: session/load was rejected by new leader"
+                    session_id = %sid,
+                    "replay: session/load was rejected by new leader"
                 );
             }
             ReplayOutcome::Failed => {
                 tracing::warn!(
-                    session_id = % sid,
+                    session_id = %sid,
                     "replay: transport failure during session/load; aborting remaining replays"
                 );
                 break;
@@ -900,9 +909,7 @@ async fn run_agent_command(
         match std::env::current_dir() {
             Ok(cwd) => xai_grok_shell::agent::folder_trust::grant_folder_trust(&cwd),
             Err(e) => {
-                tracing::warn!(
-                    error = % e, "--trust: failed to resolve cwd; folder not trusted"
-                )
+                tracing::warn!(error = %e, "--trust: failed to resolve cwd; folder not trusted")
             }
         }
     }
@@ -1064,11 +1071,18 @@ async fn run_agent_command(
                     let mut stdin_lines = xai_acp_lib::spawn_stdin_line_reader();
                     loop {
                         tokio::select! {
-                            biased; _ = cancel_stdin.cancelled() => break, maybe_line =
-                            stdin_lines.recv() => { let Some(line) = maybe_line else {
-                            break }; forward_stdio_line_to_leader(line, &
-                            leader_tx_stdin, & replay_state_stdin, & cancel_stdin,).
-                            await; }
+                            biased;
+                            _ = cancel_stdin.cancelled() => break,
+                            maybe_line = stdin_lines.recv() => {
+                                let Some(line) = maybe_line else { break };
+                                forward_stdio_line_to_leader(
+                                    line,
+                                    &leader_tx_stdin,
+                                    &replay_state_stdin,
+                                    &cancel_stdin,
+                                )
+                                .await;
+                            }
                         }
                     }
                 });
@@ -1118,7 +1132,7 @@ async fn run_agent_command(
                                         reconnector.notify_connected();
                                         let params = match replayed_session_id {
                                             Some(ref sid) => {
-                                                serde_json::json!({ "sessionId" : sid }).to_string()
+                                                serde_json::json!({ "sessionId": sid }).to_string()
                                             }
                                             None => "{}".to_string(),
                                         };
@@ -1131,7 +1145,7 @@ async fn run_agent_command(
                                         continue;
                                     }
                                     Err(e) => {
-                                        tracing::error!(error = % e, "Failed to reconnect (stdio)");
+                                        tracing::error!(error = %e, "Failed to reconnect (stdio)");
                                         cancel_stdout.cancel();
                                         break;
                                     }
@@ -1141,7 +1155,8 @@ async fn run_agent_command(
                     }
                 });
                 tokio::select! {
-                    _ = stdin_task => {} _ = stdout_task => {}
+                    _ = stdin_task => {}
+                    _ = stdout_task => {}
                 }
                 return Ok(());
             }
@@ -1166,9 +1181,7 @@ async fn run_agent_command(
                                     continue;
                                 }
                                 Err(e) => {
-                                    tracing::error!(
-                                        error = % e, "Failed to reconnect (headless)"
-                                    );
+                                    tracing::error!(error = %e, "Failed to reconnect (headless)");
                                     break;
                                 }
                             }
@@ -1510,6 +1523,9 @@ fn main() {
     if let Some(code) = xai_grok_pager::app::mermaid_worker::maybe_run_render_subprocess() {
         std::process::exit(code);
     }
+    if let Some(code) = xai_grok_pager::voice::maybe_run_capture_subprocess() {
+        std::process::exit(code);
+    }
     let args = PagerArgs::parse_cli();
     if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
         return;
@@ -1655,10 +1671,10 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         match command {
             Command::Version { json } => {
                 if json {
-                    let payload = serde_json::json!(
-                        { "currentVersion" : env!("VERSION_WITH_COMMIT"), "releaseSource" :
-                        xai_grok_update::RELEASE_SOURCE, }
-                    );
+                    let payload = serde_json::json!({
+                        "currentVersion": env!("VERSION_WITH_COMMIT"),
+                        "releaseSource": xai_grok_update::RELEASE_SOURCE,
+                    });
                     println!("{}", serde_json::to_string(&payload)?);
                 } else {
                     write_version(&mut std::io::stdout().lock(), "")?;
@@ -2170,9 +2186,7 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(
-                    error = % e, "Could not connect to leader to signal relaunch"
-                );
+                tracing::debug!(error = %e, "Could not connect to leader to signal relaunch");
                 continue;
             }
         };
@@ -2194,17 +2208,14 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
                 eprintln!("  ↻ Relaunching shared session (leader {from_version} → {to_version})…");
             }
             Ok(Ok(xai_grok_shell::leader::ControlPayload::RelaunchDeclined { reason })) => {
-                tracing::debug!(% reason, "Leader declined relaunch");
+                tracing::debug!(%reason, "Leader declined relaunch");
             }
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                tracing::debug!(error = % e.message, "Leader relaunch control error");
+                tracing::debug!(error = %e.message, "Leader relaunch control error");
             }
             Err(e) => {
-                tracing::debug!(
-                    error = % e,
-                    "Leader relaunch ack not received (leader may be exiting)"
-                );
+                tracing::debug!(error = %e, "Leader relaunch ack not received (leader may be exiting)");
             }
         }
         client.cancel();
@@ -2733,10 +2744,11 @@ mod tests {
             assert_eq!(load2_json["id"].as_str(), Some(REPLAY_LOAD_REQUEST_ID));
             response_tx
                 .send(
-                    serde_json::json!(
-                        { "jsonrpc" : "2.0", "id" : REPLAY_LOAD_REQUEST_ID, "result" : {}
-                        }
-                    )
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": REPLAY_LOAD_REQUEST_ID,
+                        "result": {}
+                    })
                     .to_string(),
                 )
                 .unwrap();
@@ -2882,8 +2894,8 @@ mod tests {
                 response_tx
                     .send(
                         format!(
-                            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s9","n":{i}}}}}"#
-                        ),
+                        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s9","n":{i}}}}}"#
+                    ),
                     )
                     .unwrap();
             }
@@ -2986,10 +2998,11 @@ mod tests {
             );
             response_tx
                 .send(
-                    serde_json::json!(
-                        { "jsonrpc" : "2.0", "id" : REPLAY_LOAD_REQUEST_ID, "result" : {}
-                        }
-                    )
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": REPLAY_LOAD_REQUEST_ID,
+                        "result": {}
+                    })
                     .to_string(),
                 )
                 .unwrap();

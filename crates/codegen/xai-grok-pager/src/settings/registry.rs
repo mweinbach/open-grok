@@ -311,6 +311,10 @@ pub struct PagerLocalSnapshot {
     pub web_search_source: xai_grok_shell::tools::config::WebSearchSourceConfig,
     /// `[toolset.x_search].enabled` (effective TOML merge; default on).
     pub x_search_enabled: bool,
+    /// `[antigravity].skip_permissions` (effective TOML merge). Full access is
+    /// the default (`unwrap_or(true)`); `false` is the read-only opt-out. Read
+    /// fresh from disk at snapshot time — no `UiConfig` mirror.
+    pub antigravity_skip_permissions: bool,
     pub perplexity_api_key_status: SecretStatus,
     /// Active Kimi service profile (`platform` | `code`).
     pub kimi_api_endpoint: String,
@@ -368,6 +372,8 @@ impl Default for PagerLocalSnapshot {
             perplexity_web_search_enabled: false,
             web_search_source: Default::default(),
             x_search_enabled: true,
+            // Matches the runner's `unwrap_or(true)` full-access default.
+            antigravity_skip_permissions: true,
             perplexity_api_key_status: SecretStatus::Missing,
             kimi_api_endpoint: "platform".to_owned(),
             coding_data_sharing_opt_out: true,
@@ -796,6 +802,9 @@ pub fn current_value_for(
             ))
         }
         "toolset.x_search.enabled" => Some(SettingValue::Bool(pager.x_search_enabled)),
+        "antigravity_skip_permissions" => {
+            Some(SettingValue::Bool(pager.antigravity_skip_permissions))
+        }
         "perplexity_api_key" => Some(SettingValue::SecretStatus(pager.perplexity_api_key_status)),
         // max_thoughts_width: `u16` widened to `i64`.
         "max_thoughts_width" => Some(SettingValue::Int(ui.max_thoughts_width as i64)),
@@ -1406,6 +1415,16 @@ mod tests {
                     assert!(
                         default,
                         "X search defaults on (registered only when xAI signed in)"
+                    );
+                }
+                // antigravity_skip_permissions: no UiConfig mirror (lives under
+                // `[antigravity]`); default anchored on the runner's full-access
+                // `unwrap_or(true)` semantics.
+                ("antigravity_skip_permissions", SettingKind::Bool { default }) => {
+                    assert!(
+                        default,
+                        "Antigravity full access defaults ON (agy skip-permissions); \
+                         the row is the read-only opt-out"
                     );
                 }
 

@@ -1932,10 +1932,9 @@ fn cycle_always_approve_with_nudge_jumps_to_plan() {
     );
     assert!(
         effects.iter().any(|e| matches!(
-                    e,
-                    Effect::SetSessionMode { mode_id, .. }
-        if &*mode_id.0 == "plan"
-                )),
+            e,
+            Effect::SetSessionMode { mode_id, .. } if &*mode_id.0 == "plan"
+        )),
         "expected SetSessionMode(plan), got {effects:?}"
     );
     assert!(
@@ -1989,10 +1988,9 @@ fn cycle_auto_with_nudge_jumps_to_plan() {
     );
     assert!(
         effects.iter().any(|e| matches!(
-                    e,
-                    Effect::SetSessionMode { mode_id, .. }
-        if &*mode_id.0 == "plan"
-                )),
+            e,
+            Effect::SetSessionMode { mode_id, .. } if &*mode_id.0 == "plan"
+        )),
         "expected SetSessionMode(plan), got {effects:?}"
     );
     assert!(

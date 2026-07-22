@@ -180,8 +180,8 @@ pub fn truncate_trailing_incomplete_tool_call(
     mut conversation: Vec<ConversationItem>,
 ) -> Vec<ConversationItem> {
     while matches!(
-        conversation.last(), Some(ConversationItem::Assistant(a)) if ! a.tool_calls
-        .is_empty()
+        conversation.last(),
+        Some(ConversationItem::Assistant(a)) if !a.tool_calls.is_empty()
     ) {
         conversation.pop();
     }
@@ -255,7 +255,8 @@ fn recover_truncated_tail_unit(
         };
     }
     let owner = if matches!(
-        body.last(), Some(ConversationItem::Assistant(a)) if ! a.tool_calls.is_empty()
+        body.last(),
+        Some(ConversationItem::Assistant(a)) if !a.tool_calls.is_empty()
     ) {
         body.pop()
     } else {
@@ -1584,9 +1585,11 @@ mod tests {
     }
     #[test]
     fn compaction_attempt_defaults_optional_fields_for_old_artifacts() {
-        let json = serde_json::json!(
-            { "attempt" : 1, "outcome" : "transient", "summary_chars" : 0, }
-        );
+        let json = serde_json::json!({
+            "attempt": 1,
+            "outcome": "transient",
+            "summary_chars": 0,
+        });
         let parsed: CompactionAttempt = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.summary, None);
         assert_eq!(parsed.error, None);
@@ -1841,6 +1844,7 @@ actual user question";
                 "<user_info>OS: macos</user_info>\n<user_query>\nreal task\n</user_query>",
             ),
             ConversationItem::assistant("done"),
+            // This is what run_inline_auto_continue() pushes after compaction:
             ConversationItem::user(AUTO_CONTINUE_PROMPT),
             ConversationItem::assistant("continuing..."),
         ];
@@ -2759,7 +2763,9 @@ actual user question";
         let items = vec![
             ConversationItem::system("sys"),
             ConversationItem::user("prompt"),
+            // Orphaned tool result — no assistant with matching tool_calls
             ConversationItem::tool_result("call_ORPHAN", "result"),
+            // Valid pair
             ConversationItem::assistant_tool_calls(vec![ToolCall {
                 id: "call_VALID".into(),
                 name: "read_file".to_string(),
@@ -2873,6 +2879,7 @@ actual user question";
         let mut items = vec![
             ConversationItem::system("sys"),
             ConversationItem::user("prompt"),
+            // ← the assistant declaring call_LOST is missing here
             ConversationItem::tool_result("call_LOST", "orphaned result"),
             ConversationItem::assistant_tool_calls(vec![call("call_OK")]),
             ConversationItem::tool_result("call_OK", "fine"),
@@ -2946,6 +2953,7 @@ actual user question";
             ConversationItem::tool_result("call_A", "ok"),
             ConversationItem::assistant_tool_calls(vec![call("call_C")]),
             ConversationItem::tool_result("call_C", "ok"),
+            // call_B's owner was flushed two messages ago.
             ConversationItem::tool_result("call_B", "displaced"),
         ];
         let report = repair_history(&mut items);
@@ -3197,13 +3205,18 @@ actual user question";
     async fn build_compacted_history_multi_turn_with_parallel_tool_calls() {
         use xai_grok_sampling_types::{AssistantItem, ToolCall};
         let conversation = vec![
+            // [0] System prompt
             ConversationItem::system("You are a helpful coding assistant."),
+            // [1] User info prefix (no <user_query> tags — this is the initial message)
             ConversationItem::user(
                 "<user_info>\nOS Version: macos\nShell: /bin/bash\nWorkspace Path: /Users/dev/project\n</user_info>\n\n<project_layout>\n/Users/dev/project/\n  src/\n    main.rs\n    lib.rs\n</project_layout>",
             ),
+            // ── Turn 1 ──────────────────────────────────────────────────
+            // [2] User query (wrapped in <user_query> tags by parse_prompt)
             ConversationItem::user(
                 "<user_query>\nRead main.rs and lib.rs and tell me what they do\n</user_query>",
             ),
+            // [3] Assistant with 2 parallel tool calls
             ConversationItem::Assistant(AssistantItem {
                 content: "I'll read both files for you.".into(),
                 tool_calls: vec![
@@ -3222,20 +3235,26 @@ actual user question";
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
+            // [4] Tool result for call_1
             ConversationItem::tool_result(
                 "call_1",
                 "fn main() {\n    println!(\"hello world\");\n}",
             ),
+            // [5] Tool result for call_2
             ConversationItem::tool_result(
                 "call_2",
                 "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}",
             ),
+            // [6] Assistant summary after reading both files
             ConversationItem::assistant(
                 "main.rs prints hello world. lib.rs has an `add` function.",
             ),
+            // ── Turn 2 ──────────────────────────────────────────────────
+            // [7] User query (second turn)
             ConversationItem::user(
                 "<user_query>\nNow fix the typo in main.rs and run the tests\n</user_query>",
             ),
+            // [8] Assistant with 2 parallel tool calls
             ConversationItem::Assistant(AssistantItem {
                 content: "I'll fix the typo and run tests.".into(),
                 tool_calls: vec![
@@ -3255,11 +3274,14 @@ actual user question";
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
+            // [9] Tool result for call_3
             ConversationItem::tool_result("call_3", "File edited successfully."),
+            // [10] Tool result for call_4
             ConversationItem::tool_result(
                 "call_4",
                 "running 1 test\ntest tests::test_add ... ok\n\ntest result: ok. 1 passed",
             ),
+            // [11] Assistant final response
             ConversationItem::assistant("Fixed the typo and all tests pass!"),
         ];
         let mut edited = BTreeSet::new();
@@ -3301,8 +3323,7 @@ actual user question";
         });
         assert_eq!(compacted.len(), 9, "compacted history should have 9 items");
         assert!(
-            matches!(& compacted[0], ConversationItem::System(s) if s.content.as_ref() ==
-            "You are a helpful coding assistant.")
+            matches!(&compacted[0], ConversationItem::System(s) if s.content.as_ref() == "You are a helpful coding assistant.")
         );
         let prefix = compacted[1].text_content();
         assert!(
@@ -3467,8 +3488,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             summary_count: 1,
         });
         assert!(!compacted.iter().any(|item| {
-            matches!(item, ConversationItem::User(user)
-            if user.synthetic_reason == Some(SyntheticReason::ProjectInstructions))
+            matches!(item, ConversationItem::User(user) if user.synthetic_reason == Some(SyntheticReason::ProjectInstructions))
         }));
     }
     /// The AGENTS.md slot must use the structural project-instructions tag.
@@ -3541,8 +3561,9 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         });
         let has_project_instructions = compacted.iter().any(|item| {
             matches!(
-                item, ConversationItem::User(u) if u.synthetic_reason ==
-                Some(SyntheticReason::ProjectInstructions)
+                item,
+                ConversationItem::User(u)
+                    if u.synthetic_reason == Some(SyntheticReason::ProjectInstructions)
             )
         });
         assert!(
@@ -3937,11 +3958,9 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             ConversationItem::tool_result("c1", "fn main() {}"),
         ];
         let has_tool_calls = |items: &[ConversationItem]| {
-            items.iter().any(|i| {
-                matches!(
-                    i, ConversationItem::Assistant(a) if ! a.tool_calls.is_empty()
-                )
-            })
+            items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::Assistant(a) if !a.tool_calls.is_empty()))
         };
         let has_tool_result = |items: &[ConversationItem]| {
             items
@@ -3950,10 +3969,8 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         };
         let has_image = |items: &[ConversationItem]| {
             items.iter().any(|i| {
-                matches!(
-                    i, ConversationItem::User(u) if u.content.iter().any(| p |
-                    matches!(p, ContentPart::Image { .. }))
-                )
+                matches!(i, ConversationItem::User(u)
+                    if u.content.iter().any(|p| matches!(p, ContentPart::Image { .. })))
             })
         };
         let seg = prepare_conversation_for_segment(conv.clone());
@@ -4059,6 +4076,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 arguments: r#"{"target_file":"a.rs"}"#.into(),
             }]),
             ConversationItem::tool_result("c1", "fn main() {}"),
+            // Trailing, no matching ToolResult — results never arrived.
             ConversationItem::assistant_tool_calls(vec![ToolCall {
                 id: "c2".into(),
                 name: "grep".to_string(),
@@ -4109,8 +4127,8 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         let big = "x".repeat(800);
         let conv = vec![
             ConversationItem::system("sys"),
-            ConversationItem::user(&big),
-            ConversationItem::assistant(&big),
+            ConversationItem::user(&big),      // old + large -> dropped
+            ConversationItem::assistant(&big), // old + large -> dropped
             ConversationItem::user("recent question"),
             ConversationItem::assistant("recent answer"),
         ];
@@ -4165,7 +4183,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 name: "read_file".to_string(),
                 arguments: "{}".into(),
             }]),
-            ConversationItem::tool_result("c1", huge.as_str()),
+            ConversationItem::tool_result("c1", huge.as_str()), // triggering result
         ];
         let out = fit_conversation_to_budget(conv, 100);
         let tr = out
@@ -4185,8 +4203,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         );
         assert!(
             out.iter()
-                .any(|i| matches!(i, ConversationItem::Assistant(a) if ! a
-            .tool_calls.is_empty())),
+                .any(|i| matches!(i, ConversationItem::Assistant(a) if !a.tool_calls.is_empty())),
             "owning assistant tool_use must be kept so the result is not orphaned"
         );
         let est: u64 = out.iter().map(estimate_item_tokens).sum();
@@ -4343,15 +4360,17 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         }
         let conv = vec![
             ConversationItem::system("sys"),
-            img_user,
+            img_user, // old turn, huge by image charges, ~0 by text bytes
             ConversationItem::user("recent question"),
             ConversationItem::assistant("recent answer"),
         ];
         let out = fit_conversation_to_budget(conv, 1_000);
         assert!(
-            !out.iter()
-                .any(|i| matches!(i, ConversationItem::User(u) if u.content
-            .iter().any(| p | matches!(p, ContentPart::Image { .. })))),
+            !out.iter().any(|i| matches!(
+                i,
+                ConversationItem::User(u)
+                    if u.content.iter().any(|p| matches!(p, ContentPart::Image { .. }))
+            )),
             "image-heavy old turn must be counted (765/image) and trimmed, not kept"
         );
         assert!(
@@ -4373,7 +4392,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         });
         let conv = vec![
             ConversationItem::system("sys"),
-            reasoning,
+            reasoning, // old turn, huge by encrypted bytes, 0 by visible text
             ConversationItem::user("recent question"),
             ConversationItem::assistant("recent answer"),
         ];

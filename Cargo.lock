@@ -13886,13 +13886,13 @@ dependencies = [
  "dirs 5.0.1",
  "dunce",
  "fs2",
- "git2",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "wait-timeout",
  "xai-grok-agent",
  "xai-grok-config",
  "xai-hooks-plugins-types",
@@ -13929,8 +13929,10 @@ dependencies = [
  "assert_matches",
  "async-openai",
  "base64",
+ "chrono",
  "indexmap",
  "reqwest 0.12.24",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -14270,6 +14272,7 @@ dependencies = [
  "clap",
  "futures-util",
  "libc",
+ "portable-pty",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
@@ -14279,7 +14282,9 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "xai-acp-lib",
+ "xai-tty-utils",
 ]
 
 [[package]]
@@ -14425,6 +14430,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "xai-tty-utils",
 ]
 
 [[package]]

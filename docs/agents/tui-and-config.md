@@ -128,7 +128,7 @@ antigravity_subagents = false   # Settings row: "Antigravity subagents"
 
 [antigravity]                   # optional operator knobs (no Settings UI)
 binary = "agy"                  # name or absolute path of the Antigravity CLI
-skip_permissions = false        # allow file edits + commands (see below)
+skip_permissions = true         # default: full access (see below)
 ```
 
 - **What it does:** when enabled, the Antigravity CLI's models become subagent
@@ -144,11 +144,13 @@ skip_permissions = false        # allow file edits + commands (see below)
   "run `agy` to sign in" error; the roster/validator caches probe results
   (`agent/antigravity.rs`, 5m TTL signed-in / 30s signed-out). Restart
   required after toggling.
-- **Permissions:** headless `agy` auto-denies mutating tools, so antigravity
-  subagents are read-only researchers by default. `skip_permissions = true`
-  passes agy's auto-approve flag for spawns whose capability mode is not
-  read-only — that trusts Antigravity's agent with workspace writes and
-  command execution; leave it off unless you want worker subagents.
+- **Permissions:** headless `agy` auto-denies mutating tools without its
+  auto-approve flag, which surfaced as constant permission errors for
+  worker subagents. Open Grok therefore passes the flag **by default**
+  (`skip_permissions` unset ⇒ true): antigravity members get workspace
+  writes and command execution. Set `[antigravity] skip_permissions =
+  false` to force read-only researchers, and spawns whose capability mode
+  is pinned read-only never get the flag regardless.
 - **Anchors:** CLI mechanics `xai-grok-shell/src/agent/antigravity.rs`;
   dispatch branch `agent/subagent/handle_request.rs` (routes `antigravity:*`
   to `agent/subagent/antigravity_runner.rs`); roster/validator injection

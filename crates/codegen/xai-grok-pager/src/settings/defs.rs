@@ -749,7 +749,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Agent,
             owner: SettingOwner::Shell,
             label: "Antigravity subagents",
-            description: "Let Antigravity CLI (agy) models serve as subagents for task, swarm, and workflow tools. Requires being signed in to agy; subagents run read-only unless [antigravity].skip_permissions is set. Restart required.",
+            description: "Let Antigravity CLI (agy) models serve as subagents for task, swarm, and workflow tools. Requires being signed in to agy. Subagents run with full access (agy skip-permissions) by default; set [antigravity] skip_permissions = false to force read-only, and callers that pin a read-only capability mode stay read-only either way. Restart required.",
             keywords: &[
                 "antigravity",
                 "agy",
@@ -762,6 +762,32 @@ pub fn default_settings() -> Vec<SettingMeta> {
             ],
             kind: SettingKind::Bool {
                 default: ui_default.antigravity_subagents.unwrap_or(false),
+            },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
+        // Shares the antigravity_subagents row's visibility gate — hidden when
+        // the `agy` CLI is absent (see `setting_row_visible`). SHELL-owned,
+        // persisted to `[antigravity].skip_permissions`.
+        SettingMeta {
+            key: "antigravity_skip_permissions",
+            category: SettingCategory::Agent,
+            owner: SettingOwner::Shell,
+            label: "Antigravity full access",
+            description: "Antigravity (agy) subagents run with agy's skip-permissions flag by default — they may write to the workspace and execute commands. Toggle OFF to force read-only researcher subagents; callers that pin a read-only capability mode (e.g. review/audit stages) stay read-only either way. Restart required.",
+            keywords: &[
+                "antigravity",
+                "agy",
+                "permissions",
+                "skip",
+                "full access",
+                "read-only",
+                "safety",
+            ],
+            kind: SettingKind::Bool {
+                // No UiConfig mirror; the effective default mirrors the runner's
+                // `[antigravity].skip_permissions.unwrap_or(true)` (full access).
+                default: true,
             },
             restart_required: true,
             hidden_in_minimal: false,

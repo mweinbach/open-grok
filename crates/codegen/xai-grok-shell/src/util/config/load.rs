@@ -71,6 +71,28 @@ pub fn load_x_search_config_sync() -> crate::tools::config::XSearchToolConfig {
     load_toolset_subsection_sync("x_search")
 }
 
+/// Synchronously resolve `[antigravity].skip_permissions` from the effective
+/// config, defaulting to `true` (full access) when unset — mirroring the
+/// antigravity runner's `state.config.skip_permissions.unwrap_or(true)`.
+/// Read fresh at session spawn so a Settings opt-out applies to new
+/// subagents without a process restart.
+pub fn load_antigravity_skip_permissions_sync() -> bool {
+    let root: TomlValue = match crate::config::load_effective_config() {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    root.as_table()
+        .and_then(|table| table.get("antigravity"))
+        .and_then(|value| {
+            value
+                .clone()
+                .try_into::<crate::agent::config::AntigravityConfig>()
+                .ok()
+        })
+        .and_then(|cfg| cfg.skip_permissions)
+        .unwrap_or(true)
+}
+
 fn load_toolset_subsection_sync<T: serde::de::DeserializeOwned + Default>(key: &str) -> T {
     let root: TomlValue = match crate::config::load_effective_config() {
         Ok(r) => r,
@@ -118,7 +140,11 @@ pub fn load_config_from_toml(root: &TomlValue) -> Config {
         models: section(table, "models"),
         ui: section(table, "ui"),
         antigravity: section(table, "antigravity"),
-        harness: section(table, "harness"),
+        harness: {
+            #[allow(unused_mut)]
+            let mut harness: crate::agent::config::HarnessConfig = section(table, "harness");
+            harness
+        },
         skills: section(table, "skills"),
         compat: section(table, "compat"),
         management_api_key,
@@ -145,6 +171,7 @@ pub fn load_config_from_toml(root: &TomlValue) -> Config {
             .and_then(|t| t.get("x_search"))
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default(),
+        privacy: section(table, "privacy"),
     }
 }
 /// Resolve permission config with project override semantics.
@@ -170,7 +197,7 @@ pub async fn resolve_permission_config(
                     tracing::info!("Loaded [permission] from project");
                     return Some((perm_config, config_path));
                 }
-                Err(e) => tracing::warn!(error = % e, "Failed to parse [permission]"),
+                Err(e) => tracing::warn!(error = %e, "Failed to parse [permission]"),
             }
         }
     }

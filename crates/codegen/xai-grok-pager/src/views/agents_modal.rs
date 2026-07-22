@@ -1302,7 +1302,7 @@ fn render_agents_tab(
     }
     let selected_row = rows
         .iter()
-        .position(|r| matches!(r, FlatRow::Agent(i) if * i == state.selected))
+        .position(|r| matches!(r, FlatRow::Agent(i) if *i == state.selected))
         .unwrap_or(0);
     let mut selected_end = selected_row + 1;
     while selected_end < rows.len()
@@ -1585,7 +1585,7 @@ fn render_personas_tab(
     }
     let selected_row = rows
         .iter()
-        .position(|r| matches!(r, PersonaFlatRow::Name(i) if * i == state.persona_selected))
+        .position(|r| matches!(r, PersonaFlatRow::Name(i) if *i == state.persona_selected))
         .unwrap_or(0);
     let mut selected_end = selected_row + 1;
     while selected_end < rows.len()

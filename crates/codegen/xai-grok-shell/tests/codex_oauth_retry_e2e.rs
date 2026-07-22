@@ -15,8 +15,9 @@ use base64::Engine as _;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use xai_grok_test_support::{
-    HeadlessResult, MockInferenceServer, MockModelEntry, ScriptedResponse, assert_headless_success,
-    assert_no_crashes, git_workdir, grok_binary, run_headless_with_cmd,
+    HeadlessResult, MockInferenceServer, MockModelEntry, ScriptedResponse, TestSandbox,
+    assert_headless_success, assert_no_crashes, git_workdir, grok_binary,
+    run_headless_in_sandbox_borrowed, run_headless_in_sandbox_borrowed_with_env,
 };
 
 struct OAuthMock {
@@ -211,8 +212,10 @@ async fn run_case(unauthorized_responses: usize, byok: bool) -> CaseResult {
     }
 
     let oauth = spawn_oauth_mock().await;
-    let home = tempfile::tempdir().expect("temp home");
-    let grok_home = home.path().join(".opengrok");
+    let mut home = TestSandbox::builder().mock_url(server.url()).build();
+    home.remove_env("XAI_API_KEY");
+    home.remove_env("GROK_LEADER_SOCKET");
+    let grok_home = home.grok_home().to_path_buf();
     std::fs::create_dir_all(&grok_home).expect("create OPENGROK_HOME");
     write_codex_auth(&grok_home);
     let byok_line = byok.then_some("api_key = \"codex-byok\"\n").unwrap_or("");
@@ -264,20 +267,22 @@ default = "codex-test"
             "--output-format",
             "json",
         ])
-        .current_dir(workdir.path())
+        .current_dir(workdir.workspace())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    xai_grok_test_support::env::test_env_cmd_tokio(&mut command, &server.url(), home.path());
-    command
-        .env("OPENGROK_HOME", &grok_home)
-        .env("GROK_CODEX_AUTH_BASE_URL", &oauth.base_url)
-        .env("GROK_CODEX_INFERENCE_BASE_URL", server.url())
-        .env_remove("XAI_API_KEY")
-        .env_remove("GROK_LEADER_SOCKET");
 
-    let headless = run_headless_with_cmd(command).await;
+    let inference_url = server.url();
+    let headless = run_headless_in_sandbox_borrowed_with_env(
+        command,
+        &home,
+        &[
+            ("GROK_CODEX_AUTH_BASE_URL", oauth.base_url.as_str()),
+            ("GROK_CODEX_INFERENCE_BASE_URL", inference_url.as_str()),
+        ],
+    )
+    .await;
     let oauth_calls = oauth.calls.load(Ordering::SeqCst);
     let requests = server.requests();
     let request_summary = server.request_log_summary();
@@ -467,8 +472,10 @@ async fn codex_resume_uses_persisted_provider_instead_of_xai_default() {
     .expect("start inference mock");
     server.set_response("Codex resume succeeded");
 
-    let home = tempfile::tempdir().expect("temp home");
-    let grok_home = home.path().join(".opengrok");
+    let mut home = TestSandbox::builder().mock_url(server.url()).build();
+    home.remove_env("XAI_API_KEY");
+    home.remove_env("GROK_LEADER_SOCKET");
+    let grok_home = home.grok_home().to_path_buf();
     std::fs::create_dir_all(&grok_home).expect("create OPENGROK_HOME");
     let workdir = git_workdir();
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -516,16 +523,11 @@ default = "{default_model}"
         let mut command = tokio::process::Command::new(grok_binary());
         command
             .args(args)
-            .current_dir(workdir.path())
+            .current_dir(workdir.workspace())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        xai_grok_test_support::env::test_env_cmd_tokio(&mut command, &server.url(), home.path());
-        command
-            .env("OPENGROK_HOME", &grok_home)
-            .env_remove("XAI_API_KEY")
-            .env_remove("GROK_LEADER_SOCKET");
         command
     };
 
@@ -543,7 +545,7 @@ default = "{default_model}"
         "--output-format",
         "json",
     ]);
-    let first = run_headless_with_cmd(first).await;
+    let first = run_headless_in_sandbox_borrowed(first, &home).await;
     assert_headless_success(&first, "create Codex session", None);
 
     let requests_before_resume = server.requests().len();
@@ -559,7 +561,7 @@ default = "{default_model}"
         "--output-format",
         "json",
     ]);
-    let resumed = run_headless_with_cmd(resumed).await;
+    let resumed = run_headless_in_sandbox_borrowed(resumed, &home).await;
     assert_headless_success(&resumed, "resume Codex session", None);
     assert_no_crashes(&resumed.stderr);
 
@@ -575,7 +577,7 @@ default = "{default_model}"
         })
     );
 
-    let profile_path = home.path().join("codex-profile.md");
+    let profile_path = home.home().join("codex-profile.md");
     std::fs::write(
         &profile_path,
         "---\nname: codex-profile\ndescription: Codex pinned profile\nmodel: codex-test\n---\n",
@@ -596,7 +598,7 @@ default = "{default_model}"
         "--output-format",
         "json",
     ]);
-    let profiled = run_headless_with_cmd(profiled).await;
+    let profiled = run_headless_in_sandbox_borrowed(profiled, &home).await;
     assert_headless_success(&profiled, "Codex-pinned profile", None);
     let profile_requests = server.requests();
     let profile_turns = main_turn_requests(&profile_requests[requests_before_profile..]);
@@ -625,7 +627,7 @@ default = "{default_model}"
         "--output-format",
         "json",
     ]);
-    let display_name = run_headless_with_cmd(display_name).await;
+    let display_name = run_headless_in_sandbox_borrowed(display_name, &home).await;
     assert_headless_success(&display_name, "Codex display-name model", None);
     let display_name_requests = server.requests();
     let display_name_turns =
@@ -655,7 +657,7 @@ default = "{default_model}"
         "--output-format",
         "json",
     ]);
-    let xai_session = run_headless_with_cmd(xai_session).await;
+    let xai_session = run_headless_in_sandbox_borrowed(xai_session, &home).await;
     assert_headless_success(&xai_session, "create xAI session", None);
 
     let requests_before_cross_provider_resume = server.requests().len();
@@ -673,7 +675,7 @@ default = "{default_model}"
         "--output-format",
         "json",
     ]);
-    let cross_provider = run_headless_with_cmd(cross_provider).await;
+    let cross_provider = run_headless_in_sandbox_borrowed(cross_provider, &home).await;
     assert_headless_success(&cross_provider, "cross-provider Codex resume", None);
     assert_no_crashes(&cross_provider.stderr);
 
@@ -702,8 +704,15 @@ async fn xai_codex_xai_resume_keeps_xai_exports_closed() {
     server.set_response("sticky provider boundary succeeded");
 
     let export_mock = spawn_xai_export_mock().await;
-    let home = tempfile::tempdir().expect("temp home");
-    let grok_home = home.path().join(".opengrok");
+    let mut home = TestSandbox::builder().mock_url(server.url()).build();
+    home.remove_env("XAI_API_KEY");
+    home.remove_env("GROK_LEADER_SOCKET");
+    home.set_env("GROK_FEEDBACK_ENABLED", "true");
+    home.set_env("GROK_FEEDBACK_BASE_URL", export_mock.base_url.as_str());
+    home.set_env("GROK_TELEMETRY_TRACE_UPLOAD", "true");
+    home.set_env("GROK_TRACE_UPLOAD", "true");
+    home.set_env("GROK_TRACE_UPLOAD_URL", server.url());
+    let grok_home = home.grok_home().to_path_buf();
     std::fs::create_dir_all(&grok_home).expect("create OPENGROK_HOME");
     write_xai_oauth(&grok_home);
 
@@ -746,21 +755,11 @@ default = "xai-sticky"
         let mut command = tokio::process::Command::new(grok_binary());
         command
             .args(args)
-            .current_dir(workdir.path())
+            .current_dir(workdir.workspace())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        xai_grok_test_support::env::test_env_cmd_tokio(&mut command, &server.url(), home.path());
-        command
-            .env("OPENGROK_HOME", &grok_home)
-            .env("GROK_FEEDBACK_ENABLED", "true")
-            .env("GROK_FEEDBACK_BASE_URL", &export_mock.base_url)
-            .env("GROK_TELEMETRY_TRACE_UPLOAD", "true")
-            .env("GROK_TRACE_UPLOAD", "true")
-            .env("GROK_TRACE_UPLOAD_URL", server.url())
-            .env_remove("XAI_API_KEY")
-            .env_remove("GROK_LEADER_SOCKET");
         command
     };
 
@@ -778,7 +777,7 @@ default = "xai-sticky"
         "json",
     ]);
     let requests_before_first = server.requests().len();
-    let first = run_headless_with_cmd(first).await;
+    let first = run_headless_in_sandbox_borrowed(first, &home).await;
     assert_headless_success(&first, "create xAI sticky-boundary session", None);
     assert_no_crashes(&first.stderr);
     let first_requests = server.requests();
@@ -803,7 +802,8 @@ default = "xai-sticky"
         "--output-format",
         "json",
     ]);
-    let before_boundary_feedback = run_headless_with_cmd(before_boundary_feedback).await;
+    let before_boundary_feedback =
+        run_headless_in_sandbox_borrowed(before_boundary_feedback, &home).await;
     assert_headless_success(
         &before_boundary_feedback,
         "submit feedback before provider boundary",
@@ -830,7 +830,7 @@ default = "xai-sticky"
         "--output-format",
         "json",
     ]);
-    let codex = run_headless_with_cmd(codex).await;
+    let codex = run_headless_in_sandbox_borrowed(codex, &home).await;
     assert_headless_success(&codex, "cross xAI session into Codex", None);
     assert_no_crashes(&codex.stderr);
     let codex_requests = server.requests();
@@ -868,7 +868,7 @@ default = "xai-sticky"
         "--output-format",
         "json",
     ]);
-    let xai_return = run_headless_with_cmd(xai_return).await;
+    let xai_return = run_headless_in_sandbox_borrowed(xai_return, &home).await;
     assert_headless_success(&xai_return, "return sticky session to xAI", None);
     assert_no_crashes(&xai_return.stderr);
     let xai_return_requests = server.requests();
@@ -901,7 +901,8 @@ default = "xai-sticky"
         "--output-format",
         "json",
     ]);
-    let after_boundary_feedback = run_headless_with_cmd(after_boundary_feedback).await;
+    let after_boundary_feedback =
+        run_headless_in_sandbox_borrowed(after_boundary_feedback, &home).await;
     assert_headless_success(
         &after_boundary_feedback,
         "keep feedback local after provider boundary",

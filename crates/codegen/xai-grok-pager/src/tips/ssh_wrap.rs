@@ -38,7 +38,6 @@ pub(crate) const SSH_WRAP_TIP_TICKS: u16 = 300;
 pub fn ssh_wrap_tip() -> EphemeralTip {
     let theme = Theme::current();
     let dim = Style::default().fg(theme.gray);
-    // Command token styled like the other tips style their chord/key tokens.
     let command = Style::default()
         .fg(theme.text_secondary)
         .add_modifier(Modifier::BOLD);
@@ -70,7 +69,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_wrap_tip_advertises_local_wrap() {
+    fn ssh_wrap_tip_points_to_doctor() {
         let tip = ssh_wrap_tip();
         assert_eq!(tip.key, SSH_WRAP_TIP_KEY);
         let text: String = tip.line.spans.iter().map(|s| s.content.as_ref()).collect();

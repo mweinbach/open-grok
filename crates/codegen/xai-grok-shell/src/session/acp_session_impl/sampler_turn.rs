@@ -215,7 +215,7 @@ where
         xai_grok_telemetry::unified_log::warn(
             "auth recovery: tool 401, refresh failed",
             None,
-            Some(serde_json::json!({ "tool" : tool_name })),
+            Some(serde_json::json!({ "tool": tool_name })),
         );
         result
     }
@@ -357,6 +357,71 @@ impl SessionActor {
             _ => true,
         }
     }
+
+    /// Hosted tools with overrides applied, plus the applied overrides to echo, in one pass.
+    fn resolve_hosted(
+        &self,
+    ) -> (
+        Vec<xai_grok_sampling_types::HostedTool>,
+        xai_grok_sampling_types::ToolOverrides,
+    ) {
+        let mut tools = self.agent.borrow().hosted_tools().to_vec();
+        let applied = xai_grok_sampling_types::apply_tool_overrides(
+            &mut tools,
+            self.tool_overrides.borrow().as_ref(),
+        );
+        (tools, applied)
+    }
+    /// Ungated. Prefer [`Self::hosted_tools_for_turn`], which folds in the backend-search gate.
+    pub(crate) fn effective_hosted_tools(&self) -> Vec<xai_grok_sampling_types::HostedTool> {
+        self.resolve_hosted().0
+    }
+    pub(crate) fn hosted_tools_for_turn(&self) -> Vec<xai_grok_sampling_types::HostedTool> {
+        if self.backend_search_active() {
+            self.effective_hosted_tools()
+        } else {
+            Vec::new()
+        }
+    }
+    /// The applied overrides to echo, or `None` when backend search is off.
+    pub(crate) fn effective_tool_overrides(
+        &self,
+    ) -> Option<xai_grok_sampling_types::ToolOverrides> {
+        if !self.backend_search_active() {
+            return None;
+        }
+        let applied = self.resolve_hosted().1;
+        (!applied.is_empty()).then_some(applied)
+    }
+    pub(crate) fn backend_search_active(&self) -> bool {
+        self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get()
+    }
+    /// Set the per-turn override and emit it before any turn runs, so a subagent spawned this turn
+    /// inherits it.
+    pub(crate) fn set_tool_overrides(&self, overrides: xai_grok_sampling_types::ToolOverrides) {
+        *self.tool_overrides.borrow_mut() = Some(overrides);
+        self.emit_resolved_tool_overrides();
+    }
+    /// Fold a per-turn update at promotion: an object sets, `null` clears to the seed, absent leaves.
+    pub(crate) fn apply_tool_overrides_update(
+        &self,
+        update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
+    ) {
+        let Some(update) = update else { return };
+        {
+            let mut slot = self.tool_overrides.borrow_mut();
+            *slot = update.apply(slot.take());
+        }
+        self.emit_resolved_tool_overrides();
+    }
+    /// Store this session's cutoff in the cell a subagent spawn reads. Not gated on backend search,
+    /// so a bounded parent bounds a searching child even if it isn't searching.
+    pub(crate) fn emit_resolved_tool_overrides(&self) {
+        let seed = self.agent.borrow().definition().tool_overrides.clone();
+        let effective = resolve_configured_cutoff(seed, self.tool_overrides.borrow().as_ref());
+        self.resolved_tool_overrides
+            .store((!effective.is_empty()).then(|| std::sync::Arc::new(effective)));
+    }
     pub(super) async fn prepare_tool_definitions_inner(&self) -> Vec<ToolDefinition> {
         let bridge = self.agent.borrow().tool_bridge().clone();
         let defs = bridge.tool_definitions_builtins_only().await;
@@ -429,24 +494,29 @@ impl SessionActor {
         match provider.ensure_fresh_token(current_key).await {
             crate::auth::ProviderRefreshOutcome::Rotated(new_key) => {
                 tracing::info!(
-                    model = % model_id, provider = % provider.name, cold = current_key
-                    .is_none(), "auth provider token rotated pre-turn"
+                    model = %model_id,
+                    provider = %provider.name,
+                    cold = current_key.is_none(),
+                    "auth provider token rotated pre-turn"
                 );
                 self.set_chat_api_key(new_key).await;
             }
             crate::auth::ProviderRefreshOutcome::Unchanged => {}
             crate::auth::ProviderRefreshOutcome::MintFailed => {
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, provider = % provider.name,
-                    model = % model_id, "auth provider pre-turn refresh failed"
+                    session_id = %self.session_info.id.0,
+                    provider = %provider.name,
+                    model = %model_id,
+                    "auth provider pre-turn refresh failed"
                 );
                 xai_grok_telemetry::unified_log::warn(
                     "auth provider pre-turn refresh failed",
                     Some(self.session_info.id.0.as_ref()),
-                    Some(serde_json::json!(
-                        { "provider" : provider.name, "model" : model_id, "cold" :
-                        current_key.is_none(), }
-                    )),
+                    Some(serde_json::json!({
+                        "provider": provider.name,
+                        "model": model_id,
+                        "cold": current_key.is_none(),
+                    })),
                 );
             }
             crate::auth::ProviderRefreshOutcome::Unusable => {}
@@ -465,18 +535,20 @@ impl SessionActor {
         };
         let Some(new_key) = recovered else {
             tracing::warn!(
-                session_id = % self.session_info.id.0, provider = % provider.name,
+                session_id = %self.session_info.id.0,
+                provider = %provider.name,
                 "auth recovery: sampler 401, provider re-mint declined or failed"
             );
             xai_grok_telemetry::unified_log::warn(
                 "auth recovery: sampler 401, provider re-mint declined or failed",
                 Some(self.session_info.id.0.as_ref()),
-                Some(serde_json::json!({ "provider" : provider.name })),
+                Some(serde_json::json!({ "provider": provider.name })),
             );
             return false;
         };
         tracing::info!(
-            session_id = % self.session_info.id.0, provider = % provider.name,
+            session_id = %self.session_info.id.0,
+            provider = %provider.name,
             "auth recovery: sampler 401, auth provider re-mint, retrying"
         );
         xai_grok_telemetry::unified_log::info(
@@ -511,12 +583,14 @@ impl SessionActor {
             return;
         }
         let refresh_active = gate.active();
-        let ctx = serde_json::json!(
-            { "site" : site, "model_byok" : gate.model_byok.as_str(), "is_session_based"
-            : gate.is_session_based, "endpoint_is_first_party" : gate
-            .endpoint_is_first_party, "refresh_active" : refresh_active, "base_url" :
-            base_url, }
-        );
+        let ctx = serde_json::json!({
+            "site": site,
+            "model_byok": gate.model_byok.as_str(),
+            "is_session_based": gate.is_session_based,
+            "endpoint_is_first_party": gate.endpoint_is_first_party,
+            "refresh_active": refresh_active,
+            "base_url": base_url,
+        });
         let sid = Some(self.session_info.id.0.as_ref());
         if refresh_active {
             xai_grok_telemetry::unified_log::info(
@@ -723,13 +797,15 @@ impl SessionActor {
         );
         let (prompt_type, classifier_reasoning_effort) =
             crate::util::config::auto_mode_classifier_defaults(&auto_cfg, effective_supports_re);
+        let classify_timeout = crate::util::config::auto_mode_classify_timeout(&auto_cfg);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
             Vec<xai_grok_workspace::permission::ClassifierMessage>,
-            tokio::sync::oneshot::Sender<Result<String, String>>,
+            tokio::sync::oneshot::Sender<
+                Result<String, xai_grok_workspace::permission::ClassifierFailure>,
+            >,
         )>();
         let session = Arc::clone(self);
         tokio::task::spawn_local(async move {
-            const TIMEOUT_MS: u64 = 15_000;
             while let Some((messages, respond_to)) = rx.recv().await {
                 let result = async {
                     let (sampling_client, model) = match &aux_classifier_sampler {
@@ -738,7 +814,9 @@ impl SessionActor {
                             let client = session
                                 .prepare_chat_completion(false)
                                 .await
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| xai_grok_workspace::permission::ClassifierFailure::TransportError(
+                                    e.to_string(),
+                                ))?;
                             let model = session
                                 .chat_state_handle
                                 .get_sampling_config()
@@ -772,21 +850,31 @@ impl SessionActor {
                             xai_grok_workspace::permission::classifier_output_json_schema(),
                         ),
                         reasoning_effort: classifier_reasoning_effort,
-                        x_grok_conv_id: Some(format!("perm-classifier-{}", uuid::Uuid::new_v4())),
-                        x_grok_req_id: Some(format!("xai-perm-auto-{}", uuid::Uuid::new_v4())),
+                        x_grok_conv_id: Some(
+                            format!("perm-classifier-{}", uuid::Uuid::new_v4()),
+                        ),
+                        x_grok_req_id: Some(
+                            format!("xai-perm-auto-{}", uuid::Uuid::new_v4()),
+                        ),
                         x_grok_session_id: Some(session_id),
                         x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
                         ..ConversationRequest::default()
                     };
                     let fut = sampling_client.conversation_collect(request);
-                    let response =
-                        tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MS), fut)
-                            .await
-                            .map_err(|_| "permission auto classifier timed out".to_string())?
-                            .map_err(|e| e.to_string())?;
+                    let response = tokio::time::timeout(classify_timeout, fut)
+                        .await
+                        .map_err(|_| {
+                            xai_grok_workspace::permission::ClassifierFailure::Timeout
+                        })?
+                        .map_err(|e| xai_grok_workspace::permission::ClassifierFailure::TransportError(
+                            e.to_string(),
+                        ))?;
                     Ok(response.assistant_text())
                 }
-                .await;
+                    .await;
+                if let Err(error) = &result {
+                    tracing::warn!(%error, "permission auto classifier side-query failed");
+                }
                 let _ = respond_to.send(result);
             }
         });
@@ -798,7 +886,7 @@ impl SessionActor {
         );
         self.permissions.set_classifier_with_side_query(clf, true);
         tracing::info!(
-            session_id = % self.session_info.id,
+            session_id = %self.session_info.id,
             "Wired live LLM permission auto-mode classifier (session sampling channel)"
         );
     }
@@ -984,10 +1072,7 @@ impl SessionActor {
         let model = cfg.model.clone();
         let client = xai_grok_sampler::SamplingClient::new(cfg)
             .map_err(|e| {
-                tracing::warn!(
-                    error = % e,
-                    "auto classifier aux sampler build failed; using session model"
-                )
+                tracing::warn!(error = %e, "auto classifier aux sampler build failed; using session model")
             })
             .ok()?;
         Some((client, model))
@@ -1149,7 +1234,12 @@ impl SessionActor {
                     context_window: cw,
                     percentage,
                 };
-                self.run_compact_only(trigger_info).await?;
+                if let Err(e) = self.run_compact_only(trigger_info).await {
+                    if Self::is_auth_compact_error(&e) {
+                        return Err(self.surface_compact_auth_failure(e).await);
+                    }
+                    return Err(e);
+                }
                 return Ok(SamplerFailureRecovery::CompactAndResubmit);
             }
         }
@@ -1283,10 +1373,10 @@ impl SessionActor {
             xai_grok_telemetry::unified_log::warn(
                 "auth recovery: sampler 401 not eligible (non-auth error kind)",
                 Some(self.session_info.id.0.as_ref()),
-                Some(serde_json::json!(
-                    { "kind" : error.kind.as_str(), "status_code" : error
-                    .status_code, }
-                )),
+                Some(serde_json::json!({
+                    "kind": error.kind.as_str(),
+                    "status_code": error.status_code,
+                })),
             );
         }
         if auth_recovery_eligible
@@ -1328,7 +1418,8 @@ impl SessionActor {
             match am.try_devbox_recovery().await {
                 Ok(auth) => {
                     tracing::info!(
-                        session_id = % self.session_info.id.0, user_id = % auth.user_id,
+                        session_id = %self.session_info.id.0,
+                        user_id = %auth.user_id,
                         "auth recovery: sampler 401, devbox re-mint, retrying"
                     );
                     self.prepare_sampler_for_turn().await;
@@ -1338,13 +1429,14 @@ impl SessionActor {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        session_id = % self.session_info.id.0, error = % e,
+                        session_id = %self.session_info.id.0,
+                        error = %e,
                         "auth recovery: sampler 401, devbox re-mint failed"
                     );
                     xai_grok_telemetry::unified_log::warn(
                         "auth recovery: sampler 401, devbox re-mint failed",
                         Some(self.session_info.id.0.as_ref()),
-                        Some(serde_json::json!({ "error" : format!("{e}") })),
+                        Some(serde_json::json!({ "error": format!("{e}") })),
                     );
                 }
             }
@@ -1357,10 +1449,7 @@ impl SessionActor {
                 .try_recover_unauthorized(crate::auth::recovery::RecoverySource::Turn)
                 .await
             {
-                tracing::info!(
-                    session_id = % self.session_info.id.0,
-                    "auth recovery: sampler 401, recovered, retrying"
-                );
+                tracing::info!(session_id = %self.session_info.id.0, "auth recovery: sampler 401, recovered, retrying");
                 xai_grok_telemetry::unified_log::info(
                     "auth recovery: sampler 401, recovered, retrying",
                     Some(self.session_info.id.0.as_ref()),
@@ -1371,10 +1460,7 @@ impl SessionActor {
                     provider: request_provider,
                 });
             }
-            tracing::warn!(
-                session_id = % self.session_info.id.0,
-                "auth recovery: sampler 401, refresh failed"
-            );
+            tracing::warn!(session_id = %self.session_info.id.0, "auth recovery: sampler 401, refresh failed");
             xai_grok_telemetry::unified_log::warn(
                 "auth recovery: sampler 401, refresh failed",
                 Some(self.session_info.id.0.as_ref()),
@@ -1395,15 +1481,18 @@ impl SessionActor {
         if matches!(error.kind, SamplingErrorKind::EmptyResponse) {
             if let Some(ref ctx) = error.empty_response_context {
                 tracing::warn!(
-                    empty_response = true, empty_reason = ctx.reason.as_str(),
-                    had_reasoning = ctx.had_reasoning, content_len = ctx.content_len,
-                    tool_call_count = ctx.tool_call_count, completion_tokens = ctx
-                    .completion_tokens.unwrap_or(0), reasoning_tokens = ctx
-                    .reasoning_tokens.unwrap_or(0), finish_reason = ctx
-                    .finish_reason_str(), first_choice_seen = ctx.first_choice_seen,
-                    model = % ctx.model,
-                    "empty response after retries exhausted: {reason}", reason = ctx
-                    .reason,
+                    empty_response = true,
+                    empty_reason = ctx.reason.as_str(),
+                    had_reasoning = ctx.had_reasoning,
+                    content_len = ctx.content_len,
+                    tool_call_count = ctx.tool_call_count,
+                    completion_tokens = ctx.completion_tokens.unwrap_or(0),
+                    reasoning_tokens = ctx.reasoning_tokens.unwrap_or(0),
+                    finish_reason = ctx.finish_reason_str(),
+                    first_choice_seen = ctx.first_choice_seen,
+                    model = %ctx.model,
+                    "empty response after retries exhausted: {reason}",
+                    reason = ctx.reason,
                 );
                 {
                     let mut cap = self.streaming_turn_capture.lock();
@@ -1473,9 +1562,9 @@ impl SessionActor {
             if let Some(ref provider) = auth_provider {
                 msg.push_str(
                     &format!(
-                        "\n  Provider:  [auth_provider.{}] (check the provider command and the debug log)",
-                        provider.name
-                    ),
+                    "\n  Provider:  [auth_provider.{}] (check the provider command and the debug log)",
+                    provider.name
+                ),
                 );
             }
             msg.push_str(&format!("\n  Version:   {client_version}"));
@@ -1673,7 +1762,7 @@ impl SessionActor {
     /// opaque tokens (External/OIDC) on the wire and guaranteed a 401.
     /// Soft failures with a still-usable access token still return here
     /// (grace / optimistic send); 401 recovery remains the safety net.
-    pub(super) async fn refresh_token_if_expired(&self) {
+    pub(crate) async fn refresh_token_if_expired(&self) {
         let mut creds = self.chat_state_handle.get_credentials().await;
         let sampling_config = self.chat_state_handle.get_sampling_config().await;
         let provider = sampling_config
@@ -1770,12 +1859,14 @@ impl SessionActor {
             if let Some(exp) = parse_jwt_expiration(key) {
                 let remaining_secs = (exp - chrono::Utc::now()).num_seconds();
                 tracing::debug!(
-                    model = % current_model_id, remaining_secs,
+                    model = %current_model_id,
+                    remaining_secs,
                     "JWT token valid, no refresh needed"
                 );
             } else {
                 tracing::debug!(
-                    model = % current_model_id, key_len = key.len(),
+                    model = %current_model_id,
+                    key_len = key.len(),
                     "Token is not a JWT, expiry-based refresh not applicable"
                 );
             }
@@ -1784,7 +1875,8 @@ impl SessionActor {
         let remaining_secs =
             parse_jwt_expiration(key).map_or(0, |exp| (exp - chrono::Utc::now()).num_seconds());
         tracing::info!(
-            model = % current_model_id, remaining_secs,
+            model = %current_model_id,
+            remaining_secs,
             "JWT near expiry, refreshing from config.toml"
         );
         let Some(new_key) = self.reload_api_key_from_config(&current_model_id) else {
@@ -1792,7 +1884,7 @@ impl SessionActor {
         };
         if key == &new_key {
             tracing::warn!(
-                model = % current_model_id,
+                model = %current_model_id,
                 "Config.toml returned same token (not yet rotated by external process?)"
             );
             return;
@@ -1800,7 +1892,9 @@ impl SessionActor {
         let new_remaining_secs = parse_jwt_expiration(&new_key)
             .map_or(0, |exp| (exp - chrono::Utc::now()).num_seconds());
         tracing::info!(
-            model = % current_model_id, new_remaining_secs, key_len = new_key.len(),
+            model = %current_model_id,
+            new_remaining_secs,
+            key_len = new_key.len(),
             "Refreshed API token from config.toml"
         );
         let mut creds = self.chat_state_handle.get_credentials().await;
@@ -1809,10 +1903,10 @@ impl SessionActor {
     }
     fn reload_api_key_from_config(&self, current_model_id: &str) -> Option<String> {
         let raw_config = crate::config::load_effective_config()
-            .map_err(|e| tracing::warn!(error = % e, "Failed to reload config"))
+            .map_err(|e| tracing::warn!(error = %e, "Failed to reload config"))
             .ok()?;
         let config = crate::agent::config::Config::new_from_toml_cfg(&raw_config)
-            .map_err(|e| tracing::warn!(error = % e, "Failed to parse reloaded config.toml"))
+            .map_err(|e| tracing::warn!(error = %e, "Failed to parse reloaded config.toml"))
             .ok()?;
         let config_model = config
             .config_models
@@ -1821,8 +1915,9 @@ impl SessionActor {
             .map(|(_, v)| v);
         let Some(model) = config_model else {
             tracing::warn!(
-                model = % current_model_id, available = ? config.config_models.keys()
-                .collect::< Vec < _ >> (), "Model not found in config.toml [model.*]"
+                model = %current_model_id,
+                available = ?config.config_models.keys().collect::<Vec<_>>(),
+                "Model not found in config.toml [model.*]"
             );
             return None;
         };
@@ -1832,7 +1927,8 @@ impl SessionActor {
         );
         if key.is_none() {
             tracing::warn!(
-                model = % current_model_id, env_key = ? model.env_key,
+                model = %current_model_id,
+                env_key = ?model.env_key,
                 "No api_key or env_key resolved for model"
             );
         }
@@ -1884,9 +1980,7 @@ impl SessionActor {
     pub(super) async fn record_assistant_response(&self, assistant_item: ConversationItem) {
         self.signals_handle().record_assistant_message();
         if let ConversationItem::Assistant(ref a) = assistant_item {
-            tracing::info!(
-                model_id = ? a.model_id, "DEBUG record_assistant_response model_id"
-            );
+            tracing::info!(model_id = ?a.model_id, "DEBUG record_assistant_response model_id");
         }
         if let ConversationItem::Assistant(ref a) = assistant_item
             && let Some(first_call) = a.tool_calls.first()
@@ -1934,5 +2028,118 @@ mod auxiliary_model_policy_tests {
             auxiliary_reasoning_effort(ModelProvider::Kimi, false, Some(ReasoningEffort::Max)),
             None
         );
+    }
+}
+
+/// Per-tool precedence: a non-empty `over` wins, else the non-empty `seed`.
+fn prefer_non_empty<T>(
+    over: Option<T>,
+    seed: Option<T>,
+    is_empty: impl Fn(&T) -> bool,
+) -> Option<T> {
+    over.filter(|o| !is_empty(o))
+        .or_else(|| seed.filter(|s| !is_empty(s)))
+}
+/// The cutoff a subagent inherits: a non-empty per-turn `base` wins per tool, else the `seed`.
+fn resolve_configured_cutoff(
+    seed: Option<xai_grok_sampling_types::ToolOverrides>,
+    base: Option<&xai_grok_sampling_types::ToolOverrides>,
+) -> xai_grok_sampling_types::ToolOverrides {
+    use xai_grok_sampling_types::{ToolOverrides, WebSearchOptions, XSearchOptions};
+    let ToolOverrides {
+        x_search: seed_x,
+        web_search: seed_w,
+    } = seed.unwrap_or_default();
+    let (over_x, over_w) =
+        base.map_or((None, None), |b| (b.x_search.clone(), b.web_search.clone()));
+    ToolOverrides {
+        x_search: prefer_non_empty(over_x, seed_x, XSearchOptions::is_empty),
+        web_search: prefer_non_empty(over_w, seed_w, WebSearchOptions::is_empty),
+    }
+}
+#[cfg(test)]
+mod configured_cutoff_tests {
+    use xai_grok_sampling_types::{
+        SearchDateBound, ToolOverrides, WebSearchOptions, XSearchOptions,
+    };
+    fn x_cut(to: &str) -> XSearchOptions {
+        XSearchOptions {
+            date_bound: Some(SearchDateBound::new(None, Some(to.into())).unwrap()),
+        }
+    }
+    #[test]
+    fn seed_only_is_inherited_without_a_per_turn_update() {
+        let seed = ToolOverrides {
+            x_search: Some(x_cut("2020-01-01")),
+            web_search: None,
+        };
+        assert_eq!(
+            super::resolve_configured_cutoff(Some(seed.clone()), None),
+            seed
+        );
+    }
+    #[test]
+    fn non_empty_base_wins_per_tool_and_empty_reverts_to_seed() {
+        let seed = ToolOverrides {
+            x_search: Some(x_cut("2020-01-01")),
+            web_search: Some(WebSearchOptions {
+                allowed_domains: Some(vec!["x.com".into()]),
+            }),
+        };
+        let base = ToolOverrides {
+            x_search: Some(x_cut("2019-06-01")),
+            web_search: Some(WebSearchOptions {
+                allowed_domains: Some(vec![]),
+            }),
+        };
+        let got = super::resolve_configured_cutoff(Some(seed.clone()), Some(&base));
+        assert_eq!(got.x_search, Some(x_cut("2019-06-01")));
+        assert_eq!(got.web_search, seed.web_search);
+    }
+    /// The contamination invariant: `resolve_configured_cutoff` (inheritance) must resolve the same
+    /// bound the wire/echo path (`apply_tool_overrides`) does for the same seed and per-turn base.
+    /// Two independent precedence implementations, so drift on the inherited boundary fails CI.
+    #[test]
+    fn inherited_cutoff_agrees_with_the_wire_echo() {
+        use xai_grok_sampling_types::{HostedTool, apply_tool_overrides};
+        let web = WebSearchOptions {
+            allowed_domains: Some(vec!["x.com".into()]),
+        };
+        let cases = [
+            (
+                Some(ToolOverrides {
+                    x_search: Some(x_cut("2020-01-01")),
+                    web_search: None,
+                }),
+                None,
+            ),
+            (
+                Some(ToolOverrides {
+                    x_search: Some(x_cut("2020-01-01")),
+                    web_search: Some(web.clone()),
+                }),
+                Some(ToolOverrides {
+                    x_search: Some(x_cut("2019-06-01")),
+                    web_search: None,
+                }),
+            ),
+            (
+                None,
+                Some(ToolOverrides {
+                    x_search: Some(x_cut("2018-01-01")),
+                    web_search: Some(web.clone()),
+                }),
+            ),
+        ];
+        for (seed, base) in cases {
+            let mut tools = vec![
+                HostedTool::WebSearch { options: None },
+                HostedTool::XSearch { options: None },
+            ];
+            apply_tool_overrides(&mut tools, seed.as_ref());
+            let wire_echo = apply_tool_overrides(&mut tools, base.as_ref());
+            let inherited = super::resolve_configured_cutoff(seed.clone(), base.as_ref());
+            assert_eq!(wire_echo, inherited, "seed={seed:?} base={base:?}");
+        }
     }
 }

@@ -795,9 +795,9 @@ mod tests {
                          - alpha-public\n\
                          - zeta-public")
                 );
-                assert!(! first_description.contains("private-hidden-model"));
-                assert!(! first_description.contains("private-unselectable-model"));
-                assert!(! first_description.contains("internal-alpha"));
+                assert!(!first_description.contains("private-hidden-model"));
+                assert!(!first_description.contains("private-unselectable-model"));
+                assert!(!first_description.contains("internal-alpha"));
                 let validator = first
                     .tool_bridge()
                     .toolset()

@@ -1545,7 +1545,7 @@ mod tests {
     fn codex_code_mode_only_keeps_hosted_web_without_x_search_or_nested_duplicate() {
         let hosted = vec![
             xai_grok_sampling_types::HostedTool::web_search(None),
-            xai_grok_sampling_types::HostedTool::XSearch,
+            xai_grok_sampling_types::HostedTool::XSearch { options: None },
         ];
         let effective_hosted = hosted_tools_for_code_mode(
             &hosted,
@@ -1645,7 +1645,7 @@ mod tests {
     fn xai_code_mode_only_preserves_native_hosted_search() {
         let hosted = vec![
             xai_grok_sampling_types::HostedTool::web_search(None),
-            xai_grok_sampling_types::HostedTool::XSearch,
+            xai_grok_sampling_types::HostedTool::XSearch { options: None },
         ];
         let effective = hosted_tools_for_code_mode(
             &hosted,
@@ -1659,7 +1659,7 @@ mod tests {
         ));
         assert!(matches!(
             effective[1],
-            xai_grok_sampling_types::HostedTool::XSearch
+            xai_grok_sampling_types::HostedTool::XSearch { .. }
         ));
 
         let definitions = vec![

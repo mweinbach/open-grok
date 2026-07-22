@@ -397,6 +397,21 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
 fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequestPolicy) {
     patch_codex_instruction_roles(request_body);
 
+    // Codex sandboxes `web_search` unless the request opts into live access.
+    // async-openai's native tool serializes the bare `{"type":"web_search"}`
+    // shape, so grant live sources here — the fork's long-standing Codex
+    // dialect behavior — while leaving any explicit override untouched.
+    if let Some(tools) = request_body.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            if tool.get("type").and_then(Value::as_str) == Some("web_search")
+                && let Some(object) = tool.as_object_mut()
+                && !object.contains_key("external_web_access")
+            {
+                object.insert("external_web_access".into(), true.into());
+            }
+        }
+    }
+
     match policy
         .reasoning_summary
         .and_then(|summary| summary.wire_value())

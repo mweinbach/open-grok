@@ -285,6 +285,21 @@ impl SettingsModalState {
         }
     }
 
+    /// Focus a setting by registry key (Browse mode). Returns whether the
+    /// key was found; no-op if missing.
+    pub fn focus_key(&mut self, key: &str) -> bool {
+        if let Some(idx) = self
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowEntry::Setting { key: k, .. } if *k == key))
+        {
+            self.selected = idx;
+            self.clamp_selected_to_visible();
+            return true;
+        }
+        false
+    }
+
     /// Filtered row indices in render order.
     pub fn filtered_indices(&self) -> &[usize] {
         &self.filtered_cache
@@ -926,7 +941,11 @@ pub(super) fn setting_row_visible(
     if meta.key == "voice_capture_mode" && !kitty_releases {
         return false;
     }
-    if meta.key == "antigravity_subagents" && !antigravity_cli {
+    if matches!(
+        meta.key,
+        "antigravity_subagents" | "antigravity_skip_permissions"
+    ) && !antigravity_cli
+    {
         return false;
     }
     if minimal && meta.hidden_in_minimal {
@@ -1010,6 +1029,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
             persist: true,
         }),
         "antigravity_subagents" => Some(Action::SetAntigravitySubagents(new)),
+        "antigravity_skip_permissions" => Some(Action::SetAntigravitySkipPermissions(new)),
         "respect_manual_folds" => Some(Action::SetRespectManualFolds(new)),
         "page_flip_on_send" => Some(Action::SetPageFlipOnSend(new)),
         "combine_queued_prompts" => Some(Action::SetCombineQueuedPrompts(new)),

@@ -115,10 +115,12 @@ impl MediaGenOutput {
         let message = format!(
             "{action} and saved to {path}. Do not read or re-display it, and do not describe how it appears to the user."
         );
-        serde_json::json!(
-            { "path" : path, "filename" : & self.filename, "session_folder" : & self
-            .session_folder, "message" : message, }
-        )
+        serde_json::json!({
+            "path": path,
+            "filename": &self.filename,
+            "session_folder": &self.session_folder,
+            "message": message,
+        })
         .to_string()
     }
 }
@@ -1456,8 +1458,7 @@ mod tests {
             to_json(ReadFileOutput::FileNotFound("Error: /tmp/x does not exist.".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "FileNotFound" :
-            "Error: /tmp/x does not exist." })
+            json!({"type": "ReadFile", "FileNotFound": "Error: /tmp/x does not exist."})
         );
     }
     #[test]
@@ -1466,8 +1467,7 @@ mod tests {
             to_json(ReadFileOutput::IsADirectory("Error: /tmp is a directory.".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "IsADirectory" :
-            "Error: /tmp is a directory." })
+            json!({"type": "ReadFile", "IsADirectory": "Error: /tmp is a directory."})
         );
     }
     #[test]
@@ -1477,8 +1477,7 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "PermissionDenied" :
-            "Permission denied: /etc/shadow" })
+            json!({"type": "ReadFile", "PermissionDenied": "Permission denied: /etc/shadow"})
         );
     }
     #[test]
@@ -1491,9 +1490,7 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "FileTooLarge" :
-            "File content (37044 tokens) exceeds maximum allowed tokens (25000 tokens)."
-            })
+            json!({"type": "ReadFile", "FileTooLarge": "File content (37044 tokens) exceeds maximum allowed tokens (25000 tokens)."})
         );
     }
     #[test]
@@ -1501,7 +1498,7 @@ mod tests {
         let json = to_json(ReadFileOutput::FileReadError("Failed to read file".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "FileReadError" : "Failed to read file" })
+            json!({"type": "ReadFile", "FileReadError": "Failed to read file"})
         );
     }
     #[test]
@@ -1509,7 +1506,7 @@ mod tests {
         let json = to_json(ReadFileOutput::ImageSizeError("Image too large".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ReadFile", "ImageSizeError" : "Image too large" })
+            json!({"type": "ReadFile", "ImageSizeError": "Image too large"})
         );
     }
     #[test]
@@ -1517,20 +1514,20 @@ mod tests {
         let json = to_json(ListDirOutput::NotFound("does not exist".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ListDir", "NotFound" : "does not exist" })
+            json!({"type": "ListDir", "NotFound": "does not exist"})
         );
     }
     #[test]
     fn list_dir_is_a_file_json() {
         let json = to_json(ListDirOutput::IsAFile("is a file".into()).into());
-        assert_eq!(json, json!({ "type" : "ListDir", "IsAFile" : "is a file" }));
+        assert_eq!(json, json!({"type": "ListDir", "IsAFile": "is a file"}));
     }
     #[test]
     fn list_dir_not_a_directory_json() {
         let json = to_json(ListDirOutput::NotADirectory("is not a directory".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ListDir", "NotADirectory" : "is not a directory" })
+            json!({"type": "ListDir", "NotADirectory": "is not a directory"})
         );
     }
     #[test]
@@ -1538,20 +1535,20 @@ mod tests {
         let json = to_json(ListDirOutput::PermissionDenied("Permission denied".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "ListDir", "PermissionDenied" : "Permission denied" })
+            json!({"type": "ListDir", "PermissionDenied": "Permission denied"})
         );
     }
     #[test]
     fn list_dir_generic_error_json() {
         let json = to_json(ListDirOutput::Error("Some error".into()).into());
-        assert_eq!(json, json!({ "type" : "ListDir", "Error" : "Some error" }));
+        assert_eq!(json, json!({"type": "ListDir", "Error": "Some error"}));
     }
     #[test]
     fn search_replace_file_not_found_json() {
         let json = to_json(SearchReplaceOutput::FileNotFound("not found".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "FileNotFound" : "not found" })
+            json!({"type": "SearchReplace", "FileNotFound": "not found"})
         );
     }
     #[test]
@@ -1566,8 +1563,13 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "NoMatchesFound" : { "message" :
-            "no matches", "file_path" : "/project/src/main.c" } })
+            json!({
+                "type": "SearchReplace",
+                "NoMatchesFound": {
+                    "message": "no matches",
+                    "file_path": "/project/src/main.c"
+                }
+            })
         );
     }
     #[test]
@@ -1591,8 +1593,7 @@ mod tests {
         let json = to_json(SearchReplaceOutput::MultipleMatchesFound("3 matches".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "MultipleMatchesFound" : "3 matches"
-            })
+            json!({"type": "SearchReplace", "MultipleMatchesFound": "3 matches"})
         );
     }
     #[test]
@@ -1600,7 +1601,7 @@ mod tests {
         let json = to_json(SearchReplaceOutput::FileAlreadyExists("exists".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "FileAlreadyExists" : "exists" })
+            json!({"type": "SearchReplace", "FileAlreadyExists": "exists"})
         );
     }
     #[test]
@@ -1608,7 +1609,7 @@ mod tests {
         let json = to_json(SearchReplaceOutput::InvalidInput("same strings".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "InvalidInput" : "same strings" })
+            json!({"type": "SearchReplace", "InvalidInput": "same strings"})
         );
     }
     #[test]
@@ -1616,8 +1617,7 @@ mod tests {
         let json = to_json(SearchReplaceOutput::FilenameTooLong("name too long".into()).into());
         assert_eq!(
             json,
-            json!({ "type" : "SearchReplace", "FilenameTooLong" : "name too long"
-            })
+            json!({"type": "SearchReplace", "FilenameTooLong": "name too long"})
         );
     }
     #[test]
@@ -1645,8 +1645,10 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "KillTask", "TaskNotFound" :
-            "Task abc not found. No background tasks exist in this session." })
+            json!({
+                "type": "KillTask",
+                "TaskNotFound": "Task abc not found. No background tasks exist in this session."
+            })
         );
     }
     #[test]
@@ -1655,8 +1657,7 @@ mod tests {
         let serialized = serde_json::to_value(&original).unwrap();
         let deserialized: KillTaskOutput = serde_json::from_value(serialized).unwrap();
         assert!(
-            matches!(deserialized, KillTaskOutput::TaskNotFound(ref msg) if msg ==
-            "not found")
+            matches!(deserialized, KillTaskOutput::TaskNotFound(ref msg) if msg == "not found")
         );
     }
     #[test]
@@ -1765,8 +1766,10 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "TaskOutput", "TaskNotFound" :
-            "Task xyz not found. Known task IDs: [task-1, task-2]" })
+            json!({
+                "type": "TaskOutput",
+                "TaskNotFound": "Task xyz not found. Known task IDs: [task-1, task-2]"
+            })
         );
     }
     #[test]
@@ -1775,8 +1778,7 @@ mod tests {
         let serialized = serde_json::to_value(&original).unwrap();
         let deserialized: TaskOutputOutput = serde_json::from_value(serialized).unwrap();
         assert!(
-            matches!(deserialized, TaskOutputOutput::TaskNotFound(ref msg) if msg ==
-            "not found")
+            matches!(deserialized, TaskOutputOutput::TaskNotFound(ref msg) if msg == "not found")
         );
     }
     #[test]
@@ -1817,8 +1819,9 @@ mod tests {
         );
         assert_eq!(
             json,
-            json!({ "type" : "Todo", "DuplicateId" :
-            "Duplicate todo ID in request: \"dup\". Each todo item must have a unique ID."
+            json!({
+                "type": "Todo",
+                "DuplicateId": "Duplicate todo ID in request: \"dup\". Each todo item must have a unique ID."
             })
         );
     }
@@ -1827,10 +1830,7 @@ mod tests {
         let original = TodoWriteOutput::DuplicateId("dup id".into());
         let serialized = serde_json::to_value(&original).unwrap();
         let deserialized: TodoWriteOutput = serde_json::from_value(serialized).unwrap();
-        assert!(
-            matches!(deserialized, TodoWriteOutput::DuplicateId(ref msg) if msg ==
-            "dup id")
-        );
+        assert!(matches!(deserialized, TodoWriteOutput::DuplicateId(ref msg) if msg == "dup id"));
     }
     #[test]
     fn todo_write_success_round_trip() {
@@ -2106,10 +2106,12 @@ mod tests {
     }
     #[test]
     fn enter_plan_mode_output_serde_defaults_tool_hints_when_absent() {
-        let json = json!(
-            { "Entered" : { "message" : "Entered plan mode.", "plan_file_path" :
-            "/tmp/plan.md" } }
-        );
+        let json = json!({
+            "Entered": {
+                "message": "Entered plan mode.",
+                "plan_file_path": "/tmp/plan.md"
+            }
+        });
         let deserialized: EnterPlanModeOutput = serde_json::from_value(json).unwrap();
         match deserialized {
             EnterPlanModeOutput::Entered {
@@ -2158,10 +2160,12 @@ mod tests {
     }
     #[test]
     fn enter_plan_mode_absent_seed_field_prompt_is_missing() {
-        let json = json!(
-            { "Entered" : { "message" : "Entered plan mode.", "plan_file_path" :
-            "/tmp/plan.md" } }
-        );
+        let json = json!({
+            "Entered": {
+                "message": "Entered plan mode.",
+                "plan_file_path": "/tmp/plan.md"
+            }
+        });
         let deserialized: EnterPlanModeOutput = serde_json::from_value(json).unwrap();
         let prompt = ToolOutput::EnterPlanMode(deserialized).to_prompt_format();
         assert!(
@@ -2213,7 +2217,7 @@ mod tests {
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(
             json["Entered"]["plan_file_seed"],
-            json!({ "missing" : "not_a_file" })
+            json!({ "missing": "not_a_file" })
         );
         let back: EnterPlanModeOutput = serde_json::from_value(json).unwrap();
         let EnterPlanModeOutput::Entered { plan_file_seed, .. } = back;

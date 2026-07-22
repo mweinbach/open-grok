@@ -38,7 +38,7 @@ async fn apply_with_resolved_tool_policy(
     xai_grok_telemetry::unified_log::info(
         "model changed",
         Some(args.session_id.0.as_ref()),
-        Some(serde_json::json!({ "model" : args.model_id.0.as_ref() })),
+        Some(serde_json::json!({"model": args.model_id.0.as_ref()})),
     );
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
     let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
@@ -136,13 +136,16 @@ async fn apply_with_resolved_tool_policy(
             .model_supports_reasoning_effort(model_id.0.as_ref())
         {
             tracing::info!(
-                session_id = % session_id.0, effort = % eff,
+                session_id = %session_id.0,
+                effort = %eff,
                 "set_session_model: applying reasoning_effort override from meta"
             );
             model_sampling.reasoning_effort = Some(eff);
         } else {
             tracing::warn!(
-                session_id = % session_id.0, model_id = % model_id.0, effort = % eff,
+                session_id = %session_id.0,
+                model_id = %model_id.0,
+                effort = %eff,
                 "set_session_model: ignoring reasoning_effort override — model does not support it"
             );
         }
@@ -173,7 +176,8 @@ async fn apply_with_resolved_tool_policy(
     let apply_prompt_override = !gate_closed;
     if gate_closed {
         tracing::info!(
-            session_id = % session_id.0, model_id = % model_id.0,
+            session_id = %session_id.0,
+            model_id = %model_id.0,
             "set_session_model: gateway gate closed, prompt override suppressed"
         );
         if pending_rebuild.is_some() {
@@ -245,9 +249,11 @@ async fn apply_with_resolved_tool_policy(
             .set_current_reasoning_effort(applied_effort);
     }
     Ok(acp::SetSessionModelResponse::new().meta(
-        serde_json::json!({ "model" : updated_model, })
-            .as_object()
-            .cloned(),
+        serde_json::json!({
+            "model": updated_model,
+        })
+        .as_object()
+        .cloned(),
     ))
 }
 /// Broadcast a `ModelChanged` to every client subscribed to this session so

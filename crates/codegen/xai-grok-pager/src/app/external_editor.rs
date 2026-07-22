@@ -578,13 +578,12 @@ mod tests {
             original_text: "sensitive draft".to_owned(),
         };
         assert!(matches!(
-                    request,
-                    PendingEditorRequest::PromptDraft {
-                        agent_id: AgentId(7),
-                        ref original_text,
-                    }
-        if original_text == "sensitive draft"
-                ));
+            request,
+            PendingEditorRequest::PromptDraft {
+                agent_id: AgentId(7),
+                ref original_text,
+            } if original_text == "sensitive draft"
+        ));
         drop(request);
     }
 }

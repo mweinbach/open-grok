@@ -584,6 +584,37 @@ pub(in crate::app::dispatch) fn set_x_search_enabled(app: &mut AppView, new: boo
     }]
 }
 
+/// Commit `[antigravity].skip_permissions` — the full-access opt-out for agy
+/// subagents (registry-driven path).
+///
+/// SHELL-OWNED with NO in-memory pager mirror (like `web_search_source` /
+/// `x_search`): persisted via `Effect::PersistSetting`; the modal reads it
+/// back fresh from disk (`load_antigravity_skip_permissions_sync`) at snapshot
+/// time. Restart-required — the antigravity runner resolves the flag at
+/// subagent spawn.
+pub(in crate::app::dispatch) fn set_antigravity_skip_permissions(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev = xai_grok_shell::util::config::load_antigravity_skip_permissions_sync();
+    refresh_open_settings_modals(app);
+    tracing::info!(
+        target: "settings",
+        key = "antigravity_skip_permissions",
+        value = new,
+        "setting changed",
+    );
+    app.show_toast(&format!(
+        "{} (restart to apply)",
+        save_success_toast("Antigravity full access", new),
+    ));
+    vec![Effect::PersistSetting {
+        key: "antigravity_skip_permissions",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
 /// Set vim-mode scrollback keybindings (registry-driven path).
 ///
 /// SHELL-OWNED: persisted to `[ui].vim_mode` in config.toml via

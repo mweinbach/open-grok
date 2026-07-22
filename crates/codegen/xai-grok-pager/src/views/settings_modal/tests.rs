@@ -189,10 +189,9 @@ fn contextual_hints_group_sub_sheet_flow() {
         .expect("group row present");
     assert!(
         !s.rows.iter().any(|r| matches!(
-                    r,
-                    RowEntry::Setting { key, .. }
-        if key.starts_with("contextual_hints.")
-                )),
+            r,
+            RowEntry::Setting { key, .. } if key.starts_with("contextual_hints.")
+        )),
         "child rows must be hidden from the top-level list",
     );
 

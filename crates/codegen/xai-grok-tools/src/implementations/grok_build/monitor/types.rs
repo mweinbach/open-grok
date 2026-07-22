@@ -26,6 +26,10 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 36_000_000; // 10 hours
 /// Maximum monitor timeout.
 pub const MAX_TIMEOUT_MS: u64 = 36_000_000; // 10 hours
 
+fn default_timeout_ms() -> Option<u64> {
+    Some(DEFAULT_TIMEOUT_MS)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct MonitorInput {
     /// Shell command or script. Each stdout line is an event; exit ends the watch.
@@ -42,9 +46,10 @@ pub struct MonitorInput {
 
     /// Kill the monitor after this deadline (ms). Ignored when persistent is true.
     /// Default: 36000000 (10 hr). Max: 36000000 (10 hr).
-    #[serde(default)]
+    #[serde(default = "default_timeout_ms")]
     #[schemars(
-        description = "Kill the monitor after this deadline (ms). Default: 36000000 (10 hr)."
+        description = "Kill the monitor after this deadline (ms). Default: 36000000 (10 hr). Max: 36000000 (10 hr).",
+        default = "default_timeout_ms"
     )]
     pub timeout_ms: Option<u64>,
 
@@ -52,12 +57,12 @@ pub struct MonitorInput {
     /// Stop with kill_command_or_subagent.
     #[serde(
         default,
-        deserialize_with = "crate::types::schema::deserialize_lenient_option_bool"
+        deserialize_with = "crate::types::schema::deserialize_lenient_bool"
     )]
     #[schemars(
         description = "Run for the lifetime of the session (no timeout).${%- if tools.by_kind.kill_task_action %} Stop with ${{ tools.by_kind.kill_task_action }}.${%- endif %}"
     )]
-    pub persistent: Option<bool>,
+    pub persistent: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -82,7 +87,7 @@ pub enum MonitorError {
 impl MonitorInput {
     /// Validate input constraints.
     pub fn validate(&self) -> Result<(), MonitorError> {
-        let persistent = self.persistent.unwrap_or(false);
+        let persistent = self.persistent;
         if let Some(timeout) = self.timeout_ms
             && !persistent
             && timeout > MAX_TIMEOUT_MS
@@ -94,7 +99,7 @@ impl MonitorInput {
 
     /// Resolved timeout in milliseconds (0 for persistent / no-deadline monitors).
     pub fn resolved_timeout_ms(&self) -> u64 {
-        if self.persistent.unwrap_or(false) {
+        if self.persistent {
             0
         } else {
             self.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)
@@ -112,7 +117,7 @@ mod tests {
             command: "tail -f log".into(),
             description: "watch log".into(),
             timeout_ms: None,
-            persistent: None,
+            persistent: false,
         };
         assert_eq!(input.resolved_timeout_ms(), DEFAULT_TIMEOUT_MS);
         assert!(input.validate().is_ok());
@@ -125,7 +130,7 @@ mod tests {
             command: "tail -f log".into(),
             description: "watch log".into(),
             timeout_ms: None,
-            persistent: Some(true),
+            persistent: true,
         };
         assert_eq!(input.resolved_timeout_ms(), 0);
         assert!(input.validate().is_ok());
@@ -137,7 +142,7 @@ mod tests {
             command: "cmd".into(),
             description: "desc".into(),
             timeout_ms: Some(600_000),
-            persistent: None,
+            persistent: false,
         };
         assert_eq!(input.resolved_timeout_ms(), 600_000);
         assert!(input.validate().is_ok());
@@ -149,7 +154,7 @@ mod tests {
             command: "cmd".into(),
             description: "desc".into(),
             timeout_ms: Some(MAX_TIMEOUT_MS + 1),
-            persistent: Some(false),
+            persistent: false,
         };
         assert!(input.validate().is_err());
     }
@@ -160,7 +165,7 @@ mod tests {
             command: "cmd".into(),
             description: "desc".into(),
             timeout_ms: Some(MAX_TIMEOUT_MS + 1),
-            persistent: Some(true),
+            persistent: true,
         };
         assert!(input.validate().is_ok());
     }

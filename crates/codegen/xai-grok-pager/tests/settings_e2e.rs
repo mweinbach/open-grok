@@ -69,6 +69,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "invert_scroll",
     "display_refresh_auto_cadence",
     "antigravity_subagents",
+    "antigravity_skip_permissions",
     "coding_data_sharing",
     "default_selected_permission",
     "plan_mode",
@@ -327,6 +328,12 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
                 "SetAntigravitySubagents value differs from expected"
             )
         }
+        ("antigravity_skip_permissions", Action::SetAntigravitySkipPermissions(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetAntigravitySkipPermissions value differs from expected"
+            )
+        }
         (key, action) => panic!(
             "expected typed setter for `{key}={expected}`, got wrong Action variant: {action:?}"
         ),
@@ -432,6 +439,10 @@ fn space_on_page_flip_on_send_dispatches_typed_setter() {
 
 #[test]
 fn space_on_combine_queued_prompts_dispatches_typed_setter() {
+    // Pin the process-global appearance cache: the registry sources the row's
+    // current value from it, and the developer's real config may differ from
+    // the UiConfig default this test asserts against.
+    xai_grok_pager::appearance::cache::set_combine_queued_prompts(false);
     let mut s = make_state();
     navigate_to(&mut s, "combine_queued_prompts");
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
@@ -923,6 +934,8 @@ fn mouse_click_on_swarm_mode_indicator_toggles_in_one_click() {
 
 #[test]
 fn mouse_click_on_combine_queued_prompts_indicator_toggles_in_one_click() {
+    // Pin the appearance cache (see the space-toggle sibling test).
+    xai_grok_pager::appearance::cache::set_combine_queued_prompts(false);
     let mut s = make_state();
     synth_rects(&mut s);
     let row_y = row_idx_for(&s, "combine_queued_prompts") as u16;
@@ -2159,6 +2172,7 @@ fn registry_kind_membership_through_pr_14() {
             "simple_mode",
             "swarm_mode",
             "antigravity_subagents",
+            "antigravity_skip_permissions",
             "vim_mode",
             "remember_tool_approvals",
             "toolset.ask_user_question.timeout_enabled",
@@ -2383,6 +2397,7 @@ fn defaults_round_trip_through_registry() {
             "invert_scroll" => SettingValue::Bool(false),
             "display_refresh_auto_cadence" => SettingValue::Bool(false),
             "antigravity_subagents" => SettingValue::Bool(false),
+            "antigravity_skip_permissions" => SettingValue::Bool(true),
             "coding_data_sharing" => SettingValue::Enum("opt-out"),
             "default_selected_permission" => SettingValue::Enum("always_allow_all_sessions"),
             "hunk_tracker_mode" => SettingValue::Enum("agent_only"),
@@ -2481,6 +2496,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetInvertScroll(_))
             | SettingsKeyOutcome::Action(Action::SetDisplayRefreshAutoCadence(_))
             | SettingsKeyOutcome::Action(Action::SetAntigravitySubagents(_))
+            | SettingsKeyOutcome::Action(Action::SetAntigravitySkipPermissions(_))
             | SettingsKeyOutcome::Action(Action::SetXSearchEnabled(_)) => {}
             other => panic!(
                 "expected a typed bool setter for `{}`, got {:?}",

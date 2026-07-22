@@ -163,9 +163,33 @@ impl SubagentCoordinator {
             subagent_usage_not_applied: self.subagent_usage_not_applied(prompt_id),
         }
     }
-    /// Drain all buffered completion summaries, returning them and clearing the buffer.
-    pub fn drain_pending_completions(&mut self) -> Vec<SubagentCompletionSummary> {
-        std::mem::take(&mut self.pending_completions)
+    pub fn drain_pending_completions_for(
+        &mut self,
+        session_id: &str,
+    ) -> Vec<SubagentCompletionSummary> {
+        if session_id.is_empty() {
+            return std::mem::take(&mut self.pending_completions);
+        }
+        let (mine, others) = std::mem::take(&mut self.pending_completions)
+            .into_iter()
+            .partition(|c| {
+                c.owner_session_id.is_empty() || c.owner_session_id == session_id
+            });
+        self.pending_completions = others;
+        mine
+    }
+    pub fn discard_pending_completions_for(&mut self, session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        self.pending_completions.retain(|c| c.owner_session_id != session_id);
+    }
+    fn enforce_pending_completions_cap(&mut self) {
+        const MAX_PENDING_COMPLETIONS: usize = 256;
+        if self.pending_completions.len() > MAX_PENDING_COMPLETIONS {
+            let excess = self.pending_completions.len() - MAX_PENDING_COMPLETIONS;
+            self.pending_completions.drain(..excess);
+        }
     }
     /// Collect references to subagents spawned for a specific parent prompt.
     /// Returns only the children whose `parent_prompt_id` matches, so the
@@ -301,6 +325,7 @@ impl SubagentCoordinator {
         };
         let summary_output = result.output.clone();
         let summary_error = result.error.clone();
+        let owner_session_id = parent_session_id.clone();
         self.completed
             .insert(
                 subagent_id.clone(),
@@ -334,6 +359,7 @@ impl SubagentCoordinator {
             self.pending_completions
                 .push(SubagentCompletionSummary {
                     subagent_id,
+                    owner_session_id,
                     subagent_type,
                     description,
                     success: false,
@@ -343,6 +369,7 @@ impl SubagentCoordinator {
                     output: summary_output,
                     error: summary_error,
                 });
+            self.enforce_pending_completions_cap();
         }
         self.completion_notify.notify_waiters();
     }
@@ -406,6 +433,7 @@ impl SubagentCoordinator {
             self.pending_completions
                 .push(SubagentCompletionSummary {
                     subagent_id: id.to_string(),
+                    owner_session_id: completed.parent_session_id.clone(),
                     subagent_type: completed.subagent_type.clone(),
                     description: completed.description.clone(),
                     success,
@@ -504,15 +532,18 @@ impl SubagentCoordinator {
                 if success { "subagent completed" } else { "subagent failed" },
                 None,
                 Some(
-                    serde_json::json!(
-                        { "subagent_id" : & completed.subagent_id, "subagent_type" : &
-                        completed.subagent_type, "effective_model" : & completed
-                        .effective_model_id, "success" : success, "cancelled" : completed
-                        .result.cancelled, "duration_ms" : completed.result.duration_ms,
-                        "turns" : completed.result.turns, "tool_calls" : completed.result
-                        .tool_calls, "output_preview" : preview, "error" : & completed
-                        .result.error, }
-                    ),
+                    serde_json::json!({
+                    "subagent_id": &completed.subagent_id,
+                    "subagent_type": &completed.subagent_type,
+                    "effective_model": &completed.effective_model_id,
+                    "success": success,
+                    "cancelled": completed.result.cancelled,
+                    "duration_ms": completed.result.duration_ms,
+                    "turns": completed.result.turns,
+                    "tool_calls": completed.result.tool_calls,
+                    "output_preview": preview,
+                    "error": &completed.result.error,
+                }),
                 ),
             );
         }
@@ -520,6 +551,7 @@ impl SubagentCoordinator {
             self.pending_completions
                 .push(SubagentCompletionSummary {
                     subagent_id: id.to_string(),
+                    owner_session_id: completed.parent_session_id.clone(),
                     subagent_type: completed.subagent_type.clone(),
                     description: completed.description.clone(),
                     success,
@@ -532,6 +564,7 @@ impl SubagentCoordinator {
                     ),
                     error: completed.result.error.clone(),
                 });
+            self.enforce_pending_completions_cap();
         }
         if completed.persisted_output_dir.is_some() {
             completed.result.output = Arc::from("");

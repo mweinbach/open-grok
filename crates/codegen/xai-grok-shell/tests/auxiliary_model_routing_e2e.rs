@@ -15,11 +15,10 @@ use std::future::Future;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 use xai_grok_test_support::mock_server::LogEntry;
 use xai_grok_test_support::{
-    GrokStdioClient, MockInferenceServer, MockModelEntry, git_workdir, stderr_tail,
+    GrokStdioClient, MockInferenceServer, MockModelEntry, TestSandbox, git_workdir, stderr_tail,
 };
 
 const SOL_RECAP_MAIN_SENTINEL: &str = "SOL_RECAP_MAIN_SENTINEL";
@@ -35,9 +34,9 @@ where
     tokio::task::LocalSet::new().run_until(f()).await;
 }
 
-fn write_config(home: &TempDir, config: String) {
-    let open_grok_home = home.path().join(".opengrok");
-    std::fs::create_dir_all(&open_grok_home).expect("create isolated OPENGROK_HOME");
+fn write_config(home: &TestSandbox, config: String) {
+    let open_grok_home = home.grok_home();
+    std::fs::create_dir_all(open_grok_home).expect("create isolated OPENGROK_HOME");
     std::fs::write(open_grok_home.join("config.toml"), config).expect("write isolated config.toml");
 }
 
@@ -129,7 +128,7 @@ async fn automatic_codex_recap_routes_to_terra_medium_with_isolated_auth() {
         .expect("start Codex Terra mock");
         terra.set_response("Implemented the requested routing and is verifying it now.");
 
-        let home = TempDir::new().expect("create isolated home");
+        let home = TestSandbox::new();
         write_config(
             &home,
             format!(
@@ -172,10 +171,10 @@ session_recap = true
         );
 
         let workdir = git_workdir();
-        let client = GrokStdioClient::spawn_with_home(&sol, workdir.path(), home).await;
+        let client = GrokStdioClient::spawn_with_sandbox(&sol, workdir.workspace(), home).await;
         client.initialize_with_timeout().await;
         let session_id = client
-            .create_session_with_model_timeout(workdir.path(), "codex-sol")
+            .create_session_with_model_timeout(workdir.workspace(), "codex-sol")
             .await;
         let prompt = client
             .prompt_with_timeout(&session_id, SOL_RECAP_MAIN_SENTINEL)
@@ -267,7 +266,7 @@ async fn explicit_codex_chat_to_xai_memory_routes_to_grok_low_with_isolated_auth
         .expect("start xAI memory mock");
         xai.set_response("## Preference\n\nUse the isolated helper route.");
 
-        let home = TempDir::new().expect("create isolated home");
+        let home = TestSandbox::new();
         write_config(
             &home,
             format!(
@@ -308,10 +307,10 @@ memory = "xai-memory"
         );
 
         let workdir = git_workdir();
-        let client = GrokStdioClient::spawn_with_home(&sol, workdir.path(), home).await;
+        let client = GrokStdioClient::spawn_with_sandbox(&sol, workdir.workspace(), home).await;
         client.initialize_with_timeout().await;
         let session_id = client
-            .create_session_with_model_timeout(workdir.path(), "codex-sol")
+            .create_session_with_model_timeout(workdir.workspace(), "codex-sol")
             .await;
         let prompt = client
             .prompt_with_timeout(&session_id, SOL_MEMORY_MAIN_SENTINEL)

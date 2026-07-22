@@ -1806,7 +1806,7 @@ impl SamplingClient {
         instructions: &str,
         remote_v2: bool,
     ) -> Result<serde_json::Value> {
-        let extra_raw_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
+        let extra_tool_entries = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
         let named_custom_tool_outputs = request.named_custom_tool_outputs();
         let mut original_detail_custom_output_images =
             request.original_detail_custom_output_images();
@@ -1835,14 +1835,14 @@ impl SamplingClient {
             tracing::error!(%error, remote_v2, "failed to serialize Codex compact request");
             SamplingError::Serialization(error)
         })?;
-        if !extra_raw_tools.is_empty() {
+        if !extra_tool_entries.is_empty() {
             if let Some(tools) = request_body
                 .get_mut("tools")
                 .and_then(serde_json::Value::as_array_mut)
             {
-                tools.extend(extra_raw_tools);
+                tools.extend(extra_tool_entries);
             } else {
-                request_body["tools"] = serde_json::Value::Array(extra_raw_tools);
+                request_body["tools"] = serde_json::Value::Array(extra_tool_entries);
             }
         }
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
@@ -2188,12 +2188,12 @@ impl SamplingClient {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
-        let extra_raw_tools = std::mem::take(&mut request.extra_raw_tools);
-        if !extra_raw_tools.is_empty() {
+        let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
+        if !extra_tool_entries.is_empty() {
             if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
-                tools.extend(extra_raw_tools);
+                tools.extend(extra_tool_entries);
             } else {
-                request_body["tools"] = serde_json::Value::Array(extra_raw_tools);
+                request_body["tools"] = serde_json::Value::Array(extra_tool_entries);
             }
         }
         // async-openai's ReasoningTextContent struct omits the `type`
@@ -2345,7 +2345,7 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let extra_raw_tools = std::mem::take(&mut request.extra_raw_tools);
+        let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
         let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
@@ -2354,13 +2354,13 @@ impl SamplingClient {
         if self.defaults.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
-        // Inject provider extensions (e.g., x_search and Codex web-search
-        // access modes) that async-openai's rs::Tool enum cannot express.
-        if !extra_raw_tools.is_empty() {
+        // Inject xAI-specific tools (e.g., x_search) that can't be expressed
+        // via async_openai's rs::Tool enum.
+        if !extra_tool_entries.is_empty() {
             if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
-                tools.extend(extra_raw_tools);
+                tools.extend(extra_tool_entries);
             } else {
-                request_body["tools"] = serde_json::Value::Array(extra_raw_tools);
+                request_body["tools"] = serde_json::Value::Array(extra_tool_entries);
             }
         }
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
@@ -3034,9 +3034,9 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
-        // Collect provider extensions that cannot be expressed via rs::Tool.
-        // They are injected as raw JSON after serialization.
-        let extra_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
+        // Collect provider extensions that can't be expressed via rs::Tool
+        // (e.g., x_search). These are injected as raw JSON after serialization.
+        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
         let named_custom_tool_outputs = request.named_custom_tool_outputs();
         let raw_input_replacements =
             request.raw_responses_input_replacements(self.defaults.provider);
@@ -3054,7 +3054,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
-        wrapper.extra_raw_tools = extra_tools;
+        wrapper.extra_tool_entries = extra_tools;
         wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
         wrapper.original_detail_custom_output_images = original_detail_custom_output_images;
         wrapper.raw_input_replacements = raw_input_replacements;
@@ -3083,7 +3083,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
-        let extra_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
+        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
         let named_custom_tool_outputs = request.named_custom_tool_outputs();
         let raw_input_replacements =
             request.raw_responses_input_replacements(self.defaults.provider);
@@ -3101,7 +3101,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
-        wrapper.extra_raw_tools = extra_tools;
+        wrapper.extra_tool_entries = extra_tools;
         wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
         wrapper.original_detail_custom_output_images = original_detail_custom_output_images;
         wrapper.raw_input_replacements = raw_input_replacements;

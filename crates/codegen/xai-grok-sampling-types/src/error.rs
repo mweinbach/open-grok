@@ -214,14 +214,13 @@ impl SamplingError {
     /// a new session.
     pub fn is_encrypted_content_error(&self) -> bool {
         matches!(
-                    self,
-                    SamplingError::Api {
-                        status: StatusCode::BAD_REQUEST,
-                        message,
-                        ..
-                    }
-        if message.contains("encrypted_content")
-                )
+            self,
+            SamplingError::Api {
+                status: StatusCode::BAD_REQUEST,
+                message,
+                ..
+            } if message.contains("encrypted_content")
+        )
     }
 
     /// The API rejected the request because an inline image could not be

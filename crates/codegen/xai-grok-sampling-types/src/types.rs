@@ -1355,7 +1355,7 @@ pub struct CreateResponseWrapper {
     /// xAI-specific tool definitions that can't be expressed via
     /// `async_openai`'s `rs::Tool` enum (e.g., `x_search`). Injected
     /// as raw JSON into the serialized request body's `tools` array.
-    pub extra_raw_tools: Vec<serde_json::Value>,
+    pub extra_tool_entries: Vec<serde_json::Value>,
 
     /// Named custom-output items whose optional `name` field is not modeled by
     /// async-openai 0.33.1. The sampler patches these exact flattened input
@@ -1388,7 +1388,7 @@ impl CreateResponseWrapper {
             x_grok_deployment_id: None,
             x_grok_user_id: None,
             trace: None,
-            extra_raw_tools: vec![],
+            extra_tool_entries: vec![],
             named_custom_tool_outputs: vec![],
             original_detail_custom_output_images: vec![],
             raw_input_replacements: vec![],

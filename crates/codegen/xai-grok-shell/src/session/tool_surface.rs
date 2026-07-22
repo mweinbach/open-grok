@@ -309,7 +309,7 @@ impl EffectiveToolSurface {
             .iter()
             .filter_map(|tool| match tool {
                 HostedTool::ClientCustom(tool) => Some(tool),
-                HostedTool::WebSearch { .. } | HostedTool::XSearch => None,
+                HostedTool::WebSearch { .. } | HostedTool::XSearch { .. } => None,
             })
             .map(|tool| {
                 let bytes = tool.name.len()
@@ -492,7 +492,7 @@ mod tests {
                 HostedTool::ClientCustom(tool) if tool.name == "exec" => Some(tool),
                 HostedTool::ClientCustom(_)
                 | HostedTool::WebSearch { .. }
-                | HostedTool::XSearch => None,
+                | HostedTool::XSearch { .. } => None,
             })
             .expect("Codex mixed Code Mode must expose native custom exec");
         let description = exec.description.as_deref().unwrap();

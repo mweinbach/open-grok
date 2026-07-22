@@ -41,21 +41,26 @@ async fn unknown_ssh_clipboard_delivery_is_unverified() {
         "{MOCK_RESPONSE_SENTINEL} clipboard delivery sentinel"
     ));
     let binary = pager_binary().expect("resolve pager binary");
-    let mut env = content.env_for_pager();
-    // The fork's bundled default can be a non-xAI provider model; pin this
-    // scenario to the mock catalog so it exercises clipboard delivery rather
-    // than waiting on an unrelated provider route.
-    env.push(("GROK_DEFAULT_MODEL".into(), "test-model".into()));
-    env.push((
-        "SSH_CONNECTION".into(),
-        "scripted-test 1 127.0.0.1 2".into(),
-    ));
-    let env_refs: Vec<(&str, &str)> = env
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    let mut harness = PtyHarness::new_in_dir(&binary, 60, 80, &[], &env_refs, Some(content.home()))
-        .expect("spawn pager");
+    let mut harness = PtyHarness::spawn_with_content_env_ops_in_dir(
+        &binary,
+        60,
+        80,
+        &content,
+        &[],
+        &[
+            // The fork's bundled default can be a non-xAI provider model; pin this
+            // scenario to the mock catalog so it exercises clipboard delivery rather
+            // than waiting on an unrelated provider route.
+            EnvOp::set("GROK_DEFAULT_MODEL", "test-model"),
+            EnvOp::set("SSH_CONNECTION", "scripted-test 1 127.0.0.1 2"),
+            // Model the no-wrap-sink path even when the parent test process was
+            // launched under `grok wrap`.
+            EnvOp::remove("GROK_OSC52_SINK"),
+            EnvOp::remove("LC_GROK_OSC52_SINK"),
+        ],
+        Some(content.home()),
+    )
+    .expect("spawn pager");
 
     harness
         .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)
@@ -98,11 +103,11 @@ async fn unknown_ssh_clipboard_delivery_is_unverified() {
 
     harness.inject_keys(b"/doctor\r").expect("run /doctor");
     harness
-        .wait_for_text("status       unverified", Duration::from_secs(10))
-        .expect("unverified clipboard status");
+        .wait_for_text("clipboard.delivery-unverified", Duration::from_secs(10))
+        .expect("named clipboard finding");
     harness
-        .wait_for_text("open-grok wrap <ssh command>", Duration::from_secs(10))
-        .expect("wrapped SSH guidance");
+        .wait_for_text("open-grok wrap ssh <host>", Duration::from_secs(10))
+        .expect("doctor-owned wrapped SSH guidance");
     assert!(!harness.contains_text("Copy failed"));
     assert!(!harness.contains_text("panicked"));
 

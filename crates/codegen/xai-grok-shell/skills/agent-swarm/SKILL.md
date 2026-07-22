@@ -179,8 +179,10 @@ Antigravity slugs are gated: the **"Antigravity subagents"** setting
 (`[ui].antigravity_subagents`) must be on, `agy` must be installed, and you must
 be signed in to it. When the setting is off the slug is rejected with
 *"Antigravity subagents are disabled. Enable the \"Antigravity subagents\"
-setting…"*. Antigravity members run read-only unless
-`[antigravity].skip_permissions` is set.
+setting…"*. Antigravity members run with full access (agy's
+skip-permissions flag) by default; set `[antigravity] skip_permissions =
+false` to force read-only, and members whose capability mode is pinned
+read-only stay read-only either way.
 
 ## How results and failures come back
 

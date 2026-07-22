@@ -18,9 +18,10 @@ fn normalize_forked_context_strips_project_layout() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let big_layout = "<project_layout>\nline1\nline2\nline3\n</project_layout>";
     let items = vec![
-        ConversationItem::system("sys"), ConversationItem::user(big_layout),
-        ConversationItem::assistant("ack"),
-    ];
+            ConversationItem::system("sys"),
+            ConversationItem::user(big_layout),
+            ConversationItem::assistant("ack"),
+        ];
     let (conv, _) = xai_grok_subagent_resolution::context::normalize_forked_context(
         items,
     );
@@ -36,9 +37,10 @@ fn normalize_forked_context_strips_project_layout() {
             })
             .collect::<String>();
         assert!(
-            ! text.contains("<project_layout>"), "project_layout tag should be stripped"
-        );
-        assert!(! text.contains("line1"), "layout content should be removed");
+                !text.contains("<project_layout>"),
+                "project_layout tag should be stripped"
+            );
+        assert!(!text.contains("line1"), "layout content should be removed");
     } else {
         panic!("expected User at position 1");
     }
@@ -47,9 +49,11 @@ fn normalize_forked_context_strips_project_layout() {
 fn normalize_forked_context_consecutive_users() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let items = vec![
-        ConversationItem::system("sys"), ConversationItem::user("prefix"),
-        ConversationItem::user("query"), ConversationItem::assistant("response"),
-    ];
+            ConversationItem::system("sys"),
+            ConversationItem::user("prefix"),
+            ConversationItem::user("query"),
+            ConversationItem::assistant("response"),
+        ];
     let (conv, prefix_len) = xai_grok_subagent_resolution::context::normalize_forked_context(
         items,
     );
@@ -65,9 +69,18 @@ fn normalize_forked_context_consecutive_users() {
                 _ => None,
             })
             .collect::<String>();
-        assert!(text.contains("[User]: prefix"), "should include first user msg");
-        assert!(text.contains("[User]: query"), "should include second user msg");
-        assert!(text.contains("[Assistant]: response"), "should include assistant");
+        assert!(
+                text.contains("[User]: prefix"),
+                "should include first user msg"
+            );
+        assert!(
+                text.contains("[User]: query"),
+                "should include second user msg"
+            );
+        assert!(
+                text.contains("[Assistant]: response"),
+                "should include assistant"
+            );
     } else {
         panic!("expected User at position 1");
     }
@@ -80,11 +93,11 @@ fn normalize_forked_context_consecutive_users() {
 fn end_to_end_normalized_conversation_shape() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let parent_conv = vec![
-        ConversationItem::system("parent system prompt"),
-        ConversationItem::user("user prefix with project info"),
-        ConversationItem::user("implement quicksort"),
-        ConversationItem::assistant("here is quicksort"),
-    ];
+            ConversationItem::system("parent system prompt"),
+            ConversationItem::user("user prefix with project info"),
+            ConversationItem::user("implement quicksort"),
+            ConversationItem::assistant("here is quicksort"),
+        ];
     let (mut conv, prefix_len) = xai_grok_subagent_resolution::context::normalize_forked_context(
         parent_conv,
     );
@@ -96,7 +109,10 @@ fn end_to_end_normalized_conversation_shape() {
         panic!("expected System at position 0");
     }
     if let ConversationItem::System(ref sys) = conv[0] {
-        assert_eq!(sys.content.as_ref(), "child system prompt with tool guidance");
+        assert_eq!(
+                sys.content.as_ref(),
+                "child system prompt with tool guidance"
+            );
     }
     if let ConversationItem::User(ref u) = conv[1] {
         let text = u
@@ -142,9 +158,10 @@ fn end_to_end_normalized_conversation_shape() {
 fn cached_prompt_text_is_task_not_background() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let parent_conv = vec![
-        ConversationItem::system("sys"), ConversationItem::user("parent query"),
-        ConversationItem::assistant("parent answer"),
-    ];
+            ConversationItem::system("sys"),
+            ConversationItem::user("parent query"),
+            ConversationItem::assistant("parent answer"),
+        ];
     let (conv, _) = xai_grok_subagent_resolution::context::normalize_forked_context(
         parent_conv,
     );
@@ -164,22 +181,23 @@ fn cached_prompt_text_is_task_not_background() {
     let task_prompt = "fix the failing test in src/lib.rs";
     assert_ne!(task_prompt, background_text.trim());
     assert!(
-        ! background_text.contains(task_prompt),
-        "background should not contain the task prompt"
-    );
+            !background_text.contains(task_prompt),
+            "background should not contain the task prompt"
+        );
     assert!(
-        background_text.contains("<background_context>"),
-        "background should be the inherited context"
-    );
+            background_text.contains("<background_context>"),
+            "background should be the inherited context"
+        );
 }
 /// Verify extract_last_real_user_query would return the task.
 #[test]
 fn last_user_message_is_task_after_normalization() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let parent_conv = vec![
-        ConversationItem::system("sys"), ConversationItem::user("parent context"),
-        ConversationItem::assistant("ack"),
-    ];
+            ConversationItem::system("sys"),
+            ConversationItem::user("parent context"),
+            ConversationItem::assistant("ack"),
+        ];
     let (mut conv, _) = xai_grok_subagent_resolution::context::normalize_forked_context(
         parent_conv,
     );
@@ -206,9 +224,10 @@ fn last_user_message_is_task_after_normalization() {
             }
         });
     assert_eq!(
-        last_user.as_deref(), Some(task),
-        "last user message should be the task, not background context"
-    );
+            last_user.as_deref(),
+            Some(task),
+            "last user message should be the task, not background context"
+        );
 }
 /// Simulate compaction preserving the inherited prefix.
 /// The compactor produces [System, UserPrefix, Summary, ...]. The prefix
@@ -219,10 +238,10 @@ fn last_user_message_is_task_after_normalization() {
 fn compaction_preserves_inherited_prefix() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let parent_conv = vec![
-        ConversationItem::system("parent sys"),
-        ConversationItem::user("parent question"),
-        ConversationItem::assistant("parent answer"),
-    ];
+            ConversationItem::system("parent sys"),
+            ConversationItem::user("parent question"),
+            ConversationItem::assistant("parent answer"),
+        ];
     let (conv, prefix_len) = xai_grok_subagent_resolution::context::normalize_forked_context(
         parent_conv,
     );
@@ -234,10 +253,10 @@ fn compaction_preserves_inherited_prefix() {
     full_conv.push(ConversationItem::user("do the thing"));
     full_conv.push(ConversationItem::assistant("done"));
     let compacted_history = vec![
-        ConversationItem::system("fresh system prompt after compaction"),
-        ConversationItem::user("user prefix"),
-        ConversationItem::user("<compacted_summary>summary of work</compacted_summary>"),
-    ];
+            ConversationItem::system("fresh system prompt after compaction"),
+            ConversationItem::user("user prefix"),
+            ConversationItem::user("<compacted_summary>summary of work</compacted_summary>"),
+        ];
     let inherited: Vec<_> = full_conv[..prefix_len].to_vec();
     let child_items: Vec<_> = compacted_history
         .into_iter()
@@ -264,9 +283,9 @@ fn compaction_preserves_inherited_prefix() {
             .collect::<Vec<_>>()
             .join("");
         assert!(
-            text.contains("<background_context>"),
-            "background context should be preserved across compaction"
-        );
+                text.contains("<background_context>"),
+                "background context should be preserved across compaction"
+            );
     } else {
         panic!("expected BackgroundContext User at [1]");
     }
@@ -274,7 +293,10 @@ fn compaction_preserves_inherited_prefix() {
         .iter()
         .filter(|i| matches!(i, ConversationItem::System(_)))
         .count();
-    assert_eq!(system_count, 1, "should have exactly one System after compaction");
+    assert_eq!(
+            system_count, 1,
+            "should have exactly one System after compaction"
+        );
     let bg_count = preserved
         .iter()
         .filter(|i| {
@@ -283,10 +305,9 @@ fn compaction_preserves_inherited_prefix() {
                     .iter()
                     .any(|p| {
                         matches!(
-                            p, xai_grok_sampling_types::conversation::ContentPart::Text {
-                            text }
-if text.contains("<background_context>")
-                        )
+                    p,
+                    xai_grok_sampling_types::conversation::ContentPart::Text { text } if text.contains("<background_context>")
+                )
                     })
             } else {
                 false
@@ -294,16 +315,18 @@ if text.contains("<background_context>")
         })
         .count();
     assert_eq!(
-        bg_count, 1, "should have exactly one background_context after compaction"
-    );
+            bg_count, 1,
+            "should have exactly one background_context after compaction"
+        );
 }
 /// Verify that compaction with prefix_len=0 (non-forked) passes through unchanged.
 #[test]
 fn compaction_no_prefix_passes_through() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let compacted = vec![
-        ConversationItem::system("sys"), ConversationItem::user("summary"),
-    ];
+            ConversationItem::system("sys"),
+            ConversationItem::user("summary"),
+        ];
     let prefix_len: usize = 0;
     let result = if prefix_len > 0 { unreachable!() } else { compacted.clone() };
     assert_eq!(result.len(), 2);
@@ -313,18 +336,20 @@ fn compaction_no_prefix_passes_through() {
 fn resumable_source_returns_none_for_unknown_id() {
     let coordinator = SubagentCoordinator::new();
     assert!(
-        coordinator.resumable_source_for("unknown", "parent", Path::new("/tmp"))
-        .is_none()
-    );
+            coordinator
+                .resumable_source_for("unknown", "parent", Path::new("/tmp"))
+                .is_none()
+        );
 }
 #[test]
 fn resumable_source_returns_none_for_active_subagent() {
     let coordinator = SubagentCoordinator::new();
-    assert!(! coordinator.is_active("active-id"));
+    assert!(!coordinator.is_active("active-id"));
     assert!(
-        coordinator.resumable_source_for("active-id", "parent", Path::new("/tmp"))
-        .is_none()
-    );
+            coordinator
+                .resumable_source_for("active-id", "parent", Path::new("/tmp"))
+                .is_none()
+        );
 }
 #[test]
 fn resumable_source_returns_info_for_completed_subagent() {
@@ -370,7 +395,10 @@ fn resumable_source_returns_info_for_completed_subagent() {
     assert_eq!(info.subagent_id, "sub-resume");
     assert_eq!(info.child_session_id, "child-resume");
     assert_eq!(info.child_cwd, "/workspace");
-    assert_eq!(info.worktree_path.as_deref(), Some(Path::new("/tmp/worktree-1")));
+    assert_eq!(
+            info.worktree_path.as_deref(),
+            Some(Path::new("/tmp/worktree-1"))
+        );
     assert_eq!(info.subagent_type, "general-purpose");
     assert_eq!(info.persona.as_deref(), Some("implementer"));
 }
@@ -476,7 +504,10 @@ fn resumed_from_none_not_serialized_in_meta() {
         model_route: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
-    assert!(! json.contains("resumed_from"), "None resumed_from should be omitted");
+    assert!(
+            !json.contains("resumed_from"),
+            "None resumed_from should be omitted"
+        );
 }
 #[test]
 fn backward_compat_meta_without_resumed_from() {
@@ -578,7 +609,10 @@ fn snapshot_test_meta(id: &str) -> SubagentMeta {
 #[test]
 fn update_subagent_meta_snapshot_ref_persists_to_disk() {
     let dir = tempfile::TempDir::new().unwrap();
-    assert!(write_subagent_meta(dir.path(), & snapshot_test_meta("sa-write")));
+    assert!(write_subagent_meta(
+            dir.path(),
+            &snapshot_test_meta("sa-write")
+        ));
     assert!(
         update_subagent_meta_snapshot_ref(dir.path(), "refs/open-grok/subagents/sa-write",
         "completed"), "persisting the ref into an existing meta.json must report success"
@@ -587,7 +621,10 @@ fn update_subagent_meta_snapshot_ref_persists_to_disk() {
     let reread: SubagentMeta = serde_json::from_str(&data).unwrap();
     assert_eq!(reread.snapshot_ref.as_deref(), Some("refs/open-grok/subagents/sa-write"));
     assert_eq!(reread.status, "completed");
-    assert_eq!(reread.worktree_path.as_deref(), Some("/tmp/grok-wt/subagent-x"));
+    assert_eq!(
+            reread.worktree_path.as_deref(),
+            Some("/tmp/grok-wt/subagent-x")
+        );
 }
 /// Missing meta.json → the writer reports failure (it `warn!`s), so the
 /// completion path keeps the worktree instead of removing it ref-less.
@@ -653,16 +690,17 @@ fn set_completed_snapshot_ref_unknown_id_is_noop() {
     let mut coordinator = SubagentCoordinator::new();
     coordinator.set_completed_snapshot_ref("ghost", "refs/open-grok/subagents/ghost".into());
     assert!(
-        coordinator.resumable_source_for("ghost", "session-A", Path::new("/tmp"))
-        .is_none()
-    );
+            coordinator
+                .resumable_source_for("ghost", "session-A", Path::new("/tmp"))
+                .is_none()
+        );
 }
 /// Gate defaults OFF: no config, no remote → snapshotting disabled, so the
 /// completion path keeps the worktree preserved (no production change).
 #[test]
 fn subagent_worktree_snapshot_gate_defaults_off() {
     let ctx = ctx_with_toggle(std::collections::HashMap::new());
-    assert!(! ctx.resolve_subagent_worktree_snapshot_enabled());
+    assert!(!ctx.resolve_subagent_worktree_snapshot_enabled());
 }
 /// Remote remote settings value enables the gate when no local override exists.
 #[test]
@@ -686,9 +724,9 @@ fn subagent_worktree_snapshot_gate_local_overrides_remote() {
         ..Default::default()
     });
     assert!(
-        ! ctx.resolve_subagent_worktree_snapshot_enabled(),
-        "local [features] subagent_worktree_snapshot=false must override remote enable"
-    );
+            !ctx.resolve_subagent_worktree_snapshot_enabled(),
+            "local [features] subagent_worktree_snapshot=false must override remote enable"
+        );
 }
 /// Local config alone enables the gate (the per-deployment rollout lever).
 #[test]
@@ -712,8 +750,8 @@ fn subagent_tool_params_carry_ask_user_question_timeouts() {
     let ask = params
         .ask_user_question
         .expect("subagents must receive resolved ask_user_question params");
-    assert!(ask.get("timeout_enabled").is_some_and(| v | v.is_boolean()));
-    assert!(ask.get("timeout_secs").is_some_and(| v | v.is_u64()));
+    assert!(ask.get("timeout_enabled").is_some_and(|v| v.is_boolean()));
+    assert!(ask.get("timeout_secs").is_some_and(|v| v.is_u64()));
 }
 /// Seed a coordinator with one completed subagent owned by `session-A`.
 fn coordinator_with_completed(id: &str) -> SubagentCoordinator {
@@ -743,10 +781,11 @@ async fn loop_unit_active_tracks_and_prunes_owned_subagents() {
         );
     coordinator.record_loop_owner("iter-1", "task-42");
     assert!(coordinator.loop_unit_active("task-42"));
-    assert!(! coordinator.loop_unit_active("other-task"));
+    assert!(!coordinator.loop_unit_active("other-task"));
     assert_eq!(
-        coordinator.loop_task_id_of_child_session("iter-1"), Some("task-42".to_string())
-    );
+            coordinator.loop_task_id_of_child_session("iter-1"),
+            Some("task-42".to_string())
+        );
     assert_eq!(coordinator.loop_task_id_of_child_session("unknown"), None);
     coordinator
         .move_to_completed(
@@ -761,7 +800,7 @@ async fn loop_unit_active_tracks_and_prunes_owned_subagents() {
             },
             None,
         );
-    assert!(! coordinator.loop_unit_active("task-42"));
+    assert!(!coordinator.loop_unit_active("task-42"));
 }
 /// End-to-end glue: gate ON + a worktree present runs the completion
 /// sequence (snapshot → persist ref to meta.json AND in-memory → remove)
@@ -798,7 +837,11 @@ async fn completion_snapshot_sequence_persists_ref_then_removes_worktree() {
         )
         .await
         .unwrap();
-    assert!(update_subagent_meta_snapshot_ref(& meta_dir, & snapshot_ref, "completed"));
+    assert!(update_subagent_meta_snapshot_ref(
+            &meta_dir,
+            &snapshot_ref,
+            "completed"
+        ));
     coordinator.set_completed_snapshot_ref("glue-1", snapshot_ref);
     crate::session::worktree::remove_subagent_worktree(&wt).await.unwrap();
     let data = std::fs::read_to_string(meta_dir.join("meta.json")).unwrap();
@@ -808,7 +851,10 @@ async fn completion_snapshot_sequence_persists_ref_then_removes_worktree() {
         .resumable_source_for("glue-1", "session-A", Path::new("/tmp"))
         .unwrap();
     assert_eq!(src.snapshot_ref.as_deref(), Some(ref_name));
-    assert!(! wt.exists(), "worktree dir should be removed after the sequence");
+    assert!(
+            !wt.exists(),
+            "worktree dir should be removed after the sequence"
+        );
 }
 /// With snapshot-dispose on, completion clears the model-facing
 /// `result.worktree_path` (the dir is removed) while resume still recovers
@@ -864,7 +910,10 @@ async fn gate_on_completion_retains_worktree_path_when_not_removed() {
     coordinator
         .move_to_completed("keep-1", "task".into(), "explore".into(), result, None);
     let entry = coordinator.completed.get("keep-1").expect("completed entry");
-    assert_eq!(Some(wt.to_string_lossy().into_owned()), entry.result.worktree_path);
+    assert_eq!(
+            Some(wt.to_string_lossy().into_owned()),
+            entry.result.worktree_path
+        );
 }
 /// Teardown ordering invariant: disposal (snapshot -> persist -> remove) runs
 /// BEFORE the subagent is made observable, so the first completed-map entry
@@ -897,11 +946,18 @@ async fn disposal_completes_before_subagent_is_observable() {
         )
         .await
         .unwrap();
-    assert!(update_subagent_meta_snapshot_ref(& meta_dir, & snapshot_ref, "completed"));
+    assert!(update_subagent_meta_snapshot_ref(
+            &meta_dir,
+            &snapshot_ref,
+            "completed"
+        ));
     let disposed_snapshot_ref = Some(snapshot_ref);
     crate::session::worktree::remove_subagent_worktree(&wt).await.unwrap();
-    assert!(! coordinator.completed.contains_key("order-1"));
-    assert!(! wt.exists(), "worktree must be removed before observability");
+    assert!(!coordinator.completed.contains_key("order-1"));
+    assert!(
+            !wt.exists(),
+            "worktree must be removed before observability"
+        );
     coordinator
         .move_to_completed(
             "order-1",
@@ -920,7 +976,7 @@ async fn disposal_completes_before_subagent_is_observable() {
     }
     let entry = coordinator.completed.get("order-1").expect("completed entry");
     assert_eq!(Some(ref_name), entry.snapshot_ref.as_deref());
-    assert!(! wt.exists());
+    assert!(!wt.exists());
 }
 /// Gate OFF: the completion path snapshots/removes nothing and records no
 /// ref, so the worktree is preserved for review (no production change).
@@ -928,13 +984,17 @@ async fn disposal_completes_before_subagent_is_observable() {
 async fn completion_gate_off_preserves_and_records_no_ref() {
     let ctx = ctx_with_toggle(std::collections::HashMap::new());
     assert!(
-        ! ctx.resolve_subagent_worktree_snapshot_enabled(), "default gate must be off"
-    );
+            !ctx.resolve_subagent_worktree_snapshot_enabled(),
+            "default gate must be off"
+        );
     let coordinator = coordinator_with_completed("glue-off");
     let src = coordinator
         .resumable_source_for("glue-off", "session-A", Path::new("/tmp"))
         .unwrap();
-    assert!(src.snapshot_ref.is_none(), "gate off must not record a snapshot ref");
+    assert!(
+            src.snapshot_ref.is_none(),
+            "gate off must not record a snapshot ref"
+        );
 }
 #[test]
 fn subagent_session_metadata_roundtrip() {
@@ -984,7 +1044,7 @@ fn subagent_session_metadata_roundtrip() {
     assert_eq!(session_meta.model_id.as_deref(), Some("grok-4.5"));
     assert_eq!(session_meta.role.as_deref(), Some("rust-dev"));
     assert_eq!(session_meta.persona.as_deref(), Some("reviewer"));
-    assert!(! session_meta.context_normalized);
+    assert!(!session_meta.context_normalized);
     assert_eq!(session_meta.depth, 1);
     let json = serde_json::to_string_pretty(&session_meta).unwrap();
     let deserialized: SubagentSessionMetadata = serde_json::from_str(&json).unwrap();
@@ -1039,7 +1099,7 @@ fn subagent_session_metadata_non_forked() {
         0,
     );
     assert_eq!(session_meta.session_kind, "subagent");
-    assert!(! session_meta.context_normalized);
+    assert!(!session_meta.context_normalized);
     assert_eq!(session_meta.depth, 0);
     assert!(session_meta.model_id.is_none());
     assert!(session_meta.worktree_path.is_none());
@@ -1062,7 +1122,7 @@ fn subagent_session_metadata_backward_compat_deserialization() {
     assert_eq!(meta.session_kind, "subagent");
     assert!(meta.persona.is_none());
     assert!(meta.role.is_none());
-    assert!(! meta.context_normalized);
+    assert!(!meta.context_normalized);
 }
 #[test]
 fn upload_lifecycle_spawn_then_completion_preserves_fields() {
@@ -1138,8 +1198,14 @@ fn upload_lifecycle_spawn_then_completion_preserves_fields() {
     assert_eq!(completion_gcs.model_id.as_deref(), Some("grok-4.5"));
     assert_eq!(completion_gcs.cwd.as_deref(), Some("/workspace"));
     assert_eq!(completion_gcs.role.as_deref(), Some("rust-dev"));
-    assert_eq!(completion_gcs.parent_prompt_id.as_deref(), Some("prompt-42"));
-    assert_eq!(completion_gcs.worktree_path.as_deref(), Some("/tmp/worktree-1"));
+    assert_eq!(
+            completion_gcs.parent_prompt_id.as_deref(),
+            Some("prompt-42")
+        );
+    assert_eq!(
+            completion_gcs.worktree_path.as_deref(),
+            Some("/tmp/worktree-1")
+        );
     assert_eq!(completion_gcs.depth, 1);
     assert_eq!(spawn_gcs.child_session_id, completion_gcs.child_session_id);
 }
@@ -1234,9 +1300,9 @@ fn session_metadata_session_kind_for_resumed() {
         0,
     );
     assert_eq!(
-        gcs.session_kind, "subagent_resume",
-        "resumed subagents should have session_kind=subagent_resume"
-    );
+            gcs.session_kind, "subagent_resume",
+            "resumed subagents should have session_kind=subagent_resume"
+        );
     assert_eq!(gcs.resumed_from.as_deref(), Some("prev-id"));
 }
 /// Resume must preserve only the System head (`Some(1)`) while passing the full
@@ -1254,10 +1320,15 @@ fn resume_initial_context_preserves_head_only() {
     assert_eq!(ctx.source, InitialContextSource::Resumed);
     assert!(ctx.copy_error.is_none());
     assert_eq!(
-        ctx.prefix_len, Some(1),
-        "resume preserves only the System head, not the full transcript"
-    );
-    assert_eq!(ctx.conversation.len(), original_len, "transcript preserved intact");
+            ctx.prefix_len,
+            Some(1),
+            "resume preserves only the System head, not the full transcript"
+        );
+    assert_eq!(
+            ctx.conversation.len(),
+            original_len,
+            "transcript preserved intact"
+        );
 }
 #[test]
 fn resume_prefix_len_is_system_head_only() {
@@ -1267,24 +1338,26 @@ fn resume_prefix_len_is_system_head_only() {
         conversation.push(ConversationItem::user(format!("u{i}")));
         conversation.push(ConversationItem::assistant(format!("a{i}")));
     }
-    assert_eq!(resume_inherited_prefix_len(& conversation), 1);
+    assert_eq!(resume_inherited_prefix_len(&conversation), 1);
 }
 #[test]
 fn resume_prefix_len_is_zero_without_system_head() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let conversation = vec![
-        ConversationItem::user("task"), ConversationItem::assistant("done"),
-    ];
-    assert_eq!(resume_inherited_prefix_len(& conversation), 0);
+            ConversationItem::user("task"),
+            ConversationItem::assistant("done"),
+        ];
+    assert_eq!(resume_inherited_prefix_len(&conversation), 0);
 }
 #[test]
 fn resume_prefix_len_counts_consecutive_system_head() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let conversation = vec![
-        ConversationItem::system("sys a"), ConversationItem::system("sys b"),
-        ConversationItem::user("work"),
-    ];
-    assert_eq!(resume_inherited_prefix_len(& conversation), 2);
+            ConversationItem::system("sys a"),
+            ConversationItem::system("sys b"),
+            ConversationItem::user("work"),
+        ];
+    assert_eq!(resume_inherited_prefix_len(&conversation), 2);
 }
 #[test]
 fn resume_source_worktree_reuse() {
@@ -1320,7 +1393,10 @@ fn resume_source_worktree_reuse() {
         model_id: None,
         model_route: None,
     };
-    assert!(source_without_worktree.worktree_path.is_none(), "no worktree to reuse");
+    assert!(
+            source_without_worktree.worktree_path.is_none(),
+            "no worktree to reuse"
+        );
 }
 #[test]
 fn resolve_child_cwd_uses_override_when_no_worktree() {
@@ -1363,18 +1439,21 @@ fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
         model_id: None,
         model_route: None,
     };
-    assert_eq!(resume_inherited_cwd(Some(& present)), Some(existing.as_str()));
+    assert_eq!(
+            resume_inherited_cwd(Some(&present)),
+            Some(existing.as_str())
+        );
     let missing = ResumeSourceData {
         child_cwd: "/no/such/dir/grok-missing".into(),
         ..present.clone()
     };
-    assert_eq!(resume_inherited_cwd(Some(& missing)), None);
+    assert_eq!(resume_inherited_cwd(Some(&missing)), None);
     let worktree_source = ResumeSourceData {
         child_cwd: existing.clone(),
         worktree_path: Some(dir.path().to_path_buf()),
         ..present.clone()
     };
-    assert_eq!(resume_inherited_cwd(Some(& worktree_source)), None);
+    assert_eq!(resume_inherited_cwd(Some(&worktree_source)), None);
     assert_eq!(resume_inherited_cwd(None), None);
 }
 #[test]
@@ -1393,7 +1472,7 @@ fn select_override_cwd_resume_never_falls_through_to_request_cwd() {
         model_id: None,
         model_route: None,
     };
-    assert_eq!(select_override_cwd(Some(& source), Some("/x")), None);
+    assert_eq!(select_override_cwd(Some(&source), Some("/x")), None);
 }
 #[test]
 fn select_override_cwd_fresh_spawn_uses_request_cwd() {
@@ -1435,13 +1514,16 @@ fn resumable_source_rejects_cross_session_lookup() {
             },
         );
     assert!(
-        coordinator.resumable_source_for("sub-other", "session-A", Path::new("/tmp"))
-        .is_some()
-    );
+            coordinator
+                .resumable_source_for("sub-other", "session-A", Path::new("/tmp"))
+                .is_some()
+        );
     assert!(
-        coordinator.resumable_source_for("sub-other", "session-B", Path::new("/tmp"))
-        .is_none(), "should reject resume from a different parent session"
-    );
+            coordinator
+                .resumable_source_for("sub-other", "session-B", Path::new("/tmp"))
+                .is_none(),
+            "should reject resume from a different parent session"
+        );
 }
 #[test]
 fn resumed_session_uses_current_runtime_contract() {
@@ -1458,7 +1540,7 @@ fn resumed_session_uses_current_runtime_contract() {
     match &conversation[0] {
         ConversationItem::System(sys) => {
             assert_eq!(sys.content.as_ref(), current_prompt);
-            assert!(! sys.content.contains("old source"));
+            assert!(!sys.content.contains("old source"));
         }
         _ => panic!("first item should be System"),
     }
@@ -1468,35 +1550,56 @@ fn resumed_session_uses_current_runtime_contract() {
 fn token_estimation_for_window_safety() {
     use xai_grok_sampling_types::conversation::ConversationItem;
     let conversation = vec![
-        ConversationItem::system("You are a helpful assistant."),
-        ConversationItem::user("Hello, how are you?"),
-        ConversationItem::assistant("I'm doing well, thank you!"),
-    ];
+            ConversationItem::system("You are a helpful assistant."),
+            ConversationItem::user("Hello, how are you?"),
+            ConversationItem::assistant("I'm doing well, thank you!"),
+        ];
     let estimated = xai_chat_state::estimate_conversation_tokens(&conversation);
     assert!(estimated > 0, "should produce non-zero estimate");
-    assert!(estimated < 100, "short conversation should have small token estimate");
-    assert_eq!(xai_chat_state::estimate_conversation_tokens(& []), 0);
+    assert!(
+            estimated < 100,
+            "short conversation should have small token estimate"
+        );
+    assert_eq!(xai_chat_state::estimate_conversation_tokens(&[]), 0);
 }
 #[test]
 fn token_estimation_accounts_for_images() {
     use xai_grok_sampling_types::conversation::{ContentPart, ConversationItem, UserItem};
-    let text_only = vec![
-        ConversationItem::User(UserItem { content : vec![ContentPart::Text { text :
-        "describe this".into(), }], synthetic_reason : None, ..Default::default() })
-    ];
+    let text_only = vec![ConversationItem::User(UserItem {
+            content: vec![ContentPart::Text {
+                text: "describe this".into(),
+            }],
+            synthetic_reason: None,
+            ..Default::default()
+        })];
     let text_tokens = xai_chat_state::estimate_conversation_tokens(&text_only);
-    let with_image = vec![
-        ConversationItem::User(UserItem { content : vec![ContentPart::Text { text :
-        "describe this".into(), }, ContentPart::Image { url : "data:image/png;base64,abc"
-        .into(), },], synthetic_reason : None, ..Default::default() })
-    ];
+    let with_image = vec![ConversationItem::User(UserItem {
+            content: vec![
+                ContentPart::Text {
+                    text: "describe this".into(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,abc".into(),
+                },
+            ],
+            synthetic_reason: None,
+            ..Default::default()
+        })];
     let image_tokens = xai_chat_state::estimate_conversation_tokens(&with_image);
-    assert_eq!(image_tokens, text_tokens + 765, "one image should add 765 tokens");
-    let multi_image = vec![
-        ConversationItem::User(UserItem { content : vec![ContentPart::Image { url :
-        "img1".into() }, ContentPart::Image { url : "img2".into() }, ContentPart::Image {
-        url : "img3".into() },], synthetic_reason : None, ..Default::default() })
-    ];
+    assert_eq!(
+            image_tokens,
+            text_tokens + 765,
+            "one image should add 765 tokens"
+        );
+    let multi_image = vec![ConversationItem::User(UserItem {
+            content: vec![
+                ContentPart::Image { url: "img1".into() },
+                ContentPart::Image { url: "img2".into() },
+                ContentPart::Image { url: "img3".into() },
+            ],
+            synthetic_reason: None,
+            ..Default::default()
+        })];
     let multi_tokens = xai_chat_state::estimate_conversation_tokens(&multi_image);
     assert_eq!(multi_tokens, 765 * 3, "three images = 3 * 765 tokens");
 }
@@ -1576,10 +1679,11 @@ fn durable_fallback_rejects_running_status() {
     write_subagent_meta(&parent_dir, &meta);
     let data = std::fs::read_to_string(parent_dir.join("meta.json")).unwrap();
     let loaded: SubagentMeta = serde_json::from_str(&data).unwrap();
-    let is_terminal = matches!(
-        loaded.status.as_str(), "completed" | "failed" | "cancelled"
-    );
-    assert!(! is_terminal, "status=running should NOT be considered terminal/resumable");
+    let is_terminal = matches!(loaded.status.as_str(), "completed" | "failed" | "cancelled");
+    assert!(
+            !is_terminal,
+            "status=running should NOT be considered terminal/resumable"
+        );
     let _ = std::fs::remove_dir_all(&dir);
 }
 /// Count persisted `SubagentFinished{status:"cancelled"}` for `id` on a
@@ -1679,7 +1783,10 @@ fn reconcile_orphan_flips_running_meta_to_cancelled() {
     assert!(reread.duration_ms.is_some(), "must stamp duration_ms");
     assert_eq!(reread.tool_calls, Some(0));
     assert_eq!(reread.turns, Some(0));
-    assert_eq!(reread.error.as_deref(), Some("interrupted by process restart"),);
+    assert_eq!(
+            reread.error.as_deref(),
+            Some("interrupted by process restart"),
+        );
 }
 #[tokio::test]
 async fn reconcile_orphan_skips_ids_in_live_registry() {
@@ -1699,7 +1806,10 @@ async fn reconcile_orphan_skips_ids_in_live_registry() {
     );
     let data = std::fs::read_to_string(sub_dir.join("meta.json")).unwrap();
     let reread: SubagentMeta = serde_json::from_str(&data).unwrap();
-    assert_eq!(reread.status, "running", "a live subagent must not be reconciled");
+    assert_eq!(
+            reread.status, "running",
+            "a live subagent must not be reconciled"
+        );
 }
 #[test]
 fn reconcile_orphan_skips_pending_ids_in_live_registry() {
@@ -1734,9 +1844,9 @@ fn reconcile_orphan_skips_pending_ids_in_live_registry() {
     let data = std::fs::read_to_string(sub_dir.join("meta.json")).unwrap();
     let reread: SubagentMeta = serde_json::from_str(&data).unwrap();
     assert_eq!(
-        reread.status, "running",
-        "a pending (initializing) subagent must not be reconciled"
-    );
+            reread.status, "running",
+            "a pending (initializing) subagent must not be reconciled"
+        );
 }
 #[test]
 fn reconcile_orphan_idempotent_on_terminal_meta() {
@@ -1761,10 +1871,13 @@ fn reconcile_orphan_idempotent_on_terminal_meta() {
         Some(&cmd_tx),
     );
     assert!(
-        cmd_rx.try_recv().is_err(),
-        "terminal meta must not persist a fresh SubagentFinished"
-    );
-    assert!(gateway_rx.try_recv().is_err(), "terminal meta must not broadcast");
+            cmd_rx.try_recv().is_err(),
+            "terminal meta must not persist a fresh SubagentFinished"
+        );
+    assert!(
+            gateway_rx.try_recv().is_err(),
+            "terminal meta must not broadcast"
+        );
 }
 #[test]
 fn reconcile_orphan_ignores_other_parent_session() {
@@ -1783,7 +1896,10 @@ fn reconcile_orphan_ignores_other_parent_session() {
     );
     let data = std::fs::read_to_string(sub_dir.join("meta.json")).unwrap();
     let reread: SubagentMeta = serde_json::from_str(&data).unwrap();
-    assert_eq!(reread.status, "running", "cross-parent meta must be left alone");
+    assert_eq!(
+            reread.status, "running",
+            "cross-parent meta must be left alone"
+        );
 }
 #[test]
 fn reconcile_orphan_skips_malformed_meta() {
@@ -1801,10 +1917,14 @@ fn reconcile_orphan_skips_malformed_meta() {
         &test_gateway(),
         Some(&cmd_tx),
     );
-    assert!(cmd_rx.try_recv().is_err(), "malformed meta must not emit a finish");
+    assert!(
+            cmd_rx.try_recv().is_err(),
+            "malformed meta must not emit a finish"
+        );
     assert_eq!(
-        std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(), "{not valid json"
-    );
+            std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
+            "{not valid json"
+        );
 }
 #[test]
 fn reconcile_orphan_noop_on_missing_subagents_dir() {
@@ -1835,7 +1955,7 @@ fn reconcile_replayed_orphan_emits_finish_for_inherited_orphan() {
         &test_gateway(),
         Some(&cmd_tx),
     );
-    assert_eq!(drain_cancelled_finish_cmds(& mut cmd_rx, "sa-inherited"), 1);
+    assert_eq!(drain_cancelled_finish_cmds(&mut cmd_rx, "sa-inherited"), 1);
 }
 #[test]
 fn reconcile_replayed_orphan_uses_real_terminal_status_from_meta() {
@@ -1913,9 +2033,10 @@ async fn reconcile_reemits_rewound_finish_even_when_id_still_in_completed_regist
         }
     }
     assert_eq!(
-        found, Some("completed".to_string()),
-        "a completed-then-rewound subagent must re-emit its real finish, not be skipped"
-    );
+            found,
+            Some("completed".to_string()),
+            "a completed-then-rewound subagent must re-emit its real finish, not be skipped"
+        );
 }
 #[tokio::test]
 async fn reconcile_reemits_real_outcome_for_completed_with_running_meta() {
@@ -1956,16 +2077,18 @@ async fn reconcile_reemits_real_outcome_for_completed_with_running_meta() {
         }
     }
     assert_eq!(
-        found, Some("completed".to_string()),
-        "must re-emit the real terminal outcome, not cancel"
-    );
+            found,
+            Some("completed".to_string()),
+            "must re-emit the real terminal outcome, not cancel"
+        );
     let reread: SubagentMeta = serde_json::from_str(
             &std::fs::read_to_string(sub_dir.join("meta.json")).unwrap(),
         )
         .unwrap();
     assert_eq!(
-        reread.status, "running", "must not finalize a completed subagent as cancelled"
-    );
+            reread.status, "running",
+            "must not finalize a completed subagent as cancelled"
+        );
 }
 #[test]
 fn reconcile_dedups_orphan_present_in_both_sources() {
@@ -1984,9 +2107,10 @@ fn reconcile_dedups_orphan_present_in_both_sources() {
         Some(&cmd_tx),
     );
     assert_eq!(
-        drain_cancelled_finish_cmds(& mut cmd_rx, "sa-crash"), 1,
-        "an orphan in both sources is healed exactly once"
-    );
+            drain_cancelled_finish_cmds(&mut cmd_rx, "sa-crash"),
+            1,
+            "an orphan in both sources is healed exactly once"
+        );
 }
 #[test]
 fn reconcile_orphan_persists_subagent_finished_via_cmd_tx() {
@@ -2007,13 +2131,15 @@ fn reconcile_orphan_persists_subagent_finished_via_cmd_tx() {
         Some(&cmd_tx),
     );
     assert_eq!(
-        drain_cancelled_finish_cmds(& mut cmd_rx, id), 1,
-        "must persist exactly one SubagentFinished via parent_cmd_tx"
-    );
+            drain_cancelled_finish_cmds(&mut cmd_rx, id),
+            1,
+            "must persist exactly one SubagentFinished via parent_cmd_tx"
+        );
     assert_eq!(
-        drain_cancelled_finish_broadcasts(& mut gateway_rx, id), 1,
-        "must broadcast exactly one SubagentFinished via gateway"
-    );
+            drain_cancelled_finish_broadcasts(&mut gateway_rx, id),
+            1,
+            "must broadcast exactly one SubagentFinished via gateway"
+        );
 }
 #[test]
 fn resume_rejects_conflicting_subagent_type() {
@@ -2031,8 +2157,9 @@ fn resume_rejects_conflicting_subagent_type() {
     };
     let request_type = "explore";
     assert_ne!(
-        request_type, source.subagent_type, "conflicting types should be detected"
-    );
+            request_type, source.subagent_type,
+            "conflicting types should be detected"
+        );
 }
 #[test]
 fn resume_rejects_conflicting_persona() {
@@ -2085,13 +2212,18 @@ fn resume_identity_does_not_gate_on_model() {
         model_route: None,
     };
     assert!(
-        xai_grok_subagent_resolution::validate_resume_identity("general-purpose", None, &
-        source,).is_ok()
-    );
+            xai_grok_subagent_resolution::validate_resume_identity(
+                "general-purpose",
+                None,
+                &source,
+            )
+            .is_ok()
+        );
     assert_eq!(
-        source.model_id.as_deref(), Some("grok-3"),
-        "source model remains available for pinning"
-    );
+            source.model_id.as_deref(),
+            Some("grok-3"),
+            "source model remains available for pinning"
+        );
 }
 #[test]
 fn durable_meta_roundtrips_effective_model_id() {
@@ -2147,7 +2279,10 @@ fn resume_model_pinning_overrides_default_resolution() {
     let source_model = Some("grok-3".to_string());
     let resolved_model = "grok-light";
     let needs_pin = source_model.as_deref() != Some(resolved_model);
-    assert!(needs_pin, "resolved model differs from source — pinning should trigger");
+    assert!(
+            needs_pin,
+            "resolved model differs from source — pinning should trigger"
+        );
     let resolved_same = "grok-3";
     let no_pin = source_model.as_deref() == Some(resolved_same);
     assert!(no_pin, "same model — no pinning needed");
@@ -2210,13 +2345,14 @@ fn resume_window_safety_rejects_instead_of_swapping() {
     const SAFE_RESUME_PERCENT: u64 = 80;
     let threshold = child_window * SAFE_RESUME_PERCENT / 100;
     assert!(
-        estimated_tokens <= threshold, "100k tokens should be within 80% of 256k window"
-    );
+            estimated_tokens <= threshold,
+            "100k tokens should be within 80% of 256k window"
+        );
     let large_transcript: u64 = 210_000;
     assert!(
-        large_transcript > threshold,
-        "210k tokens exceeds 80% of 256k window — resume should be rejected"
-    );
+            large_transcript > threshold,
+            "210k tokens exceeds 80% of 256k window — resume should be rejected"
+        );
 }
 #[test]
 fn provenance_carries_resumed_from() {
@@ -2411,7 +2547,7 @@ fn drain_pending_completions_returns_and_clears() {
             },
             None,
         );
-    let summaries = coordinator.drain_pending_completions();
+    let summaries = coordinator.drain_pending_completions_for("");
     assert_eq!(summaries.len(), 2);
     assert_eq!(summaries[0].subagent_id, "sub-d1");
     assert!(summaries[0].success);
@@ -2421,8 +2557,8 @@ fn drain_pending_completions_returns_and_clears() {
     assert_eq!(summaries[0].turns, 2);
     assert_eq!(summaries[0].duration_ms, 500);
     assert_eq!(summaries[1].subagent_id, "sub-d2");
-    assert!(! summaries[1].success);
-    let again = coordinator.drain_pending_completions();
+    assert!(!summaries[1].success);
+    let again = coordinator.drain_pending_completions_for("");
     assert!(again.is_empty(), "buffer should be empty after drain");
 }
 #[test]
@@ -2443,11 +2579,12 @@ fn drain_pending_completions_cancelled_is_not_success() {
             },
             None,
         );
-    let summaries = coordinator.drain_pending_completions();
+    let summaries = coordinator.drain_pending_completions_for("");
     assert_eq!(summaries.len(), 1);
     assert!(
-        ! summaries[0].success, "cancelled subagent should not be marked as success"
-    );
+            !summaries[0].success,
+            "cancelled subagent should not be marked as success"
+        );
 }
 #[tokio::test]
 async fn outstanding_for_prompt_includes_pending_and_active() {
@@ -2475,8 +2612,8 @@ async fn outstanding_for_prompt_includes_pending_and_active() {
     coordinator.insert(tracker2);
     let outstanding = coordinator.outstanding_for_prompt("prompt-X");
     assert_eq!(outstanding.len(), 2);
-    assert!(outstanding.contains(& "sub-p1".to_string()));
-    assert!(outstanding.contains(& "sub-a1".to_string()));
+    assert!(outstanding.contains(&"sub-p1".to_string()));
+    assert!(outstanding.contains(&"sub-a1".to_string()));
 }
 #[tokio::test]
 async fn outstanding_for_prompt_excludes_completed() {
@@ -2500,8 +2637,9 @@ async fn outstanding_for_prompt_excludes_completed() {
         );
     let outstanding = coordinator.outstanding_for_prompt("prompt-X");
     assert!(
-        outstanding.is_empty(), "completed subagents should not appear in outstanding"
-    );
+            outstanding.is_empty(),
+            "completed subagents should not appear in outstanding"
+        );
 }
 #[test]
 fn outstanding_for_prompt_returns_empty_for_unknown_prompt() {
@@ -2523,11 +2661,12 @@ async fn background_children_do_not_gate_the_drain() {
     fg.parent_prompt_id = Some("prompt-X".to_string());
     coordinator.insert(fg);
     assert_eq!(
-        coordinator.outstanding_for_prompt("prompt-X"), vec!["sub-fg".to_string()],
-        "only the foreground child gates the drain"
-    );
+            coordinator.outstanding_for_prompt("prompt-X"),
+            vec!["sub-fg".to_string()],
+            "only the foreground child gates the drain"
+        );
     assert!(coordinator.background_live_for_prompt("prompt-X"));
-    assert!(! coordinator.background_live_for_prompt("prompt-Y"));
+    assert!(!coordinator.background_live_for_prompt("prompt-Y"));
     coordinator.mark_backgrounded("sub-fg");
     assert!(coordinator.outstanding_for_prompt("prompt-X").is_empty());
     assert!(coordinator.background_live_for_prompt("prompt-X"));
@@ -2555,12 +2694,12 @@ async fn subagent_usage_not_applied_sticky_after_completion_and_is_prompt_scoped
         );
     assert!(coordinator.outstanding_for_prompt("p-1").is_empty());
     assert!(coordinator.subagent_usage_not_applied("p-1"));
-    assert!(! coordinator.subagent_usage_not_applied("p-2"));
+    assert!(!coordinator.subagent_usage_not_applied("p-2"));
     let reply = coordinator.outstanding_reply_for_prompt("p-1");
     assert!(reply.live_ids.is_empty());
     assert!(reply.subagent_usage_not_applied);
     coordinator.clear_subagent_usage_not_applied("p-1");
-    assert!(! coordinator.subagent_usage_not_applied("p-1"));
+    assert!(!coordinator.subagent_usage_not_applied("p-1"));
 }
 #[test]
 fn outstanding_for_prompt_returns_sorted_ids() {
@@ -2601,22 +2740,22 @@ fn outstanding_for_prompt_returns_sorted_ids() {
 #[test]
 fn turn_active_flag_defaults_to_false() {
     let coordinator = SubagentCoordinator::new();
-    assert!(! coordinator.is_turn_active());
+    assert!(!coordinator.is_turn_active());
 }
 #[test]
 fn turn_active_flag_shared_via_arc() {
     let coordinator = SubagentCoordinator::new();
     let flag = coordinator.turn_active_flag();
-    assert!(! flag.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
     flag.store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(coordinator.is_turn_active());
     flag.store(false, std::sync::atomic::Ordering::Relaxed);
-    assert!(! coordinator.is_turn_active());
+    assert!(!coordinator.is_turn_active());
 }
 #[test]
 fn completions_buffered_while_turn_inactive_drained_later() {
     let mut coordinator = SubagentCoordinator::new();
-    assert!(! coordinator.is_turn_active());
+    assert!(!coordinator.is_turn_active());
     coordinator
         .move_to_completed(
             "sub-idle",
@@ -2631,10 +2770,10 @@ fn completions_buffered_while_turn_inactive_drained_later() {
             },
             None,
         );
-    let drained = coordinator.drain_pending_completions();
+    let drained = coordinator.drain_pending_completions_for("");
     assert_eq!(drained.len(), 1);
     assert_eq!(drained[0].subagent_id, "sub-idle");
-    assert!(coordinator.drain_pending_completions().is_empty());
+    assert!(coordinator.drain_pending_completions_for("").is_empty());
 }
 fn ctx_with_parent_chat_state(
     session_model_id: &str,
@@ -2707,7 +2846,10 @@ async fn read_parent_sampling_config_ignores_global_default() {
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
     assert_eq!(config.model, "composer-2-fast");
     assert_eq!(model_id.0.as_ref(), "composer-2-fast");
-    assert_ne!(model_id.0.as_ref(), ctx.models_manager.current_model_id().0.as_ref(),);
+    assert_ne!(
+            model_id.0.as_ref(),
+            ctx.models_manager.current_model_id().0.as_ref(),
+        );
 }
 #[tokio::test]
 async fn read_parent_sampling_config_resolves_backend_search_from_catalog() {
@@ -2719,9 +2861,9 @@ async fn read_parent_sampling_config_resolves_backend_search_from_catalog() {
     ctx.sampling_config.supports_backend_search = false;
     let (config, _model_id) = read_parent_sampling_config(&ctx).await;
     assert!(
-        config.supports_backend_search,
-        "subagent should inherit backend-tools capability from the live model catalog"
-    );
+            config.supports_backend_search,
+            "subagent should inherit backend-tools capability from the live model catalog"
+        );
 }
 #[tokio::test]
 async fn read_parent_sampling_config_fallback_resolves_backend_search_from_catalog() {
@@ -2744,9 +2886,9 @@ async fn read_parent_sampling_config_fallback_resolves_backend_search_from_catal
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
     assert_eq!(model_id.0.as_ref(), "composer-2-fast");
     assert!(
-        config.supports_backend_search,
-        "fallback path should also resolve backend-tools capability from the catalog"
-    );
+            config.supports_backend_search,
+            "fallback path should also resolve backend-tools capability from the catalog"
+        );
 }
 #[tokio::test]
 async fn read_parent_sampling_config_resolves_compactions_remaining_from_catalog() {
@@ -2759,9 +2901,10 @@ async fn read_parent_sampling_config_resolves_compactions_remaining_from_catalog
     ctx.sampling_config.compactions_remaining = None;
     let (config, _model_id) = read_parent_sampling_config(&ctx).await;
     assert_eq!(
-        config.compactions_remaining, Some(CompactionsRemaining::Dynamic(true)),
-        "subagent should inherit compactions-remaining capability from the live model catalog"
-    );
+            config.compactions_remaining,
+            Some(CompactionsRemaining::Dynamic(true)),
+            "subagent should inherit compactions-remaining capability from the live model catalog"
+        );
 }
 #[tokio::test]
 async fn read_parent_sampling_config_fallback_resolves_compactions_remaining_from_catalog() {
@@ -2785,9 +2928,10 @@ async fn read_parent_sampling_config_fallback_resolves_compactions_remaining_fro
     let (config, model_id) = read_parent_sampling_config(&ctx).await;
     assert_eq!(model_id.0.as_ref(), "composer-2-fast");
     assert_eq!(
-        config.compactions_remaining, Some(CompactionsRemaining::Dynamic(true)),
-        "fallback path should also resolve compactions-remaining capability from the catalog"
-    );
+            config.compactions_remaining,
+            Some(CompactionsRemaining::Dynamic(true)),
+            "fallback path should also resolve compactions-remaining capability from the catalog"
+        );
 }
 #[tokio::test]
 async fn xai_parent_to_codex_child_uses_only_codex_credentials() {
@@ -2902,9 +3046,9 @@ async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
         )
         .await;
     assert_eq!(
-        config.model, "goal-model",
-        "the goal runtime override must win over the `[subagents.models]` pin",
-    );
+            config.model, "goal-model",
+            "the goal runtime override must win over the `[subagents.models]` pin",
+        );
     assert_eq!(model_id.0.as_ref(), "goal-model");
     let ctx = build_ctx();
     let (config, model_id) = resolve_effective_model_config(
@@ -2915,9 +3059,9 @@ async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
         )
         .await;
     assert_eq!(
-        config.model, "pinned-model",
-        "with no runtime override, the `[subagents.models]` pin wins",
-    );
+            config.model, "pinned-model",
+            "with no runtime override, the `[subagents.models]` pin wins",
+        );
     assert_eq!(model_id.0.as_ref(), "pinned-model");
     let ctx = build_ctx();
     let (config, _) = resolve_effective_model_config(
@@ -2928,8 +3072,9 @@ async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
         )
         .await;
     assert_eq!(
-        config.model, "pinned-model", "an unknown override falls through to the pin",
-    );
+            config.model, "pinned-model",
+            "an unknown override falls through to the pin",
+        );
 }
 /// A `fork_context = true` spawn must infer on the parent session model
 /// (`ctx.model_id`) for per-model radix reuse, even when a
@@ -2970,9 +3115,9 @@ async fn fork_context_pins_parent_model_over_overrides() {
         )
         .await;
     assert_eq!(
-        config.model, "parent-model",
-        "fork_context must pin the parent model over the [subagents.models] pin and agent-def override",
-    );
+            config.model, "parent-model",
+            "fork_context must pin the parent model over the [subagents.models] pin and agent-def override",
+        );
     assert_eq!(model_id.0.as_ref(), "parent-model");
     let ctx = build_ctx();
     let (config, model_id) = resolve_effective_model_config(
@@ -2983,9 +3128,9 @@ async fn fork_context_pins_parent_model_over_overrides() {
         )
         .await;
     assert_eq!(
-        config.model, "pinned-model",
-        "without the fork pin the [subagents.models] override wins",
-    );
+            config.model, "pinned-model",
+            "without the fork pin the [subagents.models] override wins",
+        );
     assert_eq!(model_id.0.as_ref(), "pinned-model");
 }
 /// With no explicit pin, the subagent inherits the parent model for any
@@ -3005,9 +3150,9 @@ async fn resolve_subagent_inherits_parent_model_without_pins() {
             )
             .await;
         assert_eq!(
-            config.model, parent_model,
-            "subagent must inherit parent model {parent_model:?} when no pin is set",
-        );
+                config.model, parent_model,
+                "subagent must inherit parent model {parent_model:?} when no pin is set",
+            );
         assert_eq!(model_id.0.as_ref(), parent_model);
     }
 }
@@ -3033,9 +3178,9 @@ async fn resolve_subagent_config_override_pin_applies_for_any_parent() {
             )
             .await;
         assert_eq!(
-            config.model, "pinned-model",
-            "config pin must win for parent {parent_model:?}",
-        );
+                config.model, "pinned-model",
+                "config pin must win for parent {parent_model:?}",
+            );
         assert_eq!(model_id.0.as_ref(), "pinned-model");
     }
 }
@@ -3151,9 +3296,9 @@ async fn subagent_override_provider_model_spawns_cache_only_credentials() {
         .await;
     assert_eq!(model_id.0.as_ref(), "proxied");
     assert_eq!(
-        config.api_key, None,
-        "a cold cache spawns with no key, never the parent session key"
-    );
+            config.api_key, None,
+            "a cold cache spawns with no key, never the parent session key"
+        );
     provider.ensure_fresh_token(None).await.rotated().unwrap();
     let (config, _) = resolve_subagent_sampling_config(
             "explore",
@@ -3187,11 +3332,14 @@ fn non_cursor_persona_injected_as_system_reminder() {
     use xai_grok_sampling_types::conversation::{ConversationItem, SyntheticReason};
     let persona = "You are a pragmatic implementer.";
     let mut conv = vec![
-        ConversationItem::system("sys"), ConversationItem::user("task"),
-    ];
+            ConversationItem::system("sys"),
+            ConversationItem::user("task"),
+        ];
     let mut prefix_len: usize = 2;
     let reminder = ConversationItem::system_reminder(
-        format!("<system-reminder>\n{persona}\n</system-reminder>"),
+        format!(
+            "<system-reminder>\n{persona}\n</system-reminder>"
+        ),
     );
     let insert_at = prefix_len.min(conv.len());
     conv.insert(insert_at, reminder);
@@ -3210,13 +3358,13 @@ fn non_cursor_persona_injected_as_system_reminder() {
                 _ => "",
             });
         assert!(
-            text.unwrap_or("").contains("<system-reminder>"),
-            "should use hyphen tag format"
-        );
+                text.unwrap_or("").contains("<system-reminder>"),
+                "should use hyphen tag format"
+            );
         assert!(
-            text.unwrap_or("").contains(persona),
-            "should contain the persona instructions"
-        );
+                text.unwrap_or("").contains(persona),
+                "should contain the persona instructions"
+            );
     } else {
         panic!("expected User variant for system_reminder");
     }
@@ -3227,23 +3375,28 @@ fn persona_injection_skipped_for_resumed() {
     let persona_instructions = Some("Be thorough.".to_string());
     let context_source = InitialContextSource::Resumed;
     let mut conv = vec![
-        ConversationItem::system("sys"), ConversationItem::user("old turn"),
-    ];
+            ConversationItem::system("sys"),
+            ConversationItem::user("old turn"),
+        ];
     let original_len = conv.len();
     let mut prefix_len = original_len;
     if context_source != InitialContextSource::Resumed
         && let Some(ref pi) = persona_instructions
     {
         let reminder = ConversationItem::system_reminder(
-            format!("<system-reminder>\n{pi}\n</system-reminder>"),
+            format!(
+                "<system-reminder>\n{pi}\n</system-reminder>"
+            ),
         );
         let insert_at = prefix_len.min(conv.len());
         conv.insert(insert_at, reminder);
         prefix_len += 1;
     }
     assert_eq!(
-        conv.len(), original_len, "resumed session should not get persona injected"
-    );
+            conv.len(),
+            original_len,
+            "resumed session should not get persona injected"
+        );
     assert_eq!(prefix_len, original_len, "prefix_len should be unchanged");
 }
 #[test]
@@ -3376,7 +3529,7 @@ fn filter_inheritance_all_passes_everything_through() {
         &xai_grok_agent::config::McpInheritance::All,
     );
     let result = result.expect("All should return Some");
-    assert_eq!(pool_names(& result), vec!["github", "linear", "slack"]);
+    assert_eq!(pool_names(&result), vec!["github", "linear", "slack"]);
 }
 #[test]
 fn filter_inheritance_none_returns_none() {
@@ -3397,7 +3550,7 @@ fn filter_inheritance_named_selects_specific_servers() {
         ),
     );
     let result = result.expect("Named should return Some");
-    assert_eq!(pool_names(& result), vec!["github", "slack"]);
+    assert_eq!(pool_names(&result), vec!["github", "slack"]);
 }
 #[test]
 fn filter_inheritance_except_excludes_specific_servers() {
@@ -3409,7 +3562,7 @@ fn filter_inheritance_except_excludes_specific_servers() {
         ),
     );
     let result = result.expect("Except should return Some");
-    assert_eq!(pool_names(& result), vec!["github", "slack"]);
+    assert_eq!(pool_names(&result), vec!["github", "slack"]);
 }
 #[test]
 fn filter_inheritance_named_empty_list_gives_empty_pool() {
@@ -3429,7 +3582,7 @@ fn filter_inheritance_except_empty_list_keeps_all() {
         &xai_grok_agent::config::McpInheritance::Except(vec![]),
     );
     let result = result.expect("Except([]) should return Some");
-    assert_eq!(pool_names(& result), vec!["github", "linear"]);
+    assert_eq!(pool_names(&result), vec!["github", "linear"]);
 }
 #[test]
 fn filter_inheritance_named_nonexistent_servers_ignored() {
@@ -3437,11 +3590,14 @@ fn filter_inheritance_named_nonexistent_servers_ignored() {
     let result = super::filter_pool_by_inheritance(
         pool,
         &xai_grok_agent::config::McpInheritance::Named(
-            vec!["nonexistent".into(), "github".into(),],
+            vec![
+                "nonexistent".into(),
+                "github".into(),
+            ],
         ),
     );
     let result = result.expect("Named should return Some");
-    assert_eq!(pool_names(& result), vec!["github"]);
+    assert_eq!(pool_names(&result), vec!["github"]);
 }
 #[test]
 fn filter_inheritance_except_nonexistent_servers_ignored() {
@@ -3451,7 +3607,7 @@ fn filter_inheritance_except_nonexistent_servers_ignored() {
         &xai_grok_agent::config::McpInheritance::Except(vec!["nonexistent".into()]),
     );
     let result = result.expect("Except should return Some");
-    assert_eq!(pool_names(& result), vec!["github", "linear"]);
+    assert_eq!(pool_names(&result), vec!["github", "linear"]);
 }
 #[test]
 fn filter_inheritance_named_all_nonexistent_gives_empty() {
@@ -3524,8 +3680,8 @@ fn skills_inherited_count_matches_parent_skills_len() {
     let inherit_skills = true;
     let parent_skills = Some(
         vec![
-            make_test_skill("codegen-conventions", None), make_test_skill("tui-release",
-            Some("my-plugin")),
+            make_test_skill("codegen-conventions", None),
+            make_test_skill("tui-release", Some("my-plugin")),
         ],
     );
     let count = if inherit_skills {
@@ -3541,13 +3697,13 @@ fn skills_inherited_count_matches_parent_skills_len() {
 fn goal_tick_cmd_tx_gates_on_goal_enabled() {
     let (tx, _rx) = mpsc::unbounded_channel::<SessionCommand>();
     assert!(
-        goal_tick_cmd_tx(true, Some(& tx)).is_some(),
-        "goal on + channel present must wire ticks",
-    );
+            goal_tick_cmd_tx(true, Some(&tx)).is_some(),
+            "goal on + channel present must wire ticks",
+        );
     assert!(
-        goal_tick_cmd_tx(false, Some(& tx)).is_none(),
-        "goal off must not pay the per-tick send",
-    );
+            goal_tick_cmd_tx(false, Some(&tx)).is_none(),
+            "goal off must not pay the per-tick send",
+        );
     assert!(goal_tick_cmd_tx(true, None).is_none());
     assert!(goal_tick_cmd_tx(false, None).is_none());
 }
@@ -3616,11 +3772,11 @@ fn strip_task_tools_honors_spawn_depth() {
         cfg.tools.iter().any(|tc| tc.kind == Some(ToolKind::Task))
     };
     let base = AgentDefinition::general_purpose().tool_config;
-    assert!(has_task(& base));
+    assert!(has_task(&base));
     let mut natural_child = base.clone();
-    assert!(strip_task_tools_at_max_depth(& mut natural_child, 1));
-    assert!(! has_task(& natural_child));
+    assert!(strip_task_tools_at_max_depth(&mut natural_child, 1));
+    assert!(!has_task(&natural_child));
     let mut loop_iteration = base.clone();
-    assert!(! strip_task_tools_at_max_depth(& mut loop_iteration, 0));
-    assert!(has_task(& loop_iteration));
+    assert!(!strip_task_tools_at_max_depth(&mut loop_iteration, 0));
+    assert!(has_task(&loop_iteration));
 }

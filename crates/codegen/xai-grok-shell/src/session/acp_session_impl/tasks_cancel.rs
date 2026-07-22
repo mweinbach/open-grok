@@ -611,6 +611,7 @@ impl SessionActor {
                 completion_kind: PromptCompletionKind::Rewound,
                 structured_output: None,
                 usage: None,
+                tool_overrides: self.effective_tool_overrides(),
             }));
             self.maybe_apply_pending_web_search_reload().await;
             return;
@@ -653,6 +654,13 @@ impl SessionActor {
                     structured_output: None,
                     usage: if is_running_turn {
                         cancelled_usage.clone()
+                    } else {
+                        None
+                    },
+                    // Only the running turn (idx 0) ran, so only it echoes a bound; a queued prompt
+                    // that never promoted attests nothing (like respond_removed_prompt).
+                    tool_overrides: if is_running_turn {
+                        self.effective_tool_overrides()
                     } else {
                         None
                     },
