@@ -538,7 +538,8 @@ impl ModelsManager {
     }
 
     /// Drop queried Kimi entries after its key is cleared. The embedded K3
-    /// entry remains available so the UI can accept a replacement key.
+    /// entry remains in the catalog, but is hidden from model pickers until a
+    /// replacement key is configured.
     pub(crate) fn clear_kimi_models(&self) -> bool {
         self.inner
             .kimi_catalog_generation
@@ -606,7 +607,8 @@ impl ModelsManager {
     }
 
     /// Drop queried Fireworks entries after its key is cleared. The embedded
-    /// curated entries remain available so the UI can accept a replacement key.
+    /// curated entries remain in the catalog, but are hidden from model pickers
+    /// until a replacement key is configured.
     pub(crate) fn clear_fireworks_models(&self) -> bool {
         self.inner
             .fireworks_catalog_generation
@@ -1655,9 +1657,11 @@ impl ModelsManager {
                 None => true,
                 Some(entry) => {
                     !entry.info.user_selectable
-                        || !entry
-                            .info
-                            .visible_for_provider_auth(has_xai_session, has_codex_session)
+                        || !model_available_for_provider_auth(
+                            entry,
+                            has_xai_session,
+                            has_codex_session,
+                        )
                 }
             }
         };
@@ -2241,8 +2245,7 @@ fn resolve_default_model_with_provider_auth(
     let visible: IndexMap<String, ModelEntry> = catalog
         .iter()
         .filter(|(_, e)| {
-            e.info
-                .visible_for_provider_auth(has_xai_session, has_codex_session)
+            model_available_for_provider_auth(e, has_xai_session, has_codex_session)
                 && e.info.user_selectable
         })
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -2353,13 +2356,37 @@ fn available_models_with_provider_auth(
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {
     let visible: IndexMap<String, ModelEntry> = catalog
         .iter()
-        .filter(|(_, e)| {
-            e.info
-                .visible_for_provider_auth(has_xai_session, has_codex_session)
-        })
+        .filter(|(_, e)| model_available_for_provider_auth(e, has_xai_session, has_codex_session))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     config::to_acp_model_info(&visible)
+}
+
+/// Whether a model's provider is usable with the credentials available now.
+/// OAuth-backed providers use their isolated login state; API-key-only
+/// providers must resolve a non-empty model-owned or provider-scoped key.
+fn model_available_for_provider_auth(
+    entry: &ModelEntry,
+    has_xai_session: bool,
+    has_codex_session: bool,
+) -> bool {
+    if !entry
+        .info
+        .visible_for_provider_auth(has_xai_session, has_codex_session)
+    {
+        return false;
+    }
+
+    match entry.info.provider.profile().session_auth {
+        xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly => {
+            resolve_credentials(entry, None)
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty())
+        }
+        xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession
+        | xai_grok_sampling_types::BuiltInSessionAuthKind::CodexOAuth => true,
+    }
 }
 
 /// Compiled glob matcher shared by `allowed_models`, `disabled_models`, and
@@ -4108,6 +4135,44 @@ mod tests {
         let codex_only = available_models_with_provider_auth(&catalog, false, true);
         assert!(!codex_only.contains_key(&acp::ModelId::new("xai-private")));
         assert!(codex_only.contains_key(&acp::ModelId::new("codex-private")));
+    }
+
+    #[test]
+    fn combined_catalog_hides_api_key_provider_without_credentials() {
+        let catalog = IndexMap::from([
+            (
+                "glm-keyless".to_string(),
+                fireworks_task_entry("glm-keyless", None),
+            ),
+            (
+                "glm-keyed".to_string(),
+                fireworks_task_entry("glm-keyed", Some("fw-key")),
+            ),
+        ]);
+
+        let available = available_models_with_provider_auth(&catalog, false, false);
+        assert!(!available.contains_key(&acp::ModelId::new("glm-keyless")));
+        assert!(available.contains_key(&acp::ModelId::new("glm-keyed")));
+    }
+
+    #[test]
+    fn default_resolution_skips_api_key_provider_without_credentials() {
+        let fallback = crate::models::default_model();
+        let catalog = IndexMap::from([
+            (
+                "glm-keyless".to_string(),
+                fireworks_task_entry("glm-keyless", None),
+            ),
+            (fallback.to_string(), make_model_entry(fallback)),
+        ]);
+        let mut cfg = config::Config::default();
+        cfg.models.default = Some("glm-keyless".to_string());
+
+        let (key, _, source) =
+            resolve_default_model_with_provider_auth(&cfg, &catalog, false, false);
+
+        assert_eq!(key, fallback);
+        assert_eq!(source, config::ConfigSource::Default);
     }
 
     // ── duplicate model slug re-keying (A/B experiment "auto" alias) ──
