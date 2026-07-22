@@ -70,12 +70,40 @@ fn decode_managed_toml(encoded: &str) -> Option<toml::Value> {
         .then_some(value)
 }
 
+/// Whether a managed-preferences plist for our domain exists on disk. Forced
+/// values materialize as admin-owned plists under `/Library/Managed
+/// Preferences` (domain-wide or per-user), so their absence means
+/// `CFPreferencesAppValueIsForced` cannot succeed — and skipping it avoids
+/// CFPreferences' first-use main-bundle resolution, which iterates the
+/// executable's entire parent directory (multi-second from a `target/debug/deps`
+/// with hundreds of thousands of entries; one process-spawn per test under
+/// nextest turns that into minutes).
+#[cfg(target_os = "macos")]
+fn managed_preferences_plist_exists() -> bool {
+    let root = std::path::Path::new("/Library/Managed Preferences");
+    let plist = format!("{MANAGED_PREFERENCES_DOMAIN}.plist");
+    if root.join(&plist).exists() {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    // Per-user forced prefs live one level down (`<root>/<user>/<domain>.plist`).
+    entries
+        .flatten()
+        .any(|user_dir| user_dir.path().join(&plist).exists())
+}
+
 /// The raw forced `requirements_toml_base64` MDM string via CoreFoundation, or
 /// `None`. macOS only.
 #[cfg(target_os = "macos")]
 fn read_forced_requirements() -> Option<String> {
     use core_foundation::base::{CFType, CFTypeRef, TCFType};
     use core_foundation::string::{CFString, CFStringRef};
+
+    if !managed_preferences_plist_exists() {
+        return None;
+    }
 
     // `CFPreferencesCopyAppValue` returns a +1 CFPropertyListRef (Copy rule).
     #[link(name = "CoreFoundation", kind = "framework")]
