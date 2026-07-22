@@ -291,52 +291,6 @@ impl BlockContent for ToolCallBlock {
 }
 
 impl ToolCallBlock {
-    /// Transfer timing data from another block of the same variant.
-    ///
-    /// Used when a running block is replaced with its completed version
-    /// (e.g., in `handle_tool_call_update` completion path). The new block
-    /// inherits `started_at` from the old block so `finish()` can compute
-    /// real elapsed time.
-    pub fn transfer_timing_from(&mut self, old: &ToolCallBlock) {
-        match (self, old) {
-            (ToolCallBlock::Execute(new), ToolCallBlock::Execute(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::Read(new), ToolCallBlock::Read(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::Edit(new), ToolCallBlock::Edit(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::Search(new), ToolCallBlock::Search(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::ListDir(new), ToolCallBlock::ListDir(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::WebFetch(new), ToolCallBlock::WebFetch(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::WebSearch(new), ToolCallBlock::WebSearch(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::IntegrationSearch(new), ToolCallBlock::IntegrationSearch(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::UseTool(new), ToolCallBlock::UseTool(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::Skill(new), ToolCallBlock::Skill(old)) => {
-                new.started_at = old.started_at;
-            }
-            (ToolCallBlock::Other(new), ToolCallBlock::Other(old)) => {
-                new.started_at = old.started_at;
-            }
-            // Variant mismatch (shouldn't happen in practice) — skip.
-            _ => {}
-        }
-    }
-
     /// Whether the tool call finished without an error.
     pub fn is_success(&self) -> bool {
         match self {
@@ -358,9 +312,8 @@ impl ToolCallBlock {
 
     /// Set `started_at` on the inner variant block.
     ///
-    /// Unlike `transfer_timing_from`, this works across variant boundaries
-    /// (e.g. setting `started_at` on a `Search` block from a value captured
-    /// when the block was still `Other`).
+    /// This works across variant boundaries (e.g. setting `started_at` on a
+    /// `Search` block from a value captured when the block was still `Other`).
     pub fn set_started_at(&mut self, instant: std::time::Instant) {
         match self {
             ToolCallBlock::Execute(b) => b.started_at = Some(instant),

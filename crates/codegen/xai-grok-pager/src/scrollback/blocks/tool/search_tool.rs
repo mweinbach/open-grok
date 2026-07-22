@@ -72,24 +72,6 @@ impl SearchToolCallBlock {
         self.error.is_none()
     }
 
-    pub fn set_error(&mut self, error: Option<String>) {
-        if self.elapsed_ms.is_none()
-            && let Some(start) = self.started_at
-        {
-            self.elapsed_ms = Some(start.elapsed().as_millis() as i64);
-        }
-        self.error = error;
-    }
-
-    pub fn finish(&mut self) {
-        if self.elapsed_ms.is_some() {
-            return;
-        }
-        if let Some(start) = self.started_at {
-            self.elapsed_ms = Some(start.elapsed().as_millis() as i64);
-        }
-    }
-
     pub fn elapsed_ms(&self) -> Option<i64> {
         self.elapsed_ms.or_else(|| {
             self.started_at

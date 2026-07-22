@@ -100,16 +100,6 @@ impl OtherToolCallBlock {
         None
     }
 
-    /// Set error (mutable) — compute elapsed time if not already set (Phase 2).
-    pub fn set_error(&mut self, error: Option<String>) {
-        if self.elapsed_ms.is_none()
-            && let Some(start) = self.started_at
-        {
-            self.elapsed_ms = Some(start.elapsed().as_millis() as i64);
-        }
-        self.error = error;
-    }
-
     /// Finalize elapsed time from `started_at`.
     ///
     /// Idempotent: no-op if `started_at` is `None` (pre-completed block)
