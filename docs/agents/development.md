@@ -7,6 +7,7 @@ Also see: root [`README.md`](../../README.md), [`CONTRIBUTING.md`](../../CONTRIB
 ## Prerequisites
 
 - Rust pin: `rust-toolchain.toml` (currently **1.92.0** + rustfmt, clippy)
+- Optional Hawk analysis: `cargo-hawk` **0.1.9** + Rust **1.97.1**
 - `protoc` via `./bin/protoc` (Dotslash) or `PROTOC` / `PATH`
 - Xcode CLT for signed macOS release artifacts (Apple Silicon release path)
 
@@ -50,6 +51,32 @@ cargo clippy --locked --workspace --all-targets
 ```
 
 Workspace clippy config: `clippy.toml`. Format: `rustfmt.toml`.
+
+### Hawk public-API analysis
+
+[Hawk](https://github.com/astral-sh/hawk) checks whether public Rust APIs are
+needed by the shipped `open-grok` binary. It is experimental and tied to the
+compiler version used to build it, so its Rust 1.97.1 toolchain is kept
+separate from the workspace's pinned Rust 1.92.0 toolchain.
+
+Install the compatible toolchain and Hawk release:
+
+```sh
+rustup toolchain install 1.97.1
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/astral-sh/hawk/releases/download/0.1.9/cargo-hawk-installer.sh | sh
+```
+
+Run the workspace configuration in warning-only mode:
+
+```sh
+./bin/hawk-check
+```
+
+Use `./bin/hawk-check -D warnings` to enforce all default Hawk findings,
+`./bin/hawk-check --only dead-public` to focus on deletion candidates, or
+`./bin/hawk-check --fix` to apply machine-applicable visibility reductions.
+Review fixes before committing; dead declarations remain report-only.
 
 ## Testing strategy
 

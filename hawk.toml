@@ -1,0 +1,4 @@
+[[production]]
+package = "xai-grok-pager-bin"
+bin = "open-grok"
+reason = "public Open Grok binary shipped from this workspace"

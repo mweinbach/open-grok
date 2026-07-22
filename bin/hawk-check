@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+hawk_toolchain="${HAWK_RUST_TOOLCHAIN:-1.97.1}"
+
+if ! command -v rustup >/dev/null 2>&1; then
+    echo "error: required command 'rustup' is not installed" >&2
+    exit 1
+fi
+
+if ! rustup run "$hawk_toolchain" rustc --version >/dev/null 2>&1; then
+    echo "error: Hawk requires Rust $hawk_toolchain" >&2
+    echo "install it with: rustup toolchain install $hawk_toolchain" >&2
+    exit 1
+fi
+
+if ! command -v cargo-hawk >/dev/null 2>&1; then
+    echo "error: required command 'cargo-hawk' is not installed" >&2
+    echo "install cargo-hawk 0.1.9 from: https://github.com/astral-sh/hawk/releases/tag/0.1.9" >&2
+    exit 1
+fi
+
+cd "$repo_root"
+exec cargo +"$hawk_toolchain" hawk check --manifest-path "$repo_root/Cargo.toml" "$@"
