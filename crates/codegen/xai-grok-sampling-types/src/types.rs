@@ -1,5 +1,4 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
 use std::num::NonZeroU64;
 
 // ============================================================================
@@ -138,32 +137,6 @@ impl ChatCompletionRequest {
         }
     }
 
-    pub fn from_messages(messages: Vec<ChatRequestMessage>) -> Self {
-        Self {
-            model: None,
-            messages,
-            temperature: None,
-            max_tokens: None,
-            top_p: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            user: None,
-            tools: None,
-            tool_choice: None,
-            search_parameters: None,
-            response_format: None,
-            reasoning_effort: None,
-            x_grok_conv_id: None,
-            x_grok_req_id: None,
-            x_grok_session_id: None,
-            x_grok_turn_idx: None,
-            x_grok_agent_id: None,
-            x_grok_deployment_id: None,
-            x_grok_user_id: None,
-            trace: None,
-        }
-    }
-
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.tools = Some(tools);
         self
@@ -174,18 +147,8 @@ impl ChatCompletionRequest {
         self
     }
 
-    pub fn set_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = Some(max_tokens);
-        self
-    }
-
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
-        self
-    }
-
-    pub fn with_top_p(mut self, top_p: f32) -> Self {
-        self.top_p = Some(top_p);
         self
     }
 }
@@ -212,13 +175,6 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
-    pub fn is_empty(&self) -> bool {
-        match self {
-            MessageContent::Blocks(blocks) => blocks.is_empty(),
-            MessageContent::Text(text) => text.is_empty(),
-        }
-    }
-
     pub fn blocks(&self) -> Vec<ChatContentBlock> {
         match self {
             MessageContent::Blocks(blocks) => blocks.clone(),
@@ -286,18 +242,6 @@ impl ChatRequestMessage {
         }
     }
 
-    pub fn assistant_tool_call(tool_call: ToolCallRequest) -> Self {
-        Self {
-            role: Role::Assistant,
-            content: MessageContent::Text("".into()),
-            name: None,
-            tool_calls: vec![tool_call],
-            tool_call_id: None,
-            model_id: None,
-            reasoning_content: None,
-        }
-    }
-
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
@@ -308,10 +252,6 @@ impl ChatRequestMessage {
             model_id: None,
             reasoning_content: None,
         }
-    }
-
-    pub fn is_system_message(&self) -> bool {
-        self.role == Role::System
     }
 
     /// Extract text content from the message content blocks
@@ -326,30 +266,6 @@ impl ChatRequestMessage {
             .collect::<Vec<_>>()
             .join("\n")
     }
-
-    /// Set text content, replacing all existing content blocks
-    pub fn set_text_content(&mut self, text: impl Into<String>) {
-        self.content = MessageContent::Text(text.into());
-    }
-
-    /// Append text content to existing content
-    pub fn append_text_content(&mut self, text: impl Into<String>) {
-        if self.content.is_empty() {
-            self.set_text_content(text);
-            return;
-        }
-
-        let new_content = match &self.content {
-            MessageContent::Text(prev) => MessageContent::Text(format!("{}{}", prev, text.into())),
-            MessageContent::Blocks(blocks) => {
-                let mut blocks = blocks.clone();
-                blocks.push(ChatContentBlock::Text { text: text.into() });
-                MessageContent::Blocks(blocks)
-            }
-        };
-
-        self.content = new_content;
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -359,29 +275,6 @@ pub enum Role {
     User,
     Assistant,
     Tool,
-}
-
-/// Calculate how many chat messages to keep for a given target prompt index (0-based, inclusive).
-pub fn chat_truncate_for_prompt(
-    chat_history: &[ChatRequestMessage],
-    target_prompt_index: usize,
-) -> usize {
-    let mut user_count = 0;
-    let mut keep_count = 0;
-
-    for (i, msg) in chat_history.iter().enumerate() {
-        if matches!(msg.role, Role::User) {
-            user_count += 1;
-            // If we've seen more user messages than target + 1, stop here
-            if user_count > target_prompt_index + 1 {
-                keep_count = i;
-                break;
-            }
-        }
-        keep_count = i + 1;
-    }
-
-    keep_count
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -521,13 +414,6 @@ impl ToolCallFunction {
         Self {
             name: name.into(),
             arguments: arguments.into(),
-        }
-    }
-
-    pub fn from_json(name: impl Into<String>, arguments: &Value) -> Self {
-        Self {
-            name: name.into(),
-            arguments: arguments.to_string(),
         }
     }
 }
@@ -1086,23 +972,6 @@ pub enum ResponsesDialect {
     Codex,
 }
 
-impl ResponsesDialect {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Xai => "xai",
-            Self::Codex => "codex",
-        }
-    }
-
-    pub const fn is_xai(self) -> bool {
-        matches!(self, Self::Xai)
-    }
-
-    pub const fn is_codex(self) -> bool {
-        matches!(self, Self::Codex)
-    }
-}
-
 /// Wire representation used for Code Mode's client-executed `exec` tool.
 ///
 /// This capability is independent from [`ToolMode`]: the mode controls which
@@ -1152,23 +1021,6 @@ pub enum HostedToolDialect {
     OpenAi,
 }
 
-impl HostedToolDialect {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Xai => "xai",
-            Self::OpenAi => "open_ai",
-        }
-    }
-
-    pub const fn is_xai(self) -> bool {
-        matches!(self, Self::Xai)
-    }
-
-    pub const fn is_open_ai(self) -> bool {
-        matches!(self, Self::OpenAi)
-    }
-}
-
 /// Policy for provider-private request metadata and identity headers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1180,13 +1032,6 @@ pub enum RequestMetadataPolicy {
 }
 
 impl RequestMetadataPolicy {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::XGrokHeaders => "x_grok_headers",
-            Self::StandardHeadersOnly => "standard_headers_only",
-        }
-    }
-
     pub const fn sends_x_grok_headers(self) -> bool {
         matches!(self, Self::XGrokHeaders)
     }
@@ -1239,13 +1084,6 @@ pub enum XaiServicePolicy {
 }
 
 impl XaiServicePolicy {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Allowed => "allowed",
-            Self::Denied => "denied",
-        }
-    }
-
     pub const fn allows(self) -> bool {
         matches!(self, Self::Allowed)
     }
@@ -1556,24 +1394,6 @@ impl CreateResponseWrapper {
             raw_input_replacements: vec![],
         }
     }
-
-    /// Set the conversation ID header.
-    pub fn with_conv_id(mut self, conv_id: impl Into<String>) -> Self {
-        self.x_grok_conv_id = Some(conv_id.into());
-        self
-    }
-
-    /// Set the request ID header.
-    pub fn with_req_id(mut self, req_id: impl Into<String>) -> Self {
-        self.x_grok_req_id = Some(req_id.into());
-        self
-    }
-
-    /// Set the trace context for request logging.
-    pub fn with_trace(mut self, trace: impl TraceContext + 'static) -> Self {
-        self.trace = Some(Box::new(trace));
-        self
-    }
 }
 
 impl From<crate::rs::CreateResponse> for CreateResponseWrapper {
@@ -1621,24 +1441,6 @@ impl MessagesRequestWrapper {
             x_grok_user_id: None,
             trace: None,
         }
-    }
-
-    /// Set the conversation ID header.
-    pub fn with_conv_id(mut self, conv_id: impl Into<String>) -> Self {
-        self.x_grok_conv_id = Some(conv_id.into());
-        self
-    }
-
-    /// Set the request ID header.
-    pub fn with_req_id(mut self, req_id: impl Into<String>) -> Self {
-        self.x_grok_req_id = Some(req_id.into());
-        self
-    }
-
-    /// Set the trace context for request logging.
-    pub fn with_trace(mut self, trace: impl TraceContext + 'static) -> Self {
-        self.trace = Some(Box::new(trace));
-        self
     }
 }
 

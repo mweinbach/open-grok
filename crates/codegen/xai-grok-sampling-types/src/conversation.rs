@@ -731,21 +731,6 @@ impl ReasoningContent {
         }
     }
 
-    /// Build from a Responses API `ReasoningItem`.
-    /// Prefers `content` (full raw reasoning) over `summary` for the text field;
-    /// in practice the API populates one or the other, never both.
-    pub fn from_reasoning_item(r: &rs::ReasoningItem) -> Option<Self> {
-        let text = Self::join_content(&r.content).or_else(|| Self::join_summary(&r.summary));
-        if text.is_none() && r.encrypted_content.is_none() {
-            return None;
-        }
-        Some(Self {
-            text,
-            encrypted: r.encrypted_content.as_deref().map(Arc::<str>::from),
-            id: Some(Arc::<str>::from(r.id.as_str())),
-        })
-    }
-
     /// Check if there's any reasoning content
     pub fn is_empty(&self) -> bool {
         self.text.is_none() && self.encrypted.is_none()
@@ -920,14 +905,6 @@ pub enum ClientTool {
         #[serde(default)]
         format: rs::CustomToolParamFormat,
     },
-}
-
-impl ClientTool {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Function { name, .. } | Self::Custom { name, .. } => name,
-        }
-    }
 }
 
 impl From<ToolSpec> for ClientTool {
@@ -2143,15 +2120,6 @@ pub struct TokenUsage {
     pub cached_prompt_tokens: u32,
 }
 
-impl TokenUsage {
-    pub fn record_on_span(&self, span: &tracing::Span) {
-        span.record("prompt_tokens", self.prompt_tokens);
-        span.record("completion_tokens", self.completion_tokens);
-        span.record("reasoning_tokens", self.reasoning_tokens);
-        span.record("cached_prompt_tokens", self.cached_prompt_tokens);
-    }
-}
-
 impl From<Usage> for TokenUsage {
     fn from(u: Usage) -> Self {
         let cached_prompt_tokens = u
@@ -2233,14 +2201,6 @@ impl ConversationResponse {
         })
     }
 
-    /// Mutable view of the trailing `Assistant` item.
-    pub fn assistant_mut(&mut self) -> Option<&mut AssistantItem> {
-        self.items.iter_mut().rev().find_map(|item| match item {
-            ConversationItem::Assistant(a) => Some(a),
-            _ => None,
-        })
-    }
-
     /// Trailing assistant text content, or empty string when the response
     /// has no assistant item (or the assistant carries no text). Common
     /// shorthand for `self.assistant().map(|a| a.content.as_ref().to_owned())
@@ -2260,16 +2220,6 @@ impl ConversationResponse {
             ConversationItem::Reasoning(r) => Some(r),
             _ => None,
         })
-    }
-
-    /// Backend-executed tool calls (web search, X search, code interpreter)
-    /// produced by this turn, in emission order. These are sibling items in
-    /// `items` and must also be persisted to the conversation alongside the
-    /// trailing `Assistant`.
-    pub fn backend_tool_items(&self) -> impl Iterator<Item = &ConversationItem> {
-        self.items
-            .iter()
-            .filter(|item| matches!(item, ConversationItem::BackendToolCall(_)))
     }
 
     /// Classify why the response is empty, if it is.
@@ -2596,19 +2546,6 @@ impl ConversationItem {
             images: Vec::new(),
             ordered_content: Vec::new(),
         })
-    }
-
-    /// Create a result for a native Responses custom-tool call when the caller
-    /// has provider IDs rather than the opaque [`ToolCall::id`] envelope.
-    pub fn custom_tool_result(
-        call_id: impl AsRef<str>,
-        item_id: impl AsRef<str>,
-        content: impl Into<String>,
-    ) -> Self {
-        Self::CustomToolOutput(
-            CustomToolOutputItem::text(call_id.as_ref(), content.into())
-                .with_item_id(item_id.as_ref()),
-        )
     }
 
     /// Create a native custom-tool output with ordered content blocks.
@@ -3099,11 +3036,6 @@ impl UserItem {
 }
 
 impl AssistantItem {
-    /// Add a tool call to this assistant message
-    pub fn add_tool_call(&mut self, call: ToolCall) {
-        self.tool_calls.push(call);
-    }
-
     /// Set the model ID for this assistant message
     pub fn with_model_id(mut self, model_id: impl Into<String>) -> Self {
         self.model_id = Some(model_id.into());
@@ -4527,13 +4459,6 @@ impl ConversationRequest {
     /// Set request ID header
     pub fn with_req_id(mut self, req_id: impl Into<String>) -> Self {
         self.x_grok_req_id = Some(req_id.into());
-        self
-    }
-
-    /// Set trace context for request logging.
-    /// Accepts any type that implements `TraceContext` (i.e., `Clone + Send + Sync + Debug + 'static`).
-    pub fn with_trace(mut self, trace: impl TraceContext + 'static) -> Self {
-        self.trace = Some(Box::new(trace));
         self
     }
 

@@ -263,13 +263,6 @@ impl SamplingError {
         }
     }
 
-    pub fn model_metadata(&self) -> Option<&ResponseModelMetadata> {
-        match self {
-            SamplingError::Api { model_metadata, .. } => model_metadata.as_ref(),
-            _ => None,
-        }
-    }
-
     pub fn retry_after(&self) -> Option<u64> {
         match self {
             SamplingError::Api {

@@ -111,16 +111,8 @@ impl AbsPathBuf {
         self.as_path().to_path_buf()
     }
 
-    pub fn into_string(self) -> String {
-        self.0.into_string()
-    }
-
     pub fn join(&self, path: impl AsRef<str>) -> Self {
         Self(self.0.join(path.as_ref()))
-    }
-
-    pub fn is_dir(&self) -> bool {
-        self.0.is_dir()
     }
 
     /// Check if `self` contains `path` (normalizing `.`/`..`).
@@ -246,18 +238,6 @@ impl RelPathBuf {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
-    }
-
-    pub fn as_path(&self) -> &std::path::Path {
-        self.0.as_std_path()
-    }
-
-    pub fn to_path_buf(&self) -> PathBuf {
-        self.as_path().to_path_buf()
-    }
-
-    pub fn into_string(self) -> String {
-        self.0.into_string()
     }
 }
 
