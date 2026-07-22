@@ -316,10 +316,9 @@ struct PendingTool {
     utf8_decoder: Utf8Decoder,
     /// Stashed `started_at` from eager creation. The eagerly-created block
     /// is `ToolCallBlock::Other`; when the refinement arrives with the real
-    /// kind, `transfer_timing_from` can't cross variant boundaries
-    /// (Other → Search, etc.) and would silently drop the timing. This
-    /// field preserves the instant so `set_started_at` can apply it to
-    /// whatever variant the refined block becomes.
+    /// kind, replacing it across variant boundaries (Other → Search, etc.)
+    /// would otherwise drop the timing. This field preserves the instant so
+    /// `set_started_at` can apply it to whatever variant the refined block becomes.
     started_at: Option<std::time::Instant>,
 }
 /// Streaming UTF-8 decoder for incremental byte deltas.

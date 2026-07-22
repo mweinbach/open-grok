@@ -559,8 +559,7 @@ mod tests {
             &ToolCallBlock::Execute(success)
         ));
 
-        let mut failed = ExecuteToolCallBlock::new("bad");
-        failed.set_error(Some("error".into()));
+        let failed = ExecuteToolCallBlock::new("bad").with_error("error");
         assert!(!ToolUsageStats::tool_block_is_success(
             &ToolCallBlock::Execute(failed)
         ));

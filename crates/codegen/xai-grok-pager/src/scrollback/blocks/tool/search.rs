@@ -129,16 +129,6 @@ impl SearchToolCallBlock {
         self.error.is_none()
     }
 
-    /// Set error (mutable) — compute elapsed time if not already set (Phase 2).
-    pub fn set_error(&mut self, error: Option<String>) {
-        if self.elapsed_ms.is_none()
-            && let Some(start) = self.started_at
-        {
-            self.elapsed_ms = Some(start.elapsed().as_millis() as i64);
-        }
-        self.error = error;
-    }
-
     /// Finalize elapsed time from `started_at`.
     ///
     /// Idempotent: no-op if `started_at` is `None` (pre-completed block)
@@ -160,12 +150,6 @@ impl SearchToolCallBlock {
                 .started_at
                 .map(|start| start.elapsed().as_millis() as i64),
         }
-    }
-
-    /// Set file matches (mutable).
-    pub fn set_file_matches(&mut self, match_count: usize, file_matches: Vec<SearchFileMatch>) {
-        self.match_count = match_count;
-        self.file_matches = file_matches;
     }
 
     /// Build the match summary string, adapted by output mode.
