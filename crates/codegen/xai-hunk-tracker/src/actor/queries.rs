@@ -8,9 +8,7 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::diff::generate_hunk_patch;
-use crate::types::{
-    FileContentView, FileHunkData, Hunk, HunkId, SessionSummary, TurnSummary,
-};
+use crate::types::{FileContentView, FileHunkData, Hunk, HunkId, SessionSummary, TurnSummary};
 
 use super::HunkTrackerActor;
 
