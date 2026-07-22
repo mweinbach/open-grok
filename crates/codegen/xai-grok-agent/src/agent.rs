@@ -238,19 +238,6 @@ impl Agent {
         // Mid-session policy updates are not yet supported in the new architecture.
     }
 
-    /// Re-render the system prompt from current ToolBridge state
-    /// (tool name overrides, disabled tools). Called by hosts after
-    /// mid-session tool-override updates.
-    pub async fn finalize_prompt(&mut self) {
-        self.prompt_context.build_timestamp_utc = chrono::Utc::now().to_rfc3339();
-
-        self.system_prompt = self
-            .prompt_context
-            .render(&self.tool_bridge)
-            .await
-            .unwrap_or_default();
-    }
-
     /// Re-render the system prompt for a different definition, reusing
     /// the existing ToolBridge. Used for mid-session mode switching.
     pub async fn render_prompt_for_definition(&self, definition: &AgentDefinition) -> String {

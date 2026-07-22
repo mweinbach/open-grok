@@ -17,11 +17,5 @@ pub struct McpOAuthConfig {
     pub callback_port: Option<u16>,
 }
 
-impl McpOAuthConfig {
-    pub fn is_configured(&self) -> bool {
-        self.client_id.is_some()
-    }
-}
-
 /// Per-server OAuth configuration map, keyed by MCP server name.
 pub type McpOAuthConfigMap = HashMap<String, McpOAuthConfig>;

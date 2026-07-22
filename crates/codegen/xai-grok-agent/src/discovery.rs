@@ -11,7 +11,6 @@ use std::str::FromStr;
 use xai_grok_tools::types::config_source::ConfigSource;
 
 use crate::config::{AgentDefinition, AgentScope, BuiltinAgentName};
-use crate::error::AgentBuildError;
 use crate::prompt::context::TemplateOverride;
 
 /// Project-level agent directories to scan (`.opengrok/agents/` + `.claude/agents/` compat).
@@ -61,34 +60,9 @@ pub enum SubagentSource {
     UserDefined { scope: AgentScope },
 }
 
-// ── all_subagents ────────────────────────────────────────────────────
-
-/// Build the complete list of enabled subagents.
-///
-/// 1. Start with built-in subagent definitions (general-purpose, explore, plan)
-/// 2. Discover user-defined agents from project, user, and bundled agent dirs
-/// 3. Merge: project-level user agents shadow built-ins with the same name;
-///    user-level and bundled agents with built-in names are skipped (maintains
-///    `visible == callable` guarantee)
-/// 4. Filter: remove agents toggled off via `[subagents.toggle]`
-pub fn all_subagents(cwd: &Path, toggle: &HashMap<String, bool>) -> Vec<SubagentEntry> {
-    let grok = xai_grok_config::user_grok_home();
-    all_subagents_with_home(cwd, toggle, dirs::home_dir().as_deref(), grok.as_deref())
-}
-
-fn all_subagents_with_home(
-    cwd: &Path,
-    toggle: &HashMap<String, bool>,
-    home: Option<&Path>,
-    grok_home: Option<&Path>,
-) -> Vec<SubagentEntry> {
-    let discovered = discover_with_home(cwd, home, grok_home);
-    merge_subagents(discovered, toggle)
-}
+// ── Subagent merging ─────────────────────────────────────────────────
 
 /// Internal: merge discovered agents with built-in subagents, apply toggles.
-///
-/// Separated from `all_subagents()` for testability without filesystem access.
 fn merge_subagents(
     discovered: Vec<AgentDefinition>,
     toggle: &HashMap<String, bool>,
@@ -304,24 +278,8 @@ fn by_name_in_cwd_with_home(
     by_name_with_home(name, home, grok_home)
 }
 
-/// Return all built-in subagent definitions.
-///
-/// These are the pre-defined agent profiles that can be launched via the
-/// Task tool. User/project-level agent files can shadow these by name.
-///
-/// The list covers the core built-in agents:
-/// - `general-purpose` — all tools, autonomous research & multi-step tasks
-/// - `explore` — fast read-only codebase exploration (fast model hint)
-/// - `plan` — read-only architecture & implementation planning
-pub fn builtin_subagents() -> Vec<AgentDefinition> {
-    BuiltinAgentName::subagent_variants()
-        .iter()
-        .map(|name| name.definition())
-        .collect()
-}
-
 /// Return every built-in agent definition (all `BuiltinAgentName` variants, not
-/// just the subagent-launchable subset in [`builtin_subagents`]).
+/// just the subagent-launchable subset).
 ///
 /// Introspection helper for cross-crate coverage/manifest checks that must
 /// enumerate all builtins from another crate that pins a different `strum`
@@ -332,11 +290,6 @@ pub fn all_builtin_agent_definitions() -> Vec<AgentDefinition> {
     BuiltinAgentName::iter()
         .map(BuiltinAgentName::definition)
         .collect()
-}
-
-/// Parse only YAML frontmatter from an agent file, without loading the body.
-pub fn parse_agent_frontmatter_only(path: &Path) -> Result<AgentDefinition, AgentBuildError> {
-    AgentDefinition::from_file_frontmatter_only(path)
 }
 
 fn source_from_agent_def(def: &AgentDefinition) -> ConfigSource {
@@ -1037,7 +990,7 @@ mod tests {
         assert_eq!(def.scope, AgentScope::BuiltIn);
     }
 
-    // ── all_subagents / merge_subagents tests ───────────────────────
+    // ── merge_subagents tests ───────────────────────────────────────
 
     /// Helper: build a minimal synthetic AgentDefinition for testing merge logic.
     fn synthetic_agent(name: &str, desc: &str, scope: AgentScope) -> AgentDefinition {
@@ -1325,7 +1278,10 @@ mod tests {
             "A test subagent",
         );
 
-        let entries = all_subagents_with_home(tmp.path(), &HashMap::new(), None, None);
+        let entries = merge_subagents(
+            discover_with_home(tmp.path(), None, None),
+            &HashMap::new(),
+        );
         assert_eq!(entries.len(), 4);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
@@ -1499,7 +1455,7 @@ mod tests {
         );
 
         let toggle = HashMap::from([("test-agent".to_string(), false)]);
-        let entries = all_subagents_with_home(tmp.path(), &toggle, None, None);
+        let entries = merge_subagents(discover_with_home(tmp.path(), None, None), &toggle);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["general-purpose", "explore", "plan"]);
     }

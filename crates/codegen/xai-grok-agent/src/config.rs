@@ -316,40 +316,6 @@ fn grok_build_concise_toolset() -> ToolServerConfig {
         behavior_preset: None,
     }
 }
-/// Hashline toolset: anchor-based read/edit/search + standard utilities.
-///
-/// `hashline_tools` should be the 3 hashline `ToolConfig` entries produced by
-/// `FileToolset::Hashline.tool_configs(&hashline_config)` — they carry the
-/// scheme parameters as tool params.
-pub fn grok_build_hashline_toolset(
-    hashline_tools: Vec<xai_grok_tools::registry::types::ToolConfig>,
-) -> ToolServerConfig {
-    let mut tools: Vec<xai_grok_tools::registry::types::ToolConfig> = vec![bash_tool_config()];
-    tools.extend(hashline_tools);
-    tools.extend([
-        (&grok_build::ViewImageTool).into(),
-        (&grok_build::ListDirTool).into(),
-        kill_task_tool_config(),
-        (&grok_build::TodoWriteTool).into(),
-        task_output_tool_config(),
-        wait_tasks_tool_config(),
-        task_tool_config(),
-        agent_swarm_tool_config(),
-        workflow_tool_config(),
-        (&grok_build::WebSearchTool).into(),
-        (&grok_build::SchedulerCreateTool).into(),
-        (&grok_build::SchedulerDeleteTool).into(),
-        (&grok_build::SchedulerListTool).into(),
-        (&grok_build::MonitorTool).into(),
-        (&search_tool::SearchTool).into(),
-        (&use_tool::UseTool).into(),
-        (&grok_build::UpdateGoalTool).into(),
-    ]);
-    ToolServerConfig {
-        tools,
-        behavior_preset: None,
-    }
-}
 fn codex_toolset() -> ToolServerConfig {
     ToolServerConfig {
         tools: vec![

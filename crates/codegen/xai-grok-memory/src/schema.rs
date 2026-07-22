@@ -1,16 +1,12 @@
 //! SQL schema constants for the memory index.
 //!
 //! The index uses three tables:
-//! - `meta` — key-value metadata (embedding dimensions, schema version)
+//! - `meta` — key-value metadata (embedding dimensions, reindex claims)
 //! - `chunks` — indexed text chunks with blake3 content hashes
 //! - `chunks_fts` — contentless FTS5 virtual table for BM25 keyword search
 //!
 //! When sqlite-vec is available, a fourth table is created:
 //! - `chunks_vec` — vec0 virtual table for KNN vector search
-
-/// Schema version. Bump when making breaking schema changes that require
-/// dropping and recreating tables.
-pub const SCHEMA_VERSION: u32 = 1;
 
 /// Generate the SQL schema for the memory index.
 ///

@@ -182,15 +182,6 @@ pub struct HookSpec {
 ///
 /// `source_dir` resolves relative command paths: pass the agent definition's
 /// directory or the workspace CWD.
-pub fn parse_hooks_from_value(
-    hooks: &serde_json::Value,
-    source_name: &str,
-) -> (Vec<HookSpec>, Vec<HookError>) {
-    parse_hooks_from_value_with_dir(hooks, source_name, std::path::Path::new("."))
-}
-
-/// Like `parse_hooks_from_value` but with an explicit `source_dir` for
-/// resolving relative command paths.
 pub fn parse_hooks_from_value_with_dir(
     hooks: &serde_json::Value,
     source_name: &str,

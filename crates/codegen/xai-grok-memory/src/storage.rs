@@ -94,11 +94,6 @@ impl MemoryStorage {
         &self.workspace_dir
     }
 
-    /// Returns the original workspace path.
-    pub fn workspace_path(&self) -> &Path {
-        &self.workspace_path
-    }
-
     /// Returns `true` if this storage targets an ephemeral (temp-dir) workspace.
     pub fn is_ephemeral(&self) -> bool {
         self.ephemeral

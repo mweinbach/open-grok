@@ -32,18 +32,8 @@ pub(crate) fn base_template() -> Zeroizing<String> {
     decrypt(BASE_PROMPT_ENC, PROMPT_SEEDS[0])
 }
 
-/// The base prompt template source, exposed for `open-grok prompt --section template`.
-pub fn base_template_source() -> Zeroizing<String> {
-    base_template()
-}
-
 pub(crate) fn apply_patch_template() -> Zeroizing<String> {
     decrypt(CODEX_PROMPT_ENC, PROMPT_SEEDS[1])
-}
-
-/// Apply-patch prompt template source, exposed for `open-grok prompt --section apply-patch-template`.
-pub fn apply_patch_template_source() -> Zeroizing<String> {
-    apply_patch_template()
 }
 
 /// The subagent-specific base template (decrypted fresh; zeroed on drop).

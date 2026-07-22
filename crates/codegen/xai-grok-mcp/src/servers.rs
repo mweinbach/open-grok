@@ -947,10 +947,6 @@ impl SharedMcpPool {
         self.clients.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
-    }
-
     pub fn server_names(&self) -> impl Iterator<Item = &str> {
         self.clients.keys().map(String::as_str)
     }
@@ -1108,10 +1104,6 @@ impl McpError {
             server: server.to_string(),
             timeout_secs: duration.as_secs(),
         }
-    }
-
-    pub fn is_timeout(&self) -> bool {
-        matches!(self, Self::Timeout { .. })
     }
 
     pub fn error_category(&self) -> xai_file_utils::events::McpErrorCategory {

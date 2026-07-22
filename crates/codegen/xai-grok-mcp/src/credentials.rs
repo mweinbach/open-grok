@@ -281,11 +281,6 @@ impl McpCredentialStore {
         before - self.entries.len()
     }
 
-    /// Whether the store is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// Default path: `$OPENGROK_HOME/mcp_credentials.json`.
     fn default_path() -> Option<PathBuf> {
         Some(xai_grok_config::user_grok_home()?.join(CREDENTIALS_FILENAME))
