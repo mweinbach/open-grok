@@ -297,3 +297,14 @@ Project rules for **user projects** (not this repo’s own guide) are documented
 | Scrollback / tool card UI | `xai-grok-pager/src/scrollback/blocks/` |
 | Prompt / system instructions | `xai-grok-agent` templates + `prompt/` |
 | Auto-update | `xai-grok-update` + `OPEN_GROK_VERSION` |
+
+---
+
+## 11. Cursor Cloud specific instructions
+
+Durable, non-obvious notes for agents in the Cloud VM (the update script already ran `cargo fetch --locked`). Standard build/test/run commands live in §5–§6 and the [`develop-open-grok`](.agents/skills/develop-open-grok/SKILL.md) skill — use those; only the caveats below are cloud-specific.
+
+- **`protoc` is a hard build dependency.** `xai-grok-tools-api`'s `build.rs` compiles protos, and `xai-proto-build::find_protoc` resolves `protoc` from `$PROTOC` → `bin/protoc` (dotslash) → `PATH`. The VM snapshot has both a system `protoc` (`apt install protobuf-compiler`, satisfies the `PATH` fallback) and `dotslash` on `PATH` (so `./bin/protoc` and `./bin/setup-dev` work). If a build fails with a protoc/prost error, install one of those — it is not a code issue.
+- **First compile is long, not hung.** A cold `cargo check -p xai-grok-pager-bin` is ~3–4 min and a cold `cargo build --bin open-grok` is ~5 min on this VM. Prefer package-scoped `-p <crate>` checks; inspect process activity before assuming a hang.
+- **Running the app end-to-end needs provider auth.** `target/debug/open-grok` / `./bin/open-grok-dev` launch the TUI (account chooser: ChatGPT Codex / xAI Grok). A real agent turn requires credentials — set `XAI_API_KEY` or run `open-grok login`. Without creds, only CLI smokes work: `--version`, `models`, `completions <shell>`, and `inspect` (config/skills discovery). A headless turn is `./bin/open-grok-dev -p "say hi"`.
+- **Always use an isolated `OPENGROK_HOME`** (e.g. `export OPENGROK_HOME=/tmp/opengrok-test`) for runtime/tests so real user state under `~/.opengrok` is never touched.
