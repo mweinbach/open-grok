@@ -2,3 +2,7 @@
 package = "xai-grok-pager-bin"
 bin = "open-grok"
 reason = "public Open Grok binary shipped from this workspace"
+
+[[feature-profile]]
+name = "release-dist"
+features = ["xai-grok-pager-bin/release-dist"]

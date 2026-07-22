@@ -57,7 +57,9 @@ Workspace clippy config: `clippy.toml`. Format: `rustfmt.toml`.
 [Hawk](https://github.com/astral-sh/hawk) checks whether public Rust APIs are
 needed by the shipped `open-grok` binary. It is experimental and tied to the
 compiler version used to build it, so its Rust 1.97.1 toolchain is kept
-separate from the workspace's pinned Rust 1.92.0 toolchain.
+separate from the workspace's pinned Rust 1.92.0 toolchain. `hawk.toml`
+analyzes the default features plus the shipped `release-dist` feature rather
+than Cargo's unsupported synthetic `--all-features` combination.
 
 Install the compatible toolchain and Hawk release:
 
@@ -73,8 +75,7 @@ Run the workspace configuration in warning-only mode:
 ./bin/hawk-check
 ```
 
-Use `./bin/hawk-check -D warnings` to enforce all default Hawk findings,
-`./bin/hawk-check --only dead-public` to focus on deletion candidates, or
+Use `./bin/hawk-check -D warnings` to enforce all default Hawk findings or
 `./bin/hawk-check --fix` to apply machine-applicable visibility reductions.
 Review fixes before committing; dead declarations remain report-only.
 
