@@ -823,20 +823,6 @@ pub enum TodoSummaryStatus {
     Completed,
     Cancelled,
 }
-impl TodoSummaryStatus {
-    pub fn is_actionable(self) -> bool {
-        matches!(self, Self::Pending | Self::InProgress)
-    }
-    /// Mirrors `TodoStatus::tag()` in xai-grok-tools.
-    pub fn tag(self) -> &'static str {
-        match self {
-            Self::Pending => "[pending]",
-            Self::InProgress => "[in_progress]",
-            Self::Completed => "[completed]",
-            Self::Cancelled => "[cancelled]",
-        }
-    }
-}
 /// Compaction-layer summary of a todo item. Protocol-layer equivalent is
 /// `TodoItem` in xai-grok-tools.
 #[derive(Clone)]

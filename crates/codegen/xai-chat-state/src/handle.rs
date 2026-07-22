@@ -4,8 +4,7 @@ use std::collections::BTreeSet;
 
 use tokio::sync::{mpsc, oneshot};
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DanglingToolCallReason, SamplingConfig, TokenUsage,
-    ToolSpec, TraceContext,
+    ConversationItem, ConversationRequest, SamplingConfig, TokenUsage, ToolSpec, TraceContext,
 };
 
 use crate::commands::{ChatStateCommand, RepairHistoryBlocked};
@@ -48,17 +47,6 @@ impl ChatStateHandle {
             ChatStateCommand::PushUserMessageAndAck { item, reply }
         })
         .await
-    }
-
-    /// Push a user message with an explicit dangling-repair reason.
-    pub fn push_user_message_with_repair_reason(
-        &self,
-        item: ConversationItem,
-        reason: DanglingToolCallReason,
-    ) {
-        let _ = self
-            .cmd_tx
-            .send(ChatStateCommand::PushUserMessageWithRepairReason { item, reason });
     }
 
     /// Record the assistant's response.
