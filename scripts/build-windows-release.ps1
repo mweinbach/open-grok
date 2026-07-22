@@ -84,7 +84,7 @@ if (-not (Test-Path $sourceBinary)) {
     throw "Error: Cargo did not produce $sourceBinary"
 }
 
-$stagedArtifact = Join-Path $distDir ".$artifactName.tmp.$PID"
+$stagedArtifact = Join-Path $distDir ".open-grok-windows-x86_64.tmp.$PID.exe"
 try {
     Copy-Item $sourceBinary $stagedArtifact -Force
 
