@@ -19,8 +19,9 @@ pub(crate) enum SamplerFailureRecovery {
     /// Compaction ran. The turn loop should rebuild the request from
     /// the compacted conversation and resubmit.
     CompactAndResubmit,
-    /// Auth 401 recovery succeeded (devbox re-mint or OIDC refresh).
-    /// The turn loop should resubmit once with the fresh token.
+    /// Auth 401 recovery succeeded (devbox re-mint, OIDC refresh, or auth
+    /// provider re-mint). The turn loop should resubmit once with the
+    /// fresh token.
     RefreshAuthAndResubmit {
         provider: xai_grok_sampling_types::ModelProvider,
     },
@@ -54,9 +55,9 @@ pub(crate) enum TurnOutcome {
         snapshot: Box<Option<TurnDeltaSnapshot>>,
         tools_called: Vec<String>,
         structured_output: Option<Result<serde_json::Value, String>>,
-        /// Terminal response was a content-filter refusal; maps the prompt's
-        /// ACP stop reason to `Refusal` instead of `EndTurn`.
-        refusal: bool,
+        /// `Some(explanation)` marks a content-filter refusal (empty when the
+        /// provider gave no message).
+        refusal: Option<String>,
     },
     /// The turn was cancelled (user rejection, hook denial, doom loop, etc.).
     /// The category distinguishes the cause for analytics.
@@ -225,6 +226,14 @@ pub(crate) enum NotAchievedSyntheticReason {
 pub(crate) enum GoalRoundDecision {
     Continue(String),
     EndTurn,
+}
+
+/// Decision from the turn-end stop gate: allow the turn to end, or keep the
+/// agent working by injecting `feedback` as a synthetic user message.
+#[derive(Debug)]
+pub(crate) enum StopGateDecision {
+    AllowStop,
+    KeepWorking { feedback: String },
 }
 
 /// Which part of the model's streaming lifecycle the capture was tied to

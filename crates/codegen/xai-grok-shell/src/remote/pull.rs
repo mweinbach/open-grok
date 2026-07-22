@@ -55,6 +55,7 @@ pub(crate) mod hydrate {
     use crate::remote::client::{BackendError, LoadDataResponse, LoadedMessage, SessionInfo};
     use crate::session::info::Info;
     use crate::session::persistence::{CHAT_FORMAT_VERSION, Summary, default_model_id};
+    use crate::session::storage::{SUMMARY_FILE, UPDATES_FILE};
 
     fn io_err(path: &Path, source: std::io::Error) -> BackendError {
         BackendError::Hydration {
@@ -85,7 +86,8 @@ pub(crate) mod hydrate {
 
         if let Some(ref messages) = loaded.messages {
             write_updates(dir, messages)?;
-            num_chat_messages = rebuild_chat_history(dir)?;
+            num_chat_messages = crate::session::storage::chat_rebuild::rebuild_chat_history(dir)
+                .map_err(|e| io_err(dir, e))?;
         }
 
         write_summary(dir, &info, remote, num_messages, num_chat_messages)?;
@@ -156,7 +158,7 @@ pub(crate) mod hydrate {
         };
 
         let json = serde_json::to_string_pretty(&summary)?;
-        write_file(&dir.join("summary.json"), json.as_bytes())
+        write_file(&dir.join(SUMMARY_FILE), json.as_bytes())
     }
 
     /// Convert backend JSON-RPC messages to local updates.jsonl (replayable methods only).
@@ -166,7 +168,7 @@ pub(crate) mod hydrate {
     ) -> Result<(), BackendError> {
         use std::io::Write;
 
-        let path = dir.join("updates.jsonl");
+        let path = dir.join(UPDATES_FILE);
         let file = std::fs::File::create(&path).map_err(|e| io_err(&path, e))?;
         let mut w = std::io::BufWriter::new(file);
 
@@ -185,326 +187,6 @@ pub(crate) mod hydrate {
         }
 
         w.flush().map_err(|e| io_err(&path, e))
-    }
-
-    /// Rebuild `chat_history.jsonl` from `updates.jsonl` so pulled sessions are continuable.
-    fn rebuild_chat_history(dir: &Path) -> Result<usize, BackendError> {
-        use crate::session::storage::UpdatesIterator;
-        use std::io::{Seek, Write};
-
-        let updates_path = dir.join("updates.jsonl");
-        let Some(iter) =
-            UpdatesIterator::open(&updates_path).map_err(|e| io_err(&updates_path, e))?
-        else {
-            return Ok(0);
-        };
-
-        let chat_path = dir.join("chat_history.jsonl");
-        let file = std::fs::File::create(&chat_path).map_err(|e| io_err(&chat_path, e))?;
-        let mut writer = std::io::BufWriter::new(file);
-        let mut reducer = ChatReducer::new();
-
-        for result in iter {
-            let update = match result {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-
-            for item in reducer.process(&update) {
-                if let Ok(line) = serde_json::to_string(&item) {
-                    let _ = writer.write_all(line.as_bytes());
-                    let _ = writer.write_all(b"\n");
-                }
-            }
-
-            // CompactionCheckpoint: truncate file and reset
-            if reducer.should_truncate() {
-                reducer.clear_truncate_flag();
-                let _ = writer.seek(std::io::SeekFrom::Start(0));
-                let _ = writer.get_mut().set_len(0);
-            }
-        }
-
-        // Flush trailing state
-        for item in reducer.flush() {
-            if let Ok(line) = serde_json::to_string(&item) {
-                let _ = writer.write_all(line.as_bytes());
-                let _ = writer.write_all(b"\n");
-            }
-        }
-
-        writer.flush().map_err(|e| io_err(&chat_path, e))?;
-        Ok(reducer.count())
-    }
-
-    use crate::sampling::{AssistantItem, ContentPart, ConversationItem, ToolCall};
-    use agent_client_protocol as acp;
-    use std::collections::{HashMap, HashSet};
-
-    /// Reduces ACP session updates into conversation items.
-    ///
-    /// Turn boundaries: User→Agent flushes user, Agent→User flushes agent,
-    /// tool completion flushes agent before emitting result.
-    struct ChatReducer {
-        user_parts: Vec<ContentPart>,
-        agent_text: String,
-        agent_tool_calls: Vec<ToolCall>,
-
-        in_user_turn: bool,
-        has_agent_content: bool,
-        needs_truncate: bool,
-
-        tool_args: HashMap<String, String>,
-        emitted_tool_results: HashSet<String>,
-        item_count: usize,
-    }
-
-    impl ChatReducer {
-        fn new() -> Self {
-            Self {
-                user_parts: Vec::new(),
-                agent_text: String::new(),
-                agent_tool_calls: Vec::new(),
-                in_user_turn: false,
-                has_agent_content: false,
-                needs_truncate: false,
-                tool_args: HashMap::new(),
-                emitted_tool_results: HashSet::new(),
-                item_count: 0,
-            }
-        }
-
-        fn process(
-            &mut self,
-            update: &crate::session::storage::SessionUpdate,
-        ) -> Vec<ConversationItem> {
-            use crate::session::storage::SessionUpdate;
-
-            match update {
-                SessionUpdate::Acp(n) => self.handle_acp(&n.update),
-                SessionUpdate::Xai(n) => self.handle_xai(&n.update),
-            }
-        }
-
-        fn handle_acp(&mut self, update: &acp::SessionUpdate) -> Vec<ConversationItem> {
-            match update {
-                acp::SessionUpdate::UserMessageChunk(chunk) => self.on_user_chunk(chunk),
-                acp::SessionUpdate::AgentMessageChunk(chunk) => self.on_agent_chunk(chunk),
-                acp::SessionUpdate::ToolCall(tc) => self.on_tool_call(tc),
-                acp::SessionUpdate::ToolCallUpdate(tc) => self.on_tool_call_update(tc),
-                _ => Vec::new(), // AgentThoughtChunk, Retry, Plan not needed
-            }
-        }
-
-        fn handle_xai(
-            &mut self,
-            update: &crate::extensions::notification::SessionUpdate,
-        ) -> Vec<ConversationItem> {
-            use crate::extensions::notification::SessionUpdate as XaiUpdate;
-
-            match update {
-                XaiUpdate::CompactionCheckpoint(_) => {
-                    self.reset();
-                    self.needs_truncate = true;
-                    Vec::new()
-                }
-                _ => Vec::new(), // DiffReview, MemoryFlush, etc. not needed
-            }
-        }
-
-        fn on_user_chunk(&mut self, chunk: &acp::ContentChunk) -> Vec<ConversationItem> {
-            let mut out = Vec::new();
-
-            if !self.in_user_turn {
-                out.extend(self.flush_agent());
-                self.in_user_turn = true;
-            }
-
-            match &chunk.content {
-                acp::ContentBlock::Text(t) => {
-                    self.user_parts.push(ContentPart::Text {
-                        text: std::sync::Arc::<str>::from(t.text.clone()),
-                    });
-                }
-                acp::ContentBlock::Image(img) => {
-                    if let Some(uri) = &img.uri {
-                        self.user_parts.push(ContentPart::Image {
-                            url: std::sync::Arc::<str>::from(uri.clone()),
-                        });
-                    }
-                }
-                _ => {} // Audio, Resource, etc. not needed for chat replay
-            }
-
-            out
-        }
-
-        fn on_agent_chunk(&mut self, chunk: &acp::ContentChunk) -> Vec<ConversationItem> {
-            let mut out = Vec::new();
-
-            if self.in_user_turn {
-                out.extend(self.flush_user());
-                self.in_user_turn = false;
-            }
-
-            if let acp::ContentBlock::Text(t) = &chunk.content {
-                self.agent_text.push_str(&t.text);
-                self.has_agent_content = true;
-            }
-
-            out
-        }
-
-        fn on_tool_call(&mut self, tc: &acp::ToolCall) -> Vec<ConversationItem> {
-            let id = tc.tool_call_id.0.to_string();
-            let args = tc
-                .raw_input
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-
-            self.tool_args.insert(id.clone(), args.clone());
-            self.agent_tool_calls.push(ToolCall {
-                id: std::sync::Arc::<str>::from(id),
-                name: tc.title.clone(),
-                arguments: std::sync::Arc::<str>::from(args),
-            });
-
-            Vec::new()
-        }
-
-        fn on_tool_call_update(&mut self, tc: &acp::ToolCallUpdate) -> Vec<ConversationItem> {
-            let id = tc.tool_call_id.0.to_string();
-            self.maybe_backfill_args(&id, &tc.fields);
-
-            if Self::is_completed(&tc.fields) && self.emitted_tool_results.insert(id.clone()) {
-                return self.emit_tool_result(&id, &tc.fields);
-            }
-            Vec::new()
-        }
-
-        /// Backfill tool arguments from ToolCallUpdate if ToolCall didn't have them.
-        fn maybe_backfill_args(&mut self, id: &str, fields: &acp::ToolCallUpdateFields) {
-            let Some(raw) = &fields.raw_input else { return };
-            let needs_backfill = self.tool_args.get(id).is_none_or(String::is_empty);
-            if !needs_backfill {
-                return;
-            }
-
-            let args = raw.to_string();
-            self.tool_args.insert(id.to_string(), args.clone());
-
-            if let Some(call) = self
-                .agent_tool_calls
-                .iter_mut()
-                .find(|c| c.id.as_ref() == id)
-            {
-                call.arguments = std::sync::Arc::<str>::from(args);
-            }
-        }
-
-        fn is_completed(fields: &acp::ToolCallUpdateFields) -> bool {
-            matches!(
-                fields.status,
-                Some(acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed)
-            )
-        }
-
-        fn emit_tool_result(
-            &mut self,
-            id: &str,
-            fields: &acp::ToolCallUpdateFields,
-        ) -> Vec<ConversationItem> {
-            let mut out = Vec::new();
-            out.extend(self.flush_agent());
-
-            let content = extract_tool_result_text(fields);
-            let item = ConversationItem::tool_result(id.to_string(), content);
-            self.item_count += 1;
-            out.push(item);
-            out
-        }
-
-        fn flush_user(&mut self) -> Option<ConversationItem> {
-            if self.user_parts.is_empty() {
-                return None;
-            }
-            let item = ConversationItem::user_with_parts(std::mem::take(&mut self.user_parts));
-            self.item_count += 1;
-            Some(item)
-        }
-
-        fn flush_agent(&mut self) -> Option<ConversationItem> {
-            if !self.has_agent_content && self.agent_tool_calls.is_empty() {
-                return None;
-            }
-            let item = ConversationItem::Assistant(AssistantItem {
-                content: std::sync::Arc::<str>::from(std::mem::take(&mut self.agent_text)),
-                tool_calls: std::mem::take(&mut self.agent_tool_calls),
-                model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
-            });
-            self.has_agent_content = false;
-            self.item_count += 1;
-            Some(item)
-        }
-
-        fn flush(&mut self) -> Vec<ConversationItem> {
-            let mut out = Vec::new();
-            out.extend(self.flush_user());
-            out.extend(self.flush_agent());
-            out
-        }
-
-        fn reset(&mut self) {
-            self.user_parts.clear();
-            self.agent_text.clear();
-            self.agent_tool_calls.clear();
-            self.tool_args.clear();
-            self.emitted_tool_results.clear();
-            self.in_user_turn = false;
-            self.has_agent_content = false;
-            self.item_count = 0;
-        }
-
-        fn should_truncate(&self) -> bool {
-            self.needs_truncate
-        }
-
-        fn clear_truncate_flag(&mut self) {
-            self.needs_truncate = false;
-        }
-
-        fn count(&self) -> usize {
-            self.item_count
-        }
-    }
-
-    /// Extract displayable text from a completed ToolCallUpdate.
-    fn extract_tool_result_text(fields: &agent_client_protocol::ToolCallUpdateFields) -> String {
-        if let Some(content) = &fields.content {
-            let text: String = content
-                .iter()
-                .filter_map(|c| match c {
-                    agent_client_protocol::ToolCallContent::Content(
-                        agent_client_protocol::Content {
-                            content: agent_client_protocol::ContentBlock::Text(t),
-                            ..
-                        },
-                    ) => Some(t.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            if !text.is_empty() {
-                return text;
-            }
-        }
-        if let Some(raw) = &fields.raw_output {
-            return raw.to_string();
-        }
-        String::new()
     }
 
     fn write_remote_origin_marker(dir: &Path) {

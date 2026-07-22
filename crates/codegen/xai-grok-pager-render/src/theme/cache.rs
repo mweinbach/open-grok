@@ -113,11 +113,16 @@ pub fn terminal_native_locked() -> bool {
 /// Engage or clear the terminal-native theme lock.
 pub fn set_terminal_native_lock(locked: bool) {
     TERMINAL_NATIVE_LOCK.store(locked, Ordering::Relaxed);
+    // Cap quantization at ANSI-16 and switch syntax tokens to the dual-
+    // polarity accent map (default-fg grays + base ANSI hues). Without the
+    // polarity-safe remap, night-theme pastels collapse to White and vanish
+    // on light terminal profiles in minimal mode.
     xai_grok_markdown::set_color_level_cap(if locked {
         xai_grok_markdown::ColorLevel::Basic
     } else {
         xai_grok_markdown::ColorLevel::TrueColor
     });
+    xai_grok_markdown::set_polarity_safe_syntax(locked);
 }
 
 // -- Auto-mode ---------------------------------------------------------------
@@ -381,6 +386,20 @@ mod tests {
             set_terminal_native_lock(true);
             reset_for_test();
             assert!(!terminal_native_locked());
+        });
+    }
+
+    #[test]
+    fn terminal_native_lock_enables_polarity_safe_syntax() {
+        with_test_env(|| {
+            assert!(!xai_grok_markdown::polarity_safe_syntax());
+            set_terminal_native_lock(true);
+            assert!(
+                xai_grok_markdown::polarity_safe_syntax(),
+                "minimal must engage polarity-safe syntax remapping"
+            );
+            set_terminal_native_lock(false);
+            assert!(!xai_grok_markdown::polarity_safe_syntax());
         });
     }
 

@@ -568,6 +568,20 @@ impl ChatStateHandle {
         .flatten()
     }
 
+    /// Get the current turn's last assistant message text, or `None` when the
+    /// turn produced none (or the actor is dead). Turn-scoped, unlike
+    /// [`get_last_assistant_text`], and cheaper than [`get_conversation`].
+    ///
+    /// [`get_conversation`]: Self::get_conversation
+    /// [`get_last_assistant_text`]: Self::get_last_assistant_text
+    pub async fn get_last_assistant_text_in_turn(&self) -> Option<String> {
+        self.query("GetLastAssistantTextInTurn", |reply| {
+            ChatStateCommand::GetLastAssistantTextInTurn { reply }
+        })
+        .await
+        .flatten()
+    }
+
     /// Get the text of the first `Text` content part in the first `User` message.
     ///
     /// Returns `None` if no user message with text content exists or the actor

@@ -16,9 +16,19 @@ use crate::theme::Theme;
 /// Status of a single hook execution within a batch.
 #[derive(Debug, Clone)]
 pub enum HookRunStatus {
-    Success { elapsed: Duration },
+    Success {
+        elapsed: Duration,
+    },
     Skipped,
-    Failed { error: String, elapsed: Duration },
+    /// The hook ran and blocked (a stop-gate decision, not a failure).
+    Blocked {
+        detail: String,
+        elapsed: Duration,
+    },
+    Failed {
+        error: String,
+        elapsed: Duration,
+    },
 }
 
 /// A single hook run entry for display.
@@ -74,7 +84,7 @@ fn count_hooks(entries: &[&[HookRunEntry]]) -> (usize, usize) {
     for runs in entries {
         for r in *runs {
             match r.status {
-                HookRunStatus::Success { .. } => success += 1,
+                HookRunStatus::Success { .. } | HookRunStatus::Blocked { .. } => success += 1,
                 HookRunStatus::Failed { .. } => failed += 1,
                 HookRunStatus::Skipped => {}
             }
@@ -230,6 +240,27 @@ fn render_hooks_expanded_inner(runs: &[HookRunEntry]) -> Vec<BlockLine> {
                     ])
                     .into(),
                 );
+            }
+            HookRunStatus::Blocked { detail, elapsed } => {
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(format!("{}  ", INDENT), theme.muted()),
+                        Span::styled("\u{21a9} ", theme.fg(theme.accent_running)),
+                        Span::styled(run.name.clone(), theme.muted()),
+                        Span::styled(format!(" ({}ms)", elapsed.as_millis()), theme.muted()),
+                    ])
+                    .into(),
+                );
+                let detail_text = crate::render::line_utils::truncate_str(detail, 120);
+                for detail_line in detail_text.lines().take(3) {
+                    lines.push(
+                        Line::from(vec![
+                            Span::styled(format!("{}      ", INDENT), theme.muted()),
+                            Span::styled(detail_line.to_string(), theme.fg(theme.accent_running)),
+                        ])
+                        .into(),
+                    );
+                }
             }
             HookRunStatus::Failed { error, elapsed } => {
                 lines.push(

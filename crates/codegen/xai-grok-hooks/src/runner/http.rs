@@ -6,36 +6,27 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
 use url::Url;
 
 use crate::config::HookSpec;
 use crate::event::HookEventEnvelope;
-use crate::result::{HookDecision, HttpInfo};
+use crate::result::{HookDecision, HttpInfo, StopHookOutcome};
 
-use super::{HookRunOutput, HookRunnerResult, RunContext};
+use super::{
+    GateKind, HookRunOutput, HookRunnerResult, RunContext, StopHookJson, stop_json_to_outcome,
+};
 
-/// Maximum characters to keep from the response body for the preview.
 const RESPONSE_PREVIEW_MAX: usize = 200;
 
-/// The JSON result structure expected from blocking HTTP hooks.
-#[derive(Debug, Deserialize)]
-struct HttpHookOutput {
-    decision: String,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-/// CWE-918: Returns `true` if an IP address is in a private, link-local,
-/// or cloud metadata range that should be blocked to prevent SSRF attacks.
-///
-/// Loopback (`127.x` / `::1`) is allowed for local development servers.
+/// CWE-918: `true` if `ip` is in a private, link-local, or cloud metadata range
+/// that must be blocked to prevent SSRF. Loopback (`127.x`/`::1`) is allowed for
+/// local development servers.
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let octets = v4.octets();
             if octets[0] == 127 {
-                return false; // loopback — allowed for local dev
+                return false; // loopback, allowed for local dev
             }
             if octets[0] == 10 {
                 return true; // RFC 1918: 10.0.0.0/8
@@ -59,7 +50,7 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
         }
         IpAddr::V6(v6) => {
             if v6.is_loopback() {
-                return false; // ::1 — allowed for local dev
+                return false; // ::1, allowed for local dev
             }
             if v6.is_unspecified() {
                 return true; // ::
@@ -69,25 +60,22 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
             }
             let segments = v6.segments();
             if segments[0] & 0xffc0 == 0xfe80 {
-                return true; // fe80::/10 — link-local
+                return true; // fe80::/10 link-local
             }
             if segments[0] & 0xfe00 == 0xfc00 {
-                return true; // fc00::/7 — unique local (ULA)
+                return true; // fc00::/7 unique local (ULA)
             }
             false
         }
     }
 }
 
-/// CWE-918: Validate a hook URL to prevent SSRF.
-///
-/// Requirements:
-/// - Only HTTPS scheme is allowed (reject HTTP / other schemes).
-/// - Resolved IP addresses must not be in private/link-local/metadata ranges.
+/// CWE-918: prevent SSRF. Only HTTPS is allowed and resolved IPs must not be
+/// private/link-local/metadata. Known gap: the request re-resolves the host, so
+/// a rebinding DNS server can still swap in a blocked IP after this check.
 async fn validate_hook_url(url: &str) -> Result<(), String> {
     let parsed = Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
 
-    // Restrict to HTTPS only.
     if parsed.scheme() != "https" {
         return Err(format!(
             "only https:// URLs are allowed for HTTP hooks, got {}://",
@@ -99,7 +87,6 @@ async fn validate_hook_url(url: &str) -> Result<(), String> {
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
 
-    // If host is a literal IP, check it directly.
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_blocked_ip(&ip) {
             return Err(format!("URL resolves to blocked private/internal IP: {ip}"));
@@ -107,7 +94,6 @@ async fn validate_hook_url(url: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // DNS resolution check.
     let port = parsed.port_or_known_default().unwrap_or(443);
     let addr_str = format!("{host}:{port}");
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
@@ -131,29 +117,25 @@ async fn validate_hook_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Build the reqwest client used to send a hook request.
 fn build_hook_client(timeout_ms: u64) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         // `validate_hook_url` only vets the initial URL, not redirect targets.
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_default()
+        // A default fallback would follow redirects and drop the timeout,
+        // reopening the SSRF path; build only fails on a TLS init fault.
+        .expect("hook HTTP client config is valid")
 }
 
-/// Run a single HTTP hook.
-///
-/// POSTs the serialized `HookEventEnvelope` as JSON to `spec.url`.
-/// For blocking hooks (`PreToolUse`), parses the response JSON for
-/// `{"decision": "allow"}` or `{"decision": "deny", "reason": "..."}`.
-/// For non-blocking hooks, any 2xx response is success.
-///
-/// Respects `spec.timeout_ms` for the entire request.
+/// POST the serialized `HookEventEnvelope` to `spec.url` and parse the response
+/// per gate mode (blocking parses a decision JSON; observe treats any 2xx as
+/// success).
 pub async fn run_http_hook(
     spec: &HookSpec,
     envelope: &HookEventEnvelope,
     _ctx: &RunContext<'_>,
-    is_blocking: bool,
+    mode: GateKind,
 ) -> HookRunOutput {
     let start = Instant::now();
 
@@ -165,39 +147,17 @@ pub async fn run_http_hook(
         );
     };
 
-    // Expand `${VAR}` / `$VAR` in the URL right before validation. We
-    // re-run expansion here (in addition to the load-time pass in
-    // `parse_hook_file`) because plugin URLs can reference plugin-injected
-    // vars (e.g. `${CLAUDE_PLUGIN_ROOT}/check`) that only land in
-    // `spec.extra_env` after the plugin adapter wires them in.
-    //
-    // For plugin hooks specifically: the load-time pass in
-    // `parse_hook_file` runs BEFORE the plugin adapter populates
-    // `extra_env` with plugin keys, so `${CLAUDE_PLUGIN_ROOT}` etc.
-    // survive that pass and are resolved here at runtime. For
-    // non-plugin hooks the load-time pass already resolved everything
-    // resolvable, and this pass is effectively a no-op.
-    //
-    // Unset refs are preserved verbatim, so `validate_hook_url` will
-    // reject them with an "invalid URL" error rather than silently
-    // smuggling a literal `${VAR}` past validation.
+    // Re-expand the URL here (in addition to the load-time pass) because plugin
+    // vars (e.g. `${CLAUDE_PLUGIN_ROOT}/check`) only land in `extra_env` after
+    // the plugin adapter runs. Unset refs are preserved so `validate_hook_url`
+    // rejects them rather than smuggling a literal `${VAR}` past validation.
     let expanded_url = crate::env_expand::expand_env_vars_with_extra(raw_url, &spec.extra_env);
     let url: &str = &expanded_url;
-    // For tracing/log purposes prefer the pre-expansion source so
-    // resolved values from the user `env` map (which may contain
-    // secrets like API tokens) don't land in `~/.opengrok/logs`. Falls
-    // back to the expanded form if the spec was constructed by a
-    // legacy path that didn't populate `url_raw`. The same `log_url`
-    // is also threaded into `format!("HTTP request failed for {}:
-    // {}", log_url, e.without_url())` below so reqwest's default
-    // `Display` (which appends the request URL) does not bypass the
-    // raw-source preference.
+    // Prefer the pre-expansion source for logs so resolved `env` secrets don't
+    // reach `~/.opengrok/logs`; threaded into the reqwest error format below so
+    // reqwest's default `Display` (which appends the URL) can't bypass it.
     let log_url: &str = spec.url_raw.as_deref().unwrap_or(url);
 
-    // Helper: build an `HttpInfo` populated with both the
-    // post-expansion `url` (for SSRF debugging) and the raw source
-    // form (for any user-facing display surface). See `HttpInfo`
-    // rustdoc on `crate::result::HttpInfo` for the contract.
     let make_info = |status: Option<u16>, preview: Option<String>| -> HttpInfo {
         HttpInfo {
             url: url.to_owned(),
@@ -207,8 +167,20 @@ pub async fn run_http_hook(
         }
     };
 
-    // CWE-918: Validate URL before sending any data.
-    if let Err(reason) = validate_hook_url(url).await {
+    // CWE-918: validate before sending. Bound the DNS lookup by the hook
+    // timeout; the reqwest timeout only covers the request that follows.
+    let validation = tokio::time::timeout(
+        Duration::from_millis(spec.timeout_ms),
+        validate_hook_url(url),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "URL validation timed out after {}ms",
+            spec.timeout_ms
+        ))
+    });
+    if let Err(reason) = validation {
         tracing::warn!(
             hook_name = %spec.name,
             url = %log_url,
@@ -245,15 +217,10 @@ pub async fn run_http_hook(
         Ok(r) => r,
         Err(e) => {
             let elapsed = start.elapsed();
-            // SECURITY: `reqwest::Error::Display` unconditionally
-            // appends the request URL. If the resolved URL embeds a
-            // secret resolved from the user `env` map (e.g.
-            // `?token=ghp_REAL_SECRET`), the secret would otherwise
-            // land in `HookRunResult::Failed.error` and surface in
-            // pager scrollback / wire DTOs. `e.without_url()` strips
-            // the URL from the formatted output so we substitute our
-            // own `log_url` (which prefers the raw source form) in
-            // its place.
+            // SECURITY: `reqwest::Error::Display` appends the request URL, which
+            // may embed an `env`-map secret and leak into `Failed.error` and
+            // pager scrollback. `e.without_url()` strips it so we substitute
+            // `log_url` (the raw source form).
             let error = if e.is_timeout() {
                 format!("timed out after {}ms", spec.timeout_ms)
             } else {
@@ -279,7 +246,7 @@ pub async fn run_http_hook(
         "http hook completed"
     );
 
-    if !is_blocking {
+    if mode == GateKind::Observe {
         let http_info = Some(make_info(Some(status_code), None));
         if status.is_success() {
             return (HookRunnerResult::Success, elapsed, http_info);
@@ -291,13 +258,10 @@ pub async fn run_http_hook(
         );
     }
 
-    // Blocking hook: parse response JSON for decision.
     let response_text = match response.text().await {
         Ok(t) => t,
         Err(e) => {
-            // SECURITY: same `without_url()` reasoning as the send
-            // failure above -- reqwest's body-read error also includes
-            // the URL by default.
+            // SECURITY: scrub the URL as in the send-failure branch above.
             return (
                 HookRunnerResult::Failed(format!(
                     "failed to read response body for {}: {}",
@@ -318,49 +282,65 @@ pub async fn run_http_hook(
 
     let http_info = Some(make_info(Some(status_code), response_preview.clone()));
 
-    let result = parse_http_blocking_result(&response_text, status, &spec.name);
+    let result = match mode {
+        GateKind::Tool => parse_http_blocking_result(&response_text, status, &spec.name),
+        GateKind::Stop => parse_http_stop_result(&response_text, status, &spec.name),
+        GateKind::Observe => HookRunnerResult::Success,
+    };
     (result, elapsed, http_info)
 }
 
-/// Parse an HTTP blocking hook response into a `HookRunnerResult`.
-///
-/// This is the HTTP analogue of `command::parse_blocking_result`.
-/// Extracted as a standalone function so it can be unit-tested without
-/// making real HTTP requests.
+/// HTTP analogue of `command::parse_stop_result`: a 2xx JSON body is parsed for
+/// the decision; a 2xx empty/non-JSON body allows the stop; a non-2xx response
+/// is a failure (callers fail open).
+fn parse_http_stop_result(
+    response_text: &str,
+    status: reqwest::StatusCode,
+    hook_name: &str,
+) -> HookRunnerResult {
+    if !status.is_success() {
+        return HookRunnerResult::Failed(format!("HTTP status {status}"));
+    }
+    let trimmed = response_text.trim();
+    if trimmed.is_empty() {
+        return HookRunnerResult::Stop(StopHookOutcome::default());
+    }
+    match serde_json::from_str::<StopHookJson>(trimmed) {
+        Ok(json) => match stop_json_to_outcome(json, hook_name) {
+            Ok(outcome) => HookRunnerResult::Stop(outcome),
+            Err(err) => HookRunnerResult::Failed(err),
+        },
+        Err(e) => {
+            tracing::warn!(
+                hook_name = %hook_name,
+                error = %e,
+                "could not parse HTTP stop hook response JSON, treating as allow-stop"
+            );
+            HookRunnerResult::Stop(StopHookOutcome::default())
+        }
+    }
+}
+
+/// Parse an HTTP blocking hook response, the analogue of
+/// `command::parse_blocking_result`.
 fn parse_http_blocking_result(
     response_text: &str,
     status: reqwest::StatusCode,
     hook_name: &str,
 ) -> HookRunnerResult {
     if response_text.trim().is_empty() {
-        // No body: use HTTP status as fallback.
         if status.is_success() {
             return HookRunnerResult::Decision(HookDecision::Allow);
         }
         return HookRunnerResult::Failed(format!("HTTP status {} with empty body", status));
     }
 
-    match serde_json::from_str::<HttpHookOutput>(response_text) {
-        Ok(output) => {
-            if output.decision == "deny" {
-                let reason = output
-                    .reason
-                    .unwrap_or_else(|| format!("denied by hook '{}'", hook_name));
-                HookRunnerResult::Decision(HookDecision::Deny {
-                    reason,
-                    hook_name: hook_name.to_string(),
-                })
-            } else if output.decision == "allow" {
-                HookRunnerResult::Decision(HookDecision::Allow)
-            } else {
-                HookRunnerResult::Failed(format!(
-                    "unknown decision value '{}' from hook '{}'",
-                    output.decision, hook_name
-                ))
-            }
-        }
+    match serde_json::from_str::<super::GateHookJson>(response_text) {
+        Ok(output) => match super::gate_json_to_decision(output, hook_name) {
+            Ok(decision) => HookRunnerResult::Decision(decision),
+            Err(err) => HookRunnerResult::Failed(err),
+        },
         Err(e) => {
-            // Cannot parse response: fail-open if status is success.
             if status.is_success() {
                 tracing::warn!(
                     hook_name = %hook_name,
@@ -378,16 +358,13 @@ fn parse_http_blocking_result(
     }
 }
 
-/// Truncate a response body string for preview display.
-///
-/// Uses `char_indices` to find a safe UTF-8 boundary so we never panic
-/// on multi-byte characters.
+/// Truncate a response body for preview, cutting on a UTF-8 char boundary so
+/// multi-byte characters never panic.
 fn truncate_preview(s: &str) -> String {
     let trimmed = s.trim();
     if trimmed.len() <= RESPONSE_PREVIEW_MAX {
         trimmed.to_string()
     } else {
-        // Find the last char boundary at or before RESPONSE_PREVIEW_MAX bytes.
         let boundary = trimmed
             .char_indices()
             .take_while(|&(i, _)| i <= RESPONSE_PREVIEW_MAX)
@@ -404,8 +381,6 @@ fn truncate_preview(s: &str) -> String {
 mod tests {
     use super::*;
     use reqwest::StatusCode;
-
-    // ── parse_http_blocking_result tests ──────────────────────────
 
     #[test]
     fn http_allow_json() {
@@ -461,22 +436,51 @@ mod tests {
         }
     }
 
+    /// The JSON vocabulary itself is covered by the shared `stop_json_to_outcome`
+    /// tests; this covers only the HTTP status/body handling.
     #[test]
-    fn http_empty_body_success_allows() {
-        let result = parse_http_blocking_result("", StatusCode::OK, "test-hook");
+    fn http_stop_status_and_body_handling() {
+        match parse_http_stop_result(
+            r#"{"decision":"block","reason":"tests failing"}"#,
+            StatusCode::OK,
+            "s",
+        ) {
+            HookRunnerResult::Stop(o) => {
+                assert_eq!(o.block_reason.as_deref(), Some("tests failing"));
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        match parse_http_stop_result("", StatusCode::OK, "s") {
+            HookRunnerResult::Stop(o) => assert!(o.is_empty()),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        match parse_http_stop_result("not json", StatusCode::OK, "s") {
+            HookRunnerResult::Stop(o) => assert!(o.is_empty()),
+            other => panic!("expected Stop, got {other:?}"),
+        }
         assert!(matches!(
-            result,
-            HookRunnerResult::Decision(HookDecision::Allow)
+            parse_http_stop_result(r#"{"decision":"deny"}"#, StatusCode::OK, "s"),
+            HookRunnerResult::Failed(_)
+        ));
+        assert!(matches!(
+            parse_http_stop_result(
+                r#"{"decision":"block"}"#,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "s"
+            ),
+            HookRunnerResult::Failed(_)
         ));
     }
 
     #[test]
-    fn http_empty_body_whitespace_success_allows() {
-        let result = parse_http_blocking_result("   \n  ", StatusCode::OK, "test-hook");
-        assert!(matches!(
-            result,
-            HookRunnerResult::Decision(HookDecision::Allow)
-        ));
+    fn http_empty_body_success_allows() {
+        for body in ["", "   \n  "] {
+            let result = parse_http_blocking_result(body, StatusCode::OK, "test-hook");
+            assert!(matches!(
+                result,
+                HookRunnerResult::Decision(HookDecision::Allow)
+            ));
+        }
     }
 
     #[test]
@@ -493,17 +497,17 @@ mod tests {
 
     #[test]
     fn http_invalid_json_success_status_fail_open() {
-        // Unparseable JSON with 200 OK should fail-open to allow.
-        let result = parse_http_blocking_result("not json at all", StatusCode::OK, "test-hook");
-        assert!(matches!(
-            result,
-            HookRunnerResult::Decision(HookDecision::Allow)
-        ));
+        for body in ["not json at all", r#"{"decision":"deny""#] {
+            let result = parse_http_blocking_result(body, StatusCode::OK, "test-hook");
+            assert!(matches!(
+                result,
+                HookRunnerResult::Decision(HookDecision::Allow)
+            ));
+        }
     }
 
     #[test]
     fn http_invalid_json_error_status_fails() {
-        // Unparseable JSON with 500 should fail.
         let result =
             parse_http_blocking_result("not json", StatusCode::INTERNAL_SERVER_ERROR, "test-hook");
         match result {
@@ -530,143 +534,69 @@ mod tests {
     }
 
     #[test]
-    fn http_allow_with_non_success_status() {
-        let result = parse_http_blocking_result(
-            r#"{"decision":"allow"}"#,
-            StatusCode::BAD_REQUEST,
-            "test-hook",
-        );
-        assert!(matches!(
-            result,
-            HookRunnerResult::Decision(HookDecision::Allow)
-        ));
-    }
-
-    #[test]
-    fn http_partial_json_success_fail_open() {
-        let result =
-            parse_http_blocking_result(r#"{"decision":"deny""#, StatusCode::OK, "test-hook");
-        assert!(matches!(
-            result,
-            HookRunnerResult::Decision(HookDecision::Allow)
-        ));
-    }
-
-    #[test]
-    fn http_extra_fields_tolerated() {
-        let result = parse_http_blocking_result(
-            r#"{"decision":"deny","reason":"nope","extra":"ignored","count":42}"#,
-            StatusCode::OK,
-            "test-hook",
-        );
-        match result {
-            HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
-                assert_eq!(reason, "nope");
-            }
-            other => panic!("expected Deny, got {other:?}"),
+    fn ssrf_blocks_private_and_special_ranges() {
+        for ip in [
+            "10.0.0.1", // RFC 1918 10.0.0.0/8
+            "10.255.255.255",
+            "172.16.0.1", // RFC 1918 172.16.0.0/12
+            "172.31.255.255",
+            "192.168.0.1", // RFC 1918 192.168.0.0/16
+            "192.168.255.255",
+            "169.254.0.1", // link-local / metadata
+            "169.254.169.254",
+            "100.64.0.1", // CGNAT
+            "100.127.255.255",
+            "0.0.0.0", // unspecified
+            "::",
+        ] {
+            assert!(is_blocked_ip(&ip.parse().unwrap()), "{ip} must be blocked");
+        }
+        // Just outside the blocked RFC 1918 / CGNAT ranges.
+        for ip in ["172.15.0.1", "172.32.0.1", "100.63.0.1"] {
+            assert!(!is_blocked_ip(&ip.parse().unwrap()), "{ip} must be allowed");
         }
     }
 
-    // ── SSRF protection: is_blocked_ip tests ──────────────
-
     #[test]
-    fn ssrf_blocks_rfc1918_10x() {
-        assert!(is_blocked_ip(&"10.0.0.1".parse().unwrap()));
-        assert!(is_blocked_ip(&"10.255.255.255".parse().unwrap()));
+    fn ssrf_allows_loopback_and_public() {
+        for ip in ["127.0.0.1", "::1", "1.1.1.1", "8.8.8.8"] {
+            assert!(!is_blocked_ip(&ip.parse().unwrap()), "{ip} must be allowed");
+        }
     }
 
     #[test]
-    fn ssrf_blocks_rfc1918_172x() {
-        assert!(is_blocked_ip(&"172.16.0.1".parse().unwrap()));
-        assert!(is_blocked_ip(&"172.31.255.255".parse().unwrap()));
-        assert!(!is_blocked_ip(&"172.15.0.1".parse().unwrap()));
-        assert!(!is_blocked_ip(&"172.32.0.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_blocks_rfc1918_192168() {
-        assert!(is_blocked_ip(&"192.168.0.1".parse().unwrap()));
-        assert!(is_blocked_ip(&"192.168.255.255".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_blocks_link_local_metadata() {
-        assert!(is_blocked_ip(&"169.254.0.1".parse().unwrap()));
-        assert!(is_blocked_ip(&"169.254.169.254".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_blocks_cgnat() {
-        assert!(is_blocked_ip(&"100.64.0.1".parse().unwrap()));
-        assert!(is_blocked_ip(&"100.127.255.255".parse().unwrap()));
-        assert!(!is_blocked_ip(&"100.63.0.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_blocks_unspecified() {
-        assert!(is_blocked_ip(&"0.0.0.0".parse().unwrap()));
-        assert!(is_blocked_ip(&"::".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_allows_loopback() {
-        assert!(!is_blocked_ip(&"127.0.0.1".parse().unwrap()));
-        assert!(!is_blocked_ip(&"::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_allows_public_ips() {
-        assert!(!is_blocked_ip(&"1.1.1.1".parse().unwrap()));
-        assert!(!is_blocked_ip(&"8.8.8.8".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_blocks_ipv6_link_local() {
-        assert!(is_blocked_ip(&"fe80::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_blocks_ipv6_unique_local() {
-        assert!(is_blocked_ip(&"fc00::1".parse().unwrap()));
-        assert!(is_blocked_ip(&"fd00::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn ssrf_blocks_ipv4_mapped_ipv6_private() {
-        assert!(is_blocked_ip(&"::ffff:10.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_blocked_ip(
-            &"::ffff:192.168.1.1".parse::<IpAddr>().unwrap()
-        ));
-    }
-
-    // ── SSRF protection: validate_hook_url tests ──────────
-
-    #[tokio::test]
-    async fn ssrf_rejects_http_scheme() {
-        let result = validate_hook_url("http://example.com/hook").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("https://"));
+    fn ssrf_blocks_ipv6_ranges() {
+        for ip in [
+            "fe80::1", // link-local
+            "fc00::1", // unique local (ULA)
+            "fd00::1",
+            "::ffff:10.0.0.1", // IPv4-mapped private
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(
+                is_blocked_ip(&ip.parse::<IpAddr>().unwrap()),
+                "{ip} must be blocked"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn ssrf_rejects_ftp_scheme() {
-        let result = validate_hook_url("ftp://example.com/hook").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("https://"));
+    async fn ssrf_rejects_non_https_schemes() {
+        for url in ["http://example.com/hook", "ftp://example.com/hook"] {
+            let err = validate_hook_url(url).await.expect_err("must reject");
+            assert!(err.contains("https://"));
+        }
     }
 
     #[tokio::test]
-    async fn ssrf_rejects_private_ip_literal() {
-        let result = validate_hook_url("https://10.0.0.1/hook").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("blocked"));
-    }
-
-    #[tokio::test]
-    async fn ssrf_rejects_metadata_ip_literal() {
-        let result = validate_hook_url("https://169.254.169.254/latest/meta-data/").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("blocked"));
+    async fn ssrf_rejects_blocked_ip_literals() {
+        for url in [
+            "https://10.0.0.1/hook",
+            "https://169.254.169.254/latest/meta-data/",
+        ] {
+            let err = validate_hook_url(url).await.expect_err("must reject");
+            assert!(err.contains("blocked"));
+        }
     }
 
     #[tokio::test]
@@ -682,76 +612,23 @@ mod tests {
         assert!(result.unwrap_err().contains("invalid URL"));
     }
 
-    // ── URL env-var expansion (extra_env precedence) ───────────
+    /// A host that never resolves fails validation (covers the DNS branch that
+    /// the literal-IP tests skip). `.invalid` is reserved to never resolve.
+    #[tokio::test]
+    async fn ssrf_rejects_unresolvable_host() {
+        let err = validate_hook_url("https://nonexistent.invalid/hook")
+            .await
+            .expect_err("unresolvable host must fail validation");
+        assert!(err.contains("DNS resolution failed"), "got: {err}");
+    }
 
     use crate::config::HookSpec;
     use crate::event::{HookEventEnvelope, HookEventName, HookPayload};
     use crate::test_support::with_env_var;
 
-    /// Regression: an HTTP hook whose `url` references a var present only
-    /// in `spec.extra_env` (not the process env) must still be expanded
-    /// at runtime by `run_http_hook`. This is the path used by plugin
-    /// hooks where the plugin adapter wires `${CLAUDE_PLUGIN_ROOT}` into
-    /// `extra_env` after the load-time pass in `parse_hook_file` ran.
-    ///
-    /// Documentation-of-intent unit test for the helper. The end-to-end
-    /// proof through `run_http_hook` lives in
-    /// [`run_http_hook_uses_post_expansion_url_for_ssrf`] below.
-    #[test]
-    fn url_extra_env_takes_precedence_in_runtime_expansion() {
-        // Use the same helper the runtime path uses; we don't need to
-        // make a real network call to verify the substitution, only that
-        // the helper resolves the right value from extra_env.
-        let mut extra = std::collections::HashMap::new();
-        extra.insert("PLUGIN_HOST".to_string(), "example.com".to_string());
-        let out =
-            crate::env_expand::expand_env_vars_with_extra("https://${PLUGIN_HOST}/check", &extra);
-        assert_eq!(out, "https://example.com/check");
-    }
-
-    /// If `extra_env` shadows a process-env var with the same name, the
-    /// `extra_env` value wins. This matches the contract documented on
-    /// `HookSpec::extra_env` and matches the lookup order in
-    /// `runner/command.rs`'s pre-flight check. Documentation-of-intent
-    /// unit test (the end-to-end variant via `run_http_hook` lives in
-    /// `tests/integration.rs`).
-    #[test]
-    fn url_extra_env_shadows_process_env() {
-        let key = "GROK_HOOKS_HTTP_TEST_SHADOW";
-        with_env_var(key, Some("from-process"), || {
-            let mut extra = std::collections::HashMap::new();
-            extra.insert(key.to_string(), "from-extra".to_string());
-            let out = crate::env_expand::expand_env_vars_with_extra(
-                &format!("https://${{{key}}}/x"),
-                &extra,
-            );
-            assert_eq!(out, "https://from-extra/x");
-        });
-    }
-
-    /// Regression: a URL with multiple `${VAR}` references must
-    /// expand all of them. Locks down behaviour against shellexpand
-    /// regressions that affect consecutive references.
-    #[test]
-    fn url_with_multiple_consecutive_env_refs_expands_all() {
-        let mut extra = std::collections::HashMap::new();
-        extra.insert("HOST".to_string(), "api.example.com".to_string());
-        extra.insert("PORT".to_string(), "8443".to_string());
-        extra.insert("ROUTE".to_string(), "v2/check".to_string());
-        let out = crate::env_expand::expand_env_vars_with_extra(
-            "https://${HOST}:${PORT}/${ROUTE}",
-            &extra,
-        );
-        assert_eq!(out, "https://api.example.com:8443/v2/check");
-    }
-
-    /// Regression: SSRF validation in `run_http_hook` must
-    /// operate on the POST-expansion URL. We construct a `HookSpec`
-    /// with `url: "https://${INTERNAL}/hook"` and `extra_env` mapping
-    /// `INTERNAL=10.0.0.1`, then call `run_http_hook` directly and
-    /// assert the failure carries SSRF-blocking language and that the
-    /// `HttpInfo.url` returned for scrollback is the post-expansion
-    /// form (`10.0.0.1`) rather than the literal placeholder.
+    /// SSRF validation in `run_http_hook` must operate on the post-expansion URL,
+    /// and `HttpInfo` must carry the resolved form while `raw_url` mirrors the
+    /// source.
     #[tokio::test]
     async fn run_http_hook_uses_post_expansion_url_for_ssrf() {
         let mut extra_env = std::collections::HashMap::new();
@@ -761,7 +638,7 @@ mod tests {
         let spec = HookSpec {
             name: "test-ssrf-post-expand".into(),
             event: HookEventName::PreToolUse,
-            handler_type: "http".into(),
+            handler_type: crate::config::HandlerType::Http,
             configured_matcher: None,
             matcher: None,
             enabled: true,
@@ -783,12 +660,12 @@ mod tests {
             transcript_path: None,
             client_identifier: None,
             prompt_id: None,
+            permission_mode: None,
             payload: HookPayload::PreToolUse {
                 tool_name: "test".into(),
                 tool_use_id: "id-1".into(),
                 tool_input: serde_json::json!({}),
                 tool_input_truncated: false,
-                permission_mode: None,
                 subagent_type: None,
             },
         };
@@ -796,7 +673,7 @@ mod tests {
             session_id: "test",
             workspace_root: "/tmp",
         };
-        let (result, _, info) = run_http_hook(&spec, &envelope, &ctx, true).await;
+        let (result, _, info) = run_http_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
 
         match result {
             crate::runner::HookRunnerResult::Failed(reason) => {
@@ -813,9 +690,6 @@ mod tests {
             info.url, "https://10.0.0.1/hook",
             "HttpInfo.url must reflect the post-expansion URL (the actual target SSRF blocked)"
         );
-        // HttpInfo.raw_url must mirror the source
-        // form so any future scrollback/wire-DTO consumer can prefer
-        // it for user-facing display.
         assert_eq!(
             info.raw_url.as_deref(),
             Some("https://${INTERNAL_HOST_SSRF}/hook"),
@@ -823,23 +697,14 @@ mod tests {
         );
     }
 
-    /// Regression: `reqwest::Error::Display`
-    /// unconditionally appends the request URL. If the resolved URL
-    /// embeds a secret resolved via `${TOKEN}` substitution from the
-    /// user `env` map, the secret would land in
-    /// `HookRunResult::Failed.error` and surface in pager scrollback
-    /// without the raw-fields work catching it. This test
-    /// builds a HookSpec that resolves to a guaranteed-dead host
-    /// (TEST-NET-1 192.0.2.0/24 from RFC 5737, used in docs) with a
-    /// secret-bearing query string, calls run_http_hook, and asserts
-    /// the secret does NOT appear in the returned error message.
+    /// `reqwest::Error::Display` appends the request URL, so a `${TOKEN}` secret
+    /// would leak into `Failed.error` and pager scrollback. Assert the secret
+    /// never appears in the error from a guaranteed-dead host (TEST-NET-1).
     #[tokio::test]
     async fn run_http_hook_scrubs_url_from_reqwest_error() {
-        // Use a TEST-NET-1 host (RFC 5737, "MUST NOT be used in
-        // public networks"). It is not RFC1918 so SSRF validation
-        // will let it through, but no real DNS or connection will
-        // succeed -- reqwest will surface a connection error whose
-        // default Display includes the URL.
+        // TEST-NET-1 (RFC 5737) is not RFC1918, so SSRF validation lets it
+        // through, but no connection succeeds: reqwest returns a connection
+        // error whose default Display would include the URL.
         let secret = "ghp_VERY_REAL_SECRET_TOKEN_42";
         let mut extra_env = std::collections::HashMap::new();
         extra_env.insert("RUNTIME_HOST".to_string(), "192.0.2.1".to_string());
@@ -849,7 +714,7 @@ mod tests {
         let spec = HookSpec {
             name: "test-scrub-reqwest-error".into(),
             event: HookEventName::PreToolUse,
-            handler_type: "http".into(),
+            handler_type: crate::config::HandlerType::Http,
             configured_matcher: None,
             matcher: None,
             enabled: true,
@@ -857,9 +722,8 @@ mod tests {
             command_raw: None,
             url: Some(raw.to_string()),
             url_raw: Some(raw.to_string()),
-            // Short timeout so the test doesn't hang waiting for the
-            // dead host. Still long enough to actually attempt the
-            // connection so we exercise the Err(e) branch of `send().await`.
+            // Short but long enough to attempt the connection, so we exercise
+            // the Err(e) branch of `send().await` rather than a timeout.
             timeout_ms: 500,
             source_dir: std::env::temp_dir(),
             extra_env,
@@ -873,12 +737,12 @@ mod tests {
             transcript_path: None,
             client_identifier: None,
             prompt_id: None,
+            permission_mode: None,
             payload: HookPayload::PreToolUse {
                 tool_name: "test".into(),
                 tool_use_id: "id-1".into(),
                 tool_input: serde_json::json!({}),
                 tool_input_truncated: false,
-                permission_mode: None,
                 subagent_type: None,
             },
         };
@@ -887,42 +751,31 @@ mod tests {
             workspace_root: "/tmp",
         };
 
-        let (result, _, info) = run_http_hook(&spec, &envelope, &ctx, true).await;
+        let (result, _, info) = run_http_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
 
-        // Either `Failed` (timeout / connection error) is fine; both
-        // exercise paths that previously embedded the raw URL via
-        // `format!("...{e}")`. Pure timeouts use a different
-        // formatting branch (no URL involved), so prefer the
-        // connection-error case but tolerate either.
+        // Either a timeout or a connection error is fine; both previously risked
+        // embedding the raw URL via `format!("...{e}")`.
         let error_text = match result {
             crate::runner::HookRunnerResult::Failed(reason) => reason,
             other => panic!("expected Failed, got {other:?}"),
         };
 
-        // The secret must NOT be in the error text. This covers BOTH
-        // the timeout branch (which doesn't format the URL at all,
-        // so trivially passes) and the connection-error branch
-        // (which formats `e.without_url()`, scrubbing the URL).
         assert!(
             !error_text.contains(secret),
             "secret leaked into error text: {error_text}"
         );
 
-        // The error must mention the raw URL form (so users can see
-        // which hook failed) -- never the resolved form, which would
-        // include the secret-bearing query string.
+        // The connection-error branch must reference the raw URL form (so users
+        // see which hook failed), never the resolved secret-bearing form.
         if !error_text.contains("timed out") {
-            // Connection-error branch: error must reference the raw
-            // form, not the resolved one.
             assert!(
                 error_text.contains("${RUNTIME_HOST}") || error_text.contains("${MY_TOKEN}"),
                 "expected error to reference the raw URL form, got: {error_text}"
             );
         }
 
-        // HttpInfo.url is still post-expansion (intentional, for SSRF
-        // debugging). The wire-DTO consumer must prefer raw_url for
-        // display -- documented in the HttpInfo rustdoc.
+        // HttpInfo.url stays post-expansion for SSRF debugging; consumers prefer
+        // raw_url for display (see the HttpInfo rustdoc).
         let info = info.expect("HttpInfo should be present for connection failures too");
         assert_eq!(
             info.url,
@@ -931,11 +784,8 @@ mod tests {
         assert_eq!(info.raw_url.as_deref(), Some(raw));
     }
 
-    /// The hook client must not follow HTTP redirects: `validate_hook_url`
-    /// only vets the initial URL, so a followed 3xx would reach an unvalidated
-    /// target. The local server answers every request with a 302 pointing at a
-    /// blocked address; with redirects disabled the client returns the 302
-    /// verbatim and never issues a second request to the target.
+    /// The hook client must not follow redirects: `validate_hook_url` only vets
+    /// the initial URL, so a followed 3xx would reach an unvalidated target.
     #[tokio::test]
     async fn hook_client_does_not_follow_redirects() {
         use std::sync::Arc;
@@ -983,18 +833,13 @@ mod tests {
         );
     }
 
-    /// Unresolved `${VAR}` refs are preserved verbatim by the helper,
-    /// which means `validate_hook_url` will reject the URL with an
-    /// "invalid URL" error. This is the desired behaviour: a hook
-    /// referencing an unset var must surface a clear failure rather than
-    /// silently smuggling the literal placeholder past validation.
+    /// An unresolved `${VAR}` ref is preserved verbatim, so `validate_hook_url`
+    /// rejects it rather than smuggling the literal placeholder past validation.
     #[tokio::test]
     async fn url_unresolved_var_fails_validation() {
         let key = "GROK_HOOKS_HTTP_TEST_UNRESOLVED";
-        // Step 1 (sync): ensure the var is unset and run the
-        // expansion. `with_env_var` uses `catch_unwind` so the closure
-        // is synchronous; we deliberately do the async `validate_hook_url`
-        // call OUTSIDE the helper so we don't try to nest tokio runtimes.
+        // `with_env_var`'s closure is synchronous (it uses `catch_unwind`), so
+        // run the async `validate_hook_url` outside it to avoid nesting runtimes.
         let expanded = with_env_var(key, None, || {
             let extra = std::collections::HashMap::new();
             crate::env_expand::expand_env_vars_with_extra(
@@ -1002,10 +847,8 @@ mod tests {
                 &extra,
             )
         });
-        // The literal placeholder is preserved.
         assert!(expanded.contains(&format!("${{{key}}}")));
-        // Url::parse rejects strings with literal `${` because `{`
-        // isn't a valid URL character.
+        // Url::parse rejects the literal `${` (`{` is not a valid URL character).
         let result = validate_hook_url(&expanded).await;
         assert!(result.is_err(), "expected invalid URL error, got Ok");
     }

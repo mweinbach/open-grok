@@ -975,7 +975,8 @@ fn free_usage_failure_opens_paywall_modal() {
     // 1. Real send.
     let effects = dispatch(Action::SendPrompt("draw me a cat".into()), &mut app);
     assert!(
-        matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "draw me a cat"),
+        matches!(&effects[0], Effect::SendPrompt { text, .. }
+if text == "draw me a cat"),
         "send must dispatch: {effects:?}"
     );
     let prompt_id = app.agents[&id].session.current_prompt_id.clone();
@@ -1167,7 +1168,8 @@ fn unknown_non_restricted_command_still_passes_through() {
 
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "/frobnicate arg"),
+        matches!(&effects[0], Effect::SendPrompt { text, .. }
+if text == "/frobnicate arg"),
         "unknown command must still pass through: {effects:?}"
     );
     assert!(

@@ -329,9 +329,11 @@ pub enum Action {
     ShowDebugStatus,
     /// Copy selected block's content to clipboard.
     CopyBlockContent,
-    /// Copy the Nth most recent assistant message to clipboard (1 = latest).
+    /// Copy the Nth most recent assistant message (1 = latest).
+    /// `None` => clipboard (with file fallback on failure); `Some(p)` => write UTF-8 file.
     CopyAssistantMessage {
         n: usize,
+        file_path: Option<std::path::PathBuf>,
     },
     /// Export the active (sub)agent's conversation transcript as Markdown.
     /// `None` => copy to clipboard (with route-aware toast + stats); `Some(p)` => write UTF-8 file

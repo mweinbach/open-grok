@@ -341,9 +341,18 @@ pub fn attach_result_usage_fail_closed(result: &mut serde_json::Value, usage: &s
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "status")]
 pub enum HookRunStatusDto {
-    Success { elapsed_ms: u64 },
+    Success {
+        elapsed_ms: u64,
+    },
     Skipped,
-    Failed { error: String, elapsed_ms: u64 },
+    Failed {
+        error: String,
+        elapsed_ms: u64,
+        /// Stop-gate block (the hook's decision, not a failure). Rides `failed`
+        /// so old pagers keep rendering it. TODO: promote to a dedicated status.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        blocked: bool,
+    },
 }
 
 /// A single hook run entry (wire format).
@@ -466,7 +475,6 @@ pub enum SessionUpdate {
     HookExecution {
         /// The hook event name ("pre_tool_use" or "post_tool_use").
         event_name: String,
-        /// The tool name this hook is associated with.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_name: Option<String>,
         /// The prompt turn this batch belongs to, when known; lets the
@@ -474,7 +482,6 @@ pub enum SessionUpdate {
         /// turn's marker.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
-        /// Individual hook run results.
         runs: Vec<HookRunEntryDto>,
     },
     /// Hooks registry changed (after reload or trust/untrust).
@@ -721,6 +728,8 @@ pub enum SessionUpdate {
         prompt: String,
         human_schedule: String,
         next_fire_at: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
     },
     /// A scheduled task was deleted/cancelled.
     ScheduledTaskDeleted { task_id: String },

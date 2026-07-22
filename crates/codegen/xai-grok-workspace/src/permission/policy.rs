@@ -168,7 +168,7 @@ impl From<PermissionConfig> for CompiledPolicy {
 /// `dash`, `zsh`, `ksh`); `None` if the words are not such an invocation.
 /// Known residuals: option arguments (`-o pipefail`) and `+`-option words can
 /// mis-take the operand — escalation-only so a miss never allows; skipping `+…` would add a dodge.
-fn shell_dash_c_script(words: &[String]) -> Option<&str> {
+pub(crate) fn shell_dash_c_script(words: &[String]) -> Option<&str> {
     let program = words.first()?.rsplit(['/', '\\']).next()?;
     if !matches!(program, "bash" | "sh" | "dash" | "zsh" | "ksh") {
         return None;

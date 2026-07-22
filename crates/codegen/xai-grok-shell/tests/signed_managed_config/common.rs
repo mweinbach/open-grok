@@ -180,6 +180,7 @@ pub fn signed_team_body(
         requirements: requirements.map(str::to_owned),
         fail_closed: requirements.is_some_and(xai_grok_config::fail_closed_flag_from_str),
         expires_at: TEST_EXPIRES_AT,
+        nonce: String::new(),
         key_id: TEST_KEY_ID.into(),
     };
     serde_json::json!({

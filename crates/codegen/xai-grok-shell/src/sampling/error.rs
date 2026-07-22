@@ -138,6 +138,8 @@ pub fn map_sampling_err_to_acp(err: SamplingError) -> acp::Error {
                 } else {
                     message
                 };
+                // 403 is content-safety, never auth: on this setup path it stays
+                // `internal_error` → `server_error`.
                 acp::Error::internal_error().data(message)
             }
             StatusCode::BAD_REQUEST => acp::Error::invalid_params().data(message),
@@ -146,7 +148,10 @@ pub fn map_sampling_err_to_acp(err: SamplingError) -> acp::Error {
             StatusCode::TOO_MANY_REQUESTS => {
                 acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited".to_string()).data(message)
             }
-            _ => acp::Error::internal_error().data(message),
+            // Preserve the HTTP status in data so the classifier folds capacity
+            // errors (503/529) into `rate_limit`.
+            _ => acp::Error::internal_error()
+                .data(error_data_with_status(message, Some(status.as_u16()))),
         },
         SamplingError::EventStreamError(message) => acp::Error::internal_error().data(message),
         SamplingError::StreamError {
@@ -547,6 +552,20 @@ mod tests {
         assert_eq!(rate_acp.code, acp::ErrorCode::from(RATE_LIMITED_ERROR_CODE));
         assert_ne!(rate_acp.code, server_acp.code);
         assert_eq!(server_acp.code, acp::Error::internal_error().code);
+    }
+
+    #[test]
+    fn service_unavailable_retains_http_status_for_classification() {
+        let err = SamplingError::Api {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "at capacity".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        let acp_err = map_sampling_err_to_acp(err);
+        assert_eq!(acp_err.code, acp::Error::internal_error().code);
+        assert_eq!(http_status_from_error(&acp_err), Some(503));
     }
 
     #[test]

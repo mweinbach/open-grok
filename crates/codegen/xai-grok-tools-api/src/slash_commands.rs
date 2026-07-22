@@ -34,11 +34,18 @@ pub fn loop_schedule_instruction(args: &str) -> String {
          scheduling. Do NOT invent or assume a default interval.\n\n\
          ## Action\n\
          1. Call scheduler_create with: interval (the compact string you derived), prompt,\n\
-            recurring: true, fire_immediately: true. If the interval is unparseable, the tool\n\
+            fire_immediately: true. If the interval is unparseable, the tool\n\
             returns an error — fix the interval string rather than guessing.\n\
          2. Confirm: what's scheduled, the cadence, that it auto-expires after 7 days,\n\
             and that they can cancel with scheduler_delete (include the job ID).\n\
          3. Do NOT execute the prompt inline. The scheduler will fire it immediately.\n\n\
+         ## Changing an existing loop\n\
+         Call scheduler_create with its task_id and the fields that change; do not\n\
+         delete and recreate. If later work changes what a loop should do, update its\n\
+         prompt the same way.\n\n\
+         ## One-time delayed work\n\
+         Scheduling is recurring-only. For \"do X once in N minutes\", run a background\n\
+         terminal command (`sleep <secs> && <command>`); its completion notifies you.\n\n\
          ## Input\n\
          {args}"
     )
@@ -193,6 +200,18 @@ mod tests {
         assert!(text.contains("<number><unit>"));
         assert!(text.contains("ask the user how often"));
         assert!(!text.contains("10m"), "no host-side default interval");
+        assert!(
+            !text.contains("recurring:"),
+            "the retired one-shot flag must not be referenced"
+        );
+        assert!(
+            text.contains("task_id"),
+            "must teach in-place updates via task_id"
+        );
+        assert!(
+            text.contains("delete and recreate"),
+            "must steer away from delete+recreate"
+        );
     }
 
     #[test]

@@ -264,6 +264,7 @@
                     created_at: original_created_at,
                     next_fire_at: Some("2026-01-01T00:00:00Z".into()),
                     tag: "loop".into(),
+                    last_subagent_id: None,
                 },
             );
         }
@@ -365,6 +366,7 @@
                     created_at: Instant::now(),
                     next_fire_at: Some("2026-01-01T00:00:00Z".into()),
                     tag: "loop".into(),
+                    last_subagent_id: None,
                 },
             );
         }
@@ -391,6 +393,7 @@
                     created_at: Instant::now(),
                     next_fire_at: Some("2026-01-01T00:00:00Z".into()),
                     tag: "loop".into(),
+                    last_subagent_id: None,
                 },
             );
         }
@@ -425,6 +428,85 @@
         assert!(
             agent1.session.scheduled_tasks.is_empty(),
             "non-owning agent must not receive the update"
+        );
+    }
+
+    #[test]
+    fn fired_with_subagent_id_links_chip_and_survives_foreground_fire() {
+        let mut app = make_app_with_agent("sess-1");
+
+        let notif = make_fired_notif_with_subagent("sess-1", "task-bg", "sub-abc");
+        assert!(handle_scheduled_task_fired(&notif, &mut app));
+        {
+            let agent = app.agents.get(&AgentId(0)).unwrap();
+            let info = agent.session.scheduled_tasks.get("task-bg").unwrap();
+            assert_eq!(info.last_subagent_id.as_deref(), Some("sub-abc"));
+        }
+
+        let notif = make_fired_notif_with_subagent("sess-1", "task-bg", "sub-def");
+        assert!(handle_scheduled_task_fired(&notif, &mut app));
+        {
+            let agent = app.agents.get(&AgentId(0)).unwrap();
+            let info = agent.session.scheduled_tasks.get("task-bg").unwrap();
+            assert_eq!(info.last_subagent_id.as_deref(), Some("sub-def"));
+        }
+
+        let notif = make_fired_notif(
+            "sess-1",
+            "task-bg",
+            "p",
+            "every 1 minute",
+            Some("2026-03-03T03:03:03Z"),
+        );
+        assert!(handle_scheduled_task_fired(&notif, &mut app));
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let info = agent.session.scheduled_tasks.get("task-bg").unwrap();
+        assert_eq!(info.last_subagent_id.as_deref(), Some("sub-def"));
+    }
+
+    #[test]
+    fn created_upserts_existing_chip_preserving_identity_and_linkage() {
+        let mut app = make_app_with_agent("sess-1");
+        let original_created_at = Instant::now() - std::time::Duration::from_secs(60);
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.session.scheduled_tasks.insert(
+                "task-up".into(),
+                crate::app::agent::ScheduledTaskInfo {
+                    task_id: "task-up".into(),
+                    prompt: "old prompt".into(),
+                    human_schedule: "every 5 minutes".into(),
+                    created_at: original_created_at,
+                    next_fire_at: Some("2026-01-01T00:00:00Z".into()),
+                    tag: "loop".into(),
+                    last_subagent_id: Some("sub-abc".into()),
+                },
+            );
+        }
+
+        let notif = make_created_ext_notif(
+            "sess-1",
+            "task-up",
+            "new prompt",
+            "every 10 minutes",
+            Some("2026-02-02T02:02:02Z"),
+        );
+        assert!(handle_scheduled_task_created(&notif, &mut app));
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(agent.session.scheduled_tasks.len(), 1, "no duplicate chip");
+        let info = agent.session.scheduled_tasks.get("task-up").unwrap();
+        assert_eq!(info.prompt, "new prompt");
+        assert_eq!(info.human_schedule, "every 10 minutes");
+        assert_eq!(info.next_fire_at.as_deref(), Some("2026-02-02T02:02:02Z"));
+        assert_eq!(
+            info.created_at, original_created_at,
+            "chip identity (countdown anchor) preserved"
+        );
+        assert_eq!(
+            info.last_subagent_id.as_deref(),
+            Some("sub-abc"),
+            "click-through linkage preserved across an update"
         );
     }
 
@@ -472,6 +554,7 @@
                     created_at: Instant::now(),
                     next_fire_at: Some("2026-01-01T00:00:00Z".into()),
                     tag: "loop".into(),
+                    last_subagent_id: None,
                 },
             );
         }

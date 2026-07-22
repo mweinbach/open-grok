@@ -269,7 +269,9 @@ impl ReadToolCallBlock {
         let gutter_width = digit_count(base_line + raw_lines.len().saturating_sub(1));
         let content_width = width.saturating_sub(gutter_width + 2).max(20);
 
-        let gutter_style = Style::default().fg(theme.gray_dim);
+        // Use Theme::dim/primary so terminal-native (minimal) maps grays to
+        // SGR dim / default fg instead of raw gray_dim slots.
+        let gutter_style = theme.dim();
         let text_style = theme.primary();
 
         let syntect = get_syntect();

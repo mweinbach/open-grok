@@ -48,6 +48,7 @@ fn signed_dk_empty_body(kp: &ring::signature::Ed25519KeyPair, deployment_id: &st
         requirements: None,
         fail_closed: false,
         expires_at: TEST_EXPIRES_AT,
+        nonce: String::new(),
         key_id: TEST_KEY_ID.into(),
     };
     serde_json::json!({ "signatures": [sign_envelope(kp, &payload)] }).to_string()

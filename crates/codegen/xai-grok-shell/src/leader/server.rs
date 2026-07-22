@@ -3066,7 +3066,8 @@ mod tests {
         assert!(
             matches!(response, ServerMessage::ControlResult { request_id, result :
             Ok(ControlPayload::CpuProfileStatus { active : false, stopping : false,
-            started_at : None, svg_path : None, frequency_hz : None, }), } if request_id
+            started_at : None, svg_path : None, frequency_hz : None, }), }
+if request_id
             == "status-1")
         );
         assert!(

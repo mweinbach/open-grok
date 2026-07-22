@@ -22,12 +22,10 @@
 //! ```
 
 use std::future::Future;
-use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
-use xai_grok_test_support::env::test_env_cmd_tokio;
 use xai_grok_test_support::*;
 
 /// Run an async test body inside a `LocalSet` (required by ACP's `!Send` futures).
@@ -105,25 +103,6 @@ fn inference_tool_names(server: &MockInferenceServer) -> Vec<String> {
         .filter_map(request_tool_name)
         .map(str::to_owned)
         .collect()
-}
-
-async fn run_headless_with_env(
-    server: &MockInferenceServer,
-    args: &[&str],
-    cwd: &Path,
-    env: &[(&str, &str)],
-) -> HeadlessResult {
-    let home = tempfile::TempDir::new().expect("create temp home");
-    let mut cmd = tokio::process::Command::new(grok_binary());
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .envs(env.iter().copied());
-    test_env_cmd_tokio(&mut cmd, &server.url(), home.path());
-    run_headless_with_cmd(cmd).await
 }
 
 // ============================================================================

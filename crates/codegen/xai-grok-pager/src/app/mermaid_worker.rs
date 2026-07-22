@@ -1058,9 +1058,9 @@ impl AgentView {
     fn complete_mermaid_action(&mut self, action: MermaidClickAction, path: &Path) {
         let ok = match action {
             MermaidClickAction::Open => self.open_media_natively(path),
-            MermaidClickAction::CopyPath => !self
+            MermaidClickAction::CopyPath => self
                 .copy_to_clipboard(&path.display().to_string())
-                .is_failed(),
+                .success(),
         };
         if !ok {
             crate::unified_log::error(
@@ -2220,6 +2220,7 @@ mod tests {
         assert!(
             toast.starts_with("Copied")
                 || toast.starts_with("Copy sent")
+                || toast.starts_with("Clipboard unreachable")
                 || toast.starts_with("Copy failed"),
             "a disk hit runs the copy action immediately, got {toast:?}",
         );

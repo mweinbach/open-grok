@@ -1887,6 +1887,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             next_fire_at: None,
             tag: "loop".into(),
+            last_subagent_id: None,
         }
     }
     /// A turn-idle agent with a RUNNING background task is `Working`, not

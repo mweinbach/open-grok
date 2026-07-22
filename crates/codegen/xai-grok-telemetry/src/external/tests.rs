@@ -919,8 +919,8 @@ fn redacting_log_exporter_drops_record_with_unknown_key() {
 // Remote policy: tighten-only
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[test]
-fn remote_force_disable_stops_emission() {
+#[tokio::test(flavor = "current_thread")]
+async fn remote_force_disable_stops_emission() {
     let stream = build(gates_off());
     super::apply_remote_policy_on(
         &stream.ext,
@@ -935,8 +935,8 @@ fn remote_force_disable_stops_emission() {
     );
 }
 
-#[test]
-fn remote_gate_lock_forces_gates_off_and_never_on() {
+#[tokio::test(flavor = "current_thread")]
+async fn remote_gate_lock_forces_gates_off_and_never_on() {
     let stream = build(gates_all_on());
     super::apply_remote_policy_on(
         &stream.ext,

@@ -73,6 +73,20 @@ cp examples/hooks/bin/tool-logger.sh ~/.opengrok/hooks/bin/
 chmod +x ~/.opengrok/hooks/bin/tool-logger.sh
 ```
 
+### 5. Stop Gate: verify before finishing (`stop-verify.json`)
+
+**Type:** blocking (`Stop`)
+
+Keeps the agent working until `cargo build` passes. A `Stop` hook runs when the agent is about to finish its turn; returning `{"decision":"block","reason":"…"}` feeds the reason back to the model and runs another round. The built-in cap ends the turn after 8 continuations. The hook sets a 300-second timeout because a timed-out Stop hook fails open and lets the agent stop.
+
+**Install:**
+```sh
+mkdir -p ~/.grok/hooks/bin
+cp examples/hooks/stop-verify.json ~/.grok/hooks/
+cp examples/hooks/bin/stop-verify.sh ~/.grok/hooks/bin/
+chmod +x ~/.grok/hooks/bin/stop-verify.sh
+```
+
 ## Format
 
 Hook files use the Claude-compatible JSON format:
@@ -92,7 +106,7 @@ Hook files use the Claude-compatible JSON format:
 }
 ```
 
-- **Event names:** `SessionStart`, `PreToolUse`, `PostToolUse`, `SessionEnd`
+- **Event names:** `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `SessionEnd` (see the [user guide](../../xai-grok-pager/docs/user-guide/10-hooks.md) for the full set)
 - **Matcher:** regex on tool name. Claude names like `Bash`, `Read`, `Edit` are auto-expanded to also match Grok names (`run_terminal_cmd`, `read_file`, `search_replace`)
 - **Timeout:** in seconds (default: 5)
 - **Command:** path to script (relative to hook file directory) or inline shell command
@@ -101,7 +115,7 @@ Hook files use the Claude-compatible JSON format:
 
 Scripts receive the hook event envelope as JSON on **stdin** and should write a response to **stdout**:
 
-**For blocking hooks (`PreToolUse`):**
+**For tool gates (`PreToolUse`):**
 ```json
 {"decision":"allow"}
 ```
@@ -110,7 +124,19 @@ or
 {"decision":"deny","reason":"Explanation for the user"}
 ```
 
-**Exit codes:** `0` = allow, `2` = deny, other = fail-open.
+**For stop gates (`Stop` / `SubagentStop`):** keep the agent working or force it to stop:
+```json
+{"decision":"block","reason":"Feedback fed back to the model"}
+```
+```json
+{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"Non-error feedback"}}
+```
+```json
+{"continue":false,"stopReason":"Shown to the user; overrides any block"}
+```
+The turn ends after 8 consecutive continuations. The input carries `stopHookActive` (true once a block has already continued this turn) so a hook can give up.
+
+**Exit codes:** `0` = allow / no decision, `2` = deny (`PreToolUse`) or block-stop with stderr as the feedback, other = fail-open. Valid decision JSON on stdout wins over the exit code.
 
 **For passive hooks:** stdout is informational only. Exit `0` for success.
 

@@ -49,7 +49,6 @@ pub(crate) enum UploadWait {
     Defer { deadline: tokio::time::Instant },
 }
 /// Why trace uploads are enabled or disabled for a given prompt.
-/// Recorded on the `agent.prompt` span as `upload_reason` for log queries.
 pub(crate) use xai_grok_telemetry::session_metrics::TraceUploadReason;
 /// Per-turn context for trace artifact uploads.
 #[derive(Clone)]

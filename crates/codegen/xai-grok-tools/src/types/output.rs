@@ -1004,9 +1004,10 @@ impl ToolOutput {
                 }
             }
             ToolOutput::SchedulerCreate(o) => {
+                let verb = if o.updated { "updated" } else { "created" };
                 format!(
-                    "Scheduled task created (ID: {}, {}, recurring: {}).",
-                    o.id, o.human_schedule, o.recurring
+                    "Scheduled task {} (ID: {}, {}).",
+                    verb, o.id, o.human_schedule
                 )
             }
             ToolOutput::SchedulerDelete(o) => o.message.clone(),

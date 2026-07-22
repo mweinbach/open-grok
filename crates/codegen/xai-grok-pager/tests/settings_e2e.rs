@@ -167,7 +167,10 @@ fn row_idx_for(state: &SettingsModalState, target: &str) -> usize {
     state
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == target))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == target)
+        })
         .unwrap_or_else(|| panic!("setting `{target}` not present in modal rows"))
 }
 
@@ -2575,10 +2578,10 @@ fn d_key_emits_open_reset_confirm_for_every_setting() {
         // without key-release reporting, which tests run without). Skip settings
         // with no visible row; their reset path is covered by the dispatch
         // round-trip tests.
-        let has_row = s
-            .rows
-            .iter()
-            .any(|r| matches!(r, RowEntry::Setting { key, .. } if *key == meta.key));
+        let has_row = s.rows.iter().any(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == meta.key)
+        });
         if !has_row {
             continue;
         }
@@ -3460,7 +3463,8 @@ fn pr6_permission_mode_picker_enter_dispatches_set_permission_mode_commit() {
     let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
 
     assert!(
-        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. } if key == "permission_mode"),
+        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. }
+if key == "permission_mode"),
         "Enter on permission_mode row must open the picker, got {:?}",
         s.mode(),
     );
@@ -3741,7 +3745,8 @@ fn pr11_picker_commit_for_default_dispatches_set_permission_mode_default() {
     navigate_to(&mut s, "permission_mode");
     let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
     assert!(
-        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. } if key == "permission_mode"),
+        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. }
+if key == "permission_mode"),
         "Enter on permission_mode row must open the picker, got {:?}",
         s.mode(),
     );
@@ -3786,7 +3791,8 @@ fn pr11_picker_commit_for_ask_dispatches_set_permission_mode_ask() {
     navigate_to(&mut s, "permission_mode");
     let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
     assert!(
-        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. } if key == "permission_mode"),
+        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. }
+if key == "permission_mode"),
         "Enter on permission_mode row must open the picker, got {:?}",
         s.mode(),
     );
@@ -4661,7 +4667,8 @@ fn pr14_default_model_picker_commits_resolved_model_id() {
         "Enter on DynamicEnum row must transition to PickingEnum, got {outcome:?}"
     );
     assert!(
-        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. } if key == "default_model"),
+        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. }
+if key == "default_model"),
         "Enter must transition to PickingEnum for default_model"
     );
 
@@ -4878,7 +4885,8 @@ fn pr8_mouse_click_on_int_row_opens_editor() {
         "second click on Int row must be Changed, got {outcome:?}",
     );
     assert!(
-        matches!(s.mode(), SettingsModalMode::EditingValue { key, .. } if key == "max_thoughts_width"),
+        matches!(s.mode(), SettingsModalMode::EditingValue { key, .. }
+if key == "max_thoughts_width"),
         "second click on Int row must transition to EditingValue, got {:?}",
         s.mode(),
     );
@@ -7387,7 +7395,8 @@ fn scroll_speed_mouse_click_opens_editor() {
         "second click on focused Int row must enter the editor, got {outcome:?}"
     );
     assert!(
-        matches!(s.mode(), SettingsModalMode::EditingValue { key, .. } if key == "scroll_speed"),
+        matches!(s.mode(), SettingsModalMode::EditingValue { key, .. }
+if key == "scroll_speed"),
         "mode must be EditingValue(scroll_speed) after Enter-equivalent click, got {:?}",
         s.mode(),
     );
@@ -7577,7 +7586,8 @@ fn scroll_lines_mouse_click_opens_editor() {
         "second click on focused Int row must enter the editor, got {outcome:?}"
     );
     assert!(
-        matches!(s.mode(), SettingsModalMode::EditingValue { key, .. } if key == "scroll_lines"),
+        matches!(s.mode(), SettingsModalMode::EditingValue { key, .. }
+if key == "scroll_lines"),
         "mode must be EditingValue(scroll_lines), got {:?}",
         s.mode(),
     );

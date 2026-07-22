@@ -1431,6 +1431,9 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(parent_ctx.call_id.clone());
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(
+            crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
+        );
         if let Some(cwd) = parent_ctx.extensions.get::<xai_tool_runtime::Cwd>() {
             ctx.extensions.insert((*cwd).clone());
         }
@@ -1559,6 +1562,9 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(
+            crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
+        );
         if let Some(cwd) = cwd_override {
             ctx.extensions.insert(xai_tool_runtime::Cwd(cwd));
         }

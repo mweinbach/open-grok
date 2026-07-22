@@ -2201,8 +2201,7 @@ impl MvpAgent {
         )
     }
     /// Like `trace_upload_config`, but also returns the reason why uploads
-    /// are enabled/disabled. Used by `get_trace_context` to record
-    /// `upload_reason` on the `agent.prompt` span.
+    /// are enabled or disabled for structured session events.
     async fn trace_upload_config_with_reason(
         &self,
     ) -> (
@@ -2690,12 +2689,8 @@ impl MvpAgent {
             );
         }
         let upload_method = match upload_method {
-            Some(method) => {
-                tracing::Span::current().record("uploads_enabled", true);
-                method
-            }
+            Some(method) => method,
             None => {
-                tracing::Span::current().record("uploads_enabled", false);
                 xai_grok_telemetry::session_ctx::log_session_event(crate::agent::session_metrics::TraceUploadSkipped {
                     session_id: session_info.id.0.to_string(),
                     turn_number,
@@ -2711,7 +2706,6 @@ impl MvpAgent {
                     match cfg.endpoints.resolve_trace_bucket_url() {
                         Some(resolved) => Some(resolved.value),
                         None => {
-                            tracing::Span::current().record("uploads_enabled", false);
                             xai_grok_telemetry::session_ctx::log_session_event(crate::agent::session_metrics::TraceUploadSkipped {
                                 session_id: session_info.id.0.to_string(),
                                 turn_number,

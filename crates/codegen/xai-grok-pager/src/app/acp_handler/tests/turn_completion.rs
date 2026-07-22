@@ -533,6 +533,69 @@
         assert!(agent.pending_stop_hooks.is_none());
     }
 
+    /// The wire `blocked` flag splits a failed run: a stop-gate block maps to
+    /// `HookRunStatus::Blocked` (a decision, not a failure), a plain failure stays `Failed`.
+    #[test]
+    fn blocked_wire_flag_maps_to_blocked_status() {
+        use crate::scrollback::blocks::tool::HookRunStatus;
+        use xai_grok_shell::extensions::notification::{HookRunEntryDto, HookRunStatusDto};
+
+        let mut app = make_app_with_agent("sess-blocked");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.session.start_turn(&mut agent.scrollback);
+            agent.session.current_prompt_id = Some("pid-1".into());
+        }
+
+        let _ = handle_ext_notification(
+            &xai_hook_execution_notif_with_runs(
+                "sess-blocked",
+                "stop",
+                Some("pid-1"),
+                false,
+                vec![
+                    HookRunEntryDto {
+                        name: "gate".into(),
+                        status: HookRunStatusDto::Failed {
+                            error: "blocked stop: run the tests".into(),
+                            elapsed_ms: 7,
+                            blocked: true,
+                        },
+                        output: None,
+                    },
+                    HookRunEntryDto {
+                        name: "broken".into(),
+                        status: HookRunStatusDto::Failed {
+                            error: "exit code 1".into(),
+                            elapsed_ms: 3,
+                            blocked: false,
+                        },
+                        output: None,
+                    },
+                ],
+            ),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let pending = agent
+            .pending_stop_hooks
+            .as_ref()
+            .expect("stop hooks must be stashed for the marker");
+        let runs = &pending.groups[0].1;
+        assert!(
+            matches!(&runs[0].status, HookRunStatus::Blocked { detail, .. }
+                if detail == "blocked stop: run the tests"),
+            "blocked: true must map to Blocked, got {:?}",
+            runs[0].status
+        );
+        assert!(
+            matches!(&runs[1].status, HookRunStatus::Failed { .. }),
+            "blocked: false must stay Failed, got {:?}",
+            runs[1].status
+        );
+    }
+
     #[test]
     fn foreign_turn_stop_hooks_never_stash_under_running_turn() {
         // A delayed batch from an ended turn (pid-old) lands while a later

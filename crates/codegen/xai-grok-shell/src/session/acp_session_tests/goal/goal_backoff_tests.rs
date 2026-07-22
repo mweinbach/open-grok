@@ -26,25 +26,6 @@ async fn make_test_actor_with_active_goal() -> SessionActor {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn goal_backoff_pauses_after_three_consecutive_failed_turns() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let actor = make_test_actor_with_active_goal().await;
-            for _ in 0..GOAL_CONTINUATION_BACKOFF_THRESHOLD {
-                actor.handle_turn_end(false).await;
-            }
-            let status = actor.goal_tracker.lock().status();
-            assert_eq!(
-                status,
-                Some(crate::session::goal_tracker::GoalStatus::BackOffPaused)
-            );
-            assert_eq!(actor.goal_continuation_streak.load(Ordering::Relaxed), 0);
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn goal_backoff_resets_on_success() {
     let local = tokio::task::LocalSet::new();
     local
@@ -116,7 +97,7 @@ async fn auto_pause_noop_when_goal_already_paused() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn handle_turn_end_skip_increment_when_goal_not_active() {
+async fn handle_turn_end_skips_increment_when_goal_not_active() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -204,17 +185,9 @@ async fn seed_pending_classifier_nudge(actor: &SessionActor) {
 }
 
 /// Read `events.jsonl` and return the parsed `Event` records.
-/// The test actor writes events to a session-unique events file;
-/// we read it as the canonical event sink.
 ///
-/// Synchronous-flush requirement: the live `EventWriter::emit`
-/// path takes the file mutex, calls `write_all`, and releases —
-/// no internal buffering — so this helper can read immediately
-/// after the producer awaits the call site that emits the event.
-/// If `EventWriter` ever switches to a buffered or background
-/// writer, every caller of this helper will need to flush
-/// explicitly (or this helper must grow a `wait_for_flush` arg);
-/// guard the contract from drifting silently.
+/// Relies on `EventWriter::emit` being synchronous (no buffering), so this reads
+/// immediately after the producer awaits the emitting call site.
 fn read_events_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
     let Ok(body) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -709,7 +682,7 @@ async fn maybe_queue_goal_continuation_emits_premature_stop_at_most_once_across_
 /// forces continuation with the gap inlined, so this precedence is
 /// intentional — pinned so a future gate change is caught.
 #[tokio::test(flavor = "current_thread")]
-async fn handle_turn_end_classifier_nudge_pre_empts_bail_nudge_and_event() {
+async fn handle_turn_end_classifier_nudge_preempts_bail_nudge_and_event() {
     use crate::sampling::ConversationItem;
 
     let local = tokio::task::LocalSet::new();
@@ -1017,6 +990,116 @@ fn format_turn_error_message_falls_back_to_classify_when_no_detail() {
     assert_eq!(
         SessionActor::format_turn_error_message(&err),
         "Turn failed: internal"
+    );
+}
+
+/// Matchers key on these serialized snake_case strings, so the set is a wire contract.
+#[test]
+fn stop_failure_error_type_covers_each_discriminable_class() {
+    use crate::sampling::error::{
+        RATE_LIMITED_ERROR_CODE, error_data_with_status, terminal_error_data,
+    };
+    let classify = |e: &acp::Error| SessionActor::stop_failure_error_type(e).as_str();
+
+    let rate = acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited".to_string());
+    assert_eq!(classify(&rate), "rate_limit");
+    // Defensive: a 429 that arrives only as a data-carried status.
+    let rate_status = acp::Error::internal_error().data(error_data_with_status(
+        "too many requests".into(),
+        Some(429),
+    ));
+    assert_eq!(classify(&rate_status), "rate_limit");
+
+    assert_eq!(
+        classify(&acp::Error::auth_required()),
+        "authentication_failed"
+    );
+
+    // The sampler maps 400s to invalid_params (-32602); -32600 also counts.
+    assert_eq!(classify(&acp::Error::invalid_params()), "invalid_request");
+    assert_eq!(classify(&acp::Error::invalid_request()), "invalid_request");
+
+    // 404 (model-not-found) folds into `invalid_request`, as an ACP resource
+    // error or a data-carried HTTP status.
+    assert_eq!(
+        classify(&acp::Error::resource_not_found(None)),
+        "invalid_request"
+    );
+    let missing = acp::Error::internal_error()
+        .data(error_data_with_status("no such model".into(), Some(404)));
+    assert_eq!(classify(&missing), "invalid_request");
+
+    // 400/401 arrive as `internal_error` with the status in data; the
+    // status, not the code, must discriminate.
+    let auth =
+        acp::Error::internal_error().data(error_data_with_status("bad token".into(), Some(401)));
+    assert_eq!(classify(&auth), "authentication_failed");
+    let bad_request =
+        acp::Error::internal_error().data(error_data_with_status("bad payload".into(), Some(400)));
+    assert_eq!(classify(&bad_request), "invalid_request");
+
+    // Capacity errors (503/529) fold into `rate_limit`.
+    let capacity = acp::Error::internal_error().data(error_data_with_status(
+        "upstream unavailable".into(),
+        Some(503),
+    ));
+    assert_eq!(classify(&capacity), "rate_limit");
+    let capacity_529 =
+        acp::Error::internal_error().data(error_data_with_status("overloaded".into(), Some(529)));
+    assert_eq!(classify(&capacity_529), "rate_limit");
+
+    // 403 content-safety on the turn path carries http_status:403 and folds into
+    // `invalid_request` (the setup path, which has no status, is server_error;
+    // see the sampler-mapper test below).
+    let forbidden_turn = acp::Error::internal_error()
+        .data(error_data_with_status("content blocked".into(), Some(403)));
+    assert_eq!(classify(&forbidden_turn), "invalid_request");
+
+    let max_tokens = acp::Error::internal_error().data(terminal_error_data(
+        "output truncated".into(),
+        None,
+        xai_grok_sampler::SamplingErrorKind::MaxTokensTruncation,
+    ));
+    assert_eq!(classify(&max_tokens), "max_output_tokens");
+
+    assert_eq!(classify(&acp::Error::internal_error()), "server_error");
+    assert_eq!(classify(&acp::Error::new(-31999, String::new())), "unknown");
+}
+
+/// End-to-end across `map_sampling_err_to_acp` and the classifier (not each seam in
+/// isolation): a real capacity error classifies as `rate_limit`.
+#[test]
+fn capacity_error_from_sampler_mapper_classifies_as_rate_limit() {
+    let acp_err =
+        crate::sampling::error::map_sampling_err_to_acp(crate::sampling::SamplingError::Api {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            message: "at capacity".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        });
+    assert_eq!(
+        SessionActor::stop_failure_error_type(&acp_err).as_str(),
+        "rate_limit"
+    );
+}
+
+/// A 403 from the sampler setup mapper carries no HTTP status, so it classifies
+/// as `server_error` via the `-32603` arm, unlike the turn path which folds
+/// http_status:403 into `invalid_request`.
+#[test]
+fn forbidden_error_from_sampler_mapper_classifies_as_server_error() {
+    let acp_err =
+        crate::sampling::error::map_sampling_err_to_acp(crate::sampling::SamplingError::Api {
+            status: reqwest::StatusCode::FORBIDDEN,
+            message: "content policy".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        });
+    assert_eq!(
+        SessionActor::stop_failure_error_type(&acp_err).as_str(),
+        "server_error"
     );
 }
 

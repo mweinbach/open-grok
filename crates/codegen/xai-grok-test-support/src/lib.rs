@@ -36,6 +36,8 @@ pub use counting_server::spawn_counting_server;
 pub use env::{EnvGuard, git_workdir, grok_binary};
 pub use headless::{
     HeadlessResult, assert_headless_success, assert_no_crashes, run_headless,
-    run_headless_with_cmd, stderr_tail,
+    run_headless_with_cmd, run_headless_with_env, stderr_tail,
 };
-pub use mock_server::{MockInferenceServer, MockModelEntry, ScriptedResponse, SseEvent};
+pub use mock_server::{
+    MockInferenceServer, MockModelEntry, ScriptedResponse, SseEvent, StorageUpload,
+};

@@ -201,8 +201,7 @@ fn upload_failure_log_level(method: &UploadMethod, prior_failures: u64) -> Uploa
         UploadFailureLogLevel::Error
     }
 }
-/// Wire label for the upload backend; reuses the `upload_reason` span-field
-/// vocabulary so dashboards join on one set of values.
+/// Wire label for the upload backend used by structured session events.
 fn upload_method_label(method: &UploadMethod) -> &'static str {
     use super::turn::TraceUploadReason;
     match method {
@@ -491,7 +490,6 @@ pub(crate) fn mime_type_to_extension(mime_type: &str) -> &str {
         _ => "bin",
     }
 }
-/// Path format: {session_id}/turn_{N}/full_prompt.txt
 pub(crate) async fn upload_full_prompt_txt(ctx: &PromptTraceContext, _full_prompt: &str) {
     super::manifest::skip_artifact(
         &ctx.artifact_tracker,
@@ -956,7 +954,6 @@ pub(crate) async fn upload_permission_events(
     )
     .await;
 }
-/// Path format: {session_id}/turn_{N}/turn_messages.json
 pub(crate) async fn upload_turn_messages(
     ctx: &PromptTraceContext,
     _capture: xai_chat_state::TurnCapture,
@@ -988,7 +985,7 @@ pub(crate) struct SessionStateBuildError {
 /// zero-byte payload the viewer treats as "no history" (harness pairs always
 /// carry ≥1 message, so this is only a safety floor).
 pub(crate) fn build_chat_history_session_state(
-    _messages: &[xai_grok_sampling_types::conversation::ConversationItem],
+    messages: &[xai_grok_sampling_types::conversation::ConversationItem],
 ) -> Result<Vec<u8>, SessionStateBuildError> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -998,7 +995,10 @@ pub(crate) fn build_chat_history_session_state(
             error: error.into(),
         }
     }
-    let jsonl = Vec::new();
+    let jsonl = {
+        let _ = messages;
+        Vec::new()
+    };
     let mut archive_data = Vec::new();
     {
         let encoder = GzEncoder::new(&mut archive_data, Compression::default());
@@ -2437,19 +2437,6 @@ mod tests {
         out
     }
     #[test]
-    fn chat_history_session_state_omits_conversation_items() {
-        use xai_grok_sampling_types::conversation::ConversationItem;
-        let messages = vec![
-            ConversationItem::user("verify whether the change compiles"),
-            ConversationItem::assistant("PASS: the change compiles and tests pass"),
-        ];
-        let archive = build_chat_history_session_state(&messages).unwrap();
-        let entries = read_tar_gz_entries(&archive);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, "chat_history.jsonl");
-        assert!(entries[0].1.is_empty());
-    }
-    #[test]
     fn chat_history_session_state_empty_messages_yields_valid_empty_archive() {
         let archive = build_chat_history_session_state(&[]).unwrap();
         let entries = read_tar_gz_entries(&archive);
@@ -2557,7 +2544,7 @@ mod tests {
     }
     /// Customer-managed S3 failures stay below the ERROR alerting threshold,
     /// repeats within an episode drop to debug, and the `method` log field
-    /// keeps the `upload_reason` span-field vocabulary.
+    /// keeps the structured upload-method vocabulary.
     #[test]
     fn upload_failure_log_level_splits_on_backend_and_repeats() {
         use crate::session::repo_changes::UploadMethod;

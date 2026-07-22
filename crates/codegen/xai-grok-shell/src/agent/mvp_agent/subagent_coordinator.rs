@@ -25,12 +25,42 @@ impl MvpAgent {
                 while let Some(event) = rx.recv().await {
                     match event {
                         SubagentEvent::Spawn(boxed) => {
-                            let request = *boxed;
+                            let mut request = *boxed;
                             let agent_ref = agent_ref.clone();
                             tokio::task::spawn_local(async move {
                                 let this = agent_ref.get();
+                                let parent_is_session = this.sessions.borrow().contains_key(
+                                    &acp::SessionId::new(request.parent_session_id.clone()),
+                                );
+                                if !parent_is_session
+                                    && let Some(root) = this
+                                        .subagent_coordinator
+                                        .borrow()
+                                        .parent_of_child_session(&request.parent_session_id)
+                                {
+                                    tracing::info!(
+                                        child_session_id = % request.parent_session_id,
+                                        root_session_id = % root, subagent_id = % request.id,
+                                        "Re-parenting child-session spawn to root session"
+                                    );
+                                    request.parent_session_id = root;
+                                    request.surface_completion = false;
+                                }
                                 let parent_sid = request.parent_session_id.clone();
-                                let mut ctx = this.build_subagent_spawn_context(&parent_sid);
+                                let Some(mut ctx) =
+                                    this.try_build_subagent_spawn_context(&parent_sid)
+                                else {
+                                    tracing::warn!(
+                                        parent_session_id = % parent_sid, subagent_id = % request
+                                        .id,
+                                        "Spawn for unknown/evicted parent session, failing request"
+                                    );
+                                    crate::agent::subagent::send_failure(
+                                        request,
+                                        "Parent session not found (evicted or torn down); cannot spawn subagent.",
+                                    );
+                                    return;
+                                };
                                 let parent_handle = {
                                     let parent_sid_acp = acp::SessionId::new(parent_sid.clone());
                                     this.sessions.borrow().get(&parent_sid_acp).cloned()
@@ -289,16 +319,12 @@ impl MvpAgent {
             cli_agent_names,
         }
     }
-    /// Build a `SubagentSpawnContext` from the current agent state and the
-    /// parent session's shared resources.
-    ///
-    /// This is the ONLY subagent-related method on MvpAgent besides the
-    /// coordinator startup.
-    /// Build a spawn context for a real subagent spawn. The parent session is
-    /// guaranteed present here because the parent just issued the spawn request,
-    /// so a missing parent is a real invariant violation and panics. Read-only
-    /// callers that can race a parent teardown (e.g. `DescribeType`) must use
-    /// [`Self::try_build_subagent_spawn_context`] instead.
+    /// Test-only infallible wrapper around
+    /// [`Self::try_build_subagent_spawn_context`]. Production spawn paths use
+    /// the fallible variant and fail the request when the parent session is
+    /// absent (evicted, or a child-session spawn whose re-parent lookup
+    /// missed).
+    #[cfg(test)]
     pub(super) fn build_subagent_spawn_context(
         &self,
         parent_session_id: &str,
@@ -306,10 +332,13 @@ impl MvpAgent {
         self.try_build_subagent_spawn_context(parent_session_id)
             .expect("parent session must exist when spawning subagents")
     }
-    /// Fallible variant of [`Self::build_subagent_spawn_context`]: returns
-    /// `None` when the parent `SessionHandle` is absent (evicted / torn down)
-    /// instead of panicking, so read-only paths that can race a teardown can
-    /// fail open.
+    /// Build a `SubagentSpawnContext` from the current agent state and the
+    /// parent session's shared resources. Returns `None` when the parent
+    /// `SessionHandle` is absent (evicted / torn down) so callers can fail
+    /// the request instead of panicking.
+    ///
+    /// This is the ONLY subagent-related method on MvpAgent besides the
+    /// coordinator startup.
     pub(super) fn try_build_subagent_spawn_context(
         &self,
         parent_session_id: &str,

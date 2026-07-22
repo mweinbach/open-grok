@@ -859,6 +859,7 @@ impl SessionActor {
             let mut round_trace = trace_gcs_config;
             let mut round_artifact = artifact_tracker;
             let mut swarm_rate_limit_attempt = 0u32;
+            let mut stop_continuations_this_turn: u32 = 0;
             loop {
                 if self.goal_harness_enabled() {
                     let goal_loop_active = self.goal_tracker.lock().status()
@@ -908,21 +909,35 @@ impl SessionActor {
                 if !matches!(round, Ok(TurnOutcome::Completed { .. })) {
                     break round;
                 }
-                if matches!(round, Ok(TurnOutcome::Completed { refusal: true, .. })) {
+                if matches!(
+                    round,
+                    Ok(TurnOutcome::Completed {
+                        refusal: Some(_),
+                        ..
+                    })
+                ) {
                     break round;
                 }
                 let goal_active = laziness_injection_active(
                     self.goal_harness_enabled(),
                     self.goal_tracker.lock().status(),
                 );
-                if !goal_active {
-                    break round;
+                if goal_active
+                    && let GoalRoundDecision::Continue(directive) = self.run_goal_round_end().await
+                {
+                    self.inject_goal_continuation_message(directive).await;
+                    continue;
                 }
-                match self.run_goal_round_end().await {
-                    GoalRoundDecision::Continue(directive) => {
-                        self.inject_goal_continuation_message(directive).await;
+                match self
+                    .run_stop_gate(prompt_id, stop_continuations_this_turn)
+                    .await
+                {
+                    StopGateDecision::AllowStop => break round,
+                    StopGateDecision::KeepWorking { feedback } => {
+                        stop_continuations_this_turn += 1;
+                        self.chat_state_handle
+                            .push_user_message(ConversationItem::stop_hook_feedback(feedback));
                     }
-                    GoalRoundDecision::EndTurn => break round,
                 }
             }
         };
@@ -950,12 +965,26 @@ impl SessionActor {
             })
             .await;
         match &result {
-            Ok(TurnOutcome::Completed { .. }) => {
+            Ok(TurnOutcome::Completed { refusal, .. }) => {
                 self.emit_turn_ended(
                     crate::session::events::TurnOutcomeLabel::Completed,
                     None,
                     None,
                 );
+                if let Some(explanation) = refusal {
+                    let details = (!explanation.is_empty()).then(|| explanation.clone());
+                    self.dispatch_hook(
+                        xai_grok_hooks::event::HookEventName::StopFailure,
+                        xai_grok_hooks::event::HookPayload::StopFailure {
+                            error: xai_grok_hooks::event::StopFailureKind::InvalidRequest,
+                            error_details: details.clone(),
+                            last_assistant_message: details,
+                        },
+                        Some(prompt_id),
+                        None,
+                    )
+                    .await;
+                }
                 self.send_after_turn_event(xai_tool_protocol::turn_hook::AfterTurnPayload {
                     turn_number: current_prompt_index as u64,
                     outcome: xai_tool_protocol::turn_hook::TurnHookOutcome::Completed,
@@ -994,7 +1023,7 @@ impl SessionActor {
                     tool_call_count: turn_tool_count,
                     model_id: turn_model_id.clone(),
                     written_repo_paths: Vec::new(),
-                    cancellation_category: cancellation_category_wire_string(*category),
+                    cancellation_category: cancellation_category_to_wire_string(*category),
                     cancellation_context: context.clone(),
                 })
                 .await;
@@ -1077,7 +1106,9 @@ impl SessionActor {
                 self.dispatch_hook(
                     xai_grok_hooks::event::HookEventName::StopFailure,
                     xai_grok_hooks::event::HookPayload::StopFailure {
-                        error: format!("{err}"),
+                        error: Self::stop_failure_error_type(err),
+                        error_details: Self::turn_error_detail(err),
+                        last_assistant_message: Some(Self::format_turn_error_message(err)),
                     },
                     Some(prompt_id),
                     None,
@@ -1104,22 +1135,6 @@ impl SessionActor {
                 },
             );
         }
-        let stop_reason_str = match &result {
-            Ok(TurnOutcome::Completed { .. }) => "end_turn",
-            Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. }) => {
-                "cancelled"
-            }
-            Err(_) => "error",
-        };
-        self.dispatch_hook(
-            xai_grok_hooks::event::HookEventName::Stop,
-            xai_grok_hooks::event::HookPayload::Stop {
-                reason: stop_reason_str.to_string(),
-            },
-            Some(prompt_id),
-            None,
-        )
-        .await;
         match &result {
             Ok(TurnOutcome::Completed { .. }) => {
                 for contributor in self.extension_registry.turn_lifecycle_contributors() {
@@ -1179,7 +1194,7 @@ impl SessionActor {
                         refusal,
                         ..
                     } => (
-                        if refusal {
+                        if refusal.is_some() {
                             acp::StopReason::Refusal
                         } else {
                             acp::StopReason::EndTurn
@@ -2566,7 +2581,7 @@ impl SessionActor {
                     snapshot: Box::new(snapshot),
                     tools_called: turn_tools_called,
                     structured_output,
-                    refusal: turn_refused,
+                    refusal: turn_refused.then(|| refusal_explanation.clone().unwrap_or_default()),
                 });
             }
             if structured_output_tool && let Some(validator) = structured_output_validator.as_ref()
@@ -2593,7 +2608,7 @@ impl SessionActor {
                             snapshot: Box::new(snapshot),
                             tools_called: turn_tools_called,
                             structured_output: Some(validated),
-                            refusal: false,
+                            refusal: None,
                         });
                     }
                     StructuredOutputStep::Retry => continue,

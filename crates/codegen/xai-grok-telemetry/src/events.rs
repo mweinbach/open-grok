@@ -146,6 +146,7 @@ pub enum Outcome {
 pub enum HookOutcome {
     Success,
     Error,
+    Blocked,
 }
 
 /// Outcome of one `PreToolUse` gate callback. Only `Denied` blocks the tool; the rest

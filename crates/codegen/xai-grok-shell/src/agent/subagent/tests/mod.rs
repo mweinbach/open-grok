@@ -987,6 +987,7 @@ fn completed_with_output(
         model_route: None,
         block_waited: false,
         explicitly_killed: false,
+        completion_output_cap: None,
         persisted_output_dir,
     }
 }
@@ -1177,7 +1178,8 @@ async fn cancel_with_outcome_returns_variant_for_active_finished_unknown() {
         );
     assert!(
         matches!(coordinator.cancel_with_outcome("sub-done"),
-        SubagentCancelOutcome::AlreadyFinished { status } if status == "completed")
+        SubagentCancelOutcome::AlreadyFinished { status }
+if status == "completed")
     );
     assert!(
         matches!(coordinator.cancel_with_outcome("nonexistent"),
@@ -1374,6 +1376,7 @@ fn dummy_tracker(
         effective_provider: xai_grok_sampling_types::ModelProvider::Xai,
         run_in_background: false,
         surface_completion: true,
+        completion_output_cap: None,
         color: None,
         block_waited: false,
         explicitly_killed: false,
@@ -1590,6 +1593,26 @@ async fn active_summaries_returns_all_regardless_of_parent() {
     coordinator.insert(dummy_tracker("sub-2", "session-B", "plan", "task 2"));
     let all = coordinator.active_summaries();
     assert_eq!(all.len(), 2);
+}
+/// Spawns issued from inside a child session (loop iterations) re-parent
+/// to the root session via the running tracker's child→parent mapping.
+#[tokio::test]
+async fn parent_of_child_session_maps_to_root() {
+    let mut coordinator = SubagentCoordinator::new();
+    coordinator
+        .insert(
+            dummy_tracker(
+                "iter-child-sess",
+                "root-session",
+                "general-purpose",
+                "loop iteration",
+            ),
+        );
+    assert_eq!(
+        coordinator.parent_of_child_session("iter-child-sess").as_deref(),
+        Some("root-session")
+    );
+    assert_eq!(coordinator.parent_of_child_session("unknown-sess"), None);
 }
 #[tokio::test]
 async fn resolve_running_list_returns_empty_for_empty_seeds() {
@@ -2078,7 +2101,8 @@ fn resume_vs_fork_helper_shapes_differ() {
     assert!(
         ! matches!(resumed.conversation.get(1), Some(ConversationItem::User(u)) if u
         .content.iter().any(| p | matches!(p,
-        xai_grok_sampling_types::conversation::ContentPart::Text { text } if text
+        xai_grok_sampling_types::conversation::ContentPart::Text { text }
+if text
         .contains("<background_context>"))))
     );
 }
@@ -2140,7 +2164,8 @@ fn verbatim_fork_keeps_items_byte_for_byte_when_small() {
             .any(|i| {
                 matches!(
                     i, ConversationItem::User(u) if u.content.iter().any(| p |
-                    matches!(p, ContentPart::Text { text } if text.contains(needle)))
+                    matches!(p, ContentPart::Text { text }
+if text.contains(needle)))
                 )
             })
     };
@@ -2182,7 +2207,8 @@ fn verbatim_fork_falls_back_to_summary_on_incomplete_tail() {
     assert_eq!(ctx.prefix_len, Some(2));
     assert!(
         ctx.conversation.iter().any(| i | { matches!(i, ConversationItem::User(u) if u
-        .content.iter().any(| p | matches!(p, ContentPart::Text { text } if text
+        .content.iter().any(| p | matches!(p, ContentPart::Text { text }
+if text
         .contains("<background_context>")))) }),
         "summarized fallback must produce a background_context blob"
     );
@@ -2223,7 +2249,8 @@ fn verbatim_fork_falls_back_to_summary_when_oversize() {
         .any(|i| {
             matches!(
                 i, ConversationItem::User(u) if u.content.iter().any(| p | matches!(p,
-                ContentPart::Text { text } if text.contains("<background_context>")))
+                ContentPart::Text { text }
+if text.contains("<background_context>")))
             )
         });
     assert!(has_blob, "oversize fallback must produce a background_context blob");
@@ -3541,6 +3568,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
         },
         api_key: None,
         env_key: None,
+        auth_provider: None,
         api_base_url: None,
     }
 }

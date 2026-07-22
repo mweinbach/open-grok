@@ -240,9 +240,7 @@ fn read_summary(path: &Path) -> io::Result<Summary> {
 fn write_summary_atomic(summary_path: &Path, summary: &Summary) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(summary)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let tmp = summary_path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, summary_path)
+    crate::session::storage::write_bytes_atomic(summary_path, &bytes)
 }
 
 #[cfg(test)]

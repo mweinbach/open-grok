@@ -177,6 +177,8 @@ pub struct SubagentRuntimeOverrides {
     /// (implementer vs explorer). `None` for every non-goal spawn ⇒ the parent
     /// agent decides the flavor (unchanged behavior).
     pub harness_agent_type: Option<String>,
+    pub completion_output_cap: Option<usize>,
+    pub spawn_depth: Option<u32>,
 }
 
 /// Re-export of [`xai_tool_types::is_not_sentinel`] for existing call sites.

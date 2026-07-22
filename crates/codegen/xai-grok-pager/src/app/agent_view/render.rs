@@ -1750,25 +1750,26 @@ impl AgentView {
         }
         if let Some(msg) = self.active_toast_message() {
             let sb = layout.scrollback;
-            let toast_text = format!(" {msg} ");
-            let w = toast_text.chars().count() as u16;
-            if sb.height > 0 && sb.width > w + 2 {
-                let x = sb.right().saturating_sub(w + 1);
-                let y = sb.bottom().saturating_sub(1);
-                for (i, ch) in toast_text.chars().enumerate() {
-                    if let Some(cell) = buf.cell_mut((x + i as u16, y)) {
-                        cell.set_char(ch);
-                        cell.fg = theme.accent_user;
-                        cell.bg = theme.bg_base;
-                        cell.modifier = ratatui::prelude::Modifier::BOLD;
+            if let Some(toast_text) = fit_toast_text(msg, sb.width) {
+                let w = toast_text.chars().count() as u16;
+                if sb.height > 0 {
+                    let x = sb.right().saturating_sub(w + 1);
+                    let y = sb.bottom().saturating_sub(1);
+                    for (i, ch) in toast_text.chars().enumerate() {
+                        if let Some(cell) = buf.cell_mut((x + i as u16, y)) {
+                            cell.set_char(ch);
+                            cell.fg = theme.accent_user;
+                            cell.bg = theme.bg_base;
+                            cell.modifier = ratatui::prelude::Modifier::BOLD;
+                        }
                     }
+                    self.frame_occluder_rects.push(Rect {
+                        x,
+                        y,
+                        width: w,
+                        height: 1,
+                    });
                 }
-                self.frame_occluder_rects.push(Rect {
-                    x,
-                    y,
-                    width: w,
-                    height: 1,
-                });
             }
         }
         if tasks_height > 0 {
@@ -3795,19 +3796,19 @@ impl AgentView {
                     buf.set_string(content_x, status_y, &status, status_style);
                 }
             }
-            if let Some(ref msg) = block_viewer_toast {
-                let toast_text = format!(" {msg} ");
-                let w = toast_text.len() as u16;
-                if popup_area.height > 2 && popup_area.width > w + 2 {
-                    let tx = popup_area.right().saturating_sub(w + 2);
-                    let ty = popup_area.bottom().saturating_sub(2);
-                    for (i, ch) in toast_text.chars().enumerate() {
-                        if let Some(cell) = buf.cell_mut((tx + i as u16, ty)) {
-                            cell.set_char(ch);
-                            cell.fg = theme.accent_user;
-                            cell.bg = theme.bg_base;
-                            cell.modifier = ratatui::prelude::Modifier::BOLD;
-                        }
+            if let Some(ref msg) = block_viewer_toast
+                && popup_area.height > 2
+                && let Some(toast_text) = fit_toast_text(msg, popup_area.width.saturating_sub(1))
+            {
+                let w = toast_text.chars().count() as u16;
+                let tx = popup_area.right().saturating_sub(w + 2);
+                let ty = popup_area.bottom().saturating_sub(2);
+                for (i, ch) in toast_text.chars().enumerate() {
+                    if let Some(cell) = buf.cell_mut((tx + i as u16, ty)) {
+                        cell.set_char(ch);
+                        cell.fg = theme.accent_user;
+                        cell.bg = theme.bg_base;
+                        cell.modifier = ratatui::prelude::Modifier::BOLD;
                     }
                 }
             }
@@ -4230,6 +4231,43 @@ impl AgentView {
             prompt_cursor_pos
         };
         (cursor, prompt_post_flush)
+    }
+}
+/// Pad `msg` for the toast slot, truncating with a trailing ellipsis when it
+/// cannot fit in `avail_width` columns (long clipboard toasts embed backup
+/// file paths — dropping the whole toast would hide the copy feedback
+/// entirely). Returns `None` only when the slot is too narrow for any text.
+fn fit_toast_text(msg: &str, avail_width: u16) -> Option<String> {
+    let max_msg_chars = (avail_width as usize).saturating_sub(4);
+    if max_msg_chars == 0 {
+        return None;
+    }
+    let msg_chars = msg.chars().count();
+    if msg_chars <= max_msg_chars {
+        return Some(format!(" {msg} "));
+    }
+    let truncated: String = msg.chars().take(max_msg_chars.saturating_sub(1)).collect();
+    Some(format!(" {}… ", truncated.trim_end()))
+}
+#[cfg(test)]
+mod toast_fit_tests {
+    use super::fit_toast_text;
+    #[test]
+    fn short_message_is_padded_untouched() {
+        assert_eq!(fit_toast_text("Copied!", 40).as_deref(), Some(" Copied! "));
+    }
+    #[test]
+    fn long_message_truncates_with_ellipsis_instead_of_vanishing() {
+        let msg = "Copied via OSC 52 — also saved to /tmp/grok-0/last-copy.txt. If paste fails, hold Shift (or Fn) and drag to select & copy natively.";
+        let fitted = fit_toast_text(msg, 60).expect("must render truncated");
+        assert!(fitted.chars().count() <= 58);
+        assert!(fitted.ends_with("… "));
+        assert!(fitted.contains("also saved to"));
+    }
+    #[test]
+    fn zero_width_slot_yields_none() {
+        assert_eq!(fit_toast_text("Copied!", 4), None);
+        assert_eq!(fit_toast_text("Copied!", 0), None);
     }
 }
 #[cfg(test)]

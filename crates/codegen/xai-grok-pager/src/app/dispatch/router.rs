@@ -558,8 +558,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             dispatch_copy_block_content(app);
             vec![]
         }
-        Action::CopyAssistantMessage { n } => {
-            dispatch_copy_assistant_message(app, n);
+        Action::CopyAssistantMessage { n, file_path } => {
+            dispatch_copy_assistant_message(app, n, file_path);
             vec![]
         }
         Action::ExportConversation { file_path } => {

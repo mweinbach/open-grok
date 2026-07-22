@@ -2719,6 +2719,7 @@ fn catalog_with(
                 info,
                 api_key: None,
                 env_key: None,
+                auth_provider: None,
                 api_base_url: None,
             },
         );

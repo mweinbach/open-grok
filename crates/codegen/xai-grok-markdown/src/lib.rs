@@ -47,7 +47,8 @@ mod url_scan;
 pub use buffers::MarkdownBuffers;
 pub use checkpoint::{Checkpoint, CheckpointKind};
 pub use colors::{
-    ColorLevel, adapt_color, adapt_style, detect_color_level, get_color_level, set_color_level_cap,
+    ColorLevel, adapt_color, adapt_style, detect_color_level, get_color_level,
+    polarity_safe_syntax, polarity_safe_syntax_ansi, set_color_level_cap, set_polarity_safe_syntax,
 };
 pub use latex_delimiters::{LatexDelimiterNormalizer, normalize_latex_delimiters};
 pub use output::{CodeBlockSpan, HyperlinkTarget, MarkdownRenderOutput, MarkdownRenderView};

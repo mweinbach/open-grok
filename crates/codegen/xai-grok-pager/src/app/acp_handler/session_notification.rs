@@ -776,6 +776,15 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                         xai_grok_shell::extensions::notification::HookRunStatusDto::Failed {
                             error,
                             elapsed_ms,
+                            blocked: true,
+                        } => HookRunStatus::Blocked {
+                            detail: error,
+                            elapsed: std::time::Duration::from_millis(elapsed_ms),
+                        },
+                        xai_grok_shell::extensions::notification::HookRunStatusDto::Failed {
+                            error,
+                            elapsed_ms,
+                            blocked: false,
                         } => HookRunStatus::Failed {
                             error,
                             elapsed: std::time::Duration::from_millis(elapsed_ms),

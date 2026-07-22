@@ -314,6 +314,8 @@ impl xai_tool_runtime::Tool for TaskTool {
                 // parent agent decides the flavor (the `/goal` harness override
                 // is set only by the harness-internal role spawners).
                 harness_agent_type: None,
+                completion_output_cap: None,
+                spawn_depth: None,
             },
             run_in_background: input.run_in_background,
             // Model-spawned subagents must still appear in the idle reminder.

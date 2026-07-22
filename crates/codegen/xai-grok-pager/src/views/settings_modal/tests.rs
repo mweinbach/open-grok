@@ -185,13 +185,17 @@ fn contextual_hints_group_sub_sheet_flow() {
     let group_idx = s
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "contextual_hints"))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == "contextual_hints")
+        })
         .expect("group row present");
     assert!(
         !s.rows.iter().any(|r| matches!(
-            r,
-            RowEntry::Setting { key, .. } if key.starts_with("contextual_hints.")
-        )),
+                    r,
+                    RowEntry::Setting { key, .. }
+        if key.starts_with("contextual_hints.")
+                )),
         "child rows must be hidden from the top-level list",
     );
 
@@ -4347,7 +4351,10 @@ fn advance_next_recovers_when_selection_is_hidden() {
     let compact_idx = s
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "compact_mode"))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == "compact_mode")
+        })
         .unwrap();
     s.selected = compact_idx;
     // Advance: lands on the first visible setting (show_timestamps).
@@ -4356,7 +4363,10 @@ fn advance_next_recovers_when_selection_is_hidden() {
     let show_ts_idx = s
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "show_timestamps"))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == "show_timestamps")
+        })
         .unwrap();
     assert_eq!(s.selected, show_ts_idx);
 }
@@ -4379,7 +4389,10 @@ fn advance_prev_recovers_when_selection_is_hidden() {
     let compact_idx = s
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "compact_mode"))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == "compact_mode")
+        })
         .unwrap();
     s.selected = compact_idx;
     let moved = s.advance_prev();
@@ -4387,7 +4400,10 @@ fn advance_prev_recovers_when_selection_is_hidden() {
     let simple_idx = s
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "simple_mode"))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == "simple_mode")
+        })
         .unwrap();
     assert_eq!(s.selected, simple_idx);
 }
@@ -4466,14 +4482,23 @@ fn find_text_col(buf: &Buffer, y: u16, needle: &str) -> Option<u16> {
 #[test]
 fn section_headers_have_blank_line_above_except_first() {
     let mut s = make_state();
-    // Allocate a generous viewport so every category fits — the
-    // default registry contains 6 categories with 16 settings;
-    // the blank lines push us to ~23 lines, fits in 60.
+    // Allocate a generous viewport so every category fits, including the
+    // last one (Advanced). The blank line above a section header is only
+    // rendered when the header is not the final visible line of the row
+    // area (see `render_rows`: the gap is skipped once `y_cursor + 1`
+    // reaches `area_end`). The default registry has grown well past its
+    // original 16 settings — the Models category alone now carries the
+    // per-provider web-search-source selectors, x-search, and the
+    // Kimi/Fireworks/Perplexity credential rows — so at width 80 the full
+    // list (settings + section headers + gaps, with a few two-line rows)
+    // runs to ~65 lines. The viewport must exceed that height, otherwise
+    // the trailing `Advanced` header would render flush against the last
+    // Models row and the blank-line invariant could not be checked for it.
     let area = Rect {
         x: 0,
         y: 0,
         width: 80,
-        height: 60,
+        height: 200,
     };
     let mut buf = Buffer::empty(area);
     let theme = Theme::current();
@@ -4487,10 +4512,10 @@ fn section_headers_have_blank_line_above_except_first() {
     for cat in SettingCategory::ALL {
         // Skip categories the default registry doesn't populate
         // (e.g. Session — no settings registered).
-        let has_setting = s
-            .rows
-            .iter()
-            .any(|r| matches!(r, RowEntry::Header { category } if category == cat));
+        let has_setting = s.rows.iter().any(|r| {
+            matches!(r, RowEntry::Header { category }
+if category == cat)
+        });
         if !has_setting {
             continue;
         }
@@ -4836,7 +4861,10 @@ fn two_line_row_hit_rect_spans_both_lines() {
     let row_idx = s
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "coding_data_sharing"))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == "coding_data_sharing")
+        })
         .expect("coding_data_sharing must be registered");
     // Render at a narrow width so coding_data_sharing forces a
     // two-line layout.
@@ -4901,7 +4929,10 @@ fn two_line_row_with_expansion_renders_three_segments() {
     let row_idx = s
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "coding_data_sharing"))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == "coding_data_sharing")
+        })
         .expect("coding_data_sharing must be registered");
     s.selected = row_idx;
     s.expanded_keys.insert("coding_data_sharing");
@@ -4959,7 +4990,10 @@ fn group_row_renders_expanded_description() {
     let row_idx = s
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "contextual_hints"))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key, .. }
+if *key == "contextual_hints")
+        })
         .expect("contextual_hints group must be registered");
     s.selected = row_idx;
     s.expanded_keys.insert("contextual_hints");
@@ -5998,7 +6032,10 @@ fn enter_picker_for(key: &'static str) -> SettingsModalState {
     let row_idx = s
         .rows
         .iter()
-        .position(|r| matches!(r, RowEntry::Setting { key: k, .. } if *k == key))
+        .position(|r| {
+            matches!(r, RowEntry::Setting { key: k, .. }
+if *k == key)
+        })
         .unwrap_or_else(|| panic!("no row for key `{key}` in default registry"));
     assert!(s.select_at(row_idx), "select_at({row_idx})");
     assert!(

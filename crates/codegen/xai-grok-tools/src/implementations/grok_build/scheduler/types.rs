@@ -9,20 +9,43 @@ pub enum SchedulerError {
 
     #[error("maximum of {0} scheduled tasks reached")]
     TaskLimitReached(usize),
+
+    #[error("no scheduled task with id {0}; call scheduler_list to see active task ids")]
+    TaskNotFound(String),
 }
 
-/// A single scheduled recurring or one-shot task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledTask {
     pub id: String,
     pub interval_secs: u64,
     pub prompt: String,
+    #[serde(default = "default_recurring")]
     pub recurring: bool,
     pub durable: bool,
+    #[serde(default)]
+    pub foreground: bool,
     pub created_at: DateTime<Utc>,
     pub last_fired_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_subagent_id: Option<String>,
+    #[serde(default)]
+    pub iterations_since_fresh: u32,
+    /// Set when the prompt is patched: the next fire starts a fresh
+    /// transcript instead of resuming the old task's. The anchor itself is
+    /// kept until then so the in-flight guard can still see a running
+    /// iteration.
+    #[serde(default)]
+    pub chain_reset_pending: bool,
+}
+
+pub const LOOP_FRESH_CHAIN_EVERY: u32 = 10;
+
+pub const LOOP_COMPLETION_OUTPUT_CAP: usize = 4_000;
+
+fn default_recurring() -> bool {
+    true
 }
 
 impl ScheduledTask {
@@ -51,6 +74,7 @@ impl ScheduledTask {
             prompt,
             recurring,
             durable,
+            foreground: false,
             created_at,
             last_fired_at: None,
             expires_at: if recurring {
@@ -58,6 +82,9 @@ impl ScheduledTask {
             } else {
                 None
             },
+            last_subagent_id: None,
+            iterations_since_fresh: 0,
+            chain_reset_pending: false,
         }
     }
 
@@ -70,11 +97,6 @@ impl ScheduledTask {
     /// Whether this task has expired (recurring tasks only).
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         self.expires_at.is_some_and(|exp| now >= exp)
-    }
-
-    /// Whether this task was missed (one-shot: fire time already passed, never fired).
-    pub fn is_missed(&self, now: DateTime<Utc>) -> bool {
-        !self.recurring && self.last_fired_at.is_none() && self.next_fire_at() < now
     }
 }
 
@@ -95,6 +117,12 @@ pub struct SchedulerHandle(pub mpsc::UnboundedSender<SchedulerCommand>);
 pub enum SchedulerCommand {
     Create {
         task: ScheduledTask,
+        reply: oneshot::Sender<Result<ScheduledTask, SchedulerError>>,
+    },
+    Update {
+        id: String,
+        prompt: Option<String>,
+        interval_secs: Option<u64>,
         reply: oneshot::Sender<Result<ScheduledTask, SchedulerError>>,
     },
     Delete {
@@ -161,25 +189,22 @@ mod tests {
     }
 
     #[test]
-    fn is_missed_returns_true_for_unfired_one_shot_past_due() {
-        let mut task = ScheduledTask::new(1, "test".into(), false, false);
-        task.created_at = Utc::now() - chrono::Duration::seconds(10);
-        assert!(task.is_missed(Utc::now()));
+    fn legacy_state_without_recurring_field_deserializes_as_recurring() {
+        let json = r#"{"id":"abc123","intervalSecs":300,"prompt":"check",
+                       "durable":true,"createdAt":"2026-01-01T00:00:00Z",
+                       "lastFiredAt":null,"expiresAt":null}"#;
+        let task: ScheduledTask = serde_json::from_str(json).unwrap();
+        assert!(task.recurring);
     }
 
     #[test]
-    fn is_missed_returns_false_for_recurring() {
-        let mut task = ScheduledTask::new(1, "test".into(), true, false);
-        task.created_at = Utc::now() - chrono::Duration::seconds(10);
-        assert!(!task.is_missed(Utc::now()));
-    }
-
-    #[test]
-    fn is_missed_returns_false_if_already_fired() {
-        let mut task = ScheduledTask::new(1, "test".into(), false, false);
-        task.created_at = Utc::now() - chrono::Duration::seconds(10);
-        task.last_fired_at = Some(Utc::now());
-        assert!(!task.is_missed(Utc::now()));
+    fn legacy_one_shot_state_still_deserializes() {
+        let json = r#"{"id":"abc123","intervalSecs":300,"prompt":"check",
+                       "recurring":false,"durable":true,
+                       "createdAt":"2026-01-01T00:00:00Z",
+                       "lastFiredAt":null,"expiresAt":null}"#;
+        let task: ScheduledTask = serde_json::from_str(json).unwrap();
+        assert!(!task.recurring);
     }
 
     #[test]

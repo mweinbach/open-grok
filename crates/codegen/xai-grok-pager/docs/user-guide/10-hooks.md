@@ -9,6 +9,7 @@ Hooks let you run a script or send an HTTP request at key moments in a Grok sess
 A hook is a shell command or HTTP endpoint that Grok calls when a specific lifecycle event occurs. Hooks can:
 
 - **Block actions** -- A `PreToolUse` hook can deny a dangerous command before it runs.
+- **Keep the agent working** -- A `Stop` hook can block the agent from finishing its turn until a condition holds (e.g. the test suite passes) and feed the reason back to the model.
 - **React to events** -- A `PostToolUse` hook can log every tool execution to a file.
 - **Set up context** -- A `SessionStart` hook can export environment variables or run setup scripts.
 
@@ -87,16 +88,16 @@ Because hooks are unified under folder-trust, a `--trust` / `/hooks-trust` grant
 | `PostToolUse` | A tool completes successfully. | No |
 | `PostToolUseFailure` | A tool fails. | No |
 | `PermissionDenied` | The permission system denies a tool call. | No |
-| `Stop` | An agent turn ends (completed, cancelled, or error). | No |
+| `Stop` | An agent turn ends on a genuine completion (not on a user interrupt). | Yes — can block the stop |
 | `StopFailure` | A turn ends because of an API error. | No |
 | `Notification` | The agent sends a notification. | No |
 | `SubagentStart` | A subagent starts. | No |
-| `SubagentStop` | A subagent finishes. | No |
+| `SubagentStop` | A subagent's turn ends (fires once, in the subagent, with stop decision control). | Yes — can block the stop |
 | `PreCompact` | Conversation compaction is about to run. | No |
 | `PostCompact` | Conversation compaction completes. | No |
 | `SessionEnd` | The session ends. | No |
 
-`SubagentEnd` is accepted as an alias for `SubagentStop`. Only `PreToolUse` can block a tool call; every other event is passive.
+`SubagentEnd` is accepted as an alias for `SubagentStop`. `PreToolUse` can block a tool call, and `Stop`/`SubagentStop` can block the agent from stopping (see [Stop Decision Control](#stop-decision-control)); every other event is passive.
 
 ### Cursor Hook Compatibility
 
@@ -146,10 +147,10 @@ Each `.json` file can define hooks for multiple events:
 ### Key Fields
 
 - **Event name** (top-level key): any event listed in [Hook Events](#hook-events). Grok skips unrecognized event names so a shared Claude or Cursor settings file still loads.
-- **matcher** (optional): A regular expression that selects which invocations trigger the hook. It applies to the tool events — `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` — where it tests the tool name, and to `Notification`, where it tests the notification type. The lifecycle events (`SessionStart`, `SessionEnd`, `Stop`, `UserPromptSubmit`) reject a matcher; other events ignore it. An empty or omitted matcher matches everything. The matcher tests the real tool name; MCP calls routed through the internal `use_tool` dispatcher appear as the qualified `server__tool` name (e.g. `linear__save_issue`), so match on that, not the dispatcher name.
+- **matcher** (optional): A regular expression that selects which invocations trigger the hook. What it tests depends on the event: the tool name on tool events (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionDenied`), the notification type on `Notification`, the subagent type on `SubagentStart`/`SubagentStop` (e.g. `explore`), the start source on `SessionStart` (`startup`, `resume`, …), the end reason on `SessionEnd`, the compaction trigger on `PreCompact`/`PostCompact` (`manual` or `auto`), and the error type on `StopFailure` (`rate_limit`, `authentication_failed`, `invalid_request`, `server_error`, `max_output_tokens`, or `unknown`). A matcher on `Stop` or `UserPromptSubmit` is ignored with a warning (those events always fire). An empty or omitted matcher matches everything. The matcher tests the real tool name; MCP calls routed through the internal `use_tool` dispatcher appear as the qualified `server__tool` name (e.g. `linear__save_issue`), so match on that, not the dispatcher name.
 - **type**: `"command"` (run a script or shell one-liner) or `"http"` (POST the event to a URL).
 - **command**: Path to executable (relative to the JSON file) or inline shell command.
-- **timeout**: Seconds before killing the hook (default: 5). All hook failures (timeouts, crashes, malformed output, missing required env vars) are fail-open: the failure is recorded for the UI scrollback but the tool call is not blocked. Only an explicit `deny` decision returned by the hook blocks a tool call.
+- **timeout**: Seconds before killing the hook (default: 5, or 600 for `Stop`/`SubagentStop` gates, matching Claude Code). All hook failures (timeouts, crashes, malformed output, missing required env vars) are fail-open: the failure is recorded for the UI scrollback but the tool call is not blocked. Only an explicit `deny` decision returned by the hook blocks a tool call.
 
 ### Tool Name Aliases
 
@@ -179,11 +180,14 @@ The event is sent as JSON on **stdin** (for example, a `PreToolUse` event; the p
   "sessionId": "abc-123",
   "cwd": "/Users/you/project",
   "workspaceRoot": "/Users/you/project",
+  "permissionMode": "default",
   "toolName": "run_terminal_command",
   "toolInput": { "command": "npm test" },
   "timestamp": "2026-04-14T12:00:00Z"
 }
 ```
+
+Every event carries the same common fields: `hookEventName`, `sessionId`, `cwd`, `workspaceRoot`, `timestamp`, and `permissionMode` (`default`, `auto`, `plan`, or `bypassPermissions`), plus event-specific fields like `toolName` above.
 
 ### Output (Blocking Hooks)
 
@@ -197,8 +201,59 @@ For `PreToolUse` hooks, write JSON to **stdout**:
 | Exit Code | Meaning |
 |-----------|---------|
 | `0` | Success / allow (for blocking hooks) |
-| `2` | Explicit deny (blocking hooks only) |
-| Other | Fail-open — the failure is recorded but the tool call is not blocked. To block a call, emit a `deny` decision in stdout JSON (honored regardless of exit code). |
+| `2` | Explicit deny (`PreToolUse`) or block-stop with stderr as feedback (`Stop`/`SubagentStop`) |
+| Other | Fail-open — the failure is recorded but nothing is blocked. For `PreToolUse`, a `deny` decision in stdout JSON is honored regardless of exit code. For `Stop`/`SubagentStop`, a valid decision JSON on stdout wins over the exit code (matching Claude Code); the exit code decides only when stdout has no usable JSON, in which case exit 2 blocks with stderr as the feedback. |
+
+### Stop Decision Control
+
+`Stop` and `SubagentStop` hooks run when the agent is about to finish its turn and can keep it working (Claude Code-compatible). Write JSON to **stdout**:
+
+- **Block the stop**: `{"decision": "block", "reason": "The test suite hasn't been run yet"}`. The reason is fed back to the model as a user message and the agent runs another round in the same turn.
+- **Non-error feedback**: `{"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": "Run the linter before finishing"}}`. Also keeps the agent working, but is surfaced as hook feedback rather than a hook error.
+- **Force stop**: `{"continue": false, "stopReason": "Budget exhausted"}`. Ends the turn, overriding any blocks.
+- **Allow the stop**: exit 0 with no output (or any non-JSON output).
+
+Exiting with code `2` also blocks the stop, with **stderr** as the feedback.
+
+The hook input includes `stopHookActive` and `lastAssistantMessage`. `stopHookActive` is true when the agent is already continuing due to a previous stop-hook block this turn; check it, or the transcript, to avoid blocking on a condition that will never resolve. `lastAssistantMessage` carries the text of the agent's final response this turn, so hooks can act on it without parsing the transcript. After **8 continuations** (blocks or non-error feedback) in one turn the gate is overridden and the turn ends; hooks are not consulted for that final, forced stop. The counter is per turn: the next user prompt starts fresh, so a long-running goal can span turns. Hook failures fail open: the agent stops normally.
+
+`Stop` and `SubagentStop` hooks default to a 600-second timeout (matching Claude Code) because gates commonly run builds or test suites, and a timed-out hook fails open, so the agent stops anyway. Other events keep the 5-second default. Set `timeout` explicitly when a gate needs more: `{ "type": "command", "command": "bin/verify.sh", "timeout": 1200 }`.
+
+The gate runs only for genuine completions. Interrupted (Esc / Ctrl+C), refused, and max-turns turns skip Stop hooks entirely, and API-error turns fire `StopFailure` instead. A separate Stop also fires at session end (`reason: "channel_closed"` or `"shutdown"`); its decision output is parsed but ignored, since there is no turn left to continue. A script that counts or gates on Stop fires should check `reason == "end_turn"` so the session-end fire doesn't skew it.
+
+`StopFailure` is observation-only (use it to log failures or send alerts; output and exit code are ignored). Its input carries `error` (the classified type the matcher tests, in Claude Code's vocabulary: `rate_limit`, `authentication_failed`, `invalid_request`, `server_error`, `max_output_tokens`, or `unknown` for anything the runtime cannot distinguish; capacity errors fold into `rate_limit` and there is no signal for `billing_error`), `errorDetails` (the raw error detail, when available), and `lastAssistantMessage` (the rendered error text shown in the conversation; for this event it is the error string, not assistant output).
+
+`Stop` input also carries `backgroundTasks` and `sessionCrons`, so a hook can distinguish "session is done" from "session is paused waiting for background work to wake it back up". Both arrays are empty when nothing is in flight or scheduled. Each `backgroundTasks` entry describes one in-flight task: `id`, `type` (`shell`, `monitor`, or `subagent`), `status`, and (depending on the type) `command` (shell tasks only), `description` (a monitor's watched command line, or a subagent's task description), and `agentType` (subagents). Each `sessionCrons` entry describes one scheduled wakeup (`scheduler_create` or `/loop`): `id`, `schedule`, `recurring`, and `prompt`. The `schedule` value is a human-readable interval such as `every 5 minutes`; grok schedules are intervals, not cron expressions. Free-text entry fields are capped at 1000 characters with an in-string `… [+N chars]` marker.
+
+Inside a subagent, the gate fires as `SubagentStop` (agent-frontmatter `Stop` hooks are automatically remapped). A `Stop` hook only gates the main agent.
+
+`SubagentStop` fires once per subagent, at the subagent's own turn end, matching Claude Code. Its input carries a `phase` field (currently always `"gate"`) reserved for forward compatibility.
+
+**Porting Claude Code stop hooks**: the output vocabulary (`decision`, `reason`, `continue`, `stopReason`, `additionalContext`) works unchanged. Check this list for what does not match Claude:
+
+- **camelCase input**: grok's stdin envelope uses camelCase keys throughout where Claude uses snake_case. A script reading `.stop_hook_active`, `.hook_event_name`, or `.background_tasks[].agent_type` must switch to `.stopHookActive`, `.hookEventName`, and `.backgroundTasks[].agentType` (the event value is `"stop"`). Hooks registered through the grok-agent-sdk convert both the top-level keys and the `backgroundTasks`/`sessionCrons` entry keys to snake_case, so the wire's `.backgroundTasks[].agentType` reads as `.background_tasks[].agent_type` in the SDK.
+- **`toolResult` field**: the `PostToolUse` tool output is `toolResult` (SDK: `tool_result`), not Claude's `tool_response`; a hook reading `.tool_response` must switch to `.toolResult`.
+- **Session-end fire**: an extra observe-only Stop fires at session end; filter on `reason == "end_turn"` (see above).
+- **Interval schedules**: `sessionCrons[].schedule` is a human-readable interval, never a cron expression.
+- **Task types**: `backgroundTasks[].type` is only `shell`, `monitor`, or `subagent`; Claude's other labels (`workflow`, `teammate`, …) are not emitted.
+- **StopFailure classes**: the emitted set is Claude Code's vocabulary — `rate_limit`, `authentication_failed`, `invalid_request`, `server_error`, `max_output_tokens`, `unknown`. grok emits a subset: capacity errors (503/529) fold into `rate_limit` as in Claude, and `billing_error` is never emitted (no signal), so a `billing_error` matcher will not fire.
+- **permission_mode values**: grok emits `default`, `auto`, `plan`, or `bypassPermissions`. Claude's `acceptEdits`/`dontAsk` have no grok equivalent (grok's `auto` is the nearest), so a check like `permission_mode === "acceptEdits"` never matches.
+- **Client (SDK) gate timeouts**: SDK `Stop`/`SubagentStop` gates default to 600 seconds like file hooks; `PreToolUse` client gates default to 30 seconds (the interactive hot path). Either can be overridden per matcher group via `timeoutS`, capped at 600.
+- **`/goal`**: grok's goal loop is a separate feature that runs before the stop gate; it is not a prompt-type Stop hook.
+
+A complete keep-working policy in one script:
+
+```bash
+#!/bin/bash
+input=$(cat)
+# Gate only genuine turn ends, not the session-end observe fire.
+if [ "$(echo "$input" | jq -r '.reason')" != "end_turn" ]; then exit 0; fi
+if ! bin/verify.sh >/dev/null 2>&1; then
+  echo '{"decision": "block", "reason": "verify.sh failed; fix the failures before finishing"}'
+fi
+```
+
+registered as `{ "type": "command", "command": "bin/stop-gate.sh", "timeout": 300 }` with `timeout` sized for the verify step. The hook fires again after each continuation, and the built-in cap ends the turn after 8; check `stopHookActive` to give up earlier on feedback the agent evidently cannot act on.
 
 ### Passive Hooks
 

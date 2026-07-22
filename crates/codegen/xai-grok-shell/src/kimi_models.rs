@@ -298,6 +298,7 @@ impl KimiModelsClient {
                 info,
                 api_key: None,
                 env_key: Some(EnvKeys::single(self.endpoint.api_key_env())),
+                auth_provider: None,
                 api_base_url: None,
             },
         ))

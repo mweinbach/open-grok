@@ -383,6 +383,7 @@ pub(super) async fn run_antigravity_subagent(
         full_slug,
         conversation_id,
         persisted_output_dir,
+        request.runtime_overrides.completion_output_cap,
     );
     if will_wake {
         inject_subagent_completed_prompt(

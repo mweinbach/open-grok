@@ -77,11 +77,14 @@ Rewind the conversation to an earlier turn, discarding everything after it.
 
 ### `/copy`
 
-Copy the most recent response to the clipboard. Pass a number to copy the Nth-latest response.
+Copy the most recent response to the clipboard. Pass a number to copy the Nth-latest response. Pass a file path to write instead of using the clipboard (useful over SSH when the local clipboard is unreachable).
+Every copy is also written to a backup file (`~/.opengrok/last-copy.txt` by default, or `GROK_COPY_FILE` if set), and the toast names that path so you always know where to retrieve the text — including when the clipboard cannot be reached (for example Apple Terminal over SSH) or the copy went out as an OSC 52 escape that this terminal couldn't be verified to apply.
 
 ```
 /copy
 /copy 2
+/copy out.txt
+/copy 2 ~/exports/last-reply.md
 ```
 
 ### `/export`

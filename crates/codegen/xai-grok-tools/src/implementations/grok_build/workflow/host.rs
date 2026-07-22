@@ -759,6 +759,8 @@ impl WorkflowHost {
                 capability_mode: None,
                 isolation,
                 harness_agent_type: None,
+                completion_output_cap: None,
+                spawn_depth: None,
             },
             run_in_background: false,
             surface_completion: false,

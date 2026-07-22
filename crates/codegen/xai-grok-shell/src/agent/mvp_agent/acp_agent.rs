@@ -532,8 +532,10 @@ impl acp::Agent for MvpAgent {
                         .meta(
                             serde_json::json!(
                                 { "x.ai/fs_notify" : true, "x.ai/hooks" : { "blockingEvents"
-                                : [xai_grok_hooks::event::HookEventName::PreToolUse],
-                                "decisions" : ["deny"], }, }
+                                : crate ::extensions::hooks::ADVERTISED_BLOCKING_EVENTS,
+                                "decisions" : crate
+                                ::extensions::hooks::ADVERTISED_DECISIONS, "stopSignals" :
+                                crate ::extensions::hooks::ADVERTISED_STOP_SIGNALS, }, }
                             )
                                 .as_object()
                                 .cloned(),
@@ -2258,12 +2260,7 @@ impl acp::Agent for MvpAgent {
     #[tracing::instrument(
         name = "agent.prompt",
         skip_all,
-        fields(
-            session_id = %arguments.session_id.0,
-            turn_number = tracing::field::Empty,
-            uploads_enabled = tracing::field::Empty,
-            upload_reason = tracing::field::Empty,
-        )
+        fields(session_id = %arguments.session_id.0, turn_number = tracing::field::Empty)
     )]
     #[allow(unused_mut)]
     async fn prompt(
@@ -3662,6 +3659,12 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/session/updates" => {
                 crate::extensions::session_updates::handle(&args, &self.gateway).await
+            }
+            "x.ai/session/state" => {
+                crate::extensions::session_state::handle_state(&args).await
+            }
+            "x.ai/session/import" => {
+                crate::extensions::session_state::handle_import(&args).await
             }
             "x.ai/session/load_history" => {
                 crate::extensions::chat_conversation_history::handle(self, &args).await

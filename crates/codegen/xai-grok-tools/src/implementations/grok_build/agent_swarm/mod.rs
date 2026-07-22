@@ -716,6 +716,8 @@ fn build_member_request(
             capability_mode: None,
             isolation: None,
             harness_agent_type: None,
+            completion_output_cap: None,
+            spawn_depth: None,
         },
         resume_from: member.resume_from,
         cwd: None,

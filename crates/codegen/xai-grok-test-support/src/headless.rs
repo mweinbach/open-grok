@@ -28,6 +28,18 @@ pub async fn run_headless(
     args: &[&str],
     cwd: &Path,
 ) -> HeadlessResult {
+    run_headless_with_env(server, args, cwd, &[]).await
+}
+
+/// Like [`run_headless`], but with extra environment variables applied after the
+/// shared defaults so they take precedence — e.g. to re-enable a feature the
+/// defaults turn off.
+pub async fn run_headless_with_env(
+    server: &MockInferenceServer,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(&str, &str)],
+) -> HeadlessResult {
     let home = TempDir::new().expect("create temp home");
     let mut cmd = tokio::process::Command::new(grok_binary());
     cmd.args(args)
@@ -37,6 +49,7 @@ pub async fn run_headless(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     test_env_cmd_tokio(&mut cmd, &server.url(), home.path());
+    cmd.envs(env.iter().copied());
     run_headless_with_cmd(cmd).await
 }
 

@@ -533,7 +533,7 @@ impl AgentView {
         use crate::scrollback::blocks::mermaid_content::AffordanceKind;
         match kind {
             AffordanceKind::CopySource => {
-                if self.copy_to_clipboard(&source).is_failed() {
+                if !self.copy_to_clipboard(&source).success() {
                     crate::unified_log::error(
                         "mermaid.copy_source.failed",
                         self.session.session_id.as_ref().map(|s| s.0.as_ref()),

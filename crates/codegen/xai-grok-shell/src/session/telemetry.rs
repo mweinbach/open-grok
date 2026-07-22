@@ -120,7 +120,7 @@ impl HookRegInfo {
         Self {
             name: format_hook_name(spec),
             event: spec.event.to_string(),
-            hook_type: spec.handler_type.clone(),
+            hook_type: spec.handler_type.as_str().to_string(),
             source: format_hook_source(spec),
         }
     }

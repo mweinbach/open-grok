@@ -30,14 +30,27 @@ const SUPPORTED_EVENTS: &[&str] = &[
     // v2 events — PascalCase and snake_case
     "Notification",
     "Stop",
+    "StopFailure",
     "UserPromptSubmit",
+    "PostToolUseFailure",
+    "PermissionDenied",
     "SubagentStart",
+    "SubagentStop",
+    // `SubagentEnd` is the legacy alias for `SubagentStop`.
     "SubagentEnd",
+    "PreCompact",
+    "PostCompact",
     "notification",
     "stop",
+    "stop_failure",
     "user_prompt_submit",
+    "post_tool_use_failure",
+    "permission_denied",
     "subagent_start",
+    "subagent_stop",
     "subagent_end",
+    "pre_compact",
+    "post_compact",
 ];
 
 /// Parse plugin hook files with pre-filtering and env injection.

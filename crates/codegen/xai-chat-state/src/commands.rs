@@ -306,6 +306,13 @@ pub enum ChatStateCommand {
         reply: oneshot::Sender<Option<String>>,
     },
 
+    /// Like `GetLastAssistantText`, but bounded to the current prompt turn:
+    /// returns `None` when the turn produced no assistant text (the walk stops
+    /// at the first turn-starting user item).
+    GetLastAssistantTextInTurn {
+        reply: oneshot::Sender<Option<String>>,
+    },
+
     /// Get the text of the first `Text` content part in the first `User` message.
     /// Returns `None` if the conversation has no user messages or the first user
     /// message has no text content part.
@@ -470,6 +477,9 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetLastAssistantText { reply: tx };
+
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::GetLastAssistantTextInTurn { reply: tx };
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetFirstUserText { reply: tx };

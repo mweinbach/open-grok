@@ -2926,7 +2926,7 @@ mod inline_auto_compact_flow_tests {
                 cwd: cwd.as_str().to_string(),
             },
             auth_method_id: test_auth_method_id("test-auth"),
-            model_auth_facts: std::cell::RefCell::new(None),
+            model_auth_memo: std::cell::RefCell::new(None),
             attribution_callback: None,
             auth_manager: None,
             state,
@@ -3094,7 +3094,6 @@ mod inline_auto_compact_flow_tests {
             image_describe_cache: Arc::new(
                 crate::session::image_describe::ImageDescribeCache::new(),
             ),
-            subagent_spawn_info: parking_lot::Mutex::new(std::collections::HashMap::new()),
             subagent_token_records: parking_lot::Mutex::new(std::collections::HashMap::new()),
             workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
             trace_config_template: std::cell::RefCell::new(None),

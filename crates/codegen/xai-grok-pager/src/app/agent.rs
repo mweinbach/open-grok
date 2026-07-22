@@ -285,6 +285,7 @@ pub struct ScheduledTaskInfo {
     pub next_fire_at: Option<String>,
     /// Tag shown in the tasks pane (e.g. "loop", "check").
     pub tag: String,
+    pub last_subagent_id: Option<String>,
 }
 /// Parsed goal status from `GoalUpdated` session notifications.
 ///

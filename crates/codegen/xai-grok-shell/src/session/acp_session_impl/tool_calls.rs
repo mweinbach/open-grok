@@ -1314,7 +1314,6 @@ impl SessionActor {
                     tool_use_id: call.id.clone(),
                     tool_input: hook_tool_input,
                     tool_input_truncated: hook_tool_input_truncated,
-                    permission_mode: Some(self.permission_mode_label().to_string()),
                     subagent_type: self.subagent_type_label(),
                 },
             );
@@ -1546,7 +1545,11 @@ impl SessionActor {
             match decision {
                 Decision::PolicyDeny(ref reason) | Decision::Reject(ref reason) => {
                     let is_policy_deny = matches!(&decision, Decision::PolicyDeny(_));
-                    let message = format!("{reason} for tool `{}`", call.function.name);
+                    let message = if is_policy_deny {
+                        format!("Tool `{}` was not executed: {reason}", call.function.name)
+                    } else {
+                        format!("{reason} for tool `{}`", call.function.name)
+                    };
                     self.handle_tool_not_executed(&call.id, &tool_call_id, message)
                         .await?;
                     let (tool_input_value, tool_input_truncated) =
@@ -2256,12 +2259,19 @@ impl SessionActor {
                 vec![],
                 vec![],
             ),
-            ToolInput::SchedulerCreate(ref sc) => (
-                format!("Create scheduled task (every {})", sc.interval),
-                acp::ToolKind::Other,
-                vec![],
-                vec![],
-            ),
+            ToolInput::SchedulerCreate(ref sc) => {
+                let title = match (&sc.task_id, &sc.interval) {
+                    (Some(id), Some(interval)) => {
+                        format!("Update scheduled task {id} (every {interval})")
+                    }
+                    (Some(id), None) => format!("Update scheduled task {id}"),
+                    (None, Some(interval)) => {
+                        format!("Create scheduled task (every {interval})")
+                    }
+                    (None, None) => "Create scheduled task".to_string(),
+                };
+                (title, acp::ToolKind::Other, vec![], vec![])
+            }
             ToolInput::SchedulerDelete(ref sd) => (
                 format!("Delete scheduled task: {}", sd.id),
                 acp::ToolKind::Other,

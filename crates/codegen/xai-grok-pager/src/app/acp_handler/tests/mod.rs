@@ -513,6 +513,26 @@ pub(super) fn make_fired_notif(
             prompt: prompt.into(),
             human_schedule: human_schedule.into(),
             next_fire_at: next_fire_at.map(str::to_string),
+            subagent_id: None,
+        },
+        meta: None,
+    };
+    let raw = serde_json::value::to_raw_value(&notif).unwrap();
+    acp::ExtNotification::new("x.ai/scheduled_task_fired", std::sync::Arc::from(raw))
+}
+pub(super) fn make_fired_notif_with_subagent(
+    session_id: &str,
+    task_id: &str,
+    subagent_id: &str,
+) -> acp::ExtNotification {
+    let notif = SessionNotification {
+        session_id: acp::SessionId::new(session_id),
+        update: XaiSessionUpdate::ScheduledTaskFired {
+            task_id: task_id.into(),
+            prompt: "p".into(),
+            human_schedule: "every 1 minute".into(),
+            next_fire_at: Some("2026-02-02T02:02:02Z".into()),
+            subagent_id: Some(subagent_id.into()),
         },
         meta: None,
     };
@@ -943,16 +963,31 @@ pub(super) fn xai_hook_execution_notif_for_prompt(
     is_replay: bool,
 ) -> acp::ExtNotification {
     use xai_grok_shell::extensions::notification::{HookRunEntryDto, HookRunStatusDto};
+    xai_hook_execution_notif_with_runs(
+        session_id,
+        event_name,
+        prompt_id,
+        is_replay,
+        vec![
+            HookRunEntryDto { name : "global/notify".into(), status :
+            HookRunStatusDto::Success { elapsed_ms : 12 }, output : None, }
+        ],
+    )
+}
+pub(super) fn xai_hook_execution_notif_with_runs(
+    session_id: &str,
+    event_name: &str,
+    prompt_id: Option<&str>,
+    is_replay: bool,
+    runs: Vec<xai_grok_shell::extensions::notification::HookRunEntryDto>,
+) -> acp::ExtNotification {
     let payload = SessionNotification {
         session_id: acp::SessionId::new(session_id),
         update: XaiSessionUpdate::HookExecution {
             event_name: event_name.into(),
             tool_name: None,
             prompt_id: prompt_id.map(str::to_string),
-            runs: vec![
-                HookRunEntryDto { name : "global/notify".into(), status :
-                HookRunStatusDto::Success { elapsed_ms : 12 }, output : None, }
-            ],
+            runs,
         },
         meta: Some(serde_json::json!({ "isReplay" : is_replay })),
     };

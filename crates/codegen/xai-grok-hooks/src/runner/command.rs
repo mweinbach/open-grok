@@ -1,27 +1,22 @@
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::HookSpec;
 use crate::event::HookEventEnvelope;
-use crate::result::HookDecision;
+use crate::result::{HookDecision, StopHookOutcome};
 
-use super::{HookRunnerResult, RunContext};
+use super::{
+    GateHookJson, GateKind, HookRunnerResult, RunContext, StopHookJson, gate_json_to_decision,
+    stop_json_to_outcome,
+};
 
 /// Maximum bytes to capture from hook stdout or stderr (64 KB).
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// Exit code that a blocking hook uses to signal an explicit deny.
-const DENY_EXIT_CODE: i32 = 2;
-
-/// The JSON result structure expected from blocking hooks.
-#[derive(Debug, Deserialize)]
-struct HookOutput {
-    decision: String,
-    #[serde(default)]
-    reason: Option<String>,
-}
+/// Exit code that a blocking hook uses to signal an explicit deny (PreToolUse)
+/// or block (Stop/SubagentStop, with stderr as the feedback).
+const GATE_EXIT_CODE: i32 = 2;
 
 /// Run a single hook command.
 ///
@@ -32,7 +27,7 @@ pub async fn run_command_hook(
     spec: &HookSpec,
     envelope: &HookEventEnvelope,
     ctx: &RunContext<'_>,
-    is_blocking: bool,
+    mode: GateKind,
 ) -> (HookRunnerResult, Duration) {
     let start = Instant::now();
 
@@ -44,7 +39,6 @@ pub async fn run_command_hook(
     };
     let command_str = command.to_string_lossy();
 
-    // Serialize envelope to JSON.
     let stdin_json = match serde_json::to_string(envelope) {
         Ok(j) => j,
         Err(e) => {
@@ -56,7 +50,6 @@ pub async fn run_command_hook(
         }
     };
 
-    // Check opt-in debug logging.
     let debug_payloads = std::env::var("GROK_HOOK_DEBUG").is_ok_and(|v| v == "1");
     if debug_payloads {
         tracing::trace!(
@@ -66,15 +59,10 @@ pub async fn run_command_hook(
         );
     }
 
-    // Determine how to spawn the command.
-    //
-    // If the command contains shell metacharacters (spaces, pipes, &&, ||,
-    // redirects, semicolons, env-var refs) or starts with `~` (tilde
-    // expansion), run it through `sh -c` so that shell command strings
-    // from compatible configs work correctly.
-    //
-    // Otherwise, treat it as a direct executable path (resolve relative
-    // paths from the hook file's directory).
+    // Commands with shell metacharacters (spaces, pipes, &&, ||, redirects,
+    // semicolons, env-var refs) or a leading `~` run through `sh -c` so shell
+    // command strings from compatible configs work; everything else is a
+    // direct executable path resolved from the hook file's directory.
     let is_shell_command = command_str.contains(' ')
         || command_str.contains('|')
         || command_str.contains('&')
@@ -85,18 +73,10 @@ pub async fn run_command_hook(
         || command_str.starts_with('~');
 
     let mut cmd = if is_shell_command {
-        // Refuse to spawn when the command interpolates an env var that
-        // we can't resolve from any of: the runner's always-set vars, the
-        // per-hook extra_env (plugin vars), or Grok's own process env. The
-        // alternative is letting sh expand the var to empty -- which then
-        // produces a broken command, exits 127, and (for PreToolUse hooks)
-        // fails closed with an opaque "exit code 127" reason. Catching it
-        // here gives the model a clear actionable error and skips the
-        // wasted fork+exec.
-        //
-        // Vars with a parameter-expansion modifier (`${VAR:-default}`,
-        // `${VAR-x}`, `${VAR:=x}`, `${VAR:?msg}`, `${VAR:+x}`, etc.) are
-        // NOT flagged: the user has explicitly handled the unset case.
+        // Fail fast on env vars we can't resolve (runner vars, per-hook
+        // extra_env, or process env). Letting sh expand them to empty yields a
+        // broken command that exits 127 with an opaque reason; surface a clear
+        // error instead.
         let unresolved = find_unresolved_env_vars(&command_str, &spec.extra_env);
         if !unresolved.is_empty() {
             let elapsed = start.elapsed();
@@ -126,7 +106,6 @@ pub async fn run_command_hook(
             c
         }
     } else {
-        // Direct executable: resolve relative paths from source_dir.
         let command_path = if command.is_absolute() {
             command.clone()
         } else {
@@ -142,11 +121,8 @@ pub async fn run_command_hook(
         tokio::process::Command::new(command_path)
     };
 
-    // Detach from controlling terminal so child processes (e.g. GPG pinentry)
-    // cannot open /dev/tty and corrupt the TUI display. Delegates to
-    // `xai_grok_tools::util::detach_command`: Unix uses the same setsid /
-    // EPERM→setpgid pre_exec path as before; Windows sets CREATE_NO_WINDOW only
-    // (DETACHED_PROCESS is intentionally omitted — it breaks stdio inheritance).
+    // Detach from the controlling terminal so children (e.g. GPG pinentry)
+    // can't open /dev/tty and corrupt the TUI display.
     xai_grok_tools::util::detach_command(&mut cmd);
 
     // Spawn the child process.
@@ -156,7 +132,7 @@ pub async fn run_command_hook(
     // the order matters: we MUST apply user/plugin `extra_env` FIRST and
     // the runner-injected vars LAST. Otherwise a user JSON hook (or a
     // plugin) can spoof `GROK_HOOK_EVENT`, `GROK_HOOK_NAME`, `GROK_SESSION_ID`,
-    // `GROK_WORKSPACE_ROOT`, or `CLAUDE_PROJECT_DIR` -- which are the
+    // `GROK_WORKSPACE_ROOT`, or `CLAUDE_PROJECT_DIR`, which are the
     // identity/event signals a hook script consumes for policy and audit.
     // See the `runner_injected_vars_override_extra_env_at_spawn`
     // regression test in `tests/integration.rs` and the rustdoc on
@@ -168,7 +144,7 @@ pub async fn run_command_hook(
         .current_dir(ctx.workspace_root)
         // 1. user/plugin extra_env first (lowest precedence).
         .envs(&spec.extra_env)
-        // 2. runner-injected vars last (highest precedence -- always win).
+        // 2. runner-injected vars last (highest precedence, always win).
         .env("GROK_HOOK_EVENT", envelope.hook_event_name.to_string())
         .env("GROK_HOOK_NAME", &spec.name)
         .env("GROK_SESSION_ID", ctx.session_id)
@@ -190,21 +166,27 @@ pub async fn run_command_hook(
         }
     };
 
-    // Write stdin and close.
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_json.as_bytes()).await;
-        drop(stdin);
-    }
-
-    // Wait with timeout.
+    // Write stdin concurrently with draining output, under the timeout: a hook
+    // that never reads stdin would otherwise block `write_all` on a full pipe
+    // buffer, outside the deadline.
+    let stdin = child.stdin.take();
     let timeout = Duration::from_millis(spec.timeout_ms);
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    let result = tokio::time::timeout(timeout, async move {
+        let write = async {
+            if let Some(mut stdin) = stdin {
+                let _ = stdin.write_all(stdin_json.as_bytes()).await;
+            }
+        };
+        let (_, output) = tokio::join!(write, child.wait_with_output());
+        output
+    })
+    .await;
 
     let elapsed = start.elapsed();
 
     match result {
         Err(_) => {
-            // Timeout — kill_on_drop handles cleanup.
+            // Timeout: kill_on_drop handles cleanup.
             (
                 HookRunnerResult::Failed(format!("timed out after {}ms", spec.timeout_ms)),
                 elapsed,
@@ -217,7 +199,6 @@ pub async fn run_command_hook(
         Ok(Ok(output)) => {
             let exit_code = output.status.code().unwrap_or(-1);
 
-            // Truncate stdout/stderr to buffer limits.
             let stdout = truncate_output(&output.stdout);
             let stderr = truncate_output(&output.stderr);
 
@@ -246,18 +227,21 @@ pub async fn run_command_hook(
                 "hook command completed"
             );
 
-            if !is_blocking {
-                if exit_code == 0 {
-                    return (HookRunnerResult::Success, elapsed);
+            match mode {
+                GateKind::Observe => {
+                    if exit_code == 0 {
+                        return (HookRunnerResult::Success, elapsed);
+                    }
+                    (
+                        HookRunnerResult::Failed(format!("exit code {exit_code}")),
+                        elapsed,
+                    )
                 }
-                return (
-                    HookRunnerResult::Failed(format!("exit code {exit_code}")),
-                    elapsed,
-                );
+                GateKind::Tool => parse_blocking_result(&stdout, exit_code, &spec.name, elapsed),
+                GateKind::Stop => {
+                    parse_stop_result(&stdout, &stderr, exit_code, &spec.name, elapsed)
+                }
             }
-
-            // Blocking hook: parse decision from stdout.
-            parse_blocking_result(&stdout, exit_code, &spec.name, elapsed)
         }
     }
 }
@@ -307,10 +291,6 @@ fn find_unresolved_env_vars(
 ) -> Vec<String> {
     let locally_assigned = find_local_shell_assignments(command_str);
     let mut out: Vec<String> = Vec::new();
-    // Delegate the byte-walking parser to the shared
-    // `iter_env_var_references` helper in `env_expand`. We only need to
-    // consider references where the user did NOT supply a parameter-
-    // expansion modifier (those explicitly handle the unset case).
     for r in crate::env_expand::iter_env_var_references(command_str) {
         if r.name.is_empty() || r.has_modifier {
             continue;
@@ -360,7 +340,6 @@ fn find_local_shell_assignments(command_str: &str) -> std::collections::HashSet<
         if idx == 0 {
             return true;
         }
-        // Walk left over whitespace.
         let mut j = idx;
         while j > 0 {
             let c = bytes[j - 1];
@@ -378,7 +357,6 @@ fn find_local_shell_assignments(command_str: &str) -> std::collections::HashSet<
             i += 1;
             continue;
         }
-        // Read the identifier.
         let start = i;
         while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
             i += 1;
@@ -387,17 +365,11 @@ fn find_local_shell_assignments(command_str: &str) -> std::collections::HashSet<
         if ident.is_empty() {
             continue;
         }
-        // VAR= (assignment): identifier must be at a statement-start
-        // boundary and immediately followed by '=' (no space).
         if i < bytes.len() && bytes[i] == b'=' && is_statement_start(start) {
             names.insert(ident.to_string());
             continue;
         }
-        // `read VAR1 VAR2 ...`: collect every whitespace-separated bare
-        // identifier following a `read` keyword on the same statement.
         if ident == "read" && is_statement_start(start) {
-            // Skip whitespace, then read identifiers until we hit a
-            // statement separator or end of string.
             while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
                 i += 1;
             }
@@ -441,68 +413,123 @@ fn parse_blocking_result(
     hook_name: &str,
     elapsed: Duration,
 ) -> (HookRunnerResult, Duration) {
-    // Try to parse JSON output first.
     let json_decision = if !stdout.trim().is_empty() {
-        serde_json::from_str::<HookOutput>(stdout.trim()).ok()
+        serde_json::from_str::<GateHookJson>(stdout.trim()).ok()
     } else {
         None
     };
 
-    // If we have valid JSON with a deny, prefer that over exit code.
-    if let Some(ref output) = json_decision {
-        if output.decision == "deny" {
-            let reason = output
-                .reason
-                .clone()
-                .unwrap_or_else(|| format!("denied by hook '{hook_name}'"));
-
-            if exit_code != DENY_EXIT_CODE && exit_code != 0 {
-                tracing::warn!(
-                    hook_name,
-                    exit_code,
-                    "JSON decision is 'deny' but exit code is not 0 or 2 — using JSON decision"
+    if let Some(output) = json_decision {
+        match gate_json_to_decision(output, hook_name) {
+            Ok(HookDecision::Deny { reason, hook_name }) => {
+                // A JSON deny is honored on any exit code (fail-safe).
+                if exit_code != GATE_EXIT_CODE && exit_code != 0 {
+                    tracing::warn!(
+                        hook_name,
+                        exit_code,
+                        "JSON decision is 'deny' but exit code is not 0 or 2 — using JSON decision"
+                    );
+                }
+                return (
+                    HookRunnerResult::Decision(HookDecision::Deny { reason, hook_name }),
+                    elapsed,
                 );
             }
-
-            return (
-                HookRunnerResult::Decision(HookDecision::Deny {
-                    reason,
-                    hook_name: hook_name.to_string(),
-                }),
-                elapsed,
-            );
-        }
-
-        if output.decision == "allow" {
-            if exit_code == DENY_EXIT_CODE {
-                tracing::warn!(
-                    hook_name,
-                    "JSON decision is 'allow' but exit code is 2 — using JSON decision"
-                );
+            Ok(HookDecision::Allow) => {
+                if exit_code == GATE_EXIT_CODE {
+                    // Exit 2 wins over a JSON allow (stdout is not
+                    // processed on exit 2); the exit-code ladder below
+                    // denies.
+                    tracing::warn!(
+                        hook_name,
+                        "JSON decision is 'allow' but exit code is 2 — denying (stdout is ignored on exit 2)"
+                    );
+                } else {
+                    return (HookRunnerResult::Decision(HookDecision::Allow), elapsed);
+                }
             }
-            return (HookRunnerResult::Decision(HookDecision::Allow), elapsed);
+            // Unknown decision value: failure so typos surface.
+            Err(err) => return (HookRunnerResult::Failed(err), elapsed),
         }
-
-        // Unknown decision value — treat as failure.
-        return (
-            HookRunnerResult::Failed(format!(
-                "unknown decision value '{}' from hook '{hook_name}'",
-                output.decision
-            )),
-            elapsed,
-        );
     }
 
-    // No valid JSON — fall back to exit code.
     match exit_code {
         0 => (HookRunnerResult::Decision(HookDecision::Allow), elapsed),
-        DENY_EXIT_CODE => (
+        GATE_EXIT_CODE => (
             HookRunnerResult::Decision(HookDecision::Deny {
-                reason: format!("denied by hook '{hook_name}' (exit code {DENY_EXIT_CODE})"),
+                reason: format!("denied by hook '{hook_name}' (exit code {GATE_EXIT_CODE})"),
                 hook_name: hook_name.to_string(),
             }),
             elapsed,
         ),
+        _ => (
+            HookRunnerResult::Failed(format!(
+                "hook '{hook_name}' failed with exit code {exit_code}"
+            )),
+            elapsed,
+        ),
+    }
+}
+
+/// Parse the result of a `Stop`/`SubagentStop` gate hook from stdout, stderr,
+/// and exit code:
+///
+/// A valid decision JSON on stdout wins over the exit code. The exit code
+/// decides only when stdout carries no usable JSON.
+///
+/// * **JSON stdout (any exit code)**: parsed as [`StopHookJson`]:
+///   `decision: "block"` (+ `reason`), `continue: false` (+ `stopReason`), and
+///   `hookSpecificOutput.additionalContext`.
+/// * **no JSON + exit 0**: plain allow-stop.
+/// * **no JSON + exit 2**: block, with stderr as the feedback fed to the model.
+/// * **no JSON + any other exit code**: failure (callers fail open: the agent
+///   stops normally).
+fn parse_stop_result(
+    stdout: &str,
+    stderr: &str,
+    exit_code: i32,
+    hook_name: &str,
+    elapsed: Duration,
+) -> (HookRunnerResult, Duration) {
+    let trimmed = stdout.trim();
+    if !trimmed.is_empty() {
+        match serde_json::from_str::<StopHookJson>(trimmed) {
+            Ok(json) => {
+                return match stop_json_to_outcome(json, hook_name) {
+                    Ok(outcome) => (HookRunnerResult::Stop(outcome), elapsed),
+                    Err(err) => (HookRunnerResult::Failed(err), elapsed),
+                };
+            }
+            Err(err) => {
+                // JSON-looking output that fails to parse is likely a broken
+                // decision; warn and fall back to the exit code.
+                if trimmed.starts_with('{') {
+                    tracing::warn!(
+                        hook_name,
+                        error = %err,
+                        "stop hook stdout looks like JSON but failed to parse; falling back to the exit code"
+                    );
+                }
+            }
+        }
+    }
+    match exit_code {
+        0 => (HookRunnerResult::Stop(StopHookOutcome::default()), elapsed),
+        GATE_EXIT_CODE => {
+            let feedback = stderr.trim();
+            let block_reason = if feedback.is_empty() {
+                format!("Blocked by stop hook '{hook_name}' (exit code {GATE_EXIT_CODE})")
+            } else {
+                feedback.to_string()
+            };
+            (
+                HookRunnerResult::Stop(StopHookOutcome {
+                    block_reason: Some(block_reason),
+                    ..Default::default()
+                }),
+                elapsed,
+            )
+        }
         _ => (
             HookRunnerResult::Failed(format!(
                 "hook '{hook_name}' failed with exit code {exit_code}"
@@ -545,179 +572,292 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_allow_json() {
-        let (result, _) =
+    fn parse_json_decision() {
+        let (allow, _) =
             parse_blocking_result(r#"{"decision":"allow"}"#, 0, "test", Duration::ZERO);
         assert!(matches!(
-            result,
+            allow,
             HookRunnerResult::Decision(HookDecision::Allow)
         ));
-    }
 
-    #[test]
-    fn parse_deny_json() {
-        let (result, _) = parse_blocking_result(
+        let (deny, _) = parse_blocking_result(
             r#"{"decision":"deny","reason":"bad command"}"#,
             2,
             "test",
             Duration::ZERO,
         );
-        match result {
+        match deny {
             HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
                 assert_eq!(reason, "bad command");
             }
             other => panic!("expected Deny, got {other:?}"),
         }
-    }
 
-    #[test]
-    fn parse_deny_json_without_reason() {
-        let (result, _) =
+        let (deny_no_reason, _) =
             parse_blocking_result(r#"{"decision":"deny"}"#, 2, "my-hook", Duration::ZERO);
-        match result {
+        match deny_no_reason {
             HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
                 assert!(reason.contains("my-hook"));
             }
             other => panic!("expected Deny, got {other:?}"),
         }
+
+        let (unknown, _) =
+            parse_blocking_result(r#"{"decision":"maybe"}"#, 0, "test", Duration::ZERO);
+        assert!(matches!(unknown, HookRunnerResult::Failed(_)));
     }
 
     #[test]
-    fn fallback_to_exit_code_zero() {
-        let (result, _) = parse_blocking_result("", 0, "test", Duration::ZERO);
-        assert!(matches!(
-            result,
-            HookRunnerResult::Decision(HookDecision::Allow)
-        ));
+    fn fallback_to_exit_code() {
+        for (stdout, code, expect_allow) in
+            [("", 0, true), ("not json at all", 0, true), ("", 2, false)]
+        {
+            let (result, _) = parse_blocking_result(stdout, code, "test", Duration::ZERO);
+            if expect_allow {
+                assert!(matches!(
+                    result,
+                    HookRunnerResult::Decision(HookDecision::Allow)
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    HookRunnerResult::Decision(HookDecision::Deny { .. })
+                ));
+            }
+        }
+        let (fail, _) = parse_blocking_result("", 1, "test", Duration::ZERO);
+        assert!(matches!(fail, HookRunnerResult::Failed(_)));
     }
 
     #[test]
-    fn fallback_to_exit_code_deny() {
-        let (result, _) = parse_blocking_result("", 2, "test", Duration::ZERO);
-        assert!(matches!(
-            result,
-            HookRunnerResult::Decision(HookDecision::Deny { .. })
-        ));
-    }
-
-    #[test]
-    fn fallback_to_exit_code_failure() {
-        let (result, _) = parse_blocking_result("", 1, "test", Duration::ZERO);
-        assert!(matches!(result, HookRunnerResult::Failed(_)));
-    }
-
-    #[test]
-    fn json_deny_overrides_exit_code_zero() {
-        // JSON says deny, exit code says success — prefer JSON deny.
-        let (result, _) = parse_blocking_result(
+    fn json_decision_vs_exit_code() {
+        let (deny, _) = parse_blocking_result(
             r#"{"decision":"deny","reason":"nope"}"#,
             0,
             "test",
             Duration::ZERO,
         );
         assert!(matches!(
-            result,
+            deny,
+            HookRunnerResult::Decision(HookDecision::Deny { .. })
+        ));
+
+        let (blocked, _) =
+            parse_blocking_result(r#"{"decision":"allow"}"#, 2, "test", Duration::ZERO);
+        assert!(matches!(
+            blocked,
             HookRunnerResult::Decision(HookDecision::Deny { .. })
         ));
     }
 
-    #[test]
-    fn invalid_json_falls_back_to_exit_code() {
-        let (result, _) = parse_blocking_result("not json at all", 0, "test", Duration::ZERO);
-        assert!(matches!(
-            result,
-            HookRunnerResult::Decision(HookDecision::Allow)
-        ));
+    fn stop_outcome(result: HookRunnerResult) -> StopHookOutcome {
+        match result {
+            HookRunnerResult::Stop(outcome) => outcome,
+            other => panic!("expected Stop outcome, got {other:?}"),
+        }
     }
 
     #[test]
-    fn unknown_decision_value() {
-        let (result, _) =
-            parse_blocking_result(r#"{"decision":"maybe"}"#, 0, "test", Duration::ZERO);
-        assert!(matches!(result, HookRunnerResult::Failed(_)));
-    }
-
-    #[test]
-    fn truncate_small_output() {
-        let small = "hello world".as_bytes();
-        let result = truncate_output(small);
-        assert_eq!(result, "hello world");
-    }
-
-    #[test]
-    fn truncate_large_output() {
-        let large = vec![b'x'; MAX_OUTPUT_BYTES + 1000];
-        let result = truncate_output(&large);
-        assert!(result.ends_with(" [truncated]"));
-        assert!(result.len() > MAX_OUTPUT_BYTES); // marker appended
-    }
-
-    #[test]
-    fn resolve_absolute_path() {
-        let spec = HookSpec {
-            name: "test".into(),
-            event: crate::event::HookEventName::PreToolUse,
-            handler_type: "command".into(),
-            configured_matcher: None,
-            matcher: None,
-            enabled: true,
-            command: Some(std::path::PathBuf::from("/usr/bin/hook")),
-            command_raw: Some("/usr/bin/hook".to_string()),
-            url: None,
-            url_raw: None,
-            timeout_ms: 5000,
-            source_dir: std::path::PathBuf::from("/some/dir"),
-            extra_env: std::collections::HashMap::new(),
-        };
+    fn stop_block_decision_with_reason() {
+        let (result, _) = parse_stop_result(
+            r#"{"decision":"block","reason":"tests are failing"}"#,
+            "",
+            0,
+            "my-stop",
+            Duration::ZERO,
+        );
+        let outcome = stop_outcome(result);
         assert_eq!(
-            resolve_command_path(&spec),
-            Some(std::path::PathBuf::from("/usr/bin/hook"))
+            outcome,
+            StopHookOutcome {
+                block_reason: Some("tests are failing".into()),
+                ..Default::default()
+            }
+        );
+
+        let (result, _) =
+            parse_stop_result(r#"{"decision":"block"}"#, "", 0, "my-stop", Duration::ZERO);
+        assert_eq!(
+            stop_outcome(result).block_reason.as_deref(),
+            Some("Blocked by stop hook 'my-stop'")
         );
     }
 
     #[test]
-    fn resolve_relative_path() {
-        let spec = HookSpec {
-            name: "test".into(),
-            event: crate::event::HookEventName::PreToolUse,
-            handler_type: "command".into(),
-            configured_matcher: None,
-            matcher: None,
-            enabled: true,
-            command: Some(std::path::PathBuf::from("bin/check.sh")),
-            command_raw: Some("bin/check.sh".to_string()),
-            url: None,
-            url_raw: None,
-            timeout_ms: 5000,
-            source_dir: std::path::PathBuf::from("/project/.opengrok/hooks"),
-            extra_env: std::collections::HashMap::new(),
-        };
+    fn stop_exit_2_blocks_with_stderr() {
+        let (result, _) =
+            parse_stop_result("", "run the test suite first\n", 2, "s", Duration::ZERO);
         assert_eq!(
-            resolve_command_path(&spec),
+            stop_outcome(result).block_reason.as_deref(),
+            Some("run the test suite first")
+        );
+
+        let (result, _) = parse_stop_result("", "", 2, "s", Duration::ZERO);
+        assert_eq!(
+            stop_outcome(result).block_reason.as_deref(),
+            Some("Blocked by stop hook 's' (exit code 2)")
+        );
+    }
+
+    #[test]
+    fn stop_stdout_json_wins_over_exit_2() {
+        let (result, _) = parse_stop_result(
+            r#"{"continue":false,"stopReason":"enough","hookSpecificOutput":{"additionalContext":"ctx"}}"#,
+            "log noise\n",
+            2,
+            "s",
+            Duration::ZERO,
+        );
+        let outcome = stop_outcome(result);
+        assert_eq!(
+            outcome
+                .force_stop
+                .as_ref()
+                .and_then(|f| f.reason.as_deref()),
+            Some("enough")
+        );
+        assert_eq!(outcome.additional_context.as_deref(), Some("ctx"));
+
+        let (result, _) = parse_stop_result("log noise\n", "blocked", 2, "s", Duration::ZERO);
+        assert_eq!(
+            stop_outcome(result).block_reason.as_deref(),
+            Some("blocked")
+        );
+    }
+
+    #[test]
+    fn stop_continue_false_prevents_continuation() {
+        let (result, _) = parse_stop_result(
+            r#"{"continue":false,"stopReason":"budget exhausted"}"#,
+            "",
+            0,
+            "s",
+            Duration::ZERO,
+        );
+        let outcome = stop_outcome(result);
+        assert_eq!(
+            outcome,
+            StopHookOutcome {
+                force_stop: Some(crate::result::StopOverride {
+                    reason: Some("budget exhausted".into()),
+                }),
+                ..Default::default()
+            }
+        );
+        let (result, _) = parse_stop_result(r#"{"continue":true}"#, "", 0, "s", Duration::ZERO);
+        assert!(stop_outcome(result).is_empty());
+    }
+
+    #[test]
+    fn stop_additional_context_captured() {
+        let (result, _) = parse_stop_result(
+            r#"{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"run the test suite before finishing"}}"#,
+            "",
+            0,
+            "s",
+            Duration::ZERO,
+        );
+        let outcome = stop_outcome(result);
+        assert_eq!(
+            outcome,
+            StopHookOutcome {
+                additional_context: Some("run the test suite before finishing".into()),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn stop_allow_failure_and_unknown_decision() {
+        let (result, _) = parse_stop_result("", "", 0, "s", Duration::ZERO);
+        assert!(stop_outcome(result).is_empty());
+
+        let (result, _) = parse_stop_result("all done!", "", 0, "s", Duration::ZERO);
+        assert!(stop_outcome(result).is_empty());
+
+        let (result, _) = parse_stop_result("", "boom", 1, "s", Duration::ZERO);
+        assert!(matches!(result, HookRunnerResult::Failed(_)));
+
+        let (result, _) = parse_stop_result(r#"{"decision":"deny"}"#, "", 0, "s", Duration::ZERO);
+        assert!(matches!(result, HookRunnerResult::Failed(_)));
+
+        // `approve` is accepted as a no-op (shared approve/block vocabulary).
+        let (result, _) =
+            parse_stop_result(r#"{"decision":"approve"}"#, "", 0, "s", Duration::ZERO);
+        assert!(stop_outcome(result).is_empty());
+    }
+
+    #[test]
+    fn stop_output_captures_all_combined_signals() {
+        let (result, _) = parse_stop_result(
+            r#"{"decision":"block","reason":"keep going","continue":false,"stopReason":"user said stop","hookSpecificOutput":{"additionalContext":"ctx"}}"#,
+            "",
+            0,
+            "s",
+            Duration::ZERO,
+        );
+        let outcome = stop_outcome(result);
+        assert_eq!(
+            outcome,
+            StopHookOutcome {
+                block_reason: Some("keep going".into()),
+                additional_context: Some("ctx".into()),
+                force_stop: Some(crate::result::StopOverride {
+                    reason: Some("user said stop".into()),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn truncate_output_respects_limit() {
+        assert_eq!(truncate_output(b"hello world"), "hello world");
+
+        let large = truncate_output(&vec![b'x'; MAX_OUTPUT_BYTES + 1000]);
+        assert!(large.ends_with(" [truncated]"));
+    }
+
+    #[test]
+    fn resolve_command_path_variants() {
+        let spec =
+            |handler: crate::config::HandlerType, command: Option<&str>, source: &str| HookSpec {
+                name: "test".into(),
+                event: crate::event::HookEventName::PreToolUse,
+                handler_type: handler,
+                configured_matcher: None,
+                matcher: None,
+                enabled: true,
+                command: command.map(std::path::PathBuf::from),
+                command_raw: command.map(str::to_string),
+                url: None,
+                url_raw: None,
+                timeout_ms: 5000,
+                source_dir: std::path::PathBuf::from(source),
+                extra_env: std::collections::HashMap::new(),
+            };
+        use crate::config::HandlerType;
+        assert_eq!(
+            resolve_command_path(&spec(
+                HandlerType::Command,
+                Some("/usr/bin/hook"),
+                "/some/dir"
+            )),
+            Some(std::path::PathBuf::from("/usr/bin/hook"))
+        );
+        assert_eq!(
+            resolve_command_path(&spec(
+                HandlerType::Command,
+                Some("bin/check.sh"),
+                "/project/.opengrok/hooks"
+            )),
             Some(std::path::PathBuf::from(
                 "/project/.opengrok/hooks/bin/check.sh"
             ))
         );
-    }
-
-    #[test]
-    fn resolve_no_command_for_http() {
-        let spec = HookSpec {
-            name: "test".into(),
-            event: crate::event::HookEventName::PreToolUse,
-            handler_type: "http".into(),
-            configured_matcher: None,
-            matcher: None,
-            enabled: true,
-            command: None,
-            command_raw: None,
-            url: Some("https://hooks.example.com/check".into()),
-            url_raw: Some("https://hooks.example.com/check".into()),
-            timeout_ms: 5000,
-            source_dir: std::path::PathBuf::from("/project"),
-            extra_env: std::collections::HashMap::new(),
-        };
-        assert_eq!(resolve_command_path(&spec), None);
+        assert_eq!(
+            resolve_command_path(&spec(HandlerType::Http, None, "/project")),
+            None
+        );
     }
 
     /// Helper to build a HookSpec that runs a shell command.
@@ -725,7 +865,7 @@ mod tests {
         HookSpec {
             name: "test-hook".into(),
             event: crate::event::HookEventName::Stop,
-            handler_type: "command".into(),
+            handler_type: crate::config::HandlerType::Command,
             configured_matcher: None,
             matcher: None,
             enabled: true,
@@ -750,8 +890,13 @@ mod tests {
             transcript_path: None,
             client_identifier: None,
             prompt_id: None,
+            permission_mode: None,
             payload: HookPayload::Stop {
                 reason: "test".into(),
+                stop_hook_active: false,
+                last_assistant_message: None,
+                background_tasks: None,
+                session_crons: None,
             },
         }
     }
@@ -761,6 +906,45 @@ mod tests {
             session_id: "test-session",
             workspace_root: "/tmp",
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn hook_times_out() {
+        let mut spec = make_shell_spec("sleep 5");
+        spec.timeout_ms = 100;
+        let envelope = make_envelope();
+        let ctx = make_ctx();
+        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
+        assert!(
+            matches!(&result, HookRunnerResult::Failed(msg) if msg.contains("timed out")),
+            "expected a timeout failure, got {result:?}"
+        );
+    }
+
+    /// Regression: a hook that never reads stdin while writing large stdout must
+    /// not deadlock, since stdin is written concurrently with draining output.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn large_envelope_with_unreading_hook_does_not_deadlock() {
+        use crate::event::HookPayload;
+        let spec = make_shell_spec("head -c 200000 /dev/zero | tr '\\0' x");
+        let mut envelope = make_envelope();
+        envelope.payload = HookPayload::Stop {
+            reason: "test".into(),
+            stop_hook_active: false,
+            // Larger than the OS pipe buffer (~64 KB) so the stdin write blocks
+            // without concurrent draining.
+            last_assistant_message: Some("x".repeat(256 * 1024)),
+            background_tasks: None,
+            session_crons: None,
+        };
+        let ctx = make_ctx();
+        let run = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe);
+        let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("hook must not deadlock on a large envelope");
+        assert!(matches!(result, HookRunnerResult::Success));
     }
 
     /// Verify that setsid() prevents hook child processes from opening
@@ -789,7 +973,7 @@ mod tests {
         let envelope = make_envelope();
         let ctx = make_ctx();
 
-        let (result, _duration) = run_command_hook(&spec, &envelope, &ctx, false).await;
+        let (result, _duration) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         assert!(
             matches!(result, HookRunnerResult::Success),
@@ -798,63 +982,19 @@ mod tests {
         );
     }
 
-    /// Regression: hook commands still execute successfully.
-    #[tokio::test]
-    async fn test_hook_basic_execution() {
-        let spec = make_shell_spec("exit 0");
-        let envelope = make_envelope();
-        let ctx = make_ctx();
-
-        let (result, _duration) = run_command_hook(&spec, &envelope, &ctx, false).await;
-
-        assert!(
-            matches!(result, HookRunnerResult::Success),
-            "hook should succeed, got {:?}",
-            result
-        );
-    }
-
-    /// Regression: blocking hooks still parse JSON decisions correctly.
     #[tokio::test]
     async fn test_hook_blocking_allow() {
         let spec = make_shell_spec(r#"echo '{"decision":"allow"}'"#);
         let envelope = make_envelope();
         let ctx = make_ctx();
 
-        let (result, _duration) = run_command_hook(&spec, &envelope, &ctx, true).await;
+        let (result, _duration) = run_command_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
 
         assert!(
             matches!(result, HookRunnerResult::Decision(HookDecision::Allow)),
             "blocking hook should return Allow, got {:?}",
             result
         );
-    }
-
-    #[test]
-    fn shell_command_detection() {
-        // Commands with shell metacharacters should be detected.
-        assert!("echo hello".contains(' ')); // space
-        assert!("a || b".contains('|')); // pipe/or
-        assert!("a && b".contains('&')); // and
-        assert!("a; b".contains(';')); // semicolon
-        assert!("a > out".contains('>')); // redirect
-        // Env-var interpolation must also force the sh -c branch so that
-        // commands like `${CLAUDE_PLUGIN_ROOT}/hooks/foo.sh` get expanded
-        // by the shell rather than treated as a literal executable path.
-        assert!("${CLAUDE_PLUGIN_ROOT}/hooks/foo.sh".contains('$'));
-        assert!("$HOME/bin/hook".contains('$'));
-
-        // Tilde at the start must also force the sh -c branch so that
-        // `~/.claude/hook.sh` gets expanded to the user's home directory
-        // rather than being joined to source_dir as a literal path.
-        assert!("~/.claude/hook.sh".starts_with('~'));
-        assert!("~/bin/hook".starts_with('~'));
-
-        // Simple executable paths should not be detected.
-        assert!(!"bin/check.sh".contains(' '));
-        assert!(!"/usr/bin/hook".contains(' '));
-        assert!(!"bin/check.sh".contains('$'));
-        assert!(!"bin/check.sh".starts_with('~'));
     }
 
     /// Regression: a hook command that uses `${VAR}` interpolation
@@ -887,7 +1027,7 @@ mod tests {
         let spec = HookSpec {
             name: "test-env-interp".into(),
             event: crate::event::HookEventName::Stop,
-            handler_type: "command".into(),
+            handler_type: crate::config::HandlerType::Command,
             configured_matcher: None,
             matcher: None,
             enabled: true,
@@ -902,7 +1042,7 @@ mod tests {
 
         let envelope = make_envelope();
         let ctx = make_ctx();
-        let (result, _) = run_command_hook(&spec, &envelope, &ctx, false).await;
+        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         assert!(
             matches!(result, HookRunnerResult::Success),
@@ -911,7 +1051,7 @@ mod tests {
         );
     }
 
-    /// `CLAUDE_PROJECT_DIR` is part of the external hook contract -- it points
+    /// `CLAUDE_PROJECT_DIR` is part of the external hook contract: it points
     /// to the workspace/project root and is set for ALL hooks (not just
     /// plugin-scoped ones). Plugin hooks frequently reference it as
     /// `"$CLAUDE_PROJECT_DIR/.claude/hooks/foo.sh"`. The runner must export
@@ -943,7 +1083,7 @@ mod tests {
         let spec = HookSpec {
             name: "test-claude-project-dir".into(),
             event: crate::event::HookEventName::Stop,
-            handler_type: "command".into(),
+            handler_type: crate::config::HandlerType::Command,
             configured_matcher: None,
             matcher: None,
             enabled: true,
@@ -963,7 +1103,7 @@ mod tests {
             session_id: "test-session",
             workspace_root: &workspace,
         };
-        let (result, _) = run_command_hook(&spec, &envelope, &ctx, false).await;
+        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         assert!(
             matches!(result, HookRunnerResult::Success),
@@ -972,63 +1112,47 @@ mod tests {
         );
     }
 
-    /// Unit tests for the `find_unresolved_env_vars` parser. We seed
-    /// `extra_env` to control what's "set" without depending on the test
-    /// process's real environment (other than excluding common vars).
+    /// `extra_env` seeds what's "set" so the test does not depend on the
+    /// process environment.
     #[test]
-    fn find_unresolved_braced_form() {
+    fn find_unresolved_detects_and_dedups() {
         let mut env = std::collections::HashMap::new();
         env.insert("KNOWN".to_string(), "x".to_string());
-        let v = find_unresolved_env_vars("${KNOWN}/${SOME_GB1183_UNSET_VAR}/foo", &env);
-        assert_eq!(v, vec!["SOME_GB1183_UNSET_VAR".to_string()]);
-    }
-
-    #[test]
-    fn find_unresolved_bare_form() {
-        let env = std::collections::HashMap::new();
-        let v = find_unresolved_env_vars("$SOME_GB1183_BARE_UNSET/foo", &env);
-        assert_eq!(v, vec!["SOME_GB1183_BARE_UNSET".to_string()]);
-    }
-
-    #[test]
-    fn find_unresolved_skips_runner_vars() {
-        let env = std::collections::HashMap::new();
-        let v = find_unresolved_env_vars(
-            "${GROK_HOOK_EVENT}/${CLAUDE_PROJECT_DIR}/${GROK_SESSION_ID}/foo",
-            &env,
+        assert_eq!(
+            find_unresolved_env_vars("${KNOWN}/${SOME_GB1183_UNSET_VAR}/foo", &env),
+            vec!["SOME_GB1183_UNSET_VAR".to_string()]
         );
-        assert!(
-            v.is_empty(),
-            "runner-set vars should never be flagged, got {v:?}"
+        assert_eq!(
+            find_unresolved_env_vars("$SOME_GB1183_BARE_UNSET/foo", &env),
+            vec!["SOME_GB1183_BARE_UNSET".to_string()]
+        );
+        assert_eq!(
+            find_unresolved_env_vars(
+                "${MISSING_GB1183_DUP} && ${MISSING_GB1183_DUP}/foo $MISSING_GB1183_DUP",
+                &env,
+            ),
+            vec!["MISSING_GB1183_DUP".to_string()]
         );
     }
 
     #[test]
-    fn find_unresolved_skips_extra_env() {
+    fn find_unresolved_skips_resolvable_vars() {
         let mut env = std::collections::HashMap::new();
         env.insert("CLAUDE_PLUGIN_ROOT".to_string(), "/plugins/foo".to_string());
-        let v = find_unresolved_env_vars("${CLAUDE_PLUGIN_ROOT}/hooks/foo.sh", &env);
-        assert!(
-            v.is_empty(),
-            "vars present in extra_env should not be flagged, got {v:?}"
-        );
-    }
-
-    #[test]
-    fn find_unresolved_dedups() {
-        let env = std::collections::HashMap::new();
         let v = find_unresolved_env_vars(
-            "${MISSING_GB1183_DUP} && ${MISSING_GB1183_DUP}/foo $MISSING_GB1183_DUP",
+            "${GROK_HOOK_EVENT}/${CLAUDE_PROJECT_DIR}/${GROK_SESSION_ID}/${CLAUDE_PLUGIN_ROOT}/foo",
             &env,
         );
-        assert_eq!(v, vec!["MISSING_GB1183_DUP".to_string()]);
+        assert!(
+            v.is_empty(),
+            "resolvable vars should not be flagged, got {v:?}"
+        );
     }
 
     #[test]
     fn find_unresolved_skips_non_var_dollars() {
         let env = std::collections::HashMap::new();
         // $1 (positional), $$ (pid), $(...) (cmd subst), $? (exit code), $#.
-        // None of these are env vars; none should be flagged.
         let v = find_unresolved_env_vars("echo $1 $$ $? $# $(date)", &env);
         assert!(
             v.is_empty(),
@@ -1037,38 +1161,16 @@ mod tests {
     }
 
     #[test]
-    fn find_unresolved_skips_locally_assigned_vars() {
+    fn find_unresolved_skips_local_assignments() {
         let env = std::collections::HashMap::new();
-        // INPUT is set locally inside the same command. The check must
-        // recognize that and not flag the subsequent ${INPUT} references.
-        let cmd = r#"INPUT=$(cat); echo "$INPUT" | grep -q foo"#;
-        let v = find_unresolved_env_vars(cmd, &env);
-        assert!(
-            v.is_empty(),
-            "locally-assigned vars must not be flagged, got {v:?}"
-        );
-    }
-
-    #[test]
-    fn find_unresolved_skips_read_assigned_vars() {
-        let env = std::collections::HashMap::new();
-        let cmd = "read -r LINE; echo $LINE";
-        let v = find_unresolved_env_vars(cmd, &env);
-        assert!(
-            v.is_empty(),
-            "vars assigned via `read` must not be flagged, got {v:?}"
-        );
-    }
-
-    #[test]
-    fn find_unresolved_skips_assignments_after_separators() {
-        let env = std::collections::HashMap::new();
-        let cmd = "echo first; X=hello && echo $X | cat";
-        let v = find_unresolved_env_vars(cmd, &env);
-        assert!(
-            v.is_empty(),
-            "assignment after `;` should be recognized, got {v:?}"
-        );
+        for cmd in [
+            r#"INPUT=$(cat); echo "$INPUT" | grep -q foo"#,
+            "read -r LINE; echo $LINE",
+            "echo first; X=hello && echo $X | cat",
+        ] {
+            let v = find_unresolved_env_vars(cmd, &env);
+            assert!(v.is_empty(), "`{cmd}` should not flag any var, got {v:?}");
+        }
     }
 
     #[test]
@@ -1110,7 +1212,7 @@ mod tests {
         let spec = HookSpec {
             name: "test-undef".into(),
             event: crate::event::HookEventName::Stop,
-            handler_type: "command".into(),
+            handler_type: crate::config::HandlerType::Command,
             configured_matcher: None,
             matcher: None,
             enabled: true,
@@ -1127,7 +1229,7 @@ mod tests {
 
         let envelope = make_envelope();
         let ctx = make_ctx();
-        let (result, _) = run_command_hook(&spec, &envelope, &ctx, false).await;
+        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         match result {
             HookRunnerResult::Failed(reason) => {
@@ -1183,7 +1285,7 @@ mod tests {
         let spec = HookSpec {
             name: "test-tilde".into(),
             event: crate::event::HookEventName::Stop,
-            handler_type: "command".into(),
+            handler_type: crate::config::HandlerType::Command,
             configured_matcher: None,
             matcher: None,
             enabled: true,
@@ -1207,12 +1309,16 @@ mod tests {
         // its child inherits it. Retry ONLY that exact transient; a real tilde-
         // routing break surfaces as a different result (127/spawn error), so the
         // assertion below keeps its diagnostic power.
-        let mut result = run_command_hook(&spec, &envelope, &ctx, false).await.0;
+        let mut result = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe)
+            .await
+            .0;
         for _ in 0..8 {
             if !matches!(&result, HookRunnerResult::Failed(msg) if msg == "exit code 126") {
                 break;
             }
-            result = run_command_hook(&spec, &envelope, &ctx, false).await.0;
+            result = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe)
+                .await
+                .0;
         }
 
         assert!(
@@ -1223,7 +1329,7 @@ mod tests {
     }
 
     /// Hooks that explicitly handle the unset case via parameter expansion
-    /// (e.g. `${VAR:-/some/default}`) must NOT be refused -- the user has
+    /// (e.g. `${VAR:-/some/default}`) must NOT be refused: the user has
     /// expressed intent for what should happen when the var is unset.
     #[tokio::test]
     async fn test_parameter_expansion_default_is_not_refused() {
@@ -1241,7 +1347,7 @@ mod tests {
         let spec = HookSpec {
             name: "test-default".into(),
             event: crate::event::HookEventName::Stop,
-            handler_type: "command".into(),
+            handler_type: crate::config::HandlerType::Command,
             configured_matcher: None,
             matcher: None,
             enabled: true,
@@ -1261,7 +1367,7 @@ mod tests {
 
         let envelope = make_envelope();
         let ctx = make_ctx();
-        let (result, _) = run_command_hook(&spec, &envelope, &ctx, false).await;
+        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         assert!(
             matches!(result, HookRunnerResult::Success),

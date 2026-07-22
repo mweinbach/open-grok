@@ -222,9 +222,9 @@ mod tests {
             persona: persona.map(String::from),
             capability_mode,
             isolation,
-            // Harness override is a /goal-only concern; these resolution tests
-            // exercise model/persona/capability precedence, not the harness.
             harness_agent_type: None,
+            completion_output_cap: None,
+            spawn_depth: None,
         }
     }
 

@@ -26,7 +26,6 @@ pub use task_completion::TaskCompletionReminder;
 pub const DEFAULT_REMINDER_TAG: &str = "system-reminder";
 
 /// Wrap plain text in `<system-reminder>` tags (default hyphen variant).
-///
 /// Input:  `"Some reminder text"`
 /// Output: `"<system-reminder>\nSome reminder text\n</system-reminder>"`
 pub fn wrap_reminder(text: &str) -> String {
@@ -55,6 +54,28 @@ pub fn format_scheduled_task_prompt(prompt: &str, task_id: &str, human_schedule:
          treat it as a fresh task to execute.\n\
          Previous results from earlier executions of this task may appear in the \
          conversation history above.\n\
+         </system-reminder>\n\
+         \n\
+         {prompt}"
+    )
+}
+
+pub fn format_loop_iteration_prompt(
+    prompt: &str,
+    task_id: &str,
+    human_schedule: &str,
+    prior_iteration_summary: Option<&str>,
+) -> String {
+    let prior = prior_iteration_summary
+        .map(|s| format!("\nYour previous iteration ended with:\n{s}\n"))
+        .unwrap_or_default();
+    format!(
+        "<system-reminder>\n\
+         Scheduled task {task_id} ({human_schedule}). Earlier iterations, if any, appear \
+         above.\n\
+         Run the task below. End with a short status: what changed or needs attention. \
+         The status is relayed to the main agent.\n\
+         {prior}\
          </system-reminder>\n\
          \n\
          {prompt}"
@@ -133,6 +154,30 @@ mod tests {
             "must not add <user_query> — shell does that"
         );
         assert!(out.ends_with("do stuff"));
+    }
+
+    #[test]
+    fn format_loop_iteration_prompt_frames_subagent_iteration() {
+        let out = format_loop_iteration_prompt("check ci", "task-9", "every 5 minutes", None);
+        assert!(out.starts_with("<system-reminder>"));
+        assert!(out.contains("task task-9"));
+        assert!(out.contains("every 5 minutes"));
+        assert!(out.contains("short status"));
+        assert!(out.ends_with("check ci"));
+        assert!(
+            !out.contains("previous iteration"),
+            "no prior-output note without a summary"
+        );
+
+        let with_prior = format_loop_iteration_prompt(
+            "check ci",
+            "task-9",
+            "every 5 minutes",
+            Some("ci was green"),
+        );
+        assert!(with_prior.contains("previous iteration"));
+        assert!(with_prior.contains("ci was green"));
+        assert!(with_prior.ends_with("check ci"));
     }
 
     #[test]

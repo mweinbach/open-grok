@@ -188,7 +188,8 @@ fn session_created_sets_session_id() {
     );
     assert_eq!(effects.len(), 7);
     assert!(
-        matches!(& effects[0], Effect::FetchPromptHistory { session_id, .. } if
+        matches!(& effects[0], Effect::FetchPromptHistory { session_id, .. }
+if
         session_id == "new-session-123")
     );
     assert!(matches!(&effects[1], Effect::FetchSessionAgentName { .. }));
@@ -575,7 +576,8 @@ fn worktree_session_created_drains_queued_prompts() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::SendPrompt { text, .. } if text ==
+            .any(|e| matches!(e, Effect::SendPrompt { text, .. }
+if text ==
         "hello"))
     );
     assert!(
@@ -609,7 +611,8 @@ fn session_created_drains_queued_prompts() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::SendPrompt { text, .. } if text ==
+            .any(|e| matches!(e, Effect::SendPrompt { text, .. }
+if text ==
         "queued msg"))
     );
     assert!(
@@ -978,7 +981,8 @@ fn deferred_model_switch_applied_on_session_created() {
         effects
             .iter()
             .any(|e| matches!(e, Effect::SwitchModel { agent_id : a_id,
-        session_id : s_id, model_id : m_id, .. } if * a_id == id && * s_id == session_id
+        session_id : s_id, model_id : m_id, .. }
+if * a_id == id && * s_id == session_id
         && * m_id == model_id))
     );
 }
@@ -1017,7 +1021,8 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
         effects
             .iter()
             .any(|e| matches!(e, Effect::SwitchModel { agent_id : a_id,
-        session_id : s_id, model_id : m_id, .. } if * a_id == id && * s_id == session_id
+        session_id : s_id, model_id : m_id, .. }
+if * a_id == id && * s_id == session_id
         && * m_id == model_id))
     );
 }
@@ -1317,7 +1322,8 @@ fn deferred_worktree_ref_replays_through_gate() {
         effects
             .iter()
             .any(|e| matches!(e, Effect::CreateWorktreeSession { git_ref :
-        Some(r), .. } if r == "feature-branch")),
+        Some(r), .. }
+if r == "feature-branch")),
         "the deferred --worktree <ref> replays with its git ref",
     );
     assert!(
@@ -1378,7 +1384,8 @@ fn gated_worktree_without_load_id_preserves_stashed_resume() {
         effects
             .iter()
             .any(|e| matches!(e, Effect::CreateWorktreeSession {
-        load_session_id : Some(id), .. } if id == "resume-me")),
+        load_session_id : Some(id), .. }
+if id == "resume-me")),
         "the deferred worktree replays with the preserved resume id",
     );
     assert!(app.deferred_startup.session.is_none());
@@ -1450,7 +1457,8 @@ fn gated_worktree_with_none_companions_preserves_stashed_label_and_ref() {
         effects
             .iter()
             .any(|e| matches!(e, Effect::CreateWorktreeSession {
-        load_session_id : Some(id), label : Some(l), git_ref : Some(r), .. } if id ==
+        load_session_id : Some(id), label : Some(l), git_ref : Some(r), .. }
+if id ==
         "mysess" && l == "mylabel" && r == "featbranch")),
         "the deferred worktree replays with the preserved id, label, and ref",
     );
@@ -1564,7 +1572,8 @@ fn auth_complete_retries_stashed_prompt_after_mid_session_login() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::SendPrompt { text, .. } if text ==
+            .any(|e| matches!(e, Effect::SendPrompt { text, .. }
+if text ==
         "retry me")),
         "the stashed prompt must be auto-resubmitted, got: {effects:?}"
     );
@@ -1757,13 +1766,15 @@ async fn project_selected_creates_session_and_sends_prompt() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::SetWorkingDir { path } if path == &
+            .any(|e| matches!(e, Effect::SetWorkingDir { path }
+if path == &
         selected))
     );
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::CreateSession { cwd, .. } if cwd ==
+            .any(|e| matches!(e, Effect::CreateSession { cwd, .. }
+if cwd ==
         & selected))
     );
     assert_eq!(app.agents[&id].session.queue_len(), 1);
@@ -1990,7 +2001,8 @@ fn set_plan_mode_on_from_off_emits_set_session_mode() {
     );
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(& effects[0], Effect::SetSessionMode { mode_id, .. } if &* mode_id.0 ==
+        matches!(& effects[0], Effect::SetSessionMode { mode_id, .. }
+if &* mode_id.0 ==
         "plan"),
         "expected SetSessionMode(plan), got: {effects:?}"
     );

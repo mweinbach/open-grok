@@ -269,11 +269,18 @@ impl AgentView {
         false
     }
 
-    /// Copy text to clipboard and show the result toast.
-    pub fn copy_to_clipboard(&mut self, text: &str) -> crate::clipboard::ClipboardDelivery {
-        let result = crate::clipboard::copy_text(text);
-        self.show_toast_ticks(result.message, result.ticks);
-        result.delivery
+    /// Copy text to clipboard (a backup file is always written too — see
+    /// `copy_text_or_file`) and show the result toast.
+    ///
+    /// When every trusted clipboard backend fails (common on Apple Terminal
+    /// over SSH), the toast points at the backup file
+    /// (`~/.grok/last-copy.txt`, or `GROK_COPY_FILE`) instead. The returned
+    /// [`CopyDelivery`](crate::clipboard::CopyDelivery) tells callers where
+    /// the copy actually landed (clipboard, backup file, or nowhere).
+    pub fn copy_to_clipboard(&mut self, text: &str) -> crate::clipboard::CopyDelivery {
+        let delivery = crate::clipboard::copy_text_or_file(text);
+        self.show_toast_ticks(delivery.toast_message().as_ref(), delivery.toast_ticks());
+        delivery
     }
 
     /// Like [`copy_to_clipboard`] but debounces the toast to prevent
@@ -284,8 +291,8 @@ impl AgentView {
             .last_clipboard_toast_at
             .is_some_and(|t| now.duration_since(t).as_millis() < CLIPBOARD_TOAST_DEBOUNCE_MS);
         if too_soon {
-            // Still copy, just skip the toast.
-            let _ = crate::clipboard::copy_text(text);
+            // Still deliver (clipboard or file fallback), just skip the toast.
+            let _ = crate::clipboard::copy_text_or_file(text);
             return;
         }
         self.last_clipboard_toast_at = Some(now);

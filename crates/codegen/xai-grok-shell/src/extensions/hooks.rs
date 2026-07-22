@@ -88,8 +88,7 @@ pub struct ClientHookGroup {
     /// `None` (wire `null`, `""`, or `"*"`) matches every tool.
     pub matcher: Option<HookMatcher>,
     pub callback_ids: Vec<String>,
-    /// Per-group reply deadline for the `PreToolUse` gate (wire value in seconds). `None`
-    /// falls back to the default gate timeout.
+    /// Per-group gate reply deadline (wire seconds); `None` uses the default.
     pub timeout: Option<std::time::Duration>,
 }
 
@@ -107,12 +106,24 @@ pub(crate) struct ClientHookDispatch<'a> {
     pub envelope: &'a HookEventEnvelope,
 }
 
-/// Only `Deny` blocks the tool; every other value proceeds (fail-open).
+pub(crate) const ADVERTISED_BLOCKING_EVENTS: &[xai_grok_hooks::event::HookEventName] = &[
+    xai_grok_hooks::event::HookEventName::PreToolUse,
+    xai_grok_hooks::event::HookEventName::Stop,
+    xai_grok_hooks::event::HookEventName::SubagentStop,
+];
+
+pub(crate) const ADVERTISED_DECISIONS: &[&str] = &["deny", "block"];
+
+pub(crate) const ADVERTISED_STOP_SIGNALS: &[&str] =
+    &["continue", "stopReason", "additionalContext"];
+
+/// Only `Deny` blocks; every other value proceeds (fail-open).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClientHookDecision {
     #[default]
     Continue,
+    #[serde(alias = "block")]
     Deny,
     #[serde(other)]
     Other,
@@ -125,9 +136,14 @@ pub(crate) enum ClientHookDecision {
 pub(crate) struct ClientHookResponse {
     #[serde(default)]
     pub decision: ClientHookDecision,
-    /// Deny reason surfaced to the model/user; consumed only when `decision` is `Deny`.
-    #[serde(default)]
+    #[serde(default, alias = "reason")]
     pub system_message: Option<String>,
+    #[serde(default, rename = "continue")]
+    pub continue_: Option<bool>,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub additional_context: Option<String>,
 }
 
 /// Parse client hooks from `session/new` `_meta["x.ai/hooks"]`, shaped
@@ -199,7 +215,7 @@ fn parse_hook_group(event: HookEventName, value: &serde_json::Value) -> Option<C
     }
     // Drop a non-finite/non-positive timeout (fall back to the default gate timeout) and
     // cap it so a client can't make a tool hang on the gate for an unbounded time.
-    const MAX_HOOK_TIMEOUT_SECS: f64 = 300.0;
+    const MAX_HOOK_TIMEOUT_SECS: f64 = 600.0;
     let timeout = group
         .timeout
         .filter(|s| s.is_finite() && *s > 0.0)
@@ -208,6 +224,14 @@ fn parse_hook_group(event: HookEventName, value: &serde_json::Value) -> Option<C
         // Match-all tokens map to no matcher (group always fires). `HookMatcher::new`
         // also treats these as match-all; short-circuiting here keeps the intent explicit.
         None | Some("") | Some("*") => None,
+        // Same policy as file hooks (`MatcherPolicy::Ignored`): warn and drop
+        // the matcher rather than let the registration appear scoped.
+        Some(pattern)
+            if event.traits().matcher == xai_grok_hooks::event::MatcherPolicy::Ignored =>
+        {
+            tracing::warn!(%event, pattern, "matcher on a {event} hook group is ignored (this event always fires)");
+            None
+        }
         Some(pattern) => match HookMatcher::new(pattern) {
             Ok(matcher) => Some(matcher),
             Err(err) => {
@@ -268,7 +292,7 @@ mod tests {
         HookSpec {
             name: "test:pre_tool_use[0].hooks[0]".to_string(),
             event: HookEventName::PreToolUse,
-            handler_type: "command".to_string(),
+            handler_type: xai_grok_hooks::config::HandlerType::Command,
             configured_matcher: None,
             matcher: None,
             enabled: true,
@@ -380,7 +404,7 @@ mod tests {
         assert_eq!(groups[0].timeout, Some(std::time::Duration::from_secs(5)));
         assert_eq!(groups[1].timeout, None); // non-positive -> default
         assert_eq!(groups[2].timeout, None); // absent -> default
-        assert_eq!(groups[3].timeout, Some(std::time::Duration::from_secs(300))); // capped
+        assert_eq!(groups[3].timeout, Some(std::time::Duration::from_secs(600))); // capped
     }
 
     /// A registration under the `SubagentEnd` alias must land on the canonical
@@ -435,6 +459,66 @@ mod tests {
             ClientHookResponse::default().decision,
             ClientHookDecision::Continue
         );
+
+        let stop: ClientHookResponse = serde_json::from_str(
+            r#"{"continue":false,"stopReason":"budget","additionalContext":"ctx"}"#,
+        )
+        .unwrap();
+        assert_eq!(stop.decision, ClientHookDecision::Continue);
+        assert_eq!(stop.continue_, Some(false));
+        assert_eq!(stop.stop_reason.as_deref(), Some("budget"));
+        assert_eq!(stop.additional_context.as_deref(), Some("ctx"));
+
+        // Literal stop-hook output parses on the raw wire: `block` aliases
+        // `deny` and `reason` aliases `systemMessage`.
+        let blocked: ClientHookResponse =
+            serde_json::from_str(r#"{"decision":"block","reason":"run the tests"}"#).unwrap();
+        assert_eq!(blocked.decision, ClientHookDecision::Deny);
+        assert_eq!(blocked.system_message.as_deref(), Some("run the tests"));
+    }
+
+    #[test]
+    fn advertised_blocking_events_are_gates() {
+        use xai_grok_hooks::event::GateKind;
+        for event in ADVERTISED_BLOCKING_EVENTS {
+            assert_ne!(
+                event.traits().gate,
+                GateKind::Observe,
+                "advertised blocking event {event:?} has no decision gate"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_capabilities_match_response_parser() {
+        for decision in ADVERTISED_DECISIONS {
+            let parsed: ClientHookDecision =
+                serde_json::from_value(serde_json::json!(decision)).unwrap();
+            assert_eq!(
+                parsed,
+                ClientHookDecision::Deny,
+                "advertised decision {decision:?} must parse as a blocking decision"
+            );
+        }
+
+        let signal_values = serde_json::json!({
+            "continue": false,
+            "stopReason": "r",
+            "additionalContext": "c",
+        });
+        for signal in ADVERTISED_STOP_SIGNALS {
+            let response: ClientHookResponse = serde_json::from_value(
+                serde_json::json!({ *signal: signal_values[*signal].clone() }),
+            )
+            .unwrap();
+            let captured = match *signal {
+                "continue" => response.continue_ == Some(false),
+                "stopReason" => response.stop_reason.as_deref() == Some("r"),
+                "additionalContext" => response.additional_context.as_deref() == Some("c"),
+                other => panic!("unknown advertised stop signal {other:?}"),
+            };
+            assert!(captured, "advertised stop signal {signal:?} was not parsed");
+        }
     }
 
     /// The callback id sits beside the flattened envelope (camelCase keys,
@@ -452,12 +536,12 @@ mod tests {
             transcript_path: None,
             client_identifier: None,
             prompt_id: None,
+            permission_mode: Some("default".into()),
             payload: HookPayload::PreToolUse {
                 tool_name: "run_terminal_command".into(),
                 tool_use_id: "call_1".into(),
                 tool_input: serde_json::json!({ "command": "ls" }),
                 tool_input_truncated: true,
-                permission_mode: None,
                 subagent_type: None,
             },
         };
@@ -474,5 +558,6 @@ mod tests {
         assert_eq!(value["toolName"], "run_terminal_command");
         assert_eq!(value["toolInput"]["command"], "ls");
         assert_eq!(value["toolInputTruncated"], true);
+        assert_eq!(value["permissionMode"], "default");
     }
 }

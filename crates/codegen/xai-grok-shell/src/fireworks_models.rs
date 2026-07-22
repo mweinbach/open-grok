@@ -152,6 +152,7 @@ fn curated_model_entry(
         info,
         api_key: None,
         env_key: Some(EnvKeys::single(FIREWORKS_API_KEY_ENV)),
+        auth_provider: None,
         api_base_url: None,
     }
 }

@@ -30,6 +30,13 @@ fn grok_home_override_path_helpers() {
         "$OPENGROK_HOME/memory/MEMORY.md"
     );
 
+    // Copy-toast paths follow the same abbreviation convention, so a custom
+    // $OPENGROK_HOME outside $HOME still displays short.
+    assert_eq!(
+        xai_grok_pager::clipboard::display_copy_path(&grok_home.join("last-copy.txt")),
+        "$OPENGROK_HOME/last-copy.txt"
+    );
+
     assert!(xai_grok_pager::util::is_under_user_grok_home(&memory_path));
     assert!(!xai_grok_pager::util::is_under_user_grok_home(
         PathBuf::from("/tmp/other").as_path()

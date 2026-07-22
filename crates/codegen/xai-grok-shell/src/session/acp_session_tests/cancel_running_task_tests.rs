@@ -115,7 +115,7 @@ fn persist_ack_waits_for_disk_flush_before_success() {
             let actor = Arc::new(SessionActor {
                 session_info,
                 auth_method_id: test_auth_method_id("test-auth"),
-                model_auth_facts: std::cell::RefCell::new(None),
+                model_auth_memo: std::cell::RefCell::new(None),
                 attribution_callback: None,
                 auth_manager: None,
                 state: TokioMutex::new(State {
@@ -293,7 +293,6 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
-                subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
                 subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
                 workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
@@ -583,7 +582,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
             let actor = Arc::new(SessionActor {
                 session_info: session_info.clone(),
                 auth_method_id: test_auth_method_id("test-auth"),
-                model_auth_facts: std::cell::RefCell::new(None),
+                model_auth_memo: std::cell::RefCell::new(None),
                 attribution_callback: None,
                 auth_manager: None,
                 state: TokioMutex::new(State {
@@ -764,7 +763,6 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
-                subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
                 subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
                 workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
@@ -866,7 +864,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     cwd: cwd.as_str().to_string(),
                 },
                 auth_method_id: test_auth_method_id("test-auth"),
-                model_auth_facts: std::cell::RefCell::new(None),
+                model_auth_memo: std::cell::RefCell::new(None),
                 attribution_callback: None,
                 auth_manager: None,
                 state,
@@ -1061,7 +1059,6 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
-                subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
                 subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
                 workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
@@ -2109,7 +2106,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     cwd: cwd.as_str().to_string(),
                 },
                 auth_method_id: test_auth_method_id("test-auth"),
-                model_auth_facts: std::cell::RefCell::new(None),
+                model_auth_memo: std::cell::RefCell::new(None),
                 attribution_callback: None,
                 auth_manager: None,
                 state,
@@ -2304,7 +2301,6 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
-                subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
                 subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
                 workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
@@ -2374,10 +2370,11 @@ async fn skill_reminder_deferred_while_turn_running_flushed_when_idle() {
             .iter()
             .filter(|item| {
                 matches!(
-                    item, ConversationItem::User(u) if u.content.iter().any(| p |
-                    matches!(p, xai_grok_sampling_types::ContentPart::Text { text } if
-                    text.contains("pdf-tools")))
-                )
+                                    item, ConversationItem::User(u) if u.content.iter().any(| p |
+                                    matches!(p, xai_grok_sampling_types::ContentPart::Text { text }
+                if
+                                    text.contains("pdf-tools")))
+                                )
             })
             .count()
     }

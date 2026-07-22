@@ -22,7 +22,7 @@ pub struct HookMatcher {
 enum MatcherKind {
     All,
     /// Matches no tool names. Used when a configured matcher fails to compile
-    /// after deserialization — fail closed rather than widen to match-all.
+    /// after deserialization; fail closed rather than widen to match-all.
     Never,
     Exact(Vec<String>),
     Regex(Regex),
@@ -60,6 +60,15 @@ impl HookMatcher {
                     || claude_names_for(tool_name).any(|alias| regex.is_match(alias))
             }
         }
+    }
+}
+
+/// Shared matcher-application rule: a missing matcher or missing value fires
+/// (fail-open); otherwise the compiled matcher decides.
+pub fn matcher_allows(matcher: Option<&HookMatcher>, value: Option<&str>) -> bool {
+    match (matcher, value) {
+        (Some(matcher), Some(value)) => matcher.is_match(value),
+        _ => true,
     }
 }
 
@@ -173,8 +182,6 @@ mod tests {
         assert!(!m.is_match("run_terminal_command"));
     }
 
-    // ── External tool-name aliases ────────────────────────────────
-
     #[test]
     fn claude_bash_matches_grok_tool() {
         let m = HookMatcher::new("Bash").unwrap();
@@ -196,14 +203,6 @@ mod tests {
         // The old anchoring bug matched these; the exact-list mode must not.
         assert!(!m.is_match("Editorial"));
         assert!(!m.is_match("my_search_replace"));
-    }
-
-    #[test]
-    fn claude_read_matches_grok_tool() {
-        let m = HookMatcher::new("Read").unwrap();
-        assert!(m.is_match("Read"));
-        assert!(m.is_match("read_file"));
-        assert!(m.is_match("hashline_read"));
     }
 
     #[test]

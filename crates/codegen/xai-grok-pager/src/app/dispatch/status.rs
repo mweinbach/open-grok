@@ -467,8 +467,8 @@ pub(super) fn dispatch_copy_session_id(app: &mut AppView, index: usize) -> Vec<E
                 .map(|e| e.id.clone())
         });
     if let Some(id) = id {
-        let r = crate::clipboard::copy_text(&id);
-        app.show_toast(r.message);
+        let delivery = crate::clipboard::copy_text_or_file(&id);
+        app.show_toast(delivery.toast_message().as_ref());
     }
     vec![]
 }

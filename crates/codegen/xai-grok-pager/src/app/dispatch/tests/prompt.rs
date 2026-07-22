@@ -560,7 +560,8 @@ fn send_prompt_produces_effect_and_clears_input() {
 
     // Prompt is enqueued and immediately drained (agent was idle).
     assert_eq!(effects.len(), 1);
-    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "hello"));
+    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. }
+if text == "hello"));
     assert!(app.agents[&id].prompt.text().is_empty());
     assert!(app.agents[&id].session.state.is_turn_running());
     assert_eq!(app.agents[&id].scrollback.len(), 1);
@@ -780,7 +781,8 @@ fn chip_submit_while_enqueued_clears_follow_up_chips() {
     assert!(
         !effects
             .iter()
-            .any(|e| matches!(e, Effect::SendPrompt { text, .. } if text == "Summarize")),
+            .any(|e| matches!(e, Effect::SendPrompt { text, .. }
+if text == "Summarize")),
         "chip must be enqueued, not immediate-sent, got {effects:?}"
     );
     // The chips are cleared on the enqueue path too (the bug fix).
@@ -1005,7 +1007,8 @@ fn multiple_queued_prompts_drain_one_per_turn() {
 
     // Turn end → drain "b" + FetchBilling.
     let effects = dispatch(end_turn(), &mut app);
-    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "b"));
+    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. }
+if text == "b"));
     assert!(matches!(
         &effects[1],
         Effect::FetchBilling { silent: true, .. }
@@ -1014,7 +1017,8 @@ fn multiple_queued_prompts_drain_one_per_turn() {
 
     // Turn end → drain "c" + FetchBilling.
     let effects = dispatch(end_turn(), &mut app);
-    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "c"));
+    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. }
+if text == "c"));
     assert!(matches!(
         &effects[1],
         Effect::FetchBilling { silent: true, .. }
@@ -1851,7 +1855,8 @@ fn cancel_with_queued_prompt_drains_on_completion() {
     );
 
     assert_eq!(effects.len(), 2);
-    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "queued"));
+    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. }
+if text == "queued"));
     assert!(matches!(
         &effects[1],
         Effect::FetchBilling { silent: true, .. }
@@ -1933,7 +1938,8 @@ fn cancel_with_multiple_queued_prompts_drains_only_front_prompt() {
     );
 
     assert_eq!(effects.len(), 2);
-    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "queued-1"));
+    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. }
+if text == "queued-1"));
     assert!(matches!(
         &effects[1],
         Effect::FetchBilling { silent: true, .. }
@@ -2198,7 +2204,8 @@ fn slash_unknown_command_passthrough_enqueues_prompt() {
     let effects = dispatch(Action::SendPrompt("/unknown-cmd arg1".into()), &mut app);
     // Unknown slash command → PassThrough → enqueue as prompt.
     assert_eq!(effects.len(), 1);
-    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "/unknown-cmd arg1"));
+    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. }
+if text == "/unknown-cmd arg1"));
     assert!(app.agents[&id].prompt.text().is_empty());
 }
 
@@ -2210,7 +2217,8 @@ fn non_slash_prompt_still_works() {
 
     let effects = dispatch(Action::SendPrompt("hello world".into()), &mut app);
     assert_eq!(effects.len(), 1);
-    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "hello world"));
+    assert!(matches!(&effects[0], Effect::SendPrompt { text, .. }
+if text == "hello world"));
     assert!(app.agents[&id].prompt.text().is_empty());
 }
 

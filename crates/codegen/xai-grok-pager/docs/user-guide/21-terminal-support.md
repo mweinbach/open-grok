@@ -92,6 +92,8 @@ Open Grok writes to the clipboard through up to three routes, shown in the **Cli
 
 **Linux Wayland**: on compositors that support the data-control protocol (GNOME 48+, KDE, Sway, Hyprland — the **Clipboard** section shows `data-control on`; the line is omitted off Wayland) copies work even if the terminal loses focus mid-copy. On older compositors (GNOME 46/47), keep the terminal focused until the copy toast confirms, and install the `wl-clipboard` package (provides `wl-copy`) for the most reliable route — Open Grok shows a startup warning when this applies. If data-control misbehaves on your compositor, set `GROK_CLIPBOARD_NO_DATA_CONTROL=1` to stop Open Grok from speaking that protocol entirely — copies then go through the CLI tools (`wl-copy`/`xclip`).
 
+**OSC 52 kill switch**: Grok emits OSC 52 on every Linux copy (and over SSH/tmux/containers). Terminals that do not implement OSC 52 may paint the base64 payload as visible garbage (for example some VNC/X11 clients such as OpenText Exceed). Set `GROK_CLIPBOARD_NO_OSC52=1` before starting Grok to force the OSC 52 leg off; `/terminal-setup` then shows `osc 52 off`. Native and tmux clipboard legs are unchanged.
+
 **Linux X11 selections**: X11 **PRIMARY** and **CLIPBOARD** are separate. Selecting text usually fills PRIMARY; an explicit Copy action fills CLIPBOARD. In Grok:
 
 - An unmodified middle click reads PRIMARY only when `DISPLAY` is non-empty. Pure X11 can fall back to the native arboard reader. XWayland must have `xclip` or `xsel` on `PATH`; Grok deliberately disables the arboard fallback there so it cannot substitute Wayland PRIMARY.
@@ -103,9 +105,9 @@ Open Grok writes to the clipboard through up to three routes, shown in the **Cli
 **Unknown terminals over SSH**: when Open Grok cannot identify the outer terminal, it sends the copy but reports delivery as unverified. If paste fails, reconnect with `open-grok wrap <ssh command>` or use `/minimal`.
 
 **Known limitation — Apple Terminal + SSH**:
-Apple Terminal ignores OSC 52, so copying from a Grok session over SSH can't reach your local clipboard. Use the workaround below.
+Apple Terminal ignores OSC 52, so copying from a Grok session over SSH can't reach your local clipboard. Grok writes every in-app copy to a backup file (`~/.opengrok/last-copy.txt`, override with `GROK_COPY_FILE`) and the toast names the path — so you can `cat`/`scp` it. You can also target a file explicitly with `/copy out.txt` or `/copy 2 ~/reply.md`. For native drag-select copy (terminal selection → local clipboard), turn mouse capture off with `/toggle-mouse-reporting` (opt-in feature) or run `open-grok --minimal`.
 
-**Temporary workaround**: Use `open-grok wrap ssh` instead of plain `ssh` (for example, `open-grok wrap ssh user@host`). It runs the command in a local PTY that intercepts OSC 52 sequences, including tmux-wrapped ones, and writes their contents to your local clipboard. The same command wraps anything else whose clipboard can't reach you — for example `open-grok wrap docker exec -it <container> bash` or `open-grok wrap kubectl exec -it <pod> -- bash`.
+**Optional workaround for live clipboard**: Use `open-grok wrap ssh` instead of plain `ssh` (for example, `open-grok wrap ssh user@host`). It runs the command in a local PTY that intercepts OSC 52 sequences, including tmux-wrapped ones, and writes their contents to your local clipboard. The same command wraps anything else whose clipboard can't reach you — for example `open-grok wrap docker exec -it <container> bash` or `open-grok wrap kubectl exec -it <pod> -- bash`.
 
 `open-grok wrap` also protects your local terminal from dirty disconnects: if the wrapped command dies while a remote TUI has mouse reporting, the alternate screen, or similar modes enabled (for example the SSH connection drops mid-session), wrap resets those modes on exit instead of leaving the terminal spraying mouse escape codes.
 

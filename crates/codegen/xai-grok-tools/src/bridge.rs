@@ -543,6 +543,31 @@ impl ToolBridge {
         }
     }
 
+    /// Snapshot the session's scheduled tasks; empty when no scheduler is
+    /// registered or the actor has stopped.
+    pub async fn list_scheduled_tasks(
+        &self,
+    ) -> Vec<crate::implementations::grok_build::scheduler::types::ScheduledTask> {
+        use crate::implementations::grok_build::scheduler::types::{
+            SchedulerCommand, SchedulerHandle,
+        };
+        let sender = {
+            let res = self.registry.resources.lock().await;
+            match res.get::<SchedulerHandle>() {
+                Some(handle) => handle.0.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if sender
+            .send(SchedulerCommand::List { reply: reply_tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.await.unwrap_or_default()
+    }
+
     pub async fn delete_scheduled_task(
         &self,
         task_id: &str,

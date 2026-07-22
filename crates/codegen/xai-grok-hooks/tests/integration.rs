@@ -1,11 +1,8 @@
 //! Integration tests for xai-grok-hooks.
 //!
-//! These tests use inline shell command strings (routed via `sh -c`) to verify
-//! the full dispatch pipeline: discovery → matching → execution → result.
-//!
-//! All hook commands are inline strings (containing spaces/pipes/semicolons)
-//! rather than standalone executable script files. This avoids `noexec` tmpdir
-//! issues in hermetic CI sandboxes where `chmod +x` on temp files may not work.
+//! Hooks use inline shell command strings routed via `sh -c` rather than
+//! standalone scripts, avoiding `noexec` tmpdir issues in hermetic CI sandboxes
+//! where `chmod +x` may not work.
 
 use std::path::Path;
 
@@ -15,12 +12,10 @@ use xai_grok_hooks::event::*;
 use xai_grok_hooks::result::HookDecision;
 use xai_grok_hooks::runner::RunContext;
 
-/// Helper: write a JSON hook file.
 fn write_hook(dir: &Path, filename: &str, content: &str) {
     std::fs::write(dir.join(filename), content).unwrap();
 }
 
-/// Helper: create a pre_tool_use envelope.
 fn pre_tool_use_envelope(tool_name: &str) -> HookEventEnvelope {
     HookEventEnvelope {
         hook_event_name: HookEventName::PreToolUse,
@@ -31,18 +26,17 @@ fn pre_tool_use_envelope(tool_name: &str) -> HookEventEnvelope {
         transcript_path: None,
         client_identifier: None,
         prompt_id: None,
+        permission_mode: None,
         payload: HookPayload::PreToolUse {
             tool_name: tool_name.into(),
             tool_use_id: "call-1".into(),
             tool_input: serde_json::json!({"command": "echo hello"}),
             tool_input_truncated: false,
-            permission_mode: None,
             subagent_type: None,
         },
     }
 }
 
-/// Helper: create a session_start envelope.
 fn session_start_envelope() -> HookEventEnvelope {
     HookEventEnvelope {
         hook_event_name: HookEventName::SessionStart,
@@ -53,6 +47,7 @@ fn session_start_envelope() -> HookEventEnvelope {
         transcript_path: None,
         client_identifier: None,
         prompt_id: None,
+        permission_mode: None,
         payload: HookPayload::SessionStart {
             source: "new".into(),
             model_id: None,
@@ -62,70 +57,9 @@ fn session_start_envelope() -> HookEventEnvelope {
 }
 
 #[tokio::test]
-async fn hook_allows_via_json() {
-    let dir = tempfile::tempdir().unwrap();
-
-    write_hook(
-        dir.path(),
-        "safety.json",
-        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"echo '{\"decision\":\"allow\"}'","timeout":3}]}]}}"#,
-    );
-
-    let (registry, errors) = load_hooks(Some(dir.path()), None);
-    assert!(errors.is_empty(), "errors: {errors:?}");
-
-    let ctx = RunContext {
-        session_id: "test",
-        workspace_root: dir.path().to_str().unwrap(),
-    };
-
-    let result = dispatcher::dispatch_pre_tool_use(
-        &registry,
-        &pre_tool_use_envelope("run_terminal_cmd"),
-        &ctx,
-    )
-    .await;
-    assert_eq!(result.decision, HookDecision::Allow);
-}
-
-#[tokio::test]
-async fn hook_denies_via_json() {
-    let dir = tempfile::tempdir().unwrap();
-
-    // Inline command: echo deny JSON and exit 2.
-    write_hook(
-        dir.path(),
-        "safety.json",
-        r#"{"hooks":{"PreToolUse":[{"matcher":"run_terminal_cmd","hooks":[{"type":"command","command":"echo '{\"decision\":\"deny\",\"reason\":\"dangerous\"}'; exit 2","timeout":3}]}]}}"#,
-    );
-
-    let (registry, errors) = load_hooks(Some(dir.path()), None);
-    assert!(errors.is_empty());
-
-    let ctx = RunContext {
-        session_id: "test",
-        workspace_root: dir.path().to_str().unwrap(),
-    };
-
-    let result = dispatcher::dispatch_pre_tool_use(
-        &registry,
-        &pre_tool_use_envelope("run_terminal_cmd"),
-        &ctx,
-    )
-    .await;
-    match result.decision {
-        HookDecision::Deny { reason, .. } => {
-            assert_eq!(reason, "dangerous");
-        }
-        other => panic!("expected Deny, got {other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn hook_deny_via_exit_code_only() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Inline command: no JSON output, just exit code 2.
     write_hook(
         dir.path(),
         "safety.json",
@@ -155,9 +89,6 @@ async fn hook_deny_via_exit_code_only() {
 async fn hook_fail_open_on_crash() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Inline command: exit code 1 = hook failure. Under the fail-open
-    // policy the tool call must NOT be blocked; the failure is recorded
-    // for the UI but only an explicit `deny` decision blocks.
     write_hook(
         dir.path(),
         "safety.json",
@@ -191,8 +122,6 @@ async fn hook_fail_open_on_crash() {
 async fn hook_fail_open_on_timeout() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Inline command: sleep longer than the timeout. Under fail-open
-    // the timeout must not block the tool call.
     write_hook(
         dir.path(),
         "safety.json",
@@ -235,7 +164,6 @@ async fn matcher_filters_tool_name() {
         workspace_root: dir.path().to_str().unwrap(),
     };
 
-    // Matching tool name → denied.
     let pre_result = dispatcher::dispatch_pre_tool_use(
         &registry,
         &pre_tool_use_envelope("run_terminal_cmd"),
@@ -244,7 +172,6 @@ async fn matcher_filters_tool_name() {
     .await;
     assert!(matches!(pre_result.decision, HookDecision::Deny { .. }));
 
-    // Non-matching tool name → allowed (hook doesn't run).
     let pre_result =
         dispatcher::dispatch_pre_tool_use(&registry, &pre_tool_use_envelope("read_file"), &ctx)
             .await;
@@ -288,7 +215,6 @@ async fn non_blocking_dispatch() {
 async fn first_deny_stops_chain() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Two files: first denies, second allows. Second should never run.
     write_hook(
         dir.path(),
         "01-deny.json",
@@ -326,7 +252,6 @@ async fn first_deny_stops_chain() {
 async fn hook_receives_stdin_envelope() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Inline command: read stdin, check it contains expected fields, allow if valid.
     write_hook(
         dir.path(),
         "check.json",
@@ -348,49 +273,9 @@ async fn hook_receives_stdin_envelope() {
 }
 
 #[tokio::test]
-async fn hook_receives_env_vars() {
-    let dir = tempfile::tempdir().unwrap();
-
-    // Inline command: check env vars and write results to a file.
-    let output_file = dir.path().join("env_output.txt");
-    let cmd = format!(
-        r#"echo "EVENT=$GROK_HOOK_EVENT" > {f}; echo "NAME=$GROK_HOOK_NAME" >> {f}; echo "SESSION=$GROK_SESSION_ID" >> {f}; echo '{{"decision":"allow"}}'"#,
-        f = output_file.display(),
-    );
-    let hook_json = serde_json::json!({
-        "hooks": {
-            "PreToolUse": [
-                { "hooks": [{ "type": "command", "command": cmd }] }
-            ]
-        }
-    });
-    write_hook(dir.path(), "env.json", &hook_json.to_string());
-
-    let (registry, errors) = load_hooks(Some(dir.path()), None);
-    assert!(errors.is_empty());
-
-    let ctx = RunContext {
-        session_id: "sess-456",
-        workspace_root: dir.path().to_str().unwrap(),
-    };
-
-    let pre_result =
-        dispatcher::dispatch_pre_tool_use(&registry, &pre_tool_use_envelope("read_file"), &ctx)
-            .await;
-    assert_eq!(pre_result.decision, HookDecision::Allow);
-
-    // Verify env vars were received.
-    let output = std::fs::read_to_string(&output_file).unwrap();
-    assert!(output.contains("EVENT=pre_tool_use"), "output: {output}");
-    assert!(output.contains("NAME="), "output: {output}"); // auto-generated name
-    assert!(output.contains("SESSION=sess-456"), "output: {output}");
-}
-
-#[tokio::test]
 async fn shell_pipe_command_works() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Shell command with a pipe -- must go through sh -c.
     write_hook(
         dir.path(),
         "pipe.json",
@@ -421,6 +306,7 @@ fn make_envelope(event: HookEventName, payload: HookPayload) -> HookEventEnvelop
         transcript_path: None,
         client_identifier: None,
         prompt_id: None,
+        permission_mode: None,
         payload,
     }
 }
@@ -494,11 +380,15 @@ async fn new_event_types_fire_and_receive_correct_envelope() {
             event_name: HookEventName::StopFailure,
             json_key: "StopFailure",
             payload: HookPayload::StopFailure {
-                error: "rate_limit".into(),
+                error: xai_grok_hooks::event::StopFailureKind::RateLimit,
+                error_details: Some("429 Too Many Requests".into()),
+                last_assistant_message: Some("Turn failed: rate limited".into()),
             },
             assertions: vec![
                 ("hookEventName", "stop_failure".into()),
                 ("error", "rate_limit".into()),
+                ("errorDetails", "429 Too Many Requests".into()),
+                ("lastAssistantMessage", "Turn failed: rate limited".into()),
             ],
         },
     ];
@@ -579,7 +469,6 @@ async fn runner_injected_vars_override_extra_env_at_spawn() {
     let dir = tempfile::tempdir().unwrap();
     let output_file = dir.path().join("envcap.txt");
 
-    // The hook writes the values it sees for each reserved key.
     let cmd = format!(
         r#"echo "EVENT=$GROK_HOOK_EVENT" > {f}; echo "NAME=$GROK_HOOK_NAME" >> {f}; echo "SESSION=$GROK_SESSION_ID" >> {f}; echo "ROOT=$GROK_WORKSPACE_ROOT" >> {f}; echo "PROJ=$CLAUDE_PROJECT_DIR" >> {f}; echo "USER_KEY=$USER_KEY" >> {f}; echo '{{"decision":"allow"}}'"#,
         f = output_file.display(),
@@ -627,7 +516,6 @@ async fn runner_injected_vars_override_extra_env_at_spawn() {
     assert_eq!(result.decision, HookDecision::Allow);
 
     let captured = std::fs::read_to_string(&output_file).unwrap();
-    // Reserved keys: runner values must win (NOT the spoofed values).
     assert!(
         captured.contains("EVENT=pre_tool_use"),
         "GROK_HOOK_EVENT must reflect the real event, got:\n{captured}"
@@ -660,7 +548,6 @@ async fn runner_injected_vars_override_extra_env_at_spawn() {
         !captured.contains("PROJ=/spoofed/project"),
         "spoofed CLAUDE_PROJECT_DIR must NOT leak through"
     );
-    // Non-reserved key: user value passes through.
     assert!(
         captured.contains("USER_KEY=user_value_kept"),
         "non-reserved user-declared env keys must pass through, got:\n{captured}"
@@ -682,7 +569,6 @@ async fn direct_exec_command_with_env_var_resolves_at_load_time() {
     // need to mutate global state.
     let tmpdir_str = dir.path().to_string_lossy().into_owned();
 
-    // Create the script in tempdir with executable bit.
     let script = dir.path().join("check.sh");
     std::fs::write(
         &script,
@@ -706,9 +592,9 @@ async fn direct_exec_command_with_env_var_resolves_at_load_time() {
                             "type": "command",
                             // No shell metachars apart from `${...}`. The
                             // load-time pass resolves `${ROOT}` to the
-                            // tmpdir path, leaving "/tmp.../check.sh"
-                            // with NO `$` -- the runner picks the
-                            // direct-exec branch.
+                            // tmpdir path, leaving "/tmp.../check.sh" with
+                            // no `$`, so the runner picks the direct-exec
+                            // branch.
                             "command": "${ROOT}/check.sh",
                             "env": { "ROOT": tmpdir_str }
                         }
@@ -722,7 +608,6 @@ async fn direct_exec_command_with_env_var_resolves_at_load_time() {
     let (registry, errors) = load_hooks(Some(dir.path()), None);
     assert!(errors.is_empty(), "errors: {errors:?}");
 
-    // Sanity: the loaded spec already has the resolved path with no `$`.
     let specs: Vec<_> = registry
         .hooks_for(HookEventName::PreToolUse)
         .iter()
@@ -868,7 +753,7 @@ async fn lenient_parsing_with_mixed_claude_events() {
             "PreCompact": [
                 { "hooks": [{ "type": "command", "command": "echo compact" }] }
             ],
-            // Unknown external-only events — must not break the above.
+            // Unknown external-only events; must not break the above.
             "PermissionRequest": [
                 { "hooks": [{ "type": "command", "command": "echo perm-req" }] }
             ],

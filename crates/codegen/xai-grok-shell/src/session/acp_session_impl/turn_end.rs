@@ -339,17 +339,54 @@ impl SessionActor {
         .await;
     }
 
+    /// Telemetry error category; delegates to `stop_failure_error_type` so the
+    /// two classifications cannot drift.
     pub(super) fn classify_turn_error(err: &acp::Error) -> String {
-        match i32::from(err.code) {
-            crate::sampling::error::RATE_LIMITED_ERROR_CODE => "rate_limit",
-            -32000 => "auth",
-            -32600 => "invalid_request",
-            -32603 => "internal",
-            _ => "unknown",
+        use xai_grok_hooks::event::StopFailureKind as K;
+        match Self::stop_failure_error_type(err) {
+            K::RateLimit => "rate_limit",
+            K::AuthenticationFailed => "auth",
+            K::InvalidRequest => "invalid_request",
+            K::ServerError => "internal",
+            K::MaxOutputTokens => "max_tokens",
+            K::Unknown => "unknown",
         }
         .to_string()
     }
 
+    /// The `StopFailure` hook input's classified `error`. Structured markers win
+    /// over the JSON-RPC code because they are more specific; anything the
+    /// runtime cannot distinguish stays `Unknown`.
+    pub(super) fn stop_failure_error_type(
+        err: &acp::Error,
+    ) -> xai_grok_hooks::event::StopFailureKind {
+        use xai_grok_hooks::event::StopFailureKind as K;
+        if crate::sampling::error::stop_reason_for_turn_error(err) == "MaxTokens" {
+            return K::MaxOutputTokens;
+        }
+        // The data-carried HTTP status discriminates over the JSON-RPC code. 403
+        // is content-safety, not auth: it folds into `invalid_request` on the turn
+        // path (carries `http_status: 403`) and `server_error` on the setup path
+        // (no status, so `-32603` below).
+        match crate::sampling::error::http_status_from_error(err) {
+            Some(401) => return K::AuthenticationFailed,
+            Some(429) | Some(503) | Some(529) => return K::RateLimit,
+            Some(s) if (400..500).contains(&s) => return K::InvalidRequest,
+            Some(s) if s >= 500 => return K::ServerError,
+            _ => {}
+        }
+        match i32::from(err.code) {
+            crate::sampling::error::RATE_LIMITED_ERROR_CODE => K::RateLimit,
+            -32000 => K::AuthenticationFailed,
+            -32002 | -32600 | -32602 => K::InvalidRequest,
+            -32603 => K::ServerError,
+            _ => K::Unknown,
+        }
+    }
+
+    /// Whether a turn error is transient infra worth a goal retry. Keys on the
+    /// JSON-RPC code only (unlike `stop_failure_error_type`), so `-32603` counts
+    /// as infra.
     pub(super) fn is_infra_turn_error(err: &acp::Error) -> bool {
         matches!(
             i32::from(err.code),
@@ -400,7 +437,7 @@ impl SessionActor {
     }
 
     /// Extract the best human-readable detail from an infra turn error.
-    fn turn_error_detail(err: &acp::Error) -> Option<String> {
+    pub(super) fn turn_error_detail(err: &acp::Error) -> Option<String> {
         err.data
             .as_ref()
             .and_then(crate::sampling::error::error_detail_from_data)

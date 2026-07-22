@@ -25,6 +25,24 @@ use xai_grok_tools::implementations::grok_build::task::types::*;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 use super::*;
+/// Remove the task tool (and orphaned background-task actions) from a child
+/// toolset at or beyond `MAX_SUBAGENT_DEPTH`. Returns whether the task tool
+/// was removed.
+pub(super) fn strip_task_tools_at_max_depth(
+    tool_config: &mut xai_grok_tools::registry::types::ToolServerConfig,
+    child_depth: u32,
+) -> bool {
+    use xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH;
+    use xai_grok_tools::types::tool::ToolKind;
+    if child_depth < MAX_SUBAGENT_DEPTH {
+        return false;
+    }
+    let before = tool_config.tools.len();
+    tool_config.tools.retain(|tc| tc.kind != Some(ToolKind::Task));
+    let stripped = tool_config.tools.len() < before;
+    prune_orphaned_background_task_tools(tool_config);
+    stripped
+}
 pub(super) fn task_model_override_error(
     requested: Option<&str>,
     provenance: ModelOverrideProvenance,
@@ -465,10 +483,21 @@ pub(crate) async fn handle_subagent_request(
             );
         }
     }
+    // Upstream honors a harness-pinned `spawn_depth` override (e.g. a
+    // scheduler loop iteration pinned to depth 0 keeps its spawn surface);
+    // fall back to the natural parent_depth + 1 otherwise. Bound in the
+    // function scope so the GCS upload context and child tool context below
+    // report the same depth.
+    let child_depth = request
+        .runtime_overrides
+        .spawn_depth
+        .unwrap_or(ctx.parent_depth + 1);
     {
         use xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH;
-        let child_depth = ctx.parent_depth + 1;
         if child_depth >= MAX_SUBAGENT_DEPTH {
+            // Fork delta: strip the FULL nested-spawn surface (task,
+            // agent_swarm, workflow) — the broader superset of upstream's
+            // task-only strip — so children never see any spawn tool.
             let before = definition.tool_config.tools.len();
             strip_nested_spawn_tools(&mut definition.tool_config);
             if definition.tool_config.tools.len() < before {
@@ -778,7 +807,7 @@ pub(crate) async fn handle_subagent_request(
             .capability_mode
             .as_ref()
             .map(|m| format!("{m:?}")),
-        depth: ctx.parent_depth + 1,
+        depth: child_depth,
     };
     emit_subagent_notification(
         gateway,
@@ -908,7 +937,7 @@ pub(crate) async fn handle_subagent_request(
         .with_hunk_tracking_enabled(ctx.hunk_tracking_enabled);
     tool_ctx.subagent_event_tx = Some(ctx.subagent_event_tx.clone());
     tool_ctx.monitor_event_buffer = Some(MonitorEventBuffer::default());
-    tool_ctx.subagent_depth = ctx.parent_depth + 1;
+    tool_ctx.subagent_depth = child_depth;
     tool_ctx.lsp = ctx.lsp.clone();
     let parent_traceparent = xai_file_utils::trace_context::current_traceparent();
     let tracker_child_cwd = child_session_info.cwd.clone();
@@ -1457,6 +1486,7 @@ pub(crate) async fn handle_subagent_request(
             effective_provider: tracker_provider,
             run_in_background,
             surface_completion: request.surface_completion,
+            completion_output_cap: request.runtime_overrides.completion_output_cap,
             color: tracker_color,
             block_waited: false,
             explicitly_killed: false,

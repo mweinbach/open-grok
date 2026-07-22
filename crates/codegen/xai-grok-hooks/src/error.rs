@@ -19,13 +19,6 @@ pub enum HookError {
         source: regex::Error,
     },
 
-    #[error("hook {name} in {path}: lifecycle hooks ({event}) must not specify a matcher in v0")]
-    LifecycleMatcherNotAllowed {
-        name: String,
-        path: PathBuf,
-        event: String,
-    },
-
     #[error("hook {name} timed out after {elapsed_ms}ms")]
     Timeout { name: String, elapsed_ms: u64 },
 
@@ -49,7 +42,7 @@ pub enum HookError {
     },
 
     #[error(
-        "hook {name} in {path}: unsupported handler type '{handler_type}', only 'command' is supported in v0"
+        "hook {name} in {path}: unsupported handler type '{handler_type}', expected 'command' or 'http'"
     )]
     UnsupportedHandlerType {
         name: String,

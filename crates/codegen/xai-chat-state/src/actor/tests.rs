@@ -2778,6 +2778,43 @@ async fn get_last_assistant_text_skips_whitespace_only() {
 }
 
 #[tokio::test]
+async fn get_last_assistant_text_in_turn_stops_at_boundary() {
+    let h = TestHarness::new();
+    h.handle.push_user_message(ConversationItem::user("q1"));
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("previous turn answer"));
+    h.handle.push_user_message(ConversationItem::user("q2"));
+
+    assert!(h.handle.get_last_assistant_text_in_turn().await.is_none());
+    assert_eq!(
+        h.handle.get_last_assistant_text().await.as_deref(),
+        Some("previous turn answer"),
+        "the unbounded sibling still sees prior turns"
+    );
+}
+
+#[tokio::test]
+async fn get_last_assistant_text_in_turn_walks_past_synthetic_injections() {
+    let h = TestHarness::new();
+    h.handle.push_user_message(ConversationItem::user("q"));
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("turn answer"));
+    h.handle
+        .push_user_message(ConversationItem::stop_hook_feedback("keep working"));
+
+    assert_eq!(
+        h.handle.get_last_assistant_text_in_turn().await.as_deref(),
+        Some("turn answer"),
+        "synthetic mid-turn items must not act as turn boundaries"
+    );
+
+    // A turn-starting synthetic item (auto-wake) IS a boundary.
+    h.handle
+        .push_user_message(ConversationItem::task_completed("task done"));
+    assert!(h.handle.get_last_assistant_text_in_turn().await.is_none());
+}
+
+#[tokio::test]
 async fn get_last_assistant_text_no_assistant_messages() {
     let h = TestHarness::new();
     h.handle.push_user_message(ConversationItem::user("hi"));

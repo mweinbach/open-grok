@@ -283,13 +283,7 @@ pub(super) async fn run_session(
             xai_grok_hooks::dispatcher::dispatch_non_blocking(& registry,
             xai_grok_hooks::event::HookEventName::SessionEnd, & envelope, & ctx,). await;
             session.send_hook_execution("session_end", None, None, & results). await; }
-            let envelope = session.fire_hook(xai_grok_hooks::event::HookEventName::Stop,
-            None, xai_grok_hooks::event::HookPayload::Stop { reason : "channel_closed"
-            .to_string(), },); if let Some(registry) = session.hook_registry.borrow()
-            .clone() { let ctx = session.hook_run_ctx(); let results =
-            xai_grok_hooks::dispatcher::dispatch_non_blocking(& registry,
-            xai_grok_hooks::event::HookEventName::Stop, & envelope, & ctx,). await;
-            session.send_hook_execution("stop", None, None, & results). await; } let mut
+            session.dispatch_session_end_stop("channel_closed"). await; let mut
             session_end_result = "disabled"; let mut total_chunks_at_end = 0usize; if !
             session.startup_hints.is_subagent { if let Some(storage) = session.memory
             .storage() { let conversation = session.chat_state_handle.get_conversation().
@@ -401,8 +395,7 @@ pub(super) async fn run_session(
             .api_key.as_deref()) { session.chat_state_handle
             .update_credentials(xai_chat_state::Credentials { api_key : r.api_key,
             auth_type : r.auth_type, alpha_test_key : existing.alpha_test_key,
-            client_version : existing.client_version, }); } session.model_auth_facts
-            .replace(None); } } SessionCommand::GetCurrentModel { responds_to } => { let
+            client_version : existing.client_version, }); } session.invalidate_model_auth_memo(); } } SessionCommand::GetCurrentModel { responds_to } => { let
             model = session.chat_state_handle.get_sampling_config(). await .map(| c | c
             .model).unwrap_or_default(); let _ = responds_to.send(model); }
             SessionCommand::GetCurrentPromptMode { responds_to } => { let mode = *
@@ -860,13 +853,7 @@ pub(super) async fn run_session(
             xai_grok_hooks::dispatcher::dispatch_non_blocking(& registry,
             xai_grok_hooks::event::HookEventName::SessionEnd, & envelope, & ctx,). await;
             session.send_hook_execution("session_end", None, None, & results). await; }
-            let envelope = session.fire_hook(xai_grok_hooks::event::HookEventName::Stop,
-            None, xai_grok_hooks::event::HookPayload::Stop { reason : "shutdown"
-            .to_string(), },); if let Some(registry) = session.hook_registry.borrow()
-            .clone() { let ctx = session.hook_run_ctx(); let results =
-            xai_grok_hooks::dispatcher::dispatch_non_blocking(& registry,
-            xai_grok_hooks::event::HookEventName::Stop, & envelope, & ctx,). await;
-            session.send_hook_execution("stop", None, None, & results). await; } let mut
+            session.dispatch_session_end_stop("shutdown"). await; let mut
             session_end_result = "disabled"; let mut total_chunks_at_end = 0usize; if !
             session.startup_hints.is_subagent { if let Some(storage) = session.memory
             .storage() { let conversation = session.chat_state_handle.get_conversation().

@@ -1123,6 +1123,11 @@ pub(crate) async fn spawn_session_actor(
         session_id_str: session_info.id.0.to_string(),
         respect_gitignore,
         path_not_found_hints,
+        scheduler_background_loops: crate::util::config::resolve_scheduler_background_loops(
+            remote_settings
+                .as_ref()
+                .and_then(|r| r.scheduler_background_loops),
+        ),
         mcp_state: mcp_state.clone(),
         managed_gateway_tool_client: managed_gateway_tool_client.clone(),
         is_non_interactive: startup_hints.non_interactive,
@@ -1403,7 +1408,7 @@ pub(crate) async fn spawn_session_actor(
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
         session_info: session_info.clone(),
         auth_method_id,
-        model_auth_facts: std::cell::RefCell::new(None),
+        model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback,
         auth_manager,
         state,
@@ -1603,7 +1608,6 @@ pub(crate) async fn spawn_session_actor(
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
-        subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: workspace_ops.clone(),
         trace_config_template: std::cell::RefCell::new(None),

@@ -660,6 +660,7 @@ pub(super) fn dispatch_send_prompt_inner(
                             created_at: std::time::Instant::now(),
                             next_fire_at: preview.next_fire_at,
                             tag: preview.tag,
+                            last_subagent_id: None,
                         },
                     );
                 }
