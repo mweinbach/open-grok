@@ -74,27 +74,16 @@ fn resolve_config(cfg: &AgentConfig, auth_manager: &AuthManager) -> AgentConfig 
         tracing::info!(field = %e.path, value = %e.value, source = %e.source, "policy override");
     }
 
-    // Fallback: if the client didn't pre-supply remote settings, fetch them
-    // now so remote-settings-gated features work regardless of which client
-    // spawned us.  Clients that already call `start_early_prefetch()` and
-    // thread the result into `cfg.remote_settings` skip this entirely.
-    if cfg.remote_settings.is_none()
-        && let Some(handle) =
-            crate::agent::models::start_early_prefetch(Some(cfg.grok_com_config.clone()))
-    {
-        match handle.join() {
-            Ok(result) => {
-                cfg.remote_settings = result.settings;
-                crate::util::config::set_remote_campaigns_from_settings(
-                    cfg.remote_settings.as_ref(),
-                );
-                tracing::info!("remote_settings fetched as shell-level fallback");
-            }
-            Err(_) => {
-                tracing::warn!("remote_settings fallback prefetch thread panicked");
-            }
-        }
-    }
+    // Open Grok divergence: xAI's cli-chat-proxy remote settings exist to
+    // stage xAI's own client rollout (workflows_enabled, the goal_* family,
+    // telemetry/OTel gates, role-model picks, campaigns). None of those flags
+    // describe this fork's feature set, and a remote `false` must never
+    // disable an Open Grok feature — in production `workflows_enabled: false`
+    // silently stripped the workflow tool from every session. Drop the
+    // payload wholesale (whether a client pre-supplied it or not, and without
+    // fetching a fallback copy) so every feature gate resolves from local
+    // env/config/defaults only.
+    cfg.remote_settings = None;
     crate::util::config::sync_campaign_fields(&mut cfg);
     crate::agent::config::apply_remote_settings_side_effects(cfg.remote_settings.as_ref());
 

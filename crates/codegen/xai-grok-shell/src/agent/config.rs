@@ -2668,22 +2668,18 @@ impl Config {
             .resolve()
     }
     pub(crate) fn resolve_workflows(&self) -> Resolved<bool> {
-        let ff = self
-            .remote_settings
-            .as_ref()
-            .and_then(|s| s.workflows_enabled);
-        if ff == Some(false) {
-            return Resolved::new(false, ConfigSource::Remote);
-        }
+        // Open Grok divergence: upstream stages its workflow rollout through
+        // the remote `workflows_enabled` flag served by cli-chat-proxy, and a
+        // remote `false` hard-disables workflows even over local opt-in
+        // (including `GROK_WORKFLOWS=1`). That flag tracks xAI's own client
+        // rollout and says nothing about this fork's feature set — in
+        // practice it shipped `false` here and silently stripped the
+        // workflow tool from every session. Open Grok ignores the remote
+        // flag entirely: workflows have been generally available since
+        // v0.1.220-open-grok.20 and stay on by default. Precedence:
+        // `GROK_WORKFLOWS` env > `[workflows] enabled` > on.
         BoolFlag::env("GROK_WORKFLOWS")
             .config(self.workflows.enabled)
-            .feature_flag(ff)
-            // Open Grok divergence: upstream defaults workflows off and opts
-            // sessions in via its remote feature flag, which Open Grok
-            // deployments don't have. Workflows have been generally available
-            // in Open Grok since v0.1.220-open-grok.20, so the native runtime
-            // stays on by default; `[workflows] enabled = false` or
-            // `GROK_WORKFLOWS=0` still disables it.
             .default(true)
             .resolve()
     }
@@ -10564,33 +10560,36 @@ if n == name && f.as_deref() == field
         assert!(cfg.resolve_workflows().value);
         assert!(cfg.resolve_goal().value);
     }
+    /// Open Grok ignores xAI's remote `workflows_enabled` rollout flag: it
+    /// tracks upstream's own client rollout (and shipped `false` here,
+    /// silently stripping the workflow tool). Only local env/config gate the
+    /// feature.
     #[test]
     #[serial]
-    fn resolve_workflows_remote_settings_opt_in() {
+    fn resolve_workflows_ignores_remote_flag() {
         unsafe { std::env::remove_var("GROK_WORKFLOWS") };
         let cfg = Config {
             remote_settings: Some(crate::util::config::RemoteSettings {
-                workflows_enabled: Some(true),
+                workflows_enabled: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let r = cfg.resolve_workflows();
-        assert_eq!(r.source, ConfigSource::Remote);
-        assert!(r.value);
+        assert_eq!(r.source, ConfigSource::Default);
+        assert!(r.value, "remote false must not disable workflows");
     }
     #[test]
     #[serial]
-    fn resolve_workflows_remote_false_kills_local_opt_in() {
-        unsafe { std::env::set_var("GROK_WORKFLOWS", "1") };
+    fn resolve_workflows_local_opt_out_still_wins() {
+        unsafe { std::env::set_var("GROK_WORKFLOWS", "0") };
         let mut cfg = Config::default();
-        cfg.workflows.enabled = Some(true);
         cfg.remote_settings = Some(crate::util::config::RemoteSettings {
-            workflows_enabled: Some(false),
+            workflows_enabled: Some(true),
             ..Default::default()
         });
         let r = cfg.resolve_workflows();
-        assert_eq!(r.source, ConfigSource::Remote);
+        assert_eq!(r.source, ConfigSource::Env);
         assert!(!r.value);
         unsafe { std::env::remove_var("GROK_WORKFLOWS") };
     }

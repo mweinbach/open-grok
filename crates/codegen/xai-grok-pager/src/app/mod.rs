@@ -454,7 +454,15 @@ pub async fn run(
     if let Ok(cwd) = std::env::current_dir() {
         crate::git_info::populate_from_cwd_async(cwd);
     }
-    let remote_settings = join_early_prefetch(early_prefetch);
+    // Open Grok divergence: the remote settings payload only carries
+    // xAI-rollout feature flags and remote config (leader_mode, auto_mode,
+    // campaigns, workflows_enabled, …) that don't describe this fork.
+    // Everything gates on local env/config/defaults instead, so don't even
+    // block startup joining the fetch — the prefetch thread still warms the
+    // model catalog and auth in the background. The shell drops any
+    // remote-settings payload at session init for the same reason.
+    drop(early_prefetch);
+    let remote_settings: Option<xai_grok_shell::util::config::RemoteSettings> = None;
     xai_grok_shell::util::config::cache_remote_auto_mode(
         remote_settings.as_ref().and_then(|s| s.auto_mode.clone()),
     );

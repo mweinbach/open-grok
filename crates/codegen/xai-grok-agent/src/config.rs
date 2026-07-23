@@ -328,6 +328,7 @@ fn codex_toolset() -> ToolServerConfig {
             wait_tasks_tool_config(),
             task_tool_config(),
             agent_swarm_tool_config(),
+            (&grok_build::WorkflowTool).into(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
@@ -1647,6 +1648,8 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         for required in [
             "task",
+            "agent_swarm",
+            "workflow",
             "wait_tasks",
             "get_task_output",
             "kill_task",
