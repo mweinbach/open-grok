@@ -82,12 +82,17 @@ and config, providers, and development workflow).
 
 ## Install
 
-The initial binary release supports **Apple Silicon macOS only** (`arm64` /
-`aarch64`). Linux, Intel macOS, and Windows users should build from source for
-now.
+Prebuilt releases support **Apple Silicon macOS** (`arm64` / `aarch64`) and
+**Windows x86_64**. Linux, Intel macOS, and Windows ARM64 users should build
+from source for now.
 
 ```sh
 curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+open-grok --version
+```
+
+```powershell
+irm https://github.com/mweinbach/open-grok/releases/latest/download/install.ps1 | iex
 open-grok --version
 ```
 
