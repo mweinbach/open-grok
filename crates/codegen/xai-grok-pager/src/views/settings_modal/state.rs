@@ -935,7 +935,12 @@ pub(super) fn setting_row_visible(
     voice_mode: bool,
     antigravity_cli: bool,
 ) -> bool {
-    if !voice_mode && matches!(meta.key, "voice_capture_mode" | "voice_stt_language") {
+    if !voice_mode
+        && matches!(
+            meta.key,
+            "voice_keybind_enabled" | "voice_capture_mode" | "voice_stt_language"
+        )
+    {
         return false;
     }
     if meta.key == "voice_capture_mode" && !kitty_releases {
@@ -1013,6 +1018,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "contextual_hints.ssh_wrap" => Some(Action::SetContextualHintSshWrap(new)),
         "multiline_mode" => Some(Action::SetMultilineMode(new)),
         "vim_mode" => Some(Action::SetVimMode(new)),
+        "voice_keybind_enabled" => Some(Action::SetVoiceKeybindEnabled(new)),
         "remember_tool_approvals" => Some(Action::SetRememberToolApprovals(new)),
         "toolset.ask_user_question.timeout_enabled" => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(new))

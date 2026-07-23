@@ -58,6 +58,8 @@ async fn create_test_actor(
             api_backend: Default::default(),
             provider: Default::default(),
             extra_headers: Default::default(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(context_window)
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
@@ -501,6 +503,8 @@ async fn create_test_actor_with_memory(
             api_backend: Default::default(),
             provider: Default::default(),
             extra_headers: Default::default(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(context_window)
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
@@ -1231,6 +1235,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     top_p: None,
                     api_backend: Default::default(),
                     extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
                     context_window: std::num::NonZeroU64::new(200_000).unwrap(),
                     reasoning_effort: None,
                     stream_tool_calls: None,

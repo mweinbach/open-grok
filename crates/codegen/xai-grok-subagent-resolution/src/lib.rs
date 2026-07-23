@@ -14,26 +14,29 @@
 //! Designed to be consumed by local hosts (e.g. `xai-grok-shell`) and any
 //! future remote spawn path that only needs pure resolution logic.
 //!
-//! ## Planned composition API
-//!
-//! Future work may add a higher-level composition helper once shell call sites
-//! are refactored onto this crate:
-//!
-//! - `resolve_subagent_spec()` composition function
-//! - `SubagentSpec`, `ResolveSubagentRequest`, `ResolutionContext` boundary types
-//! - Optional deps for `AgentDefinition` lookup and worktree creation
-//! - Model override resolution chain (global > per-type > role > parent)
-//! - Capability mode filtering (delegates to `SubagentCapabilityMode::filter_tool_config()`)
+//! Definition discovery, gating, prompt context, runtime defaults, and
+//! capability/depth tool policy are shared here. Model catalog selection and
+//! workspace materialization remain host adapters.
 
 pub mod config;
 pub mod context;
+pub mod definition;
 pub mod overrides;
 pub mod resume;
 pub mod types;
 
 pub use config::{PersonaIOField, SubagentPersona, SubagentRole};
+pub use definition::{
+    DefinitionResolutionContext, DefinitionValidationContext, HarnessToolsetContext,
+    apply_child_tool_policy, apply_definition_runtime_defaults, apply_harness_toolset,
+    available_agent_names, discover_agent_definition, gate_agent_definition,
+    render_subagent_initial_user_message, render_subagent_system_prompt, resolve_agent_definition,
+    resolve_runtime_config, select_role, subagent_harness_flavor_is_representable,
+    validate_agent_name,
+};
 pub use overrides::{intersect_capability_modes, resolve_effective_overrides};
 pub use resume::{ResumeValidationError, validate_resume_identity};
 pub use types::{
     ContextSource, EffectiveRuntimeConfig, ResolutionError, ResumeSourceData, SubagentModelRoute,
 };
+pub use xai_grok_agent::config::AgentDefinition;

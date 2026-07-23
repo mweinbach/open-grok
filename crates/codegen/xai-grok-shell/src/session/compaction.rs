@@ -3002,6 +3002,8 @@ mod inline_auto_compact_flow_tests {
                 api_backend: Default::default(),
                 provider: Default::default(),
                 extra_headers: Default::default(),
+                query_params: Default::default(),
+                env_http_headers: Default::default(),
                 context_window: std::num::NonZeroU64::new(context_window)
                     .expect("test context_window must be non-zero"),
                 reasoning_effort: None,

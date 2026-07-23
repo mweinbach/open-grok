@@ -1290,6 +1290,7 @@ async fn file_toolset_override_e2e_to_finalized_toolset() {
         session_env: std::sync::Arc::new(std::collections::HashMap::new()),
         notification_handle: ToolNotificationHandle::noop(),
         owner_session_id: None,
+        subagent: None,
         parent_scheduler_handle: None,
         skills: vec![],
         state_path: tmp.path().join("state.json"),
@@ -2484,6 +2485,8 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             codex_multi_agent_v2: false,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            env_http_headers: IndexMap::new(),
             context_window: std::num::NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
@@ -2972,6 +2975,31 @@ async fn prepare_video_gen_config_sends_client_identifier_header() {
         "video gen API calls must carry the client identifier so the server \
          applies the coding ZDR opt-out to Build traffic"
     );
+}
+/// Regression: `x.ai/auth/info` must return profile fields even when the
+/// access token is expired — profile data does not expire with the token,
+/// and hiding it made the desktop render "Signed in" with no identity.
+#[tokio::test]
+async fn auth_info_returns_profile_when_token_expired() {
+    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+        email: Some("user@example.com".into()),
+        first_name: Some("Test".into()),
+        refresh_token: Some("rt".into()),
+        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        ..crate::auth::GrokAuth::test_default()
+    });
+    let resp = crate::extensions::auth::handle(
+        &agent,
+        &acp::ExtRequest::new(
+            "x.ai/auth/info",
+            std::sync::Arc::from(serde_json::value::to_raw_value(&serde_json::json!({})).unwrap()),
+        ),
+    )
+    .await
+    .expect("auth/info must succeed with an expired token");
+    let info: serde_json::Value = serde_json::from_str(resp.0.get()).unwrap();
+    assert_eq!(info["email"], "user@example.com");
+    assert_eq!(info["firstName"], "Test");
 }
 #[tokio::test]
 async fn data_collection_enabled_for_normal_user() {
@@ -5120,6 +5148,11 @@ mod soft_default_settings_emit {
                 let cfg = AgentConfig {
                     remote_settings: Some(crate::util::config::RemoteSettings {
                         permission_mode: Some("always-approve".into()),
+                        slash_command_tags: Some(
+                            [("workflows".to_string(), "new".to_string())]
+                                .into_iter()
+                                .collect(),
+                        ),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -5139,6 +5172,14 @@ mod soft_default_settings_emit {
                     params.get("permission_mode").and_then(|v| v.as_str()),
                     Some("always-approve"),
                     "post-auth emit must carry remote permission_mode for first session"
+                );
+                assert_eq!(
+                    params
+                        .get("slash_command_tags")
+                        .and_then(|v| v.get("workflows"))
+                        .and_then(|v| v.as_str()),
+                    Some("new"),
+                    "post-auth emit must carry remote slash_command_tags"
                 );
                 let _ = args.response_tx.send(Ok(()));
             })

@@ -9,9 +9,20 @@ use crate::hub_ids::WORKSPACE_RPC_TOOL_ID;
 use crate::rpc_envelope::{RpcEnvelope, envelope_err};
 use crate::workspace_ops::WorkspaceOp;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
 use serde_json::Value;
 use xai_computer_hub_sdk::ToolServerHandler;
+use xai_grok_tools::computer::types::TaskKind;
+use xai_grok_tools::implementations::grok_build::scheduler::interval::interval_to_human;
+use xai_grok_tools::implementations::grok_build::scheduler::types::{
+    SchedulerCommand, SchedulerHandle,
+};
+use xai_grok_tools::registry::types::FinalizedToolset;
+use xai_grok_tools::types::resources::Terminal;
+use xai_grok_workspace_types::rpc::workspace::{
+    BackgroundTaskSnapshotWire, ScheduledTaskSnapshotWire, TasksSnapshotResponse,
+};
 use xai_tool_protocol::{HookEvent, HookFrame, SessionId, ToolId, ToolServerEvictParams};
 use xai_tool_runtime::{
     ToolCallContext, ToolError, ToolErrorKind, ToolStream, TypedToolOutput, terminal_only,
@@ -236,6 +247,68 @@ async fn list_outstanding_background_tasks(
         })
         .collect()
 }
+/// Point-in-time snapshot of the session's outstanding background terminal
+/// tasks and live scheduled tasks.
+async fn tasks_snapshot(toolset: &FinalizedToolset) -> TasksSnapshotResponse {
+    let (terminal, scheduler) = {
+        let res = toolset.resources.lock().await;
+        (
+            res.get::<Terminal>().map(|t| t.0.clone()),
+            res.get::<SchedulerHandle>().cloned(),
+        )
+    };
+    let background_tasks = match terminal {
+        Some(terminal) => terminal
+            .list_tasks()
+            .await
+            .into_iter()
+            .filter(|t| !t.completed)
+            .map(|t| {
+                let command = t
+                    .display_command
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(t.command);
+                BackgroundTaskSnapshotWire {
+                    task_id: t.task_id,
+                    command,
+                    kind: match t.kind {
+                        TaskKind::Bash => "bash".to_owned(),
+                        TaskKind::Monitor => "monitor".to_owned(),
+                    },
+                    started_at: DateTime::<Utc>::from(t.start_time).to_rfc3339(),
+                    description: t.description,
+                }
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let scheduled_tasks = match scheduler {
+        Some(handle) => {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let _ = handle.0.send(SchedulerCommand::List { reply: reply_tx });
+            reply_rx
+                .await
+                .map(|snapshot| snapshot.tasks)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| ScheduledTaskSnapshotWire {
+                    task_id: t.id.clone(),
+                    prompt: t.prompt.clone(),
+                    human_schedule: interval_to_human(t.interval_secs),
+                    next_fire_at: t.next_fire_at().to_rfc3339(),
+                    recurring: t.recurring,
+                    created_at: t.created_at.to_rfc3339(),
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    TasksSnapshotResponse {
+        background_tasks,
+        scheduled_tasks,
+    }
+}
 /// List the session's TODO items (via `todo_write`) from the session toolset's
 /// `State<TodoState>` resource, mapped to the slim wire DTO. Empty when the
 /// session has no todo state. Source of truth for the `workspace.list_todos`
@@ -297,7 +370,7 @@ impl WorkspaceRpcHandler {
             ConfigureMcpReq, DropSessionReq, InstallPluginReq, ListBackgroundTasksReq,
             ListBackgroundTasksResponse, ListTodosReq, ListTodosResponse, LoadEnvrcReq,
             LoadPermissionsReq, LoadProjectConfigReq, RefreshPluginsReq, ResolveFileReferencesReq,
-            ToolDefinitionsReq, UpdateToolConfigReq,
+            TasksSnapshotReq, ToolDefinitionsReq, UpdateToolConfigReq,
         };
         use xai_grok_workspace_types::rpc::worktree::WorktreeCreateSyncReq;
         tracing::debug!(method, "workspace rpc dispatch");
@@ -372,6 +445,19 @@ impl WorkspaceRpcHandler {
                 let tasks = list_outstanding_background_tasks(toolset.as_ref()).await;
                 serde_json::to_value(ListBackgroundTasksResponse { tasks })
                     .map_err(|e| WorkspaceError::HubError(e.to_string()))
+            }
+            <TasksSnapshotReq as WorkspaceRpc>::METHOD => {
+                let session_id = params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| WorkspaceError::HubError("missing session_id".into()))?;
+                let session = self
+                    .workspace
+                    .session(session_id)
+                    .ok_or_else(|| WorkspaceError::SessionNotFound(session_id.into()))?;
+                let toolset = session.toolset();
+                let snapshot = tasks_snapshot(toolset.as_ref()).await;
+                serde_json::to_value(snapshot).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
             <ListTodosReq as WorkspaceRpc>::METHOD => {
                 let session_id = params
@@ -1082,7 +1168,12 @@ impl ToolServerHandler for WorkspaceRpcHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handle::tests::make_handle;
+    use crate::capability::CapabilityMode;
+    use crate::handle::tests::{background_capable_cfg, make_handle, start_background_sleep};
+    use xai_grok_tools::implementations::grok_build::scheduler::types::{
+        ScheduledTask, SchedulerState,
+    };
+    use xai_grok_tools::types::resources::State;
     use xai_tool_protocol::turn_hook;
     /// Helper: consume the first item from a ToolStream.
     async fn next_item(
@@ -1307,6 +1398,108 @@ mod tests {
         assert!(
             tasks.is_empty(),
             "a killed task must leave the outstanding list: {tasks:?}"
+        );
+    }
+    /// `workspace.tasks_snapshot` (GC-614 part 3): returns the outstanding
+    /// background task with kind/started_at, plus scheduled tasks (empty when
+    /// no scheduler resource exists), and drops the task once killed.
+    #[tokio::test]
+    async fn tasks_snapshot_rpc_lists_outstanding_background_tasks() {
+        let handle = make_handle();
+        let cfg = background_capable_cfg();
+        let session = handle
+            .create_session_with_config(
+                "snap-rpc",
+                None,
+                Some(cfg.clone()),
+                CapabilityMode::All,
+                None,
+                false,
+            )
+            .expect("create background-capable session");
+        session.set_bind_tool_config_fingerprint(serde_json::to_value(&cfg).ok());
+        let out_dir = tempfile::tempdir().expect("temp dir");
+        let bg = start_background_sleep(&session, out_dir.path(), "snap-rpc-task").await;
+        let handler = WorkspaceRpcHandler::new(handle.clone());
+        async fn snapshot(handler: &WorkspaceRpcHandler) -> TasksSnapshotResponse {
+            let value = handler
+                .dispatch(
+                    "workspace.tasks_snapshot",
+                    serde_json::json!({"session_id": "snap-rpc"}),
+                    Some("snap-rpc"),
+                )
+                .await
+                .expect("tasks_snapshot rpc");
+            serde_json::from_value(value).expect("decode response")
+        }
+        let snap = snapshot(&handler).await;
+        assert_eq!(
+            snap.background_tasks.len(),
+            1,
+            "the running task must be listed"
+        );
+        let task = &snap.background_tasks[0];
+        assert_eq!(task.task_id, bg.task_id);
+        assert_eq!(task.kind, "bash");
+        assert!(
+            task.description.is_none(),
+            "start_background_sleep does not set description: {:?}",
+            task.description
+        );
+        assert!(
+            DateTime::parse_from_rfc3339(&task.started_at).is_ok(),
+            "started_at must be RFC3339: {}",
+            task.started_at
+        );
+        assert!(
+            snap.scheduled_tasks.is_empty(),
+            "no scheduler resource in this toolset: {:?}",
+            snap.scheduled_tasks
+        );
+        {
+            use crate::handle::tests::terminal_run_request;
+            let mut req = terminal_run_request("sleep 30", out_dir.path(), "snap-desc-task");
+            req.description = Some("build frontend".into());
+            let desc_bg = session
+                .terminal_backend()
+                .run_background(req)
+                .await
+                .expect("start described background task");
+            let snap = snapshot(&handler).await;
+            let described = snap
+                .background_tasks
+                .iter()
+                .find(|t| t.task_id == desc_bg.task_id)
+                .expect("described task in snapshot");
+            assert_eq!(described.description.as_deref(), Some("build frontend"));
+            session.terminal_backend().kill_task(&desc_bg.task_id).await;
+        }
+        session.terminal_backend().kill_task(&bg.task_id).await;
+        let snap = snapshot(&handler).await;
+        assert!(
+            snap.background_tasks.is_empty(),
+            "a killed task must leave the snapshot: {:?}",
+            snap.background_tasks
+        );
+        {
+            let toolset = session.toolset();
+            let mut resources = toolset.resources.lock().await;
+            let state = resources.get_or_default::<State<SchedulerState>>();
+            let mut task = ScheduledTask::new(300, "check CI".into(), true, false);
+            task.id = "loop-1".into();
+            state.tasks.push(task);
+        }
+        let snap = snapshot(&handler).await;
+        assert_eq!(snap.scheduled_tasks.len(), 1);
+        let loop_task = &snap.scheduled_tasks[0];
+        assert_eq!(loop_task.task_id, "loop-1");
+        assert_eq!(loop_task.prompt, "check CI");
+        assert_eq!(loop_task.human_schedule, "every 5 minutes");
+        assert!(loop_task.recurring);
+        assert!(
+            DateTime::parse_from_rfc3339(&loop_task.next_fire_at).is_ok(),
+            "next_fire_at must be RFC3339: {}",
+            loop_task.next_fire_at
         );
     }
     /// Evicting one session while another is live must NOT global-drain (which

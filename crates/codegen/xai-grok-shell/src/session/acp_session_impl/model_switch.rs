@@ -322,6 +322,8 @@ impl SessionActor {
                 api_backend: sampling_config.api_backend,
                 provider: sampling_config.provider,
                 extra_headers: sampling_config.extra_headers.clone(),
+                query_params: sampling_config.query_params.clone(),
+                env_http_headers: sampling_config.env_http_headers.clone(),
                 context_window: new_context_window,
                 reasoning_effort: sampling_config.reasoning_effort,
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),

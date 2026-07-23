@@ -686,7 +686,6 @@ fn build_member_request(
     id: String,
     status_tx: Option<mpsc::UnboundedSender<SubagentStatusEvent>>,
 ) -> SubagentRequest {
-    let (result_tx, _) = tokio::sync::oneshot::channel();
     SubagentRequest {
         id,
         prompt: member.prompt,
@@ -730,7 +729,6 @@ fn build_member_request(
         fork_context: false,
         owner: crate::implementations::grok_build::task::types::SubagentOwner::Task,
         cancel_token: tokio_util::sync::CancellationToken::new(),
-        result_tx,
     }
 }
 

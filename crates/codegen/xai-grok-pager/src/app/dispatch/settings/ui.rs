@@ -14,7 +14,7 @@ use super::setters::{
     set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
     set_show_thinking_blocks_inner, set_show_tips_inner, set_simple_mode_inner, set_theme_inner,
     set_timeline_inner, set_timestamps, set_timestamps_inner, set_vim_mode_inner,
-    set_voice_capture_mode_inner, set_voice_stt_language_inner,
+    set_voice_capture_mode_inner, set_voice_keybind_enabled_inner, set_voice_stt_language_inner,
 };
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
@@ -1112,6 +1112,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("kimi_api_endpoint", SettingValue::Enum(s)) => {
             Some(Action::SetKimiApiEndpoint((*s).to_string()))
         }
+        ("voice_keybind_enabled", SettingValue::Bool(b)) => {
+            Some(Action::SetVoiceKeybindEnabled(*b))
+        }
         ("voice_capture_mode", SettingValue::Enum(s)) => {
             Some(Action::SetVoiceCaptureMode((*s).to_string()))
         }
@@ -1439,6 +1442,9 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         }
         ("screen_mode", SettingValue::Enum(s)) => {
             set_screen_mode_inner(app, crate::settings::canonical_screen_mode(Some(s)));
+        }
+        ("voice_keybind_enabled", SettingValue::Bool(b)) => {
+            set_voice_keybind_enabled_inner(app, *b)
         }
         ("voice_capture_mode", SettingValue::Enum(s)) => {
             set_voice_capture_mode_inner(

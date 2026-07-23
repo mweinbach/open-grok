@@ -2085,26 +2085,30 @@ impl acp::Agent for MvpAgent {
             cwd.as_path(),
             remote_settings.as_ref(),
         );
-        if let Some((parent_cmd_tx, session_cwd)) = self
-            .sessions
-            .borrow()
-            .get(&session_id)
-            .map(|h| (h.cmd_tx.clone(), h.info.cwd.clone()))
-        {
+        let orphan_parent = {
+            let sessions = self.sessions.borrow();
+            sessions
+                .get(&session_id)
+                .map(|handle| (handle.cmd_tx.clone(), handle.info.cwd.clone()))
+        };
+        if let Some((parent_cmd_tx, session_cwd)) = orphan_parent {
             let session_dir = crate::session::persistence::session_dir(
                 &SessionInfo {
                     id: session_id.clone(),
                     cwd: session_cwd,
                 },
             );
-            crate::agent::subagent::reconcile_orphaned_subagents(
-                &unfinished_subagents,
-                &self.subagent_coordinator.borrow(),
-                &session_dir,
-                session_id.0.as_ref(),
-                &self.gateway,
-                Some(&parent_cmd_tx),
-            );
+            crate::agent::subagent::reconcile_orphaned_subagents_with_backend(
+                    &unfinished_subagents,
+                    &xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
+                        self.subagent_event_tx.clone(),
+                    ),
+                    &session_dir,
+                    session_id.0.as_ref(),
+                    &self.gateway,
+                    Some(&parent_cmd_tx),
+                )
+                .await;
         }
         let persisted_model = startup_model_id;
         let models = self.models_manager.models();
@@ -2921,9 +2925,11 @@ impl acp::Agent for MvpAgent {
                     tool_overrides: _,
                 } = turn_ok;
                 let subagent_refs = self
-                    .subagent_coordinator
-                    .borrow()
-                    .spawned_refs_for_prompt(&prompt_id);
+                    .spawned_subagent_refs_for_prompt(
+                        arguments.session_id.0.as_ref(),
+                        &prompt_id,
+                    )
+                    .await;
                 let permission_events = self
                     .collect_permission_events(&arguments.session_id);
                 let turn_messages: Option<xai_chat_state::TurnCapture> = {
@@ -3403,9 +3409,11 @@ impl acp::Agent for MvpAgent {
             }
             Err(err) => {
                 let subagent_refs = self
-                    .subagent_coordinator
-                    .borrow()
-                    .spawned_refs_for_prompt(&prompt_id);
+                    .spawned_subagent_refs_for_prompt(
+                        arguments.session_id.0.as_ref(),
+                        &prompt_id,
+                    )
+                    .await;
                 let turn_messages: Option<xai_chat_state::TurnCapture> = {
                     let (tx, rx) = oneshot::channel();
                     if handle
@@ -3719,10 +3727,10 @@ impl acp::Agent for MvpAgent {
                 // initializing child whose provider is not resolved yet)
                 // before mutating the live credential so no later child turn
                 // can use stale auth.
-                let cancelled_subagents = self
-                    .subagent_coordinator
-                    .borrow_mut()
-                    .cancel_for_fireworks_runtime_change();
+                let cancelled_subagents = crate::agent::subagent::cancel_for_provider_runtime_change(
+                    &self.subagent_provider_registry,
+                    xai_grok_sampling_types::ModelProvider::Fireworks,
+                );
                 if cancelled_subagents > 0 {
                     tracing::warn!(
                         cancelled_subagents,
@@ -3749,10 +3757,10 @@ impl acp::Agent for MvpAgent {
                 // spawn. Stop resident Kimi children (and every initializing
                 // child whose provider is not resolved yet) before mutating
                 // the live service so no later child turn can use stale auth.
-                let cancelled_subagents = self
-                    .subagent_coordinator
-                    .borrow_mut()
-                    .cancel_for_kimi_runtime_change();
+                let cancelled_subagents = crate::agent::subagent::cancel_for_provider_runtime_change(
+                    &self.subagent_provider_registry,
+                    xai_grok_sampling_types::ModelProvider::Kimi,
+                );
                 if cancelled_subagents > 0 {
                     tracing::warn!(
                         cancelled_subagents,

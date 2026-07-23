@@ -707,6 +707,8 @@ mod tests {
                 provider: ModelProvider::Xai,
                 auth_scheme: crate::config::AuthScheme::Bearer,
                 extra_headers: indexmap::IndexMap::new(),
+                query_params: indexmap::IndexMap::new(),
+                env_http_headers: indexmap::IndexMap::new(),
                 context_window: 8192,
                 force_http1: false,
                 max_retries: None,

@@ -352,17 +352,22 @@ fn setting_row_visible_gates_antigravity_on_cli_presence() {
 #[test]
 fn setting_row_visible_hides_voice_rows_when_voice_mode_off() {
     let reg = SettingsRegistry::defaults();
+    let keybind = meta_for(&reg, "voice_keybind_enabled");
     let capture = meta_for(&reg, "voice_capture_mode");
     let language = meta_for(&reg, "voice_stt_language");
     let vim = meta_for(&reg, "vim_mode");
-    // Gate off: both voice rows gone even with kitty releases + full TUI.
+    // Gate off: all voice rows gone even with kitty releases + full TUI.
+    assert!(!setting_row_visible(keybind, true, false, false, true));
     assert!(!setting_row_visible(capture, true, false, false, true));
     assert!(!setting_row_visible(language, true, false, false, true));
     // Non-voice rows unaffected.
     assert!(setting_row_visible(vim, true, false, false, true));
-    // Gate on: both visible (kitty releases for capture).
+    // Gate on: all visible (kitty releases for capture).
+    assert!(setting_row_visible(keybind, true, false, true, true));
     assert!(setting_row_visible(capture, true, false, true, true));
     assert!(setting_row_visible(language, true, false, true, true));
+    // The keybind row (unlike capture) doesn't need key-release reporting.
+    assert!(setting_row_visible(keybind, false, false, true, true));
 }
 
 #[test]
@@ -868,7 +873,8 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "prompt_suggestions",
             // SHELL-owned swarm_mode (Agent; live session update + persisted default).
             "swarm_mode",
-            // voice_capture_mode + voice_stt_language hidden when gate is off.
+            // voice_keybind_enabled + voice_capture_mode + voice_stt_language
+            // hidden when the voice gate is off.
             // SHELL-owned permission_mode (Agent category).
             "permission_mode",
             // SHELL-owned remember_tool_approvals (Agent category,

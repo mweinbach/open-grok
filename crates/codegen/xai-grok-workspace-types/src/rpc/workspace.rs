@@ -179,6 +179,59 @@ impl WorkspaceRpc for ListBackgroundTasksReq {
     type Response = ListBackgroundTasksResponse;
 }
 
+/// One outstanding background terminal task, with the fields client task UI
+/// needs (a slim DTO over `xai_grok_tools`'s `TaskSnapshot`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTaskSnapshotWire {
+    /// Background task registry id (pairs with the `task.*` push events).
+    pub task_id: String,
+    /// The launched command line (prefers `display_command`).
+    pub command: String,
+    /// `bash` | `monitor`.
+    pub kind: String,
+    /// RFC3339 start timestamp.
+    pub started_at: String,
+    /// Model-supplied label when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One live scheduled task (`/loop`), a slim DTO over the scheduler's
+/// `ScheduledTask` (pairs with the `scheduled_task.*` push events).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledTaskSnapshotWire {
+    pub task_id: String,
+    pub prompt: String,
+    /// Human-readable schedule, e.g. "every 5 minutes".
+    pub human_schedule: String,
+    /// RFC3339 timestamp of the next fire.
+    pub next_fire_at: String,
+    pub recurring: bool,
+    /// RFC3339 creation timestamp.
+    pub created_at: String,
+}
+
+/// Response of `workspace.tasks_snapshot` — outstanding background tasks and
+/// live scheduled tasks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TasksSnapshotResponse {
+    pub background_tasks: Vec<BackgroundTaskSnapshotWire>,
+    pub scheduled_tasks: Vec<ScheduledTaskSnapshotWire>,
+}
+
+/// `workspace.tasks_snapshot` — point-in-time snapshot of the session's
+/// outstanding background tasks and scheduled tasks, for task
+/// UI rebuild on client attach/reconnect.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TasksSnapshotReq {
+    pub session_id: String,
+}
+
+impl WorkspaceRpc for TasksSnapshotReq {
+    const METHOD: &'static str = "workspace.tasks_snapshot";
+    type Response = TasksSnapshotResponse;
+}
+
 /// One TODO list item (slim DTO over `xai_grok_tools`'s `TodoState`). `status`
 /// is the snake_case tag: `pending` | `in_progress` | `completed` | `cancelled`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

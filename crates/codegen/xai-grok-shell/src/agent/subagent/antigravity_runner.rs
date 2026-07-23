@@ -1,15 +1,14 @@
 //! Out-of-process subagent execution via the Antigravity CLI.
 //!
-//! `handle_subagent_request` routes `antigravity:*` models here instead of
-//! spawning an in-process child session: the whole "session" lives inside
-//! `agy --print`, which brings its own model, login, and tool loop. The
-//! coordinator entry stays in `pending` for the duration of the run (its
-//! `cancel_token` keeps kill/cancel flows working — there is no
-//! `SubagentTracker` because there is no child session handle) and then moves
-//! straight to `completed` via `complete_pending_with_result`, so
-//! `get_task_output`, auto-wake, and `resume_from` behave like any other
-//! subagent. Resume continues the CLI conversation with `--conversation`,
-//! using the id persisted in `meta.json` / the completed record.
+//! `run_shell_child` routes `antigravity:*` models here instead of spawning an
+//! in-process child session: the whole "session" lives inside `agy --print`,
+//! which brings its own model, login, and tool loop. The coordinator actor's
+//! entry stays in `pending` for the duration of the run (its `cancel_token`
+//! keeps kill/cancel flows working — no `StartedChild` promotion because
+//! there is no child session handle); returning the `ChildRunOutput` moves it
+//! straight to `completed`, so `get_task_output`, auto-wake, and
+//! `resume_from` behave like any other subagent. Resume continues the CLI
+//! conversation with `--conversation`, using the id persisted in `meta.json`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,13 +22,13 @@ use xai_tool_types::SubagentCapabilityMode;
 use crate::agent::antigravity::{self, AgyRun, AgyRunError};
 use crate::extensions::notification::SessionUpdate;
 use crate::session::info::Info as SessionInfo;
+use xai_grok_tools::implementations::grok_build::task::coordinator::ChildRunOutput;
 use xai_grok_tools::implementations::grok_build::task::types::{SubagentRequest, SubagentResult};
 
 use super::{
-    PendingGuard, SubagentCoordinator, SubagentMeta, SubagentSpawnContext,
-    emit_subagent_notification, inject_subagent_completed_prompt, resolve_child_cwd,
-    select_override_cwd, send_failure, should_auto_wake_subagent, write_subagent_meta,
-    write_subagent_output,
+    ShellCompletionData, SubagentMeta, SubagentSpawnContext, child_run_output,
+    emit_subagent_notification, failure_result, resolve_child_cwd, select_override_cwd,
+    write_subagent_meta, write_subagent_output,
 };
 
 /// Fallback wall-clock budget for one `agy --print` run when
@@ -49,7 +48,7 @@ fn run_timeout() -> Duration {
         .unwrap_or(DEFAULT_RUN_TIMEOUT)
 }
 
-/// Everything the dispatch branch hands over from `handle_subagent_request`'s
+/// Everything the dispatch branch hands over from `run_shell_child`'s
 /// locals (already resolved: overrides, resume source, worktree).
 pub(super) struct AntigravityLaunch<'a> {
     pub request: SubagentRequest,
@@ -59,7 +58,6 @@ pub(super) struct AntigravityLaunch<'a> {
     pub resume_source: Option<&'a ResumeSourceData>,
     pub worktree_path: Option<PathBuf>,
     pub worktree_freshly_created: bool,
-    pub run_in_background: bool,
     pub cancel_token: CancellationToken,
     pub start: std::time::Instant,
 }
@@ -67,10 +65,9 @@ pub(super) struct AntigravityLaunch<'a> {
 pub(super) async fn run_antigravity_subagent(
     launch: AntigravityLaunch<'_>,
     ctx: &SubagentSpawnContext,
-    coordinator: &std::cell::RefCell<SubagentCoordinator>,
     gateway: &GatewaySender,
-    mut pending_guard: PendingGuard<'_>,
-) {
+    mut completion_data: ShellCompletionData,
+) -> ChildRunOutput<ShellCompletionData> {
     let AntigravityLaunch {
         request,
         agy_model,
@@ -78,7 +75,6 @@ pub(super) async fn run_antigravity_subagent(
         resume_source,
         worktree_path,
         worktree_freshly_created,
-        run_in_background,
         cancel_token,
         start,
     } = launch;
@@ -88,16 +84,12 @@ pub(super) async fn run_antigravity_subagent(
         let msg = "Antigravity subagents are disabled. Enable the \"Antigravity \
                    subagents\" setting (`[ui].antigravity_subagents`) first."
             .to_string();
-        pending_guard.set_error(msg.clone());
-        send_failure(request, &msg);
-        return;
+        return child_run_output(failure_result(&request, &msg), completion_data, None);
     }
     let binary = antigravity::binary_name(&state.config);
     if !state.installed {
         let msg = format!("Antigravity CLI (`{binary}`) was not found on this system.");
-        pending_guard.set_error(msg.clone());
-        send_failure(request, &msg);
-        return;
+        return child_run_output(failure_result(&request, &msg), completion_data, None);
     }
     let status = antigravity::cached_status(&binary).await;
     if !status.signed_in {
@@ -106,18 +98,14 @@ pub(super) async fn run_antigravity_subagent(
              to sign in, then retry.",
             status.detail.as_deref().unwrap_or("sign-in required")
         );
-        pending_guard.set_error(msg.clone());
-        send_failure(request, &msg);
-        return;
+        return child_run_output(failure_result(&request, &msg), completion_data, None);
     }
     if !status.models.is_empty() && !status.models.iter().any(|m| m == &agy_model) {
         let msg = format!(
             "Unknown antigravity model \"{agy_model}\". Available: {}",
             status.prefixed_models().join(", ")
         );
-        pending_guard.set_error(msg.clone());
-        send_failure(request, &msg);
-        return;
+        return child_run_output(failure_result(&request, &msg), completion_data, None);
     }
     // Pre-spawn availability: a prior run in this process may have cached
     // `GetAvailableModels`. Fail fast (with quota/availability context and a
@@ -129,9 +117,7 @@ pub(super) async fn run_antigravity_subagent(
             subagent_id = %request.id, model = %agy_model, ?issue,
             "antigravity spawn short-circuited on cached availability"
         );
-        pending_guard.set_error(msg.clone());
-        send_failure(request, &msg);
-        return;
+        return child_run_output(failure_result(&request, &msg), completion_data, None);
     }
     // Resume must have a stored conversation id — without one there is no
     // transcript to continue (the transcript lives inside agy, not in a
@@ -146,9 +132,7 @@ pub(super) async fn run_antigravity_subagent(
                 .map(|s| s.subagent_id.as_str())
                 .unwrap_or_default()
         );
-        pending_guard.set_error(msg.clone());
-        send_failure(request, &msg);
-        return;
+        return child_run_output(failure_result(&request, &msg), completion_data, None);
     }
     let full_slug = format!("{}{agy_model}", antigravity::MODEL_PREFIX);
     let subagent_id = request.id.clone();
@@ -245,6 +229,7 @@ pub(super) async fn run_antigravity_subagent(
         },
         ctx.parent_cmd_tx.as_ref(),
     );
+    completion_data.spawned_notification_emitted = true;
     // Full access by default: headless agy auto-denies mutating tools
     // without its skip-permissions flag, which surfaced as constant
     // permission errors for implementation-stage subagents. Antigravity
@@ -423,6 +408,7 @@ pub(super) async fn run_antigravity_subagent(
         && !result.output.is_empty()
         && write_subagent_output(&subagent_meta_dir, &result.output))
     .then(|| subagent_meta_dir.clone());
+    completion_data.set_persisted_output_dir(persisted_output_dir);
     let outcome = if result.success {
         xai_grok_telemetry::events::Outcome::Completed
     } else if result.cancelled {
@@ -438,66 +424,7 @@ pub(super) async fn run_antigravity_subagent(
         tool_calls: 0,
         tokens_used: None,
     });
-    let (block_waited, explicitly_killed) = {
-        let mut coord = coordinator.borrow_mut();
-        (
-            coord.block_wait_delivered_or_live(&subagent_id),
-            coord.is_explicitly_killed(&subagent_id),
-        )
-    };
-    let will_wake = should_auto_wake_subagent(
-        run_in_background,
-        result.cancelled,
-        ctx.auto_wake_enabled,
-        block_waited,
-        explicitly_killed,
-        ctx.goal_loop_active
-            .load(std::sync::atomic::Ordering::Relaxed),
-        ctx.parent_cmd_tx.is_some(),
-    );
-    emit_subagent_notification(
-        gateway,
-        &ctx.parent_session_id,
-        SessionUpdate::SubagentFinished {
-            subagent_id: subagent_id.clone(),
-            child_session_id: child_session_id.0.to_string(),
-            status: result.status().to_string(),
-            error: result.error.clone(),
-            tool_calls: result.tool_calls,
-            turns: result.turns,
-            duration_ms,
-            tokens_used: 0,
-            output: if result.success {
-                Some(result.output.to_string())
-            } else {
-                None
-            },
-            will_wake,
-        },
-        ctx.parent_cmd_tx.as_ref(),
-    );
-    pending_guard.defuse();
-    coordinator.borrow_mut().complete_pending_with_result(
-        &subagent_id,
-        result.clone(),
-        request.resume_from.clone(),
-        effective_cwd_str,
-        worktree_path,
-        full_slug,
-        conversation_id,
-        persisted_output_dir,
-        request.runtime_overrides.completion_output_cap,
-    );
-    if will_wake {
-        inject_subagent_completed_prompt(
-            &subagent_id,
-            &result,
-            &request,
-            &ctx.task_completion_reservations,
-            ctx.parent_cmd_tx.as_ref(),
-            &ctx.task_output_tool_name,
-            &ctx.synthetic_trace_tx,
-        );
-    }
-    let _ = request.result_tx.send(result);
+    // The coordinator actor owns terminal disposition: result delivery,
+    // SubagentFinished presentation, auto-wake, and the completed registry.
+    child_run_output(result, completion_data, None)
 }

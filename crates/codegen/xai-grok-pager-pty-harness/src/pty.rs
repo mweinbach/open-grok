@@ -985,7 +985,7 @@ mod tests {
             "hermetic baseline must remove unrelated inherited vars"
         );
         assert_eq!(
-            cmd.get_env("GROK_HOME").and_then(|v| v.to_str()),
+            cmd.get_env("OPENGROK_HOME").and_then(|v| v.to_str()),
             sandbox.grok_home().to_str()
         );
     }
@@ -1002,7 +1002,7 @@ mod tests {
             sandbox.home().to_str()
         );
         assert_eq!(
-            cmd.get_env("GROK_HOME").and_then(|v| v.to_str()),
+            cmd.get_env("OPENGROK_HOME").and_then(|v| v.to_str()),
             sandbox.grok_home().to_str()
         );
         assert_eq!(cmd.get_env("GROK_LEADER_SOCKET"), None);

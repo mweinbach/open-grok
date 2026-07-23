@@ -1637,6 +1637,8 @@ mod reasoning_compaction_regression_tests {
             provider: Default::default(),
             auth_scheme: Default::default(),
             extra_headers: Default::default(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
             context_window: 256_000,
             client_version: None,
             force_http1: false,
