@@ -1030,6 +1030,11 @@ fn turn_end_with_empty_queue_stays_idle() {
 fn multiple_queued_prompts_drain_one_per_turn() {
     // Deterministic effect lists — see `turn_end_with_empty_queue_stays_idle`.
     crate::appearance::cache::set_prompt_suggestions(false);
+    // Pin combine off: the assertion below (one SendPrompt per turn) is the
+    // non-combined drain shape. The drain reads the effective
+    // `[ui].combine_queued_prompts`, so a combine-on dev config would emit one
+    // merged `SendPromptBlocks` instead. Keep the test hermetic.
+    crate::appearance::cache::set_combine_queued_prompts(false);
     let mut app = test_app_with_agent();
     let id = AgentId(0);
 
@@ -1981,6 +1986,12 @@ fn send_prompt_stashes_in_flight_for_restore() {
 fn cancel_with_multiple_queued_prompts_drains_only_front_prompt() {
     // Cancel completion should only resume the next queued prompt, not
     // every queued prompt at once.
+    //
+    // Pin combine off so the drain reads a known value instead of the
+    // developer's on-disk `[ui].combine_queued_prompts`; this test proves the
+    // one-per-turn (non-combined) resume, which a combine-on dev config would
+    // collapse into a single merged send.
+    crate::appearance::cache::set_combine_queued_prompts(false);
     let mut app = test_app_with_agent();
     let id = AgentId(0);
 

@@ -2155,6 +2155,13 @@ mod tests {
     /// `mermaid_needs_tick()` flips back to false (the settle invariant).
     #[test]
     fn mermaid_view_miss_dispatches_then_settles() {
+        // Pin the process-global theme (and hold the shared test lock) so the
+        // click-time cache key stays fixed: the key is derived from
+        // `theme::cache::current_kind()`, a global `AtomicU8` that concurrent
+        // `set_theme`/`reset_for_test` tests mutate. Without the lock, a theme
+        // flip between the click and the key-recompute below makes the recomputed
+        // `want_key` miss the pending entry.
+        let _theme = crate::theme::cache::pin_theme();
         let mut agent = agent_with_session("miss");
         let src = "flowchart LR\nA-->B\n".to_string();
 
@@ -2202,6 +2209,13 @@ mod tests {
     /// dispatches no render, and never even spins up the worker runtime.
     #[test]
     fn mermaid_view_disk_hit_runs_action_without_dispatch() {
+        // Hold the theme lock for the whole test so the out_path we pre-seed the
+        // PNG at (computed from `current_kind()`) matches the path
+        // `request_mermaid_render` reads. A concurrent theme flip between the two
+        // reads would move the target path, turn the intended disk HIT into a
+        // miss, and spuriously dispatch a render (failing the `mermaid.is_none()`
+        // / no-tick assertions). See `pin_theme`.
+        let _theme = crate::theme::cache::pin_theme();
         let mut agent = agent_with_session("hit");
         let src = "flowchart LR\nA-->B\n".to_string();
         let theme = crate::theme::cache::current_kind();
@@ -2240,6 +2254,14 @@ mod tests {
     /// when the poll resolves the pending entry (two opens / two copies).
     #[test]
     fn mermaid_view_pending_dedup_wins_over_disk_hit_race() {
+        // Hold the theme lock so both clicks derive the SAME cache key: the dedup
+        // guard matches the second click against the first's in-flight (pending)
+        // key. A concurrent theme flip between the clicks (the global `CURRENT`
+        // theme is an `AtomicU8` other tests mutate) would give the second click a
+        // different key, bypass the `has_pending` guard, and fall through to the
+        // disk-hit / dispatch path — the exact double-fire this test guards. See
+        // `pin_theme`.
+        let _theme = crate::theme::cache::pin_theme();
         let mut agent = agent_with_session("race");
         let src = "flowchart LR\nA-->B\n".to_string();
 

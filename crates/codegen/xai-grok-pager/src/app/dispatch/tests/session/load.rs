@@ -875,6 +875,12 @@ fn auth_complete_restores_view_after_mid_session_login() {
 }
 #[test]
 fn session_loaded_drains_pending_first_prompt_to_front() {
+    // Pin combine off: SessionLoaded drains only the FRONT prompt (the fork's
+    // pending-first directive), leaving the user-typed prompt queued. The drain
+    // reads the effective `[ui].combine_queued_prompts`, so a combine-on dev
+    // config would merge both into one send and drain the queue to empty. Keep
+    // the front-first assertion hermetic.
+    crate::appearance::cache::set_combine_queued_prompts(false);
     let mut app = fork_test_app();
     dispatch(
         Action::Fork(fork_args(Some(false), Some("first directive"))),

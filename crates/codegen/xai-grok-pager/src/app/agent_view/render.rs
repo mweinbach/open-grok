@@ -110,7 +110,7 @@ impl AgentView {
         }
     }
     /// Shared "normal pane" hints: flag computation + `build_hints` + queue hint.
-    fn normal_pane_hints(&self, registry: &ActionRegistry) -> Vec<HintItem> {
+    pub(crate) fn normal_pane_hints(&self, registry: &ActionRegistry) -> Vec<HintItem> {
         let fold_label = self.selected_fold_label();
         let is_editing = matches!(self.prompt_mode, PromptMode::EditingQueued { .. });
         let selected_entry = self

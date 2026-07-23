@@ -1666,7 +1666,7 @@ mod background_and_tasks_shortcut_tests {
         assert!(child.is_subagent_view);
         assert!(
             !child
-                .current_shortcut_hints(&registry)
+                .normal_pane_hints(&registry)
                 .iter()
                 .any(|hint| hint.label == "send to bg")
         );

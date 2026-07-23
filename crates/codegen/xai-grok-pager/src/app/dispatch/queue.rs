@@ -2189,6 +2189,14 @@ mod tests {
         // Regression: editing #3, prompts #1 and #2 drain, #3 becomes front.
         // User presses Enter (save) → DrainQueue should send #3's updated text,
         // NOT #4 or the old text.
+        //
+        // Pin the combine flag off: this test asserts the one-per-turn (non
+        // combined) drain, and `maybe_drain_queue` reads the effective value via
+        // `combine_queued_prompts_enabled()` → the developer's on-disk
+        // `[ui].combine_queued_prompts`. Without pinning it, a dev config with the
+        // combine feature on merges the whole queue into one send and this
+        // non-combined assertion fails.
+        crate::appearance::cache::set_combine_queued_prompts(false);
         let mut app = test_app_with_agent();
         let id = AgentId(0);
 
