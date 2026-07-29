@@ -312,6 +312,7 @@ mod tests {
             env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(128_000).unwrap(),
             reasoning_effort: None,
+            service_tier: None,
             stream_tool_calls: None,
         }
     }

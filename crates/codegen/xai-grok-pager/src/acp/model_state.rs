@@ -3,8 +3,10 @@
 use agent_client_protocol as acp;
 use indexmap::IndexMap;
 use xai_grok_shell::sampling::types::{
-    ReasoningEffort, ReasoningEffortOption, parse_reasoning_effort_meta,
-    parse_reasoning_efforts_meta, supports_reasoning_effort_meta,
+    ModelServiceTier, ReasoningEffort, ReasoningEffortOption, SERVICE_TIER_DEFAULT_REQUEST_VALUE,
+    SERVICE_TIER_FAST_REQUEST_VALUE, parse_reasoning_effort_meta, parse_reasoning_efforts_meta,
+    parse_service_tier_meta, parse_service_tiers_meta, supports_fast_service_tier_meta,
+    supports_reasoning_effort_meta,
 };
 
 use crate::slash::commands::effort_levels::legacy_effort_options;
@@ -52,6 +54,9 @@ pub struct ModelState {
     pub available: IndexMap<acp::ModelId, acp::ModelInfo>,
     pub current: Option<acp::ModelId>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Selected Responses `service_tier` id for the session (`priority`, …).
+    /// `None` means standard routing (field omitted on the wire).
+    pub service_tier: Option<String>,
     /// External override for the context window size (tokens).
     /// When set, `get_context_window()` returns this instead of
     /// reading from the current model's metadata. Used for subagent
@@ -155,6 +160,12 @@ impl ModelState {
                 .as_ref()
                 .and_then(|id| self.available.get(id))
                 .and_then(|info| parse_reasoning_effort_meta(info.meta.as_ref()));
+            // Drop a previously selected tier when the new model cannot run it.
+            if let Some(tier) = self.service_tier.clone()
+                && !self.current_supports_service_tier(&tier)
+            {
+                self.service_tier = None;
+            }
         }
     }
 
@@ -170,6 +181,79 @@ impl ModelState {
                 .get(&model_id)
                 .and_then(|info| parse_reasoning_effort_meta(info.meta.as_ref()))
         });
+        if let Some(tier) = self.service_tier.clone()
+            && !self
+                .available
+                .get(&model_id)
+                .map(|info| {
+                    parse_service_tiers_meta(info.meta.as_ref())
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|t| t.id == tier)
+                })
+                .unwrap_or(false)
+        {
+            self.service_tier = None;
+        }
+    }
+
+    /// Whether the current model advertises Fast / priority service tier.
+    pub fn current_supports_fast(&self) -> bool {
+        self.current
+            .as_ref()
+            .and_then(|id| self.available.get(id))
+            .map(|info| supports_fast_service_tier_meta(info.meta.as_ref()))
+            .unwrap_or(false)
+    }
+
+    /// Fast service-tier id for the current model (`priority` when advertised).
+    pub fn current_fast_service_tier_id(&self) -> Option<String> {
+        self.current_service_tiers()
+            .into_iter()
+            .find(|tier| tier.is_fast())
+            .map(|tier| tier.id)
+    }
+
+    /// Whether Fast mode is currently enabled for the session.
+    pub fn fast_mode_enabled(&self) -> bool {
+        self.service_tier.as_deref().is_some_and(|tier| {
+            tier == SERVICE_TIER_FAST_REQUEST_VALUE || tier.eq_ignore_ascii_case("fast")
+        }) && self.current_supports_fast()
+    }
+
+    pub fn current_service_tiers(&self) -> Vec<ModelServiceTier> {
+        self.current
+            .as_ref()
+            .and_then(|id| self.available.get(id))
+            .and_then(|info| parse_service_tiers_meta(info.meta.as_ref()))
+            .unwrap_or_default()
+    }
+
+    pub fn current_supports_service_tier(&self, service_tier: &str) -> bool {
+        self.current_service_tiers()
+            .iter()
+            .any(|tier| tier.id == service_tier)
+    }
+
+    /// Apply a service-tier selection from a completed switch (`None` = default).
+    pub fn set_service_tier(&mut self, service_tier: Option<String>) {
+        self.service_tier = service_tier.and_then(|tier| {
+            if tier.is_empty() || tier.eq_ignore_ascii_case(SERVICE_TIER_DEFAULT_REQUEST_VALUE) {
+                None
+            } else {
+                Some(tier)
+            }
+        });
+    }
+
+    /// Sync session service tier from model meta when present (e.g. session load).
+    pub fn apply_service_tier_from_meta(
+        &mut self,
+        meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) {
+        if let Some(selection) = parse_service_tier_meta(meta) {
+            self.service_tier = selection;
+        }
     }
 
     /// The reasoning-effort menu for the current model. Gate-first: an unset or
@@ -316,6 +400,7 @@ impl From<Option<acp::SessionModelState>> for ModelState {
                     available: models,
                     current: current_model,
                     reasoning_effort,
+                    service_tier: None,
                     context_window_override: None,
                 }
             })

@@ -1514,7 +1514,11 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
         // Both the effort-bearing (`SwitchModel`) and bare
         // (`SetDefaultModel`) forms map to the same per-spawn staging — we
         // deliberately do NOT persist a global default here.
-        CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+        CommandResult::Action(Action::SwitchModel {
+            model_id,
+            effort,
+            service_tier: _,
+        }) => {
             stage_dashboard_model(app, model_id, effort);
             vec![]
         }

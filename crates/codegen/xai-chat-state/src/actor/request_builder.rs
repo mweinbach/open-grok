@@ -145,6 +145,7 @@ impl ChatStateActor {
             trace,
             prompt_cache_key: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
+            service_tier: self.state.sampling_config.service_tier.clone(),
             json_schema: None,
         }
     }

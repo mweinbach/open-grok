@@ -83,6 +83,11 @@ pub struct SamplerConfig {
     // Reasoning effort
     pub reasoning_effort: Option<ReasoningEffort>,
 
+    /// Responses API `service_tier` request value (`priority`, `flex`, …).
+    /// `None` omits the field (standard routing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+
     /// Effective Responses API reasoning-summary mode for this model.
     /// `None` omits the parameter (unsupported or explicitly disabled).
     #[serde(default)]
@@ -177,6 +182,7 @@ impl Default for SamplerConfig {
             stream_tool_calls: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
+            service_tier: None,
             reasoning_summary: None,
             origin_client: None,
             client_identifier: None,

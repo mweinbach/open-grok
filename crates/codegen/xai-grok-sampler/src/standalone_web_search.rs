@@ -307,6 +307,7 @@ mod tests {
             stream_tool_calls: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
+            service_tier: None,
             reasoning_summary: None,
             origin_client: None,
             client_identifier: None,

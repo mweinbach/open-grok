@@ -175,6 +175,7 @@ mod tests {
                 env_http_headers: Default::default(),
                 context_window: NonZeroU64::new(256_000).unwrap(),
                 reasoning_effort: None,
+                service_tier: None,
                 stream_tool_calls: None,
             },
             Box::new(xai_chat_state::NullChatPersistence),

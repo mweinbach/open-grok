@@ -3700,6 +3700,9 @@ fn merge_remote_provider_partition(
             entry.info.supports_reasoning_effort = donor.info.supports_reasoning_effort;
             entry.info.reasoning_effort = donor.info.reasoning_effort;
         }
+        if entry.info.service_tiers.is_empty() && !donor.info.service_tiers.is_empty() {
+            entry.info.service_tiers = donor.info.service_tiers.clone();
+        }
     }
     remote.retain(|_, entry| entry.info.provider == provider);
 
@@ -4803,6 +4806,9 @@ pub struct ModelInfo {
     /// Per-model reasoning-effort menu (source of truth); legacy fields derived from it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
+    /// Service tiers this model can run with (Codex Fast/Flex routing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_tiers: Vec<xai_grok_sampling_types::ModelServiceTier>,
     /// Whether this model accepts the Responses `reasoning.summary` member.
     #[serde(default = "default_true")]
     pub supports_reasoning_summary_parameter: bool,
@@ -4859,6 +4865,7 @@ impl ModelInfo {
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            service_tiers: Vec::new(),
             supports_reasoning_summary_parameter: false,
             default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
@@ -4902,6 +4909,7 @@ impl ModelInfo {
             reasoning_effort: entry.reasoning_effort,
             supports_reasoning_effort: entry.supports_reasoning_effort,
             reasoning_efforts: entry.reasoning_efforts.clone(),
+            service_tiers: Vec::new(),
             supports_reasoning_summary_parameter: entry.supports_reasoning_summary_parameter,
             default_reasoning_summary: entry.default_reasoning_summary,
             supports_backend_search: entry.supports_backend_search,
@@ -5884,6 +5892,7 @@ pub fn resolve_aux_model_sampling_config(
                 reasoning_effort: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
+                service_tiers: Vec::new(),
                 supports_reasoning_summary_parameter: false,
                 default_reasoning_summary: ReasoningSummary::None,
                 supports_backend_search: false,
@@ -6121,6 +6130,7 @@ pub fn sampling_config_for_model(
             .then_some(client_version)
             .flatten(),
         reasoning_effort: info.reasoning_effort,
+        service_tier: None,
         reasoning_summary: model_reasoning_summary(info),
         force_http1: false,
         max_retries: info.max_retries,
@@ -6293,6 +6303,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            service_tiers: Vec::new(),
             supports_reasoning_summary_parameter: false,
             default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
@@ -6432,6 +6443,12 @@ pub fn to_acp_model_info(
                     map.insert(
                         REASONING_EFFORTS_META_KEY.to_string(),
                         reasoning_efforts_meta_value(&info.reasoning_efforts),
+                    );
+                }
+                if !info.service_tiers.is_empty() {
+                    map.insert(
+                        xai_grok_sampling_types::SERVICE_TIERS_META_KEY.to_string(),
+                        xai_grok_sampling_types::service_tiers_meta_value(&info.service_tiers),
                     );
                 }
                 if map.is_empty() { None } else { Some(map) }
@@ -7715,6 +7732,7 @@ reasoning_effort = "low"
                 reasoning_effort: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
+                service_tiers: Vec::new(),
                 supports_reasoning_summary_parameter: false,
                 default_reasoning_summary: ReasoningSummary::None,
                 supports_backend_search: false,
@@ -13485,6 +13503,7 @@ default = "grok-4.5"
                 reasoning_effort: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
+                service_tiers: Vec::new(),
                 supports_reasoning_summary_parameter: false,
                 default_reasoning_summary: ReasoningSummary::None,
                 supports_backend_search: false,

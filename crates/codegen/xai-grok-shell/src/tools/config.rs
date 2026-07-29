@@ -238,6 +238,7 @@ impl ShellToolsetConfig {
             context_window: 256_000,
             client_version: None,
             reasoning_effort: None,
+            service_tier: None,
             reasoning_summary: None,
             force_http1: false,
             max_retries: None,

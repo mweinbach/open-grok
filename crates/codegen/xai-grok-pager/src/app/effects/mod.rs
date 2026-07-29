@@ -3413,27 +3413,31 @@ pub(crate) fn execute(
             session_id,
             model_id,
             effort,
+            service_tier,
             prev_model_id,
         } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
-                    let meta = effort
-                        .map(|eff| {
-                            use xai_grok_shell::sampling::types::{
-                                REASONING_EFFORT_META_KEY, reasoning_effort_meta_value,
-                            };
-                            let mut m = acp::Meta::new();
-                            m.insert(
-                                REASONING_EFFORT_META_KEY.to_string(),
-                                reasoning_effort_meta_value(eff),
-                            );
-                            m
-                        });
-                    let req = acp::SetSessionModelRequest::new(
-                            session_id,
-                            model_id.clone(),
-                        )
+                    use xai_grok_shell::sampling::types::{
+                        REASONING_EFFORT_META_KEY, SERVICE_TIER_META_KEY,
+                        reasoning_effort_meta_value, service_tier_meta_value,
+                    };
+                    let mut meta = acp::Meta::new();
+                    if let Some(eff) = effort {
+                        meta.insert(
+                            REASONING_EFFORT_META_KEY.to_string(),
+                            reasoning_effort_meta_value(eff),
+                        );
+                    }
+                    if let Some(tier_selection) = service_tier.as_ref() {
+                        meta.insert(
+                            SERVICE_TIER_META_KEY.to_string(),
+                            service_tier_meta_value(tier_selection.as_deref()),
+                        );
+                    }
+                    let meta = (!meta.is_empty()).then_some(meta);
+                    let req = acp::SetSessionModelRequest::new(session_id, model_id.clone())
                         .meta(meta);
                     let result = acp_send(req, &tx)
                         .await
@@ -3455,6 +3459,7 @@ pub(crate) fn execute(
                         agent_id,
                         model_id,
                         effort,
+                        service_tier,
                         result,
                         prev_model_id,
                     }

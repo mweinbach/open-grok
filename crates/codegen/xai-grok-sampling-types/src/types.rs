@@ -934,6 +934,132 @@ pub fn reasoning_efforts_meta_value(opts: &[ReasoningEffortOption]) -> serde_jso
     serde_json::to_value(opts).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
 }
 
+// ============================================================================
+// Service tiers (Codex Fast / Flex routing)
+// ============================================================================
+
+/// Selected service-tier id in ACP model meta (`priority`, `flex`, …).
+pub const SERVICE_TIER_META_KEY: &str = "serviceTier";
+/// Catalog of service tiers available for a model.
+pub const SERVICE_TIERS_META_KEY: &str = "serviceTiers";
+/// Explicit standard routing — not a catalog id. Omits `service_tier` on the wire.
+pub const SERVICE_TIER_DEFAULT_REQUEST_VALUE: &str = "default";
+/// Wire/request value for Fast mode (Codex `ServiceTier::Fast`).
+pub const SERVICE_TIER_FAST_REQUEST_VALUE: &str = "priority";
+/// Slash-command / catalog display name for Fast mode.
+pub const SERVICE_TIER_FAST_NAME: &str = "fast";
+
+/// One selectable service tier advertised by a model catalog entry.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelServiceTier {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl ModelServiceTier {
+    pub fn is_fast(&self) -> bool {
+        self.id == SERVICE_TIER_FAST_REQUEST_VALUE
+            || self.name.eq_ignore_ascii_case(SERVICE_TIER_FAST_NAME)
+            || self.id.eq_ignore_ascii_case(SERVICE_TIER_FAST_NAME)
+    }
+}
+
+/// Whether the model meta advertises at least one Fast / priority service tier.
+pub fn supports_fast_service_tier_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    parse_service_tiers_meta(meta)
+        .unwrap_or_default()
+        .iter()
+        .any(ModelServiceTier::is_fast)
+}
+
+/// Parse the current session service-tier selection from model meta.
+///
+/// Returns:
+/// - `None` when the key is absent (caller may preserve prior selection)
+/// - `Some(None)` for explicit `"default"` / empty (standard routing)
+/// - `Some(Some(id))` for a concrete tier id such as `"priority"`
+pub fn parse_service_tier_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<Option<String>> {
+    let raw = meta?.get(SERVICE_TIER_META_KEY)?;
+    let s = match raw.as_str() {
+        Some(s) => s.trim(),
+        None => {
+            tracing::warn!(value = %raw, "meta.serviceTier: expected string, ignoring");
+            return None;
+        }
+    };
+    if s.is_empty() || s.eq_ignore_ascii_case(SERVICE_TIER_DEFAULT_REQUEST_VALUE) {
+        return Some(None);
+    }
+    Some(Some(s.to_owned()))
+}
+
+pub fn service_tier_meta_value(tier: Option<&str>) -> serde_json::Value {
+    serde_json::Value::String(
+        tier.unwrap_or(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+            .to_owned(),
+    )
+}
+
+/// Parse the per-model service-tier menu from ACP `meta`.
+pub fn parse_service_tiers_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<Vec<ModelServiceTier>> {
+    let raw = meta?.get(SERVICE_TIERS_META_KEY)?;
+    let arr = match raw.as_array() {
+        Some(arr) => arr,
+        None => {
+            tracing::warn!(value = %raw, "meta.serviceTiers: expected array, ignoring");
+            return None;
+        }
+    };
+    let tiers: Vec<ModelServiceTier> = arr
+        .iter()
+        .filter_map(|el| match serde_json::from_value::<ModelServiceTier>(el.clone()) {
+            Ok(tier) if !tier.id.trim().is_empty() => Some(ModelServiceTier {
+                id: tier.id.trim().to_owned(),
+                name: if tier.name.trim().is_empty() {
+                    tier.id.trim().to_owned()
+                } else {
+                    tier.name.trim().to_owned()
+                },
+                description: tier
+                    .description
+                    .map(|d| d.trim().to_owned())
+                    .filter(|d| !d.is_empty()),
+            }),
+            Ok(_) => None,
+            Err(err) => {
+                tracing::warn!(value = %el, error = %err, "serviceTiers: skipping invalid entry");
+                None
+            }
+        })
+        .collect();
+    (!tiers.is_empty()).then_some(tiers)
+}
+
+pub fn service_tiers_meta_value(tiers: &[ModelServiceTier]) -> serde_json::Value {
+    serde_json::to_value(tiers).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+}
+
+/// Map a catalog/request service-tier id to the Responses API enum.
+pub fn service_tier_to_responses_api(tier: &str) -> Option<crate::rs::ServiceTier> {
+    match tier.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(crate::rs::ServiceTier::Auto),
+        "default" => Some(crate::rs::ServiceTier::Default),
+        "flex" => Some(crate::rs::ServiceTier::Flex),
+        "scale" => Some(crate::rs::ServiceTier::Scale),
+        // Codex Fast mode uses the wire value `priority` (alias `fast`).
+        "priority" | "fast" => Some(crate::rs::ServiceTier::Priority),
+        _ => None,
+    }
+}
+
 /// Which API backend to use for model inference.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1390,6 +1516,10 @@ pub struct SamplingConfig {
     /// Reasoning effort level for reasoning models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Responses API `service_tier` request value (`priority`, `flex`, …).
+    /// `None` omits the field (standard routing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     /// When true, inject `stream_tool_calls: true` into the Responses
     /// API request body so the upstream emits per-chunk argument deltas.
     #[serde(default, skip_serializing_if = "Option::is_none")]

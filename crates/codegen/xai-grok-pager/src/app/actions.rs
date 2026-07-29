@@ -426,6 +426,12 @@ pub enum Action {
     SwitchModel {
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        /// Service-tier selection for the request body.
+        /// - `None`: do not send a service-tier meta key (shell may preserve the
+        ///   previous session tier when the model still supports it).
+        /// - `Some(None)`: explicit standard routing (`default`).
+        /// - `Some(Some(id))`: concrete tier id such as `priority` (Fast).
+        service_tier: Option<Option<String>>,
     },
     /// Cancel the currently running turn.
     CancelTurn,
@@ -1792,6 +1798,8 @@ pub enum Effect {
         session_id: acp::SessionId,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        /// See [`Action::SwitchModel::service_tier`].
+        service_tier: Option<Option<String>>,
         /// The model that was active before the optimistic UI update
         /// in `set_default_model`. `None` for `Action::SwitchModel`
         /// (no optimistic update). Threaded through to
@@ -2832,6 +2840,8 @@ pub enum TaskResult {
         agent_id: AgentId,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        /// See [`Action::SwitchModel::service_tier`].
+        service_tier: Option<Option<String>>,
         result: Result<(), SwitchModelError>,
         /// Forwarded from `Effect::SwitchModel.prev_model_id` for
         /// rollback on `IncompatibleAgent`.

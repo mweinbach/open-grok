@@ -9,7 +9,9 @@ use crate::agent::mvp_agent::{
 use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
-use xai_grok_sampling_types::parse_reasoning_effort_meta;
+use xai_grok_sampling_types::{
+    SERVICE_TIER_DEFAULT_REQUEST_VALUE, parse_reasoning_effort_meta, parse_service_tier_meta,
+};
 /// Apply a model switch to a session (no gate — `set_session_model` gates first).
 pub(crate) async fn apply(
     agent: &MvpAgent,
@@ -42,6 +44,10 @@ async fn apply_with_resolved_tool_policy(
     );
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
     let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
+    // `None` = meta key absent (preserve prior session tier when still valid).
+    // `Some(None)` = explicit standard routing (`default`).
+    // `Some(Some(id))` = concrete tier id such as `priority`.
+    let service_tier_override = parse_service_tier_meta(args.meta.as_ref());
     let acp::SetSessionModelRequest {
         session_id,
         model_id,
@@ -148,6 +154,54 @@ async fn apply_with_resolved_tool_policy(
                 effort = %eff,
                 "set_session_model: ignoring reasoning_effort override — model does not support it"
             );
+        }
+    }
+    let previous_service_tier = handle
+        .chat_state_handle
+        .get_sampling_config()
+        .await
+        .and_then(|cfg| cfg.service_tier);
+    match service_tier_override {
+        Some(Some(tier_id)) => {
+            if agent
+                .models_manager
+                .model_supports_service_tier(model_id.0.as_ref(), &tier_id)
+            {
+                tracing::info!(
+                    session_id = %session_id.0,
+                    service_tier = %tier_id,
+                    "set_session_model: applying service_tier override from meta"
+                );
+                model_sampling.service_tier = Some(tier_id);
+            } else {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    model_id = %model_id.0,
+                    service_tier = %tier_id,
+                    "set_session_model: ignoring service_tier override — model does not support it"
+                );
+                model_sampling.service_tier = None;
+            }
+        }
+        Some(None) => {
+            tracing::info!(
+                session_id = %session_id.0,
+                "set_session_model: clearing service_tier (explicit {SERVICE_TIER_DEFAULT_REQUEST_VALUE})"
+            );
+            model_sampling.service_tier = None;
+        }
+        None => {
+            // Preserve the prior session selection when the new model still
+            // advertises that tier; otherwise drop it.
+            if let Some(prev) = previous_service_tier
+                && agent
+                    .models_manager
+                    .model_supports_service_tier(model_id.0.as_ref(), &prev)
+            {
+                model_sampling.service_tier = Some(prev);
+            } else {
+                model_sampling.service_tier = None;
+            }
         }
     }
     // A provider-harness rebuild happens before the actor applies the model.

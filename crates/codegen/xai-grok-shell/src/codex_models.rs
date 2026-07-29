@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 use xai_grok_sampling_types::{
-    ApiBackend, ModelProvider, ReasoningEffort, ReasoningEffortOption, ReasoningSummary, ToolMode,
+    ApiBackend, ModelProvider, ModelServiceTier, ReasoningEffort, ReasoningEffortOption,
+    ReasoningSummary, SERVICE_TIER_FAST_NAME, SERVICE_TIER_FAST_REQUEST_VALUE, ToolMode,
 };
 
 pub(crate) const CODEX_MODELS_CACHE_FILE: &str = "codex_models_cache.json";
@@ -235,6 +236,22 @@ struct CodexWireModel {
     tool_mode: Option<String>,
     #[serde(default)]
     multi_agent_version: Option<String>,
+    /// Deprecated Codex field; treat `fast` as a priority service tier.
+    #[serde(default)]
+    additional_speed_tiers: Vec<String>,
+    #[serde(default)]
+    service_tiers: Vec<CodexWireServiceTier>,
+    #[serde(default)]
+    default_service_tier: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CodexWireServiceTier {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -643,6 +660,48 @@ impl CodexModelsClient {
             info.supports_reasoning_effort = true;
             info.reasoning_efforts = reasoning_efforts;
         }
+
+        let mut service_tiers: Vec<ModelServiceTier> = wire
+            .service_tiers
+            .into_iter()
+            .filter_map(|tier| {
+                let id = tier.id.trim().to_owned();
+                if id.is_empty() {
+                    return None;
+                }
+                let name = if tier.name.trim().is_empty() {
+                    id.clone()
+                } else {
+                    tier.name.trim().to_owned()
+                };
+                let description = {
+                    let d = tier.description.trim();
+                    (!d.is_empty()).then(|| d.to_owned())
+                };
+                Some(ModelServiceTier {
+                    id,
+                    name,
+                    description,
+                })
+            })
+            .collect();
+        // Legacy catalogs advertise Fast via additional_speed_tiers without a
+        // full service_tiers entry.
+        let has_legacy_fast = wire
+            .additional_speed_tiers
+            .iter()
+            .any(|tier| tier.eq_ignore_ascii_case(SERVICE_TIER_FAST_NAME));
+        if has_legacy_fast && !service_tiers.iter().any(ModelServiceTier::is_fast) {
+            service_tiers.push(ModelServiceTier {
+                id: SERVICE_TIER_FAST_REQUEST_VALUE.to_owned(),
+                name: "Fast".to_owned(),
+                description: Some("Fastest inference with increased plan usage".to_owned()),
+            });
+        }
+        // default_service_tier is catalog metadata only; it is not auto-applied
+        // to requests (matches codex-rs service_tier_for_request).
+        let _ = wire.default_service_tier;
+        info.service_tiers = service_tiers;
 
         Some(CodexCatalogModel {
             priority: wire.priority,

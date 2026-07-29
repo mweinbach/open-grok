@@ -63,6 +63,7 @@ async fn create_test_actor(
             context_window: std::num::NonZeroU64::new(context_window)
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
+            service_tier: None,
             stream_tool_calls: None,
         },
         Box::new(xai_chat_state::NullChatPersistence),
@@ -508,6 +509,7 @@ async fn create_test_actor_with_memory(
             context_window: std::num::NonZeroU64::new(context_window)
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
+            service_tier: None,
             stream_tool_calls: None,
         },
         Box::new(xai_chat_state::NullChatPersistence),
@@ -1239,6 +1241,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     env_http_headers: Default::default(),
                     context_window: std::num::NonZeroU64::new(200_000).unwrap(),
                     reasoning_effort: None,
+                    service_tier: None,
                     stream_tool_calls: None,
                 },
                 Box::new(xai_chat_state::NullChatPersistence),

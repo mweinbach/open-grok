@@ -1073,6 +1073,9 @@ pub struct ConversationRequest {
     pub trace: Option<Box<dyn TraceContext>>,
     /// Reasoning effort level for reasoning models.
     pub reasoning_effort: Option<crate::ReasoningEffort>,
+    /// Responses API `service_tier` request value (`priority`, `flex`, …).
+    /// `None` omits the field (standard routing).
+    pub service_tier: Option<String>,
     /// JSON Schema for structured output (strict mode).
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
@@ -3848,7 +3851,10 @@ impl From<&ConversationRequest> for rs::CreateResponse {
                 summary: Some(rs::ReasoningSummary::Concise),
             }),
             safety_identifier: None,
-            service_tier: None,
+            service_tier: req
+                .service_tier
+                .as_deref()
+                .and_then(crate::service_tier_to_responses_api),
             store: None,
             stream: None,
             stream_options: None,

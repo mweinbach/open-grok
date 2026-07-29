@@ -119,6 +119,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     env_http_headers: Default::default(),
                     context_window: std::num::NonZeroU64::new(200_000).unwrap(),
                     reasoning_effort: None,
+                    service_tier: None,
                     stream_tool_calls: None,
                 },
                 Box::new(xai_chat_state::NullChatPersistence),

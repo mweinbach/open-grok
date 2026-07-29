@@ -573,6 +573,7 @@ fn handle_kimi_model_rebind_complete(
             session_id: current_session_id,
             model_id: target_model,
             effort: target_effort,
+            service_tier: None,
             prev_model_id: None,
         }];
     }
@@ -821,6 +822,7 @@ fn handle_fireworks_model_rebind_complete(
             session_id: current_session_id,
             model_id: target_model,
             effort: target_effort,
+            service_tier: None,
             prev_model_id: None,
         }];
     }
@@ -1048,6 +1050,7 @@ fn handle_deepseek_model_rebind_complete(
             session_id: current_session_id,
             model_id: target_model,
             effort: target_effort,
+            service_tier: None,
             prev_model_id: None,
         }];
     }
@@ -1269,6 +1272,7 @@ fn handle_opencode_go_model_rebind_complete(
             session_id: current_session_id,
             model_id: target_model,
             effort: target_effort,
+            service_tier: None,
             prev_model_id: None,
         }];
     }
@@ -2029,6 +2033,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             agent_id,
             model_id,
             effort,
+            service_tier,
             result,
             prev_model_id,
         } => {
@@ -2075,6 +2080,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 agent_id,
                 model_id,
                 effort,
+                service_tier,
                 result,
                 prev_model_id,
             );

@@ -1166,6 +1166,41 @@ impl ModelsManager {
             .unwrap_or_default()
     }
 
+    /// Service tiers advertised for `model_id` (Codex Fast/Flex routing).
+    pub fn model_service_tiers(
+        &self,
+        model_id: &str,
+    ) -> Vec<xai_grok_sampling_types::ModelServiceTier> {
+        self.inner
+            .models
+            .read()
+            .get(model_id)
+            .map(|e| e.info().service_tiers.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `model_id` advertises a concrete service-tier id.
+    pub fn model_supports_service_tier(&self, model_id: &str, service_tier: &str) -> bool {
+        self.model_service_tiers(model_id)
+            .iter()
+            .any(|tier| tier.id == service_tier)
+    }
+
+    /// Whether `model_id` advertises Fast / priority routing (`/fast`).
+    pub fn model_supports_fast_service_tier(&self, model_id: &str) -> bool {
+        self.model_service_tiers(model_id)
+            .iter()
+            .any(xai_grok_sampling_types::ModelServiceTier::is_fast)
+    }
+
+    /// Resolve the Fast service-tier id for `model_id`, if advertised.
+    pub fn model_fast_service_tier_id(&self, model_id: &str) -> Option<String> {
+        self.model_service_tiers(model_id)
+            .into_iter()
+            .find(|tier| tier.is_fast())
+            .map(|tier| tier.id)
+    }
+
     /// Whether a concrete effort is accepted by this model's live catalog
     /// entry. A non-empty server menu is authoritative; legacy entries fall
     /// back to the standard reasoning menu.

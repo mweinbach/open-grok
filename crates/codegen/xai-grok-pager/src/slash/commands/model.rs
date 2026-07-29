@@ -95,6 +95,7 @@ impl SlashCommand for ModelCommand {
                 Ok(effort) => CommandResult::Action(Action::SwitchModel {
                     model_id: id,
                     effort: Some(effort),
+                    service_tier: None,
                 }),
                 Err(err) => CommandResult::Error(err.message()),
             };
@@ -494,7 +495,9 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&state);
         let result = ModelCommand.run(&mut ctx, "Reasoning X xhigh");
         match result {
-            CommandResult::Action(Action::SwitchModel { model_id, effort }) => {
+            CommandResult::Action(Action::SwitchModel {
+                model_id, effort, ..
+            }) => {
                 assert_eq!(model_id.0.as_ref(), "reasoning-x");
                 assert_eq!(effort, Some(ReasoningEffort::Xhigh));
             }

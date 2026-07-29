@@ -279,6 +279,7 @@ pub(crate) async fn create_test_actor_ex(
             context_window: std::num::NonZeroU64::new(context_window)
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
+            service_tier: None,
             stream_tool_calls: None,
         },
         Box::new(xai_chat_state::NullChatPersistence),

@@ -851,6 +851,7 @@ async fn read_parent_sampling_config(
                 context_window: cfg.context_window.get(),
                 client_version: creds.client_version,
                 reasoning_effort: cfg.reasoning_effort,
+                service_tier: None,
                 reasoning_summary: ctx
                     .models_manager
                     .model_reasoning_summary(ctx.model_id.0.as_ref()),

@@ -24,6 +24,7 @@ pub mod effort_levels;
 pub mod exit;
 pub mod expand;
 pub mod export;
+pub mod fast;
 pub mod feedback;
 pub mod find;
 pub mod fork;
@@ -100,6 +101,8 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(screen_mode_switch::ScreenModeSwitchCommand::fullscreen()),
         Arc::new(model::ModelCommand),
         Arc::new(effort::EffortCommand),
+        // Immediately after /model (Codex catalogs expose Fast as a service tier).
+        Arc::new(fast::FastCommand),
         Arc::new(always_approve::AlwaysApproveCommand),
         Arc::new(auto::AutoCommand),
         Arc::new(multiline::MultilineCommand),
@@ -275,6 +278,7 @@ mod tests {
             "exit",
             "expand",
             "export",
+            "fast",
             "feedback",
             "find",
             "fork",

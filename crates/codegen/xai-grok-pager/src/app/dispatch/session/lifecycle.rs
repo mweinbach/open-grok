@@ -1007,6 +1007,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 session_id: session_id_clone.clone(),
                 model_id,
                 effort,
+                service_tier: None,
                 prev_model_id: None,
             });
         }
@@ -1123,6 +1124,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
                 session_id: session_id_clone.clone(),
                 model_id,
                 effort,
+                service_tier: None,
                 prev_model_id: None,
             });
         }
@@ -1272,6 +1274,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
     agent_id: AgentId,
     model_id: acp::ModelId,
     effort: Option<ReasoningEffort>,
+    service_tier: Option<Option<String>>,
     result: Result<(), SwitchModelError>,
     prev_model_id: Option<acp::ModelId>,
 ) -> Vec<Effect> {
@@ -1290,15 +1293,34 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     .unwrap_or_else(|| model_id.0.to_string());
                 let prev_model = agent.session.models.current.clone();
                 let prev_effort = agent.session.models.reasoning_effort;
+                let prev_service_tier = agent.session.models.service_tier.clone();
                 agent.session.models.set_current(model_id.clone(), effort);
+                if let Some(selection) = service_tier {
+                    agent.session.models.set_service_tier(selection);
+                }
                 let resolved_effort = agent.session.models.reasoning_effort;
-                let unchanged =
-                    prev_model.as_ref() == Some(&model_id) && prev_effort == resolved_effort;
+                let resolved_service_tier = agent.session.models.service_tier.clone();
+                let model_or_effort_changed =
+                    prev_model.as_ref() != Some(&model_id) || prev_effort != resolved_effort;
+                let service_tier_changed = prev_service_tier != resolved_service_tier;
+                let unchanged = !model_or_effort_changed && !service_tier_changed;
                 if !unchanged {
-                    let msg = if let Some(eff) = resolved_effort {
-                        format!("Switched to {display_name} ({eff} effort)")
+                    let msg = if !model_or_effort_changed && service_tier_changed {
+                        if agent.session.models.fast_mode_enabled() {
+                            "Fast mode enabled".to_string()
+                        } else {
+                            "Fast mode disabled".to_string()
+                        }
                     } else {
-                        format!("Switched to {display_name}")
+                        let mut msg = if let Some(eff) = resolved_effort {
+                            format!("Switched to {display_name} ({eff} effort)")
+                        } else {
+                            format!("Switched to {display_name}")
+                        };
+                        if agent.session.models.fast_mode_enabled() {
+                            msg.push_str(" · Fast");
+                        }
+                        msg
                     };
                     agent.scrollback.push_block(RenderBlock::system(msg));
                 }

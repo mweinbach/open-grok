@@ -316,6 +316,7 @@ impl SessionActor {
                 env_http_headers: sampling_config.env_http_headers.clone(),
                 context_window: new_context_window,
                 reasoning_effort: sampling_config.reasoning_effort,
+                service_tier: sampling_config.service_tier.clone(),
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),
             });
         let existing = self.chat_state_handle.get_credentials().await;

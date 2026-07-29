@@ -576,6 +576,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
             env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(1).expect("non-zero"),
             reasoning_effort: None,
+            service_tier: None,
             stream_tool_calls: None,
         },
         Box::new(xai_chat_state::NullChatPersistence),

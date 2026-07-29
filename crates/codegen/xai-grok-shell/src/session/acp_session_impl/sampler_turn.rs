@@ -643,6 +643,7 @@ impl SessionActor {
                 env_http_headers: Default::default(),
                 context_window: std::num::NonZeroU64::new(256_000).unwrap(),
                 reasoning_effort: None,
+                service_tier: None,
                 stream_tool_calls: None,
             });
         let creds = self.chat_state_handle.get_credentials().await;
@@ -732,6 +733,7 @@ impl SessionActor {
             context_window: cfg.context_window.get(),
             client_version: creds.client_version,
             reasoning_effort: cfg.reasoning_effort,
+            service_tier: cfg.service_tier.clone(),
             reasoning_summary,
             force_http1: false,
             max_retries: Some(self.max_retries),

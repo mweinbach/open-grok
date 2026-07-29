@@ -2068,6 +2068,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            service_tiers: Vec::new(),
             supports_reasoning_summary_parameter: false,
             default_reasoning_summary: xai_grok_sampling_types::ReasoningSummary::None,
             supports_backend_search: false,
@@ -2340,6 +2341,7 @@ fn test_sampling_config(model_slug: &str) -> xai_grok_sampling_types::SamplingCo
         env_http_headers: Default::default(),
         context_window: NonZeroU64::new(256_000).expect("non-zero context window"),
         reasoning_effort: None,
+        service_tier: None,
         stream_tool_calls: None,
     }
 }

@@ -92,6 +92,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         stream_tool_calls: false,
         idle_timeout_secs: Some(30),
         reasoning_effort: None,
+        service_tier: None,
         reasoning_summary: None,
         origin_client: None,
         client_identifier: None,

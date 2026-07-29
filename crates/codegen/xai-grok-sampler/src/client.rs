@@ -1101,6 +1101,7 @@ struct ClientDefaults {
     idle_timeout_secs: Option<u64>,
     codex_multi_agent_v2: bool,
     reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+    service_tier: Option<String>,
     reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     max_retries: u32,
@@ -1372,6 +1373,7 @@ impl SamplingClient {
             // "unset" (not "none"): `ReasoningEffort::None` is a real wire value;
             // logging the absent Option as "none" looked like we were sending it.
             reasoning_effort = config.reasoning_effort.map_or("unset", |e| e.as_str()),
+            service_tier = config.service_tier.as_deref().unwrap_or("unset"),
             has_api_key = config.api_key.is_some(),
             has_bearer_resolver = config.bearer_resolver.is_some(),
             has_authorization_header = headers.get(AUTHORIZATION).is_some(),
@@ -1391,6 +1393,7 @@ impl SamplingClient {
             idle_timeout_secs: config.idle_timeout_secs,
             codex_multi_agent_v2: config.codex_multi_agent_v2,
             reasoning_effort: config.reasoning_effort,
+            service_tier: config.service_tier,
             reasoning_summary: config.reasoning_summary,
             doom_loop_recovery: config.doom_loop_recovery,
             max_retries,
@@ -3066,6 +3069,10 @@ impl SamplingClient {
             request.reasoning_effort = self.defaults.reasoning_effort;
         }
 
+        if request.service_tier.is_none() {
+            request.service_tier = self.defaults.service_tier.clone();
+        }
+
         // Codex rejects invalid base64 data URLs, remote image URLs, and
         // detail=low tool images with a non-retryable 400 that bricks the
         // turn. Prepare images before conversion (parity with codex-rs
@@ -3552,6 +3559,7 @@ mod tests {
             stream_tool_calls: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
+            service_tier: None,
             reasoning_summary: None,
             origin_client: None,
             client_identifier: None,

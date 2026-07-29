@@ -2300,6 +2300,7 @@ pub(in crate::app::dispatch) fn set_default_model(
             session_id: sid,
             model_id: new_id,
             effort: None,
+            service_tier: None,
             prev_model_id: prev_id.clone(),
         });
     } else if let Some(agent) = app.agents.get_mut(&aid) {
