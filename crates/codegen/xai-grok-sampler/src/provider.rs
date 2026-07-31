@@ -280,9 +280,9 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
     fn normalizes_response_events(&self) -> bool {
         match self.profile().responses_dialect() {
             None => false,
-            Some(
-                ResponsesDialect::Xai | ResponsesDialect::Codex | ResponsesDialect::DeepSeek,
-            ) => true,
+            Some(ResponsesDialect::Xai | ResponsesDialect::Codex | ResponsesDialect::DeepSeek) => {
+                true
+            }
         }
     }
 
