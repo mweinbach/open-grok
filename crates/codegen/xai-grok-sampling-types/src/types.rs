@@ -971,13 +971,16 @@ pub enum ModelProvider {
 
 /// Provider-specific wire contract used by the Responses API.
 ///
-/// This remains separate from [`ApiBackend`]: both built-in providers use the
+/// This remains separate from [`ApiBackend`]: multiple providers use the
 /// Responses endpoint, but they require different request and replay shapes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesDialect {
     Xai,
     Codex,
+    /// DeepSeek's native OpenAI-compatible Responses API (V4 Flash and later).
+    /// Stateless (`store: false`), with DeepSeek-owned reasoning-effort mapping.
+    DeepSeek,
 }
 
 /// Wire representation used for Code Mode's client-executed `exec` tool.
@@ -1189,14 +1192,16 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
-    /// DeepSeek's direct OpenAI-compatible inference API. DeepSeek uses
-    /// ordinary client-side function tools over Chat Completions and
-    /// authenticates with a provider-owned API key only.
+    /// DeepSeek's direct OpenAI-compatible inference API. Chat Completions
+    /// remains available for every curated model; Responses is enabled for the
+    /// DeepSeek dialect used by V4 Flash (and later Responses-capable models).
+    /// Hosted search stays off at the profile layer so Chat-only models keep
+    /// client-side search routing. Authenticates with a provider-owned API key.
     pub const DEEPSEEK: Self = Self {
         provider: ModelProvider::DeepSeek,
         backends: ProviderBackends {
             chat_completions: true,
-            responses: None,
+            responses: Some(ResponsesDialect::DeepSeek),
             messages: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
@@ -1613,7 +1618,7 @@ mod tests {
                 name: "DeepSeek",
                 backends: ProviderBackends {
                     chat_completions: true,
-                    responses: None,
+                    responses: Some(ResponsesDialect::DeepSeek),
                     messages: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,

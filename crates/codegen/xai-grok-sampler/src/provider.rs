@@ -163,13 +163,16 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
         match self.profile().responses_dialect() {
             None | Some(ResponsesDialect::Xai) => {}
             Some(ResponsesDialect::Codex) => patch_codex_responses_request(request_body, policy),
+            Some(ResponsesDialect::DeepSeek) => {
+                patch_deepseek_responses_request(request_body, policy)
+            }
         }
     }
 
     /// Return the provider-owned cache key derived from stable request state.
     fn prompt_cache_key(&self, session_id: Option<&str>) -> Option<String> {
         match self.profile().responses_dialect() {
-            None | Some(ResponsesDialect::Xai) => None,
+            None | Some(ResponsesDialect::Xai | ResponsesDialect::DeepSeek) => None,
             Some(ResponsesDialect::Codex) => session_id
                 .filter(|session_id| !session_id.is_empty())
                 .map(str::to_owned),
@@ -246,7 +249,7 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
         }
 
         match self.profile().responses_dialect() {
-            None | Some(ResponsesDialect::Xai) => {}
+            None | Some(ResponsesDialect::Xai | ResponsesDialect::DeepSeek) => {}
             Some(ResponsesDialect::Codex) => {
                 let value = parsed
                     .as_ref()
@@ -272,17 +275,22 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
         self.profile().request_metadata == RequestMetadataPolicy::XGrokHeaders
     }
 
-    /// Both current dialects need the dependency-boundary compatibility pass.
+    /// Dialects that speak Responses need the dependency-boundary compatibility
+    /// pass so typed async-openai gaps do not break streaming.
     fn normalizes_response_events(&self) -> bool {
         match self.profile().responses_dialect() {
             None => false,
-            Some(ResponsesDialect::Xai | ResponsesDialect::Codex) => true,
+            Some(
+                ResponsesDialect::Xai | ResponsesDialect::Codex | ResponsesDialect::DeepSeek,
+            ) => true,
         }
     }
 
     fn ignores_unknown_response_event(&self, error: &SamplingError, data: &str) -> bool {
-        self.profile().responses_dialect() == Some(ResponsesDialect::Codex)
-            && is_unknown_top_level_response_event(error, data)
+        matches!(
+            self.profile().responses_dialect(),
+            Some(ResponsesDialect::Codex | ResponsesDialect::DeepSeek)
+        ) && is_unknown_top_level_response_event(error, data)
     }
 }
 
@@ -528,6 +536,34 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
         ModelProvider::Fireworks => PROVIDER_REGISTRY[3].adapter,
         ModelProvider::DeepSeek => PROVIDER_REGISTRY[4].adapter,
         ModelProvider::OpenCodeGo => PROVIDER_REGISTRY[5].adapter,
+    }
+}
+
+fn patch_deepseek_responses_request(request_body: &mut Value, policy: ResponsesRequestPolicy) {
+    // DeepSeek's Responses API is explicitly stateless.
+    request_body["store"] = Value::Bool(false);
+    if let Some(object) = request_body.as_object_mut() {
+        object.remove("previous_response_id");
+        object.remove("prompt_cache_key");
+        object.remove("prompt_cache_retention");
+    }
+
+    // Summary is accepted but never produced; keep the wire minimal.
+    if let Some(reasoning) = request_body
+        .get_mut("reasoning")
+        .and_then(Value::as_object_mut)
+    {
+        reasoning.remove("summary");
+    }
+
+    // async-openai maps Max/Ultra onto xhigh; DeepSeek's max effort must stay
+    // the literal "max" value documented for V4 Flash Responses.
+    if matches!(
+        policy.local_effort,
+        Some(ReasoningEffort::Max | ReasoningEffort::Ultra)
+    ) {
+        ensure_reasoning_object(request_body);
+        request_body["reasoning"]["effort"] = Value::String("max".to_owned());
     }
 }
 
@@ -778,15 +814,43 @@ mod tests {
                 },
             );
 
-            if provider != ModelProvider::Codex {
-                assert_eq!(request, original);
-            } else {
-                assert_eq!(request["instructions"], "base prompt");
-                assert_eq!(request["input"].as_array().unwrap().len(), 1);
-                assert_eq!(request["reasoning"]["effort"], "max");
-                assert!(request["reasoning"].get("summary").is_none());
+            match provider {
+                ModelProvider::Codex => {
+                    assert_eq!(request["instructions"], "base prompt");
+                    assert_eq!(request["input"].as_array().unwrap().len(), 1);
+                    assert_eq!(request["reasoning"]["effort"], "max");
+                    assert!(request["reasoning"].get("summary").is_none());
+                }
+                ModelProvider::DeepSeek => {
+                    assert_eq!(request["store"], false);
+                    assert_eq!(request["reasoning"]["effort"], "max");
+                    assert!(request["reasoning"].get("summary").is_none());
+                    assert!(request.get("previous_response_id").is_none());
+                    assert!(request.get("prompt_cache_key").is_none());
+                }
+                _ => assert_eq!(request, original),
             }
         }
+    }
+
+    #[test]
+    fn deepseek_accepts_responses_and_chat_backends() {
+        let deepseek = provider_adapter(ModelProvider::DeepSeek);
+        assert!(
+            deepseek
+                .validate_backend(&ApiBackend::ChatCompletions)
+                .is_ok()
+        );
+        assert!(deepseek.validate_backend(&ApiBackend::Responses).is_ok());
+        assert!(deepseek.validate_backend(&ApiBackend::Messages).is_err());
+        assert_eq!(deepseek.prompt_cache_key(Some("session")), None);
+        assert!(!deepseek.supports_turn_state(&ApiBackend::Responses));
+        assert!(!deepseek.sends_doom_loop_opt_in());
+        assert!(deepseek.normalizes_response_events());
+        assert_eq!(
+            deepseek.profile().responses_dialect(),
+            Some(ResponsesDialect::DeepSeek)
+        );
     }
 
     #[test]
@@ -834,6 +898,19 @@ mod tests {
         );
         assert!(fireworks.validate_backend(&ApiBackend::Responses).is_err());
         assert!(fireworks.validate_backend(&ApiBackend::Messages).is_err());
+
+        let deepseek = provider_adapter(ModelProvider::DeepSeek);
+        assert_eq!(deepseek.prompt_cache_key(Some("session")), None);
+        assert!(!deepseek.supports_turn_state(&ApiBackend::Responses));
+        assert!(!deepseek.sends_doom_loop_opt_in());
+        assert!(deepseek.normalizes_response_events());
+        assert!(
+            deepseek
+                .validate_backend(&ApiBackend::ChatCompletions)
+                .is_ok()
+        );
+        assert!(deepseek.validate_backend(&ApiBackend::Responses).is_ok());
+        assert!(deepseek.validate_backend(&ApiBackend::Messages).is_err());
     }
 
     #[test]

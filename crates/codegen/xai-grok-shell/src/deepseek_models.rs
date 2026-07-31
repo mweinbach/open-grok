@@ -1,9 +1,9 @@
 //! Provider-isolated DeepSeek direct model discovery.
 //!
-//! DeepSeek serves an OpenAI-compatible Chat Completions API. The provider's
-//! `/models` endpoint is authoritative for the curated direct-model partition;
-//! unknown future model ids fail closed until their limits and capabilities are
-//! reviewed here.
+//! DeepSeek serves OpenAI-compatible Chat Completions and, for V4 Flash, a
+//! native Responses API. The provider's `/models` endpoint is authoritative for
+//! the curated direct-model partition; unknown future model ids fail closed
+//! until their limits and capabilities are reviewed here.
 
 use crate::agent::config::{EnvKeys, ModelEntry, ModelInfo};
 use anyhow::{Context, anyhow};
@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::num::NonZeroU64;
 use std::time::Duration;
 use url::Url;
-use xai_grok_sampling_types::{ApiBackend, ModelProvider, ToolMode};
+use xai_grok_sampling_types::{ApiBackend, ModelProvider, ReasoningEffort, ToolMode};
 
 pub const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEEPSEEK_API_BASE_URL_ENV: &str = "OPENGROK_DEEPSEEK_API_BASE_URL";
@@ -26,6 +26,7 @@ pub struct CuratedDeepSeekModel {
     pub name: &'static str,
     pub description: &'static str,
     pub context_window: u64,
+    pub api_backend: ApiBackend,
 }
 
 pub const CURATED_DEEPSEEK_MODELS: [CuratedDeepSeekModel; 2] = [
@@ -33,15 +34,17 @@ pub const CURATED_DEEPSEEK_MODELS: [CuratedDeepSeekModel; 2] = [
         key: "deepseek:deepseek-v4-pro",
         slug: "deepseek-v4-pro",
         name: "DeepSeek V4 Pro",
-        description: "DeepSeek V4 Pro through the direct DeepSeek API",
+        description: "DeepSeek V4 Pro through the direct DeepSeek Chat Completions API",
         context_window: 1_000_000,
+        api_backend: ApiBackend::ChatCompletions,
     },
     CuratedDeepSeekModel {
         key: "deepseek:deepseek-v4-flash",
         slug: "deepseek-v4-flash",
         name: "DeepSeek V4 Flash",
-        description: "DeepSeek V4 Flash through the direct DeepSeek API",
+        description: "DeepSeek V4 Flash (0731) through the direct DeepSeek Responses API",
         context_window: 1_000_000,
+        api_backend: ApiBackend::Responses,
     },
 ];
 
@@ -98,6 +101,72 @@ fn credential_fingerprint(api_key: &str) -> String {
     blake3::hash(api_key.as_bytes()).to_hex().to_string()
 }
 
+fn reasoning_effort_option(
+    value: ReasoningEffort,
+    description: &str,
+    default: bool,
+) -> xai_grok_sampling_types::ReasoningEffortOption {
+    let id = value.as_str().to_owned();
+    xai_grok_sampling_types::ReasoningEffortOption {
+        label: match value {
+            ReasoningEffort::None => "None".to_owned(),
+            ReasoningEffort::Low => "Low".to_owned(),
+            ReasoningEffort::High => "High".to_owned(),
+            ReasoningEffort::Max => "Max".to_owned(),
+            other => other.as_str().to_owned(),
+        },
+        id,
+        value,
+        description: Some(description.to_owned()),
+        default,
+    }
+}
+
+fn curated_reasoning_efforts(
+    curated: &CuratedDeepSeekModel,
+) -> Vec<xai_grok_sampling_types::ReasoningEffortOption> {
+    match curated.api_backend {
+        // Responses documents none/low/high/max for V4 Flash thinking control.
+        ApiBackend::Responses => vec![
+            reasoning_effort_option(ReasoningEffort::None, "Disable thinking mode", false),
+            reasoning_effort_option(
+                ReasoningEffort::Low,
+                "Faster responses with lighter reasoning",
+                false,
+            ),
+            reasoning_effort_option(
+                ReasoningEffort::High,
+                "Default DeepSeek reasoning depth for agentic work",
+                true,
+            ),
+            reasoning_effort_option(
+                ReasoningEffort::Max,
+                "Maximum reasoning depth for the hardest problems",
+                false,
+            ),
+        ],
+        // Chat Completions uses reasoning_effort with thinking enabled by default.
+        ApiBackend::ChatCompletions => vec![
+            reasoning_effort_option(
+                ReasoningEffort::Low,
+                "Faster responses with lighter reasoning",
+                false,
+            ),
+            reasoning_effort_option(
+                ReasoningEffort::High,
+                "Default DeepSeek reasoning depth for agentic work",
+                true,
+            ),
+            reasoning_effort_option(
+                ReasoningEffort::Max,
+                "Maximum reasoning depth for the hardest problems",
+                false,
+            ),
+        ],
+        ApiBackend::Messages => Vec::new(),
+    }
+}
+
 fn curated_model_entry(curated: &CuratedDeepSeekModel, base_url: &str) -> ModelEntry {
     let mut info = ModelInfo::fallback(curated.key);
     info.id = Some(curated.key.to_owned());
@@ -105,14 +174,19 @@ fn curated_model_entry(curated: &CuratedDeepSeekModel, base_url: &str) -> ModelE
     info.base_url = base_url.trim_end_matches('/').to_owned();
     info.name = Some(curated.name.to_owned());
     info.description = Some(curated.description.to_owned());
-    info.api_backend = ApiBackend::ChatCompletions;
+    info.api_backend = curated.api_backend;
     info.provider = ModelProvider::DeepSeek;
     info.tool_mode = Some(ToolMode::Direct);
     info.context_window =
         NonZeroU64::new(curated.context_window).expect("non-zero DeepSeek context window");
-    info.supports_reasoning_effort = false;
-    info.reasoning_efforts.clear();
-    info.reasoning_effort = None;
+    info.reasoning_efforts = curated_reasoning_efforts(curated);
+    info.supports_reasoning_effort = !info.reasoning_efforts.is_empty();
+    info.reasoning_effort = info
+        .reasoning_efforts
+        .iter()
+        .find(|opt| opt.default)
+        .or_else(|| info.reasoning_efforts.first())
+        .map(|opt| opt.value);
     info.supported_in_api = true;
     ModelEntry {
         info,
@@ -290,13 +364,16 @@ mod tests {
     }
 
     #[test]
-    fn wire_catalog_is_curated_namespaced_and_chat_only() {
+    fn wire_catalog_routes_flash_to_responses_and_pro_to_chat() {
         let client = DeepSeekModelsClient::with_base_url(DEEPSEEK_API_BASE_URL);
         let catalog = client.catalog_from_wire(
             DeepSeekModelsResponse {
                 data: vec![
                     DeepSeekWireModel {
                         id: "deepseek-v4-pro".to_owned(),
+                    },
+                    DeepSeekWireModel {
+                        id: "deepseek-v4-flash".to_owned(),
                     },
                     DeepSeekWireModel {
                         id: "future-unknown".to_owned(),
@@ -306,16 +383,40 @@ mod tests {
             "catalog-key",
         );
         let entries = catalog.entries();
-        assert_eq!(entries.len(), 1);
-        let entry = &entries["deepseek:deepseek-v4-pro"];
-        assert_eq!(entry.info.model, "deepseek-v4-pro");
-        assert_eq!(entry.info.provider, ModelProvider::DeepSeek);
-        assert_eq!(entry.info.api_backend, ApiBackend::ChatCompletions);
-        assert_eq!(entry.info.tool_mode, Some(ToolMode::Direct));
-        assert_eq!(entry.info.context_window.get(), 1_000_000);
+        assert_eq!(entries.len(), 2);
+
+        let pro = &entries["deepseek:deepseek-v4-pro"];
+        assert_eq!(pro.info.model, "deepseek-v4-pro");
+        assert_eq!(pro.info.provider, ModelProvider::DeepSeek);
+        assert_eq!(pro.info.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(pro.info.tool_mode, Some(ToolMode::Direct));
+        assert_eq!(pro.info.context_window.get(), 1_000_000);
+        assert!(pro.info.supports_reasoning_effort);
+        assert_eq!(pro.info.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(
-            entry.env_key.as_ref().and_then(EnvKeys::primary),
+            pro.env_key.as_ref().and_then(EnvKeys::primary),
             Some(DEEPSEEK_API_KEY_ENV)
+        );
+
+        let flash = &entries["deepseek:deepseek-v4-flash"];
+        assert_eq!(flash.info.model, "deepseek-v4-flash");
+        assert_eq!(flash.info.provider, ModelProvider::DeepSeek);
+        assert_eq!(flash.info.api_backend, ApiBackend::Responses);
+        assert!(flash.info.supports_reasoning_effort);
+        assert_eq!(flash.info.reasoning_effort, Some(ReasoningEffort::High));
+        assert!(
+            flash
+                .info
+                .reasoning_efforts
+                .iter()
+                .any(|opt| opt.value == ReasoningEffort::None)
+        );
+        assert!(
+            flash
+                .info
+                .description
+                .as_deref()
+                .is_some_and(|text| text.contains("0731") && text.contains("Responses"))
         );
     }
 
@@ -357,7 +458,8 @@ mod tests {
 
         let client = DeepSeekModelsClient::with_base_url(format!("http://{address}"));
         let catalog = client.query_with_key("model-query-canary").await.unwrap();
-        assert!(catalog.entries().contains_key("deepseek:deepseek-v4-flash"));
+        let flash = &catalog.entries()["deepseek:deepseek-v4-flash"];
+        assert_eq!(flash.info.api_backend, ApiBackend::Responses);
         assert_eq!(
             capture.0.lock().unwrap().as_deref(),
             Some("Bearer model-query-canary")

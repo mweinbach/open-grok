@@ -35,7 +35,7 @@ Adapters (credential-free): `xai-grok-sampler/src/provider.rs`.
 | OpenAI Codex | Responses | Codex | OpenAI | Codex OAuth | **denied** |
 | Kimi | Chat | none | client function tools | API key only | **denied** |
 | Fireworks AI | Chat | none | client function tools | API key only | **denied** |
-| DeepSeek direct | Chat | none | client function tools | API key only | **denied** |
+| DeepSeek direct | Chat, Responses (Flash) | DeepSeek | client function tools | API key only | **denied** |
 | OpenCode Go | Chat, Messages (per model) | none | client function tools | API key only | **denied** |
 
 ## Layer map (paths)
@@ -143,7 +143,7 @@ Also isolated:
 | --- | --- | --- | --- | --- | --- | --- |
 | Private headers | `x-grok-*` | stripped | stripped | stripped | stripped | stripped |
 | Doom-loop opt-in | yes | no | no | no | no | no |
-| Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A | N/A | N/A | N/A |
+| Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A | N/A | Max→`max`, strip summary, force `store: false` | N/A |
 | Prompt cache key | no | session id | no | no | no | no |
 | Sticky turn state | no | `x-codex-turn-state` | no | no | no | no |
 | Unknown `response.*` events | strict | ignore unknown side-channels when opted | N/A | N/A | N/A | N/A |

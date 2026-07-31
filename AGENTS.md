@@ -139,6 +139,7 @@ Three independent axes: **`ApiBackend`** × **`ProviderProfile`** × **`AuthSche
 | Kimi Platform | `auth.json` scope `kimi::api_key` | Isolated from Kimi Code |
 | Kimi Code | `auth.json` scope `kimi_code::api_key` | Isolated from Platform |
 | Fireworks AI | `auth.json` scope `fireworks::api_key` | Curated model list; `/login fireworks` |
+| DeepSeek direct | `auth.json` scope `deepseek::api_key` | Chat + Responses (V4 Flash); `/login deepseek` |
 
 After any non-xAI profile that denies xAI services, the session export boundary closes monotonically (compatibility field still named `ever_used_codex`).
 
