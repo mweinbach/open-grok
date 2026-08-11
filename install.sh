@@ -3,7 +3,6 @@
 set -euo pipefail
 
 readonly REPOSITORY="mweinbach/open-grok"
-readonly ARTIFACT_NAME="open-grok-macos-aarch64"
 
 usage() {
     cat >&2 <<'EOF'
@@ -34,11 +33,28 @@ fi
 
 os="$(uname -s)"
 arch="$(uname -m)"
-if [[ "$os" != "Darwin" ]] || [[ "$arch" != "arm64" && "$arch" != "aarch64" ]]; then
-    echo "Error: prebuilt Open Grok releases currently require Apple Silicon macOS." >&2
-    echo "Detected: ${os} ${arch}. Build from source on unsupported platforms." >&2
-    exit 1
-fi
+case "${os}:${arch}" in
+    Darwin:arm64 | Darwin:aarch64)
+        artifact_name="open-grok-macos-aarch64"
+        versioned_platform="macos-aarch64"
+        platform_name="Apple Silicon macOS"
+        ;;
+    Linux:x86_64 | Linux:amd64)
+        artifact_name="open-grok-linux-x86_64"
+        versioned_platform="linux-x86_64"
+        platform_name="Linux x86_64"
+        ;;
+    Linux:aarch64 | Linux:arm64)
+        artifact_name="open-grok-linux-aarch64"
+        versioned_platform="linux-aarch64"
+        platform_name="Linux aarch64"
+        ;;
+    *)
+        echo "Error: no prebuilt Open Grok release supports ${os} ${arch}." >&2
+        echo "Supported: Apple Silicon macOS, Linux x86_64, and Linux aarch64." >&2
+        exit 1
+        ;;
+esac
 
 if command -v curl >/dev/null 2>&1; then
     downloader="curl"
@@ -102,12 +118,12 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
-binary_tmp="${stage_dir}/${ARTIFACT_NAME}"
-checksum_tmp="${stage_dir}/${ARTIFACT_NAME}.sha256"
+binary_tmp="${stage_dir}/${artifact_name}"
+checksum_tmp="${stage_dir}/${artifact_name}.sha256"
 
-echo "Downloading Open Grok ${version:-latest} for Apple Silicon macOS..." >&2
-download "${release_url}/${ARTIFACT_NAME}" "$binary_tmp"
-download "${release_url}/${ARTIFACT_NAME}.sha256" "$checksum_tmp"
+echo "Downloading Open Grok ${version:-latest} for ${platform_name}..." >&2
+download "${release_url}/${artifact_name}" "$binary_tmp"
+download "${release_url}/${artifact_name}.sha256" "$checksum_tmp"
 
 expected_sha="$(awk 'NR == 1 { print $1 }' "$checksum_tmp")"
 if [[ ${#expected_sha} -ne 64 || "$expected_sha" == *[!0-9A-Fa-f]* ]]; then
@@ -153,7 +169,7 @@ fi
 
 installed_version="$reported_version"
 
-versioned_name="open-grok-${installed_version}-macos-aarch64"
+versioned_name="open-grok-${installed_version}-${versioned_platform}"
 versioned_binary="${download_dir}/${versioned_name}"
 if [[ -e "$versioned_binary" || -L "$versioned_binary" ]]; then
     versioned_name="${versioned_name}-reinstall-$$"

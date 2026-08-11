@@ -101,6 +101,108 @@ jobs:
             dist/open-grok-windows-x86_64.exe.sha256
             dist/install.ps1
 
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            rg_triple: x86_64-unknown-linux-musl
+            rg_sha256: 253ad0fd5fef0d64cba56c70dccdacc1916d4ed70ad057cc525fcdb0c3bbd2a7
+            protoc_asset: protoc-29.3-linux-x86_64.zip
+            protoc_sha256: 3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            rg_triple: aarch64-unknown-linux-gnu
+            rg_sha256: 15f8cc2fab12d88491c54d49f38589922a9d6a7353c29b0a0856727bcdf80754
+            protoc_asset: protoc-29.3-linux-aarch_64.zip
+            protoc_sha256: 6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify tag and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < OPEN_GROK_VERSION)"
+          test "v${version}" = '${{ needs.resolve.outputs.tag }}'
+          git tag --points-at HEAD | grep -Fx '${{ needs.resolve.outputs.tag }}'
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ runner.os }}-${{ matrix.arch }}
+          cache-on-failure: true
+          cache-workspace-crates: true
+
+      - name: Install pinned ripgrep
+        shell: bash
+        env:
+          RG_TRIPLE: ${{ matrix.rg_triple }}
+          RG_SHA256: ${{ matrix.rg_sha256 }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ripgrep-15.0.0-${RG_TRIPLE}.tar.gz"
+          curl -fL --retry 3 \
+            "https://github.com/BurntSushi/ripgrep/releases/download/15.0.0/ripgrep-15.0.0-${RG_TRIPLE}.tar.gz" \
+            -o "$archive"
+          printf '%s  %s\n' "$RG_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "GROK_TOOLS_BUNDLE_RG_PATH=$RUNNER_TEMP/ripgrep-15.0.0-${RG_TRIPLE}/rg" \
+            >> "$GITHUB_ENV"
+
+      - name: Install pinned protoc
+        shell: bash
+        env:
+          PROTOC_ASSET: ${{ matrix.protoc_asset }}
+          PROTOC_SHA256: ${{ matrix.protoc_sha256 }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/$PROTOC_ASSET"
+          protoc_root="$RUNNER_TEMP/protoc-29.3"
+          curl -fL --retry 3 \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/$PROTOC_ASSET" \
+            -o "$archive"
+          printf '%s  %s\n' "$PROTOC_SHA256" "$archive" | sha256sum -c -
+          mkdir -p "$protoc_root"
+          unzip -q "$archive" -d "$protoc_root"
+          protoc="$protoc_root/bin/protoc"
+          test "$("$protoc" --version)" = "libprotoc 29.3"
+          echo "PROTOC=$protoc" >> "$GITHUB_ENV"
+
+      - name: Build and verify Linux release
+        shell: bash
+        run: ./scripts/build-linux-release.sh
+
+      - name: Smoke Linux installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$smoke_root"' EXIT
+          export OPENGROK_HOME="$smoke_root/home"
+          export OPEN_GROK_BIN_DIR="$smoke_root/bin"
+          export OPEN_GROK_RELEASE_BASE_URL="file://$PWD/dist"
+          bash dist/install.sh '${{ needs.resolve.outputs.tag }}'
+          "$smoke_root/bin/open-grok" --version | grep -F "$(cat OPEN_GROK_VERSION)"
+          "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
+
+      - name: Upload Linux assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}-release
+          if-no-files-found: error
+          path: |
+            dist/open-grok-linux-${{ matrix.arch }}
+            dist/open-grok-linux-${{ matrix.arch }}.sha256
+
   macos:
     name: macOS Apple Silicon
     needs: resolve
@@ -193,7 +295,7 @@ jobs:
 
   publish:
     name: Publish and verify GitHub release
-    needs: [resolve, windows, macos]
+    needs: [resolve, windows, linux, macos]
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
