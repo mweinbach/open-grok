@@ -86,7 +86,7 @@ Prebuilt releases support **Apple Silicon macOS** (`arm64` / `aarch64`) and
 **64-bit Windows** (`x86_64`). Linux, Intel macOS, and Windows on Arm users
 should build from source for now.
 
-Apple Silicon macOS:
+Apple Silicon macOS And linux :
 
 ```sh
 curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
