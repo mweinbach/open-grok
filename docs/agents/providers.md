@@ -38,6 +38,7 @@ Adapters (credential-free): `xai-grok-sampler/src/provider.rs`.
 | DeepSeek direct | Chat, Responses (V4 Flash) | DeepSeek | OpenAI hosted search + client functions | API key only | **denied** |
 | Meta API | Responses | Meta | OpenAI hosted search + client functions | API key only | **denied** |
 | Wafer AI | Chat | none | client function tools | API key only | **denied** |
+| Z AI | Chat | none | client function tools | API key only | **denied** |
 | OpenCode Go | Chat, Messages (per model) | none | client function tools | API key only | **denied** |
 
 ### Wafer AI ([wafer.ai](https://www.wafer.ai/))
@@ -47,6 +48,18 @@ is `https://pass.wafer.ai/v1`; use Chat Completions for inference and
 `GET /v1/models` for dynamic model discovery. Wafer accepts standard client
 function tools, does not provide native hosted web search, and must not receive
 xAI credentials, private metadata, or xAI-only exports.
+
+### Z AI ([z.ai](https://z.ai/))
+
+Z AI is an isolated, API-key-only OpenAI-compatible provider offering GLM
+models. Its default base URL is the GLM Coding Plan endpoint
+`https://api.z.ai/api/coding/paas/v4` (overridable via
+`OPENGROK_ZAI_API_BASE_URL`); use Chat Completions for inference and
+`GET /models` for dynamic model discovery, with a curated fallback catalog when
+the endpoint is unavailable. Known reasoning-capable models (e.g. GLM-4.6,
+GLM-5.x) expose `reasoning_effort`; Z AI accepts standard client function tools,
+does not provide native hosted web search, and must not receive xAI credentials,
+private metadata, or xAI-only exports.
 
 ## Layer map (paths)
 
@@ -88,6 +101,10 @@ Wafer AI
   xai-grok-shell/src/wafer_models.rs            # dynamic /models catalog, trusted host
   auth/storage.rs                               # wafer::api_key (generic provider scope)
 
+Z AI
+  xai-grok-shell/src/zai_models.rs              # dynamic /models catalog + curated fallback, trusted host
+  auth/storage.rs                               # zai::api_key (generic provider scope)
+
 OpenCode Go
   xai-grok-shell/src/opencode_go_models.rs      # live availability + models.dev protocol mapping
   auth/storage.rs                               # opencode_go::api_key (generic provider scope)
@@ -118,6 +135,7 @@ Home root: `$OPENGROK_HOME` or `~/.opengrok` via `xai_grok_config::grok_home()`.
 | DeepSeek direct | `auth.json` scope `deepseek::api_key` | Settings / `/login deepseek` |
 | Meta API | `auth.json` scope `meta::api_key` or `META_API_KEY` | Settings / `/login meta` / environment |
 | Wafer AI | `auth.json` scope `wafer::api_key` | Settings / `/login wafer` |
+| Z AI | `auth.json` scope `zai::api_key` or `ZAI_API_KEY` | Settings / `/login zai` / environment |
 | OpenCode Go | `auth.json` scope `opencode_go::api_key` | Settings / `/login opencode-go` |
 | Perplexity Search fallback | `auth.json` scope `perplexity::api_key` | Settings |
 | Both providers | — | `logout --all` |

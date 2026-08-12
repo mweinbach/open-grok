@@ -359,6 +359,7 @@ pub enum WebSearchSourceTarget {
     DeepSeek,
     Meta,
     Wafer,
+    Zai,
     OpenCodeGo,
 }
 
@@ -380,6 +381,7 @@ impl WebSearchSourceTarget {
             ModelProvider::DeepSeek => Self::DeepSeek,
             ModelProvider::Meta => Self::Meta,
             ModelProvider::Wafer => Self::Wafer,
+            ModelProvider::Zai => Self::Zai,
             ModelProvider::OpenCodeGo => Self::OpenCodeGo,
         }
     }
@@ -399,6 +401,7 @@ pub struct WebSearchSourceConfig {
     pub deepseek: Option<WebSearchSource>,
     pub meta: Option<WebSearchSource>,
     pub wafer: Option<WebSearchSource>,
+    pub zai: Option<WebSearchSource>,
     pub opencode_go: Option<WebSearchSource>,
 }
 
@@ -414,6 +417,7 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::DeepSeek => self.deepseek,
             WebSearchSourceTarget::Meta => self.meta,
             WebSearchSourceTarget::Wafer => self.wafer,
+            WebSearchSourceTarget::Zai => self.zai,
             WebSearchSourceTarget::OpenCodeGo => self.opencode_go,
         }
     }
@@ -429,6 +433,7 @@ impl WebSearchSourceConfig {
             | WebSearchSourceTarget::Fireworks
             | WebSearchSourceTarget::DeepSeek
             | WebSearchSourceTarget::Wafer
+            | WebSearchSourceTarget::Zai
             | WebSearchSourceTarget::OpenCodeGo => WebSearchSource::Xai,
         }
     }
@@ -450,6 +455,7 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::DeepSeek => self.deepseek = source,
             WebSearchSourceTarget::Meta => self.meta = source,
             WebSearchSourceTarget::Wafer => self.wafer = source,
+            WebSearchSourceTarget::Zai => self.zai = source,
             WebSearchSourceTarget::OpenCodeGo => self.opencode_go = source,
         }
     }
@@ -544,6 +550,7 @@ impl WebSearchCandidates {
             | WebSearchSourceTarget::Fireworks
             | WebSearchSourceTarget::DeepSeek
             | WebSearchSourceTarget::Wafer
+            | WebSearchSourceTarget::Zai
             | WebSearchSourceTarget::OpenCodeGo => WebSearchSource::Xai,
         }
     }
@@ -575,6 +582,7 @@ impl WebSearchCandidates {
                 | ModelProvider::Fireworks
                 | ModelProvider::DeepSeek
                 | ModelProvider::Wafer
+                | ModelProvider::Zai
                 | ModelProvider::OpenCodeGo => WebSearchConfig::Disabled,
                 // For xAI, "native" and the xAI client tool are the same
                 // service — keep the client declaration as today.

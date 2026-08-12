@@ -323,6 +323,7 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs(
         meta_catalog,
         opencode_go_catalog,
         None,
+        None,
     )
 }
 
@@ -336,6 +337,7 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs_and_wafer(
     meta_catalog: Option<&MetaModelsCatalog>,
     opencode_go_catalog: Option<&OpenCodeGoModelsCatalog>,
     wafer_catalog: Option<&crate::wafer_models::WaferModelsCatalog>,
+    zai_catalog: Option<&crate::zai_models::ZaiModelsCatalog>,
 ) -> IndexMap<String, ModelEntry> {
     let codex_entries = codex_catalog.map(CodexModelsCatalog::entries);
     let codex_authoritative = codex_catalog.is_some_and(CodexModelsCatalog::is_authoritative);
@@ -375,6 +377,12 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs_and_wafer(
             entry.info.provider != xai_grok_sampling_types::ModelProvider::Wafer
         });
         catalog.extend(wafer_catalog.entries());
+    }
+
+    if let Some(zai_catalog) = zai_catalog {
+        catalog
+            .retain(|_, entry| entry.info.provider != xai_grok_sampling_types::ModelProvider::Zai);
+        catalog.extend(zai_catalog.entries());
     }
 
     let enabled_open_code_go = cfg

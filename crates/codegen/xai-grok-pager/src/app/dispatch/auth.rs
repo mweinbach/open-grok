@@ -30,6 +30,7 @@ pub(super) fn dispatch_open_login_provider_picker(app: &mut AppView) -> Vec<Effe
     let meta_status = super::settings::ui::meta_api_key_status();
     let opencode_go_status = super::settings::ui::opencode_go_api_key_status();
     let wafer_status = super::settings::ui::wafer_api_key_status();
+    let zai_status = super::settings::ui::zai_api_key_status();
     let items = crate::slash::commands::login::provider_items(
         Some(kimi_status),
         Some(fireworks_status),
@@ -37,6 +38,7 @@ pub(super) fn dispatch_open_login_provider_picker(app: &mut AppView) -> Vec<Effe
         Some(meta_status),
         Some(opencode_go_status),
         Some(wafer_status),
+        Some(zai_status),
     );
     if let Some(agent) = get_visible_agent_mut(app) {
         agent.active_modal = Some(crate::views::modal::ActiveModal::ArgPicker {
@@ -156,6 +158,7 @@ fn select_startup_model(
             PrimaryProvider::Meta => "Meta API",
             PrimaryProvider::OpenCodeGo => "OpenCode Go",
             PrimaryProvider::Wafer => "Wafer AI",
+            PrimaryProvider::Zai => "Z AI",
         };
         return Err(if allow_provider_fallback {
             format!("No visible {provider_name} model is available. Check model filters and retry.")

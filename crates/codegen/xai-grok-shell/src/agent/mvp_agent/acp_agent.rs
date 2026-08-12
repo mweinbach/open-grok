@@ -107,6 +107,19 @@ pub(super) fn wafer_models_apply_payload(
     }
 }
 
+pub(super) fn zai_models_apply_payload(
+    refreshed: Result<bool, String>,
+    models: acp::SessionModelState,
+) -> serde_json::Value {
+    match refreshed {
+        Ok(refreshed) => serde_json::json!({ "refreshed": refreshed, "models": models }),
+        Err(warning) => {
+            tracing::warn!(%warning, "Z AI model query failed; returning current models");
+            serde_json::json!({ "refreshed": false, "warning": warning, "models": models })
+        }
+    }
+}
+
 pub(super) fn opencode_go_models_payload(
     refreshed: Result<bool, String>,
     models: acp::SessionModelState,
@@ -2564,6 +2577,31 @@ impl acp::Agent for MvpAgent {
                     available.values().cloned().collect(),
                 );
                 crate::extensions::to_ext_response(Ok(wafer_models_apply_payload(
+                    refreshed, models,
+                )))
+            }
+            "open-grok/zai/models/apply" => {
+                let cancelled_subagents = crate::agent::subagent::cancel_for_provider_runtime_change(
+                    &self.subagent_provider_registry,
+                    xai_grok_sampling_types::ModelProvider::Zai,
+                );
+                if cancelled_subagents > 0 {
+                    tracing::warn!(
+                        cancelled_subagents,
+                        "cancelled subagents before Z AI runtime credential change"
+                    );
+                }
+                let refreshed = self
+                    .models_manager
+                    .apply_zai_credential_change()
+                    .await
+                    .map_err(|error| error.to_string());
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(zai_models_apply_payload(
                     refreshed, models,
                 )))
             }

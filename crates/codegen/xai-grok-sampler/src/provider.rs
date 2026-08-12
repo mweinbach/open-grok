@@ -430,6 +430,26 @@ impl ProviderAdapter for WaferProvider {
     }
 }
 
+/// Z AI is an OpenAI-compatible Chat Completions provider (GLM models).
+/// Unlike Wafer, Z AI keeps `reasoning_effort` so callers can drive its
+/// "thinking mode"; it still drops Grok-internal `service_tier` and
+/// per-message `model_id` metadata.
+#[derive(Debug)]
+pub struct ZaiProvider;
+
+impl ProviderAdapter for ZaiProvider {
+    fn provider(&self) -> ModelProvider {
+        ModelProvider::Zai
+    }
+
+    fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
+        request.service_tier = None;
+        for message in &mut request.messages {
+            message.model_id = None;
+        }
+    }
+}
+
 fn normalize_fireworks_schema(schema: &mut Value) {
     match schema {
         Value::Bool(true) => {
@@ -535,9 +555,10 @@ static DEEPSEEK_PROVIDER: DeepSeekProvider = DeepSeekProvider;
 static META_PROVIDER: MetaProvider = MetaProvider;
 static OPEN_CODE_GO_PROVIDER: OpenCodeGoProvider = OpenCodeGoProvider;
 static WAFER_PROVIDER: WaferProvider = WaferProvider;
+static ZAI_PROVIDER: ZaiProvider = ZaiProvider;
 
 /// Complete registry for the built-in providers.
-pub static PROVIDER_REGISTRY: [ProviderRegistration; 8] = [
+pub static PROVIDER_REGISTRY: [ProviderRegistration; 9] = [
     ProviderRegistration {
         provider: ModelProvider::Xai,
         adapter: &XAI_PROVIDER,
@@ -570,6 +591,10 @@ pub static PROVIDER_REGISTRY: [ProviderRegistration; 8] = [
         provider: ModelProvider::Wafer,
         adapter: &WAFER_PROVIDER,
     },
+    ProviderRegistration {
+        provider: ModelProvider::Zai,
+        adapter: &ZAI_PROVIDER,
+    },
 ];
 
 /// Look up the stateless transport adapter for a built-in provider.
@@ -585,6 +610,7 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
         ModelProvider::Meta => PROVIDER_REGISTRY[5].adapter,
         ModelProvider::OpenCodeGo => PROVIDER_REGISTRY[6].adapter,
         ModelProvider::Wafer => PROVIDER_REGISTRY[7].adapter,
+        ModelProvider::Zai => PROVIDER_REGISTRY[8].adapter,
     }
 }
 
@@ -875,6 +901,7 @@ mod tests {
             ModelProvider::Meta,
             ModelProvider::OpenCodeGo,
             ModelProvider::Wafer,
+            ModelProvider::Zai,
         ];
         assert_eq!(PROVIDER_REGISTRY.len(), expected.len());
         for provider in expected {
@@ -901,6 +928,7 @@ mod tests {
             ModelProvider::Meta,
             ModelProvider::OpenCodeGo,
             ModelProvider::Wafer,
+            ModelProvider::Zai,
         ] {
             let mut request = base_request();
             let original = request.clone();
@@ -1009,6 +1037,15 @@ mod tests {
         assert!(wafer.validate_backend(&ApiBackend::ChatCompletions).is_ok());
         assert!(wafer.validate_backend(&ApiBackend::Responses).is_err());
         assert!(wafer.validate_backend(&ApiBackend::Messages).is_err());
+
+        let zai = provider_adapter(ModelProvider::Zai);
+        assert_eq!(zai.prompt_cache_key(Some("session")), None);
+        assert!(!zai.supports_turn_state(&ApiBackend::Responses));
+        assert!(!zai.sends_doom_loop_opt_in());
+        assert!(!zai.normalizes_response_events());
+        assert!(zai.validate_backend(&ApiBackend::ChatCompletions).is_ok());
+        assert!(zai.validate_backend(&ApiBackend::Responses).is_err());
+        assert!(zai.validate_backend(&ApiBackend::Messages).is_err());
     }
 
     #[test]
@@ -1133,6 +1170,46 @@ mod tests {
         assert_eq!(request.top_p, Some(0.95));
         assert_eq!(request.reasoning_effort, None);
         assert_eq!(request.service_tier, None);
+        let wire = serde_json::to_value(&request).expect("serializes");
+        assert!(wire["messages"][0].get("model_id").is_none());
+        assert_eq!(wire["tools"][0]["type"], "function");
+        assert_eq!(wire["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn zai_sanitizes_internal_metadata_but_keeps_reasoning_and_function_tools() {
+        use xai_grok_sampling_types::types::{ChatRequestMessage, ToolDefinition};
+
+        let assistant = ChatRequestMessage::assistant("previous turn", "glm-5.2", None);
+        let mut request = ChatCompletionRequest::new("glm-5.2", vec![assistant]);
+        request.temperature = Some(0.7);
+        request.top_p = Some(0.95);
+        request.reasoning_effort = Some(ReasoningEffort::High);
+        request.service_tier = Some("priority".to_owned());
+        request.tools = Some(vec![ToolDefinition::function(
+            "lookup",
+            Some("Look up a value"),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"]
+            }),
+        )]);
+
+        provider_adapter(ModelProvider::Zai).sanitize_chat_request(&mut request);
+
+        // Internal Grok metadata is stripped...
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| message.model_id.is_none())
+        );
+        assert_eq!(request.service_tier, None);
+        // ...but reasoning_effort is preserved so callers can drive thinking mode.
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, Some(0.95));
         let wire = serde_json::to_value(&request).expect("serializes");
         assert!(wire["messages"][0].get("model_id").is_none());
         assert_eq!(wire["tools"][0]["type"], "function");

@@ -24,6 +24,7 @@ use crate::opencode_go_models::{
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::sampling::SamplerConfig as SamplingConfig;
 use crate::wafer_models::{WaferModelsCatalog, WaferModelsClient};
+use crate::zai_models::{ZaiModelsCatalog, ZaiModelsClient};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption, ToolMode};
 
@@ -133,6 +134,7 @@ fn task_model_credential_error(requested: &str, entry: &ModelEntry) -> Option<St
             | ModelProvider::Meta
             | ModelProvider::OpenCodeGo
             | ModelProvider::Wafer
+            | ModelProvider::Zai
     ) {
         return None;
     }
@@ -200,6 +202,10 @@ struct Inner {
     meta_catalog: RwLock<Option<MetaModelsCatalog>>,
     opencode_go_catalog: RwLock<Option<OpenCodeGoModelsCatalog>>,
     wafer_catalog: RwLock<Option<WaferModelsCatalog>>,
+    /// Provider-isolated direct Z AI catalog queried only with the Z AI
+    /// credential. Populated from `/models` when available, else a curated
+    /// fallback lineup.
+    zai_catalog: RwLock<Option<ZaiModelsCatalog>>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
     // ── Owned context for self-contained refresh ────────────────
@@ -216,6 +222,7 @@ struct Inner {
     meta_client: MetaModelsClient,
     opencode_go_client: OpenCodeGoModelsClient,
     wafer_client: WaferModelsClient,
+    zai_client: ZaiModelsClient,
     /// Serialize Codex cache/network refreshes. Session startup waits for an
     /// already-running refresh so it resolves against the same catalog rather
     /// than racing past the initial `OnlineIfUncached` request.
@@ -226,6 +233,7 @@ struct Inner {
     meta_refresh_lock: tokio::sync::Mutex<()>,
     opencode_go_refresh_lock: tokio::sync::Mutex<()>,
     wafer_refresh_lock: tokio::sync::Mutex<()>,
+    zai_refresh_lock: tokio::sync::Mutex<()>,
     /// Invalidates a refresh result when Codex logout races an in-flight
     /// `/models` request. Logout increments this before clearing the cache;
     /// only a refresh that started in the current generation may publish.
@@ -239,6 +247,7 @@ struct Inner {
     meta_catalog_generation: AtomicU64,
     opencode_go_catalog_generation: AtomicU64,
     wafer_catalog_generation: AtomicU64,
+    zai_catalog_generation: AtomicU64,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// Single-flight for the etag-triggered background refresh (`spawn_fetch`).
@@ -441,6 +450,7 @@ impl ModelsManager {
                 meta_catalog: RwLock::new(None),
                 opencode_go_catalog: RwLock::new(None),
                 wafer_catalog: RwLock::new(None),
+                zai_catalog: RwLock::new(None),
                 current_model_id: RwLock::new(current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
                 auth_manager,
@@ -456,6 +466,7 @@ impl ModelsManager {
                 meta_client: MetaModelsClient::new(),
                 opencode_go_client: OpenCodeGoModelsClient::new(),
                 wafer_client: WaferModelsClient::new(),
+                zai_client: ZaiModelsClient::new(),
                 codex_refresh_lock: tokio::sync::Mutex::new(()),
                 kimi_refresh_lock: tokio::sync::Mutex::new(()),
                 fireworks_refresh_lock: tokio::sync::Mutex::new(()),
@@ -463,6 +474,7 @@ impl ModelsManager {
                 meta_refresh_lock: tokio::sync::Mutex::new(()),
                 opencode_go_refresh_lock: tokio::sync::Mutex::new(()),
                 wafer_refresh_lock: tokio::sync::Mutex::new(()),
+                zai_refresh_lock: tokio::sync::Mutex::new(()),
                 codex_catalog_generation: AtomicU64::new(0),
                 kimi_catalog_generation: AtomicU64::new(0),
                 fireworks_catalog_generation: AtomicU64::new(0),
@@ -470,6 +482,7 @@ impl ModelsManager {
                 meta_catalog_generation: AtomicU64::new(0),
                 opencode_go_catalog_generation: AtomicU64::new(0),
                 wafer_catalog_generation: AtomicU64::new(0),
+                zai_catalog_generation: AtomicU64::new(0),
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
                 fetches_in_flight: AtomicUsize::new(0),
@@ -541,6 +554,7 @@ impl ModelsManager {
             None,
             None,
             None,
+            None,
         );
 
         // Validate only against a real catalog; a bundled-only first run defers
@@ -597,6 +611,7 @@ impl ModelsManager {
         self.start_meta_models_query();
         self.start_opencode_go_models_query();
         self.start_wafer_models_query();
+        self.start_zai_models_query();
     }
 
     /// Refresh the authenticated ChatGPT Codex catalog after the agent has a
@@ -1115,6 +1130,72 @@ impl ModelsManager {
         }
     }
 
+    fn start_zai_models_query(&self) {
+        if !self.inner.zai_client.has_usable_api_key() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("Z AI model query deferred: no Tokio runtime");
+            return;
+        };
+        let manager = self.clone();
+        runtime.spawn(async move {
+            if let Err(error) = manager.refresh_zai_models().await {
+                tracing::warn!(%error, "Z AI model query failed; keeping current models");
+            }
+        });
+    }
+
+    pub(crate) async fn refresh_zai_models(&self) -> anyhow::Result<bool> {
+        let _refresh_guard = self.inner.zai_refresh_lock.lock().await;
+        let generation = self.inner.zai_catalog_generation.load(Ordering::Acquire);
+        let client = self.inner.zai_client.clone();
+        let Some(refreshed) = client.query().await? else {
+            tracing::debug!("Z AI model query skipped: no Z AI API key");
+            return Ok(false);
+        };
+        if generation != self.inner.zai_catalog_generation.load(Ordering::Acquire)
+            || !client.catalog_matches_current_credential(&refreshed)
+        {
+            tracing::debug!(
+                "discarded Z AI model query completed after catalog clear or credential change"
+            );
+            return Ok(false);
+        }
+        let count = refreshed.entries().len();
+        let authoritative = refreshed.is_authoritative();
+        *self.inner.zai_catalog.write() = Some(refreshed);
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.catalog.read().prefetched.clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        tracing::info!(count, authoritative, "Z AI model catalog refreshed");
+        Ok(true)
+    }
+
+    pub(crate) fn clear_zai_models(&self) -> bool {
+        self.inner
+            .zai_catalog_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let had_catalog = self.inner.zai_catalog.write().take().is_some();
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.catalog.read().prefetched.clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        had_catalog
+    }
+
+    pub(crate) async fn apply_zai_credential_change(&self) -> anyhow::Result<bool> {
+        if self.inner.zai_client.has_usable_api_key() {
+            self.refresh_zai_models().await
+        } else {
+            self.clear_zai_models();
+            Ok(false)
+        }
+    }
+
     pub fn opencode_go_models(&self) -> Vec<OpenCodeGoModelDescriptor> {
         self.inner
             .opencode_go_catalog
@@ -1182,6 +1263,7 @@ impl ModelsManager {
             let deepseek_catalog = self.inner.deepseek_catalog.read();
             let meta_catalog = self.inner.meta_catalog.read();
             let wafer_catalog = self.inner.wafer_catalog.read();
+            let zai_catalog = self.inner.zai_catalog.read();
             let opencode_go_catalog = self.inner.opencode_go_catalog.read();
             resolve_model_catalog_with_provider_catalogs_and_wafer(
                 &new_config,
@@ -1197,6 +1279,7 @@ impl ModelsManager {
                 meta_catalog.as_ref(),
                 opencode_go_catalog.as_ref(),
                 wafer_catalog.as_ref(),
+                zai_catalog.as_ref(),
             )
         };
         let has_real_catalog = self.inner.catalog.read().has_fetched_real_catalog;
@@ -1682,6 +1765,7 @@ impl ModelsManager {
             let deepseek_catalog = self.inner.deepseek_catalog.read();
             let meta_catalog = self.inner.meta_catalog.read();
             let wafer_catalog = self.inner.wafer_catalog.read();
+            let zai_catalog = self.inner.zai_catalog.read();
             let opencode_go_catalog = self.inner.opencode_go_catalog.read();
             resolve_model_catalog_with_provider_catalogs_and_wafer(
                 cfg,
@@ -1693,6 +1777,7 @@ impl ModelsManager {
                 meta_catalog.as_ref(),
                 opencode_go_catalog.as_ref(),
                 wafer_catalog.as_ref(),
+                zai_catalog.as_ref(),
             )
         };
         self.inner.catalog.write().models = catalog;
@@ -2034,6 +2119,7 @@ impl ModelsManager {
         self.start_meta_models_query();
         self.start_opencode_go_models_query();
         self.start_wafer_models_query();
+        self.start_zai_models_query();
         if self.inner.catalog.read().has_fetched_real_catalog {
             tracing::debug!(
                 "skipping startup background model refresh: fresh cache already loaded"

@@ -144,6 +144,7 @@ Three independent axes: **`ApiBackend`** × **`ProviderProfile`** × **`AuthSche
 | Fireworks AI | `auth.json` scope `fireworks::api_key` | Curated model list; `/login fireworks` |
 | DeepSeek direct | `auth.json` scope `deepseek::api_key` | Chat + Responses (V4 Flash); `/login deepseek` |
 | Wafer AI | `auth.json` scope `wafer::api_key` | Chat Completions; dynamic `/models`; `/login wafer` |
+| Z AI | `auth.json` scope `zai::api_key` | Chat Completions (GLM); dynamic `/models` + curated fallback; Coding Plan endpoint default; `/login zai` |
 
 After any non-xAI profile that denies xAI services, the session export boundary closes monotonically (compatibility field still named `ever_used_codex`).
 

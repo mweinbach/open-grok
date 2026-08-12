@@ -1129,6 +1129,7 @@ fn refresh_kimi_sampling_config_for_spawn(
             | ModelProvider::Fireworks
             | ModelProvider::DeepSeek
             | ModelProvider::Wafer
+            | ModelProvider::Zai
     ) {
         return Ok(());
     }

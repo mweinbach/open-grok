@@ -41,8 +41,8 @@ pub(crate) use flow::{
 pub use flow::{
     AuthUrlInfo, AuthUrlMode, LoginTransportOverride, LogoutResult, ensure_authenticated,
     ensure_authenticated_or_noninteractive, ensure_authenticated_with_override, perform_logout,
-    run_cli_login, run_cli_logout, run_cli_wafer_login, run_cli_wafer_logout,
-    try_ensure_fresh_auth,
+    run_cli_login, run_cli_logout, run_cli_wafer_login, run_cli_wafer_logout, run_cli_zai_login,
+    run_cli_zai_logout, try_ensure_fresh_auth,
 };
 pub use jwt::{is_jwt_expired_or_near, parse_jwt_expiration};
 mod meta;
@@ -54,10 +54,11 @@ pub use model::{AuthMode, GrokAuth, lookup_auth};
 pub(crate) use model::{TOKEN_TTL, UserInfo, default_coding_data_retention_opt_out, is_expired};
 pub(crate) use refresh::DiagnosticUploader;
 pub use storage::{
-    WAFER_API_KEY_SCOPE, clear_api_key, clear_kimi_api_key, clear_perplexity_api_key,
-    clear_provider_api_key, clear_wafer_api_key, kimi_api_key_is_configured,
-    perplexity_api_key_is_configured, provider_api_key_is_configured, read_api_key, read_auth_json,
-    read_kimi_api_key, read_perplexity_api_key, read_provider_api_key, read_token_by_scope,
-    read_wafer_api_key, store_api_key, store_kimi_api_key, store_perplexity_api_key,
-    store_provider_api_key, store_wafer_api_key, wafer_api_key_is_configured,
+    WAFER_API_KEY_SCOPE, ZAI_API_KEY_SCOPE, clear_api_key, clear_kimi_api_key,
+    clear_perplexity_api_key, clear_provider_api_key, clear_wafer_api_key, clear_zai_api_key,
+    kimi_api_key_is_configured, perplexity_api_key_is_configured, provider_api_key_is_configured,
+    read_api_key, read_auth_json, read_kimi_api_key, read_perplexity_api_key,
+    read_provider_api_key, read_token_by_scope, read_wafer_api_key, read_zai_api_key,
+    store_api_key, store_kimi_api_key, store_perplexity_api_key, store_provider_api_key,
+    store_wafer_api_key, store_zai_api_key, wafer_api_key_is_configured, zai_api_key_is_configured,
 };
