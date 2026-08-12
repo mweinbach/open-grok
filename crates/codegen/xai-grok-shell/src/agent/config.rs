@@ -4296,6 +4296,10 @@ fn default_models(
                 m.base_url = Some(crate::wafer_models::api_base_url());
                 m.env_key = Some(EnvKeys::single(crate::wafer_models::WAFER_API_KEY_ENV));
             }
+            if m.provider == ModelProvider::Zai {
+                m.base_url = Some(crate::zai_models::api_base_url());
+                m.env_key = Some(EnvKeys::single(crate::zai_models::ZAI_API_KEY_ENV));
+            }
             let key = m.id.clone().unwrap_or_else(|| m.model.clone());
             let context_window = m
                 .context_window
@@ -4642,6 +4646,7 @@ impl ConfigModelOverride {
                 | ModelProvider::Fireworks
                 | ModelProvider::DeepSeek
                 | ModelProvider::Wafer
+                | ModelProvider::Zai
                 | ModelProvider::OpenCodeGo => ApiBackend::ChatCompletions,
             };
             if self.base_url.is_none() {
@@ -5537,6 +5542,7 @@ fn trusted_built_in_session_endpoint(provider: ModelProvider, base_url: &str) ->
                 || (provider.is_open_code_go()
                     && crate::opencode_go_models::is_trusted_api_base_url(base_url))
                 || (provider.is_wafer() && crate::wafer_models::is_trusted_api_base_url(base_url))
+                || (provider.is_zai() && crate::zai_models::is_trusted_api_base_url(base_url))
         }
         xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
             crate::util::is_xai_api_bearer_url(base_url)

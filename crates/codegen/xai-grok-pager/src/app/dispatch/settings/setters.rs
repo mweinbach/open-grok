@@ -124,6 +124,23 @@ fn next_wafer_operation_generation(app: &mut AppView) -> u64 {
     app.wafer_operation_generation
 }
 
+fn remember_loaded_zai_sessions(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models) == Some(PrimaryProvider::Zai) {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_zai_rebind_agents.extend(targets);
+}
+
+fn next_zai_operation_generation(app: &mut AppView) -> u64 {
+    app.zai_operation_generation = app.zai_operation_generation.wrapping_add(1).max(1);
+    app.zai_runtime_update_pending = true;
+    app.zai_operation_generation
+}
+
 fn remember_loaded_perplexity_sessions(app: &mut AppView) {
     let mut targets = Vec::new();
     for (&agent_id, agent) in &mut app.agents {
@@ -376,6 +393,29 @@ pub(in crate::app::dispatch) fn clear_wafer_api_key(app: &mut AppView) -> Vec<Ef
     let generation = next_wafer_operation_generation(app);
     app.show_toast("Removing Wafer AI API key…");
     vec![Effect::UpdateWaferApiKey {
+        generation,
+        key: None,
+    }]
+}
+
+pub(in crate::app::dispatch) fn set_zai_api_key(
+    app: &mut AppView,
+    key: SecretInput,
+) -> Vec<Effect> {
+    remember_loaded_zai_sessions(app);
+    let generation = next_zai_operation_generation(app);
+    app.show_toast("Saving Z AI API key and refreshing models…");
+    vec![Effect::UpdateZaiApiKey {
+        generation,
+        key: Some(key),
+    }]
+}
+
+pub(in crate::app::dispatch) fn clear_zai_api_key(app: &mut AppView) -> Vec<Effect> {
+    remember_loaded_zai_sessions(app);
+    let generation = next_zai_operation_generation(app);
+    app.show_toast("Removing Z AI API key…");
+    vec![Effect::UpdateZaiApiKey {
         generation,
         key: None,
     }]
@@ -2383,6 +2423,8 @@ pub(in crate::app::dispatch) fn set_default_model(
         Some(PrimaryProvider::OpenCodeGo)
     } else if app.pending_wafer_rebind_agents.contains(&aid) {
         Some(PrimaryProvider::Wafer)
+    } else if app.pending_zai_rebind_agents.contains(&aid) {
+        Some(PrimaryProvider::Zai)
     } else {
         Some(PrimaryProvider::Kimi)
     };
@@ -2413,6 +2455,9 @@ pub(in crate::app::dispatch) fn set_default_model(
                 }
                 Some(PrimaryProvider::Wafer) => {
                     app.cancel_pending_wafer_rebind(aid);
+                }
+                Some(PrimaryProvider::Zai) => {
+                    app.cancel_pending_zai_rebind(aid);
                 }
                 Some(PrimaryProvider::Xai | PrimaryProvider::Codex) | None => {}
             }

@@ -619,6 +619,7 @@ pub(super) fn dispatch_send_prompt_inner(
                         crate::app::dispatch::settings::ui::opencode_go_api_key_status(),
                     wafer_api_key_status: crate::app::dispatch::settings::ui::wafer_api_key_status(
                     ),
+                    zai_api_key_status: crate::app::dispatch::settings::ui::zai_api_key_status(),
                     opencode_go_models: app.opencode_go_models.clone(),
                     opencode_go_enabled_models: app.opencode_go_enabled_models.clone(),
                     perplexity_web_search_enabled: app.perplexity_web_search_enabled,

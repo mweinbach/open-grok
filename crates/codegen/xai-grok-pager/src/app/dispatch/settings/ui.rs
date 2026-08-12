@@ -60,6 +60,19 @@ pub(in crate::app::dispatch) fn wafer_api_key_status() -> crate::settings::Secre
     }
 }
 
+pub(in crate::app::dispatch) fn zai_api_key_status() -> crate::settings::SecretStatus {
+    if xai_grok_shell::zai_models::environment_api_key_is_configured() {
+        crate::settings::SecretStatus::EnvironmentOverride
+    } else if xai_grok_shell::auth::provider_api_key_is_configured(
+        &xai_grok_tools::util::grok_home::grok_home(),
+        xai_grok_shell::sampling::types::ModelProvider::Zai,
+    ) {
+        crate::settings::SecretStatus::Stored
+    } else {
+        crate::settings::SecretStatus::Missing
+    }
+}
+
 pub(in crate::app::dispatch) fn perplexity_api_key_status() -> crate::settings::SecretStatus {
     if xai_grok_shell::auth::perplexity_api_key_is_configured(
         &xai_grok_tools::util::grok_home::grok_home(),
@@ -132,6 +145,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let meta_api_key_status = meta_api_key_status();
     let opencode_go_api_key_status = opencode_go_api_key_status();
     let wafer_api_key_status = wafer_api_key_status();
+    let zai_api_key_status = zai_api_key_status();
     let perplexity_api_key_status = perplexity_api_key_status();
     let kimi_api_endpoint = app.kimi_api_endpoint.clone();
     let perplexity_web_search_enabled = app.perplexity_web_search_enabled;
@@ -175,6 +189,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 meta_api_key_status,
                 opencode_go_api_key_status,
                 wafer_api_key_status,
+                zai_api_key_status,
                 opencode_go_models: app.opencode_go_models.clone(),
                 opencode_go_enabled_models: app.opencode_go_enabled_models.clone(),
                 perplexity_web_search_enabled,
@@ -318,6 +333,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     let meta_api_key_status = meta_api_key_status();
     let opencode_go_api_key_status = opencode_go_api_key_status();
     let wafer_api_key_status = wafer_api_key_status();
+    let zai_api_key_status = zai_api_key_status();
     let kimi_api_endpoint = app.kimi_api_endpoint.clone();
     if opencode_go_api_key_status != crate::settings::SecretStatus::Missing {
         effects.push(Effect::QueryOpenCodeGoModels {
@@ -368,6 +384,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         meta_api_key_status,
         opencode_go_api_key_status,
         wafer_api_key_status,
+        zai_api_key_status,
         opencode_go_models: app.opencode_go_models.clone(),
         opencode_go_enabled_models: app.opencode_go_enabled_models.clone(),
         perplexity_web_search_enabled: app.perplexity_web_search_enabled,
@@ -573,6 +590,30 @@ pub(in crate::app::dispatch) fn dispatch_open_wafer_api_key_editor(
     let mut state = SettingsModalState::new(registry, ui_snapshot, pager_snapshot);
     if !state.try_open_wafer_provider_login() {
         tracing::error!(target: "settings", "Wafer API-key setting is missing from the registry");
+        return vec![];
+    }
+    if let Some(agent) = get_visible_agent_mut(app) {
+        agent.active_modal = Some(ActiveModal::Settings {
+            state: Box::new(state),
+        });
+    } else if matches!(app.active_view, ActiveView::AgentDashboard)
+        && let Some(dashboard) = app.dashboard.as_mut()
+    {
+        dashboard.settings_modal = Some(Box::new(state));
+    }
+    vec![]
+}
+
+pub(in crate::app::dispatch) fn dispatch_open_zai_api_key_editor(app: &mut AppView) -> Vec<Effect> {
+    use crate::views::modal::ActiveModal;
+    use crate::views::settings_modal::SettingsModalState;
+
+    let registry = app.settings_registry.clone();
+    let ui_snapshot = app.current_ui.clone();
+    let pager_snapshot = build_pager_snapshot(app);
+    let mut state = SettingsModalState::new(registry, ui_snapshot, pager_snapshot);
+    if !state.try_open_zai_provider_login() {
+        tracing::error!(target: "settings", "Z AI API-key setting is missing from the registry");
         return vec![];
     }
     if let Some(agent) = get_visible_agent_mut(app) {
@@ -1085,6 +1126,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         meta_api_key_status: meta_api_key_status(),
         opencode_go_api_key_status: opencode_go_api_key_status(),
         wafer_api_key_status: wafer_api_key_status(),
+        zai_api_key_status: zai_api_key_status(),
         opencode_go_models: app.opencode_go_models.clone(),
         opencode_go_enabled_models: app.opencode_go_enabled_models.clone(),
         perplexity_web_search_enabled: app.perplexity_web_search_enabled,
@@ -1456,6 +1498,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ) => Some(Action::ClearOpenCodeGoApiKey),
         ("wafer_api_key", SettingValue::SecretStatus(crate::settings::SecretStatus::Missing)) => {
             Some(Action::ClearWaferApiKey)
+        }
+        ("zai_api_key", SettingValue::SecretStatus(crate::settings::SecretStatus::Missing)) => {
+            Some(Action::ClearZaiApiKey)
         }
         (
             "perplexity_api_key",

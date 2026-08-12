@@ -78,8 +78,8 @@ use super::settings::setters::{
     clear_deepseek_api_key, clear_default_model, clear_fireworks_api_key,
     clear_fork_secondary_model, clear_kimi_api_key, clear_memory_model, clear_meta_api_key,
     clear_opencode_go_api_key, clear_perplexity_api_key, clear_recap_model, clear_wafer_api_key,
-    preview_auto_dark_theme, preview_auto_light_theme, preview_theme, refresh_opencode_go_models,
-    set_antigravity_skip_permissions, set_antigravity_subagents,
+    clear_zai_api_key, preview_auto_dark_theme, preview_auto_light_theme, preview_theme,
+    refresh_opencode_go_models, set_antigravity_skip_permissions, set_antigravity_subagents,
     set_ask_user_question_timeout_enabled, set_auto_dark_theme, set_auto_light_theme,
     set_auto_update, set_code_mode, set_collapsed_edit_blocks, set_combine_queued_prompts,
     set_compact_mode, set_confirm_before_rewind, set_contextual_hint_image_input,
@@ -97,7 +97,7 @@ use super::settings::setters::{
     set_scroll_lines, set_scroll_mode, set_scroll_speed, set_show_thinking_blocks, set_show_tips,
     set_simple_mode, set_theme, set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode,
     set_voice_keybind_enabled, set_voice_stt_language, set_wafer_api_key, set_web_search_source,
-    set_x_search_enabled,
+    set_x_search_enabled, set_zai_api_key,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette,
@@ -105,8 +105,8 @@ use super::settings::ui::{
     dispatch_open_howto_guides, dispatch_open_kimi_api_key_editor,
     dispatch_open_meta_api_key_editor, dispatch_open_opencode_go_api_key_editor,
     dispatch_open_reset_confirm, dispatch_open_settings, dispatch_open_wafer_api_key_editor,
-    dispatch_toggle_compact_mode, dispatch_toggle_mouse_capture, dispatch_toggle_multiline,
-    dispatch_toggle_timestamps, dispatch_toggle_vim_mode,
+    dispatch_open_zai_api_key_editor, dispatch_toggle_compact_mode, dispatch_toggle_mouse_capture,
+    dispatch_toggle_multiline, dispatch_toggle_timestamps, dispatch_toggle_vim_mode,
 };
 use super::status::{
     dispatch_copy_session_id, dispatch_manage_billing, dispatch_open_gboom, dispatch_open_tutorial,
@@ -1165,6 +1165,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ClearOpenCodeGoApiKey => clear_opencode_go_api_key(app),
         Action::SetWaferApiKey { key } => set_wafer_api_key(app, key),
         Action::ClearWaferApiKey => clear_wafer_api_key(app),
+        Action::SetZaiApiKey { key } => set_zai_api_key(app, key),
+        Action::ClearZaiApiKey => clear_zai_api_key(app),
         Action::SetOpenCodeGoEnabledModels { models } => {
             set_opencode_go_enabled_models(app, models)
         }
@@ -1259,6 +1261,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenMetaApiKeyEditor => dispatch_open_meta_api_key_editor(app),
         Action::OpenOpenCodeGoApiKeyEditor => dispatch_open_opencode_go_api_key_editor(app),
         Action::OpenWaferApiKeyEditor => dispatch_open_wafer_api_key_editor(app),
+        Action::OpenZaiApiKeyEditor => dispatch_open_zai_api_key_editor(app),
         Action::Login => dispatch_login(app),
         Action::LoginCodex => dispatch_login_codex(app),
         Action::ChooseStartupCodex => dispatch_choose_startup_codex(app),

@@ -1505,6 +1505,212 @@ fn handle_wafer_model_rebind_complete(
     effects
 }
 
+fn capture_zai_sessions_created_during_update(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models) == Some(PrimaryProvider::Zai) {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_zai_rebind_agents.extend(targets);
+}
+
+fn pending_zai_model(models: &crate::acp::model_state::ModelState) -> Option<acp::ModelId> {
+    let is_zai = |model_id: &acp::ModelId| {
+        PrimaryProvider::for_model(models, model_id) == Some(PrimaryProvider::Zai)
+    };
+    models
+        .current
+        .clone()
+        .filter(|id| is_zai(id))
+        .or_else(|| models.available.keys().find(|id| is_zai(id)).cloned())
+}
+
+fn rebind_pending_zai_sessions(app: &mut AppView, generation: u64) -> Vec<Effect> {
+    let targets = app
+        .pending_zai_rebind_agents
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let mut effects = Vec::new();
+    let mut completed = Vec::new();
+    for agent_id in targets {
+        let Some(agent) = app.agents.get_mut(&agent_id) else {
+            completed.push(agent_id);
+            continue;
+        };
+        if !agent.session.provider_rebind_pending || agent.session.model_switch_pending {
+            continue;
+        }
+        let Some(session_id) = agent.session.session_id.clone() else {
+            continue;
+        };
+        let Some(model_id) = pending_zai_model(&agent.session.models) else {
+            agent.scrollback.push_block(RenderBlock::system(
+                "No Z AI model is available for this session; queued prompts are paused. Adjust the model allowlist or switch this tab to another provider.".to_owned(),
+            ));
+            continue;
+        };
+        let effort = (agent.session.models.current.as_ref() == Some(&model_id))
+            .then_some(agent.session.models.reasoning_effort)
+            .flatten();
+        agent.session.model_switch_pending = true;
+        effects.push(Effect::RebindZaiModel {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+        });
+    }
+    for agent_id in completed {
+        app.pending_zai_rebind_agents.remove(&agent_id);
+    }
+    effects
+}
+
+fn after_zai_session_ready(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    mut effects: Vec<Effect>,
+) -> Vec<Effect> {
+    if app.zai_runtime_update_pending {
+        if let Some(agent) = app.agents.get_mut(&agent_id)
+            && PrimaryProvider::for_current_model(&agent.session.models)
+                == Some(PrimaryProvider::Zai)
+        {
+            agent.session.provider_rebind_pending = true;
+            app.pending_zai_rebind_agents.insert(agent_id);
+        }
+        return effects;
+    }
+    if app.pending_zai_rebind_agents.contains(&agent_id)
+        && app.agents.get(&agent_id).is_some_and(|agent| {
+            agent.session.provider_rebind_pending && !agent.session.model_switch_pending
+        })
+    {
+        effects.extend(rebind_pending_zai_sessions(
+            app,
+            app.zai_operation_generation,
+        ));
+    }
+    effects
+}
+
+fn mark_runtime_pending_zai_session(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    incoming_models: Option<&acp::SessionModelState>,
+) {
+    if !app.zai_runtime_update_pending && app.zai_operation_generation == 0 {
+        return;
+    }
+    let incoming = incoming_models
+        .cloned()
+        .map(|models| crate::acp::model_state::ModelState::from(Some(models)));
+    let is_zai = incoming.as_ref().map_or_else(
+        || {
+            app.agents.get(&agent_id).is_some_and(|agent| {
+                PrimaryProvider::for_current_model(&agent.session.models)
+                    == Some(PrimaryProvider::Zai)
+            })
+        },
+        |models| PrimaryProvider::for_current_model(models) == Some(PrimaryProvider::Zai),
+    );
+    if incoming.is_some() && !is_zai {
+        app.cancel_pending_zai_rebind(agent_id);
+    } else if is_zai && let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.provider_rebind_pending = true;
+        app.pending_zai_rebind_agents.insert(agent_id);
+    }
+}
+
+fn finish_zai_rebind(app: &mut AppView, agent_id: crate::app::agent::AgentId) {
+    app.pending_zai_rebind_agents.remove(&agent_id);
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.provider_rebind_pending = false;
+        agent.session.model_switch_pending = false;
+    }
+}
+
+fn handle_zai_model_rebind_complete(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    session_id: acp::SessionId,
+    model_id: acp::ModelId,
+    effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
+    generation: u64,
+    result: Result<(), crate::app::actions::SwitchModelError>,
+) -> Vec<Effect> {
+    let still_owned = app.pending_zai_rebind_agents.contains(&agent_id);
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        app.pending_zai_rebind_agents.remove(&agent_id);
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(&session_id) {
+        if !agent.session.provider_rebind_pending {
+            app.pending_zai_rebind_agents.remove(&agent_id);
+            return vec![];
+        }
+        if agent.session.model_switch_pending {
+            return vec![];
+        }
+        return rebind_pending_zai_sessions(app, app.zai_operation_generation);
+    }
+    if !still_owned || !agent.session.provider_rebind_pending {
+        agent.session.model_switch_pending = false;
+        let Some(target_model) = agent.session.models.current.clone() else {
+            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+        };
+        if target_model == model_id {
+            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+        };
+        let Some(current_session_id) = agent.session.session_id.clone() else {
+            agent.session.provider_rebind_pending = true;
+            return vec![];
+        };
+        let target_effort = agent.session.models.reasoning_effort;
+        agent.session.provider_rebind_pending = true;
+        agent.session.model_switch_pending = true;
+        return vec![Effect::SwitchModel {
+            agent_id,
+            session_id: current_session_id,
+            model_id: target_model,
+            effort: target_effort,
+            service_tier: None,
+            prev_model_id: None,
+        }];
+    }
+    agent.session.model_switch_pending = false;
+    if generation != app.zai_operation_generation {
+        return rebind_pending_zai_sessions(app, app.zai_operation_generation);
+    }
+    match result {
+        Ok(()) => agent.session.models.set_current(model_id, effort),
+        Err(error) => {
+            agent.scrollback.push_block(RenderBlock::system(format!(
+                "Couldn't refresh the Z AI session after its credential changed; queued prompts are paused. Update the Z AI key or switch this tab to another provider. ({})",
+                match error {
+                    crate::app::actions::SwitchModelError::Other(message) => {
+                        scrub_error_for_toast(&message)
+                    }
+                    crate::app::actions::SwitchModelError::IncompatibleAgent { .. } => {
+                        "the current agent is incompatible with the selected Z AI model".to_owned()
+                    }
+                },
+            )));
+            return vec![];
+        }
+    }
+    finish_zai_rebind(app, agent_id);
+    let mut effects = crate::app::dispatch::maybe_drain_queue_and_note_peek(app, agent_id);
+    if matches!(app.active_view, ActiveView::Agent(active) if active == agent_id) {
+        effects.extend(app.sync_primary_provider_from_active_agent());
+    }
+    effects
+}
+
 fn capture_opencode_go_sessions_created_during_update(app: &mut AppView) {
     let mut targets = Vec::new();
     for (&agent_id, agent) in &mut app.agents {
@@ -1767,6 +1973,14 @@ fn wafer_credential_configured() -> bool {
         || xai_grok_shell::auth::provider_api_key_is_configured(
             &xai_grok_tools::util::grok_home::grok_home(),
             xai_grok_shell::sampling::types::ModelProvider::Wafer,
+        )
+}
+
+fn zai_credential_configured() -> bool {
+    xai_grok_shell::zai_models::environment_api_key_is_configured()
+        || xai_grok_shell::auth::provider_api_key_is_configured(
+            &xai_grok_tools::util::grok_home::grok_home(),
+            xai_grok_shell::sampling::types::ModelProvider::Zai,
         )
 }
 
@@ -2122,6 +2336,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             mark_runtime_pending_meta_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_opencode_go_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_wafer_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_zai_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_perplexity_session(app, agent_id, new_models.as_ref());
             let effects = handle_session_created(
                 app,
@@ -2135,7 +2350,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let effects = after_deepseek_session_ready(app, agent_id, effects);
             let effects = after_meta_session_ready(app, agent_id, effects);
             let effects = after_opencode_go_session_ready(app, agent_id, effects);
-            after_wafer_session_ready(app, agent_id, effects)
+            let effects = after_wafer_session_ready(app, agent_id, effects);
+            after_zai_session_ready(app, agent_id, effects)
         }
         TaskResult::SessionFailed { agent_id, error } => {
             handle_session_failed(app, agent_id, error)
@@ -2154,6 +2370,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             mark_runtime_pending_meta_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_opencode_go_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_wafer_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_zai_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_perplexity_session(app, agent_id, new_models.as_ref());
             let effects = handle_worktree_session_created(
                 app,
@@ -2169,7 +2386,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let effects = after_deepseek_session_ready(app, agent_id, effects);
             let effects = after_meta_session_ready(app, agent_id, effects);
             let effects = after_opencode_go_session_ready(app, agent_id, effects);
-            after_wafer_session_ready(app, agent_id, effects)
+            let effects = after_wafer_session_ready(app, agent_id, effects);
+            after_zai_session_ready(app, agent_id, effects)
         }
         TaskResult::WorktreeForked {
             agent_id,
@@ -2272,6 +2490,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             mark_runtime_pending_meta_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_opencode_go_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_wafer_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_zai_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_perplexity_session(app, agent_id, new_models.as_ref());
             let effects = handle_session_loaded(
                 app,
@@ -2289,7 +2508,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let effects = after_deepseek_session_ready(app, agent_id, effects);
             let effects = after_meta_session_ready(app, agent_id, effects);
             let effects = after_opencode_go_session_ready(app, agent_id, effects);
-            after_wafer_session_ready(app, agent_id, effects)
+            let effects = after_wafer_session_ready(app, agent_id, effects);
+            after_zai_session_ready(app, agent_id, effects)
         }
         TaskResult::SessionMetaFromDisk {
             agent_id,
@@ -2395,13 +2615,15 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             mark_runtime_pending_meta_session(app, agent_id, None);
             mark_runtime_pending_opencode_go_session(app, agent_id, None);
             mark_runtime_pending_wafer_session(app, agent_id, None);
+            mark_runtime_pending_zai_session(app, agent_id, None);
             let effects = handle_session_restored(app, agent_id, local_session_id);
             let effects = after_kimi_session_ready(app, agent_id, effects);
             let effects = after_fireworks_session_ready(app, agent_id, effects);
             let effects = after_deepseek_session_ready(app, agent_id, effects);
             let effects = after_meta_session_ready(app, agent_id, effects);
             let effects = after_opencode_go_session_ready(app, agent_id, effects);
-            after_wafer_session_ready(app, agent_id, effects)
+            let effects = after_wafer_session_ready(app, agent_id, effects);
+            after_zai_session_ready(app, agent_id, effects)
         }
         TaskResult::SessionRestoreFailed { agent_id, error } => {
             handle_session_restore_failed(app, agent_id, error)
@@ -2536,12 +2758,14 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let held_by_meta = app.pending_meta_rebind_agents.contains(&agent_id);
             let held_by_opencode_go = app.pending_opencode_go_rebind_agents.contains(&agent_id);
             let held_by_wafer = app.pending_wafer_rebind_agents.contains(&agent_id);
+            let held_by_zai = app.pending_zai_rebind_agents.contains(&agent_id);
             let left_kimi = switch_succeeded
                 && !held_by_fireworks
                 && !held_by_deepseek
                 && !held_by_meta
                 && !held_by_opencode_go
                 && !held_by_wafer
+                && !held_by_zai
                 && target_provider != Some(PrimaryProvider::Kimi);
             if left_kimi {
                 app.cancel_pending_kimi_rebind(agent_id);
@@ -2574,6 +2798,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 && target_provider != Some(PrimaryProvider::Wafer);
             if left_wafer {
                 app.cancel_pending_wafer_rebind(agent_id);
+            }
+            let left_zai =
+                switch_succeeded && held_by_zai && target_provider != Some(PrimaryProvider::Zai);
+            if left_zai {
+                app.cancel_pending_zai_rebind(agent_id);
             }
             let mut effects = handle_switch_model_complete(
                 app,
@@ -2988,6 +3217,84 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             generation,
             result,
         } => handle_wafer_model_rebind_complete(
+            app, agent_id, session_id, model_id, effort, generation, result,
+        ),
+        TaskResult::ZaiApiKeyUpdated {
+            configured,
+            generation,
+            stale,
+            warning,
+            error,
+            models,
+        } => {
+            if stale || generation != app.zai_operation_generation {
+                return vec![];
+            }
+            capture_zai_sessions_created_during_update(app);
+            let storage_succeeded = error.is_none();
+            super::settings::ui::refresh_open_settings_modals(app);
+            let credential_status = super::settings::ui::zai_api_key_status();
+            let runtime_apply_unconfirmed = warning.is_some() && models.is_none();
+            if let Some(error) = error {
+                app.show_toast(&format!(
+                    "✗ Could not {} Z AI API key: {}; queued Z AI prompts remain paused",
+                    if configured { "save" } else { "remove" },
+                    scrub_error_for_toast(&error),
+                ));
+            } else {
+                let message = if configured {
+                    if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
+                        "✓ Z AI API key saved to UI storage; environment key remains active"
+                            .to_owned()
+                    } else if warning.is_some() {
+                        "✓ Z AI API key saved".to_owned()
+                    } else {
+                        "✓ Z AI API key saved; models refreshed".to_owned()
+                    }
+                } else if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
+                    "✓ UI-stored Z AI API key cleared; environment key remains active".to_owned()
+                } else {
+                    "✓ UI-stored Z AI API key cleared".to_owned()
+                };
+                if let Some(warning) = warning {
+                    app.show_toast(&format!(
+                        "{message}; model query warning: {}{}",
+                        scrub_error_for_toast(&warning),
+                        if runtime_apply_unconfirmed {
+                            "; queued Z AI prompts remain paused"
+                        } else {
+                            ""
+                        },
+                    ));
+                } else {
+                    app.show_toast(&message);
+                }
+            }
+            if !storage_succeeded || runtime_apply_unconfirmed {
+                return vec![];
+            }
+            app.zai_runtime_update_pending = false;
+            if let Some(models) = models {
+                apply_kimi_catalog(app, models);
+                super::settings::ui::refresh_open_settings_modals(app);
+            }
+            if !zai_credential_configured() {
+                app.show_toast(&format!(
+                    "✓ Z AI API key {}; API key required and queued Z AI prompts remain paused",
+                    if configured { "saved" } else { "cleared" },
+                ));
+                return vec![];
+            }
+            rebind_pending_zai_sessions(app, generation)
+        }
+        TaskResult::ZaiModelRebindComplete {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+            result,
+        } => handle_zai_model_rebind_complete(
             app, agent_id, session_id, model_id, effort, generation, result,
         ),
         TaskResult::OpenCodeGoModelsUpdated {

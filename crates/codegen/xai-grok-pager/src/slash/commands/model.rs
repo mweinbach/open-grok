@@ -153,6 +153,7 @@ fn model_provider_label(info: &acp::ModelInfo) -> Option<&str> {
         Some("deepseek" | "deep_seek" | "deepseek_api") => Some("DeepSeek"),
         Some("opencode_go" | "opencode-go") => Some("OpenCode Go"),
         Some("wafer" | "wafer_ai") => Some("Wafer AI"),
+        Some("zai" | "z_ai" | "z-ai") => Some("Z AI"),
         Some(provider) => Some(provider),
         None => None,
     }

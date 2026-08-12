@@ -1152,6 +1152,29 @@ pub fn run_cli_wafer_logout() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Store a Z AI API key supplied by a command or client integration.
+///
+/// Z AI credentials are provider-local API keys, not xAI sessions, so this
+/// deliberately never updates the xAI auth manager or its scope.
+pub fn run_cli_zai_login(api_key: &str) -> anyhow::Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        anyhow::bail!("Z AI API key cannot be empty");
+    }
+    crate::auth::store_zai_api_key(&grok_home::grok_home(), api_key)
+        .map_err(|e| anyhow::anyhow!("Failed to save Z AI API key: {e}"))?;
+    eprintln!("Connected Z AI API key.");
+    Ok(())
+}
+
+/// Remove only the stored Z AI API key.
+pub fn run_cli_zai_logout() -> anyhow::Result<()> {
+    crate::auth::clear_zai_api_key(&grok_home::grok_home())
+        .map_err(|e| anyhow::anyhow!("Failed to clear Z AI API key: {e}"))?;
+    eprintln!("Signed out of Z AI.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

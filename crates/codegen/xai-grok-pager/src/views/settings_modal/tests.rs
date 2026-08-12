@@ -927,6 +927,8 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "opencode_go_api_key",
             // Wafer AI isolated credential.
             "wafer_api_key",
+            // Z AI isolated credential.
+            "zai_api_key",
             "opencode_go_models",
             "toolset.perplexity_web_search.enabled",
             "perplexity_api_key",

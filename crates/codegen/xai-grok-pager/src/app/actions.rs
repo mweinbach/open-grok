@@ -664,6 +664,12 @@ pub enum Action {
     },
     /// Remove the UI-stored Wafer AI credential.
     ClearWaferApiKey,
+    /// Save the Z AI API key from the dedicated masked editor.
+    SetZaiApiKey {
+        key: crate::settings::SecretInput,
+    },
+    /// Remove the UI-stored Z AI credential.
+    ClearZaiApiKey,
     SetOpenCodeGoEnabledModels {
         models: Vec<String>,
     },
@@ -783,6 +789,8 @@ pub enum Action {
     OpenOpenCodeGoApiKeyEditor,
     /// Open Settings directly in the secure Wafer AI API-key editor.
     OpenWaferApiKeyEditor,
+    /// Open Settings directly in the secure Z AI API-key editor.
+    OpenZaiApiKeyEditor,
     /// Start the concrete xAI login flow (welcome screen, picker, or re-auth).
     Login,
     /// Connect the independent OpenAI Codex OAuth account in the browser.
@@ -1609,6 +1617,11 @@ pub enum Effect {
         generation: u64,
         key: Option<crate::settings::SecretInput>,
     },
+    /// Update the Z AI credential, then refresh its dynamic model catalog.
+    UpdateZaiApiKey {
+        generation: u64,
+        key: Option<crate::settings::SecretInput>,
+    },
     UpdateOpenCodeGoEnabledModels {
         generation: u64,
         models: Vec<String>,
@@ -1667,6 +1680,13 @@ pub enum Effect {
         generation: u64,
     },
     RebindWaferModel {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+    },
+    RebindZaiModel {
         agent_id: AgentId,
         session_id: acp::SessionId,
         model_id: acp::ModelId,
@@ -2655,6 +2675,15 @@ pub enum TaskResult {
         error: Option<String>,
         models: Option<acp::SessionModelState>,
     },
+    /// Completion of a Z AI credential update and dynamic catalog refresh.
+    ZaiApiKeyUpdated {
+        configured: bool,
+        generation: u64,
+        stale: bool,
+        warning: Option<String>,
+        error: Option<String>,
+        models: Option<acp::SessionModelState>,
+    },
     /// Completion of an automatic Fireworks sampler/model rebind.
     FireworksModelRebindComplete {
         agent_id: AgentId,
@@ -2692,6 +2721,15 @@ pub enum TaskResult {
     },
     /// Completion of an automatic Wafer sampler/model rebind.
     WaferModelRebindComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+        result: Result<(), SwitchModelError>,
+    },
+    /// Completion of an automatic Z AI sampler/model rebind.
+    ZaiModelRebindComplete {
         agent_id: AgentId,
         session_id: acp::SessionId,
         model_id: acp::ModelId,

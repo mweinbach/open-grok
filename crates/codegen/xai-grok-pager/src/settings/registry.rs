@@ -368,6 +368,8 @@ pub struct PagerLocalSnapshot {
     pub opencode_go_api_key_status: SecretStatus,
     /// Status-only mirror for the Wafer AI API-key source.
     pub wafer_api_key_status: SecretStatus,
+    /// Status-only mirror for the Z AI API-key source.
+    pub zai_api_key_status: SecretStatus,
     pub opencode_go_models: Vec<xai_grok_shell::opencode_go_models::OpenCodeGoModelDescriptor>,
     pub opencode_go_enabled_models: Vec<String>,
     pub perplexity_web_search_enabled: bool,
@@ -448,6 +450,7 @@ impl Default for PagerLocalSnapshot {
             meta_api_key_status: SecretStatus::Missing,
             opencode_go_api_key_status: SecretStatus::Missing,
             wafer_api_key_status: SecretStatus::Missing,
+            zai_api_key_status: SecretStatus::Missing,
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
             perplexity_web_search_enabled: false,
@@ -898,6 +901,7 @@ pub fn current_value_for(
         "meta_api_key" => Some(SettingValue::SecretStatus(pager.meta_api_key_status)),
         "opencode_go_api_key" => Some(SettingValue::SecretStatus(pager.opencode_go_api_key_status)),
         "wafer_api_key" => Some(SettingValue::SecretStatus(pager.wafer_api_key_status)),
+        "zai_api_key" => Some(SettingValue::SecretStatus(pager.zai_api_key_status)),
         "toolset.perplexity_web_search.enabled" => {
             Some(SettingValue::Bool(pager.perplexity_web_search_enabled))
         }
@@ -1255,6 +1259,7 @@ mod tests {
                     | "meta_api_key"
                     | "opencode_go_api_key"
                     | "wafer_api_key"
+                    | "zai_api_key"
                     | "perplexity_api_key",
                     SettingKind::Secret,
                 ) => {

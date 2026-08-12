@@ -28,6 +28,7 @@ pub mod kimi_models;
 pub mod meta_models;
 pub mod opencode_go_models;
 pub mod wafer_models;
+pub mod zai_models;
 pub use xai_grok_shell_base::cpu_profile;
 pub use xai_grok_shell_base::env;
 pub mod extensions;

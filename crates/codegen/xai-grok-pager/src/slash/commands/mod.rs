@@ -710,6 +710,7 @@ mod tests {
             Some(crate::settings::SecretStatus::EnvironmentOverride),
             Some(crate::settings::SecretStatus::Missing),
             Some(crate::settings::SecretStatus::Stored),
+            Some(crate::settings::SecretStatus::Stored),
         );
         assert_eq!(
             items
@@ -724,7 +725,8 @@ mod tests {
                 "deepseek",
                 "meta",
                 "opencode-go",
-                "wafer"
+                "wafer",
+                "zai"
             ]
         );
         assert_eq!(items[2].description, "API key · saved");

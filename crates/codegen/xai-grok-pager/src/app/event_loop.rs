@@ -127,7 +127,8 @@ fn startup_codex_freshness_required(
             | PrimaryProvider::DeepSeek
             | PrimaryProvider::Meta
             | PrimaryProvider::OpenCodeGo
-            | PrimaryProvider::Wafer => false,
+            | PrimaryProvider::Wafer
+            | PrimaryProvider::Zai => false,
         },
     }
 }
@@ -153,7 +154,8 @@ fn plan_startup_auth(
             | PrimaryProvider::DeepSeek
             | PrimaryProvider::Meta
             | PrimaryProvider::OpenCodeGo
-            | PrimaryProvider::Wafer => StartupAuthPlan::Ready,
+            | PrimaryProvider::Wafer
+            | PrimaryProvider::Zai => StartupAuthPlan::Ready,
         };
     }
     match selected_provider {
@@ -166,7 +168,8 @@ fn plan_startup_auth(
         | PrimaryProvider::DeepSeek
         | PrimaryProvider::Meta
         | PrimaryProvider::OpenCodeGo
-        | PrimaryProvider::Wafer => StartupAuthPlan::Ready,
+        | PrimaryProvider::Wafer
+        | PrimaryProvider::Zai => StartupAuthPlan::Ready,
     }
 }
 

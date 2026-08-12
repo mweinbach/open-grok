@@ -1100,6 +1100,8 @@ pub enum ModelProvider {
     OpenCodeGo,
     #[serde(alias = "wafer_ai")]
     Wafer,
+    #[serde(alias = "z_ai", alias = "z-ai")]
+    Zai,
 }
 
 /// Provider-specific wire contract used by the Responses API.
@@ -1399,6 +1401,25 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
+    /// Z AI's OpenAI-compatible Chat Completions API (GLM Coding Plan
+    /// endpoint by default). Z AI supports ordinary client-side function
+    /// tools and per-model reasoning ("thinking mode"), but does not provide
+    /// hosted tools, web search, Responses, or provider-managed OAuth.
+    pub const ZAI: Self = Self {
+        provider: ModelProvider::Zai,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: None,
+            messages: false,
+        },
+        code_mode_transport: CodeModeTransport::Unsupported,
+        hosted_tool_dialect: None,
+        native_web_search: false,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
     pub const fn id(self) -> &'static str {
         self.provider.as_str()
     }
@@ -1439,6 +1460,10 @@ impl ProviderProfile {
         self.provider.is_wafer()
     }
 
+    pub const fn is_zai(self) -> bool {
+        self.provider.is_zai()
+    }
+
     pub const fn allows_xai_services(self) -> bool {
         self.xai_services.allows()
     }
@@ -1468,6 +1493,7 @@ impl ModelProvider {
             Self::Meta => "meta",
             Self::OpenCodeGo => "opencode_go",
             Self::Wafer => "wafer",
+            Self::Zai => "zai",
         }
     }
 
@@ -1482,6 +1508,7 @@ impl ModelProvider {
             Self::Meta => "Meta API",
             Self::OpenCodeGo => "OpenCode Go",
             Self::Wafer => "Wafer AI",
+            Self::Zai => "Z AI",
         }
     }
 
@@ -1517,6 +1544,10 @@ impl ModelProvider {
         matches!(self, Self::Wafer)
     }
 
+    pub const fn is_zai(self) -> bool {
+        matches!(self, Self::Zai)
+    }
+
     /// Return the built-in provider's complete behavior policy.
     pub const fn profile(self) -> ProviderProfile {
         match self {
@@ -1528,6 +1559,7 @@ impl ModelProvider {
             Self::Meta => ProviderProfile::META,
             Self::OpenCodeGo => ProviderProfile::OPEN_CODE_GO,
             Self::Wafer => ProviderProfile::WAFER,
+            Self::Zai => ProviderProfile::ZAI,
         }
     }
 }
@@ -1884,6 +1916,22 @@ mod tests {
                 session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
                 xai_services: XaiServicePolicy::Denied,
             },
+            Case {
+                provider: ModelProvider::Zai,
+                id: "zai",
+                name: "Z AI",
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: None,
+                    messages: false,
+                },
+                code_mode_transport: CodeModeTransport::Unsupported,
+                hosted_tools: None,
+                native_web_search: false,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+                xai_services: XaiServicePolicy::Denied,
+            },
         ];
 
         for case in cases {
@@ -1906,6 +1954,7 @@ mod tests {
             assert_eq!(profile.is_deepseek(), case.provider.is_deepseek());
             assert_eq!(profile.is_open_code_go(), case.provider.is_open_code_go());
             assert_eq!(profile.is_wafer(), case.provider.is_wafer());
+            assert_eq!(profile.is_zai(), case.provider.is_zai());
             assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
             for backend in [
                 ApiBackend::ChatCompletions,

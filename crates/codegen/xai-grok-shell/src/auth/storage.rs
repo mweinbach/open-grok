@@ -441,6 +441,7 @@ fn provider_api_key_scope(provider: ModelProvider) -> String {
 const KIMI_CODE_API_KEY_SCOPE: &str = "kimi_code::api_key";
 const PERPLEXITY_API_KEY_SCOPE: &str = "perplexity::api_key";
 pub const WAFER_API_KEY_SCOPE: &str = "wafer::api_key";
+pub const ZAI_API_KEY_SCOPE: &str = "zai::api_key";
 
 fn kimi_api_key_scope(endpoint: KimiApiEndpoint) -> String {
     match endpoint {
@@ -663,6 +664,39 @@ pub fn clear_wafer_api_key(grok_home: &Path) -> std::io::Result<()> {
     clear_scoped_api_key(grok_home, WAFER_API_KEY_SCOPE)
 }
 
+/// Read the Z AI API key from its isolated auth.json scope.
+pub fn read_zai_api_key(grok_home: &Path) -> Option<String> {
+    let path = grok_home.join("auth.json");
+    let map = read_auth_json(&path).ok()?;
+    map.get(ZAI_API_KEY_SCOPE)
+        .map(|auth| auth.key.clone())
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// Return whether a non-empty Z AI credential exists without cloning it.
+pub fn zai_api_key_is_configured(grok_home: &Path) -> bool {
+    let path = grok_home.join("auth.json");
+    let Ok(map) = read_auth_json(&path) else {
+        return false;
+    };
+    map.get(ZAI_API_KEY_SCOPE)
+        .is_some_and(|auth| !auth.key.trim().is_empty())
+}
+
+/// Store a Z AI API key in the provider-isolated auth.json scope.
+pub fn store_zai_api_key(grok_home: &Path, api_key: &str) -> std::io::Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return clear_zai_api_key(grok_home);
+    }
+    store_scoped_api_key(grok_home, ZAI_API_KEY_SCOPE, api_key)
+}
+
+/// Clear only the Z AI API-key scope.
+pub fn clear_zai_api_key(grok_home: &Path) -> std::io::Result<()> {
+    clear_scoped_api_key(grok_home, ZAI_API_KEY_SCOPE)
+}
+
 #[cfg(test)]
 mod provider_api_key_tests {
     use super::*;
@@ -807,6 +841,39 @@ mod provider_api_key_tests {
         store_wafer_api_key(dir.path(), "  ").unwrap();
 
         assert!(read_wafer_api_key(dir.path()).is_none());
+        assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
+    }
+
+    #[test]
+    fn zai_key_round_trip_and_clear_preserve_unrelated_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        store_api_key(dir.path(), "xai-secret").unwrap();
+        store_wafer_api_key(dir.path(), "wafer-secret").unwrap();
+        store_zai_api_key(dir.path(), "zai-secret").unwrap();
+
+        assert_eq!(read_zai_api_key(dir.path()).as_deref(), Some("zai-secret"));
+        assert!(zai_api_key_is_configured(dir.path()));
+
+        clear_zai_api_key(dir.path()).unwrap();
+
+        assert!(read_zai_api_key(dir.path()).is_none());
+        assert!(!zai_api_key_is_configured(dir.path()));
+        assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
+        assert_eq!(
+            read_wafer_api_key(dir.path()).as_deref(),
+            Some("wafer-secret")
+        );
+    }
+
+    #[test]
+    fn empty_zai_key_clears_only_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        store_zai_api_key(dir.path(), "zai-secret").unwrap();
+        store_api_key(dir.path(), "xai-secret").unwrap();
+
+        store_zai_api_key(dir.path(), "  ").unwrap();
+
+        assert!(read_zai_api_key(dir.path()).is_none());
         assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
     }
 
