@@ -1935,6 +1935,9 @@ pub(crate) async fn spawn_session_actor(
         workspace_ops: workspace_ops.clone(),
         trace_config_template: std::cell::RefCell::new(None),
     });
+    if owns_permission_manager {
+        session.wire_permission_prompt_notification();
+    }
     if let Err(error) = session
         .rebuild_spec
         .code_mode_runtime

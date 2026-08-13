@@ -1665,6 +1665,9 @@ mod observability_bridge_mapping_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/permission_auto_mode_tests.rs"]
 mod permission_auto_mode_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/permission_prompt_notification_tests.rs"]
+mod permission_prompt_notification_tests;
 /// Resume re-park of the parked `exit_plan_mode` approval.
 #[cfg(test)]
 #[path = "acp_session_tests/plan_approval_resume_tests.rs"]
@@ -1863,6 +1866,7 @@ mod tool_meta_stamp_tests {
                     yolo_pin: None,
                     deny_read_globs: Arc::new(vec![]),
                     in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    user_prompt_notify: Arc::new(parking_lot::Mutex::new(None)),
                 };
                 let captured: Arc<tokio::sync::Mutex<Option<acp::ToolCallUpdate>>> =
                     Arc::new(tokio::sync::Mutex::new(None));
