@@ -310,6 +310,13 @@ pub enum PersistenceMsg {
     },
     /// Replace the entire chat history (used for compaction)
     ReplaceChatHistory(Vec<ConversationItem>),
+    /// Destructive image-strip rewrite: back up the on-disk history first,
+    /// and only rewrite if the backup landed: recoverability gates the
+    /// destruction. Acks the combined disk outcome.
+    ReplaceChatHistoryForStripAndAck {
+        messages: Vec<ConversationItem>,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     CurrentModel {
         model_id: acp::ModelId,
         /// Provider contract for this model. This is persisted as a sticky
@@ -2353,6 +2360,23 @@ impl SessionPersistence {
                     if let Err(e) = result {
                         tracing::warn!(?e, "failed to replace chat history");
                     }
+                }
+                PersistenceMsg::ReplaceChatHistoryForStripAndAck {
+                    messages,
+                    respond_to,
+                } => {
+                    // Backup gates the rewrite; see `strip_rewrite_gated`.
+                    let result = crate::session::storage::strip_rewrite_gated(
+                        self.storage.as_ref(),
+                        &self.info,
+                        &messages,
+                    )
+                    .await;
+                    self.observe_io(&result);
+                    if let Err(e) = &result {
+                        tracing::warn!(?e, "image-strip history rewrite failed");
+                    }
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::CurrentModel {
                     model_id,

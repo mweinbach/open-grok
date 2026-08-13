@@ -63,6 +63,29 @@ impl ChatPersistence for ChannelChatPersistence {
             .send(PersistenceMsg::ReplaceChatHistory(items.to_vec()));
     }
 
+    fn replace_history_for_strip_and_ack(
+        &mut self,
+        items: &[ConversationItem],
+    ) -> oneshot::Receiver<io::Result<()>> {
+        let (respond_to, receiver) = oneshot::channel();
+        if self
+            .tx
+            .send(PersistenceMsg::ReplaceChatHistoryForStripAndAck {
+                messages: items.to_vec(),
+                respond_to,
+            })
+            .is_err()
+        {
+            let (reply, receiver) = oneshot::channel();
+            let _ = reply.send(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor unavailable for strip rewrite",
+            )));
+            return receiver;
+        }
+        receiver
+    }
+
     fn flush(&mut self) {
         let _ = self.tx.send(PersistenceMsg::Flush);
     }
@@ -114,6 +137,31 @@ mod tests {
         persistence.replace_history(&[ConversationItem::system("compacted")]);
         let msg = rx.recv().await.unwrap();
         assert!(matches!(msg, PersistenceMsg::ReplaceChatHistory(_)));
+    }
+
+    #[tokio::test]
+    async fn channel_persistence_sends_acked_strip_rewrite() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut persistence = ChannelChatPersistence::new(tx);
+        let ack = persistence.replace_history_for_strip_and_ack(&[ConversationItem::system("s")]);
+        let msg = rx.recv().await.unwrap();
+        let PersistenceMsg::ReplaceChatHistoryForStripAndAck { respond_to, .. } = msg else {
+            panic!("expected acked strip rewrite, got {msg:?}");
+        };
+        respond_to.send(Ok(())).unwrap();
+        assert!(ack.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn channel_persistence_acks_strip_error_when_actor_gone() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let mut persistence = ChannelChatPersistence::new(tx);
+        let ack = persistence.replace_history_for_strip_and_ack(&[ConversationItem::system("s")]);
+        assert!(
+            ack.await.unwrap().is_err(),
+            "dead persistence actor must ack an error, not hang or succeed"
+        );
     }
 
     #[tokio::test]

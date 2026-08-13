@@ -27,11 +27,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_error_message};
 use xai_grok_sampling_types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CodeModeTransport,
-    ConversationRequest, ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER,
-    MessagesRequestWrapper, ModelProvider, NamedCustomToolOutputOccurrence,
-    OriginalDetailCustomOutputImageOccurrence, ResponseModelMetadata, Result, SamplingError,
-    SentCredential, build_messages_request, is_check_event, messages, rs,
+    build_messages_request, is_check_event, messages, parse_error_code, rs, ChatCompletionChunk,
+    ChatCompletionRequest, ChatCompletionResponse, CodeModeTransport, ConversationRequest,
+    ConversationResponse, CreateResponseWrapper, MessagesRequestWrapper, ModelProvider,
+    NamedCustomToolOutputOccurrence, OriginalDetailCustomOutputImageOccurrence,
+    ResponseModelMetadata, Result, SamplingError, SentCredential, DOOM_LOOP_CHECK_HEADER,
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
@@ -1780,6 +1780,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1851,6 +1852,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -2027,6 +2029,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -2291,6 +2294,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
         let response: CodexCompactHistoryResponse =
@@ -2391,6 +2395,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -2589,6 +2594,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -2785,6 +2791,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -2997,6 +3004,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -3131,6 +3139,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -3579,8 +3588,6 @@ impl SamplingClient {
     }
 }
 
-/// Rebuild `Api` from stream-collected info, preserving status,
-/// `Retry-After`, and `x-should-retry` (kind is lost on this path).
 fn stream_collect_error(info: SamplingErrorInfo) -> SamplingError {
     SamplingError::Api {
         status: info
@@ -3591,6 +3598,7 @@ fn stream_collect_error(info: SamplingErrorInfo) -> SamplingError {
         model_metadata: info.model_metadata,
         retry_after_secs: info.retry_after_secs,
         should_retry: info.should_retry,
+        error_code: info.error_code,
     }
 }
 
@@ -3610,6 +3618,7 @@ mod tests {
             is_retryable: true,
             retry_after_secs: Some(3),
             should_retry: Some(false),
+            error_code: None,
             model_metadata: None,
             empty_response_context: None,
             doom_loop_triggers: None,
@@ -3624,6 +3633,7 @@ mod tests {
             model_metadata,
             retry_after_secs,
             should_retry,
+            error_code,
         } = stream_collect_error(info)
         else {
             panic!("expected Api");
@@ -3635,8 +3645,9 @@ mod tests {
                 model_metadata.is_none(),
                 retry_after_secs,
                 should_retry,
+                error_code,
             ),
-            (529, "Overloaded", true, Some(3), Some(false)),
+            (529, "Overloaded", true, Some(3), Some(false), None),
         );
     }
 

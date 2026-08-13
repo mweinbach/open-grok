@@ -1481,6 +1481,17 @@ impl StorageAdapter for JsonlStorageAdapter {
         .await
         .map_err(io::Error::other)?
     }
+    async fn backup_chat_history_before_strip(&self, info: &Info) -> io::Result<()> {
+        let path = self.chat_file(info);
+        let backup = path.with_extension("jsonl.pre-strip");
+        if !tokio::fs::try_exists(&path).await? || tokio::fs::try_exists(&backup).await? {
+            return Ok(());
+        }
+        let staging = path.with_extension("jsonl.pre-strip.tmp");
+        tokio::fs::copy(&path, &staging).await?;
+        tokio::fs::rename(&staging, &backup).await?;
+        Ok(())
+    }
     async fn replace_chat_history(
         &self,
         info: &Info,

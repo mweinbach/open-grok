@@ -254,6 +254,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
+        pending_image_strip: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -816,6 +817,7 @@ async fn failed_event_preserves_streaming_capture_for_takeout() {
                         is_retryable: false,
                         retry_after_secs: None,
                         should_retry: None,
+                        error_code: None,
                         model_metadata: None,
                         empty_response_context: None,
                         doom_loop_triggers: None,
@@ -1228,6 +1230,7 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                 is_retryable: false,
                 retry_after_secs: None,
                 should_retry: None,
+                error_code: None,
                 model_metadata: None,
                 empty_response_context: Some(EmptyResponseContext {
                     reason: EmptyReason::ReasoningOnly,

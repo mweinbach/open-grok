@@ -3225,6 +3225,7 @@ mod inline_auto_compact_flow_tests {
                 crate::session::acp_session::StreamingTurnCapture::default(),
             ),
             turn_stream_drained: parking_lot::Mutex::new(None),
+            pending_image_strip: parking_lot::Mutex::new(None),
             sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
             rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
             image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -4458,6 +4459,7 @@ mod inline_auto_compact_flow_tests {
             is_retryable: false,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
             model_metadata: Some(crate::sampling::ResponseModelMetadata {
                 context_window: Some(context_window),
                 max_completion_tokens: None,
@@ -4520,6 +4522,7 @@ mod inline_auto_compact_flow_tests {
                     is_retryable: false,
                     retry_after_secs: None,
                     should_retry: None,
+                    error_code: None,
                     model_metadata: None,
                     empty_response_context: None,
                     doom_loop_triggers: None,

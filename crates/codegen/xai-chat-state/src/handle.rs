@@ -213,6 +213,21 @@ impl ChatStateHandle {
         .await
     }
 
+    /// See [`ChatStateCommand::StripConversationImages`]. The outcome is
+    /// typed and disk-acknowledged: `Applied` means the backup and the
+    /// rewrite both reached disk; a dead actor reads as `ActorUnavailable`,
+    /// never as a successful no-op.
+    pub async fn strip_conversation_images(
+        &self,
+        urls: Vec<std::sync::Arc<str>>,
+    ) -> crate::StripOutcome {
+        self.query("StripConversationImages", |reply| {
+            ChatStateCommand::StripConversationImages { urls, reply }
+        })
+        .await
+        .unwrap_or(crate::StripOutcome::ActorUnavailable)
+    }
+
     /// Atomically align the leading `System` message with `prompt` (insert one
     /// if absent), persisting when changed. Serializes with turn pushes inside
     /// the actor, so a mid-turn reconnect can't drop concurrent updates.

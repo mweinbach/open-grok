@@ -105,6 +105,8 @@ pub(crate) use auth_retry::{
 mod goal;
 #[path = "acp_session_impl/interjection.rs"]
 mod interjection;
+#[path = "acp_session_impl/image_strip.rs"]
+mod image_strip;
 #[path = "acp_session_impl/tool_calls.rs"]
 mod tool_calls;
 #[path = "acp_session_impl/turn.rs"]
@@ -1072,6 +1074,12 @@ pub(crate) struct SessionActor {
     /// terminal `SamplingEvent::Completed` (every text/thought chunk has been
     /// `send_update`d by then). `None` between turns.
     pub(crate) turn_stream_drained: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// A server-confirmed image strip awaiting proof that the stripped retry
+    /// helped: URLs buffered by request id on `ImagesStripped`, persisted to
+    /// stored history only when that request's `Completed` arrives, dropped
+    /// on `Failed`. See `acp_session_impl/image_strip.rs`.
+    pub(crate) pending_image_strip:
+        parking_lot::Mutex<Option<(xai_grok_sampler::RequestId, Vec<std::sync::Arc<str>>)>>,
     /// Handle to the per-session `xai-grok-sampler` actor.
     ///
     /// Live sessions get a real handle from `spawn_session_actor`;
@@ -1960,6 +1968,9 @@ mod feedback_turn_lookup_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/idle_resume_tests.rs"]
 mod idle_resume_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/image_strip_tests.rs"]
+mod image_strip_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/inline_auto_compact_flow_tests.rs"]
 mod inline_auto_compact_flow_tests;
