@@ -16,7 +16,9 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 use std::time::Duration;
 use url::Url;
-use xai_grok_sampling_types::{ApiBackend, ModelProvider, ToolMode};
+use xai_grok_sampling_types::{
+    ApiBackend, ModelProvider, ReasoningEffort, ReasoningEffortOption, ToolMode,
+};
 
 /// Default base URL: the GLM Coding Plan OpenAI-compatible endpoint.
 pub const ZAI_API_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
@@ -104,6 +106,50 @@ fn is_known_reasoning_model(model_id: &str) -> bool {
         .any(|prefix| lower.starts_with(prefix))
 }
 
+/// Effort menu for GLM reasoning models. Z AI documents low/medium/high/max
+/// for `reasoning_effort`; high is the balanced default and max matches Z
+/// AI's quickstart for the hardest tasks.
+fn zai_reasoning_efforts() -> Vec<ReasoningEffortOption> {
+    [
+        (
+            ReasoningEffort::Low,
+            "Faster responses with lighter reasoning",
+            false,
+        ),
+        (
+            ReasoningEffort::Medium,
+            "Balanced reasoning for everyday coding",
+            false,
+        ),
+        (
+            ReasoningEffort::High,
+            "Z AI's recommended reasoning level for coding",
+            true,
+        ),
+        (
+            ReasoningEffort::Max,
+            "Maximum thinking depth for difficult tasks",
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(|(value, description, default)| ReasoningEffortOption {
+        id: value.as_str().to_owned(),
+        value,
+        label: match value {
+            ReasoningEffort::Low => "Low",
+            ReasoningEffort::Medium => "Medium",
+            ReasoningEffort::High => "High",
+            ReasoningEffort::Max => "Max",
+            _ => unreachable!("Z AI exposes only low/medium/high/max"),
+        }
+        .to_owned(),
+        description: Some(description.to_owned()),
+        default,
+    })
+    .collect()
+}
+
 fn model_entry(model_id: &str, base_url: &str) -> ModelEntry {
     let key = format!("zai:{model_id}");
     let mut info = ModelInfo::fallback(&key);
@@ -114,9 +160,17 @@ fn model_entry(model_id: &str, base_url: &str) -> ModelEntry {
     info.api_backend = ApiBackend::ChatCompletions;
     info.provider = ModelProvider::Zai;
     info.tool_mode = Some(ToolMode::Direct);
-    info.supports_reasoning_effort = is_known_reasoning_model(model_id);
-    info.reasoning_effort = None;
-    info.reasoning_efforts.clear();
+    if is_known_reasoning_model(model_id) {
+        // The menu is authoritative (gate + default derive from it), so the
+        // legacy fallback ladder without `max` never applies to GLM.
+        info.reasoning_efforts = zai_reasoning_efforts();
+        info.supports_reasoning_effort = true;
+        info.reasoning_effort = Some(ReasoningEffort::High);
+    } else {
+        info.supports_reasoning_effort = false;
+        info.reasoning_effort = None;
+        info.reasoning_efforts.clear();
+    }
     info.supports_backend_search = false;
     info.supports_standalone_web_search = Some(false);
     info.supported_in_api = true;
@@ -394,6 +448,43 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_models_offer_zai_effort_menu_with_max() {
+        let catalog = ZaiModelsCatalog::fallback(ZAI_API_BASE_URL);
+        let entries = catalog.entries();
+        let glm_5_2 = &entries["zai:glm-5.2"];
+        // Menu is authoritative: low/medium/high/max, high default.
+        let efforts: Vec<ReasoningEffort> = glm_5_2
+            .info
+            .reasoning_efforts
+            .iter()
+            .map(|option| option.value)
+            .collect();
+        assert_eq!(
+            efforts,
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Max
+            ]
+        );
+        assert_eq!(
+            glm_5_2
+                .info
+                .reasoning_efforts
+                .iter()
+                .filter(|option| option.default)
+                .map(|option| option.value)
+                .collect::<Vec<_>>(),
+            [ReasoningEffort::High]
+        );
+        assert_eq!(glm_5_2.info.reasoning_effort, Some(ReasoningEffort::High));
+        assert!(glm_5_2.info.supports_reasoning_effort);
+        // The max option round-trips through its wire token.
+        assert_eq!(ReasoningEffort::Max.as_str(), "max");
+    }
+
+    #[test]
     fn wire_catalog_marks_reasoning_for_known_models() {
         let client = ZaiModelsClient::with_base_url(ZAI_API_BASE_URL);
         let catalog = client.catalog_from_wire(
@@ -415,7 +506,11 @@ mod tests {
         let entries = catalog.entries();
         assert!(entries["zai:glm-5.2"].info.supports_reasoning_effort);
         assert!(entries["zai:glm-4.6"].info.supports_reasoning_effort);
-        assert!(!entries["zai:glm-ocr"].info.supports_reasoning_effort);
+        // Non-reasoning models keep the gate off and an empty menu.
+        let glm_ocr = &entries["zai:glm-ocr"];
+        assert!(!glm_ocr.info.supports_reasoning_effort);
+        assert!(glm_ocr.info.reasoning_efforts.is_empty());
+        assert_eq!(glm_ocr.info.reasoning_effort, None);
     }
 
     #[test]
