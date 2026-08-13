@@ -667,7 +667,8 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         team_scope_id: "test-session".to_string(),
         blocking_wait_depth: Arc::new(crate::tools::tool_context::BlockingWaitState::new()),
         orchestration_steer:
-            xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal::new(),
+            xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal::new(
+            ),
         swarm_registry: xai_grok_tools::implementations::grok_build::SwarmRegistry::new(),
         respect_gitignore: false,
         scheduler_background_loops: true,

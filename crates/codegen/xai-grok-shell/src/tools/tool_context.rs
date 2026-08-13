@@ -244,7 +244,8 @@ pub struct ToolContext {
     pub blocking_wait_depth: Arc<BlockingWaitState>,
     /// Fired when a user message arrives during an orchestration wait so
     /// `agent_swarm` / `swarm_wait` can detach without cancelling members.
-    pub orchestration_steer: xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal,
+    pub orchestration_steer:
+        xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal,
     /// Detached `agent_swarm` cohorts and their finished notices.
     pub swarm_registry: xai_grok_tools::implementations::grok_build::SwarmRegistry,
     pub task_output_token_budget: Option<TaskOutputTokenBudget>,

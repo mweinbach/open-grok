@@ -133,7 +133,10 @@ impl xai_tool_runtime::Tool for SwarmWaitTool {
 
         let _foreground_wait =
             foreground_wait.map(|wait| wait.enter_kind(ForegroundWaitKind::Orchestration));
-        let steer_seen = steer.as_ref().map(|signal| signal.generation()).unwrap_or(0);
+        let steer_seen = steer
+            .as_ref()
+            .map(|signal| signal.generation())
+            .unwrap_or(0);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
         loop {
