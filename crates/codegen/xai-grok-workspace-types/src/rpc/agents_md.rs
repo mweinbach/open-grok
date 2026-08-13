@@ -2,16 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::WorkspaceRpc;
+use super::{RpcActivityClass, WorkspaceRpc};
 
 /// `workspace.discover_agents_md` — project-instruction files (AGENTS.md /
-/// Claude.md / `.opengrok/rules/*.md`) discovered from the workspace root up to
-/// the git root, plus `~/.opengrok` and compat dirs.
+/// Claude.md / `.grok/rules/*.md`) discovered from the workspace root up to
+/// the git root, plus `~/.grok` and compat dirs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscoverAgentsMdReq {}
 
 impl WorkspaceRpc for DiscoverAgentsMdReq {
     const METHOD: &'static str = "workspace.discover_agents_md";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = Vec<AgentConfigFile>;
 }
 
