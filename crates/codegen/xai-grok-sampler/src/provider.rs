@@ -1236,8 +1236,12 @@ mod tests {
     #[test]
     fn zai_thinking_follows_reasoning_effort() {
         // Without reasoning_effort, no `thinking` object is sent.
-        let mut request =
-            ChatCompletionRequest::new("glm-5.2", vec![xai_grok_sampling_types::types::ChatRequestMessage::user("hi")]);
+        let mut request = ChatCompletionRequest::new(
+            "glm-5.2",
+            vec![xai_grok_sampling_types::types::ChatRequestMessage::user(
+                "hi",
+            )],
+        );
         provider_adapter(ModelProvider::Zai).sanitize_chat_request(&mut request);
         let wire = serde_json::to_value(&request).expect("serializes");
         assert!(wire.get("thinking").is_none());
