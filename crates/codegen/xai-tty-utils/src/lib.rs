@@ -174,6 +174,14 @@ pub fn detach_command(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Configure a short-lived search child ([`detach_command`], no stdin) that is
+/// killed and queued for reaping if its future is dropped (cancellation).
+pub fn detach_search_command(cmd: &mut tokio::process::Command) {
+    detach_command(cmd);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+}
+
 // ---------------------------------------------------------------------------
 // std::process::Command wrapper
 // ---------------------------------------------------------------------------
@@ -372,6 +380,40 @@ pub async fn reap_killed_bounded(
     match tokio::time::timeout(bound, child.wait()).await {
         Ok(res) => res.ok(),
         Err(_elapsed) => None,
+    }
+}
+
+/// True when `pid` is gone or a zombie awaiting reap — i.e. no longer running.
+/// Test/assertion observation only — production liveness checks must use
+/// [`ProcessGroup::has_live_members`], which counts zombies as live.
+#[cfg(unix)]
+pub fn process_not_running(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            // State is the first field after the parenthesized comm.
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .and_then(|rest| rest.trim_start().chars().next())
+                .is_some_and(|state| state == 'Z'),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        {
+            // Can't tell; report "running" so callers fail loudly.
+            Err(_) => false,
+            Ok(out) => {
+                let stat = String::from_utf8_lossy(&out.stdout);
+                let stat = stat.trim();
+                stat.is_empty() || stat.starts_with('Z')
+            }
+        }
     }
 }
 
@@ -1576,5 +1618,48 @@ mod tests {
         let foreign = if own == 2 { 3 } else { 2 };
         let id = ProcessGroupId::new(foreign).expect("foreign pgid should be accepted");
         assert_eq!(id.get(), foreign);
+    }
+
+    /// Pins the mechanism every search-tool spawn site relies on: the child is
+    /// detached into its own process group and killed when its `Child` drops.
+    #[cfg(unix)]
+    #[test]
+    fn detach_search_command_kills_child_on_drop() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let mut cmd = tokio::process::Command::new("/bin/sleep");
+            cmd.arg("30");
+            detach_search_command(&mut cmd);
+            #[allow(clippy::disallowed_methods)] // test child, killed on drop below
+            let child = cmd.spawn().expect("spawn sleep");
+            let pid = child.id().expect("child pid");
+
+            // The pre_exec setsid lands between fork and exec; poll until the
+            // child leaves our process group (pins the detach property).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)))
+                .expect("getpgid")
+                == nix::unistd::getpgrp()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleep (pid {pid}) stayed in our process group — not detached"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            drop(child);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !process_not_running(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleep (pid {pid}) still running 5s after its Child was dropped — leaked"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
     }
 }

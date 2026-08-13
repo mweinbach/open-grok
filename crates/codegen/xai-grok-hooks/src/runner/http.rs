@@ -336,10 +336,13 @@ fn parse_http_blocking_result(
     }
 
     match serde_json::from_str::<super::GateHookJson>(response_text) {
-        Ok(output) => match super::gate_json_to_decision(output, hook_name) {
-            Ok(decision) => HookRunnerResult::Decision(decision),
-            Err(err) => HookRunnerResult::Failed(err),
-        },
+        // HTTP hooks have no stderr channel, so there is no fallback reason.
+        Ok(output) => {
+            match super::gate_json_to_decision(output, hook_name, /* fallback_reason */ None) {
+                Ok(decision) => HookRunnerResult::Decision(decision),
+                Err(err) => HookRunnerResult::Failed(err),
+            }
+        }
         Err(e) => {
             if status.is_success() {
                 tracing::warn!(

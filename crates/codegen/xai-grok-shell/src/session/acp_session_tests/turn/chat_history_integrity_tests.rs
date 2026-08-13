@@ -210,6 +210,7 @@ async fn run_mid_turn_user_injection_history_test() {
                     None,
                     None,
                     true,
+                    false,
                     None,
                     None,
                     None,

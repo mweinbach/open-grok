@@ -860,6 +860,7 @@ async fn observe_only_confident_completion_stays_warn_only() {
                 Some(xai_grok_sampling_types::DoomLoopRecoveryPolicy {
                     max_threshold: 8,
                     max_retries: 0,
+                    ..Default::default()
                 });
             let actor = Arc::new(fixture.actor);
             *actor

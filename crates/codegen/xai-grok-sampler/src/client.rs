@@ -2729,9 +2729,11 @@ impl SamplingClient {
             .provider_adapter
             .apply_request_headers(builder, grok_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        if doom_loop.is_some() && self.provider_adapter.sends_doom_loop_opt_in() {
-            // Presence opts in; the server ignores the value.
-            http_request = http_request.header(DOOM_LOOP_CHECK_HEADER, "true");
+        if let Some(policy) = self.defaults.doom_loop_recovery
+            && self.provider_adapter.sends_doom_loop_opt_in()
+        {
+            http_request =
+                http_request.header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string());
         }
         let http_request = http_request.json(&request_body);
 
