@@ -264,11 +264,23 @@ impl BackgroundTaskRegistry {
 /// Creates the directory structure if it doesn't exist.
 /// Path format: `~/.opengrok/sessions/{session_id}/tasks/{task_id}.log`
 pub fn get_task_output_path(session_id: &str, task_id: &str) -> PathBuf {
-    use crate::util::grok_home::grok_home;
+    get_task_output_path_in(&crate::util::grok_home::grok_home(), session_id, task_id)
+}
 
-    let tasks_dir = grok_home().join("sessions").join(session_id).join("tasks");
-    // Create directory (ignore errors - will fail on write if dir creation fails)
-    std::fs::create_dir_all(&tasks_dir).ok();
+/// Inner implementation with an injectable grok home for tests.
+fn get_task_output_path_in(
+    grok_home: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> PathBuf {
+    let sessions_root = grok_home.join("sessions");
+    let session_dir = sessions_root.join(session_id);
+    let tasks_dir = session_dir.join("tasks");
+    // Legacy flat layout, no <encoded-cwd> shield: tighten every level
+    // (best-effort; failures surface on the log write).
+    let _ = crate::util::grok_home::create_dir_all_owner_only(&tasks_dir);
+    crate::util::grok_home::set_dir_owner_only(&session_dir);
+    crate::util::grok_home::set_dir_owner_only(&sessions_root);
     tasks_dir.join(format!("{}.log", task_id))
 }
 
@@ -396,6 +408,25 @@ mod tests {
             block_waited: false,
             explicitly_killed: false,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn task_output_dirs_are_owner_only() {
+        use crate::test_support::unix_mode;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let path = get_task_output_path_in(home.path(), "task-perm-test", "t1");
+
+        let tasks_dir = path.parent().unwrap();
+        let session_dir = tasks_dir.parent().unwrap();
+        assert_eq!(unix_mode(tasks_dir), 0o700, "tasks dir must be 0700");
+        assert_eq!(unix_mode(session_dir), 0o700, "session-id dir must be 0700");
+        assert_eq!(
+            unix_mode(session_dir.parent().unwrap()),
+            0o700,
+            "sessions root must be 0700"
+        );
     }
 
     #[tokio::test]
