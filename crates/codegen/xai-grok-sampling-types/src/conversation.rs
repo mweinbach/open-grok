@@ -3818,6 +3818,7 @@ impl From<ConversationRequest> for ChatCompletionRequest {
             search_parameters: None,
             response_format,
             reasoning_effort: req.reasoning_effort,
+            thinking: None,
             service_tier: req.service_tier,
             x_grok_conv_id: req.x_grok_conv_id,
             x_grok_req_id: req.x_grok_req_id,

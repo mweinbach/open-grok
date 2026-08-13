@@ -10,8 +10,8 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 use xai_grok_sampling_types::{
-    ApiBackend, ChatCompletionRequest, ModelProvider, ProviderProfile, ReasoningEffort,
-    ReasoningSummary, RequestMetadataPolicy, ResponsesDialect, SamplingError,
+    ApiBackend, ChatCompletionRequest, ChatThinkingMode, ModelProvider, ProviderProfile,
+    ReasoningEffort, ReasoningSummary, RequestMetadataPolicy, ResponsesDialect, SamplingError,
 };
 
 use crate::config::SamplerConfig;
@@ -432,8 +432,9 @@ impl ProviderAdapter for WaferProvider {
 
 /// Z AI is an OpenAI-compatible Chat Completions provider (GLM models).
 /// Unlike Wafer, Z AI keeps `reasoning_effort` so callers can drive its
-/// "thinking mode"; it still drops Grok-internal `service_tier` and
-/// per-message `model_id` metadata.
+/// "thinking mode", and a requested effort turns on the explicit `thinking`
+/// object Z AI expects alongside it; it still drops Grok-internal
+/// `service_tier` and per-message `model_id` metadata.
 #[derive(Debug)]
 pub struct ZaiProvider;
 
@@ -447,6 +448,12 @@ impl ProviderAdapter for ZaiProvider {
         for message in &mut request.messages {
             message.model_id = None;
         }
+        // Z AI gates GLM thinking with an explicit `thinking` object; a
+        // requested reasoning_effort implies thinking enabled.
+        request.thinking = request
+            .reasoning_effort
+            .is_some()
+            .then(ChatThinkingMode::enabled);
     }
 }
 
@@ -1206,14 +1213,45 @@ mod tests {
                 .all(|message| message.model_id.is_none())
         );
         assert_eq!(request.service_tier, None);
-        // ...but reasoning_effort is preserved so callers can drive thinking mode.
+        // ...but reasoning_effort is preserved so callers can drive thinking
+        // mode, and a requested effort turns on Z AI's `thinking` object.
         assert_eq!(request.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            request.thinking,
+            Some(xai_grok_sampling_types::ChatThinkingMode::enabled())
+        );
         assert_eq!(request.temperature, Some(0.7));
         assert_eq!(request.top_p, Some(0.95));
         let wire = serde_json::to_value(&request).expect("serializes");
         assert!(wire["messages"][0].get("model_id").is_none());
+        assert_eq!(wire["reasoning_effort"], "high");
+        assert_eq!(
+            wire["thinking"],
+            serde_json::json!({"type": "enabled", "clear_thinking": false})
+        );
         assert_eq!(wire["tools"][0]["type"], "function");
         assert_eq!(wire["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn zai_thinking_follows_reasoning_effort() {
+        // Without reasoning_effort, no `thinking` object is sent.
+        let mut request =
+            ChatCompletionRequest::new("glm-5.2", vec![xai_grok_sampling_types::types::ChatRequestMessage::user("hi")]);
+        provider_adapter(ModelProvider::Zai).sanitize_chat_request(&mut request);
+        let wire = serde_json::to_value(&request).expect("serializes");
+        assert!(wire.get("thinking").is_none());
+        assert!(wire.get("reasoning_effort").is_none());
+
+        // Z AI's documented top effort serializes as "max" and enables thinking.
+        request.reasoning_effort = Some(ReasoningEffort::Max);
+        provider_adapter(ModelProvider::Zai).sanitize_chat_request(&mut request);
+        let wire = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(wire["reasoning_effort"], "max");
+        assert_eq!(
+            wire["thinking"],
+            serde_json::json!({"type": "enabled", "clear_thinking": false})
+        );
     }
 
     #[test]

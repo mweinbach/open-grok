@@ -86,6 +86,9 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<crate::rs::ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Z AI GLM "thinking mode" switch; unset for every other provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ChatThinkingMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
 
@@ -128,6 +131,7 @@ impl ChatCompletionRequest {
             search_parameters: None,
             response_format: None,
             reasoning_effort: None,
+            thinking: None,
             service_tier: None,
             x_grok_conv_id: None,
             x_grok_req_id: None,
@@ -665,6 +669,36 @@ pub enum ReasoningEffort {
     Xhigh,
     Max,
     Ultra,
+}
+
+/// Z AI GLM "thinking mode" selector (`thinking.type` body parameter).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatThinkingType {
+    Enabled,
+    Disabled,
+}
+
+/// Z AI GLM "thinking mode" switch sent alongside `reasoning_effort`. Z AI
+/// requires the explicit object to turn thinking on; no other Chat
+/// Completions provider sends it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChatThinkingMode {
+    #[serde(rename = "type")]
+    pub thinking_type: ChatThinkingType,
+    /// Keep the thinking content in the response when `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_thinking: Option<bool>,
+}
+
+impl ChatThinkingMode {
+    /// Thinking on with the content preserved, matching Z AI's quickstart.
+    pub fn enabled() -> Self {
+        Self {
+            thinking_type: ChatThinkingType::Enabled,
+            clear_thinking: Some(false),
+        }
+    }
 }
 
 /// Reasoning-summary detail requested from a Responses API model.
