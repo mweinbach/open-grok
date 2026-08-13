@@ -57,7 +57,10 @@ models. Its default base URL is the GLM Coding Plan endpoint
 `OPENGROK_ZAI_API_BASE_URL`); use Chat Completions for inference and
 `GET /models` for dynamic model discovery, with a curated fallback catalog when
 the endpoint is unavailable. Known reasoning-capable models (e.g. GLM-4.6,
-GLM-5.x) expose `reasoning_effort`; Z AI accepts standard client function tools,
+GLM-5.x) expose an authoritative `reasoning_effort` menu of low/medium/high/max
+(high default); the `ZaiProvider` adapter turns any requested effort into the
+explicit `thinking` object (`{"type":"enabled","clear_thinking":false}`) Z AI
+requires alongside it. Z AI accepts standard client function tools,
 does not provide native hosted web search, and must not receive xAI credentials,
 private metadata, or xAI-only exports.
 

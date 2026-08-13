@@ -95,6 +95,29 @@ standard client function tools but does not provide native hosted web search.
 Its key and model catalog remain isolated from other providers and Wafer
 sessions cannot export data to xAI-only services.
 
+### Z AI
+
+Z AI (GLM models) uses an isolated API key with the OpenAI-compatible Chat
+Completions API. It does not use Open Grok's xAI or Codex login flows. Set
+the key before starting Open Grok, or connect it in a session with
+`/login zai` (Settings → Models → Z AI API key):
+
+```bash
+export ZAI_API_KEY="zai-..."
+open-grok
+```
+
+The default base URL is Z AI's GLM Coding Plan endpoint
+`https://api.z.ai/api/coding/paas/v4`; override it with
+`OPENGROK_ZAI_API_BASE_URL` (for example, the standard
+`https://api.z.ai/api/paas/v4`). Models are discovered from `GET /models`
+with a curated GLM fallback when the endpoint is unavailable. Reasoning GLM
+models expose low/medium/high/max efforts; requesting any effort sends Z
+AI's `thinking` mode switch automatically. Z AI supports standard client
+function tools but no native hosted web search. Its key and model catalog
+remain isolated from other providers and Z AI sessions cannot export data
+to xAI-only services.
+
 ---
 
 ## OIDC (Customer SSO)
