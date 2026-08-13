@@ -105,6 +105,50 @@ impl std::fmt::Display for AgentKind {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PhaseSnapshot {
+    pub completed: Vec<(StartupPhase, Duration)>,
+    pub open: Option<(StartupPhase, Duration)>,
+}
+
+impl PhaseSnapshot {
+    pub fn stuck_in(&self) -> &'static str {
+        self.open.map_or("unknown", |(phase, _)| phase.label())
+    }
+
+    /// Not the open step: a step with no await inside closes before a deadline
+    /// observer can run, so the open one is usually its successor.
+    pub fn longest_step(&self) -> Option<StartupPhase> {
+        self.completed
+            .iter()
+            .copied()
+            .chain(self.open)
+            .max_by_key(|(_, elapsed)| *elapsed)
+            .map(|(phase, _)| phase)
+    }
+
+    /// Completed phases read `phase=dur`; the open one reads `phase>=dur`.
+    pub fn summary(&self) -> String {
+        if self.completed.is_empty() && self.open.is_none() {
+            return "no phases entered".to_string();
+        }
+        let mut out = String::new();
+        for (phase, d) in &self.completed {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{}={}", phase.label(), format_duration(*d));
+        }
+        if let Some((phase, open)) = self.open {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{}>={}", phase.label(), format_duration(open));
+        }
+        out
+    }
+}
+
 struct Inner {
     completed: Vec<(StartupPhase, Duration)>,
     current: Option<(StartupPhase, Instant)>,
@@ -138,35 +182,35 @@ impl StartupTimer {
     /// layers can name the same step and it is measured once.
     pub fn enter(&self, phase: StartupPhase) {
         let now = Instant::now();
-        {
-            let mut g = self.lock();
-            if matches!(g.current, Some((open, _)) if open == phase) {
+        let mut g = self.lock();
+        if let Some((current_phase, _)) = g.current {
+            if current_phase == phase {
                 return;
             }
-            if let Some((prev, t0)) = g.current.take() {
-                g.completed.push((prev, now.saturating_duration_since(t0)));
-            }
-            g.current = Some((phase, now));
         }
-        let elapsed_ms = self.started.elapsed().as_millis() as u64;
-        tracing::info!(phase = %phase.label(), elapsed_ms, "startup phase");
-        crate::unified_log::info(
-            STARTUP_PHASE_MSG,
-            None,
-            Some(serde_json::json!({ "phase": phase.label(), "elapsed_ms": elapsed_ms })),
-        );
+        if let Some((prev_phase, started_at)) = g.current.take() {
+            g.completed
+                .push((prev_phase, now.saturating_duration_since(started_at)));
+        }
+        g.current = Some((phase, now));
     }
 
-    fn close_open_phase(&self) {
+    /// Close any currently-open phase (e.g. at connect success or timeout).
+    pub fn close_open_phase(&self) {
         let now = Instant::now();
         let mut g = self.lock();
-        if let Some((prev, t0)) = g.current.take() {
-            g.completed.push((prev, now.saturating_duration_since(t0)));
+        if let Some((phase, started_at)) = g.current.take() {
+            g.completed
+                .push((phase, now.saturating_duration_since(started_at)));
         }
     }
 
     pub fn set_auth_mode(&self, mode: AuthMode) {
         self.lock().auth_mode = mode;
+    }
+
+    pub fn set_owner(&self, owner: Owner) {
+        self.lock().owner = owner;
     }
 
     pub fn auth_mode(&self) -> AuthMode {
@@ -177,40 +221,25 @@ impl StartupTimer {
         self.lock().owner
     }
 
-    pub fn stuck_in(&self) -> &'static str {
-        self.lock()
-            .current
-            .map(|(p, _)| p.label())
-            .unwrap_or("unknown")
-    }
-
     /// The open phase and how long it has been open.
     fn open_phase_age(&self) -> Option<(StartupPhase, Duration)> {
         self.lock().current.map(|(p, t0)| (p, t0.elapsed()))
     }
 
-    /// Completed phases read `phase=dur`; the open one reads `phase>=dur`.
-    pub fn summary(&self) -> String {
+    /// One read, so a caller reporting several facts can't mix moments.
+    pub fn phase_snapshot(&self) -> PhaseSnapshot {
         let now = Instant::now();
         let g = self.lock();
-        if g.completed.is_empty() && g.current.is_none() {
-            return "no phases entered".to_string();
+        PhaseSnapshot {
+            completed: g.completed.clone(),
+            open: g
+                .current
+                .map(|(phase, t0)| (phase, now.saturating_duration_since(t0))),
         }
-        let mut out = String::new();
-        for (phase, d) in &g.completed {
-            if !out.is_empty() {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "{}={}", phase.label(), format_duration(*d));
-        }
-        if let Some((phase, t0)) = g.current {
-            if !out.is_empty() {
-                out.push_str(", ");
-            }
-            let open = now.saturating_duration_since(t0);
-            let _ = write!(out, "{}>={}", phase.label(), format_duration(open));
-        }
-        out
+    }
+
+    pub fn summary(&self) -> String {
+        self.phase_snapshot().summary()
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -242,8 +271,9 @@ impl StartupTimer {
         if outcome == StartupOutcome::Ok {
             self.close_open_phase();
         }
-        let stuck_in = (outcome == StartupOutcome::Timeout).then(|| self.stuck_in().to_string());
-        let phases = self.summary();
+        let timings = self.phase_snapshot();
+        let stuck_in = (outcome == StartupOutcome::Timeout).then(|| timings.stuck_in().to_string());
+        let phases = timings.summary();
         let elapsed_ms = self.elapsed().as_millis() as u64;
         crate::unified_log::info(
             CONNECT_FINISHED_MSG,
@@ -573,7 +603,7 @@ impl ReadinessBudget {
     }
 }
 
-fn format_duration(d: Duration) -> String {
+pub fn format_duration(d: Duration) -> String {
     let ms = d.as_millis();
     if ms < 1000 {
         format!("{ms}ms")
@@ -649,7 +679,7 @@ mod tests {
         assert!(s.contains("load_config="), "{s}");
         assert!(s.contains("managed_policy="), "{s}");
         assert!(s.contains("model_catalog>="), "{s}");
-        assert_eq!(p.stuck_in(), "model_catalog");
+        assert_eq!(p.phase_snapshot().stuck_in(), "model_catalog");
         let d = p.phase_durations_ms();
         assert!(
             d.contains_key("load_config") && d.contains_key("model_catalog"),
@@ -665,7 +695,7 @@ mod tests {
         let p = begin(Owner::Client);
         enter(StartupPhase::ManagedPolicy);
         set_auth_mode(AuthMode::Deployment);
-        assert_eq!(p.stuck_in(), "managed_policy");
+        assert_eq!(p.phase_snapshot().stuck_in(), "managed_policy");
         assert_eq!(p.auth_mode().label(), "deployment");
         assert!(
             agent_owned().is_none(),
@@ -674,8 +704,8 @@ mod tests {
 
         let p2 = begin(Owner::Client);
         enter(StartupPhase::Bootstrap);
-        assert_eq!(p2.stuck_in(), "bootstrap");
-        assert_eq!(p.stuck_in(), "managed_policy");
+        assert_eq!(p2.phase_snapshot().stuck_in(), "bootstrap");
+        assert_eq!(p.phase_snapshot().stuck_in(), "managed_policy");
 
         drop(crate::instrumentation::timer("startup.mirror_probe_active"));
 
@@ -693,11 +723,19 @@ mod tests {
 
         report_total(StartupOutcome::Ok);
         enter(StartupPhase::ModelCatalog);
-        assert_eq!(p2.stuck_in(), "unknown", "ok total closes the open phase");
+        assert_eq!(
+            p2.phase_snapshot().stuck_in(),
+            "unknown",
+            "ok total closes the open phase"
+        );
         assert!(p2.summary().contains("session_create="), "{}", p2.summary());
         let p3 = begin(Owner::Agent);
         enter(StartupPhase::LoadConfig);
-        assert_eq!(p3.stuck_in(), "unknown", "ended: enter records nothing");
+        assert_eq!(
+            p3.phase_snapshot().stuck_in(),
+            "unknown",
+            "ended: enter records nothing"
+        );
 
         clear();
         assert!(agent_owned().is_none(), "cleared: nothing installed");
@@ -711,9 +749,13 @@ mod tests {
         let p4 = begin(Owner::Client);
         let token = PendingStartup::new();
         enter(StartupPhase::LoadConfig);
-        assert_eq!(p4.stuck_in(), "load_config");
+        assert_eq!(p4.phase_snapshot().stuck_in(), "load_config");
         drop(token);
         enter(StartupPhase::Bootstrap);
-        assert_eq!(p4.stuck_in(), "load_config", "dropped token ended startup");
+        assert_eq!(
+            p4.phase_snapshot().stuck_in(),
+            "load_config",
+            "dropped token ended startup"
+        );
     }
 }

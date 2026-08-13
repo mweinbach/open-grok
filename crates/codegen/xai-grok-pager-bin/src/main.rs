@@ -1764,7 +1764,10 @@ fn main() {
     xai_grok_telemetry::debug_log::flush();
     if let Err(e) = result {
         xai_tty_utils::restore_native_stderr();
-        eprintln!("Error: {e:#}");
+        match e.downcast_ref::<xai_grok_pager::app::StartupFailure>() {
+            Some(startup) => eprintln!("{}", startup.user_report()),
+            None => eprintln!("Error: {e:#}"),
+        }
         drop(_sentry_guard);
         std::process::exit(1);
     }

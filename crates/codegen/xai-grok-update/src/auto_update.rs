@@ -46,6 +46,103 @@ fn reinstall_hint(installer: &str) -> String {
     )
 }
 
+/// True when this process is an x86_64 build translated by Rosetta on an
+/// Apple Silicon host. `hw.optional.arm64` is 1 on Apple Silicon — including
+/// from a translated process, where the compile-time arch says x86_64.
+///
+/// Read in-process via `sysctlbyname`: no spawn, no stdout parse, and no
+/// dependence on the `sysctl` binary being on PATH. A missing key (genuine
+/// Intel Mac) or any error means not Apple Silicon — the probe fails open
+/// to the compile-time arch. Cached: fixed host property, read from async
+/// paths via [`detect_platform`].
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn running_under_rosetta_on_apple_silicon() -> bool {
+    static ROSETTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ROSETTA.get_or_init(|| {
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        // SAFETY: the name is a valid NUL-terminated C string; `val`/`len`
+        // describe a properly sized c_int; sysctlbyname writes at most
+        // `len` bytes into `val`.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"hw.optional.arm64".as_ptr(),
+                (&raw mut val).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        rc == 0 && val == 1
+    })
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+fn running_under_rosetta_on_apple_silicon() -> bool {
+    false
+}
+
+/// Arch to download artifacts for, given the compile-time arch and whether
+/// the host is Apple Silicon running this build under Rosetta. Separated
+/// from [`detect_platform`] so the decision is unit-testable.
+fn corrected_arch(
+    os: &'static str,
+    arch: &'static str,
+    rosetta_on_apple_silicon: bool,
+) -> &'static str {
+    if os == "macos" && arch == "x86_64" && rosetta_on_apple_silicon {
+        "aarch64"
+    } else {
+        arch
+    }
+}
+
+/// Artifact platform from [`detect_platform`]; compile-time values for
+/// combos the updater does not support.
+fn platform_label() -> String {
+    detect_platform()
+        .map(|(os, arch)| format!("{os}-{arch}"))
+        .unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+/// Typed phase marker for telemetry classification. Deliberately no
+/// `source()`, so anyhow's `{:#}` does not print the chain twice.
+#[derive(Debug, thiserror::Error)]
+enum InstallPhaseError {
+    #[error("{0:#}")]
+    Download(anyhow::Error),
+    #[error("{0:#}")]
+    Activate(anyhow::Error),
+}
+
+/// Smoke failures stay unwrapped — already typed, and the base-retry abort
+/// in [`install_internal_from_bases`] must still downcast them.
+fn wrap_download_err(e: anyhow::Error) -> anyhow::Error {
+    if e.is::<SmokeTestFailure>() {
+        e
+    } else {
+        InstallPhaseError::Download(e).into()
+    }
+}
+
+#[doc(hidden)]
+pub fn classify_install_error(err: &anyhow::Error) -> xai_grok_telemetry::events::CliUpdateErrorKind {
+    use xai_grok_telemetry::events::CliUpdateErrorKind;
+    if let Some(smoke) = err.downcast_ref::<SmokeTestFailure>() {
+        return match smoke {
+            SmokeTestFailure::Timeout => CliUpdateErrorKind::SmokeTimeout,
+            SmokeTestFailure::Spawn(_) => CliUpdateErrorKind::SmokeSpawn,
+            SmokeTestFailure::NonZero { .. } => CliUpdateErrorKind::SmokeNonzero,
+        };
+    }
+    match err.downcast_ref::<InstallPhaseError>() {
+        Some(InstallPhaseError::Download(_)) => CliUpdateErrorKind::Download,
+        Some(InstallPhaseError::Activate(_)) => CliUpdateErrorKind::Activate,
+        // npm / gh-release failures carry no phase marker.
+        None => CliUpdateErrorKind::Other,
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateStatus {
@@ -769,6 +866,9 @@ pub async fn run_install_script(
     target: Option<&str>,
     update_config: &UpdateConfig,
 ) -> Result<()> {
+    let from_version =
+        disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
+    let started = std::time::Instant::now();
     let result = match installer {
         "open-grok" => install_open_grok_release(target, update_config).await,
         "npm" => install_npm(
@@ -779,9 +879,34 @@ pub async fn run_install_script(
         "gh-release" => install_gh_release(target).await,
         _ => install_internal(target, update_config).await,
     };
+    let duration_ms = started.elapsed().as_millis() as u64;
     if result.is_ok() {
         remove_stale_models_cache().await;
     }
+    let (outcome, error_kind) = match &result {
+        Ok(_) => (
+            xai_grok_telemetry::events::CliUpdateOutcome::Success,
+            None,
+        ),
+        Err(e) => (
+            xai_grok_telemetry::events::CliUpdateOutcome::Failed,
+            Some(classify_install_error(e)),
+        ),
+    };
+    xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::CliUpdate {
+        outcome,
+        trigger: xai_grok_telemetry::events::CliUpdateTrigger::UserCommand,
+        from_version,
+        to_version: target.map(str::to_string),
+        channel: xai_grok_telemetry::events::CliUpdateChannel::from_channel_str(
+            &update_config.channel,
+        ),
+        installer: xai_grok_telemetry::events::CliUpdateInstaller::from_installer_str(installer),
+        platform: platform_label(),
+        rosetta: running_under_rosetta_on_apple_silicon(),
+        duration_ms,
+        error_kind,
+    });
     result.map_err(|e| {
         anyhow::anyhow!(
             "Auto-update failed: {:#}\n\n{}",
@@ -804,7 +929,9 @@ struct OpenGrokReleasePlatform {
 }
 
 fn open_grok_release_platform() -> Result<OpenGrokReleasePlatform> {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    if cfg!(target_os = "macos")
+        && (cfg!(target_arch = "aarch64") || running_under_rosetta_on_apple_silicon())
+    {
         Ok(OpenGrokReleasePlatform {
             asset: OPEN_GROK_MACOS_AARCH64_ASSET,
             versioned_platform: "macos-aarch64",
@@ -1090,6 +1217,7 @@ pub(crate) fn detect_platform() -> Result<(&'static str, &'static str)> {
     } else {
         anyhow::bail!("Unsupported architecture");
     };
+    let arch = corrected_arch(os, arch, running_under_rosetta_on_apple_silicon());
     Ok((os, arch))
 }
 
@@ -1477,13 +1605,18 @@ pub async fn install_internal_from_bases(
     let mut last_err: Option<anyhow::Error> = None;
     for (i, base) in bases.iter().enumerate() {
         match download_verified_from_base(target, update_config, base).await {
-            Ok(download) => return activate_verified_download(&download).await,
+            Ok(download) => {
+                return activate_verified_download(&download)
+                    .await
+                    .map_err(|e| InstallPhaseError::Activate(e).into());
+            }
             Err(e) if e.is::<SmokeTestFailure>() => {
                 // Same published artifact on every base — retrying will not
                 // change a --version timeout or crash.
                 return Err(e);
             }
             Err(e) => {
+                let e = wrap_download_err(e);
                 if i + 1 < bases.len() {
                     tracing::warn!(
                         "install via {} failed ({:#}); trying next base URL",
@@ -1605,8 +1738,12 @@ pub async fn install_internal_from_base(
     update_config: &UpdateConfig,
     gcs_base_url: &str,
 ) -> Result<()> {
-    let download = download_verified_from_base(target, update_config, gcs_base_url).await?;
-    activate_verified_download(&download).await
+    let download = download_verified_from_base(target, update_config, gcs_base_url)
+        .await
+        .map_err(wrap_download_err)?;
+    activate_verified_download(&download)
+        .await
+        .map_err(|e| InstallPhaseError::Activate(e).into())
 }
 
 /// A downloaded and smoke-tested binary in `~/.opengrok/downloads/`, not yet

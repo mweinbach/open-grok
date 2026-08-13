@@ -14584,6 +14584,7 @@ dependencies = [
  "dunce",
  "futures",
  "indicatif",
+ "libc",
  "reqwest 0.12.24",
  "semver",
  "serde",
@@ -14595,8 +14596,10 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "url",
  "wiremock",
  "xai-grok-shell",
+ "xai-grok-telemetry",
  "xai-grok-tools",
  "xai-grok-version",
 ]
