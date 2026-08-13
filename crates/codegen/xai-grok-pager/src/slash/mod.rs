@@ -307,6 +307,9 @@ pub struct SlashController {
     /// screen-mode-switcher commands' visibility through [`AppCtx`]. Defaults
     /// to `Fullscreen` (the process default) for tests and unwired surfaces.
     screen_mode: crate::app::ScreenMode,
+    /// Current session title for `/rename` ghost-prefill. Synced from the
+    /// agent view; `None` when the session has no title yet.
+    current_title: Option<String>,
     /// MRU/recency store. Owned by `AppView` in production and injected via
     /// [`Self::set_mru`] so agent prompts and the dashboard share one store;
     /// defaults to an isolated in-memory store (no disk I/O) for tests and any
@@ -344,6 +347,7 @@ impl SlashController {
             billing_surface_visible: true,
             workflows_available: false,
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
             mru,
             command_tags: std::rc::Rc::new(std::cell::RefCell::new(
                 std::collections::HashMap::new(),
@@ -406,6 +410,18 @@ impl SlashController {
         self.screen_mode
     }
 
+    pub fn set_current_title(&mut self, title: Option<String>) {
+        let title = title.filter(|t| !t.trim().is_empty());
+        if self.current_title == title {
+            return;
+        }
+        self.current_title = title;
+    }
+
+    pub fn current_title(&self) -> Option<&str> {
+        self.current_title.as_deref()
+    }
+
     pub(crate) fn app_ctx<'a>(&'a self, models: &'a ModelState) -> AppCtx<'a> {
         AppCtx {
             models,
@@ -414,6 +430,7 @@ impl SlashController {
             billing_surface_visible: self.billing_surface_visible,
             workflows_available: self.workflows_available,
             screen_mode: self.screen_mode,
+            current_title: self.current_title.as_deref(),
         }
     }
 

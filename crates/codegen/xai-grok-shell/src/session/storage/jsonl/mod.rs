@@ -1038,6 +1038,16 @@ impl StorageAdapter for JsonlStorageAdapter {
         )
         .await
     }
+    async fn reset_title_to_auto(&self, info: &Info) -> io::Result<bool> {
+        self.apply_summary_patch_reporting(
+            info,
+            super::summary_write::SummaryPatch {
+                reset_title_to_auto: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
     async fn set_last_turn_summary(
         &self,
         info: &Info,

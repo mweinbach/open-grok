@@ -73,6 +73,8 @@ pub(in crate::app::dispatch) fn dispatch_sessions_confirm_close(
     remove_agent_and_cleanup(app, closed_id);
     effects
 }
+use crate::scrollback::block::RenderBlock;
+
 /// Rename the current session via x.ai/session/rename.
 ///
 /// Produces Effect::RenameSession which spawns an async ACP ext request.
@@ -90,11 +92,59 @@ pub(in crate::app::dispatch) fn dispatch_rename_session(
     let Some(session_id) = agent.session.session_id.clone() else {
         return vec![];
     };
+    let title = xai_grok_shell::session::persistence::sanitize_rename_title(&title).into_owned();
+    if title.is_empty() {
+        agent.scrollback.push_block(RenderBlock::system(
+            "Couldn't rename session: title must not be blank".to_string(),
+        ));
+        return vec![];
+    }
     agent.display_name = Some(title.clone());
     vec![Effect::RenameSession {
         agent_id: id,
         session_id,
         title,
         cwd: agent.session.cwd.clone(),
+        kind: agent.rename_kind(),
+    }]
+}
+
+/// Unpin the current session title via `x.ai/session/rename` + `resetToAuto`.
+///
+/// Chat-kind sessions have no local `SummaryGenerator` to restore, so they
+/// are refused here (no optimistic clear, no ext request).
+pub(in crate::app::dispatch) fn dispatch_reset_session_title(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    let Some(session_id) = agent.session.session_id.clone() else {
+        return vec![];
+    };
+    let kind = agent.rename_kind();
+    if kind == xai_grok_shell::session::unified_list::SessionKind::Chat {
+        agent
+            .scrollback
+            .push_block(crate::scrollback::block::RenderBlock::system(
+                "Chat conversations have no auto-title to restore",
+            ));
+        return vec![];
+    }
+    let previous_display_name = agent.display_name.clone();
+    let previous_generated_title = agent.generated_session_title.clone();
+    agent.title_unpin_committed = false;
+    let pin = agent.display_name.take();
+    if agent.generated_session_title.as_deref() == pin.as_deref() {
+        agent.generated_session_title = None;
+    }
+    vec![Effect::ResetSessionTitle {
+        agent_id: id,
+        session_id,
+        cwd: agent.session.cwd.clone(),
+        kind,
+        previous_display_name,
+        previous_generated_title,
     }]
 }

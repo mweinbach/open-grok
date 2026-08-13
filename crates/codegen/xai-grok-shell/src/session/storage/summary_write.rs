@@ -96,6 +96,11 @@ pub(crate) struct SummaryPatch {
     /// automatic LLM title generation so it never clobbers a title the user
     /// set via `/rename`. Ignored when `generated_title` is also set.
     pub generated_title_if_absent: Option<String>,
+    /// Clear a manual `/rename` pin (`/rename --auto`). Sets
+    /// `title_is_manual = false` and, when a manual pin was present,
+    /// blanks `generated_title` and `session_summary` so `display_title()`
+    /// is empty.
+    pub reset_title_to_auto: bool,
     pub cwd_switch_bookkeeping_generation: Option<u64>,
     /// Per-turn dashboard summary as `(text, prompt_id)`. Outer `Some`
     /// applies (last-writer-wins); `Some(None)` clears it (conversation
@@ -179,7 +184,23 @@ impl Summary {
             self.last_turn_summary_prompt_id = prompt_id;
         }
         let mut absent_title_applied = false;
-        if let Some(title) = &patch.generated_title {
+        if patch.reset_title_to_auto {
+            // Gate on a real pin (`manual_title_opt`), not a stale flag
+            // over a blank `generated_title` — that would wipe a legitimate
+            // auto title living in `session_summary`.
+            let cleared_manual = self.manual_title_opt().is_some();
+            if cleared_manual {
+                self.generated_title = None;
+                // Blank both fields so `display_title()` is empty and
+                // `set_generated_title_if_absent` can adopt again. A leftover
+                // pre-rename auto title in `session_summary` would otherwise
+                // pin display forever.
+                self.session_summary.clear();
+            }
+            self.title_is_manual = false;
+            self.updated_at = now;
+            return cleared_manual;
+        } else if let Some(title) = &patch.generated_title {
             self.set_title(title);
             // Manual `/rename`: recorded so clients can restore the
             // prompt-border title on resume.
@@ -482,6 +503,166 @@ mod tests {
             // Manual-ness survives the race in either landing order, so the
             // prompt-border title is restored on resume.
             assert!(summary.title_is_manual);
+        }
+    }
+
+    /// `/rename --auto` after a rename-before-auto: both generated_title and
+    /// the mirrored session_summary are cleared, so if-absent can adopt again.
+    #[tokio::test]
+    async fn reset_title_to_auto_clears_manual_and_unmirrors_equal_summary() {
+        let dir = TempDir::new().unwrap();
+        let (adapter, info, summary_path) = new_session(&dir).await;
+
+        adapter
+            .update_session_title(&info, "Manual Title".into())
+            .await
+            .unwrap();
+        let applied = adapter
+            .set_generated_title_if_absent(&info, "Auto Title".into())
+            .await
+            .unwrap();
+        assert!(!applied, "manual pin must block auto title");
+
+        assert!(adapter.reset_title_to_auto(&info).await.unwrap());
+
+        let summary = read_summary(&summary_path).unwrap();
+        assert!(!summary.title_is_manual);
+        assert!(summary.generated_title.is_none());
+        assert!(
+            summary.session_summary.is_empty(),
+            "mirrored session_summary must be cleared so display_title is blank"
+        );
+        assert!(summary.display_title().trim().is_empty());
+        assert!(summary.manual_title_opt().is_none());
+
+        let applied = adapter
+            .set_generated_title_if_absent(&info, "Fresh Auto".into())
+            .await
+            .unwrap();
+        assert!(applied, "reset session must accept a subsequent auto title");
+        let summary = read_summary(&summary_path).unwrap();
+        assert_eq!(summary.display_title(), "Fresh Auto");
+        assert!(!summary.title_is_manual);
+    }
+
+    /// Common path: auto → `/rename` → `/rename --auto`. The leftover
+    /// pre-rename auto title in `session_summary` must not block if-absent.
+    #[tokio::test]
+    async fn reset_after_auto_then_manual_blanks_display_and_accepts_if_absent() {
+        let dir = TempDir::new().unwrap();
+        let (adapter, info, summary_path) = new_session(&dir).await;
+
+        adapter
+            .set_generated_title_if_absent(&info, "Auto Title".into())
+            .await
+            .unwrap();
+        adapter
+            .update_session_title(&info, "Manual Title".into())
+            .await
+            .unwrap();
+        let before = read_summary(&summary_path).unwrap();
+        assert_eq!(before.session_summary, "Auto Title");
+        assert_eq!(before.display_title(), "Manual Title");
+
+        assert!(adapter.reset_title_to_auto(&info).await.unwrap());
+
+        let summary = read_summary(&summary_path).unwrap();
+        assert!(!summary.title_is_manual);
+        assert!(summary.generated_title.is_none());
+        assert!(
+            summary.session_summary.is_empty(),
+            "pre-rename auto leftover must be cleared so if-absent can fire"
+        );
+        assert!(
+            summary.display_title().trim().is_empty(),
+            "load/resume would mark_done() if display_title stayed non-blank"
+        );
+
+        let applied = adapter
+            .set_generated_title_if_absent(&info, "Fresh Auto".into())
+            .await
+            .unwrap();
+        assert!(
+            applied,
+            "auto→rename→unpin must accept a subsequent auto title"
+        );
+        let summary = read_summary(&summary_path).unwrap();
+        assert_eq!(summary.display_title(), "Fresh Auto");
+        assert!(!summary.title_is_manual);
+    }
+
+    /// Unpin on a never-renamed / auto-titled session is a no-op: the auto
+    /// title stays, the flag stays false.
+    #[tokio::test]
+    async fn reset_title_to_auto_is_noop_when_not_manual() {
+        let dir = TempDir::new().unwrap();
+        let (adapter, info, summary_path) = new_session(&dir).await;
+
+        assert!(!adapter.reset_title_to_auto(&info).await.unwrap());
+        let empty = read_summary(&summary_path).unwrap();
+        assert!(!empty.title_is_manual);
+        assert!(empty.generated_title.is_none());
+
+        adapter
+            .set_generated_title_if_absent(&info, "Auto Title".into())
+            .await
+            .unwrap();
+        assert!(!adapter.reset_title_to_auto(&info).await.unwrap());
+        let summary = read_summary(&summary_path).unwrap();
+        assert!(!summary.title_is_manual);
+        assert_eq!(summary.display_title(), "Auto Title");
+        assert_eq!(summary.session_summary, "Auto Title");
+        assert!(
+            !adapter
+                .set_generated_title_if_absent(&info, "Fresh".into())
+                .await
+                .unwrap(),
+            "no-op unpin must leave the auto title blocking if-absent"
+        );
+    }
+
+    /// Reset and a racing auto-title never leave a manual pin on disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reset_and_auto_title_never_leave_manual_pin() {
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
+        for _ in 0..50 {
+            let dir = TempDir::new().unwrap();
+            let (adapter, info, summary_path) = new_session(&dir).await;
+            adapter
+                .update_session_title(&info, "Manual Title".into())
+                .await
+                .unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+
+            let reset = adapter.clone();
+            let info_r = info.clone();
+            let barrier_r = barrier.clone();
+            let task_r = tokio::spawn(async move {
+                barrier_r.wait().await;
+                reset.reset_title_to_auto(&info_r).await.unwrap();
+            });
+
+            let auto = adapter.clone();
+            let info_a = info.clone();
+            let barrier_a = barrier.clone();
+            let task_a = tokio::spawn(async move {
+                barrier_a.wait().await;
+                auto.set_generated_title_if_absent(&info_a, "Auto Title".into())
+                    .await
+                    .unwrap();
+            });
+
+            task_r.await.unwrap();
+            task_a.await.unwrap();
+
+            let summary = read_summary(&summary_path).unwrap();
+            assert!(
+                !summary.title_is_manual,
+                "reset must clear the manual pin under contention"
+            );
+            assert_ne!(summary.display_title(), "Manual Title");
         }
     }
 }

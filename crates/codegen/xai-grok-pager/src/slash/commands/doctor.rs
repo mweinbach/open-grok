@@ -191,6 +191,7 @@ mod tests {
             billing_surface_visible: true,
             workflows_available: false,
             screen_mode: crate::app::ScreenMode::Inline,
+            current_title: None,
         };
         let command = DoctorCommand;
         assert!(command.suggest_args(&context, "").is_none());

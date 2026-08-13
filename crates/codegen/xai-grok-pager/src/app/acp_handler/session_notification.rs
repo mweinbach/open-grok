@@ -1017,8 +1017,41 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             }
         }
         XaiSessionUpdate::SessionSummaryGenerated { session_summary } => {
-            agent.generated_session_title =
-                Some(crate::util::decode_html_entities(&session_summary).into_owned());
+            let title_is_manual = session_notif.meta.as_ref().and_then(|v| {
+                v.get(xai_grok_shell::extensions::notification::TITLE_IS_MANUAL_META_KEY)
+                    .and_then(|v| v.as_bool())
+            });
+            match title_is_manual {
+                Some(true) => {
+                    if let Some(clean) =
+                        xai_grok_shell::session::persistence::sanitize_and_cap_title(
+                            &session_summary,
+                        )
+                    {
+                        agent.display_name = Some(clean.clone());
+                        agent.generated_session_title = Some(clean);
+                        agent.title_unpin_committed = false;
+                    }
+                }
+                other => {
+                    let pin = if other == Some(false) {
+                        agent.title_unpin_committed = true;
+                        agent.display_name.take()
+                    } else {
+                        None
+                    };
+                    let decoded = crate::util::decode_html_entities(&session_summary);
+                    if let Some(clean) =
+                        xai_grok_shell::session::persistence::sanitize_and_cap_title(&decoded)
+                    {
+                        agent.generated_session_title = Some(clean);
+                    } else if other == Some(false)
+                        && agent.generated_session_title.as_deref() == pin.as_deref()
+                    {
+                        agent.generated_session_title = None;
+                    }
+                }
+            }
             true
         }
         XaiSessionUpdate::LastTurnSummary {

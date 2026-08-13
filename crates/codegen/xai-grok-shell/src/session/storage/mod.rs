@@ -1006,6 +1006,13 @@ pub trait StorageAdapter: Send + Sync {
         session_title: String,
     ) -> io::Result<bool>;
 
+    /// Clear a manual `/rename` pin (`/rename --auto`). Sets
+    /// `title_is_manual = false` and, when a pin was present, blanks
+    /// `generated_title` and `session_summary` so `display_title()` is
+    /// empty. Returns `true` iff a manual pin was actually cleared.
+    /// Idempotent when the title is not manual.
+    async fn reset_title_to_auto(&self, info: &Info) -> io::Result<bool>;
+
     /// Replace or clear (`None`) the per-turn dashboard summary
     /// (`(text, prompt_id)`) in `summary.json`; last-writer-wins.
     async fn set_last_turn_summary(
