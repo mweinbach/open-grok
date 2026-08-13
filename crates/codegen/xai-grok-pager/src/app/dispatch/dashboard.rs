@@ -187,7 +187,7 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
             && let Some(agent) = app.agents.get_mut(&id)
         {
             agent.current_branch = info.branch;
-            agent.is_worktree = info.is_worktree;
+            agent.is_worktree = info.is_worktree || agent.session.is_worktree;
             agent.main_repo = info.main_repo;
             agent.worktree_label = info.worktree_label;
         }

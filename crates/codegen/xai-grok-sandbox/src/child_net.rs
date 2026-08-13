@@ -223,11 +223,15 @@ pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
     ns_lockdown::install(&mut filter)
 }
 
+/// # Safety
+/// After fork / before exec.
 #[cfg(not(target_os = "linux"))]
 pub unsafe fn install_child_network_filter() -> std::io::Result<()> {
     Ok(())
 }
 
+/// # Safety
+/// Process-wide; call after bwrap re-exec / at apply.
 #[cfg(not(target_os = "linux"))]
 pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
     Ok(())
