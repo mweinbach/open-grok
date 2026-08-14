@@ -2163,6 +2163,7 @@ mod tests {
             "/rename",
             "/btw",
             "/session-info",
+            "/cache",
             "/find",
             "/doctor",
         ] {

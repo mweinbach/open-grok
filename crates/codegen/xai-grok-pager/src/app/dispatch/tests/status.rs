@@ -1012,6 +1012,7 @@ fn session_cache_complete_commits_block() {
             hits: 2,
             partial_hits: 0,
             breaks: 0,
+            provider_misses: 0,
             last_break_diagnostic: None,
         },
         recent_turns: vec![],

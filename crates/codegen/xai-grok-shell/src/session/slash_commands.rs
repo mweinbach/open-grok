@@ -228,6 +228,14 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         resolve: |_args| BuiltinAction::SessionInfo,
     },
     BuiltinCommand {
+        name: "cache",
+        description: "Show prompt cache hit rate and prefix-break diagnostics",
+        argument_hint: None,
+        aliases: &["cache-status", "prompt-cache"],
+        gate: BuiltinGate::AlwaysOn,
+        resolve: |_args| BuiltinAction::Cache,
+    },
+    BuiltinCommand {
         name: "feedback",
         description: "Send feedback about the current session",
         argument_hint: Some("feedback text"),
@@ -446,6 +454,8 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "announcements",
     "auto",
     "btw",
+    "cache",
+    "cache-status",
     "cd",
     "changelog",
     "chat",
@@ -510,6 +520,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "preferences",
     "prefs",
     "privacy",
+    "prompt-cache",
     "queue",
     "quit",
     "recap",
@@ -920,6 +931,7 @@ pub(super) enum BuiltinAction {
     PluginsReload,
     PluginsTrust,
     SessionInfo,
+    Cache,
     PluginsAdd {
         path: String,
     },
@@ -983,6 +995,7 @@ impl BuiltinAction {
             BuiltinAction::PluginsReload => "plugins-reload",
             BuiltinAction::PluginsTrust => "plugins-trust",
             BuiltinAction::SessionInfo => "session",
+            BuiltinAction::Cache => "cache",
             BuiltinAction::PluginsAdd { .. } => "plugins-add",
             BuiltinAction::PluginsRemove { .. } => "plugins-remove",
             BuiltinAction::PluginsInstall { .. } => "plugins-install",
@@ -1020,6 +1033,7 @@ impl BuiltinAction {
             BuiltinAction::PluginsReload => false,
             BuiltinAction::PluginsTrust => false,
             BuiltinAction::SessionInfo => false,
+            BuiltinAction::Cache => false,
             BuiltinAction::PluginsAdd { .. } => true,
             BuiltinAction::PluginsRemove { .. } => true,
             BuiltinAction::PluginsInstall { .. } => true,
@@ -1551,6 +1565,36 @@ mod tests {
     }
 
     #[test]
+    fn cache_resolves_to_builtin() {
+        let outcome = resolve(
+            vec![text_block("/cache")],
+            &[],
+            all_gated(),
+            SkillSlashRewrite::default(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            outcome,
+            SlashCommandOutcome::Builtin(BuiltinAction::Cache)
+        ));
+        for alias in ["/cache-status", "/prompt-cache"] {
+            let outcome = resolve(
+                vec![text_block(alias)],
+                &[],
+                all_gated(),
+                SkillSlashRewrite::default(),
+                &[],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(outcome, SlashCommandOutcome::Builtin(BuiltinAction::Cache)),
+                "{alias}"
+            );
+        }
+    }
+
+    #[test]
     fn yolo_alias_resolves_to_always_approve() {
         // /yolo should resolve via alias to the always-approve command
         let blocks = vec![text_block("/yolo on")];
@@ -1891,6 +1935,7 @@ mod tests {
                 "plugins",
                 "reload-plugins",
                 "session-info",
+                "cache",
                 "feedback",
                 "deep-research",
                 "workflow",
@@ -2124,7 +2169,13 @@ mod tests {
             );
         }
         // Always-on commands are still present.
-        for required in ["compact", "always-approve", "context", "session-info"] {
+        for required in [
+            "compact",
+            "always-approve",
+            "context",
+            "session-info",
+            "cache",
+        ] {
             assert!(
                 names.iter().any(|n| n == required),
                 "{required} should be present, got: {names:?}",
@@ -2740,7 +2791,13 @@ mod tests {
                 "{forbidden} must not be advertised under default fail-closed availability, got: {names:?}",
             );
         }
-        for required in ["compact", "always-approve", "context", "session-info"] {
+        for required in [
+            "compact",
+            "always-approve",
+            "context",
+            "session-info",
+            "cache",
+        ] {
             assert!(
                 names.iter().any(|n| n == required),
                 "AlwaysOn {required} must always be advertised, got: {names:?}",
