@@ -89,6 +89,7 @@ mod tests {
             hits: 1,
             partial_hits: 0,
             breaks: 0,
+            provider_misses: 0,
             last_break_diagnostic: None,
         };
 

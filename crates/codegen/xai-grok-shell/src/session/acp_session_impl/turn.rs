@@ -2851,19 +2851,24 @@ impl SessionActor {
                 .get_prompt_index()
                 .await
                 .to_string();
-            self.cache_tracker.borrow_mut().record_turn_outcome(
-                Some(self.session_info.id.0.as_ref()),
-                &turn_idx_str,
-                loop_index,
-                prompt_tokens.unwrap_or(0),
-                cached_prompt_tokens.unwrap_or(0),
-                completion_tokens.unwrap_or(0),
-                request_summary,
-            );
             if let Some(usage) = response.usage.as_ref() {
+                self.cache_tracker.borrow_mut().record_turn_outcome(
+                    Some(self.session_info.id.0.as_ref()),
+                    &turn_idx_str,
+                    loop_index,
+                    usage.prompt_tokens,
+                    usage.cached_prompt_tokens,
+                    usage.completion_tokens,
+                    request_summary,
+                    api_backend.forwards_prompt_cache_key(),
+                );
                 self.chat_state_handle
                     .record_token_usage(u64::from(usage.total_tokens));
                 self.send_available_commands_update().await;
+            } else {
+                self.cache_tracker
+                    .borrow_mut()
+                    .remember_request(request_summary);
             }
             turn_span_totals.record(&tracing::Span::current(), &response);
             let _ = self.compaction.auto_compact_suppressed.compare_exchange(
