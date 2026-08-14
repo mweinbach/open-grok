@@ -611,6 +611,29 @@ pub async fn set_auto_update(value: bool) -> Result<()> {
     update_config(|cfg| cfg.cli.auto_update = Some(value)).await
 }
 
+/// Persist one `[model.<key>]` table. Does not go through `save_config`.
+pub async fn upsert_custom_model(
+    record: crate::custom_models::CustomModelRecord,
+) -> Result<(
+    crate::custom_models::CustomModelRecord,
+    crate::agent::config::ConfigModelOverride,
+    Option<String>,
+)> {
+    let (record, warning) = crate::custom_models::normalize_custom_model(record)?;
+    let _guard = lock_config_writes().await;
+    let path = user_config_path();
+    let model = super::persist::persist_custom_model_upsert_at(&path, &record)?;
+    Ok((record, model, warning))
+}
+
+/// Remove one `[model.<key>]` table. Missing keys are a no-op.
+pub async fn delete_custom_model(key: &str) -> Result<bool> {
+    let key = key.trim();
+    crate::custom_models::validate_model_key(key)?;
+    let _guard = lock_config_writes().await;
+    super::persist::persist_custom_model_delete_at(&user_config_path(), key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

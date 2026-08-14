@@ -120,6 +120,22 @@ pub(super) fn zai_models_apply_payload(
     }
 }
 
+pub(super) fn custom_models_mutation_payload(
+    models: acp::SessionModelState,
+    custom_models: Vec<crate::custom_models::CustomModelPublicRecord>,
+    warning: Option<String>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "ok": true,
+        "models": models,
+        "custom_models": custom_models,
+    });
+    if let Some(warning) = warning {
+        payload["warning"] = serde_json::Value::String(warning);
+    }
+    payload
+}
+
 pub(super) fn opencode_go_models_payload(
     refreshed: Result<bool, String>,
     models: acp::SessionModelState,
@@ -155,6 +171,11 @@ struct KimiEndpointApplyParams {
 struct OpenCodeGoEnabledModelsParams {
     #[serde(default)]
     enabled_models: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CustomModelDeleteParams {
+    key: String,
 }
 
 fn persisted_perplexity_web_search_enabled() -> anyhow::Result<bool> {
@@ -2605,6 +2626,47 @@ impl acp::Agent for MvpAgent {
                     refreshed, models,
                 )))
             }
+            "open-grok/custom-models/list" => crate::extensions::to_ext_response(Ok(
+                serde_json::json!({
+                    "models": self.models_manager.list_custom_models(),
+                }),
+            )),
+            "open-grok/custom-models/upsert" => {
+                let params = crate::extensions::parse_params::<crate::custom_models::CustomModelRecord>(&args)?;
+                match self.models_manager.upsert_custom_model(params).await {
+                    Ok(warning) => {
+                        let available = self.models_manager.available();
+                        let models = acp::SessionModelState::new(
+                            self.models_manager.current_model_id(),
+                            available.values().cloned().collect(),
+                        );
+                        crate::extensions::to_ext_response(Ok(custom_models_mutation_payload(
+                            models,
+                            self.models_manager.list_custom_models(),
+                            warning,
+                        )))
+                    }
+                    Err(error) => crate::extensions::to_ext_response::<serde_json::Value>(Err(error)),
+                }
+            }
+            "open-grok/custom-models/delete" => {
+                let params = crate::extensions::parse_params::<CustomModelDeleteParams>(&args)?;
+                match self.models_manager.delete_custom_model(&params.key).await {
+                    Ok(()) => {
+                        let available = self.models_manager.available();
+                        let models = acp::SessionModelState::new(
+                            self.models_manager.current_model_id(),
+                            available.values().cloned().collect(),
+                        );
+                        crate::extensions::to_ext_response(Ok(custom_models_mutation_payload(
+                            models,
+                            self.models_manager.list_custom_models(),
+                            None,
+                        )))
+                    }
+                    Err(error) => crate::extensions::to_ext_response::<serde_json::Value>(Err(error)),
+                }
+            }
             "open-grok/opencode-go/models/get" => {
                 let refreshed = if self.models_manager.opencode_go_models().is_empty() {
                     self.models_manager.refresh_opencode_go_models().await.map_err(|error| error.to_string())
@@ -2822,6 +2884,7 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/session/repair" => crate::extensions::repair::handle(self, &args).await,
             "x.ai/session/usage" => crate::extensions::usage::handle(self, &args).await,
+            "x.ai/session/cache" => crate::extensions::cache::handle(self, &args).await,
             "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
                 crate::extensions::memory::handle(self, &args).await
             }
@@ -3522,6 +3585,43 @@ mod tool_overrides_capability_tests {
                 "x_user_search": false,
                 "x_thread_fetch": false,
             }),
+        );
+    }
+}
+
+#[cfg(test)]
+mod custom_models_payload_tests {
+    use super::custom_models_mutation_payload;
+    use agent_client_protocol as acp;
+
+    #[test]
+    fn mutation_payload_omits_api_key_and_optional_warning() {
+        let model_id = acp::ModelId::new("my-ollama");
+        let models = acp::SessionModelState::new(
+            model_id.clone(),
+            vec![acp::ModelInfo::new(model_id, "Local".to_string())],
+        );
+        let custom = vec![crate::custom_models::CustomModelPublicRecord {
+            key: "my-ollama".into(),
+            model: "llama".into(),
+            has_api_key: true,
+            ..crate::custom_models::CustomModelPublicRecord::default()
+        }];
+        let payload = custom_models_mutation_payload(models, custom, None);
+        assert_eq!(payload.get("ok"), Some(&serde_json::json!(true)));
+        assert!(payload.get("warning").is_none());
+        let listed = payload.get("custom_models").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(listed[0].get("has_api_key"), Some(&serde_json::json!(true)));
+        assert!(listed[0].get("api_key").is_none());
+
+        let warned = custom_models_mutation_payload(
+            acp::SessionModelState::new(acp::ModelId::new("x"), Vec::new()),
+            Vec::new(),
+            Some("api_key was omitted because env_key is set".into()),
+        );
+        assert_eq!(
+            warned.get("warning").and_then(serde_json::Value::as_str),
+            Some("api_key was omitted because env_key is set")
         );
     }
 }
