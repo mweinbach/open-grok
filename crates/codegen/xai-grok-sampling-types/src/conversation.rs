@@ -2136,6 +2136,22 @@ impl From<Usage> for TokenUsage {
     }
 }
 
+impl TokenUsage {
+    /// Cache hit rate as a percentage (0.0 to 100.0), or `None` if `prompt_tokens == 0`.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        if self.prompt_tokens == 0 {
+            None
+        } else {
+            Some((f64::from(self.cached_prompt_tokens) / f64::from(self.prompt_tokens)) * 100.0)
+        }
+    }
+
+    /// Cache hit rate percentage, defaulting to `0.0` if `prompt_tokens == 0`.
+    pub fn cache_hit_rate_pct(&self) -> f64 {
+        self.cache_hit_rate().unwrap_or(0.0)
+    }
+}
+
 /// Response from a conversation turn.
 ///
 /// `items` is a flat ordered list mirroring the Responses API's
@@ -5638,6 +5654,37 @@ mod tests {
     use crate::tool_overrides::*;
     use crate::{ReasoningEffort, SERVICE_TIER_FAST_REQUEST_VALUE};
     use assert_matches::assert_matches;
+
+    #[test]
+    fn token_usage_cache_hit_rate_calculation() {
+        let empty = TokenUsage::default();
+        assert_eq!(empty.cache_hit_rate(), None);
+        assert_eq!(empty.cache_hit_rate_pct(), 0.0);
+
+        let zero_cached = TokenUsage {
+            prompt_tokens: 1000,
+            cached_prompt_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(zero_cached.cache_hit_rate(), Some(0.0));
+        assert_eq!(zero_cached.cache_hit_rate_pct(), 0.0);
+
+        let partial = TokenUsage {
+            prompt_tokens: 2000,
+            cached_prompt_tokens: 1500,
+            ..Default::default()
+        };
+        assert_eq!(partial.cache_hit_rate(), Some(75.0));
+        assert_eq!(partial.cache_hit_rate_pct(), 75.0);
+
+        let full = TokenUsage {
+            prompt_tokens: 500,
+            cached_prompt_tokens: 500,
+            ..Default::default()
+        };
+        assert_eq!(full.cache_hit_rate(), Some(100.0));
+        assert_eq!(full.cache_hit_rate_pct(), 100.0);
+    }
 
     #[test]
     fn chat_completions_forwards_reasoning_effort_and_service_tier() {

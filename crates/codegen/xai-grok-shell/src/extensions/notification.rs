@@ -180,6 +180,16 @@ impl PromptUsage {
             && cache_creation_tokens == 0
             && self.model_usage.is_empty()
     }
+
+    /// Cache hit rate as a percentage (0.0 to 100.0), or `None` if `input_tokens == 0`.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        self.totals.cache_hit_rate()
+    }
+
+    /// Cache hit rate percentage, defaulting to `0.0` if `input_tokens == 0`.
+    pub fn cache_hit_rate_pct(&self) -> f64 {
+        self.totals.cache_hit_rate_pct()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -221,6 +231,22 @@ pub struct PromptUsageModel {
     /// `cost_is_partial` only — never on the public ACP wire.
     #[serde(default, skip_serializing)]
     pub cost_missing_calls: u64,
+}
+
+impl PromptUsageModel {
+    /// Cache hit rate as a percentage (0.0 to 100.0), or `None` if `input_tokens == 0`.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        if self.input_tokens == 0 {
+            None
+        } else {
+            Some((self.cached_read_tokens as f64 / self.input_tokens as f64) * 100.0)
+        }
+    }
+
+    /// Cache hit rate percentage, defaulting to `0.0` if `input_tokens == 0`.
+    pub fn cache_hit_rate_pct(&self) -> f64 {
+        self.cache_hit_rate().unwrap_or(0.0)
+    }
 }
 
 impl From<&xai_chat_state::UsageTotals> for PromptUsageModel {
