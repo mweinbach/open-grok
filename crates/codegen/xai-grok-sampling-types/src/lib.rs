@@ -10,12 +10,19 @@ pub mod conversation;
 pub mod doom_loop;
 pub mod error;
 pub mod messages;
+pub mod prompt_cache;
 pub mod provider_error;
 pub mod serde_helpers;
 pub mod tool_overrides;
 pub mod types;
 
 pub use self::conversation::*;
+pub use self::prompt_cache::{
+    CacheBreak, CacheCallOutcome, CachePrefixDiff, PROVIDER_MISS_MIN_PROMPT_TOKENS,
+    PromptCacheFingerprint, PromptCacheReport, PromptCacheSection, PromptCacheSectionKind,
+    PromptCacheTracker, cache_hit_rate, diff_fingerprints, fingerprint_request,
+    format_cache_hit_rate,
+};
 pub use self::doom_loop::{
     DOOM_LOOP_CHECK_EVENT_TYPE, DOOM_LOOP_CHECK_HEADER, DoomLoopPeek, DoomLoopRecoveryPolicy,
     DoomLoopSignal, DoomLoopSignalKind, is_check_event, peek_doom_loop,
