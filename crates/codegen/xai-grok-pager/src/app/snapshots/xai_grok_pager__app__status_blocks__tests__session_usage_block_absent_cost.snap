@@ -4,6 +4,7 @@ expression: text
 ---
 Session usage (since start or last resume):
   Input tokens:   100 (0 cached)
+  Cache hit rate: 0.0% (0 / 100)
   Output tokens:  10 (0 reasoning)
   Total tokens:   110
   Model calls:    1 · API time: 1.0s

@@ -952,6 +952,60 @@ fn show_usage_on_welcome_screen_is_noop() {
 }
 
 #[test]
+fn show_cache_on_welcome_screen_is_noop() {
+    let mut app = test_app();
+    let effects = dispatch(Action::ShowCache, &mut app);
+    assert!(
+        effects.is_empty(),
+        "ShowCache with no active agent should be a no-op"
+    );
+}
+
+#[test]
+fn show_cache_fetches_session_cache() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::ShowCache, &mut app);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::FetchSessionCache { agent_id, .. }] if *agent_id == AgentId(0)
+        ),
+        "got: {effects:?}"
+    );
+}
+
+#[test]
+fn session_cache_complete_commits_scrollback() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionCacheComplete {
+            agent_id: AgentId(0),
+            session_id: "test-session".to_string().into(),
+            text: "Prompt cache: no model calls yet in this session.".to_string(),
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+}
+
+#[test]
+fn session_cache_result_drops_stale_session() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionCacheComplete {
+            agent_id: AgentId(0),
+            session_id: "other-session".to_string().into(),
+            text: "stale".to_string(),
+        }),
+        &mut app,
+    );
+    assert_eq!(agent_scrollback_len(&app), before);
+}
+
+#[test]
 fn show_usage_with_redirect_url_fetches_session_only() {
     // Redirect link is deferred until SessionUsageComplete (see billing tests).
     let mut app = test_app_with_agent();

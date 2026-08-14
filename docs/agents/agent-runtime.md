@@ -56,6 +56,7 @@ xai-grok-shell::MvpAgent  (LocalSet, !Send)
    - Outcomes: permission reject can cancel turn; hook deny continues with failure result; followups inject user messages
    - Preflight overflow → compact and continue
    - Honor `max_turns`
+   - On inference usage, `record_and_log_prompt_cache` fingerprints the main-turn request and logs `shell.turn.prompt_cache` (plus `_break` / `_miss`). Auxiliary calls must not record — they would poison the next prefix.
 4. Auth recovery uses **`AuthRetrySchedule` of 1s / 2s / 4s** (do not inflate bases — hang regressions).
 
 ### Invariants

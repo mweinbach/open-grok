@@ -7,6 +7,7 @@ pub mod always_approve;
 pub mod announcements;
 pub mod auto;
 pub mod btw;
+pub mod cache;
 pub mod cd;
 pub mod compact;
 pub mod compact_mode;
@@ -114,6 +115,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(plugin::SkillsCommand),
         Arc::new(share::ShareCommand),
         Arc::new(session_info::SessionInfoCommand),
+        Arc::new(cache::CacheCommand),
         Arc::new(rename::RenameCommand),
         Arc::new(dashboard::DashboardCommand),
         Arc::new(cd::CdCommand),
@@ -256,6 +258,7 @@ mod tests {
             "announcements",
             "auto",
             "btw",
+            "cache",
             "cd",
             "changelog",
             "chat",

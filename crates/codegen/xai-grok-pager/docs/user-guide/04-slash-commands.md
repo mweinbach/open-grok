@@ -43,6 +43,16 @@ Show how the context window is being used: a category breakdown (system prompt, 
 
 Show session details — auth method, model, turn count, and context usage. Aliases: `/status`, `/info`.
 
+### `/cache`
+
+Show this session's prompt-cache hit rate and where the KV-cache prefix last broke (model, tools, system prompt, or an earlier message). The report uses section labels and hashes only — prompt text is never shown. `/usage` also prints the session hit rate next to input tokens.
+
+Search logs for `shell.turn.prompt_cache`, `shell.turn.prompt_cache_break`, and `shell.turn.prompt_cache_miss` when debugging a miss.
+
+```
+/cache
+```
+
 ### `/fork`
 
 Branch the current session into a new agent, keeping history up to this point.
@@ -448,7 +458,8 @@ the independent OpenAI Codex account and keep the xAI session active.
 
 View xAI billing and OpenAI Codex quota usage together in one labeled summary.
 The two providers load independently, so one provider's error does not hide or
-alter the other. `/usage manage` opens xAI billing management. Alias: `/cost`.
+alter the other. The session token block includes prompt-cache hit rate; `/cache`
+has the prefix-break log. `/usage manage` opens xAI billing management. Alias: `/cost`.
 
 ```
 /usage

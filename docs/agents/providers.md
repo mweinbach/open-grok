@@ -194,6 +194,8 @@ Also isolated:
 | Doom-loop opt-in | yes | no | no | no | no | no | no | no |
 | Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A | N/A | stateless fields; effort normalized to none/low/high/max | stateless fields; preserves low/medium/high/xhigh | N/A | N/A |
 | Prompt cache key | no | session id | no | no | no | no | no | no |
+
+Main-turn requests are fingerprinted (model, tools, system, earlier items — hashes only). `/cache` and `x.ai/session/cache` report session hit rate and the first prefix section that changed. Auxiliary calls (recap, `/btw`) log hit rate but must not record on the tracker. Search `shell.turn.prompt_cache_break` / `shell.turn.prompt_cache_miss`.
 | Sticky turn state | no | `x-codex-turn-state` | no | no | no | no | no | no |
 | Unknown `response.*` events | strict | ignore unknown side-channels when opted | N/A | N/A | strict | strict | N/A | N/A |
 | Chat sanitization | — | — | clears temp/top_p/penalties | schema normalization | strips internal message model IDs | N/A | standard | per backend |

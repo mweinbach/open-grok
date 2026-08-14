@@ -199,6 +199,15 @@ pub(crate) fn session_usage_block_text(
         group_thousands(t.cached_read_tokens),
     ));
     rows.push(format!(
+        "  Cache hit rate: {} ({} / {})",
+        xai_grok_shell::sampling::format_cache_hit_rate(xai_grok_shell::sampling::cache_hit_rate(
+            t.cached_read_tokens,
+            t.input_tokens,
+        )),
+        group_thousands(t.cached_read_tokens),
+        group_thousands(t.input_tokens),
+    ));
+    rows.push(format!(
         "  Output tokens:  {} ({} reasoning)",
         group_thousands(t.output_tokens),
         group_thousands(t.reasoning_tokens),
@@ -327,6 +336,10 @@ mod tests {
             ..Default::default()
         };
         let text = session_usage_block_text(&usage);
+        assert!(
+            text.contains("Cache hit rate: 81.0% (1,000,000 / 1,234,567)"),
+            "{text}"
+        );
         // Snapshot pins content and column alignment together; single-model
         // sessions must skip the redundant by-model breakdown.
         insta::assert_snapshot!("session_usage_block_full", text);

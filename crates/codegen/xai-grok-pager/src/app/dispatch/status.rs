@@ -373,6 +373,41 @@ pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
     }
 }
 
+/// `/cache` — always a scrollback system block (no modal). Prefix hashes
+/// and hit rates come from the session tracker via `x.ai/session/cache`.
+pub(super) fn dispatch_show_cache(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    let Some(session_id) = agent.session.session_id.clone() else {
+        return vec![];
+    };
+    vec![Effect::FetchSessionCache {
+        agent_id: id,
+        session_id,
+    }]
+}
+
+/// Commit a `/cache` report (or error) if still on `session_id`.
+pub(super) fn handle_session_cache_result(
+    app: &mut AppView,
+    agent_id: AgentId,
+    session_id: &acp::SessionId,
+    text: String,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(session_id) {
+        return vec![];
+    }
+    push_and_page_flip(&mut agent.scrollback, RenderBlock::system(text));
+    vec![]
+}
+
 /// Route a session-usage result (success or failure text) into the open
 /// usage modal, or into scrollback in minimal mode. Stale results are dropped.
 pub(super) fn handle_session_usage_result(

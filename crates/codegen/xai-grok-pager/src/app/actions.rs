@@ -838,6 +838,8 @@ pub enum Action {
     ShowContextInfo,
     /// `/usage` — session token/cost, plus consumer credits when visible.
     ShowUsage,
+    /// `/cache` — session prompt-cache hit rate and prefix-break log.
+    ShowCache,
     /// `/usage manage` — open consumer billing (no-op if surface hidden).
     ManageBilling,
     /// Commit a read-only list of the queued prompts as a system block
@@ -2483,6 +2485,11 @@ pub enum Effect {
         /// Usage-modal fetch generation; echoed back on the task result.
         nonce: u64,
     },
+    /// Fetch prompt-cache hit rate and prefix breaks via `x.ai/session/cache`.
+    FetchSessionCache {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
     /// Re-fetch remote settings to check subscription gate.
     RefreshGate,
     /// Spawn a debounce sleep task for shell suggestions. `agent_id` rides
@@ -3295,6 +3302,18 @@ pub enum TaskResult {
         session_id: acp::SessionId,
         error: String,
         nonce: u64,
+    },
+    /// `/cache` report fetched. Drop if `session_id` no longer matches.
+    SessionCacheComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        text: String,
+    },
+    /// `/cache` fetch failed. Drop if `session_id` no longer matches.
+    SessionCacheFailed {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        error: String,
     },
     /// Feedback submitted successfully (fire-and-forget).
     FeedbackComplete {

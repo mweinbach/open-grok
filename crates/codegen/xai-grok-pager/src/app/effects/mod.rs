@@ -5674,6 +5674,28 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::FetchSessionCache { agent_id, session_id } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    match fetch_session_cache(&session_id, &tx).await {
+                        Ok(text) => {
+                            TaskResult::SessionCacheComplete {
+                                agent_id,
+                                session_id,
+                                text,
+                            }
+                        }
+                        Err(error) => {
+                            TaskResult::SessionCacheFailed {
+                                agent_id,
+                                session_id,
+                                error,
+                            }
+                        }
+                    }
+                });
+        }
         Effect::SendFeedback { agent_id, session_id, feedback_text } => {
             use xai_grok_shell::session::ClientType;
             use xai_grok_shell::session::acp_types::ClientFeedbackInput;
@@ -6700,6 +6722,38 @@ async fn fetch_session_usage(
             "invalid session usage response".to_string()
         })?;
     Ok(parsed.usage)
+}
+async fn fetch_session_cache(
+    session_id: &acp::SessionId,
+    tx: &AcpAgentTx,
+) -> Result<String, String> {
+    let request = acp::ExtRequest::new(
+        "x.ai/session/cache",
+        serde_json::value::to_raw_value(
+                &serde_json::json!({
+            "sessionId": session_id.0.to_string()
+        }),
+            )
+            .expect("serialize session/cache params")
+            .into(),
+    );
+    let resp = acp_send(request, tx)
+        .await
+        .map_err(|e| {
+            if i32::from(e.code) == i32::from(acp::Error::method_not_found().code) {
+                "not supported by this agent version".to_string()
+            } else {
+                sanitize_user_error(&e.to_string())
+            }
+        })?;
+    let parsed: xai_grok_shell::extensions::cache::SessionCacheResponse = serde_json::from_str(
+            resp.0.get(),
+        )
+        .map_err(|e| {
+            tracing::debug!("session cache deser failed: {e}");
+            "invalid session cache response".to_string()
+        })?;
+    Ok(parsed.text)
 }
 /// Shared `x.ai/session/rename` RPC for rename and `/rename --auto`.
 async fn session_rename_rpc(
