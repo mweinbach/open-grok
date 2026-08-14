@@ -327,9 +327,111 @@ pub(crate) fn resolve_permission_queue_transition(agent: &mut AgentView) {
 pub(super) fn restore_permission_stashes(agent: &mut AgentView) {
     agent.permission_pattern_edit = None;
     if let Some(stashed) = agent.permission_stashed_prompt.take() {
-        agent.prompt.restore(stashed);
+        agent.plan_freeform_prefill_deferred = false;
+        agent.restore_card_prompt(stashed);
+    } else if agent.plan_freeform_prefill_deferred {
+        // Only when exit_plan_mode deferred prefill under an open permission;
+        // not on every restore (e.g. YOLO with an empty queue) or freeform notes
+        // during steady-state plan review get wiped / re-prefilled.
+        agent.plan_freeform_prefill_deferred = false;
+        if let Some(pav) = agent.plan_approval_view.as_ref() {
+            let session = pav.stashed_prompt.clone_for_live_prefill();
+            if session.is_effectively_empty() {
+                agent.prompt.set_text("");
+            } else {
+                agent.prompt.restore(session);
+            }
+            if let Some(ref mut pav) = agent.plan_approval_view {
+                pav.focus = crate::views::plan_approval_view::PlanApprovalFocus::Prompt;
+            }
+        }
     }
     if let Some(pane) = agent.permission_stashed_pane.take() {
         agent.set_active_pane(pane, true);
+    }
+}
+
+#[cfg(test)]
+mod plan_prefill_after_permission_tests {
+    use super::*;
+    use crate::app::agent_view::test_fixtures::{
+        make_agent, make_followup_permission_state, make_plan_approval_view_state,
+    };
+
+    #[test]
+    fn emptying_permission_prefills_plan_freeform_from_session_draft() {
+        let mut agent = make_agent();
+        agent
+            .permission_queue
+            .push_back(make_followup_permission_state());
+        let mut pav = make_plan_approval_view_state();
+        pav.stashed_prompt = crate::views::prompt_widget::StashedPrompt {
+            text: "deferred session draft".into(),
+            cursor: 0,
+            images: Vec::new(),
+            chip_elements: Vec::new(),
+            image_counter: 0,
+            image_undo_stash: Vec::new(),
+        };
+        agent.plan_approval_view = Some(pav);
+        agent.plan_freeform_prefill_deferred = true;
+        agent.prompt.set_text("");
+        agent.permission_queue.clear();
+        restore_permission_stashes(&mut agent);
+        assert_eq!(agent.prompt.text(), "deferred session draft");
+        assert!(!agent.plan_freeform_prefill_deferred);
+    }
+
+    #[test]
+    fn emptying_permission_replaces_leftover_followup_with_session_draft() {
+        let mut agent = make_agent();
+        agent
+            .permission_queue
+            .push_back(make_followup_permission_state());
+        let mut pav = make_plan_approval_view_state();
+        pav.stashed_prompt = crate::views::prompt_widget::StashedPrompt {
+            text: "session draft".into(),
+            cursor: 0,
+            images: Vec::new(),
+            chip_elements: Vec::new(),
+            image_counter: 0,
+            image_undo_stash: Vec::new(),
+        };
+        agent.plan_approval_view = Some(pav);
+        agent.plan_freeform_prefill_deferred = true;
+        // Typed followup after plan opened under permission (session draft was
+        // already taken into pav.stashed_prompt; permission_stashed is empty).
+        agent.prompt.set_text("leftover permission followup");
+        agent.permission_queue.clear();
+        restore_permission_stashes(&mut agent);
+        assert_eq!(
+            agent.prompt.text(),
+            "session draft",
+            "leftover followup must not remain as plan freeform"
+        );
+    }
+
+    #[test]
+    fn restore_without_deferred_flag_does_not_clobber_freeform() {
+        let mut agent = make_agent();
+        let mut pav = make_plan_approval_view_state();
+        pav.stashed_prompt = crate::views::prompt_widget::StashedPrompt {
+            text: "session draft".into(),
+            cursor: 0,
+            images: Vec::new(),
+            chip_elements: Vec::new(),
+            image_counter: 0,
+            image_undo_stash: Vec::new(),
+        };
+        agent.plan_approval_view = Some(pav);
+        agent.plan_freeform_prefill_deferred = false;
+        agent.prompt.set_text("in-progress freeform notes");
+        // e.g. set_yolo_mode with an already-empty permission queue
+        restore_permission_stashes(&mut agent);
+        assert_eq!(
+            agent.prompt.text(),
+            "in-progress freeform notes",
+            "unrelated restore must not wipe freeform during plan review"
+        );
     }
 }

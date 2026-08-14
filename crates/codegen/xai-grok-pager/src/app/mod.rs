@@ -67,8 +67,8 @@ pub(crate) use foreign_sessions::{
     badge_for_picker_source, foreign_tool_display_label, is_foreign_picker_source,
 };
 mod startup_failure;
-pub use startup_failure::StartupFailure;
 use ratatui::backend::CrosstermBackend;
+pub use startup_failure::StartupFailure;
 use std::io::{self, Write};
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1827,10 +1827,7 @@ mod tests {
         };
         assert_eq!(f.outcome, crate::acp::StartupOutcome::Timeout);
         let msg = f.error.to_string();
-        assert!(
-            msg.contains("startup timed out after 0s"),
-            "{msg}"
-        );
+        assert!(msg.contains("startup timed out after 0s"), "{msg}");
     }
     #[tokio::test]
     async fn bounded_connect_returns_err_on_cancel() {

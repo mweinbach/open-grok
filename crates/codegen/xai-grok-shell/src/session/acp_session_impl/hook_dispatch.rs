@@ -236,7 +236,7 @@ impl SessionActor {
         prompt_id: Option<&str>,
         tool_name: Option<&str>,
     ) {
-        if !self.hook_event_active(event) {
+        if !self.may_have_hooks_for(event) {
             return;
         }
         // Fires observe-only client hooks before (and independent of) the on-disk registry guard below.

@@ -277,6 +277,20 @@ pub enum Action {
         /// live on [`Effect::QueueInterject`].
         new_text: Option<String>,
     },
+    /// A queued-row edit whose saved text is a complete pager builtin invocation: drop the row,
+    /// then run the command through the normal slash dispatch. The view only classifies; dispatch
+    /// stays the sole execution owner, and it removes the row only after its own guards pass, so a
+    /// failed run leaves the row queued.
+    RunEditedQueuedCommand {
+        /// `PromptMode::EditingQueued.id`: the local `pending_prompts` id, or the synthesized
+        /// selection id for a server row (unused there).
+        local_id: u64,
+        /// `Some` for a server-authoritative row. `None` covers both a local row and a server row
+        /// that vanished from the mirror before Enter: with nothing to remove, no versioned
+        /// `x.ai/queue/remove` request is sent.
+        server: Option<SharedQueueTarget>,
+        text: String,
+    },
     /// Focus the prompt pane.
     FocusPrompt,
     /// Focus the scrollback pane (leave prompt).
@@ -582,6 +596,9 @@ pub enum Action {
     /// drain site) and persists to `[ui].combine_queued_prompts` via
     /// `Effect::PersistSetting`.
     SetCombineQueuedPrompts(bool),
+    /// Mid-turn follow-up routing (`queue` | `steer`).
+    /// SHARED-owned: `[ui].follow_up_behavior`.
+    SetFollowUpBehavior(crate::appearance::FollowUpBehavior),
     /// Mid-turn Enter steers (send-now) vs queues. SHARED-owned cache +
     /// `[ui].enter_steers` via `Effect::PersistSetting`. Default off: Enter
     /// queues and Ctrl+Enter sends now.
@@ -1181,6 +1198,12 @@ pub enum Action {
     JumpPickerSelect(EntryId),
     /// Close the picker and restore the stashed viewport.
     JumpDismiss,
+}
+/// A server-authoritative queue row plus the version its removal is checked against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SharedQueueTarget {
+    pub id: String,
+    pub expected_version: u64,
 }
 /// Persist-and-notify semantics for [`Effect::PersistPermissionMode`].
 ///

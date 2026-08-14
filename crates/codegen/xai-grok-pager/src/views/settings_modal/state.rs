@@ -1093,6 +1093,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "confirm_before_rewind" => Some(Action::SetConfirmBeforeRewind(new)),
         "combine_queued_prompts" => Some(Action::SetCombineQueuedPrompts(new)),
         "enter_steers" => Some(Action::SetEnterSteers(new)),
+
         "invert_scroll" => Some(Action::SetInvertScroll(new)),
         "show_tips" => Some(Action::SetShowTips(new)),
         "auto_update" => Some(Action::SetAutoUpdate(new)),
@@ -1190,6 +1191,8 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
         "scroll_mode" => {
             crate::appearance::ScrollMode::from_canonical(choice).map(Action::SetScrollMode)
         }
+        "follow_up_behavior" => crate::appearance::FollowUpBehavior::from_canonical(choice)
+            .map(Action::SetFollowUpBehavior),
         "default_selected_permission" => {
             Some(Action::SetDefaultSelectedPermission(choice.to_string()))
         }

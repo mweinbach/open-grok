@@ -570,7 +570,7 @@ impl WorkspaceRpcHandler {
                     .get("refs")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
-                let cwd = self.workspace.root_cwd()?;
+                let cwd = self.workspace.client_fs_base(bound_session).await?.base;
                 let mut results = Vec::new();
                 for ref_path in &refs {
                     let requested_path = if std::path::Path::new(ref_path).is_absolute() {
@@ -578,23 +578,20 @@ impl WorkspaceRpcHandler {
                     } else {
                         cwd.join(ref_path)
                     };
-                    let full_path = match self
-                        .workspace
-                        .confine_to_workspace_root(&requested_path)
-                        .await
-                    {
-                        Ok((confined, _)) => confined,
-                        Err(e) => {
-                            results.push(serde_json::json!({
-                                "path": requested_path.to_string_lossy(),
-                                "ref": ref_path,
-                                "exists": false,
-                                "content": Value::Null,
-                                "error": e.to_string(),
-                            }));
-                            continue;
-                        }
-                    };
+                    let full_path =
+                        match self.workspace.confine_to_root(&requested_path, &cwd).await {
+                            Ok((confined, _)) => confined,
+                            Err(e) => {
+                                results.push(serde_json::json!({
+                                    "path": requested_path.to_string_lossy(),
+                                    "ref": ref_path,
+                                    "exists": false,
+                                    "content": Value::Null,
+                                    "error": e.to_string(),
+                                }));
+                                continue;
+                            }
+                        };
                     let exists = full_path.exists();
                     let content = if exists {
                         tokio::fs::read_to_string(&full_path).await.ok()
@@ -611,10 +608,10 @@ impl WorkspaceRpcHandler {
                 Ok(Value::Array(results))
             }
             <PutFilesReq as WorkspaceRpc>::METHOD => {
-                dispatch_op::<PutFilesReq>(params, &self.workspace, None).await
+                dispatch_op::<PutFilesReq>(params, &self.workspace, bound_session).await
             }
             <GetFilesReq as WorkspaceRpc>::METHOD => {
-                dispatch_op::<GetFilesReq>(params, &self.workspace, None).await
+                dispatch_op::<GetFilesReq>(params, &self.workspace, bound_session).await
             }
             <FsListReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<FsListReq>(params, &self.workspace, None).await
@@ -633,15 +630,15 @@ impl WorkspaceRpcHandler {
             }
             <ClientFsListReq as WorkspaceRpc>::METHOD => {
                 ensure_client_fs_queries_enabled()?;
-                dispatch_op::<ClientFsListReq>(params, &self.workspace, None).await
+                dispatch_op::<ClientFsListReq>(params, &self.workspace, bound_session).await
             }
             <ClientFsStatReq as WorkspaceRpc>::METHOD => {
                 ensure_client_fs_queries_enabled()?;
-                dispatch_op::<ClientFsStatReq>(params, &self.workspace, None).await
+                dispatch_op::<ClientFsStatReq>(params, &self.workspace, bound_session).await
             }
             <ClientFsReadFileReq as WorkspaceRpc>::METHOD => {
                 ensure_client_fs_queries_enabled()?;
-                dispatch_op::<ClientFsReadFileReq>(params, &self.workspace, None).await
+                dispatch_op::<ClientFsReadFileReq>(params, &self.workspace, bound_session).await
             }
             <DiscoverSkillsReq as WorkspaceRpc>::METHOD => {
                 let cwd = self.workspace.root_cwd()?;

@@ -547,6 +547,14 @@ pub(crate) async fn spawn_session_actor(
             (0, Vec::new(), Vec::new())
         };
     let primary_model_id = sampling_config.model.clone();
+    // `[toolset.web_search]` domain policy, resolved once and applied to both
+    // search paths (hosted tool_overrides on the rebuild spec; the client-side
+    // candidate configs resolve it where they are built) so they never diverge.
+    let web_search_domains = if disable_web_search {
+        None
+    } else {
+        crate::util::config::resolve_web_search_domains_from_disk()
+    };
     // Resolve the client web-search backend for the spawn model's provider;
     // the candidates stay on the state so a model switch can re-resolve.
     let web_search_state = crate::session::agent_rebuild::ResolvedWebSearchState::resolved_for(
@@ -1141,6 +1149,7 @@ pub(crate) async fn spawn_session_actor(
         active_sampling_config: parking_lot::RwLock::new(sampling_config.clone()),
         chat_state_handle: chat_state_handle.clone(),
         x_search_enabled: crate::util::config::load_x_search_config_sync().enabled,
+        web_search_domains,
         backend_search: backend_tools_enabled,
         web_fetch_config: web_fetch_config.clone(),
         image_gen_config: image_gen_config.clone(),
@@ -1899,6 +1908,9 @@ pub(crate) async fn spawn_session_actor(
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(built_hook_registry),
+        turn_report: Default::default(),
+        turn_abort: Default::default(),
+        turn_end_tx: Default::default(),
         client_hooks: std::cell::RefCell::new(client_hooks),
         hook_resolved_workspace_root: resolved_workspace_root,
         vcs_kind: {

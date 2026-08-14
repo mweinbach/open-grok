@@ -675,12 +675,26 @@ pub(super) fn make_deleted_ext_notif(
     session_id: &str,
     task_id: &str,
 ) -> acp::ExtNotification {
+    make_deleted_ext_notif_with_reason(
+        session_id,
+        task_id,
+        xai_grok_tools::notification::ScheduledTaskRemovedReason::Unknown,
+        false,
+    )
+}
+pub(super) fn make_deleted_ext_notif_with_reason(
+    session_id: &str,
+    task_id: &str,
+    reason: xai_grok_tools::notification::ScheduledTaskRemovedReason,
+    is_replay: bool,
+) -> acp::ExtNotification {
     let notif = SessionNotification {
         session_id: acp::SessionId::new(session_id),
         update: XaiSessionUpdate::ScheduledTaskDeleted {
             task_id: task_id.into(),
+            reason,
         },
-        meta: None,
+        meta: is_replay.then(crate::acp::meta::ReplayMetaStamp::replayed),
     };
     let raw = serde_json::value::to_raw_value(&notif).unwrap();
     acp::ExtNotification::new("x.ai/scheduled_task_deleted", std::sync::Arc::from(raw))
@@ -1274,6 +1288,13 @@ pub(super) fn test_subagent_spawned(
     parent_sid: &str,
     child_sid: &str,
 ) -> XaiSessionUpdate {
+    test_subagent_spawned_for_workflow(parent_sid, child_sid, None)
+}
+pub(super) fn test_subagent_spawned_for_workflow(
+    parent_sid: &str,
+    child_sid: &str,
+    workflow_run_id: Option<String>,
+) -> XaiSessionUpdate {
     XaiSessionUpdate::SubagentSpawned {
         subagent_id: child_sid.into(),
         parent_session_id: parent_sid.into(),
@@ -1284,7 +1305,7 @@ pub(super) fn test_subagent_spawned(
         effective_context_source: None,
         context_normalized: false,
         capability_mode: None,
-        workflow_run_id: None,
+        workflow_run_id,
         persona: None,
         role: None,
         model: None,

@@ -16,12 +16,14 @@ use std::io::{self, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use std::{process, thread};
 #[cfg(windows)]
 use windows::Win32::Foundation::HANDLE;
 
 use fs2::FileExt;
+use prometheus::{IntCounterVec, register_int_counter_vec};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -69,6 +71,91 @@ const TAKEOVER_POLL: Duration = Duration::from_millis(50);
 
 /// Invocation fragment identifying a pidfile holder as a workspace-server.
 const WORKSPACE_SERVER_NAME_FRAGMENT: &str = "workspace-server";
+
+/// `oom_score_adj` for the workspace-server when `--oom-protect` is set. Not -1000: reserved for
+/// init/privileged agents; still killable last-resort.
+pub const WORKSPACE_SERVER_OOM_SCORE_ADJ: i32 = -900;
+
+/// `oom_score_adj` for the supervised preview-proxy (between user work at 0 and workspace/files
+/// daemons at -900).
+pub const PREVIEW_PROXY_OOM_SCORE_ADJ: i32 = -500;
+
+/// `workspace_oom_protect_applied{outcome}`: result of the in-guest self-lowering write when
+/// `--oom-protect` is set.
+static OOM_PROTECT_APPLIED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "workspace_oom_protect_applied",
+        "workspace-server in-guest oom_score_adj self-lowering attempts",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+fn record_oom_protect(outcome: &'static str) {
+    OOM_PROTECT_APPLIED.with_label_values(&[outcome]).inc();
+}
+
+/// Write `/proc/self/oom_score_adj`. Linux only; checked so a capability
+/// regression surfaces as an error rather than silent no-op.
+#[cfg(target_os = "linux")]
+pub fn set_oom_score_adj(adj: i32) -> io::Result<()> {
+    fs::write("/proc/self/oom_score_adj", format!("{adj}\n"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_oom_score_adj(_adj: i32) -> io::Result<()> {
+    Ok(())
+}
+
+/// Serializes process-global `/proc/self/oom_score_adj` mutation across crate tests.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static TEST_OOM_SCORE_ADJ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lower the workspace-server's `oom_score_adj` to [`WORKSPACE_SERVER_OOM_SCORE_ADJ`] and record
+/// `workspace_oom_protect_applied{outcome}`.
+///
+/// Call after daemonize (double-fork) and before the runtime starts when
+/// `--oom-protect` is set. Complements always-on `protect_from_oom_kill`: the
+/// unshare parent may already have lowered the score *before* `--map-root-user`
+/// (nested userns lacks init-ns `CAP_SYS_RESOURCE`); an already-applied target
+/// counts as success so the metric is truthful. On a true failure logs to
+/// stderr and returns `false`; callers still force the child-reset env so a
+/// partial lower cannot shield user work.
+pub fn apply_workspace_oom_protect() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cur) = fs::read_to_string("/proc/self/oom_score_adj")
+            && cur.trim().parse::<i32>().ok() == Some(WORKSPACE_SERVER_OOM_SCORE_ADJ)
+        {
+            record_oom_protect("applied");
+            return true;
+        }
+    }
+    match set_oom_score_adj(WORKSPACE_SERVER_OOM_SCORE_ADJ) {
+        Ok(()) => {
+            record_oom_protect("applied");
+            true
+        }
+        Err(e) => {
+            // Score may already be at the target (wrapper lowered it; nested
+            // userns cannot re-write). Treat that as applied.
+            #[cfg(target_os = "linux")]
+            if let Ok(cur) = fs::read_to_string("/proc/self/oom_score_adj")
+                && cur.trim().parse::<i32>().ok() == Some(WORKSPACE_SERVER_OOM_SCORE_ADJ)
+            {
+                record_oom_protect("applied");
+                return true;
+            }
+            // stderr is already the log channel when daemonized.
+            eprintln!(
+                "failed to lower oom_score_adj to {}: {e}",
+                WORKSPACE_SERVER_OOM_SCORE_ADJ
+            );
+            record_oom_protect("failed");
+            false
+        }
+    }
+}
 
 /// Double-fork + `setsid()` into a new session, `chdir("/")`, and redirect
 /// stdio (stdin ← `/dev/null`, stdout+stderr appended to `log_path`).
@@ -1084,5 +1171,84 @@ mod tests {
         assert_eq!(read_pidfile_pid(&path), None);
 
         assert_eq!(read_pidfile_pid(&dir.path().join("missing")), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn set_oom_score_adj_lowers_when_permitted() {
+        let _guard = super::TEST_OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let own = fs::read_to_string("/proc/self/oom_score_adj").expect("read own score");
+        let restore = own.trim().to_owned();
+        // Lowering below 0 needs CAP_SYS_RESOURCE; skip when unavailable (CI host).
+        if set_oom_score_adj(WORKSPACE_SERVER_OOM_SCORE_ADJ).is_err() {
+            return;
+        }
+        let after = fs::read_to_string("/proc/self/oom_score_adj").unwrap();
+        assert_eq!(after.trim(), WORKSPACE_SERVER_OOM_SCORE_ADJ.to_string());
+        let _ = fs::write("/proc/self/oom_score_adj", format!("{restore}\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_workspace_oom_protect_records_outcome() {
+        let _guard = super::TEST_OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before_applied = OOM_PROTECT_APPLIED.with_label_values(&["applied"]).get();
+        let before_failed = OOM_PROTECT_APPLIED.with_label_values(&["failed"]).get();
+        let ok = apply_workspace_oom_protect();
+        if ok {
+            assert!(OOM_PROTECT_APPLIED.with_label_values(&["applied"]).get() > before_applied);
+            // Restore default so later tests are not OOM-immune.
+            let _ = set_oom_score_adj(0);
+        } else {
+            assert!(OOM_PROTECT_APPLIED.with_label_values(&["failed"]).get() > before_failed);
+        }
+    }
+
+    /// Pre-unshare lower leaves the score already at the target; the binary's
+    /// re-check must count as `applied`, not `failed`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_workspace_oom_protect_already_at_target_counts_as_applied() {
+        let _guard = super::TEST_OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let own = fs::read_to_string("/proc/self/oom_score_adj").expect("read own score");
+        let restore = own.trim().to_owned();
+        // Precondition needs CAP_SYS_RESOURCE to plant -900.
+        if set_oom_score_adj(WORKSPACE_SERVER_OOM_SCORE_ADJ).is_err() {
+            return;
+        }
+        let before_applied = OOM_PROTECT_APPLIED.with_label_values(&["applied"]).get();
+        let before_failed = OOM_PROTECT_APPLIED.with_label_values(&["failed"]).get();
+
+        assert!(
+            apply_workspace_oom_protect(),
+            "already-at-target must report success"
+        );
+        assert!(
+            OOM_PROTECT_APPLIED.with_label_values(&["applied"]).get() > before_applied,
+            "already-at-target must increment applied"
+        );
+        assert_eq!(
+            OOM_PROTECT_APPLIED.with_label_values(&["failed"]).get(),
+            before_failed,
+            "already-at-target must not increment failed"
+        );
+
+        let _ = fs::write("/proc/self/oom_score_adj", format!("{restore}\n"));
+    }
+
+    #[test]
+    fn oom_score_constants_preserve_ordering() {
+        // user work (0) > proxy (-500) > workspace/files (-900); never -1000.
+        const {
+            assert!(PREVIEW_PROXY_OOM_SCORE_ADJ < 0);
+            assert!(WORKSPACE_SERVER_OOM_SCORE_ADJ < PREVIEW_PROXY_OOM_SCORE_ADJ);
+            assert!(WORKSPACE_SERVER_OOM_SCORE_ADJ > -1000);
+        }
     }
 }

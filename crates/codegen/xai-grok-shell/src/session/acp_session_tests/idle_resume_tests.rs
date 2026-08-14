@@ -252,7 +252,9 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 git_head_enabled: false,
                 models_manager: Default::default(),
-                cache_tracker: std::cell::RefCell::new(crate::session::cache_tracker::CacheTracker::new()),
+                cache_tracker: std::cell::RefCell::new(
+                    crate::session::cache_tracker::CacheTracker::new(),
+                ),
                 display_cwd: std::sync::OnceLock::new(),
                 active_agent_type: parking_lot::Mutex::new(None),
                 queue_exit_reminder_on_approved_exit: Arc::new(std::sync::atomic::AtomicBool::new(
@@ -313,6 +315,9 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
+                turn_report: Default::default(),
+                turn_abort: Default::default(),
+                turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
                 vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,

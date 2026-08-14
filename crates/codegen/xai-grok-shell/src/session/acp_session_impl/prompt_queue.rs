@@ -615,7 +615,74 @@ impl SessionActor {
                 redirect_kind: crate::session::events::RedirectKind::Interjection,
             });
         Self::respond_removed_prompt(respond_to);
-        tracing::info!("queued user prompt as a mid-turn interjection");
+        tracing::info!(
+            ?source,
+            prompt_id = %prompt_id,
+            "queued prompt promoted as a mid-turn interjection"
+        );
+    }
+
+    /// Move held user prompts into `pending_interjections` so the next drain
+    /// injects them. Stops (does not skip over) at: bash (FIFO); send-now
+    /// (cancel-and-run-next must not become continue-with-interject); edit
+    /// hold (would inject stale pre-edit text); a different `queue_meta.owner`
+    /// than the running prompt (leader mode: another client's next-turn row
+    /// stays queued); or a row with `tool_overrides_update` (interjection
+    /// discards the override payload that a normal turn drain would apply).
+    /// No-op when idle or the held queue is empty.
+    pub(super) async fn promote_queued_as_interjections(&self) {
+        let mut state = self.state.lock().await;
+        let running_front_id = state.running_prompt_id().map(str::to_string);
+        let Some(running_id) = running_front_id.as_deref() else {
+            return;
+        };
+        let running_owner = state
+            .pending_inputs
+            .iter()
+            .find(|item| item.prompt_id == running_id)
+            .and_then(|item| item.queue_meta.as_ref())
+            .and_then(|meta| meta.owner.as_deref())
+            .map(str::to_string);
+        let mut promoted = Vec::new();
+        loop {
+            let Some(pos) = state.pending_inputs.iter().position(|item| {
+                !item.origin.is_synthetic()
+                    && Some(item.prompt_id.as_str()) != running_front_id.as_deref()
+            }) else {
+                break;
+            };
+            let item = &state.pending_inputs[pos];
+            let item_owner = item
+                .queue_meta
+                .as_ref()
+                .and_then(|meta| meta.owner.as_deref());
+            if Self::extract_bash_command(&item.prompt_blocks).is_some()
+                || item.send_now
+                || state.combine_edit_holds.contains(&item.prompt_id)
+                || item_owner != running_owner.as_deref()
+                || item.tool_overrides_update.is_some()
+            {
+                break;
+            }
+            if let Some(item) = state.pending_inputs.remove(pos) {
+                promoted.push(item);
+            }
+        }
+        if promoted.is_empty() {
+            return;
+        }
+        let goal_active = self.goal_tracker.lock().status()
+            == Some(crate::session::goal_tracker::GoalStatus::Active);
+        for item in promoted {
+            if goal_active {
+                self.enqueue_prompt_as_planner_steering(&item);
+            }
+            self.enqueue_prompt_as_interjection(
+                item,
+                crate::session::events::InterjectionSource::Queue,
+            );
+        }
+        self.broadcast_queue_changed(&state);
     }
 
     /// Resolve a removed prompt's pending RPC with `Ok(RemovedFromQueue)` before dropping it. A

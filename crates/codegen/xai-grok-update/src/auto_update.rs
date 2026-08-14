@@ -126,7 +126,9 @@ fn wrap_download_err(e: anyhow::Error) -> anyhow::Error {
 }
 
 #[doc(hidden)]
-pub fn classify_install_error(err: &anyhow::Error) -> xai_grok_telemetry::events::CliUpdateErrorKind {
+pub fn classify_install_error(
+    err: &anyhow::Error,
+) -> xai_grok_telemetry::events::CliUpdateErrorKind {
     use xai_grok_telemetry::events::CliUpdateErrorKind;
     if let Some(smoke) = err.downcast_ref::<SmokeTestFailure>() {
         return match smoke {
@@ -884,10 +886,7 @@ pub async fn run_install_script(
         remove_stale_models_cache().await;
     }
     let (outcome, error_kind) = match &result {
-        Ok(_) => (
-            xai_grok_telemetry::events::CliUpdateOutcome::Success,
-            None,
-        ),
+        Ok(_) => (xai_grok_telemetry::events::CliUpdateOutcome::Success, None),
         Err(e) => (
             xai_grok_telemetry::events::CliUpdateOutcome::Failed,
             Some(classify_install_error(e)),

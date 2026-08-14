@@ -321,6 +321,9 @@ impl SessionActor {
         // before the user-message chunk can race in.
         self.broadcast_queue_changed_promoting(&state, running_display);
 
+        // Bump the epoch here rather than in `handle_prompt`: a cancel reads the slot as soon as
+        // `running_task` is set on the next line.
+        self.turn_report.start_next_turn();
         state.running_task = Some(AgentTask::new_prompt(
             self.clone(),
             prompt_id,
@@ -435,12 +438,20 @@ impl SessionActor {
 
     /// Notifies extensions when the session settles idle (nothing running, nothing queued).
     /// The idle check stays host-side; extensions only get the event.
+    ///
+    /// Ignores `notifications_suppressed`, unlike [`is_session_idle_for_injection`]: after an
+    /// interrupt the session really is idle, and that is the ping a host waits for.
+    /// Like the session-end `Stop`: a subagent settling is not the session settling.
+    /// `SessionEnd` itself still fires for a child, carrying `subagentType`.
     pub(super) async fn emit_session_idle_if_idle(&self) {
         {
             let state = self.state.lock().await;
-            if !is_session_idle_for_injection(&state) {
+            if state_is_busy(&state) {
                 return;
             }
+        }
+        if self.startup_hints.is_subagent {
+            return;
         }
         for contributor in self.extension_registry.session_lifecycle_contributors() {
             contributor

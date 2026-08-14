@@ -950,7 +950,10 @@ mod tests {
                 "subagents/personas/researcher.toml",
                 b"instructions = \"hello\"".as_slice(),
             ),
-            ("subagents/roles/reviewer.toml", b"description = \"review\"".as_slice()),
+            (
+                "subagents/roles/reviewer.toml",
+                b"description = \"review\"".as_slice(),
+            ),
             ("skills/commit/SKILL.md", b"# Commit skill".as_slice()),
         ]);
         let (proxy_base_url, server) = start_archive_bundle_server(archive).await;

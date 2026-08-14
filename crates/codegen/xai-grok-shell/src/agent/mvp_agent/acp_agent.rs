@@ -285,10 +285,9 @@ impl acp::Agent for MvpAgent {
         tokio::task::spawn_blocking(|| {
             crate::session::persistence::cleanup_stale_sessions(None);
         });
-        {
-            let root = crate::util::grok_home::grok_home();
-            crate::session::storage::search::SEARCH_INDEX_MANAGER.bootstrap_once(root);
-        }
+        self.apply_session_search_gate();
+        crate::session::storage::search::SEARCH_INDEX_MANAGER
+            .bootstrap_once(crate::util::grok_home::grok_home());
         const PERMISSION_CLEANUP_TTL_DAYS: u64 = 30;
         static CLEANUP_PERMISSIONS_ONCE: std::sync::Once = std::sync::Once::new();
         CLEANUP_PERMISSIONS_ONCE

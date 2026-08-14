@@ -1390,12 +1390,11 @@ pub(crate) async fn run(
         effective_config.as_ref().ok_or(()),
         remote_settings.as_ref(),
     );
-    app.foreign_session_compat =
-        xai_grok_foreign_sessions::EnabledForeignSessionSources {
-            claude: compat.claude.sessions,
-            codex: compat.codex.sessions,
-            cursor: compat.cursor.sessions,
-        };
+    app.foreign_session_compat = xai_grok_foreign_sessions::EnabledForeignSessionSources {
+        claude: compat.claude.sessions,
+        codex: compat.codex.sessions,
+        cursor: compat.cursor.sessions,
+    };
 
     // Load notification config from [ui.notifications] in config.toml.
     if let Some(ref raw) = effective_config {
@@ -1766,6 +1765,14 @@ pub(crate) async fn run(
     app.ask_user_question_timeout_enabled = config_session_bools.ask_user_question_timeout_enabled;
     // Prime thread-local caches so first render doesn't hit disk.
     crate::appearance::cache::prime(&app.current_ui);
+    // Apply the remote soft default for text selection (flash | hold | word_select) when the
+    // user has set none locally; an explicit local `keep_text_selection` always wins.
+    crate::appearance::cache::apply_remote_keep_text_selection_default(
+        remote_settings
+            .as_ref()
+            .and_then(|s| s.keep_text_selection_default.as_deref()),
+        &app.current_ui,
+    );
     // Re-derive the render-value compact flag from the hydrated `current_ui`:
     // the seed above used the pre-hydration disk read, which layered/remote
     // config can contradict — the canonical single-writer corrects it (and

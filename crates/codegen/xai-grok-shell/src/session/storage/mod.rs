@@ -24,6 +24,7 @@ mod search_bootstrap;
 mod search_content;
 mod search_db;
 pub mod search_fts;
+pub(crate) mod search_gate;
 mod search_recovery;
 pub(crate) mod summary_write;
 

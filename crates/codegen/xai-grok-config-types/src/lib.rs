@@ -866,6 +866,10 @@ pub struct RemoteSettings {
     /// Optional remote kill-switch; shell defaults ON when unset (set `false` to disable).
     #[serde(default)]
     pub session_recap: Option<bool>,
+    /// Enables the session search index (`/load` deep search).
+    /// Optional remote kill-switch; shell defaults ON when unset (set `false` to disable).
+    #[serde(default)]
+    pub session_search: Option<bool>,
     /// Enables the per-turn dashboard summary (one-line "what happened last
     /// turn" generated at turn end). Optional remote kill-switch; shell
     /// defaults ON when unset (set `false` to disable).
@@ -1058,6 +1062,13 @@ pub struct RemoteSettings {
     /// `Some(true)` enables it; `None`/`Some(false)` (the default) keep it off.
     #[serde(default)]
     pub workspace_command_enabled: Option<bool>,
+    /// Soft default for `keep_text_selection` (`"flash"` / `"hold"` / `"word_select"`), from
+    /// `grok_build_settings.keep_text_selection_default`. Applied only when the user has set no
+    /// local text-selection preference; an explicit local `keep_text_selection` always wins. An
+    /// absent or unrecognized value keeps the client default (`flash`). Set remotely to stage a
+    /// new default to a segment, cut everyone over, or revert it for a customer.
+    #[serde(default)]
+    pub keep_text_selection_default: Option<String>,
     /// Master switch for jemalloc heap sampling + threshold dumps.
     /// `Some(true)` enables, `Some(false)` kill-switch, `None` = client default off.
     #[serde(default)]
@@ -1867,6 +1878,20 @@ mod tests {
         let json = r#"{}"#;
         let s: RemoteSettings = serde_json::from_str(json).unwrap();
         assert_eq!(s.workspace_command_enabled, None);
+    }
+    #[test]
+    fn remote_settings_keep_text_selection_default_round_trips() {
+        let ws: RemoteSettings =
+            serde_json::from_str(r#"{"keep_text_selection_default": "word_select"}"#).unwrap();
+        assert_eq!(
+            ws.keep_text_selection_default.as_deref(),
+            Some("word_select")
+        );
+        let flash: RemoteSettings =
+            serde_json::from_str(r#"{"keep_text_selection_default": "flash"}"#).unwrap();
+        assert_eq!(flash.keep_text_selection_default.as_deref(), Some("flash"));
+        let absent: RemoteSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.keep_text_selection_default, None);
     }
     #[test]
     fn remote_settings_permission_mode_deserializes() {

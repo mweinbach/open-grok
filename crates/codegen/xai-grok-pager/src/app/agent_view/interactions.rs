@@ -1131,18 +1131,15 @@ impl AgentView {
     }
     /// Give back the draft a card displaced when it opened.
     ///
-    /// A permission and a plan approval each stash the composer and blank it, so while one is up the composer is not the live editor
-    /// and their stash is what will be restored from. The draft has to go there instead, or that stash puts back whatever the card was
-    /// holding, which for `/feedback` is a report that must never reach the model's input. Casual commenting is the other way round,
-    /// keeping its draft parked and the composer live, so it takes the ordinary restore.
+    /// Permission open: write into `permission_stashed_prompt`. Otherwise restore
+    /// the live composer (plan freeform when approval is parked; session draft is
+    /// only on `plan_approval_view.stashed_prompt`).
     pub(crate) fn restore_card_prompt(
         &mut self,
         stashed: crate::views::prompt_widget::StashedPrompt,
     ) {
         if self.permission_stashed_prompt.is_some() {
             self.permission_stashed_prompt = Some(stashed);
-        } else if let Some(pav) = self.plan_approval_view.as_mut() {
-            pav.stashed_prompt = stashed;
         } else {
             self.prompt.restore(stashed);
         }

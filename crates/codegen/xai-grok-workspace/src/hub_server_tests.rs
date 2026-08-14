@@ -1513,6 +1513,43 @@ async fn dispatch_put_files_writes_and_returns_hash() {
     let on_disk = std::fs::read_to_string(root.join("test_file.txt")).unwrap();
     assert_eq!(on_disk, "hello world");
 }
+/// A bound session's cwd rebases `put_files` / `get_files`; a session-less
+/// dispatch keeps the root.
+#[tokio::test]
+async fn dispatch_put_get_files_resolve_against_bound_session_cwd() {
+    let handle = make_handle();
+    let root = handle.root_cwd().unwrap();
+    std::fs::create_dir(root.join("artifacts")).unwrap();
+    handle
+        .create_session_with_cwd("cwd-session", Some(root.join("artifacts")))
+        .unwrap();
+    let handler = WorkspaceRpcHandler::new(handle);
+    let params = serde_json::json!({
+        "files": [{"path": "out.txt", "content": "rebased"}]
+    });
+    let result = handler
+        .dispatch("workspace.put_files", params, Some("cwd-session"))
+        .await
+        .expect("dispatch should succeed");
+    let res: PutFilesRes = serde_json::from_value(result).unwrap();
+    assert!(res.results[0].ok, "{:?}", res.results[0].error);
+    let on_disk = std::fs::read_to_string(root.join("artifacts").join("out.txt")).unwrap();
+    assert_eq!(on_disk, "rebased");
+    let params = serde_json::json!({ "files": [{"path": "out.txt"}] });
+    let result = handler
+        .dispatch("workspace.get_files", params.clone(), Some("cwd-session"))
+        .await
+        .expect("dispatch should succeed");
+    let res: GetFilesRes = serde_json::from_value(result).unwrap();
+    assert!(res.results[0].exists);
+    assert_eq!(res.results[0].content.as_deref(), Some("rebased"));
+    let result = handler
+        .dispatch("workspace.get_files", params, None)
+        .await
+        .expect("dispatch should succeed");
+    let res: GetFilesRes = serde_json::from_value(result).unwrap();
+    assert!(!res.results[0].exists);
+}
 #[tokio::test]
 async fn dispatch_put_files_rejects_path_traversal() {
     let handle = make_handle();
@@ -1564,6 +1601,64 @@ async fn dispatch_resolve_file_references_rejects_outside_root_when_confined() {
         );
     }
     std::fs::remove_file(&secret).ok();
+}
+/// On a confining server, refs from a rebased session cannot climb out of
+/// the client-fs base, even to paths still inside the workspace root.
+#[tokio::test]
+async fn dispatch_resolve_file_references_confines_to_session_base() {
+    let handle = make_confining_handle();
+    let root = handle.root_cwd().unwrap();
+    std::fs::create_dir(root.join("artifacts")).unwrap();
+    std::fs::write(root.join("rooted.txt"), "ROOT_ONLY").unwrap();
+    handle
+        .create_session_with_cwd("cwd-session", Some(root.join("artifacts")))
+        .unwrap();
+    let handler = WorkspaceRpcHandler::new(handle);
+    let params = serde_json::json!({ "refs": ["../rooted.txt"] });
+    let result = handler
+        .dispatch(
+            "workspace.resolve_file_references",
+            params,
+            Some("cwd-session"),
+        )
+        .await
+        .expect("dispatch itself should succeed");
+    let arr = result.as_array().expect("results array");
+    assert_eq!(arr[0]["exists"], serde_json::Value::Bool(false));
+    assert_eq!(arr[0]["content"], serde_json::Value::Null);
+    assert!(
+        arr[0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("escapes workspace root"),
+        "escape above the base should be rejected: {:?}",
+        arr[0]
+    );
+}
+/// Relative @-mention refs resolve against the bound session's client-fs
+/// base, matching the paths the files pane hands out.
+#[tokio::test]
+async fn dispatch_resolve_file_references_uses_bound_session_base() {
+    let handle = make_handle();
+    let root = handle.root_cwd().unwrap();
+    std::fs::create_dir(root.join("artifacts")).unwrap();
+    std::fs::write(root.join("artifacts").join("out.txt"), "rebased").unwrap();
+    handle
+        .create_session_with_cwd("cwd-session", Some(root.join("artifacts")))
+        .unwrap();
+    let handler = WorkspaceRpcHandler::new(handle);
+    let params = serde_json::json!({ "refs": ["out.txt"] });
+    let result = handler
+        .dispatch(
+            "workspace.resolve_file_references",
+            params,
+            Some("cwd-session"),
+        )
+        .await
+        .expect("dispatch should succeed");
+    let arr = result.as_array().expect("results array");
+    assert_eq!(arr[0]["exists"], serde_json::Value::Bool(true));
+    assert_eq!(arr[0]["content"], serde_json::json!("rebased"));
 }
 #[tokio::test]
 async fn handle_hook_pause_resume_are_noops() {

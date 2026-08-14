@@ -3516,6 +3516,28 @@ async fn diagnostic_upload_skipped_after_mid_session_trace_upload_kill_switch() 
          trace-upload kill switch"
     );
 }
+#[tokio::test]
+#[serial_test::serial]
+async fn session_search_stops_on_a_mid_session_kill_switch() {
+    use crate::session::storage::search_gate;
+    let _env = xai_grok_test_support::EnvGuard::unset("GROK_SESSION_SEARCH");
+    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let _gate = search_gate::IndexGateGuard::open();
+    agent.apply_session_search_gate();
+    assert!(
+        search_gate::is_index_enabled(),
+        "precondition: nothing has turned the index off"
+    );
+    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
+        session_search: Some(false),
+        ..Default::default()
+    });
+    agent.apply_session_search_gate();
+    assert!(
+        !search_gate::is_index_enabled(),
+        "a remote kill switch must reach the indexer without a new session"
+    );
+}
 /// The live collection gate reads a `Send` mirror of the config-level
 /// trace-upload switch; `sync_collection_config_gate` must keep that mirror
 /// current so a mid-session remote-settings flip (kill switch) stops

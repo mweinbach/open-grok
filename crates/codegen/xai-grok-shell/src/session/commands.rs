@@ -200,6 +200,13 @@ pub enum CancelTrigger {
     SessionDelete,
     Client(String),
 }
+/// What a cancel means for the session, derived from its trigger by [`CancelTrigger::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelKind {
+    StopGesture,
+    Replace,
+    Teardown,
+}
 impl CancelTrigger {
     /// Parse a client's `_meta.cancelTrigger`. Internal spellings land in
     /// [`Self::Client`], so a client-supplied string never maps to an
@@ -211,9 +218,14 @@ impl CancelTrigger {
             other => Self::Client(other.to_string()),
         }
     }
-    /// Stop gesture (Esc/Ctrl+C/`Client`); unrecognized wire names fail closed.
-    pub fn is_stop_gesture(&self) -> bool {
-        matches!(self, Self::Esc | Self::CtrlC | Self::Client(_))
+    /// The one place a trigger is classified, so a new variant is a single decision.
+    /// `Client(_)` lands on `StopGesture`, so an unrecognized wire name fails closed.
+    pub fn kind(&self) -> CancelKind {
+        match self {
+            Self::Esc | Self::CtrlC | Self::Client(_) => CancelKind::StopGesture,
+            Self::SendNow => CancelKind::Replace,
+            Self::Shutdown | Self::SessionClose | Self::SessionDelete => CancelKind::Teardown,
+        }
     }
     pub fn as_str(&self) -> &str {
         match self {
@@ -232,9 +244,8 @@ pub struct CancelOptions {
     pub cancel_subagents: bool,
     pub kill_background_tasks: bool,
     pub rewind_if_no_output: bool,
-    /// [`CancelTrigger::is_stop_gesture`] arms the task-wake barrier.
     pub trigger: Option<CancelTrigger>,
-    /// Drives the cancel-rate metric.
+    /// Drives the cancel-rate metric, and marks an untriggered cancel as the user's.
     pub user_initiated: bool,
 }
 pub enum SessionCommand {
@@ -480,7 +491,10 @@ pub enum SessionCommand {
     },
     /// Query prompt cache telemetry summary and recent turn records.
     GetCacheInfo {
-        responds_to: oneshot::Sender<(crate::session::CacheSummary, Vec<crate::session::CacheTurnRecord>)>,
+        responds_to: oneshot::Sender<(
+            crate::session::CacheSummary,
+            Vec<crate::session::CacheTurnRecord>,
+        )>,
     },
     /// Persist the monotonic telemetry turn counter ("next trace turn") for the session.
     SetNextTraceTurn {
@@ -905,16 +919,23 @@ pub enum SessionCommand {
 }
 #[cfg(test)]
 mod cancel_trigger_tests {
-    use super::CancelTrigger;
+    use super::{CancelKind, CancelTrigger};
     #[test]
-    fn only_stop_gestures_arm_the_wake_barrier() {
-        assert!(!CancelTrigger::SendNow.is_stop_gesture());
-        assert!(!CancelTrigger::SessionDelete.is_stop_gesture());
-        assert!(!CancelTrigger::Shutdown.is_stop_gesture());
-        assert!(!CancelTrigger::SessionClose.is_stop_gesture());
-        assert!(CancelTrigger::Esc.is_stop_gesture());
-        assert!(CancelTrigger::CtrlC.is_stop_gesture());
-        assert!(CancelTrigger::from_client("mouse").is_stop_gesture());
-        assert!(CancelTrigger::from_client("some_future_gesture").is_stop_gesture());
+    fn classifies_every_trigger() {
+        for (trigger, expected) in [
+            (CancelTrigger::Esc, CancelKind::StopGesture),
+            (CancelTrigger::CtrlC, CancelKind::StopGesture),
+            (CancelTrigger::from_client("mouse"), CancelKind::StopGesture),
+            (
+                CancelTrigger::from_client("some_future_gesture"),
+                CancelKind::StopGesture,
+            ),
+            (CancelTrigger::SendNow, CancelKind::Replace),
+            (CancelTrigger::Shutdown, CancelKind::Teardown),
+            (CancelTrigger::SessionClose, CancelKind::Teardown),
+            (CancelTrigger::SessionDelete, CancelKind::Teardown),
+        ] {
+            assert_eq!(trigger.kind(), expected, "{trigger:?}");
+        }
     }
 }

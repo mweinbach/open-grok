@@ -979,11 +979,12 @@ async fn scheduled_task_removed_is_persisted() {
     // The deletion must also persist so replay nets out a removed loop
     // instead of resurrecting it from a persisted `created` line.
     let (config, _gateway_rx, mut persistence_rx, _cmd_rx) = make_test_config_full();
-    let removed = xai_grok_tools::notification::ScheduledTaskRemoved {
-        task_id: "loop-1".into(),
-        generation: "generation-a".into(),
-        revision: 2,
-    };
+    let removed = xai_grok_tools::notification::ScheduledTaskRemoved::new(
+        "loop-1".into(),
+        xai_grok_tools::notification::ScheduledTaskRemovedReason::Expired,
+        "generation-a".into(),
+        2,
+    );
 
     handle_scheduled_task_removed(&config, removed, None)
         .await
@@ -996,7 +997,10 @@ async fn scheduled_task_removed_is_persisted() {
         PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(notif)) => {
             assert!(matches!(
                 &notif.update,
-                crate::extensions::notification::SessionUpdate::ScheduledTaskDeleted { .. }
+                crate::extensions::notification::SessionUpdate::ScheduledTaskDeleted {
+                    reason: xai_grok_tools::notification::ScheduledTaskRemovedReason::Expired,
+                    ..
+                }
             ));
             assert!(
                 xai_persisted_event_id(&notif).is_some(),
@@ -1013,11 +1017,12 @@ async fn scheduled_task_removed_is_persisted() {
 #[tokio::test]
 async fn acknowledged_scheduler_removal_appends_before_ack_and_broadcast() {
     let (config, mut gateway_rx, mut persistence_rx, _cmd_rx) = make_test_config_full();
-    let removed = xai_grok_tools::notification::ScheduledTaskRemoved {
-        task_id: "loop-ack".into(),
-        generation: "generation-a".into(),
-        revision: 17,
-    };
+    let removed = xai_grok_tools::notification::ScheduledTaskRemoved::new(
+        "loop-ack".into(),
+        xai_grok_tools::notification::ScheduledTaskRemovedReason::Deleted,
+        "generation-a".into(),
+        17,
+    );
     let (acknowledgement, mut receipt) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let persistence = async {
         let PersistenceMsg::AppendUpdateDurablyAndAck {

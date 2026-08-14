@@ -1059,6 +1059,306 @@ async fn interject_queued_bash_row_noop_keeps_row_queued() {
         .await;
 }
 
+#[tokio::test]
+async fn promote_queued_as_interjections_sends_plain_and_stops_at_bash() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("running", "A"));
+                state.pending_inputs.push_back(user_item("m1", "A"));
+                state.pending_inputs.push_back(user_item("m2", "A"));
+                state.pending_inputs.push_back(bash_item("b3", "A", "ls"));
+                state.pending_inputs.push_back(user_item("m4", "A"));
+                state.running_task = Some(running_task_stub("running"));
+            }
+
+            actor.promote_queued_as_interjections().await;
+
+            let state = actor.state.lock().await;
+            let order: Vec<&str> = state
+                .pending_inputs
+                .iter()
+                .map(|i| i.prompt_id.as_str())
+                .collect();
+            assert_eq!(order, vec!["running", "b3", "m4"]);
+            drop(state);
+            let interjections: Vec<String> = actor
+                .pending_interjections
+                .drain_all()
+                .into_iter()
+                .map(|entry| entry.text)
+                .collect();
+            assert_eq!(interjections, vec!["text for m1", "text for m2"]);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn promote_queued_as_interjections_stops_at_edit_hold() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("running", "A"));
+                state.pending_inputs.push_back(user_item("m1", "A"));
+                state.pending_inputs.push_back(user_item("m2", "A"));
+                state.pending_inputs.push_back(user_item("m3", "A"));
+                state.combine_edit_holds.insert("m2".into());
+                state.running_task = Some(running_task_stub("running"));
+            }
+
+            actor.promote_queued_as_interjections().await;
+
+            let state = actor.state.lock().await;
+            let order: Vec<&str> = state
+                .pending_inputs
+                .iter()
+                .map(|i| i.prompt_id.as_str())
+                .collect();
+            assert_eq!(order, vec!["running", "m2", "m3"]);
+            assert!(state.combine_edit_holds.contains("m2"));
+            drop(state);
+            let interjections: Vec<String> = actor
+                .pending_interjections
+                .drain_all()
+                .into_iter()
+                .map(|entry| entry.text)
+                .collect();
+            assert_eq!(interjections, vec!["text for m1"]);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn promote_queued_as_interjections_stops_at_send_now() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("running", "A"));
+                let mut send_now = user_item("m1", "A");
+                send_now.send_now = true;
+                state.pending_inputs.push_back(send_now);
+                state.pending_inputs.push_back(user_item("m2", "A"));
+                state.running_task = Some(running_task_stub("running"));
+            }
+
+            actor.promote_queued_as_interjections().await;
+
+            let state = actor.state.lock().await;
+            let order: Vec<&str> = state
+                .pending_inputs
+                .iter()
+                .map(|i| i.prompt_id.as_str())
+                .collect();
+            assert_eq!(order, vec!["running", "m1", "m2"]);
+            assert!(state.pending_inputs[1].send_now);
+            drop(state);
+            assert!(
+                actor.pending_interjections.is_empty(),
+                "send-now must stay queued to run as the next turn"
+            );
+        })
+        .await;
+}
+
+/// Product gate: with Steer off, a held plain row must not promote at a
+/// safe point (queue stays; no interjection in conversation).
+#[tokio::test]
+async fn drain_at_safe_point_with_steer_off_does_not_promote_held_row() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            crate::util::config::set_follow_up_steer_cache(false);
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("running", "A"));
+                state.pending_inputs.push_back(user_item("held", "A"));
+                state.running_task = Some(running_task_stub("running"));
+            }
+
+            assert!(!actor.drain_interjections_at_safe_point().await);
+            let state = actor.state.lock().await;
+            let order: Vec<&str> = state
+                .pending_inputs
+                .iter()
+                .map(|i| i.prompt_id.as_str())
+                .collect();
+            assert_eq!(order, vec!["running", "held"]);
+            drop(state);
+            assert!(
+                actor.pending_interjections.is_empty(),
+                "Queue mode must not promote into the interjection buffer"
+            );
+        })
+        .await;
+}
+
+/// Product gate: with Steer on, a held plain row promotes and drains into a
+/// synthetic interjection user item.
+#[tokio::test]
+async fn drain_at_safe_point_with_steer_on_promotes_and_drains_held_row() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            crate::util::config::set_follow_up_steer_cache(true);
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("running", "A"));
+                state.pending_inputs.push_back(user_item("held", "A"));
+                state.running_task = Some(running_task_stub("running"));
+            }
+
+            assert!(
+                actor.drain_interjections_at_safe_point().await,
+                "Steer must promote and drain the held follow-up"
+            );
+            let state = actor.state.lock().await;
+            let order: Vec<&str> = state
+                .pending_inputs
+                .iter()
+                .map(|i| i.prompt_id.as_str())
+                .collect();
+            assert_eq!(order, vec!["running"]);
+            drop(state);
+            assert!(actor.pending_interjections.is_empty());
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let last = conversation
+                .last()
+                .expect("interjection must land in conversation");
+            let text = last.text_content();
+            assert!(
+                text.contains("text for held"),
+                "drained interjection must include held prompt text, got: {text}"
+            );
+        })
+        .await;
+}
+
+/// Leader multi-client: only promote rows owned by the *running* client.
+/// Another client's "I'll go next" row stops the FIFO prefix (not skipped).
+#[tokio::test]
+async fn promote_queued_as_interjections_stops_at_other_owner() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("running", "A"));
+                state.pending_inputs.push_back(user_item("a1", "A"));
+                state.pending_inputs.push_back(user_item("b1", "B"));
+                state.pending_inputs.push_back(user_item("a2", "A"));
+                state.running_task = Some(running_task_stub("running"));
+            }
+
+            actor.promote_queued_as_interjections().await;
+
+            let state = actor.state.lock().await;
+            let order: Vec<&str> = state
+                .pending_inputs
+                .iter()
+                .map(|i| i.prompt_id.as_str())
+                .collect();
+            // a1 promoted; b1 blocks a2 (FIFO — do not jump B).
+            assert_eq!(order, vec!["running", "b1", "a2"]);
+            drop(state);
+            let interjections: Vec<String> = actor
+                .pending_interjections
+                .drain_all()
+                .into_iter()
+                .map(|entry| entry.text)
+                .collect();
+            assert_eq!(interjections, vec!["text for a1"]);
+        })
+        .await;
+}
+
+/// Per-turn tool overrides are applied at turn promotion, not via
+/// interjection; stop rather than drop the override payload.
+#[tokio::test]
+async fn promote_queued_as_interjections_stops_at_tool_overrides() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("running", "A"));
+                state.pending_inputs.push_back(user_item("plain", "A"));
+                let mut with_override = user_item("override", "A");
+                with_override.tool_overrides_update = Some(x_search_cutoff_update());
+                state.pending_inputs.push_back(with_override);
+                state.pending_inputs.push_back(user_item("after", "A"));
+                state.running_task = Some(running_task_stub("running"));
+            }
+
+            actor.promote_queued_as_interjections().await;
+
+            let state = actor.state.lock().await;
+            let order: Vec<&str> = state
+                .pending_inputs
+                .iter()
+                .map(|i| i.prompt_id.as_str())
+                .collect();
+            assert_eq!(order, vec!["running", "override", "after"]);
+            assert!(
+                state.pending_inputs[1].tool_overrides_update.is_some(),
+                "override row must stay queued with its payload"
+            );
+            drop(state);
+            let interjections: Vec<String> = actor
+                .pending_interjections
+                .drain_all()
+                .into_iter()
+                .map(|entry| entry.text)
+                .collect();
+            assert_eq!(interjections, vec!["text for plain"]);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn promote_queued_as_interjections_does_not_steal_other_owners_next_turn() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                // A is running; B only has a queued next-turn prompt.
+                state.pending_inputs.push_back(user_item("running", "A"));
+                state.pending_inputs.push_back(user_item("b_next", "B"));
+                state.running_task = Some(running_task_stub("running"));
+            }
+
+            actor.promote_queued_as_interjections().await;
+
+            let state = actor.state.lock().await;
+            let order: Vec<&str> = state
+                .pending_inputs
+                .iter()
+                .map(|i| i.prompt_id.as_str())
+                .collect();
+            assert_eq!(order, vec!["running", "b_next"]);
+            drop(state);
+            assert!(
+                actor.pending_interjections.is_empty(),
+                "must not inject another client's next-turn into A's turn"
+            );
+        })
+        .await;
+}
+
 /// An edited interject of a bash row refuses the interject but keeps the edit.
 #[tokio::test]
 async fn interject_queued_bash_row_with_new_text_saves_edit() {
@@ -1964,6 +2264,120 @@ async fn effective_tool_overrides_echoes_and_gates_on_backend_search() {
                 actor.effective_tool_overrides(),
                 None,
                 "backend search off ⇒ echo is None: never attest a cutoff the wire never carried"
+            );
+        })
+        .await;
+}
+
+/// Moving `web_search` onto the raw-JSON `extra_tool_entries` channel must not leak it past the
+/// backend-search gate. `hosted_tools_for_turn` is the only thing that populates a request's
+/// `hosted_tools`, and `extra_tool_entries` is derived from that, so a model without server-side
+/// search sends no hosted tool on either channel, configured domain policy or not.
+#[tokio::test]
+async fn unsupported_backend_search_sends_no_hosted_tool_on_either_channel() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            let configured = xai_grok_sampling_types::WebSearchOptions {
+                allowed_domains: None,
+                excluded_domains: Some(vec!["reddit.com".to_string()]),
+            };
+            *actor.agent.borrow_mut() =
+                test_agent_backend_search(vec![xai_grok_sampling_types::HostedTool::WebSearch {
+                    options: Some(configured),
+                }])
+                .await;
+
+            // Model advertises server-side search: the hosted tool rides both channels.
+            actor.supports_backend_search.set(true);
+            assert!(!actor.hosted_tools_for_turn().is_empty());
+            assert_eq!(
+                xai_grok_sampling_types::extra_tool_entries(&actor.hosted_tools_for_turn()).len(),
+                1
+            );
+
+            // Model does not: the gate empties the list before it can reach the wire.
+            actor.supports_backend_search.set(false);
+            assert!(
+                actor.hosted_tools_for_turn().is_empty(),
+                "the backend-search gate must drop the hosted tool"
+            );
+            assert!(
+                xai_grok_sampling_types::extra_tool_entries(&actor.hosted_tools_for_turn())
+                    .is_empty(),
+                "and so no raw-JSON entry is produced to splice"
+            );
+        })
+        .await;
+}
+
+/// The `[toolset.web_search]` policy is folded into the agent's hosted tools at build
+/// time (see `agent_rebuild`), and it beats agent frontmatter. A per-turn
+/// `ToolOverridesUpdate` is a deliberate API-level override, so it intentionally still
+/// wins on top of the config policy: the one bypass the config does not close.
+#[tokio::test]
+async fn per_turn_tool_overrides_win_over_the_config_web_search_policy() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            // The hosted tool as `build_agent` leaves it: config blocklist already folded in.
+            let configured = xai_grok_sampling_types::WebSearchOptions {
+                allowed_domains: None,
+                excluded_domains: Some(vec!["reddit.com".to_string()]),
+            };
+            *actor.agent.borrow_mut() =
+                test_agent_backend_search(vec![xai_grok_sampling_types::HostedTool::WebSearch {
+                    options: Some(configured.clone()),
+                }])
+                .await;
+            actor.supports_backend_search.set(true);
+            assert!(actor.backend_search_active());
+
+            // No per-turn update: the config policy is what reaches the wire.
+            assert_eq!(
+                actor.effective_hosted_tools(),
+                vec![xai_grok_sampling_types::HostedTool::WebSearch {
+                    options: Some(configured.clone()),
+                }],
+            );
+
+            let per_turn = xai_grok_sampling_types::WebSearchOptions {
+                allowed_domains: Some(vec!["docs.x.ai".to_string()]),
+                excluded_domains: None,
+            };
+            actor.apply_tool_overrides_update(Some(xai_grok_sampling_types::ToolOverridesUpdate {
+                x_search: None,
+                web_search: Some(Some(per_turn.clone())),
+            }));
+
+            assert_eq!(
+                actor.effective_hosted_tools(),
+                vec![xai_grok_sampling_types::HostedTool::WebSearch {
+                    options: Some(per_turn.clone()),
+                }],
+                "an explicit per-turn override replaces the configured policy on the wire"
+            );
+            assert_eq!(
+                actor.effective_tool_overrides(),
+                Some(xai_grok_sampling_types::ToolOverrides {
+                    x_search: None,
+                    web_search: Some(per_turn),
+                }),
+                "and the echo attests exactly what the wire carried"
+            );
+
+            // Clearing the per-turn override falls back to the configured policy.
+            actor.apply_tool_overrides_update(Some(xai_grok_sampling_types::ToolOverridesUpdate {
+                x_search: None,
+                web_search: Some(None),
+            }));
+            assert_eq!(
+                actor.effective_hosted_tools(),
+                vec![xai_grok_sampling_types::HostedTool::WebSearch {
+                    options: Some(configured),
+                }],
             );
         })
         .await;

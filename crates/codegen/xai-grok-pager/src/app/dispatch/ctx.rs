@@ -7,6 +7,11 @@ use crate::app::app_view::{ActiveView, AppView, WelcomeAnnouncementState};
 use crate::scrollback::state::ScrollbackState;
 use agent_client_protocol as acp;
 
+/// Refusal shown when a dispatch path can't proceed without a bound session. Every path in this
+/// module tree that says exactly this uses it; the action-specific variants ("No active session
+/// to delete") stay separate.
+pub(super) const NO_SESSION_NOTICE: &str = "No active session";
+
 /// The active agent's root session id, if any. Used to scope server-queue
 /// edit Effects to the foregrounded session.
 pub(super) fn active_agent_session_id(app: &AppView) -> Option<acp::SessionId> {

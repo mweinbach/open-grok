@@ -431,6 +431,12 @@ pub(crate) enum SwapOutcome {
 pub struct WorkspaceHandle {
     pub(crate) shared: Arc<WorkspaceShared>,
 }
+/// Client-fs resolution base: request paths resolve against `base`,
+/// `canonical` is the matching canonicalization-containment boundary.
+pub(crate) struct ClientFsBase {
+    pub(crate) base: PathBuf,
+    pub(crate) canonical: PathBuf,
+}
 impl WorkspaceHandle {
     /// `None` when not connected. Never hands out an owned
     /// `ToolServer` — a clone-drop begins server teardown.
@@ -1773,13 +1779,8 @@ impl WorkspaceHandle {
     /// Resolve a caller-provided path safely. Accepts a path relative to the
     /// workspace root, or an absolute path that resolves within the root;
     /// either form is confined to the root (paths that escape are rejected).
-    /// Two-layer defense: textual normalization + symlink containment.
-    ///
-    /// # TOCTOU caveat
-    /// The symlink check is point-in-time. If a symlink is created between
-    /// resolution and I/O, containment is not guaranteed. Defense-in-depth
-    /// (e.g., `O_NOFOLLOW`, mount namespaces) would be needed for hostile
-    /// workspace environments, which is out of scope for this service-level API.
+    /// See [`Self::resolve_path_within_root`] for the confinement contract
+    /// and its TOCTOU caveat.
     pub(crate) async fn resolve_service_path(
         &self,
         req_path: &str,
@@ -1788,9 +1789,73 @@ impl WorkspaceHandle {
         let root = self.root_cwd()?;
         Self::resolve_path_within_root(req_path, &root, canonical_root).await
     }
-    /// Core of [`Self::resolve_service_path`], parameterized over the
-    /// confinement root (see [`Self::confine_to_root`]).
-    async fn resolve_path_within_root(
+    /// Resolution base for the client-facing fs ops: the bound session's
+    /// cwd when it extends the workspace root by a plain path suffix (e.g.
+    /// a bind cwd of `<root>/artifacts`), else the root. A suffix that is
+    /// missing on disk, not a directory, non-`Normal` (`..`), or whose
+    /// canonicalization leaves the root falls back to the root base rather
+    /// than failing every op with a confinement error (the bind cwd is
+    /// caller-supplied and the artifacts mount is asynchronous).
+    pub(crate) async fn client_fs_base(
+        &self,
+        session_id: Option<&str>,
+    ) -> WorkspaceResult<ClientFsBase> {
+        let root = self.root_cwd()?;
+        let canonical_root = self.canonical_root().await?;
+        let suffix = session_id
+            .and_then(|id| self.session(id))
+            .and_then(|session| {
+                let cwd = session.cwd();
+                cwd.strip_prefix(&root)
+                    .or_else(|_| cwd.strip_prefix(&canonical_root))
+                    .ok()
+                    .filter(|s| {
+                        !s.as_os_str().is_empty()
+                            && s.components()
+                                .all(|c| matches!(c, std::path::Component::Normal(_)))
+                    })
+                    .map(std::path::Path::to_path_buf)
+            });
+        let root_base = || ClientFsBase {
+            base: root.clone(),
+            canonical: canonical_root.clone(),
+        };
+        let Some(suffix) = suffix else {
+            return Ok(root_base());
+        };
+        let base = root.join(&suffix);
+        #[allow(clippy::disallowed_methods)]
+        let canonical = match tokio::fs::canonicalize(&base).await {
+            Ok(c) => dunce::simplified(&c).to_path_buf(),
+            Err(error) => {
+                tracing::warn!(session_id, base = %base.display(), %error,
+                    "client-fs base unusable; falling back to the workspace root");
+                return Ok(root_base());
+            }
+        };
+        let is_dir = tokio::fs::metadata(&canonical)
+            .await
+            .is_ok_and(|m| m.is_dir());
+        if !canonical.starts_with(&canonical_root) || !is_dir {
+            tracing::warn!(session_id, base = %base.display(), canonical = %canonical.display(),
+                "client-fs base leaves the root or is not a directory; falling back to the workspace root");
+            return Ok(root_base());
+        }
+        tracing::info!(session_id, base = %base.display(),
+            "client-fs ops rebased to the session cwd");
+        Ok(ClientFsBase { base, canonical })
+    }
+    /// Resolve a caller-provided path against an explicit base, confining
+    /// it there with two-layer defense: textual normalization + symlink
+    /// containment (see [`Self::confine_to_root`]). Entry point for the
+    /// client-facing fs ops, and the core of [`Self::resolve_service_path`].
+    ///
+    /// # TOCTOU caveat
+    /// The symlink check is point-in-time. If a symlink is created between
+    /// resolution and I/O, containment is not guaranteed. Defense-in-depth
+    /// (e.g., `O_NOFOLLOW`, mount namespaces) would be needed for hostile
+    /// workspace environments, which is out of scope for this service-level API.
+    pub(crate) async fn resolve_path_within_root(
         req_path: &str,
         root: &std::path::Path,
         canonical_root: &std::path::Path,
@@ -1931,31 +1996,32 @@ impl WorkspaceHandle {
     /// Files are written sequentially. If file N fails, files 1..N-1 are
     /// already on disk and will NOT be rolled back. Callers must inspect
     /// per-file results in the response to detect partial failures.
-    pub async fn put_files(&self, files: Vec<PutFileEntry>) -> WorkspaceResult<PutFilesRes> {
-        let canonical_root = self.canonical_root().await?;
+    pub async fn put_files(
+        &self,
+        session_id: Option<&str>,
+        files: Vec<PutFileEntry>,
+    ) -> WorkspaceResult<PutFilesRes> {
+        let base = self.client_fs_base(session_id).await?;
         let mut results = Vec::with_capacity(files.len());
         for entry in files {
-            let result = self.put_single_file(&entry, &canonical_root).await;
+            let result = self.put_single_file(&entry, &base).await;
             results.push(result);
         }
         Ok(PutFilesRes { results })
     }
-    async fn put_single_file(
-        &self,
-        entry: &PutFileEntry,
-        canonical_root: &std::path::Path,
-    ) -> PutFileResult {
-        let resolved = match self.resolve_service_path(&entry.path, canonical_root).await {
-            Ok(p) => p,
-            Err(e) => {
-                return PutFileResult {
-                    path: entry.path.clone(),
-                    ok: false,
-                    error: Some(e.to_string()),
-                    hash: None,
-                };
-            }
-        };
+    async fn put_single_file(&self, entry: &PutFileEntry, base: &ClientFsBase) -> PutFileResult {
+        let resolved =
+            match Self::resolve_path_within_root(&entry.path, &base.base, &base.canonical).await {
+                Ok(p) => p,
+                Err(e) => {
+                    return PutFileResult {
+                        path: entry.path.clone(),
+                        ok: false,
+                        error: Some(e.to_string()),
+                        hash: None,
+                    };
+                }
+            };
         if entry.create_dirs
             && let Some(parent) = resolved.parent()
             && let Err(e) = tokio::fs::create_dir_all(parent).await
@@ -2009,34 +2075,35 @@ impl WorkspaceHandle {
     /// - `hash`: SHA-256 hex digest of the **full** file content.
     /// - `matched`: true if `if_none_match` matched the current hash.
     /// - `size`: total file size in bytes.
-    pub async fn get_files(&self, files: Vec<GetFileEntry>) -> WorkspaceResult<GetFilesRes> {
-        let canonical_root = self.canonical_root().await?;
+    pub async fn get_files(
+        &self,
+        session_id: Option<&str>,
+        files: Vec<GetFileEntry>,
+    ) -> WorkspaceResult<GetFilesRes> {
+        let base = self.client_fs_base(session_id).await?;
         let mut results = Vec::with_capacity(files.len());
         for entry in files {
-            let result = self.get_single_file(&entry, &canonical_root).await;
+            let result = self.get_single_file(&entry, &base).await;
             results.push(result);
         }
         Ok(GetFilesRes { results })
     }
-    async fn get_single_file(
-        &self,
-        entry: &GetFileEntry,
-        canonical_root: &std::path::Path,
-    ) -> GetFileResult {
-        let resolved = match self.resolve_service_path(&entry.path, canonical_root).await {
-            Ok(p) => p,
-            Err(e) => {
-                return GetFileResult {
-                    path: entry.path.clone(),
-                    exists: false,
-                    content: None,
-                    hash: None,
-                    matched: false,
-                    size: None,
-                    error: Some(e.to_string()),
-                };
-            }
-        };
+    async fn get_single_file(&self, entry: &GetFileEntry, base: &ClientFsBase) -> GetFileResult {
+        let resolved =
+            match Self::resolve_path_within_root(&entry.path, &base.base, &base.canonical).await {
+                Ok(p) => p,
+                Err(e) => {
+                    return GetFileResult {
+                        path: entry.path.clone(),
+                        exists: false,
+                        content: None,
+                        hash: None,
+                        matched: false,
+                        size: None,
+                        error: Some(e.to_string()),
+                    };
+                }
+            };
         let is_chunked = entry.offset.is_some() || entry.length.is_some();
         let metadata = match tokio::fs::metadata(&resolved).await {
             Ok(m) => m,

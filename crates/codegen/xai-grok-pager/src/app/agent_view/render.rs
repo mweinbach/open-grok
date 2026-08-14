@@ -1027,6 +1027,12 @@ impl AgentView {
                     .is_some_and(|pav| pav.focus == PlanApprovalFocus::Commenting)
             {
                 Some("Type your comment...")
+            } else if self
+                .plan_approval_view
+                .as_ref()
+                .is_some_and(|pav| pav.focus == PlanApprovalFocus::Prompt)
+            {
+                Some("Type revision notes...")
             } else {
                 None
             },

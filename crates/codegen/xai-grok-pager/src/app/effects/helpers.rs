@@ -1134,6 +1134,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "follow_up_behavior" => {
+            let SettingValue::Enum(s) = value else {
+                return Err(kind_mismatch("follow_up_behavior", "Enum", &value));
+            };
+            xai_grok_shell::util::config::set_follow_up_behavior(s.to_string())
+                .await
+                .map_err(|e| e.to_string())
+        }
         "show_timeline" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("show_timeline", "Bool", &value));

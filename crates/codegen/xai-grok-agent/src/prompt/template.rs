@@ -298,8 +298,6 @@ mod tests {
         );
     }
 
-
-
     // ── Required sections regression ────────────────────────────────
 
     #[test]

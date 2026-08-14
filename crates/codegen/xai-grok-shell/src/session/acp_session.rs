@@ -180,6 +180,12 @@ pub(crate) use goal_support::*;
 #[path = "acp_session_impl/hook_dispatch.rs"]
 mod hook_dispatch;
 use hook_dispatch::*;
+#[path = "acp_session_impl/turn_report_slot.rs"]
+mod turn_report_slot;
+use turn_report_slot::{CommitOutcome, TurnEpoch, TurnReportClaim};
+#[path = "acp_session_impl/turn_end_hooks.rs"]
+mod turn_end_hooks;
+use turn_end_hooks::TurnEnd;
 #[path = "acp_session_impl/stop_gate.rs"]
 mod stop_gate;
 pub use stop_gate::MAX_STOP_HOOK_CONTINUATIONS_PER_TURN;
@@ -386,14 +392,15 @@ impl State {
     }
 }
 /// Canonical "session is idle and safe to inject a synthetic turn"
-/// predicate. The post-turn idle consumers — `maybe_drain_notifications`
-/// (notification batching), `maybe_fire_laziness_check` (Layer 3 classifier),
-/// and `arm_idle_notification` (idle-notification debounce) — all consult this
-/// so they share one definition of idleness, with no drift between them.
+/// predicate. Two post-turn idle consumers share it so they cannot drift:
+/// `maybe_drain_notifications` (notification batching) and
+/// `maybe_fire_laziness_check` (the Layer 3 classifier).
 ///
 /// Returns `true` exactly when: no turn is running, no user prompt is
 /// queued, no lifecycle mutation owns the start gate, and an interactive stop
 /// has not suppressed notifications pending genuine user re-engagement.
+/// Idle *reporting* uses `state_is_busy` instead, because after an interrupt
+/// the session really is idle.
 pub(crate) fn is_session_idle_for_injection(state: &State) -> bool {
     state.running_task.is_none()
         && state.pending_inputs.is_empty()
@@ -402,9 +409,10 @@ pub(crate) fn is_session_idle_for_injection(state: &State) -> bool {
 }
 /// Predicate behind `SessionCommand::IsBusy`: the session has work in flight
 /// when a turn is running, inputs are queued, **or** a lifecycle mutation is
-/// active. Consulted by the leader's idle-unload decision on client disconnect.
-/// Kept as a free function so it can be unit-tested directly against a `State`
-/// without spawning a full actor + leader.
+/// active. Consulted by the leader's idle-unload decision on client
+/// disconnect, and by `emit_session_idle_if_idle`. Kept as a free function so
+/// it can be unit-tested directly against a `State` without spawning a full
+/// actor + leader.
 pub(crate) fn state_is_busy(state: &State) -> bool {
     state.running_task.is_some()
         || !state.pending_inputs.is_empty()
@@ -975,6 +983,14 @@ pub(crate) struct SessionActor {
     /// Safe: session actor is single-threaded (LocalSet), no concurrent access.
     pub(crate) hook_registry:
         std::cell::RefCell<Option<Arc<xai_grok_hooks::discovery::HookRegistry>>>,
+    /// The turn's single end-of-turn hook report. Actor-scoped rather than turn-local because the
+    /// gate runs on the turn task while a cancel runs on the command loop.
+    pub(crate) turn_report: turn_report_slot::TurnReportSlot,
+    /// Keyed on the same turn epoch as `turn_report`: a turn announces its abort at most once.
+    pub(crate) turn_abort: turn_report_slot::AbortAnnouncement,
+    /// Set once by [`turn_end_hooks::TurnEndQueue::spawn`]; `None` before the loop starts.
+    pub(crate) turn_end_tx:
+        std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<turn_end_hooks::QueueItem>>>,
     /// Client hooks from `session/new` `_meta["x.ai/hooks"]`; gated in
     /// [`crate::session::acp_session::hooks`]. `RefCell` so `load_session` reconnect can
     /// replace the set on the live actor (see `SessionCommand::SetClientHooks`).
@@ -2019,6 +2035,9 @@ mod tool_layer_images_bridge_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/turn/turn_end_guard_tests.rs"]
 mod turn_end_guard_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/turn_end_reporting_tests.rs"]
+mod turn_end_reporting_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/wait_for_mcp_prefix_tests.rs"]
 mod wait_for_mcp_prefix_tests;

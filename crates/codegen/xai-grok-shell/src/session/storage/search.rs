@@ -143,8 +143,12 @@ impl SearchIndexManager {
 
     /// Queue a bootstrap of all sessions (idempotent per root; repeat calls
     /// re-verify the on-disk marker). Sets `bootstrapping` eagerly so
-    /// pollers see `true` before the background task starts.
+    /// pollers see `true` before the background task starts. Does nothing
+    /// while the index is switched off.
     pub fn bootstrap_once(&self, root: PathBuf) {
+        if !super::search_gate::is_index_enabled() {
+            return;
+        }
         self.progress.begin_bootstrapping();
         let _ = self.tx.send(SearchManagerCmd::BootstrapOnce { root });
     }
@@ -159,8 +163,12 @@ impl SearchIndexManager {
         }
     }
 
-    /// Queue an index update for a single session.
+    /// Queue an index update for a single session. Does nothing while the
+    /// index is switched off.
     pub fn enqueue(&self, root: PathBuf, session_id: String, cwd: String) {
+        if !super::search_gate::is_index_enabled() {
+            return;
+        }
         let key = SessionSearchKey { session_id, cwd };
         let _ = self.tx.send(SearchManagerCmd::Enqueue {
             root,
@@ -192,12 +200,32 @@ pub fn notify_session_updated(session_id: &str, cwd: &str) {
     SEARCH_INDEX_MANAGER.enqueue(root, session_id.to_string(), cwd.to_string());
 }
 
+/// Remove one session from an index built earlier. Ignores the switch, because a delete must land
+/// whether or not this process still indexes. Best effort: a failure is logged, not returned, and
+/// the row waits for the next bootstrap, which only runs if search is on again.
+pub(crate) async fn evict_session(root_dir: &Path, session_id: &str) {
+    if !search_db_path(root_dir).exists() {
+        return;
+    }
+    if let Err(e) = delete_session(root_dir, session_id).await {
+        log_session_index_failure(session_id, &e, "failed to remove session from search index");
+    }
+}
+
 /// Execute a session search query, waiting up to [`BOOTSTRAP_WAIT_TIMEOUT`]
 /// for a first-call bootstrap so the query runs against a populated index.
 pub async fn execute_search(
     root_dir: &Path,
     req: &SessionSearchRequest,
 ) -> io::Result<SessionSearchResponse> {
+    if !super::search_gate::is_index_enabled() {
+        return Ok(SessionSearchResponse {
+            results: Vec::new(),
+            next_offset: None,
+            total_estimate: Some(0),
+            bootstrapping: false,
+        });
+    }
     let query = req.query.trim();
     if query.is_empty() {
         return Ok(SessionSearchResponse {
@@ -299,6 +327,9 @@ async fn handle_job(
             pending.insert(key, Instant::now() + debounce);
         }
         SearchIndexJob::BootstrapAll => {
+            if !super::search_gate::is_index_enabled() {
+                return;
+            }
             let _bootstrapping = BootstrappingGuard::new(&SEARCH_INDEX_MANAGER.progress);
             match bootstrap_with_lease(root_dir, storage, &SEARCH_INDEX_MANAGER.progress).await {
                 Ok(BootstrapOutcome::Done) => {}
@@ -314,6 +345,9 @@ async fn handle_job(
             }
         }
         SearchIndexJob::RecheckBootstrap => {
+            if !super::search_gate::is_index_enabled() {
+                return;
+            }
             let _bootstrapping = BootstrappingGuard::new(&SEARCH_INDEX_MANAGER.progress);
             match has_completed_bootstrap_marker(root_dir).await {
                 Some(true) => {}
@@ -357,6 +391,10 @@ async fn flush_ready(
     storage: &dyn StorageAdapter,
     pending: &mut HashMap<SessionSearchKey, Instant>,
 ) {
+    if !super::search_gate::is_index_enabled() {
+        pending.clear();
+        return;
+    }
     let now = Instant::now();
     let ready: Vec<SessionSearchKey> = pending
         .iter()
@@ -411,6 +449,12 @@ async fn upsert_session(
     } else {
         return Ok(UpsertOutcome::NoContent);
     };
+    // The read above takes seconds, long enough for the switch to close under it. The outcome is
+    // advisory here (the only caller discards it), so it reports as `NoContent` rather than the
+    // upstream crate's dedicated `Declined`.
+    if !super::search_gate::is_index_enabled() {
+        return Ok(UpsertOutcome::NoContent);
+    }
     let doc = build_session_doc(summary, content);
     let db_path = search_db_path(root_dir);
 

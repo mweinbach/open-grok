@@ -769,7 +769,7 @@ impl AgentView {
                 _ => InputOutcome::Changed,
             };
         }
-        if self.line_viewer.is_some() {
+        if self.line_viewer.is_some() && self.focused_card() != Some(BlockingCard::Permission) {
             if let Event::Mouse(mouse) = ev
                 && mouse.kind == MouseEventKind::Down(MouseButton::Left)
                 && self.hit_voice_stop_button.contains(mouse.column, mouse.row)

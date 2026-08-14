@@ -35,6 +35,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "page_flip_on_send",
     "confirm_before_rewind",
     "combine_queued_prompts",
+    "follow_up_behavior",
     "enter_steers",
     "simple_mode",
     "swarm_mode",
@@ -312,6 +313,7 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
         ("enter_steers", Action::SetEnterSteers(b)) => {
             assert_eq!(b, expected, "SetEnterSteers value differs from expected")
         }
+
         ("simple_mode", Action::SetSimpleMode(b)) => {
             assert_eq!(b, expected, "SetSimpleMode value differs from expected")
         }
@@ -560,6 +562,48 @@ fn space_on_enter_steers_dispatches_typed_setter() {
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
     let default_on = UiConfig::default().enter_steers_enabled();
     assert_set_bool_action(outcome, "enter_steers", !default_on);
+}
+
+#[test]
+fn enter_on_follow_up_behavior_row_enters_picking_enum() {
+    let mut s = make_state();
+    navigate_to(&mut s, "follow_up_behavior");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "Enter on follow_up_behavior row must transition to PickingEnum, got {outcome:?}"
+    );
+    match &s.mode() {
+        SettingsModalMode::PickingEnum {
+            key,
+            original_value,
+            ..
+        } => {
+            assert_eq!(*key, "follow_up_behavior");
+            assert_eq!(
+                original_value,
+                &SettingValue::Enum("queue"),
+                "default follow_up_behavior is queue"
+            );
+        }
+        other => panic!("expected PickingEnum mode, got {other:?}"),
+    }
+}
+
+#[test]
+fn follow_up_behavior_picker_enter_dispatches_set_commit() {
+    let mut s = make_state();
+    navigate_to(&mut s, "follow_up_behavior");
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    // Default is queue (index 0); Down → steer.
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Down));
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    match outcome {
+        SettingsKeyOutcome::Action(Action::SetFollowUpBehavior(mode)) => {
+            assert_eq!(mode, xai_grok_pager::appearance::FollowUpBehavior::Steer);
+        }
+        other => panic!("expected SetFollowUpBehavior(Steer), got {other:?}"),
+    }
 }
 
 #[test]
@@ -1151,6 +1195,28 @@ fn mouse_click_on_enter_steers_indicator_toggles_in_one_click() {
     );
     let default_on = UiConfig::default().enter_steers_enabled();
     assert_set_bool_action(outcome, "enter_steers", !default_on);
+}
+
+#[test]
+fn mouse_click_on_follow_up_behavior_indicator_opens_picker() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "follow_up_behavior") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "click on follow_up_behavior indicator should open picker, got {outcome:?}"
+    );
+    assert!(
+        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. } if key == "follow_up_behavior"),
+        "expected PickingEnum(follow_up_behavior), got {:?}",
+        s.mode()
+    );
 }
 
 /// Value-column click toggles `remember_tool_approvals` in one click.
@@ -2698,6 +2764,7 @@ fn registry_kind_membership_through_pr_14() {
             "custom_model_backend",
             "custom_model_provider",
             "default_selected_permission",
+            "follow_up_behavior",
             "hunk_tracker_mode",
             "image_generation_provider",
             "keep_text_selection",
@@ -2819,6 +2886,7 @@ fn enum_settings_membership_through_pr_14() {
             "custom_model_backend",
             "custom_model_provider",
             "default_selected_permission",
+            "follow_up_behavior",
             "hunk_tracker_mode",
             "image_generation_provider",
             "keep_text_selection",
@@ -2861,6 +2929,9 @@ fn defaults_round_trip_through_registry() {
     xai_grok_pager::appearance::cache::set_group_tool_verbs(true);
     xai_grok_pager::appearance::cache::set_page_flip_on_send(true);
     xai_grok_pager::appearance::cache::set_combine_queued_prompts(false);
+    xai_grok_pager::appearance::cache::set_follow_up_behavior(
+        xai_grok_pager::appearance::FollowUpBehavior::Queue,
+    );
     xai_grok_pager::appearance::cache::set_enter_steers(false);
     xai_grok_pager::appearance::cache::set_scroll_mode(
         xai_grok_pager::appearance::ScrollMode::Auto,
@@ -2879,6 +2950,7 @@ fn defaults_round_trip_through_registry() {
             "page_flip_on_send" => SettingValue::Bool(true),
             "confirm_before_rewind" => SettingValue::Bool(true),
             "combine_queued_prompts" => SettingValue::Bool(false),
+            "follow_up_behavior" => SettingValue::Enum("queue"),
             "enter_steers" => SettingValue::Bool(false),
             "simple_mode" => SettingValue::Bool(true),
             "swarm_mode" => SettingValue::Bool(false),
@@ -7790,6 +7862,12 @@ fn enter_on_keep_text_selection_row_enters_picking_enum() {
 
 #[test]
 fn keep_text_selection_picker_nav_does_not_dispatch_preview() {
+    // Pin the cache-backed live value so the picker seeds at flash (idx 0)
+    // regardless of a sibling test that set hold/word_select on this thread.
+    // (word_select is the last choice, so Down would clamp; flash gives room.)
+    xai_grok_pager::appearance::cache::set_keep_text_selection(
+        xai_grok_pager::appearance::TextSelection::Flash,
+    );
     for nav_key in &[
         KeyCode::Down,
         KeyCode::Up,

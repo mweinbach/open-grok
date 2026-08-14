@@ -123,9 +123,7 @@ pub enum PrefixDivergence {
         curr_len: usize,
     },
     /// Tool definitions were added, removed, reordered, or modified.
-    ToolsChanged {
-        diff: String,
-    },
+    ToolsChanged { diff: String },
     /// Conversation item at `index` diverged from the previous turn.
     ItemDiverged {
         index: usize,
@@ -290,8 +288,7 @@ impl CacheTracker {
 
         let mut items = Vec::with_capacity(request.items.len());
         for (index, item) in request.items.iter().enumerate() {
-            let (kind, identifier, byte_len, is_pruned, has_images, preview) =
-                summarize_item(item);
+            let (kind, identifier, byte_len, is_pruned, has_images, preview) = summarize_item(item);
             let content_hash = hash_item(item);
             total_body_bytes += byte_len;
             items.push(ItemSummary {
@@ -646,19 +643,21 @@ fn hash_item(item: &ConversationItem) -> u64 {
         }
         ConversationItem::BackendToolCall(btc) => {
             5u8.hash(&mut hasher);
-            serde_json::to_string(btc).unwrap_or_default().hash(&mut hasher);
+            serde_json::to_string(btc)
+                .unwrap_or_default()
+                .hash(&mut hasher);
         }
         ConversationItem::Reasoning(r) => {
             6u8.hash(&mut hasher);
-            serde_json::to_string(r).unwrap_or_default().hash(&mut hasher);
+            serde_json::to_string(r)
+                .unwrap_or_default()
+                .hash(&mut hasher);
         }
     }
     hasher.finish()
 }
 
-fn summarize_item(
-    item: &ConversationItem,
-) -> (String, Option<String>, usize, bool, bool, String) {
+fn summarize_item(item: &ConversationItem) -> (String, Option<String>, usize, bool, bool, String) {
     match item {
         ConversationItem::System(s) => {
             let len = s.content.len();
@@ -763,7 +762,14 @@ fn summarize_item(
         ConversationItem::BackendToolCall(btc) => {
             let s = serde_json::to_string(btc).unwrap_or_default();
             let preview = truncate_preview(&s, 40);
-            ("backend_tool_call".into(), None, s.len(), false, false, preview)
+            (
+                "backend_tool_call".into(),
+                None,
+                s.len(),
+                false,
+                false,
+                preview,
+            )
         }
         ConversationItem::Reasoning(r) => {
             let s = serde_json::to_string(r).unwrap_or_default();
@@ -783,7 +789,10 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     if single_line.chars().count() <= max_chars {
         single_line
     } else {
-        let truncated: String = single_line.chars().take(max_chars.saturating_sub(1)).collect();
+        let truncated: String = single_line
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect();
         format!("{truncated}…")
     }
 }

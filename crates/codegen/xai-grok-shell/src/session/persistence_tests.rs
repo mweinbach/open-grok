@@ -28,13 +28,12 @@ fn test_actor_inner(
     let provider_boundary = ProviderBoundary::default();
     let (disk_full_tx, disk_full_rx) = tokio::sync::watch::channel(false);
     let sampling_client = OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap();
-    let mut summary = crate::session::summary::SummaryGenerator::new(
-        crate::session::summary::SummaryConfig {
+    let mut summary =
+        crate::session::summary::SummaryGenerator::new(crate::session::summary::SummaryConfig {
             sampling_client,
             model: String::new(),
             persistence_tx: summary_tx,
-        },
-    );
+        });
     if mark_summary_done {
         summary.mark_done();
     }

@@ -21,8 +21,10 @@ pub(crate) enum UpsertOutcome {
     Unchanged {
         bytes_read: u64,
     },
-    /// Storage backend doesn't expose an updates file path.
+    /// Nothing to write: the store exposes no updates file.
     NoContent,
+    /// The switch closed while the transcript was being read, so nothing was written.
+    Declined,
 }
 
 /// Upsert `doc` unless the stored content hash already matches.

@@ -1126,7 +1126,10 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
         ];
         request.x_grok_conv_id = Some("must-not-leak".into());
         request.x_grok_req_id = Some("must-not-leak".into());
-        request.x_grok_session_id = Some("must-not-leak".into());
+        // The session id is NOT private for Codex: it must be projected onto
+        // the session affinity headers so the backend serves the
+        // per-conversation prompt cache (it never leaks as an x-grok header).
+        request.x_grok_session_id = Some("codex-session-affinity".into());
         request.x_grok_turn_idx = Some("must-not-leak".into());
         request.x_grok_agent_id = Some("must-not-leak".into());
         request

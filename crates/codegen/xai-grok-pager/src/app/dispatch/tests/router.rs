@@ -317,12 +317,11 @@ fn seed_foreign_resume_hint(
     app: &mut AppView,
     tool: xai_grok_foreign_sessions::ForeignSessionTool,
 ) {
-    app.foreign_session_compat =
-        xai_grok_foreign_sessions::EnabledForeignSessionSources {
-            claude: true,
-            codex: true,
-            cursor: true,
-        };
+    app.foreign_session_compat = xai_grok_foreign_sessions::EnabledForeignSessionSources {
+        claude: true,
+        codex: true,
+        cursor: true,
+    };
     let Effect::CanonicalizeForeignResumeCwd {
         requested_cwd,
         launch_token,

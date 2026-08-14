@@ -44,6 +44,9 @@ pub struct SubagentInfo {
     /// Initialised to `started_at` so that brand-new subagents with
     /// no progress notifications yet still sort correctly.
     pub last_progress_at: Instant,
+    /// Lifecycle dedup tombstone: a child emits one terminal transition, so
+    /// duplicate finishes must not re-finalize it and duplicate spawns must
+    /// never replace this terminal state.
     pub finished: bool,
     /// "completed", "failed", or "cancelled".
     pub status: Option<Arc<str>>,
@@ -316,6 +319,11 @@ pub(crate) fn ensure_subagent_child_replayed(
 }
 /// Finalize a finished child view: end the turn and append the `TurnCompleted`
 /// footer. Shared by the live `SubagentFinished` path and the deferred resume path.
+///
+/// Idempotent on the *trailing* footer: kill reconciliation or a late replay
+/// rebuild that re-finalizes an already-finished child must not append a second
+/// completed line. An earlier turn's `TurnCompleted` deeper in the transcript
+/// must not suppress a later turn's footer.
 pub(crate) fn finalize_finished_child_view(
     child_view: &mut crate::app::agent_view::AgentView,
     elapsed: std::time::Duration,
@@ -325,6 +333,19 @@ pub(crate) fn finalize_finished_child_view(
         .tracker
         .finish_turn(&mut child_view.scrollback);
     child_view.scrollback.finish_all_running();
+    let already_has_trailing_completed_footer = child_view.scrollback.last().is_some_and(|e| {
+        matches!(
+            &e.block,
+            crate::scrollback::block::RenderBlock::SessionEvent(seb)
+                if matches!(
+                    seb.event,
+                    crate::scrollback::blocks::SessionEvent::TurnCompleted { .. }
+                )
+        )
+    });
+    if already_has_trailing_completed_footer {
+        return;
+    }
     child_view
         .scrollback
         .push_block(crate::scrollback::block::RenderBlock::session_event(

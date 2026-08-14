@@ -942,6 +942,7 @@ impl HostedTool {
         Self::WebSearch {
             options: allowed_domains.map(|allowed_domains| WebSearchOptions {
                 allowed_domains: Some(allowed_domains),
+                excluded_domains: None,
             }),
         }
     }
@@ -4319,16 +4320,12 @@ fn content_parts_to_easy_input_content(parts: &[ContentPart]) -> rs::EasyInputCo
     rs::EasyInputContent::ContentList(items)
 }
 
-/// Build tools for Responses API.
+/// The request's client function tools plus `rs::Tool::Custom` hosted tools.
+/// A function tool whose name collides with a backend-hosted tool is dropped,
+/// because sending both is rejected as a duplicate, so the hosted tool wins.
 ///
-/// Combines client-side function tools (`req.tools`) with native Responses
-/// tools (`req.hosted_tools`). Function tools are sent as `rs::Tool::Function`;
-/// custom tools are sent as `rs::Tool::Custom`; hosted tools use their native
-/// server-executed Responses types.
-///
-/// Function tools whose name collides with a hosted tool are dropped (the
-/// backend rejects the request with `Duplicate tool names: <name>` otherwise);
-/// the hosted tool wins.
+/// `web_search` and `x_search` are not emitted here. Both ride the raw-JSON
+/// [`extra_tool_entries`] channel instead.
 fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
     let mut tools: Vec<rs::Tool> = req
         .tools
@@ -4355,23 +4352,9 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
 
     for hosted in &req.hosted_tools {
         match hosted {
-            HostedTool::WebSearch { options } => {
-                // An empty allowlist is unbounded, so it emits no filter.
-                let filters = options
-                    .as_ref()
-                    .and_then(|o| o.allowed_domains.as_deref())
-                    .filter(|domains| !domains.is_empty())
-                    .map(|domains| rs::WebSearchToolFilters {
-                        allowed_domains: Some(domains.to_vec()),
-                    });
-                tools.push(rs::Tool::WebSearch(rs::WebSearchTool {
-                    filters,
-                    ..Default::default()
-                }));
-            }
-            // XSearch is xAI-specific — not in async_openai's rs::Tool enum.
-            // Injected as raw JSON by the sampler client after serialization.
-            HostedTool::XSearch { .. } => {}
+            // web_search and x_search ride the raw-JSON `extra_tool_entries` channel — see
+            // that function for why neither may also be emitted as a typed `rs::Tool`.
+            HostedTool::WebSearch { .. } | HostedTool::XSearch { .. } => {}
             HostedTool::ClientCustom(tool) => {
                 tools.push(rs::Tool::Custom(rs::CustomToolParam {
                     name: tool.name.clone(),
@@ -4385,17 +4368,26 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
     tools
 }
 
-/// Return raw JSON tool definitions for provider extensions that cannot be
-/// represented by `async_openai`'s `rs::Tool` enum.
+/// Every hosted tool that cannot ship as a typed `rs::Tool`, as a raw JSON
+/// entry which the sampler client splices into the serialized `tools` array.
 ///
-/// The sampler client injects these into the serialized request body's
-/// `tools` array before sending to the API.
+/// `x_search` rides this channel because it has no `rs::Tool` variant, and
+/// `web_search` rides it because async_openai's `rs::WebSearchToolFilters`
+/// models only `allowed_domains` and cannot carry `excluded_domains`. Emitting
+/// either as a typed `rs::Tool` as well would send it twice, which the API
+/// rejects as a duplicate; the JSON built here is byte-identical to the native
+/// `rs::Tool::WebSearch` for the no-filter and allowlist-only cases.
+/// `client_custom` is skipped because it ships as a typed `rs::Tool::Custom`.
 pub fn extra_tool_entries(hosted_tools: &[HostedTool]) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     for tool in hosted_tools {
         match tool {
-            // WebSearch ships natively (rs::Tool::WebSearch), so no JSON entry here.
-            HostedTool::WebSearch { .. } => {}
+            HostedTool::WebSearch { options } => {
+                entries.push(match options {
+                    Some(o) => o.to_tool_entry(),
+                    None => WebSearchOptions::default().to_tool_entry(),
+                });
+            }
             HostedTool::XSearch { options } => {
                 entries.push(match options {
                     Some(o) => o.to_tool_entry(),
@@ -6636,13 +6628,16 @@ mod tests {
         let responses_req: rs::CreateResponse = (&req).into();
         let tools = responses_req.tools.expect("tools should be set");
 
+        // web_search rides the raw-JSON `extra_tool_entries` channel (so it can carry
+        // `excluded_domains`, which async_openai's typed filter omits), so it never
+        // appears as a native `rs::Tool::WebSearch`.
         let web_search_count = tools
             .iter()
             .filter(|t| matches!(t, rs::Tool::WebSearch(_)))
             .count();
         assert_eq!(
-            web_search_count, 1,
-            "exactly one typed web_search: {tools:?}"
+            web_search_count, 0,
+            "web_search is not a native tool: {tools:?}"
         );
         let function_names: Vec<&str> = tools
             .iter()
@@ -6660,6 +6655,10 @@ mod tests {
             responses_req.include,
             Some(vec![rs::IncludeEnum::WebSearchCallActionSources])
         );
+
+        // The hosted web_search is emitted as a raw entry instead.
+        let entries = extra_tool_entries(&req.hosted_tools);
+        assert_eq!(entries, vec![serde_json::json!({"type": "web_search"})]);
     }
 
     #[test]
@@ -6677,6 +6676,49 @@ mod tests {
         assert!(tools.is_empty(), "expected no tools, got: {tools:?}");
         let entries = extra_tool_entries(&req.hosted_tools);
         assert_eq!(entries, vec![serde_json::json!({"type": "x_search"})]);
+    }
+
+    /// The hosted `web_search` domain policy only reaches the API through this raw
+    /// entry (async_openai's typed filters model no blocklist), so both filters must
+    /// survive the `HostedTool` → `extra_tool_entries` hop, and an empty/absent
+    /// policy must stay byte-identical to the bare tool.
+    #[test]
+    fn web_search_domain_filters_reach_the_tool_entry() {
+        let hosted = |options: Option<WebSearchOptions>| {
+            extra_tool_entries(&[HostedTool::WebSearch { options }])
+        };
+        assert_eq!(
+            hosted(Some(WebSearchOptions {
+                allowed_domains: Some(vec!["docs.x.ai".into(), "arxiv.org".into()]),
+                excluded_domains: None,
+            })),
+            vec![serde_json::json!({
+                "type": "web_search",
+                "filters": { "allowed_domains": ["docs.x.ai", "arxiv.org"] },
+            })]
+        );
+        assert_eq!(
+            hosted(Some(WebSearchOptions {
+                allowed_domains: None,
+                excluded_domains: Some(vec!["reddit.com".into()]),
+            })),
+            vec![serde_json::json!({
+                "type": "web_search",
+                "filters": { "excluded_domains": ["reddit.com"] },
+            })]
+        );
+
+        // No policy (absent, default, or empty lists) emits the bare tool.
+        let bare = vec![serde_json::json!({ "type": "web_search" })];
+        assert_eq!(hosted(None), bare);
+        assert_eq!(hosted(Some(WebSearchOptions::default())), bare);
+        assert_eq!(
+            hosted(Some(WebSearchOptions {
+                allowed_domains: Some(vec![]),
+                excluded_domains: Some(vec![]),
+            })),
+            bare
+        );
     }
 
     #[test]
@@ -6720,6 +6762,7 @@ mod tests {
         };
         let w = WebSearchOptions {
             allowed_domains: Some(vec!["x.com".into()]),
+            excluded_domains: None,
         };
 
         // set: an object sets that tool's options.

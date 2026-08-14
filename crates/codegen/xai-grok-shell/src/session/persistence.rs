@@ -3573,24 +3573,37 @@ pub async fn delete_session_history(
         false
     };
 
-    let Some(info) = local_info else {
-        return Ok(SessionDeletion {
-            local_removed: false,
-            remote_removed,
-        });
+    let removed = match local_info {
+        Some(info) => {
+            JsonlStorageAdapter::default()
+                .delete_session(&info)
+                .await
+                .map_err(DeleteSessionError::Local)?;
+            Some(info)
+        }
+        None => None,
     };
+    let local_removed = removed.is_some();
 
-    JsonlStorageAdapter::default()
-        .delete_session(&info)
-        .await
-        .map_err(DeleteSessionError::Local)?;
-
-    // Evict from the search index: the indexer re-reads the (now
-    // missing) summary and drops the document.
-    crate::session::storage::search::notify_session_updated(&info.id.to_string(), &info.cwd);
+    // Evict whenever this delete removed the session, and also when no workspace was named, since
+    // that row outlives the directory and nothing else prunes it while search is off. A delete
+    // scoped to a workspace that held nothing leaves the row alone, because the session lives in
+    // another workspace.
+    if local_removed || cwd.is_none() {
+        crate::session::storage::search::evict_session(
+            &crate::util::grok_home::grok_home(),
+            session_id,
+        )
+        .await;
+    }
+    // The eviction above is a point in time. Queue the indexer as well so an upsert already under
+    // way, which would otherwise write the row back, is followed by a re-read that finds nothing.
+    if let Some(info) = removed {
+        crate::session::storage::search::notify_session_updated(&info.id.to_string(), &info.cwd);
+    }
 
     Ok(SessionDeletion {
-        local_removed: true,
+        local_removed,
         remote_removed,
     })
 }

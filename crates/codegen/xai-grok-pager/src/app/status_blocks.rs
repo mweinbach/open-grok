@@ -306,10 +306,7 @@ pub(crate) fn session_cache_block_text(
         }
     }
 
-    join_header_rows(
-        "Prompt Cache Telemetry & Diagnostics:".to_string(),
-        rows,
-    )
+    join_header_rows("Prompt Cache Telemetry & Diagnostics:".to_string(), rows)
 }
 
 /// Cost cell. Ticks are 1e10 per USD; partial sums are scrubbed to absent.
@@ -324,7 +321,7 @@ fn format_cost(m: &xai_grok_shell::extensions::notification::PromptUsageModel) -
 
 /// First non-empty, trimmed line of `text` (empty string if none). Collapses a
 /// multi-line prompt/command to a single display line.
-fn first_nonempty_line(text: &str) -> &str {
+pub(crate) fn first_nonempty_line(text: &str) -> &str {
     text.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
@@ -510,7 +507,9 @@ mod tests {
                 hits: 3,
                 partial_hits: 0,
                 breaks: 1,
-                last_break_diagnostic: Some("Cache break: 0% hit rate. Item #2 was pruned/trimmed".into()),
+                last_break_diagnostic: Some(
+                    "Cache break: 0% hit rate. Item #2 was pruned/trimmed".into(),
+                ),
             },
             recent_turns: vec![
                 xai_grok_shell::session::CacheTurnRecord {
@@ -544,10 +543,26 @@ mod tests {
         };
         let text = session_cache_block_text(&resp);
         assert!(text.contains("Cache hit rate: 85.0% (6,375 of 7,500 steady-state input tokens cached; cold start excluded)"), "{text}");
-        assert!(text.contains("Turns tracked:  4 (3 hits · 0 partial · 1 breaks)"), "{text}");
-        assert!(text.contains("Last break:     Cache break: 0% hit rate. Item #2 was pruned/trimmed"), "{text}");
-        assert!(text.contains("Turn #1 (loop 0) — cold start (2,500 in) · First turn in session (cold cache)."), "{text}");
-        assert!(text.contains("Turn #2 (loop 0) — 80.0% hit (2,500 in, 2,000 cached) · Cache hit: 80.0%"), "{text}");
+        assert!(
+            text.contains("Turns tracked:  4 (3 hits · 0 partial · 1 breaks)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Last break:     Cache break: 0% hit rate. Item #2 was pruned/trimmed"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Turn #1 (loop 0) — cold start (2,500 in) · First turn in session (cold cache)."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Turn #2 (loop 0) — 80.0% hit (2,500 in, 2,000 cached) · Cache hit: 80.0%"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
@@ -579,8 +594,17 @@ mod tests {
             }],
         };
         let text = session_cache_block_text(&resp);
-        assert!(text.contains("Cache hit rate: n/a (cold-start request only so far)"), "{text}");
-        assert!(text.contains("Turn #1 (loop 0) — cold start (2,500 in)"), "{text}");
-        assert!(!text.contains("% hit ("), "must not render a hit-rate percentage: {text}");
+        assert!(
+            text.contains("Cache hit rate: n/a (cold-start request only so far)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Turn #1 (loop 0) — cold start (2,500 in)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("% hit ("),
+            "must not render a hit-rate percentage: {text}"
+        );
     }
 }

@@ -24,6 +24,8 @@ mod source;
 
 pub use manager::{
     SearchIndexManager, SearchIndexStatus, SessionSearchRequest, SessionSearchResponse,
-    execute_search,
+    evict_session, execute_search,
 };
-pub use source::{ContentExtractor, IndexableSession, SessionSource, SessionSourceFactory};
+pub use source::{
+    ContentExtractor, IndexEnabled, IndexableSession, SessionSource, SessionSourceFactory,
+};

@@ -10,6 +10,12 @@ pub const MAX_STOP_HOOK_CONTINUATIONS_PER_TURN: u32 = 8;
 
 const SESSION_END_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn commit_stop_report(claim: TurnReportClaim<'_>, prompt_id: &str) {
+    if claim.commit() == CommitOutcome::LostToAnotherReporter {
+        tracing::debug!(prompt_id, "a cancel already reported this turn");
+    }
+}
+
 /// `command` is a shell-only field, so a monitor's watch command is carried in
 /// `description` instead.
 fn stop_entry_from_task(task: &xai_grok_tools::types::TaskSnapshot) -> StopBackgroundTask {
@@ -110,7 +116,7 @@ impl SessionActor {
     /// exit code 2 parses as a block, but the decision is discarded (no turn
     /// left to continue).
     pub(crate) async fn dispatch_session_end_stop(&self, reason: &str) {
-        if self.startup_hints.is_subagent || !self.hook_event_active(event::HookEventName::Stop) {
+        if self.startup_hints.is_subagent || !self.may_have_hooks_for(event::HookEventName::Stop) {
             return;
         }
         let envelope = self.fire_hook(
@@ -207,11 +213,19 @@ impl SessionActor {
         .await;
     }
 
+    /// Answering the gate's hook request takes a client, so a test reaches the payload here.
+    #[cfg(test)]
+    pub(super) async fn stop_payload_for_test(&self) -> event::HookPayload {
+        self.build_stop_payload(/* stop_hook_active */ false).await
+    }
+
     async fn build_stop_payload(&self, stop_hook_active: bool) -> event::HookPayload {
         let last_assistant_message = self
             .chat_state_handle
             .get_last_assistant_text_in_turn()
-            .await;
+            .await
+            .as_deref()
+            .map(event::clip_assistant_message);
         if self.startup_hints.is_subagent {
             event::HookPayload::SubagentStop {
                 phase: event::SubagentStopPhase::Gate,
@@ -258,13 +272,7 @@ impl SessionActor {
         } else {
             event::HookEventName::Stop
         };
-        let has_file_hooks = self
-            .hook_registry
-            .borrow()
-            .as_ref()
-            .is_some_and(|r| r.has_enabled_hooks_for_canonical(event));
-        let has_client_hooks = self.client_hooks.borrow().contains_key(&event);
-        if !has_file_hooks && !has_client_hooks {
+        if !self.has_enabled_hooks_for(event) {
             return StopGateDecision::AllowStop;
         }
         // At the cap no hook is consulted or notified for this forced stop,
@@ -280,6 +288,16 @@ impl SessionActor {
             .await;
             return StopGateDecision::AllowStop;
         }
+
+        // Claim before the hooks, not after: a turn already reported is being torn down, so the
+        // gate skips instead of running verification hooks for a turn the user cancelled.
+        let Some(claim) = self.turn_report.claim_for_gate() else {
+            tracing::debug!(
+                prompt_id,
+                "a cancel already reported this turn; the stop gate did not run"
+            );
+            return StopGateDecision::AllowStop;
+        };
 
         let payload = self.build_stop_payload(continuations_this_turn > 0).await;
         // Gate envelope via `make_hook_envelope`, not the observe-notify
@@ -303,6 +321,7 @@ impl SessionActor {
             self.emit_stop_results(event, prompt_id, &result.results)
                 .await;
             self.notify_client_hooks(&envelope);
+            commit_stop_report(claim, prompt_id);
             self.announce_force_stop(&prevent).await;
             return StopGateDecision::AllowStop;
         }
@@ -319,14 +338,25 @@ impl SessionActor {
         result.blocks.extend(client.blocks);
         result.additional_context.extend(client.additional_context);
         if let Some(prevent) = client.prevent_continuation {
+            commit_stop_report(claim, prompt_id);
             self.announce_force_stop(&prevent).await;
             return StopGateDecision::AllowStop;
         }
 
         if !result.wants_continuation() {
+            // A gate whose hooks all skipped or crashed told nobody the turn ended, so it
+            // releases the claim and a later cancel or failure can still report.
+            let any_hook_succeeded = all_results
+                .iter()
+                .any(|r| matches!(r, result::HookRunResult::Success { .. }));
+            if any_hook_succeeded {
+                commit_stop_report(claim, prompt_id);
+            }
             return StopGateDecision::AllowStop;
         }
 
+        // The turn has not ended, so a later interrupt must still be able to report it.
+        drop(claim);
         self.announce_keep_working(&result.blocks, &result.additional_context)
             .await;
         StopGateDecision::KeepWorking {

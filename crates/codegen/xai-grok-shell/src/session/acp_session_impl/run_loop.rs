@@ -32,12 +32,13 @@ mod yolo_toggle_report_tests {
 fn cleanup_session_scratch(_session: &SessionActor) {}
 /// SessionEnd hooks + stop dispatch. Shared so channel-closed and Shutdown
 /// cannot drift on hook ordering (memory save still runs after this).
-async fn fire_session_end_hooks(session: &SessionActor, reason: &str) {
+pub(super) async fn fire_session_end_hooks(session: &SessionActor, reason: &str) {
     let envelope = session.fire_hook(
         xai_grok_hooks::event::HookEventName::SessionEnd,
         None,
         xai_grok_hooks::event::HookPayload::SessionEnd {
             reason: reason.to_string(),
+            subagent_type: session.subagent_type_label(),
             turn_count: None,
             tool_call_count: None,
         },
@@ -182,6 +183,7 @@ pub(super) async fn run_session(
 ) {
     let (completion_tx, mut completion_rx) =
         mpsc::unbounded_channel::<(String, PromptTurnResult)>();
+    let mut turn_end_queue = super::turn_end_hooks::TurnEndQueue::spawn(session.clone());
     tracing::debug!("fs_notify_config: {:?}", fs_notify_config);
     let mut replay_buffer = ReplayBuffer::new(session.buffering_settings.clone());
     let event_tx_for_flush_timer = session.event_tx.clone();
@@ -450,7 +452,11 @@ pub(super) async fn run_session(
                         // Completion channel closed: full feedback teardown so
                         // final signal sync + upload drain still run (cancel
                         // alone no longer force-syncs — shutdown owns that).
+                        // No session-end hooks here, but the flush still has to precede
+                        // `shutdown_workflows`, which makes a queued report's entry durable.
+                        turn_end_queue.flush().await;
                         shutdown_workflows(&session).await;
+                        turn_end_queue.drain().await;
                         finish_session_exit_feedback(&session).await;
                         return;
                     };
@@ -535,7 +541,9 @@ pub(super) async fn run_session(
                 maybe_cmd = cmd_rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
                         // ── session_end (channel-closed path) ────────
-                        // Hooks fire BEFORE memory auto-save per plan contract.
+                        // Queued reports first, so an earlier turn's report precedes the
+                        // session-end `Stop`. Hooks fire BEFORE memory auto-save per plan contract.
+                        turn_end_queue.flush().await;
                         fire_session_end_hooks(&session, "channel_closed").await;
                         session
                             .run_session_end_memory_pipeline(
@@ -560,6 +568,7 @@ pub(super) async fn run_session(
                             }
                         }
                         shutdown_workflows(&session).await;
+                        turn_end_queue.drain().await;
                         finish_session_exit_feedback(&session).await;
                         return;
                     };
@@ -1009,7 +1018,7 @@ pub(super) async fn run_session(
                             // that prior success. Cancel targets the current turn;
                             // under show-until-replaced the prior line should still
                             // finish. New real prompts and rewind abort separately.
-                            let barrier = session.cancel_running_task(options).await;
+                            let cancel = session.cancel_running_task(options).await;
 
                             // Auto-pause the active goal on any cancel so timers stop
                             // and the pager shows "paused" instead of "active".
@@ -1027,12 +1036,15 @@ pub(super) async fn run_session(
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                             // An armed barrier must outlive the cancel; only
                             // a clear one lets queued notifications drain.
-                            if barrier == super::tasks_cancel::WakeBarrier::Clear {
+                            if cancel.barrier == super::tasks_cancel::WakeBarrier::Clear {
                                 SessionActor::maybe_drain_notifications(
                                     session.clone(),
                                     completion_tx.clone(),
                                 )
                                 .await;
+                            }
+                            if cancel.turn_stopped {
+                                session.emit_session_idle_if_idle().await;
                             }
                         }
                         SessionCommand::CompactSession { user_context, respond_to } => {
@@ -2228,8 +2240,8 @@ pub(super) async fn run_session(
                             // This arm returns; an unanswered turn would race
                             // teardown and report `EndTurn` for unfinished work.
                             if kind == crate::session::ShutdownKind::CancelRunningTurn {
-                                // Shutdown is not a stop gesture; the barrier
-                                // stays clear.
+                                // Shutdown is not a stop gesture: the
+                                // session-end `Stop` reports this teardown.
                                 let _ = session
                                     .cancel_running_task(crate::session::CancelOptions {
                                         cancel_subagents: true,
@@ -2252,10 +2264,12 @@ pub(super) async fn run_session(
 
                             // ── session_end (shutdown path) ────────────
                             // Hooks fire BEFORE memory auto-save per plan contract.
+                            turn_end_queue.flush().await;
                             fire_session_end_hooks(&session, "shutdown").await;
                             session
                                 .run_session_end_memory_pipeline("session summary saved")
                                 .await;
+                            turn_end_queue.drain().await;
                             finish_session_exit_feedback(&session).await;
                             return;
                         }

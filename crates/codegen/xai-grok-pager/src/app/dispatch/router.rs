@@ -90,8 +90,8 @@ use super::settings::setters::{
     set_custom_model_env_key, set_custom_model_id, set_custom_model_name,
     set_custom_model_provider, set_custom_model_save, set_custom_model_slug, set_deepseek_api_key,
     set_default_model, set_default_selected_permission, set_display_refresh_auto_cadence,
-    set_enter_steers, set_fireworks_api_key, set_fork_secondary_model, set_group_tool_verbs,
-    set_hunk_tracker_mode, set_image_generation_provider, set_invert_scroll,
+    set_enter_steers, set_fireworks_api_key, set_follow_up_behavior, set_fork_secondary_model,
+    set_group_tool_verbs, set_hunk_tracker_mode, set_image_generation_provider, set_invert_scroll,
     set_keep_text_selection, set_kimi_api_endpoint, set_kimi_api_key, set_local_feature_flag,
     set_max_thoughts_width, set_memory_model, set_meta_api_key, set_multiline_mode,
     set_opencode_go_api_key, set_opencode_go_enabled_models, set_page_flip_on_send,
@@ -459,6 +459,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             expected_version,
             new_text,
         } => queue::dispatch_queue_interject_shared(app, id, expected_version, new_text),
+        Action::RunEditedQueuedCommand {
+            local_id,
+            server,
+            text,
+        } => queue::dispatch_run_edited_queued_command(app, local_id, server, text),
         Action::FocusPrompt => {
             with_active_agent(app, |agent| {
                 agent.set_active_pane(ActivePane::Prompt, false);
@@ -1142,6 +1147,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetPageFlipOnSend(v) => set_page_flip_on_send(app, v),
         Action::SetConfirmBeforeRewind(v) => set_confirm_before_rewind(app, v),
         Action::SetCombineQueuedPrompts(v) => set_combine_queued_prompts(app, v),
+        Action::SetFollowUpBehavior(v) => set_follow_up_behavior(app, v),
         Action::SetEnterSteers(v) => set_enter_steers(app, v),
         Action::SetSimpleMode(v) => set_simple_mode(app, v),
         Action::SetContextualHintUndo(v) => set_contextual_hint_undo(app, v),

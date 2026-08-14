@@ -157,6 +157,12 @@ struct Args {
     /// without `--daemonize`.
     #[arg(long, default_value = daemonize::DEFAULT_PIDFILE_PATH)]
     pid_file: PathBuf,
+    /// Record `workspace_oom_protect_applied`, lower or recheck `oom_score_adj`
+    /// to -900, and force `GROK_TOOLS_RESET_CHILD_OOM` so shell/pty children
+    /// reset to 0. Complements always-on self-protect after pre-unshare
+    /// inheritance; arms child reset even if the early write failed. Off by default.
+    #[arg(long)]
+    oom_protect: bool,
     #[command(flatten)]
     preview: PreviewCliArgs,
 }
@@ -253,10 +259,6 @@ fn main() -> anyhow::Result<()> {
         None => std::env::current_dir()?,
     };
     let oom_protection = xai_tty_utils::protect_from_oom_kill();
-    #[cfg(unix)]
-    if oom_protection.is_ok() {
-        unsafe { std::env::set_var(xai_tty_utils::RESET_CHILD_OOM_ENV, "1") };
-    }
     let _pidfile_guard = if args.daemonize {
         let anchor = |p: PathBuf| if p.is_absolute() { p } else { cwd.join(p) };
         args.log_file = anchor(std::mem::take(&mut args.log_file));
@@ -274,14 +276,44 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let oom_protect_applied = if args.oom_protect {
+        Some(daemonize::apply_workspace_oom_protect())
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    if should_set_reset_child_oom(oom_protection.is_ok(), args.oom_protect) {
+        unsafe { std::env::set_var(xai_tty_utils::RESET_CHILD_OOM_ENV, "1") };
+    }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .worker_threads(xai_tty_utils::runtime::capped_worker_threads().get())
         .enable_all();
     let rt = xai_tty_utils::runtime::build_with_blocking_pool(&mut builder)?;
-    rt.block_on(run(args, cwd, oom_protection))
+    rt.block_on(run(args, cwd, oom_protection, oom_protect_applied))
 }
-async fn run(args: Args, cwd: PathBuf, oom_protection: std::io::Result<()>) -> anyhow::Result<()> {
+/// Whether to arm `GROK_TOOLS_RESET_CHILD_OOM` after the always-on protect attempt.
+///
+/// Always-on success must arm so children do not inherit -900. `--oom-protect`
+/// forces the env even when the early write failed (pre-unshare may still have
+/// left the score at -900).
+fn should_set_reset_child_oom(early_protect_ok: bool, oom_protect_flag: bool) -> bool {
+    early_protect_ok || oom_protect_flag
+}
+/// Whether the startup log should report OOM protection as active.
+///
+/// Prefer the `--oom-protect` apply outcome when present (already-at-target after
+/// pre-unshare counts as active even if the early write failed). Without the
+/// flag, report the always-on write only.
+fn oom_protect_log_active(applied: Option<bool>, early_ok: bool) -> bool {
+    applied.unwrap_or(early_ok)
+}
+async fn run(
+    args: Args,
+    cwd: PathBuf,
+    oom_protection: std::io::Result<()>,
+    oom_protect_applied: Option<bool>,
+) -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -293,9 +325,12 @@ async fn run(args: Args, cwd: PathBuf, oom_protection: std::io::Result<()>) -> a
         .with(tracing_subscriber::fmt::layer())
         .with(donating.clone())
         .init();
-    match &oom_protection {
-        Ok(()) => tracing::info!("kernel OOM-kill protection active"),
-        Err(e) => tracing::info!(error = %e, "kernel OOM-kill protection not active"),
+    if oom_protect_log_active(oom_protect_applied, oom_protection.is_ok()) {
+        tracing::info!("kernel OOM-kill protection active");
+    } else if let (None, Err(e)) = (oom_protect_applied, &oom_protection) {
+        tracing::info!(error = %e, "kernel OOM-kill protection not active");
+    } else {
+        tracing::info!("kernel OOM-kill protection not active");
     }
     let direct_otlp = match std::env::var("GROK_WORKSPACE_OTLP_ENDPOINT") {
         Ok(endpoint) if !endpoint.is_empty() => {
@@ -788,12 +823,32 @@ mod tests {
     fn daemonize_defaults_are_inert() {
         let args = Args::try_parse_from(["xai-workspace-server"]).unwrap();
         assert!(!args.daemonize);
+        assert!(!args.oom_protect);
         assert_eq!(args.log_file, PathBuf::from(daemonize::DEFAULT_LOG_PATH));
         assert_eq!(
             args.pid_file,
             PathBuf::from(daemonize::DEFAULT_PIDFILE_PATH)
         );
         assert_eq!(args.ready_file, None);
+    }
+    #[test]
+    fn should_set_reset_child_oom_truth_table() {
+        assert!(!should_set_reset_child_oom(false, false));
+        assert!(should_set_reset_child_oom(true, false));
+        assert!(should_set_reset_child_oom(false, true));
+        assert!(should_set_reset_child_oom(true, true));
+    }
+    #[test]
+    fn oom_protect_log_active_truth_table() {
+        assert!(oom_protect_log_active(Some(true), false));
+        assert!(!oom_protect_log_active(Some(false), true));
+        assert!(oom_protect_log_active(None, true));
+        assert!(!oom_protect_log_active(None, false));
+    }
+    #[test]
+    fn oom_protect_flag_parses() {
+        let args = Args::try_parse_from(["xai-workspace-server", "--oom-protect"]).unwrap();
+        assert!(args.oom_protect);
     }
     #[test]
     fn ready_file_is_accepted_as_a_deprecated_no_op() {

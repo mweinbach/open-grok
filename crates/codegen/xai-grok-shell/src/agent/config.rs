@@ -693,6 +693,8 @@ pub struct Requirements {
     pub write_file: Constrained<bool>,
     /// Voice dictation (STT). Pin via requirements/managed `[features] voice_mode`.
     pub voice_mode: Constrained<bool>,
+    /// The session search index. Pin via requirements/managed `[features] session_search`.
+    pub session_search: Constrained<bool>,
     pub sandbox_auto_allow_bash: Constrained<bool>,
     pub sandbox_profile: Constrained<String>,
     pub respect_gitignore: Constrained<bool>,
@@ -1996,6 +1998,11 @@ const NON_SERDE_CONFIG_PATHS: &[&str] = &[
     crate::util::config::REMOTE_FETCH_CONFIG_PATH,
     crate::util::config::SLASH_COMMAND_TAGS_CONFIG_PATH,
 ];
+/// [`NON_SERDE_CONFIG_PATHS`] plus the multi-path groups.
+fn is_non_serde_config_path(path: &str) -> bool {
+    NON_SERDE_CONFIG_PATHS.contains(&path)
+        || crate::util::config::WEB_SEARCH_DOMAIN_CONFIG_PATHS.contains(&path)
+}
 /// Parse `[auth_provider.<name>]` tables leniently: a malformed entry warns
 /// (surfaced by `grok inspect`) and is skipped, so it fails closed for the
 /// models referencing it instead of failing the whole config.
@@ -2108,7 +2115,7 @@ impl Config {
                     let top_level = path.split('.').next().unwrap_or(path);
                     user_table.contains_key(top_level)
                 })
-                .filter(|path| !NON_SERDE_CONFIG_PATHS.contains(&path.as_str()))
+                .filter(|path| !is_non_serde_config_path(path))
                 .collect(),
             None => Vec::new(),
         };
@@ -2657,7 +2664,10 @@ impl Config {
                 .doom_loop_recovery
                 .window_tokens
                 .or(remote.and_then(|s| s.window_tokens))
-                .map_or(Policy::DEFAULT_RECOVERY_WINDOW_TOKENS, Policy::clamp_window_tokens),
+                .map_or(
+                    Policy::DEFAULT_RECOVERY_WINDOW_TOKENS,
+                    Policy::clamp_window_tokens,
+                ),
         })
     }
     /// Automatic worktree GC policy. Precedence: env kill/dry-run >
@@ -2731,6 +2741,18 @@ impl Config {
         let ff = self.remote_settings.as_ref().and_then(|s| s.session_recap);
         BoolFlag::env("GROK_SESSION_RECAP")
             .config(self.features.session_recap)
+            .feature_flag(ff)
+            .default(true)
+            .resolve()
+    }
+    /// Session search index. Default ON. Turn off with a `requirements.toml` or MDM pin, the
+    /// `GROK_SESSION_SEARCH` env var, the `[features] session_search` config key, or remote
+    /// settings, in that order. Only a pin outranks the environment.
+    pub(crate) fn resolve_session_search(&self) -> Resolved<bool> {
+        let ff = self.remote_settings.as_ref().and_then(|s| s.session_search);
+        BoolFlag::env("GROK_SESSION_SEARCH")
+            .requirement(self.requirements.session_search.pinned())
+            .config(self.features.session_search)
             .feature_flag(ff)
             .default(true)
             .resolve()
@@ -5367,6 +5389,10 @@ pub struct Features {
     /// `None` = defer to remote settings / env / default (`true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_recap: Option<bool>,
+    /// Full-text index of past sessions, behind `/load` deep search. `None` = defer to remote
+    /// settings / env / default (`true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_search: Option<bool>,
     /// Per-turn dashboard summary generated at turn end.
     /// `None` = defer to remote settings / env / default (`true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10680,6 +10706,61 @@ reasoning_effort = "low"
     }
     #[test]
     #[serial]
+    fn resolve_session_search_precedence() {
+        fn resolved(apply: fn(&mut Config)) -> (bool, ConfigSource) {
+            let mut cfg = Config::default();
+            apply(&mut cfg);
+            let gate = cfg.resolve_session_search();
+            (gate.value, gate.source)
+        }
+        fn remote_off(cfg: &mut Config) {
+            cfg.remote_settings = Some(crate::util::config::RemoteSettings {
+                session_search: Some(false),
+                ..Default::default()
+            });
+        }
+        {
+            let _env = EnvGuard::unset("GROK_SESSION_SEARCH");
+            assert_eq!(resolved(|_| {}), (true, ConfigSource::Default));
+            assert_eq!(resolved(remote_off), (false, ConfigSource::Remote));
+            assert_eq!(
+                resolved(|cfg| {
+                    remote_off(cfg);
+                    cfg.features.session_search = Some(true);
+                }),
+                (true, ConfigSource::Config),
+                "config.toml beats remote settings",
+            );
+        }
+        {
+            let _env = EnvGuard::set("GROK_SESSION_SEARCH", "0");
+            assert_eq!(
+                resolved(|cfg| cfg.features.session_search = Some(true)),
+                (false, ConfigSource::Env),
+                "env beats config.toml",
+            );
+        }
+        {
+            let _env = EnvGuard::set("GROK_SESSION_SEARCH", "1");
+            assert_eq!(
+                resolved(|cfg| cfg.features.session_search = Some(false)),
+                (true, ConfigSource::Env),
+                "env beats config.toml in both directions",
+            );
+            assert_eq!(
+                resolved(|cfg| {
+                    cfg.features.session_search = Some(false);
+                    cfg.requirements
+                        .session_search
+                        .pin(false, crate::config::RequirementSource::Unknown);
+                }),
+                (false, ConfigSource::Requirement),
+                "a requirements pin beats env, so a tenant cannot switch it back on",
+            );
+        }
+    }
+    #[test]
+    #[serial]
     fn resolve_session_recap_defaults_to_true_when_unset() {
         unsafe { std::env::remove_var("GROK_SESSION_RECAP") };
         let cfg = Config::default();
@@ -12303,6 +12384,33 @@ agent_type = "cursor"
             unused.iter().any(|k| k == "features.not_a_real_feature"),
             "real typos still surface: {unused:?}"
         );
+    }
+    /// `[toolset.web_search]`'s domain keys are read from the raw layers, not from
+    /// `ShellToolsetConfig::web_search` (a `SamplerConfig`), so the scan must not
+    /// call the documented settings typos.
+    #[test]
+    fn web_search_domain_keys_are_not_reported_unused() {
+        for key in ["allowed_domains", "excluded_domains"] {
+            let unused = unused_keys_from_toml(&format!(
+                r#"
+                [toolset.web_search]
+                {key} = ["docs.x.ai"]
+                not_a_real_key = true
+            "#
+            ));
+            assert!(
+                !unused
+                    .iter()
+                    .any(|k| k == &format!("toolset.web_search.{key}")),
+                "toolset.web_search.{key} must not be treated as a typo: {unused:?}"
+            );
+            assert!(
+                unused
+                    .iter()
+                    .any(|k| k == "toolset.web_search.not_a_real_key"),
+                "real typos in the same section still surface: {unused:?}"
+            );
+        }
     }
     #[test]
     fn config_warns_on_field_typos() {

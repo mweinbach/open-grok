@@ -1063,9 +1063,9 @@ impl WorkspaceOp for PutFilesReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        ws.put_files(self.files.clone()).await
+        ws.put_files(session_id, self.files.clone()).await
     }
 }
 #[async_trait]
@@ -1073,9 +1073,9 @@ impl WorkspaceOp for GetFilesReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        ws.get_files(self.files.clone()).await
+        ws.get_files(session_id, self.files.clone()).await
     }
 }
 #[async_trait]
@@ -1083,9 +1083,9 @@ impl WorkspaceOp for ClientFsListReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        crate::file_system::client_fs::list(ws, self).await
+        crate::file_system::client_fs::list(ws, session_id, self).await
     }
 }
 #[async_trait]
@@ -1093,9 +1093,9 @@ impl WorkspaceOp for ClientFsStatReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        crate::file_system::client_fs::stat(ws, self).await
+        crate::file_system::client_fs::stat(ws, session_id, self).await
     }
 }
 #[async_trait]
@@ -1103,9 +1103,9 @@ impl WorkspaceOp for ClientFsReadFileReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        crate::file_system::client_fs::read_file(ws, self).await
+        crate::file_system::client_fs::read_file(ws, session_id, self).await
     }
 }
 /// Resolve the index root for a code-nav op. Prefers the explicit per-session
@@ -2157,6 +2157,7 @@ mod tests {
                 E::SessionEnd => HookEventNameWire::SessionEnd,
                 E::Stop => HookEventNameWire::Stop,
                 E::StopFailure => HookEventNameWire::StopFailure,
+                E::StopCancelled => HookEventNameWire::StopCancelled,
                 E::PreToolUse => HookEventNameWire::PreToolUse,
                 E::PostToolUse => HookEventNameWire::PostToolUse,
                 E::PostToolUseFailure => HookEventNameWire::PostToolUseFailure,
@@ -2175,6 +2176,7 @@ mod tests {
             E::SessionEnd,
             E::Stop,
             E::StopFailure,
+            E::StopCancelled,
             E::PreToolUse,
             E::PostToolUse,
             E::PostToolUseFailure,

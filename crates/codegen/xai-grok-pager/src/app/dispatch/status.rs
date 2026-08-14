@@ -436,7 +436,8 @@ pub(super) fn dispatch_show_cache(app: &mut AppView) -> Vec<Effect> {
                 push_and_page_flip(
                     &mut agent.scrollback,
                     RenderBlock::system(
-                        "Prompt cache telemetry is unavailable until the session starts.".to_string(),
+                        "Prompt cache telemetry is unavailable until the session starts."
+                            .to_string(),
                     ),
                 );
             }

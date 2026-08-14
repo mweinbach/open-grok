@@ -143,6 +143,7 @@ async fn handle_scheduled_task_removed(
             session_id: config.session_id.clone(),
             update: crate::extensions::notification::SessionUpdate::ScheduledTaskDeleted {
                 task_id: removed.task_id,
+                reason: removed.reason,
             },
             meta: meta.map(serde_json::Value::Object),
         };

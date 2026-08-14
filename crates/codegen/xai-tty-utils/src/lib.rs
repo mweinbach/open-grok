@@ -1012,7 +1012,13 @@ fn is_wsl_from_inputs(env: &HashMap<String, String>, osrelease: Option<&str>) ->
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// Serializes process-global `/proc/self/oom_score_adj` mutation across tests.
+    #[cfg(target_os = "linux")]
+    static TEST_OOM_SCORE_ADJ_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn detach_command_does_not_panic() {
@@ -1067,6 +1073,11 @@ mod tests {
     /// `CAP_SYS_RESOURCE`).
     #[cfg(target_os = "linux")]
     fn child_oom_score_under(hook: fn() -> io::Result<()>) -> Option<String> {
+        // Hold for the full lower/spawn/restore window so parallel cargo test
+        // cannot interleave sibling score mutations (same pattern as workspace-daemon).
+        let _score_guard = TEST_OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let own = std::fs::read_to_string("/proc/self/oom_score_adj").expect("read own score");
         let restore = own.trim().to_owned();
         if std::fs::write("/proc/self/oom_score_adj", b"-500\n").is_err() {

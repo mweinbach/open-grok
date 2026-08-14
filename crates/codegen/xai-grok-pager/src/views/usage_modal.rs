@@ -217,7 +217,10 @@ pub fn handle_usage_modal_mouse(
         }
         MouseEventKind::Down(crossterm::event::MouseButton::Left)
             if state.session_id_rect.is_some_and(|r| {
-                column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+                column >= r.x
+                    && column < r.x.saturating_add(r.width)
+                    && row >= r.y
+                    && row < r.y.saturating_add(r.height)
             }) =>
         {
             UsageModalOutcome::CopySessionId

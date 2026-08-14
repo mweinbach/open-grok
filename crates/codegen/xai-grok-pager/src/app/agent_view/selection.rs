@@ -1,4 +1,4 @@
-//! Scrollback text/block selection: click counting, word/line select,
+//! Scrollback text/block selection: click counting, word/paragraph select,
 //! drag latches, drag autoscroll ticks, and selection-highlight timers.
 
 use super::{
@@ -1220,9 +1220,138 @@ impl AgentView {
         }
     }
 
+    /// Select the logical line (paragraph or list item) at `hit`.
+    ///
+    /// The run is bounded to a single pre-wrap logical line: prose paragraphs
+    /// collapse soft breaks into one logical line, so this takes the whole
+    /// wrapped paragraph, while each list item (and each hard-broken source
+    /// line) is its own logical line, so triple-click on a bullet takes just
+    /// that item, not the whole list. Soft-wrap continuation rows carry a
+    /// `joiner_to_previous`; a `None` joiner marks a new logical line and bounds
+    /// the run. A single-line run delegates to [`Self::select_line_at`].
+    pub(in crate::app) fn select_paragraph_at(&mut self, hit: &RangeHit) {
+        // Resolve the run's first/last rendered lines under an immutable
+        // borrow, then release it before mutating selection state.
+        let resolved = {
+            let model = self.selection_model_for_hit(hit);
+            let Some(range) = model.range(hit.entry_idx, hit.range_id) else {
+                return;
+            };
+            let Some(click_pos) = range
+                .lines
+                .iter()
+                .position(|line| line.block_line_idx == hit.block_line_idx)
+            else {
+                return;
+            };
+
+            // `b` is a soft-wrap continuation of `a` (same logical line): the two
+            // are adjacent and `b` carries a joiner. A `None` joiner starts a new
+            // logical line (new paragraph, list item, or source line) and bounds
+            // the run. Reads go through `.get()`, so an out-of-range neighbor just
+            // ends the walk instead of panicking; `click_pos` is valid and
+            // start/end only move inward-to-outward from it.
+            let continues = |a: usize, b: usize| match (range.lines.get(a), range.lines.get(b)) {
+                (Some(a), Some(b)) => {
+                    a.block_line_idx + 1 == b.block_line_idx && b.joiner_to_previous.is_some()
+                }
+                _ => false,
+            };
+            let mut start = click_pos;
+            while start > 0 && continues(start - 1, start) {
+                start -= 1;
+            }
+            let mut end = click_pos;
+            while continues(end, end + 1) {
+                end += 1;
+            }
+
+            // Bounds-checked reads; `None` only if the model shifted under us,
+            // in which case the caller falls back to the single clicked line.
+            match (range.lines.get(start), range.lines.get(end)) {
+                (Some(first), Some(last)) => Some((
+                    first.block_line_idx,
+                    last.block_line_idx,
+                    last.selectable_cols
+                        .end
+                        .saturating_sub(last.selectable_cols.start),
+                )),
+                _ => None,
+            }
+        };
+
+        // Degrade to the single clicked line if the run could not be resolved,
+        // which never panics and is still a valid selection.
+        let Some((first_block_line_idx, last_block_line_idx, last_width)) = resolved else {
+            self.select_line_at(hit);
+            return;
+        };
+
+        // A single-line paragraph is exactly the clicked line, so reuse the
+        // tested full-line copy path (boundary-aware).
+        if first_block_line_idx == last_block_line_idx {
+            self.select_line_at(hit);
+            return;
+        }
+        if last_width == 0 {
+            return;
+        }
+
+        let model = self.selection_model_for_hit(hit);
+        let drag = ActiveTextDrag {
+            anchor: RangeHit {
+                entry_idx: hit.entry_idx,
+                range_id: hit.range_id,
+                block_line_idx: first_block_line_idx,
+                col_within_range: 0,
+            },
+            head: RangeHit {
+                entry_idx: hit.entry_idx,
+                range_id: hit.range_id,
+                block_line_idx: last_block_line_idx,
+                col_within_range: last_width.saturating_sub(1),
+            },
+            kind: SelectionKind::Linear,
+            anchor_content_width: None,
+        };
+        let clipboard_text = if hit.entry_idx == BTW_OVERLAY_ENTRY_IDX {
+            reconstruct_selection_text(model, &drag)
+        } else {
+            reconstruct_selection_text_with_boundaries(
+                model,
+                &self.last_scrollback_selection_boundaries,
+                &drag,
+            )
+        };
+
+        self.persistent_text_selection = Some(PersistentTextSelection {
+            entry_idx: hit.entry_idx,
+            range_id: hit.range_id,
+            anchor: SelectionEndpoint {
+                block_line_idx: first_block_line_idx,
+                col_within_range: 0,
+            },
+            head: SelectionEndpoint {
+                block_line_idx: last_block_line_idx,
+                col_within_range: last_width.saturating_sub(1),
+            },
+            origin: SelectionOrigin::TripleClick,
+            kind: SelectionKind::Linear,
+        });
+        self.selection_created_at = Some(Instant::now());
+
+        if let Some(text) = clipboard_text.filter(|text| !text.is_empty()) {
+            self.copy_to_clipboard_debounced(&text);
+        }
+
+        if hit.entry_idx != BTW_OVERLAY_ENTRY_IDX {
+            self.scrollback.set_selected(Some(hit.entry_idx));
+        }
+    }
+
     /// Select and copy the whole table cell at `hit`, wrapped fragments
     /// included. `false` when there is no cell there (no grid, or a column
-    /// outside it) — the caller falls back to line selection.
+    /// outside it), so the caller falls back to paragraph selection.
     pub(in crate::app) fn select_cell_at(&mut self, hit: &RangeHit) -> bool {
         let Some(geometry) = self.compute_drag_table_geometry(hit) else {
             return false;
@@ -1389,6 +1518,137 @@ mod tests {
             },
             anchor_content_width: None,
         }
+    }
+
+    /// Build an agent whose scrollback selection model holds a single range
+    /// with the given `(block_line_idx, text, joiner_to_previous)` lines. A
+    /// `None` joiner starts a new logical line; `Some` marks a soft-wrap
+    /// continuation of the previous line.
+    fn agent_with_range_lines(lines: &[(usize, &str, Option<&str>)]) -> AgentView {
+        let mut agent = make_agent();
+        let mut model = ResolvedSelectionModel::default();
+        for (bl, text, joiner) in lines {
+            model.push_line(ResolvedSelectableLine {
+                entry_idx: 0,
+                range_id: 0,
+                block_line_idx: *bl,
+                screen_y: *bl as u16,
+                screen_x: 0,
+                selectable_cols: 0..text.len() as u16,
+                text: (*text).to_string(),
+                joiner_to_previous: joiner.map(str::to_string),
+            });
+        }
+        agent.update_scrollback_selection_state(model, Default::default());
+        agent
+    }
+
+    /// Triple-click on a soft-wrapped prose paragraph selects the whole wrapped
+    /// logical line (continuation rows carry a joiner) and stops at the next
+    /// logical line.
+    #[test]
+    fn select_paragraph_at_selects_soft_wrapped_logical_line() {
+        // One paragraph wrapped across rows 0,1,2 (row 0 starts it; 1 and 2 are
+        // soft-wrap continuations). Row 3 starts the next paragraph.
+        let mut agent = agent_with_range_lines(&[
+            (0, "alpha one", None),
+            (1, "alpha two", Some(" ")),
+            (2, "alpha three", Some(" ")),
+            (3, "bravo one", None),
+        ]);
+
+        agent.select_paragraph_at(&RangeHit {
+            entry_idx: 0,
+            range_id: 0,
+            block_line_idx: 1, // a continuation row
+            col_within_range: 0,
+        });
+
+        let sel = agent
+            .persistent_text_selection
+            .expect("paragraph selection persists");
+        assert_eq!(sel.origin, SelectionOrigin::TripleClick);
+        assert_eq!(sel.kind, SelectionKind::Linear);
+        assert_eq!(
+            sel.anchor.block_line_idx, 0,
+            "extends to the paragraph start"
+        );
+        assert_eq!(
+            sel.head.block_line_idx, 2,
+            "stops at the next logical line, not into the following paragraph"
+        );
+    }
+
+    /// Triple-click on a tight bullet list selects only the clicked item, not
+    /// the whole list: each item is its own logical line (joiner `None`).
+    #[test]
+    fn select_paragraph_at_on_bullet_selects_only_that_item() {
+        let mut agent = agent_with_range_lines(&[
+            (0, "\u{2022} item one", None),
+            (1, "\u{2022} item two", None),
+            (2, "\u{2022} item three", None),
+        ]);
+
+        agent.select_paragraph_at(&RangeHit {
+            entry_idx: 0,
+            range_id: 0,
+            block_line_idx: 1,
+            col_within_range: 0,
+        });
+
+        let sel = agent.persistent_text_selection.expect("selection persists");
+        assert_eq!(sel.anchor.block_line_idx, 1, "only the clicked bullet");
+        assert_eq!(
+            sel.head.block_line_idx, 1,
+            "does not extend to sibling bullets"
+        );
+    }
+
+    /// A wrapped bullet (its continuation carries a joiner) selects the whole
+    /// item, but not the sibling bullets on either side.
+    #[test]
+    fn select_paragraph_at_on_wrapped_bullet_selects_the_item_only() {
+        let mut agent = agent_with_range_lines(&[
+            (0, "\u{2022} first", None),
+            (1, "\u{2022} second is long", None),
+            (2, "and wraps", Some(" ")),
+            (3, "\u{2022} third", None),
+        ]);
+
+        agent.select_paragraph_at(&RangeHit {
+            entry_idx: 0,
+            range_id: 0,
+            block_line_idx: 1, // start of the wrapped bullet
+            col_within_range: 0,
+        });
+
+        let sel = agent
+            .persistent_text_selection
+            .expect("paragraph selection persists");
+        assert_eq!(sel.anchor.block_line_idx, 1, "starts at the clicked bullet");
+        assert_eq!(
+            sel.head.block_line_idx, 2,
+            "includes the wrap but stops before the next bullet"
+        );
+    }
+
+    /// A single-line logical run selects exactly that line (delegates to the
+    /// existing line-select path).
+    #[test]
+    fn select_paragraph_at_single_line_selects_only_that_line() {
+        let mut agent = agent_with_range_lines(&[(1, "solo", None)]);
+
+        agent.select_paragraph_at(&RangeHit {
+            entry_idx: 0,
+            range_id: 0,
+            block_line_idx: 1,
+            col_within_range: 0,
+        });
+
+        let sel = agent.persistent_text_selection.expect("selection persists");
+        assert_eq!(sel.origin, SelectionOrigin::TripleClick);
+        assert_eq!(sel.anchor.block_line_idx, 1);
+        assert_eq!(sel.head.block_line_idx, 1);
     }
 
     #[test]

@@ -19,6 +19,17 @@ use crate::config::SamplerConfig;
 /// Process-level fallback for the `x-grok-client-identifier` header.
 const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 pub(crate) const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+/// Codex session-affinity headers (codex-rs `build_session_headers`).
+///
+/// The ChatGPT Codex backend activates per-conversation prompt caching only
+/// when a session identity header accompanies the body's `prompt_cache_key`;
+/// with the body key alone, every request only hits the globally shared
+/// instruction-prefix cache (verified empirically against
+/// `/backend-api/codex/responses`: identical back-to-back requests report
+/// `cached_tokens: 0` without these headers and a full prefix hit with them).
+pub(crate) const CODEX_SESSION_ID_HEADER: &str = "session-id";
+pub(crate) const CODEX_THREAD_ID_HEADER: &str = "thread-id";
+pub(crate) const CODEX_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 
 pub(crate) const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
 pub(crate) const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
@@ -148,11 +159,25 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
         builder: RequestBuilder,
         headers: ProviderRequestHeaders<'_>,
     ) -> RequestBuilder {
+        let builder = self.apply_session_affinity_headers(builder, Some(headers.session_id));
         if self.profile().request_metadata == RequestMetadataPolicy::XGrokHeaders {
             headers.apply_x_grok(builder)
         } else {
             builder
         }
+    }
+
+    /// Apply the provider's session identity headers for prompt-cache
+    /// affinity. No-op for providers whose backends do not key caching on a
+    /// session identity (xAI uses `x-grok-session-id` via the request
+    /// metadata policy instead).
+    fn apply_session_affinity_headers(
+        &self,
+        builder: RequestBuilder,
+        session_id: Option<&str>,
+    ) -> RequestBuilder {
+        let _ = session_id;
+        builder
     }
 
     /// Apply provider-owned request constraints after shared defaults. Most
@@ -315,6 +340,25 @@ pub struct CodexProvider;
 impl ProviderAdapter for CodexProvider {
     fn provider(&self) -> ModelProvider {
         ModelProvider::Codex
+    }
+
+    /// codex-rs sends `session-id`, `thread-id`, and `x-client-request-id`
+    /// (all derived from the stable thread id) on every Responses request.
+    /// The backend requires one of the session identity headers before it
+    /// serves the per-conversation prompt cache keyed by `prompt_cache_key`,
+    /// so Open Grok maps its stable session id onto all three.
+    fn apply_session_affinity_headers(
+        &self,
+        builder: RequestBuilder,
+        session_id: Option<&str>,
+    ) -> RequestBuilder {
+        let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
+            return builder;
+        };
+        builder
+            .header(CODEX_SESSION_ID_HEADER, session_id)
+            .header(CODEX_THREAD_ID_HEADER, session_id)
+            .header(CODEX_CLIENT_REQUEST_ID_HEADER, session_id)
     }
 }
 

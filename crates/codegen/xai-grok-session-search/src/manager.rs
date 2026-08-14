@@ -21,14 +21,17 @@ use crate::bootstrap::{
     has_completed_bootstrap_marker, try_bootstrap_with_lease,
 };
 use crate::db::{
-    HealAwareLogCounter, log_session_index_failure, search_db_path, with_search_index,
+    HealAwareLogCounter, log_session_index_failure, search_db_path, search_index_exists,
+    with_search_index, with_search_index_blocking,
 };
 use crate::doc::{UpsertOutcome, build_session_doc, upsert_unless_unchanged};
 use crate::fts::{META_KEY_BOOTSTRAP_CLAIM, META_KEY_LAST_BOOTSTRAP, SessionSearchRow};
 #[cfg(test)]
 use crate::fts::{META_KEY_SCHEMA_VERSION, SessionSearchIndex};
 use crate::recovery;
-use crate::source::{ContentExtractor, IndexableSession, SessionSource, SessionSourceFactory};
+use crate::source::{
+    ContentExtractor, IndexEnabled, IndexableSession, SessionSource, SessionSourceFactory,
+};
 
 const SEARCH_INDEX_DEBOUNCE_MS: u64 = 500;
 const BOOTSTRAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -54,6 +57,17 @@ pub struct SessionSearchResponse {
     /// Also true when a live claim exists without a completion marker, so a
     /// peer mid-rebuild or a dead claimant within its lease is visible.
     pub bootstrapping: bool,
+}
+
+impl SessionSearchResponse {
+    fn empty() -> Self {
+        Self {
+            results: Vec::new(),
+            next_offset: None,
+            total_estimate: Some(0),
+            bootstrapping: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -87,11 +101,11 @@ struct WorkerContext {
     progress: Arc<BootstrapProgress>,
     source_factory: SessionSourceFactory,
     extract: ContentExtractor,
+    enabled: IndexEnabled,
 }
 
 impl WorkerContext {
-    /// Same eager-flag-then-send as [`SearchIndexManager::bootstrap_once`],
-    /// reachable from inside a worker.
+    /// Requeue from inside a worker. `handle_job` re-reads the switch when the job arrives.
     fn bootstrap_once(&self, root: PathBuf) {
         self.progress.begin_bootstrapping();
         let _ = self.tx.send(SearchManagerCmd::BootstrapOnce { root });
@@ -105,6 +119,7 @@ impl WorkerContext {
 pub struct SearchIndexManager {
     tx: mpsc::UnboundedSender<SearchManagerCmd>,
     progress: Arc<BootstrapProgress>,
+    enabled: IndexEnabled,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -120,9 +135,14 @@ pub struct SearchIndexStatus {
 }
 
 impl SearchIndexManager {
-    /// Start the dispatcher. `source_factory` opens the session store for a
-    /// grok home, and `extract` pulls searchable text out of one transcript.
-    pub fn start(source_factory: SessionSourceFactory, extract: ContentExtractor) -> Self {
+    /// Start the dispatcher. `source_factory` opens the session store for a grok home, `extract`
+    /// pulls searchable text out of one transcript, and `enabled` reports whether this process
+    /// may keep an index, which it is asked at each decision (see [`IndexEnabled`]).
+    pub fn start(
+        source_factory: SessionSourceFactory,
+        extract: ContentExtractor,
+        enabled: IndexEnabled,
+    ) -> Self {
         let progress = Arc::new(BootstrapProgress::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<SearchManagerCmd>();
         let context = Arc::new(WorkerContext {
@@ -130,6 +150,7 @@ impl SearchIndexManager {
             progress: Arc::clone(&progress),
             source_factory,
             extract,
+            enabled,
         });
 
         tokio::spawn(async move {
@@ -165,13 +186,20 @@ impl SearchIndexManager {
             }
         });
 
-        Self { tx, progress }
+        Self {
+            tx,
+            progress,
+            enabled,
+        }
     }
 
-    /// Queue a bootstrap of all sessions (idempotent per root; repeat calls
-    /// re-verify the on-disk marker). Sets `bootstrapping` eagerly so
-    /// pollers see `true` before the background task starts.
+    /// Queue a bootstrap of all sessions (idempotent per root; repeat calls re-verify the
+    /// on-disk marker). Sets `bootstrapping` eagerly so pollers see `true` before the background
+    /// task starts. Does nothing while the index is switched off.
     pub fn bootstrap_once(&self, root: PathBuf) {
+        if !(self.enabled)() {
+            return;
+        }
         self.progress.begin_bootstrapping();
         let _ = self.tx.send(SearchManagerCmd::BootstrapOnce { root });
     }
@@ -186,8 +214,11 @@ impl SearchIndexManager {
         }
     }
 
-    /// Queue an index update for a single session.
+    /// Queue an index update for a single session. Does nothing while the index is switched off.
     pub fn enqueue(&self, root: PathBuf, session_id: String, cwd: String) {
+        if !(self.enabled)() {
+            return;
+        }
         let key = SessionSearchKey { session_id, cwd };
         let _ = self.tx.send(SearchManagerCmd::Enqueue {
             root,
@@ -224,14 +255,12 @@ pub async fn execute_search(
     root_dir: &Path,
     req: &SessionSearchRequest,
 ) -> io::Result<SessionSearchResponse> {
+    if !(manager.enabled)() {
+        return Ok(SessionSearchResponse::empty());
+    }
     let query = req.query.trim();
     if query.is_empty() {
-        return Ok(SessionSearchResponse {
-            results: Vec::new(),
-            next_offset: None,
-            total_estimate: Some(0),
-            bootstrapping: false,
-        });
+        return Ok(SessionSearchResponse::empty());
     }
 
     manager.bootstrap_once(root_dir.to_path_buf());
@@ -243,6 +272,9 @@ pub async fn execute_search(
             break;
         }
         tokio::time::sleep(BOOTSTRAP_POLL_INTERVAL).await;
+    }
+    if !(manager.enabled)() {
+        return Ok(SessionSearchResponse::empty());
     }
     let db_path = search_db_path(root_dir);
     let cwd = req.cwd.clone();
@@ -274,6 +306,23 @@ pub async fn execute_search(
         total_estimate: query_result.total_estimate,
         bootstrapping: healed || manager.progress.is_bootstrapping() || claim_in_flight,
     })
+}
+
+/// Remove one session from an index built earlier. Ignores the switch, because a delete must land
+/// whether or not this process still indexes. Best effort: a failure is logged, not returned, and
+/// the row waits for the next bootstrap, which only runs if search is on again.
+pub async fn evict_session(root_dir: &Path, session_id: &str) {
+    if !search_index_exists(root_dir) {
+        return;
+    }
+    let id = session_id.to_string();
+    let deleted = with_search_index_blocking(&search_db_path(root_dir), move |index| {
+        index.delete_doc(&id)
+    })
+    .await;
+    if let Err(e) = deleted {
+        log_session_index_failure(session_id, &e, "failed to remove session from search index");
+    }
 }
 
 async fn run_worker(
@@ -325,8 +374,20 @@ async fn handle_job(
             pending.insert(key, Instant::now() + debounce);
         }
         SearchIndexJob::BootstrapAll => {
+            // Take the guard first so the bootstrapping flag clears even when we decline.
             let _bootstrapping = BootstrappingGuard::new(&context.progress);
-            match bootstrap_with_lease(root_dir, source, context.extract, &context.progress).await {
+            if !(context.enabled)() {
+                return;
+            }
+            match bootstrap_with_lease(
+                root_dir,
+                source,
+                context.extract,
+                context.enabled,
+                &context.progress,
+            )
+            .await
+            {
                 Ok(BootstrapOutcome::Done) => {}
                 Ok(BootstrapOutcome::RunAgain) => {
                     context.bootstrap_once(root_dir.to_path_buf());
@@ -341,6 +402,9 @@ async fn handle_job(
         }
         SearchIndexJob::RecheckBootstrap => {
             let _bootstrapping = BootstrappingGuard::new(&context.progress);
+            if !(context.enabled)() {
+                return;
+            }
             match has_completed_bootstrap_marker(root_dir).await {
                 Some(true) => {}
                 Some(false) => {
@@ -351,6 +415,7 @@ async fn handle_job(
                         root_dir,
                         source,
                         context.extract,
+                        context.enabled,
                         &context.progress,
                     )
                     .await
@@ -385,6 +450,10 @@ async fn flush_ready(
     context: &WorkerContext,
     pending: &mut HashMap<SessionSearchKey, Instant>,
 ) {
+    if !(context.enabled)() {
+        pending.clear();
+        return;
+    }
     let now = Instant::now();
     let ready: Vec<SessionSearchKey> = pending
         .iter()
@@ -412,7 +481,7 @@ async fn upsert_by_key(
     // `None` is a deleted session; a read failure surfaces as `Err` and
     // leaves the existing index row alone.
     match source.load_session(&key.session_id, &key.cwd).await? {
-        Some(session) => upsert_session(root_dir, &session, context.extract)
+        Some(session) => upsert_session(root_dir, &session, context.extract, context.enabled)
             .await
             .map(|_| ()),
         None => delete_session(root_dir, &key.session_id).await,
@@ -423,6 +492,7 @@ async fn upsert_session(
     root_dir: &Path,
     session: &IndexableSession,
     extract: ContentExtractor,
+    enabled: IndexEnabled,
 ) -> io::Result<UpsertOutcome> {
     let (content, bytes_read) = if let Some(updates_path) = session.updates_path.clone() {
         tokio::task::spawn_blocking(move || extract(&updates_path))
@@ -431,6 +501,10 @@ async fn upsert_session(
     } else {
         return Ok(UpsertOutcome::NoContent);
     };
+    // The read above takes seconds, long enough for the switch to close under it.
+    if !enabled() {
+        return Ok(UpsertOutcome::Declined);
+    }
     let doc = build_session_doc(session, content);
     let db_path = search_db_path(root_dir);
 
@@ -456,6 +530,8 @@ async fn delete_session(root_dir: &Path, session_id: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::{index_off, index_on};
+    use std::sync::atomic::AtomicBool;
 
     /// Permission bits (`mode & 0o777`) of `path`, for owner-only assertions.
     #[cfg(unix)]
@@ -487,10 +563,24 @@ mod tests {
         Ok((String::new(), 0))
     }
 
+    fn session_is_indexed(root: &Path, query: &str) -> bool {
+        !with_search_index(&search_db_path(root), |index| {
+            index.query(query, None, 10, 0, false)
+        })
+        .unwrap()
+        .results
+        .is_empty()
+    }
+
     fn test_manager() -> SearchIndexManager {
+        manager_with(index_on)
+    }
+
+    fn manager_with(enabled: IndexEnabled) -> SearchIndexManager {
         SearchIndexManager::start(
             |_root| -> Box<dyn SessionSource> { Box::new(EmptySource) },
             no_content,
+            enabled,
         )
     }
 
@@ -616,6 +706,7 @@ mod tests {
             progress: Arc::new(BootstrapProgress::default()),
             source_factory: |_root| -> Box<dyn SessionSource> { Box::new(EmptySource) },
             extract: no_content,
+            enabled: index_on,
         };
         let mut pending: HashMap<SessionSearchKey, Instant> = HashMap::new();
 
@@ -666,6 +757,144 @@ mod tests {
             index.get_content_hash("stub").unwrap(),
             None,
             "the upgrade drop must clear stub rows so their stale hashes cannot block re-indexing"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_off_skips_the_bootstrap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = manager_with(index_off);
+
+        manager.bootstrap_once(tmp.path().to_path_buf());
+
+        assert!(!manager.progress.is_bootstrapping());
+    }
+
+    #[tokio::test]
+    async fn search_off_answers_without_creating_an_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = manager_with(index_off);
+        let req = SessionSearchRequest {
+            query: "anything".to_string(),
+            cwd: None,
+            limit: 10,
+            offset: 0,
+            include_content: false,
+        };
+
+        let resp = execute_search(&manager, tmp.path(), &req).await.unwrap();
+
+        assert!(resp.results.is_empty());
+        assert!(
+            !search_index_exists(tmp.path()),
+            "answering a query must not create the index",
+        );
+    }
+
+    /// The marker probe opens the database, so a recheck that arrives after the switch closed
+    /// has to decline before it asks.
+    #[tokio::test]
+    async fn search_off_rechecks_nothing_and_creates_no_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let context = WorkerContext {
+            tx,
+            progress: Arc::new(BootstrapProgress::default()),
+            source_factory: |_root| -> Box<dyn SessionSource> { Box::new(EmptySource) },
+            extract: no_content,
+            enabled: index_off,
+        };
+        let mut pending = HashMap::new();
+
+        for job in [
+            SearchIndexJob::BootstrapAll,
+            SearchIndexJob::RecheckBootstrap,
+        ] {
+            handle_job(
+                tmp.path(),
+                &EmptySource,
+                &context,
+                &mut pending,
+                job,
+                Duration::from_millis(0),
+            )
+            .await;
+        }
+
+        assert!(!search_index_exists(tmp.path()));
+    }
+
+    /// Reading a transcript takes long enough for the switch to close under it, so the write that
+    /// follows must decline rather than report the session as indexed.
+    #[tokio::test]
+    async fn a_switch_that_closes_during_the_read_declines_the_write() {
+        static OPEN: AtomicBool = AtomicBool::new(true);
+        fn switchable() -> bool {
+            OPEN.load(Ordering::Relaxed)
+        }
+        fn close_while_reading(_path: &Path) -> io::Result<(String, u64)> {
+            OPEN.store(false, Ordering::Relaxed);
+            Ok(("body".to_string(), 4))
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut session = test_session("s1", "/ws", "title");
+        session.updates_path = Some(tmp.path().join("updates.jsonl"));
+
+        let outcome = upsert_session(tmp.path(), &session, close_while_reading, switchable)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, UpsertOutcome::Declined));
+        assert!(!search_index_exists(tmp.path()), "nothing may be written");
+    }
+
+    #[tokio::test]
+    async fn search_off_drops_queued_writes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let context = WorkerContext {
+            tx,
+            progress: Arc::new(BootstrapProgress::default()),
+            source_factory: |_root| -> Box<dyn SessionSource> { Box::new(EmptySource) },
+            extract: no_content,
+            enabled: index_off,
+        };
+        let mut pending = HashMap::from([(
+            SessionSearchKey {
+                session_id: "s1".to_string(),
+                cwd: "/ws".to_string(),
+            },
+            Instant::now() + Duration::from_secs(60),
+        )]);
+
+        flush_ready(tmp.path(), &EmptySource, &context, &mut pending).await;
+
+        assert!(
+            pending.is_empty(),
+            "a queued write is dropped, not held until search comes back on",
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_removes_the_row_and_never_creates_the_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        evict_session(root, "s1").await;
+        assert!(!search_index_exists(root), "no index may be created");
+
+        let doc = crate::doc::build_session_doc(
+            &test_session("s1", "/ws", "a memorable title"),
+            "indexed body text".to_string(),
+        );
+        with_search_index(&search_db_path(root), |index| index.upsert_doc(&doc)).unwrap();
+        assert!(session_is_indexed(root, "a memorable title"));
+
+        evict_session(root, "s1").await;
+
+        assert!(
+            !session_is_indexed(root, "a memorable title"),
+            "a delete must land even with the index switched off",
         );
     }
 }

@@ -52,6 +52,10 @@ pub(super) fn subagent_activity_label(child_view: &AgentView) -> Option<String> 
 /// Synthesize a finish for a stuck row when a kill found nothing live to stop
 /// (else `pending_kill` times out → "running"). `status` is the real terminal
 /// status for an already-finished orphan, else `"cancelled"`.
+///
+/// When the child had already finished, the retained terminal status wins over
+/// the call's default (`cancelled`) so a failed child is not repainted as
+/// cancelled while still carrying its failure text.
 pub(crate) fn finalize_killed_subagent(
     app: &mut AppView,
     session_id: &acp::SessionId,
@@ -64,32 +68,39 @@ pub(crate) fn finalize_killed_subagent(
     let Some(agent) = app.agents.get(&agent_id) else {
         return false;
     };
-    // Idempotency: skip if already finished.
-    let Some(child_session_id) = agent
+    let Some(info) = agent
         .subagent_sessions
         .values()
-        .find(|i| i.subagent_id.as_ref() == subagent_id && !i.finished)
-        .map(|i| i.child_session_id.to_string())
+        .find(|info| info.subagent_id.as_ref() == subagent_id)
     else {
         return false;
+    };
+    let child_session_id = info.child_session_id.to_string();
+    let was_finished = info.finished;
+    let (effective_status, error, tool_calls, turns, duration_ms, tokens_used) = if was_finished {
+        (
+            info.status.as_deref().unwrap_or(status).to_owned(),
+            info.error.as_deref().map(str::to_owned),
+            info.tool_calls.unwrap_or(0),
+            info.turns.unwrap_or(0),
+            info.duration_ms.unwrap_or(0),
+            info.tokens_used.unwrap_or(0),
+        )
+    } else {
+        (status.to_owned(), None, 0, 0, 0, 0)
     };
 
     let payload = SessionNotification {
         session_id: session_id.clone(),
         update: XaiSessionUpdate::SubagentFinished {
             subagent_id: subagent_id.to_string(),
-            child_session_id,
-            // An already-finished orphan may be "failed", but the cancel response
-            // carries no failure reason (lost across the resume window), so
-            // `error` stays None.
-            status: status.to_string(),
-            error: None,
-            tool_calls: 0,
-            turns: 0,
-            // Real run time is unknown for an already-gone orphan (the row's
-            // started_at is stamped at resume, not the real spawn), so emit 0.
-            duration_ms: 0,
-            tokens_used: 0,
+            child_session_id: child_session_id.clone(),
+            status: effective_status,
+            error,
+            tool_calls,
+            turns,
+            duration_ms,
+            tokens_used,
             output: None,
             will_wake: false,
         },
@@ -98,6 +109,7 @@ pub(crate) fn finalize_killed_subagent(
     let Ok(params) = serde_json::value::to_raw_value(&payload) else {
         return false;
     };
+
     let notif = acp::ExtNotification::new("x.ai/session/update", params.into());
-    handle_ext_notification(&notif, app)
+    handle_session_notification_with_origin(&notif, app, LifecycleOrigin::Reconciliation)
 }
