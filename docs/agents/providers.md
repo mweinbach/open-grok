@@ -64,6 +64,16 @@ requires alongside it. Z AI accepts standard client function tools,
 does not provide native hosted web search, and must not receive xAI credentials,
 private metadata, or xAI-only exports.
 
+Live `/models` objects are `{id, object, created, owned_by}` only — there is
+no `context_window`, `context_length`, or `max_model_len`. Open Grok assigns
+curated windows by case-insensitive prefix (most-specific first): `glm-5.2`
+→ 1_000_000 (max completion 131072); `glm-4-32b` or any id containing `128k`
+→ 128_000; other `glm-5`, `glm-4.7`, `glm-4.6`, `glm-4.5`, and `glm-4` ids
+→ 200_000; unknown ids → 200_000. A positive wire context field, if the
+endpoint ever sends one, wins over the curated value. After a live Z AI (or
+Wafer) catalog replace, user `[model.*]` / `cfg.config_models` are re-applied
+so custom entries and field overrides survive.
+
 ## Layer map (paths)
 
 ```text

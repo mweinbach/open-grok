@@ -1196,6 +1196,47 @@ impl ModelsManager {
         }
     }
 
+    pub(crate) fn list_custom_models(&self) -> Vec<crate::custom_models::CustomModelPublicRecord> {
+        self.inner
+            .cfg
+            .read()
+            .config_models
+            .iter()
+            .map(|(key, model)| crate::custom_models::override_to_public(key, model))
+            .collect()
+    }
+
+    pub(crate) fn apply_custom_model_override(
+        &self,
+        key: String,
+        model: crate::agent::config::ConfigModelOverride,
+    ) {
+        let mut cfg = self.inner.cfg.read().clone();
+        cfg.config_models.insert(key, model);
+        self.apply_config(cfg);
+    }
+
+    pub(crate) fn apply_custom_model_delete(&self, key: &str) {
+        let mut cfg = self.inner.cfg.read().clone();
+        cfg.config_models.shift_remove(key);
+        self.apply_config(cfg);
+    }
+
+    pub(crate) async fn upsert_custom_model(
+        &self,
+        record: crate::custom_models::CustomModelRecord,
+    ) -> anyhow::Result<Option<String>> {
+        let (record, model, warning) = crate::util::config::upsert_custom_model(record).await?;
+        self.apply_custom_model_override(record.key, model);
+        Ok(warning)
+    }
+
+    pub(crate) async fn delete_custom_model(&self, key: &str) -> anyhow::Result<()> {
+        crate::util::config::delete_custom_model(key).await?;
+        self.apply_custom_model_delete(key);
+        Ok(())
+    }
+
     pub fn opencode_go_models(&self) -> Vec<OpenCodeGoModelDescriptor> {
         self.inner
             .opencode_go_catalog
@@ -2662,3 +2703,56 @@ pub(crate) use resolution::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod custom_model_manager_tests {
+    use super::*;
+    use crate::agent::config::ConfigModelOverride;
+    use crate::auth::GrokComConfig;
+    use std::sync::Arc;
+
+    fn isolated_manager() -> (tempfile::TempDir, ModelsManager) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+        let mgr = ModelsManagerBuilder::new(
+            None,
+            IndexMap::new(),
+            acp::ModelId::new("default"),
+            auth_manager,
+            config::Config::default(),
+        )
+        .cache(ModelsCacheManager {
+            path: tmp.path().join(MODELS_CACHE_FILE),
+            ttl: CACHE_TTL,
+        })
+        .build();
+        (tmp, mgr)
+    }
+
+    #[test]
+    fn apply_and_list_custom_models_never_echo_api_key() {
+        let (_tmp, mgr) = isolated_manager();
+        mgr.apply_custom_model_override(
+            "my-ollama".into(),
+            ConfigModelOverride {
+                model: Some("llama".into()),
+                name: Some("Local Llama".into()),
+                context_window: Some(128_000),
+                api_key: Some("sk-secret".into()),
+                ..ConfigModelOverride::default()
+            },
+        );
+        let listed = mgr.list_custom_models();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "my-ollama");
+        assert_eq!(listed[0].model, "llama");
+        assert_eq!(listed[0].name.as_deref(), Some("Local Llama"));
+        assert_eq!(listed[0].context_window, Some(128_000));
+        assert!(listed[0].has_api_key);
+        let json = serde_json::to_value(&listed[0]).unwrap();
+        assert!(json.get("api_key").is_none());
+
+        mgr.apply_custom_model_delete("my-ollama");
+        assert!(mgr.list_custom_models().is_empty());
+    }
+}

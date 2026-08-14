@@ -444,6 +444,226 @@ pub(in crate::app::dispatch) fn refresh_opencode_go_models(app: &mut AppView) ->
     }]
 }
 
+static CUSTOM_MODELS_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn next_custom_models_generation() -> u64 {
+    CUSTOM_MODELS_GENERATION
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        .wrapping_add(1)
+        .max(1)
+}
+
+pub(in crate::app::dispatch) fn current_custom_models_generation() -> u64 {
+    CUSTOM_MODELS_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn update_open_custom_model_draft(
+    app: &mut AppView,
+    update: impl Fn(&mut crate::settings::PagerLocalSnapshot),
+) {
+    use crate::views::modal::ActiveModal;
+    for agent in app.agents.values_mut() {
+        let state = match agent.active_modal.as_mut() {
+            Some(ActiveModal::Settings { state }) => Some(state.as_mut()),
+            Some(ActiveModal::ResetSettingsConfirm { settings_state, .. }) => {
+                Some(settings_state.as_mut())
+            }
+            _ => None,
+        };
+        if let Some(state) = state {
+            update(&mut state.pager_snapshot);
+        }
+    }
+    if let Some(state) = app
+        .dashboard
+        .as_mut()
+        .and_then(|dashboard| dashboard.settings_modal.as_mut())
+    {
+        update(&mut state.pager_snapshot);
+    }
+}
+
+fn optional_draft_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+pub(in crate::app::dispatch) fn set_custom_model_id(
+    app: &mut AppView,
+    value: String,
+) -> Vec<Effect> {
+    update_open_custom_model_draft(app, |snapshot| snapshot.custom_model_id = value.clone());
+    vec![]
+}
+
+pub(in crate::app::dispatch) fn set_custom_model_slug(
+    app: &mut AppView,
+    value: String,
+) -> Vec<Effect> {
+    update_open_custom_model_draft(app, |snapshot| snapshot.custom_model_slug = value.clone());
+    vec![]
+}
+
+pub(in crate::app::dispatch) fn set_custom_model_name(
+    app: &mut AppView,
+    value: String,
+) -> Vec<Effect> {
+    update_open_custom_model_draft(app, |snapshot| snapshot.custom_model_name = value.clone());
+    vec![]
+}
+
+pub(in crate::app::dispatch) fn set_custom_model_provider(
+    app: &mut AppView,
+    value: String,
+) -> Vec<Effect> {
+    let canonical = crate::settings::canonical_custom_model_provider(&value).to_owned();
+    update_open_custom_model_draft(app, |snapshot| {
+        snapshot.custom_model_provider = canonical.clone();
+    });
+    vec![]
+}
+
+pub(in crate::app::dispatch) fn set_custom_model_base_url(
+    app: &mut AppView,
+    value: String,
+) -> Vec<Effect> {
+    update_open_custom_model_draft(app, |snapshot| {
+        snapshot.custom_model_base_url = value.clone();
+    });
+    vec![]
+}
+
+pub(in crate::app::dispatch) fn set_custom_model_context_window(
+    app: &mut AppView,
+    value: i64,
+) -> Vec<Effect> {
+    let clamped = value.clamp(
+        crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_MIN,
+        crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_MAX,
+    );
+    update_open_custom_model_draft(app, |snapshot| {
+        snapshot.custom_model_context_window = clamped;
+    });
+    vec![]
+}
+
+pub(in crate::app::dispatch) fn set_custom_model_backend(
+    app: &mut AppView,
+    value: String,
+) -> Vec<Effect> {
+    let canonical = crate::settings::canonical_custom_model_backend(&value).to_owned();
+    update_open_custom_model_draft(app, |snapshot| {
+        snapshot.custom_model_backend = canonical.clone();
+    });
+    vec![]
+}
+
+pub(in crate::app::dispatch) fn set_custom_model_env_key(
+    app: &mut AppView,
+    value: String,
+) -> Vec<Effect> {
+    update_open_custom_model_draft(app, |snapshot| {
+        snapshot.custom_model_env_key = value.clone()
+    });
+    vec![]
+}
+
+fn custom_model_draft_from_open(app: &AppView) -> Option<crate::settings::PagerLocalSnapshot> {
+    use crate::views::modal::ActiveModal;
+    for agent in app.agents.values() {
+        match &agent.active_modal {
+            Some(ActiveModal::Settings { state })
+            | Some(ActiveModal::ResetSettingsConfirm {
+                settings_state: state,
+                ..
+            }) => return Some(state.pager_snapshot.clone()),
+            _ => {}
+        }
+    }
+    app.dashboard
+        .as_ref()
+        .and_then(|dashboard| dashboard.settings_modal.as_ref())
+        .map(|state| state.pager_snapshot.clone())
+}
+
+pub(in crate::app::dispatch) fn set_custom_model_save(
+    app: &mut AppView,
+    save: bool,
+) -> Vec<Effect> {
+    if !save {
+        update_open_custom_model_draft(app, |snapshot| snapshot.custom_model_save = false);
+        return vec![];
+    }
+    let Some(draft) = custom_model_draft_from_open(app) else {
+        app.show_toast("Open Settings → Models → Custom models to save a model");
+        return vec![];
+    };
+    let key = draft.custom_model_id.trim().to_owned();
+    let model = draft.custom_model_slug.trim().to_owned();
+    if key.is_empty() || model.is_empty() {
+        update_open_custom_model_draft(app, |snapshot| snapshot.custom_model_save = false);
+        app.show_toast("Enter a catalog key and model id before saving");
+        return vec![];
+    }
+    if !crate::settings::custom_model_key_is_valid(&key) {
+        update_open_custom_model_draft(app, |snapshot| snapshot.custom_model_save = false);
+        app.show_toast("✗ Catalog key must be a TOML table suffix (letters, digits, :, ., -, _)");
+        return vec![];
+    }
+    if !crate::settings::custom_model_slug_is_valid(&model) {
+        update_open_custom_model_draft(app, |snapshot| snapshot.custom_model_save = false);
+        app.show_toast("✗ Model id cannot be empty or contain newlines");
+        return vec![];
+    }
+    let generation = next_custom_models_generation();
+    update_open_custom_model_draft(app, |snapshot| snapshot.clear_custom_model_draft());
+    app.show_toast("Saving custom model…");
+    vec![Effect::UpsertCustomModel {
+        generation,
+        key,
+        model,
+        name: optional_draft_text(&draft.custom_model_name),
+        provider: optional_draft_text(&draft.custom_model_provider),
+        base_url: optional_draft_text(&draft.custom_model_base_url),
+        context_window: Some(draft.custom_model_context_window.max(1) as u64),
+        api_backend: optional_draft_text(&draft.custom_model_backend),
+        env_key: optional_draft_text(&draft.custom_model_env_key),
+    }]
+}
+
+pub(in crate::app::dispatch) fn delete_custom_model(app: &mut AppView, key: String) -> Vec<Effect> {
+    if key.trim().is_empty() {
+        return vec![];
+    }
+    update_open_custom_model_draft(app, |snapshot| {
+        snapshot.custom_models.retain(|model| model.key != key);
+    });
+    let cached = crate::settings::cached_custom_models()
+        .into_iter()
+        .filter(|model| model.key != key)
+        .collect();
+    crate::settings::store_cached_custom_models(cached);
+    let generation = next_custom_models_generation();
+    app.show_toast("Removing custom model…");
+    vec![Effect::DeleteCustomModel { generation, key }]
+}
+
+pub(in crate::app::dispatch) fn refresh_custom_models(_app: &mut AppView) -> Vec<Effect> {
+    vec![Effect::QueryCustomModels {
+        generation: current_custom_models_generation(),
+    }]
+}
+
+pub(in crate::app::dispatch) fn apply_custom_models_list(
+    app: &mut AppView,
+    models: Vec<crate::settings::CustomModelRecord>,
+) {
+    update_open_custom_model_draft(app, |snapshot| {
+        snapshot.custom_models = models.clone();
+    });
+}
+
 pub(in crate::app::dispatch) fn set_perplexity_web_search(
     app: &mut AppView,
     enabled: bool,

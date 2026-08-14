@@ -1,5 +1,19 @@
 //! Tests for settings setters, toggles, resets, and rollback.
 use super::*;
+
+#[test]
+fn dispatch_save_custom_model_without_id_or_slug_does_not_upsert() {
+    let mut app = test_app_with_agent();
+    let _ = dispatch(Action::OpenSettings, &mut app);
+    let effects = dispatch(Action::SetCustomModelSave(true), &mut app);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::UpsertCustomModel { .. })),
+        "empty id/slug must not emit UpsertCustomModel, got {effects:?}"
+    );
+}
+
 /// `Action::ToggleVimMode` flips the active agent's `vim_mode` field,
 /// updates the in-process pager cache so future agents pick it up
 /// via `load_vim_mode`, emits `Effect::PersistSetting` so the new
@@ -2015,6 +2029,37 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
                 },
                 app,
             );
+        }
+        "custom_models.list" => {}
+        "custom_model_id" => {
+            let _ = dispatch(Action::SetCustomModelId("tmp-key".to_owned()), app);
+        }
+        "custom_model_slug" => {
+            let _ = dispatch(Action::SetCustomModelSlug("tmp-model".to_owned()), app);
+        }
+        "custom_model_name" => {
+            let _ = dispatch(Action::SetCustomModelName("Tmp".to_owned()), app);
+        }
+        "custom_model_provider" => {
+            let _ = dispatch(Action::SetCustomModelProvider("zai".to_owned()), app);
+        }
+        "custom_model_base_url" => {
+            let _ = dispatch(
+                Action::SetCustomModelBaseUrl("https://example.invalid".to_owned()),
+                app,
+            );
+        }
+        "custom_model_context_window" => {
+            let _ = dispatch(Action::SetCustomModelContextWindow(300_000), app);
+        }
+        "custom_model_backend" => {
+            let _ = dispatch(Action::SetCustomModelBackend("responses".to_owned()), app);
+        }
+        "custom_model_env_key" => {
+            let _ = dispatch(Action::SetCustomModelEnvKey("TMP_API_KEY".to_owned()), app);
+        }
+        "custom_model_save" => {
+            let _ = dispatch(Action::SetCustomModelSave(true), app);
         }
         "toolset.x_search.enabled" => {
             let _ = dispatch(Action::SetXSearchEnabled(false), app);

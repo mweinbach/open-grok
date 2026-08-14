@@ -28,12 +28,14 @@ pub mod registry;
 mod secret;
 
 pub use registry::{
-    CodingDataSharingLock, DynamicEnumSource, DynamicMultiSelectSource, EnumChoice,
-    OwnedEnumChoice, OwnedMultiSelectChoice, PagerLocalSnapshot, SecretStatus, SettingCategory,
-    SettingKey, SettingKind, SettingMeta, SettingOwner, SettingValue, SettingsRegistry,
-    StringValidator, canonical_hunk_tracker_mode, canonical_kimi_api_endpoint,
+    CodingDataSharingLock, CustomModelRecord, DynamicEnumSource, DynamicMultiSelectSource,
+    EnumChoice, OwnedEnumChoice, OwnedMultiSelectChoice, PagerLocalSnapshot, SecretStatus,
+    SettingCategory, SettingKey, SettingKind, SettingMeta, SettingOwner, SettingValue,
+    SettingsRegistry, StringValidator, cached_custom_models, canonical_custom_model_backend,
+    canonical_custom_model_provider, canonical_hunk_tracker_mode, canonical_kimi_api_endpoint,
     canonical_screen_mode, canonical_voice_capture_mode, canonical_voice_stt_language,
-    current_value_for, default_value_for, dynamic_enum_choices, dynamic_multi_select_choices,
-    is_consent_chooser, is_local_feature_flag,
+    current_value_for, custom_model_key_is_valid, custom_model_slug_is_valid, default_value_for,
+    dynamic_enum_choices, dynamic_multi_select_choices, is_consent_chooser, is_local_feature_flag,
+    store_cached_custom_models,
 };
 pub use secret::SecretInput;

@@ -14,6 +14,7 @@ use crate::agent::config::{EnvKeys, ModelEntry, ModelInfo};
 use anyhow::{Context, anyhow};
 use indexmap::IndexMap;
 use serde::Deserialize;
+use std::num::NonZeroU64;
 use std::time::Duration;
 use url::Url;
 use xai_grok_sampling_types::{
@@ -106,6 +107,71 @@ fn is_known_reasoning_model(model_id: &str) -> bool {
         .any(|prefix| lower.starts_with(prefix))
 }
 
+/// Curated context window and optional max output. Prefix-matched
+/// (case-insensitive), most-specific first. `/models` does not currently
+/// return a window; these values come from Z.AI's published GLM docs.
+fn curated_limits(model_id: &str) -> (u64, Option<u32>) {
+    let lower = model_id.to_ascii_lowercase();
+    if lower.starts_with("glm-5.2") {
+        return (1_000_000, Some(131_072));
+    }
+    if lower.starts_with("glm-4-32b") || lower.contains("128k") {
+        return (128_000, None);
+    }
+    if lower.starts_with("glm-5")
+        || lower.starts_with("glm-4.7")
+        || lower.starts_with("glm-4.6")
+        || lower.starts_with("glm-4.5")
+        || lower.starts_with("glm-4")
+    {
+        return (200_000, None);
+    }
+    (200_000, None)
+}
+
+fn first_positive_context(
+    window: Option<u64>,
+    length: Option<u64>,
+    max_len: Option<u64>,
+) -> Option<u64> {
+    [window, length, max_len]
+        .into_iter()
+        .flatten()
+        .find(|&value| value > 0)
+}
+
+fn assigned_context_window(model_id: &str, wire_context: Option<u64>) -> NonZeroU64 {
+    let (curated, _) = curated_limits(model_id);
+    NonZeroU64::new(wire_context.filter(|&value| value > 0).unwrap_or(curated))
+        .unwrap_or_else(|| NonZeroU64::new(200_000).expect("non-zero Z AI fallback"))
+}
+
+fn log_catalog_refreshed(
+    entries: &IndexMap<String, ModelEntry>,
+    authoritative: bool,
+    wire_context_present: bool,
+) {
+    let models: Vec<serde_json::Value> = entries
+        .values()
+        .map(|entry| {
+            serde_json::json!({
+                "id": entry.info.model,
+                "context_window": entry.info.context_window.get(),
+            })
+        })
+        .collect();
+    crate::unified_log::info(
+        "Z AI model catalog refreshed",
+        None,
+        Some(serde_json::json!({
+            "count": entries.len(),
+            "authoritative": authoritative,
+            "wire_context_present": wire_context_present,
+            "models": models,
+        })),
+    );
+}
+
 /// Effort menu for GLM reasoning models. Z AI documents low/medium/high/max
 /// for `reasoning_effort`; high is the balanced default and max matches Z
 /// AI's quickstart for the hardest tasks.
@@ -151,6 +217,14 @@ fn zai_reasoning_efforts() -> Vec<ReasoningEffortOption> {
 }
 
 fn model_entry(model_id: &str, base_url: &str) -> ModelEntry {
+    model_entry_with_context(model_id, base_url, None)
+}
+
+fn model_entry_with_context(
+    model_id: &str,
+    base_url: &str,
+    wire_context: Option<u64>,
+) -> ModelEntry {
     let key = format!("zai:{model_id}");
     let mut info = ModelInfo::fallback(&key);
     info.id = Some(key);
@@ -160,6 +234,9 @@ fn model_entry(model_id: &str, base_url: &str) -> ModelEntry {
     info.api_backend = ApiBackend::ChatCompletions;
     info.provider = ModelProvider::Zai;
     info.tool_mode = Some(ToolMode::Direct);
+    info.context_window = assigned_context_window(model_id, wire_context);
+    let (_, max_completion_tokens) = curated_limits(model_id);
+    info.max_completion_tokens = max_completion_tokens;
     if is_known_reasoning_model(model_id) {
         // The menu is authoritative (gate + default derive from it), so the
         // legacy fallback ladder without `max` never applies to GLM.
@@ -200,6 +277,8 @@ fn fallback_entries(base_url: &str) -> IndexMap<String, ModelEntry> {
 pub(crate) struct ZaiModelsCatalog {
     entries: IndexMap<String, ModelEntry>,
     credential_fingerprint: Option<String>,
+    /// True when at least one `/models` row carried a positive context field.
+    wire_context_present: bool,
 }
 
 impl ZaiModelsCatalog {
@@ -207,6 +286,7 @@ impl ZaiModelsCatalog {
         Self {
             entries,
             credential_fingerprint: Some(credential_fingerprint(api_key)),
+            wire_context_present: false,
         }
     }
 
@@ -214,6 +294,7 @@ impl ZaiModelsCatalog {
         Self {
             entries: fallback_entries(base_url),
             credential_fingerprint: None,
+            wire_context_present: false,
         }
     }
 
@@ -268,7 +349,17 @@ impl ZaiModelsClient {
                     %error,
                     "Z AI models request failed; using curated fallback catalog"
                 );
-                ZaiModelsCatalog::fallback(&self.base_url)
+                crate::unified_log::warn(
+                    "Z AI models request failed; using curated fallback catalog",
+                    None,
+                    Some(serde_json::json!({
+                        "reason": "request_failed",
+                        "error": error.to_string(),
+                    })),
+                );
+                let catalog = ZaiModelsCatalog::fallback(&self.base_url);
+                log_catalog_refreshed(&catalog.entries, false, false);
+                catalog
             }
         }
     }
@@ -311,18 +402,41 @@ impl ZaiModelsClient {
             .json()
             .await
             .context("Z AI models response was invalid")?;
-        Ok(self.catalog_from_wire(wire, api_key))
+        let catalog = self.catalog_from_wire(wire, api_key);
+        if catalog.is_authoritative() {
+            log_catalog_refreshed(&catalog.entries, true, catalog.wire_context_present);
+        } else {
+            crate::unified_log::info(
+                "Z AI model catalog using curated fallback",
+                None,
+                Some(serde_json::json!({
+                    "reason": "empty_wire_response",
+                })),
+            );
+            log_catalog_refreshed(&catalog.entries, false, false);
+        }
+        Ok(catalog)
     }
 
     fn catalog_from_wire(&self, wire: ZaiModelsResponse, api_key: &str) -> ZaiModelsCatalog {
+        let mut wire_context_present = false;
         let entries: IndexMap<String, ModelEntry> = wire
             .data
             .into_iter()
-            .map(|model| model.id.trim().to_owned())
-            .filter(|id| !id.is_empty())
-            .map(|id| {
+            .filter_map(|model| {
+                let id = model.id.trim().to_owned();
+                if id.is_empty() {
+                    return None;
+                }
+                let wire_context = model.wire_context_window();
+                if wire_context.is_some() {
+                    wire_context_present = true;
+                }
                 let key = format!("zai:{id}");
-                (key, model_entry(&id, &self.base_url))
+                Some((
+                    key,
+                    model_entry_with_context(&id, &self.base_url, wire_context),
+                ))
             })
             .collect();
         if entries.is_empty() {
@@ -330,7 +444,9 @@ impl ZaiModelsClient {
             // fallback so the picker stays usable.
             ZaiModelsCatalog::fallback(&self.base_url)
         } else {
-            ZaiModelsCatalog::dynamic(entries, api_key)
+            let mut catalog = ZaiModelsCatalog::dynamic(entries, api_key);
+            catalog.wire_context_present = wire_context_present;
+            catalog
         }
     }
 }
@@ -351,6 +467,28 @@ struct ZaiModelsResponse {
 #[derive(Debug, Deserialize)]
 struct ZaiWireModel {
     id: String,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    max_model_len: Option<u64>,
+}
+
+impl ZaiWireModel {
+    #[cfg(test)]
+    fn from_id(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            context_window: None,
+            context_length: None,
+            max_model_len: None,
+        }
+    }
+
+    fn wire_context_window(&self) -> Option<u64> {
+        first_positive_context(self.context_window, self.context_length, self.max_model_len)
+    }
 }
 
 #[cfg(test)]
@@ -403,13 +541,9 @@ mod tests {
         let catalog = client.catalog_from_wire(
             ZaiModelsResponse {
                 data: vec![
-                    ZaiWireModel {
-                        id: " glm-5.2 ".to_owned(),
-                    },
-                    ZaiWireModel { id: "".to_owned() },
-                    ZaiWireModel {
-                        id: "glm-4.6".to_owned(),
-                    },
+                    ZaiWireModel::from_id(" glm-5.2 "),
+                    ZaiWireModel::from_id(""),
+                    ZaiWireModel::from_id("glm-4.6"),
                 ],
             },
             "catalog-key",
@@ -490,15 +624,9 @@ mod tests {
         let catalog = client.catalog_from_wire(
             ZaiModelsResponse {
                 data: vec![
-                    ZaiWireModel {
-                        id: "glm-5.2".to_owned(),
-                    },
-                    ZaiWireModel {
-                        id: "glm-4.6".to_owned(),
-                    },
-                    ZaiWireModel {
-                        id: "glm-ocr".to_owned(),
-                    },
+                    ZaiWireModel::from_id("glm-5.2"),
+                    ZaiWireModel::from_id("glm-4.6"),
+                    ZaiWireModel::from_id("glm-ocr"),
                 ],
             },
             "catalog-key",
@@ -529,6 +657,137 @@ mod tests {
             safe_error_excerpt("invalid zai-secret\nretry", "zai-secret"),
             "invalid [REDACTED] retry"
         );
+    }
+
+    #[test]
+    fn curated_windows_match_published_glm_docs() {
+        let catalog = ZaiModelsCatalog::fallback(ZAI_API_BASE_URL);
+        let entries = catalog.entries();
+        let glm_5_2 = &entries["zai:glm-5.2"];
+        assert_eq!(glm_5_2.info.context_window.get(), 1_000_000);
+        assert_eq!(glm_5_2.info.max_completion_tokens, Some(131_072));
+        assert!(glm_5_2.info.supports_reasoning_effort);
+        assert_eq!(glm_5_2.info.reasoning_efforts.len(), 4);
+        assert_eq!(glm_5_2.info.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(entries["zai:glm-5.1"].info.context_window.get(), 200_000);
+        assert_eq!(entries["zai:glm-4.6"].info.context_window.get(), 200_000);
+        assert_eq!(
+            entries["zai:glm-5-turbo"].info.context_window.get(),
+            200_000
+        );
+        assert_eq!(
+            entries["zai:glm-4-32b-0414-128k"].info.context_window.get(),
+            128_000
+        );
+        assert_eq!(entries["zai:glm-5.1"].info.max_completion_tokens, None);
+        assert_eq!(
+            entries["zai:glm-4-32b-0414-128k"]
+                .info
+                .max_completion_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn wire_context_length_wins_over_curated() {
+        let client = ZaiModelsClient::with_base_url(ZAI_API_BASE_URL);
+        let catalog = client.catalog_from_wire(
+            ZaiModelsResponse {
+                data: vec![
+                    ZaiWireModel {
+                        id: "glm-5.1".to_owned(),
+                        context_window: None,
+                        context_length: Some(400_000),
+                        max_model_len: None,
+                    },
+                    ZaiWireModel {
+                        id: "glm-5.2".to_owned(),
+                        context_window: Some(0),
+                        context_length: None,
+                        max_model_len: Some(750_000),
+                    },
+                    ZaiWireModel {
+                        id: "glm-4.6".to_owned(),
+                        context_window: Some(333_000),
+                        context_length: Some(111_000),
+                        max_model_len: Some(222_000),
+                    },
+                ],
+            },
+            "catalog-key",
+        );
+        let entries = catalog.entries();
+        assert_eq!(entries["zai:glm-5.1"].info.context_window.get(), 400_000);
+        assert_eq!(entries["zai:glm-5.2"].info.context_window.get(), 750_000);
+        assert_eq!(entries["zai:glm-4.6"].info.context_window.get(), 333_000);
+        // Wire overrides the window only; curated max output still applies.
+        assert_eq!(
+            entries["zai:glm-5.2"].info.max_completion_tokens,
+            Some(131_072)
+        );
+    }
+
+    #[test]
+    fn live_models_payload_without_context_fields_uses_curated() {
+        let wire: ZaiModelsResponse = serde_json::from_value(serde_json::json!({
+            "object": "list",
+            "data": [{
+                "id": "glm-5.2",
+                "object": "model",
+                "created": 0,
+                "owned_by": "zhipu"
+            }]
+        }))
+        .expect("live Z AI /models shape");
+        let client = ZaiModelsClient::with_base_url(ZAI_API_BASE_URL);
+        let catalog = client.catalog_from_wire(wire, "catalog-key");
+        let glm_5_2 = &catalog.entries()["zai:glm-5.2"];
+        assert_eq!(glm_5_2.info.context_window.get(), 1_000_000);
+        assert_eq!(glm_5_2.info.max_completion_tokens, Some(131_072));
+    }
+
+    #[test]
+    fn unknown_and_zero_wire_context_stay_at_200k() {
+        let client = ZaiModelsClient::with_base_url(ZAI_API_BASE_URL);
+        let catalog = client.catalog_from_wire(
+            ZaiModelsResponse {
+                data: vec![
+                    ZaiWireModel::from_id("mystery-model"),
+                    ZaiWireModel {
+                        id: "also-unknown".to_owned(),
+                        context_window: Some(0),
+                        context_length: Some(0),
+                        max_model_len: Some(0),
+                    },
+                ],
+            },
+            "catalog-key",
+        );
+        let entries = catalog.entries();
+        assert_eq!(
+            entries["zai:mystery-model"].info.context_window.get(),
+            200_000
+        );
+        assert_eq!(
+            entries["zai:also-unknown"].info.context_window.get(),
+            200_000
+        );
+        assert_eq!(
+            entries["zai:mystery-model"].info.max_completion_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn curated_prefix_match_is_case_insensitive_and_most_specific() {
+        assert_eq!(
+            curated_limits("GLM-5.2-preview"),
+            (1_000_000, Some(131_072))
+        );
+        assert_eq!(curated_limits("GLM-4-32B-0414-128K"), (128_000, None));
+        assert_eq!(curated_limits("custom-128k-local"), (128_000, None));
+        assert_eq!(curated_limits("glm-5.1"), (200_000, None));
+        assert_eq!(curated_limits("glm-ocr"), (200_000, None));
     }
 
     #[tokio::test]

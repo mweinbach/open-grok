@@ -339,6 +339,35 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs_and_wafer(
     wafer_catalog: Option<&crate::wafer_models::WaferModelsCatalog>,
     zai_catalog: Option<&crate::zai_models::ZaiModelsCatalog>,
 ) -> IndexMap<String, ModelEntry> {
+    resolve_model_catalog_with_live_provider_entries(
+        cfg,
+        prefetched,
+        codex_catalog,
+        kimi_catalog,
+        fireworks_catalog,
+        deepseek_catalog,
+        meta_catalog,
+        opencode_go_catalog,
+        wafer_catalog.map(crate::wafer_models::WaferModelsCatalog::entries),
+        zai_catalog.map(crate::zai_models::ZaiModelsCatalog::entries),
+    )
+}
+
+/// Same merge as [`resolve_model_catalog_with_provider_catalogs_and_wafer`],
+/// taking already-materialized Wafer/Z AI entries so tests do not need the
+/// provider catalog wrappers (those keep their constructors crate-private).
+fn resolve_model_catalog_with_live_provider_entries(
+    cfg: &config::Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    codex_catalog: Option<&CodexModelsCatalog>,
+    kimi_catalog: Option<&KimiModelsCatalog>,
+    fireworks_catalog: Option<&FireworksModelsCatalog>,
+    deepseek_catalog: Option<&DeepSeekModelsCatalog>,
+    meta_catalog: Option<&MetaModelsCatalog>,
+    opencode_go_catalog: Option<&OpenCodeGoModelsCatalog>,
+    wafer_entries: Option<IndexMap<String, ModelEntry>>,
+    zai_entries: Option<IndexMap<String, ModelEntry>>,
+) -> IndexMap<String, ModelEntry> {
     let codex_entries = codex_catalog.map(CodexModelsCatalog::entries);
     let codex_authoritative = codex_catalog.is_some_and(CodexModelsCatalog::is_authoritative);
     let kimi_entries = kimi_catalog.map(KimiModelsCatalog::entries);
@@ -372,18 +401,22 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs_and_wafer(
             opencode_go_authoritative,
         );
 
-    if let Some(wafer_catalog) = wafer_catalog {
+    if let Some(wafer_entries) = wafer_entries {
         catalog.retain(|_, entry| {
             entry.info.provider != xai_grok_sampling_types::ModelProvider::Wafer
         });
-        catalog.extend(wafer_catalog.entries());
+        catalog.extend(wafer_entries);
     }
 
-    if let Some(zai_catalog) = zai_catalog {
+    if let Some(zai_entries) = zai_entries {
         catalog
             .retain(|_, entry| entry.info.provider != xai_grok_sampling_types::ModelProvider::Zai);
-        catalog.extend(zai_catalog.entries());
+        catalog.extend(zai_entries);
     }
+
+    // Live Wafer/Z AI catalogs replace that provider's partition. Re-apply
+    // `[model.*]` so user custom/override entries win after the replace.
+    apply_config_model_overrides(cfg, &mut catalog);
 
     let enabled_open_code_go = cfg
         .models
@@ -456,6 +489,102 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs_and_wafer(
     }
 
     catalog
+}
+
+/// Re-apply `[model.*]` / `cfg.config_models` with the same semantics as the
+/// loop in `resolve_model_list`: new keys are inserted, existing keys are
+/// overlaid via [`config::ConfigModelOverride::apply`].
+fn apply_config_model_overrides(cfg: &config::Config, catalog: &mut IndexMap<String, ModelEntry>) {
+    if cfg.config_models.is_empty() {
+        return;
+    }
+    for (key, model_override) in &cfg.config_models {
+        let had_base = catalog.contains_key(key);
+        let base = catalog.shift_remove(key);
+        if !had_base {
+            tracing::debug!(
+                model_key = %key,
+                "config model adding new entry (not in defaults/prefetched)"
+            );
+            if model_override.context_window.is_none() {
+                tracing::debug!(
+                    model_key = %key,
+                    default = 200_000,
+                    "new model missing context_window, defaulting to 200000 — set context_window in [model.{}] to override",
+                    key,
+                );
+            }
+        }
+        let with_provider = model_override.model_provider.as_deref().map(|pid| {
+            match cfg.model_providers.get(pid) {
+                Some(provider) => model_override.with_provider_defaults(provider, pid),
+                None => model_override.with_missing_provider(),
+            }
+        });
+        let effective = with_provider.as_ref().unwrap_or(model_override);
+        let mut entry = effective.apply(key, base, &cfg.endpoints);
+        let session_bearer_unsafe = !crate::util::is_xai_api_bearer_url(&entry.info.base_url)
+            || entry
+                .api_base_url
+                .as_deref()
+                .is_some_and(|url| !crate::util::is_xai_api_bearer_url(url));
+        if let Some(pid) = model_override.model_provider.as_deref()
+            && entry.auth_provider.is_none()
+            && session_bearer_unsafe
+        {
+            entry.auth_provider = Some(crate::auth::AuthProviderRef::fail_closed(format!(
+                "model_provider:{pid} (fail-closed)"
+            )));
+        }
+        tracing::debug!(
+            model_key = %key,
+            base_url = %entry.info.base_url,
+            has_api_key = entry.api_key.is_some(),
+            env_key = ?entry.env_key,
+            auth_provider = entry.auth_provider.as_ref().map(|p| p.name.as_str()),
+            model_provider = model_override.model_provider.as_deref(),
+            had_base,
+            "config model override applied"
+        );
+        catalog.insert(key.clone(), entry);
+    }
+    for (key, entry) in catalog.iter_mut() {
+        if let Some(ref mut provider) = entry.auth_provider {
+            if provider.is_fail_closed() {
+                continue;
+            }
+            let config = cfg.auth_providers.get(&provider.name);
+            if config.is_none() {
+                tracing::debug!(
+                    model_key = %key,
+                    provider = %provider.name,
+                    "provider ref has no trusted config; failing closed with an empty command"
+                );
+            }
+            provider.attach_trusted_config(config);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_model_catalog_with_live_wafer_and_zai_entries(
+    cfg: &config::Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    wafer_entries: Option<IndexMap<String, ModelEntry>>,
+    zai_entries: Option<IndexMap<String, ModelEntry>>,
+) -> IndexMap<String, ModelEntry> {
+    resolve_model_catalog_with_live_provider_entries(
+        cfg,
+        prefetched,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        wafer_entries,
+        zai_entries,
+    )
 }
 
 /// Whether `effort` is a value this model will accept on the wire.

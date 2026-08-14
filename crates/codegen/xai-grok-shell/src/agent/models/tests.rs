@@ -2528,3 +2528,158 @@ fn resolve_model_tool_mode_honors_selected_key_and_last_slug_override() {
         "a persisted routing slug must use the last override"
     );
 }
+
+fn live_provider_entry(
+    key: &str,
+    model: &str,
+    provider: xai_grok_sampling_types::ModelProvider,
+    context_window: u64,
+) -> (String, ModelEntry) {
+    let mut entry = ModelEntry::fallback(key, &config::EndpointsConfig::default());
+    entry.info.model = model.to_owned();
+    entry.info.provider = provider;
+    entry.info.context_window =
+        std::num::NonZeroU64::new(context_window).expect("context_window > 0");
+    entry.info.base_url = match provider {
+        xai_grok_sampling_types::ModelProvider::Zai => crate::zai_models::api_base_url(),
+        xai_grok_sampling_types::ModelProvider::Wafer => crate::wafer_models::api_base_url(),
+        _ => entry.info.base_url,
+    };
+    (key.to_owned(), entry)
+}
+
+#[test]
+fn config_models_survive_and_override_zai_catalog_replace() {
+    use xai_grok_sampling_types::ModelProvider;
+
+    let mut cfg = config::Config::default();
+    cfg.config_models.insert(
+        "zai:extra".to_string(),
+        config::ConfigModelOverride {
+            model: Some("glm-extra".to_string()),
+            provider: Some(ModelProvider::Zai),
+            context_window: Some(500_000),
+            base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "zai:glm-5.2".to_string(),
+        config::ConfigModelOverride {
+            context_window: Some(1_000_000),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "my-ollama".to_string(),
+        config::ConfigModelOverride {
+            model: Some("llama3".to_string()),
+            context_window: Some(128_000),
+            base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let zai_live = IndexMap::from([live_provider_entry(
+        "zai:glm-5.2",
+        "glm-5.2",
+        ModelProvider::Zai,
+        200_000,
+    )]);
+
+    let catalog =
+        resolve_model_catalog_with_live_wafer_and_zai_entries(&cfg, None, None, Some(zai_live));
+
+    let extra = catalog
+        .get("zai:extra")
+        .expect("custom Z AI model must survive a live catalog that omits it");
+    assert_eq!(extra.info.model, "glm-extra");
+    assert_eq!(extra.info.provider, ModelProvider::Zai);
+    assert_eq!(extra.info.context_window.get(), 500_000);
+
+    let overridden = catalog
+        .get("zai:glm-5.2")
+        .expect("live Z AI catalog entry must remain after override");
+    assert_eq!(overridden.info.model, "glm-5.2");
+    assert_eq!(overridden.info.provider, ModelProvider::Zai);
+    assert_eq!(
+        overridden.info.context_window.get(),
+        1_000_000,
+        "user [model.zai:glm-5.2] context_window must win over the live catalog"
+    );
+
+    let custom = catalog
+        .get("my-ollama")
+        .expect("non-Z AI custom models must be untouched by a Z AI catalog apply");
+    assert_eq!(custom.info.model, "llama3");
+    assert_ne!(custom.info.provider, ModelProvider::Zai);
+    assert_eq!(custom.info.context_window.get(), 128_000);
+}
+
+#[test]
+fn config_models_survive_and_override_wafer_catalog_replace() {
+    use xai_grok_sampling_types::ModelProvider;
+
+    let mut cfg = config::Config::default();
+    cfg.config_models.insert(
+        "wafer:extra".to_string(),
+        config::ConfigModelOverride {
+            model: Some("wafer-extra".to_string()),
+            provider: Some(ModelProvider::Wafer),
+            context_window: Some(400_000),
+            base_url: Some("https://pass.wafer.ai/v1".to_string()),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "wafer:live-one".to_string(),
+        config::ConfigModelOverride {
+            context_window: Some(750_000),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "my-ollama".to_string(),
+        config::ConfigModelOverride {
+            model: Some("llama3".to_string()),
+            context_window: Some(128_000),
+            base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let wafer_live = IndexMap::from([live_provider_entry(
+        "wafer:live-one",
+        "live-one",
+        ModelProvider::Wafer,
+        200_000,
+    )]);
+
+    let catalog =
+        resolve_model_catalog_with_live_wafer_and_zai_entries(&cfg, None, Some(wafer_live), None);
+
+    let extra = catalog
+        .get("wafer:extra")
+        .expect("custom Wafer model must survive a live catalog that omits it");
+    assert_eq!(extra.info.model, "wafer-extra");
+    assert_eq!(extra.info.provider, ModelProvider::Wafer);
+    assert_eq!(extra.info.context_window.get(), 400_000);
+
+    let overridden = catalog
+        .get("wafer:live-one")
+        .expect("live Wafer catalog entry must remain after override");
+    assert_eq!(overridden.info.model, "live-one");
+    assert_eq!(overridden.info.provider, ModelProvider::Wafer);
+    assert_eq!(
+        overridden.info.context_window.get(),
+        750_000,
+        "user [model.wafer:live-one] context_window must win over the live catalog"
+    );
+
+    let custom = catalog
+        .get("my-ollama")
+        .expect("non-Wafer custom models must be untouched by a Wafer catalog apply");
+    assert_eq!(custom.info.model, "llama3");
+    assert_ne!(custom.info.provider, ModelProvider::Wafer);
+    assert_eq!(custom.info.context_window.get(), 128_000);
+}

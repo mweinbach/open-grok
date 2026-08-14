@@ -252,6 +252,109 @@ where
     f(&mut cfg);
     save_config_locked(&cfg).await
 }
+
+fn parse_user_config_root(contents: &str, path: &std::path::Path) -> Result<TomlValue> {
+    if contents.trim().is_empty() {
+        return Ok(TomlValue::Table(TomlMap::new()));
+    }
+    let mut root = toml::from_str::<TomlValue>(contents).map_err(|parse_err| {
+        anyhow::anyhow!(
+            "refusing to overwrite unparseable {}: {}; save a backup and fix the syntax error before retrying",
+            path.display(),
+            parse_err,
+        )
+    })?;
+    if !root.is_table() {
+        root = TomlValue::Table(TomlMap::new());
+    }
+    Ok(root)
+}
+
+/// Merge `incoming` into `[model.<key>]` only. Sibling model tables and
+/// unrelated root keys are left alone.
+pub(crate) fn upsert_config_model_table(
+    root: &mut TomlValue,
+    key: &str,
+    incoming: TomlMap<String, TomlValue>,
+) {
+    if !root.is_table() {
+        *root = TomlValue::Table(TomlMap::new());
+    }
+    let table = root.as_table_mut().expect("root must be a table");
+    let model_section = table
+        .entry("model".to_string())
+        .or_insert_with(|| TomlValue::Table(TomlMap::new()));
+    if !model_section.is_table() {
+        *model_section = TomlValue::Table(TomlMap::new());
+    }
+    let Some(TomlValue::Table(models)) = table.get_mut("model") else {
+        return;
+    };
+    let drop_api_key = incoming.get("env_key").is_some();
+    match models.get_mut(key) {
+        Some(TomlValue::Table(existing)) => {
+            merge_toml_tables(existing, incoming);
+            if drop_api_key {
+                existing.remove("api_key");
+            }
+        }
+        _ => {
+            models.insert(key.to_string(), TomlValue::Table(incoming));
+        }
+    }
+}
+
+/// Remove `[model.<key>]`. An empty `[model]` section is dropped.
+pub(crate) fn delete_config_model_table(root: &mut TomlValue, key: &str) -> bool {
+    let Some(table) = root.as_table_mut() else {
+        return false;
+    };
+    let Some(TomlValue::Table(models)) = table.get_mut("model") else {
+        return false;
+    };
+    let removed = models.remove(key).is_some();
+    if models.is_empty() {
+        table.remove("model");
+    }
+    removed
+}
+
+pub(crate) fn persist_custom_model_upsert_to_root(
+    root: &mut TomlValue,
+    record: &crate::custom_models::CustomModelRecord,
+) -> Result<crate::agent::config::ConfigModelOverride> {
+    upsert_config_model_table(root, &record.key, record.to_toml_table());
+    let table = root
+        .get("model")
+        .and_then(|section| section.get(&record.key))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("failed to write [model.{}]", record.key))?;
+    table
+        .try_into()
+        .map_err(|error| anyhow::anyhow!("failed to parse written [model.{}]: {error}", record.key))
+}
+
+/// Write one `[model.<key>]` table to `path` without going through
+/// [`save_config_locked`].
+pub(crate) fn persist_custom_model_upsert_at(
+    path: &std::path::Path,
+    record: &crate::custom_models::CustomModelRecord,
+) -> Result<crate::agent::config::ConfigModelOverride> {
+    let contents = read_to_string_or_empty(path)?;
+    let mut root = parse_user_config_root(&contents, path)?;
+    let model = persist_custom_model_upsert_to_root(&mut root, record)?;
+    atomic_write_string(path, &toml::to_string_pretty(&root)?)?;
+    Ok(model)
+}
+
+/// Delete one `[model.<key>]` table at `path`.
+pub(crate) fn persist_custom_model_delete_at(path: &std::path::Path, key: &str) -> Result<bool> {
+    let contents = read_to_string_or_empty(path)?;
+    let mut root = parse_user_config_root(&contents, path)?;
+    let removed = delete_config_model_table(&mut root, key);
+    atomic_write_string(path, &toml::to_string_pretty(&root)?)?;
+    Ok(removed)
+}
 #[cfg(test)]
 mod tests {
     use super::super::load::load_config_from_toml;
@@ -1609,6 +1712,173 @@ custom_unknown_key = 42
             ui.get("custom_unknown_key").and_then(|v| v.as_integer()),
             Some(42),
             "unmodeled (unknown to the schema) field must survive"
+        );
+    }
+
+    fn custom_record(key: &str, model: &str) -> crate::custom_models::CustomModelRecord {
+        crate::custom_models::CustomModelRecord {
+            key: key.to_owned(),
+            model: model.to_owned(),
+            context_window: Some(200_000),
+            ..crate::custom_models::CustomModelRecord::default()
+        }
+    }
+
+    #[test]
+    fn custom_model_table_upsert_preserves_siblings_and_extra_fields() {
+        let mut root: TomlValue = toml::from_str(
+            r#"
+[ui]
+theme = "groknight"
+
+[model.keep-me]
+model = "kept"
+description = "sibling"
+
+[model."zai:extra"]
+model = "old"
+description = "preserve-me"
+api_key = "sk-old"
+"#,
+        )
+        .unwrap();
+        let record = crate::custom_models::CustomModelRecord {
+            name: Some("Extra".into()),
+            provider: Some("zai".into()),
+            env_key: Some("ZAI_API_KEY".into()),
+            context_window: Some(500_000),
+            ..custom_record("zai:extra", "glm-extra")
+        };
+        let parsed = persist_custom_model_upsert_to_root(&mut root, &record).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("glm-extra"));
+        assert_eq!(parsed.context_window, Some(500_000));
+        assert_eq!(parsed.name.as_deref(), Some("Extra"));
+        assert_eq!(
+            root.get("ui")
+                .and_then(|v| v.get("theme"))
+                .and_then(TomlValue::as_str),
+            Some("groknight")
+        );
+        let extra = root
+            .get("model")
+            .and_then(|v| v.get("zai:extra"))
+            .and_then(TomlValue::as_table)
+            .unwrap();
+        assert_eq!(
+            extra.get("description").and_then(TomlValue::as_str),
+            Some("preserve-me")
+        );
+        assert!(
+            extra.get("api_key").is_none(),
+            "env_key upsert must drop a stored api_key"
+        );
+        assert_eq!(
+            extra.get("env_key").and_then(TomlValue::as_str),
+            Some("ZAI_API_KEY")
+        );
+        assert_eq!(
+            root.get("model")
+                .and_then(|v| v.get("keep-me"))
+                .and_then(|v| v.get("model"))
+                .and_then(TomlValue::as_str),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn custom_model_table_delete_removes_only_that_entry() {
+        let mut root: TomlValue = toml::from_str(
+            r#"
+[model.keep-me]
+model = "kept"
+[model.drop-me]
+model = "gone"
+"#,
+        )
+        .unwrap();
+        assert!(delete_config_model_table(&mut root, "drop-me"));
+        assert!(root.get("model").and_then(|v| v.get("drop-me")).is_none());
+        assert_eq!(
+            root.get("model")
+                .and_then(|v| v.get("keep-me"))
+                .and_then(|v| v.get("model"))
+                .and_then(TomlValue::as_str),
+            Some("kept")
+        );
+        assert!(delete_config_model_table(&mut root, "keep-me"));
+        assert!(
+            root.get("model").is_none(),
+            "empty [model] section must be dropped"
+        );
+    }
+
+    #[test]
+    fn custom_model_persist_round_trips_on_isolated_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ui]\ntheme = \"groknight\"\n[model.keep-me]\nmodel = \"kept\"\n",
+        )
+        .unwrap();
+        let (record, _) =
+            crate::custom_models::normalize_custom_model(crate::custom_models::CustomModelRecord {
+                provider: Some("zai".into()),
+                context_window: Some(1_000_000),
+                ..custom_record("zai:glm-5.2", "glm-5.2")
+            })
+            .unwrap();
+        persist_custom_model_upsert_at(&path, &record).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("sk-"),
+            "upsert must not invent secrets: {written}"
+        );
+        let parsed: TomlValue = toml::from_str(&written).unwrap();
+        assert_eq!(
+            parsed
+                .get("ui")
+                .and_then(|v| v.get("theme"))
+                .and_then(TomlValue::as_str),
+            Some("groknight")
+        );
+        let extra = parsed
+            .get("model")
+            .and_then(|v| v.get("zai:glm-5.2"))
+            .and_then(TomlValue::as_table)
+            .expect("quoted colon key must round-trip");
+        assert_eq!(
+            extra.get("model").and_then(TomlValue::as_str),
+            Some("glm-5.2")
+        );
+        assert_eq!(
+            extra.get("context_window").and_then(TomlValue::as_integer),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            extra.get("base_url").and_then(TomlValue::as_str),
+            Some(crate::zai_models::api_base_url().as_str())
+        );
+        assert_eq!(
+            extra.get("env_key").and_then(TomlValue::as_str),
+            Some(crate::zai_models::ZAI_API_KEY_ENV)
+        );
+        persist_custom_model_delete_at(&path, "zai:glm-5.2").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let parsed: TomlValue = toml::from_str(&after).unwrap();
+        assert!(
+            parsed
+                .get("model")
+                .and_then(|v| v.get("zai:glm-5.2"))
+                .is_none()
+        );
+        assert_eq!(
+            parsed
+                .get("model")
+                .and_then(|v| v.get("keep-me"))
+                .and_then(|v| v.get("model"))
+                .and_then(TomlValue::as_str),
+            Some("kept")
         );
     }
 }

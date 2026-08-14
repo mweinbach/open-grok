@@ -59,7 +59,19 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "meta_api_key",
     "opencode_go_api_key",
     "wafer_api_key",
+    "zai_api_key",
     "opencode_go_models",
+    "custom_models",
+    "custom_models.list",
+    "custom_model_id",
+    "custom_model_slug",
+    "custom_model_name",
+    "custom_model_provider",
+    "custom_model_base_url",
+    "custom_model_context_window",
+    "custom_model_backend",
+    "custom_model_env_key",
+    "custom_model_save",
     "toolset.perplexity_web_search.enabled",
     "perplexity_api_key",
     "toolset.web_search_source.xai",
@@ -720,6 +732,7 @@ fn enter_on_each_provider_api_key_opens_matching_empty_secret_editor() {
         "meta_api_key",
         "opencode_go_api_key",
         "wafer_api_key",
+        "zai_api_key",
         "perplexity_api_key",
     ] {
         let mut s = make_state();
@@ -1249,6 +1262,7 @@ fn mouse_click_on_each_provider_key_value_opens_matching_secret_editor() {
         "meta_api_key",
         "opencode_go_api_key",
         "wafer_api_key",
+        "zai_api_key",
         "perplexity_api_key",
     ] {
         let mut s = make_state();
@@ -1407,6 +1421,77 @@ fn mouse_click_on_opencode_go_models_opens_sub_sheet_and_toggles_enabled() {
                 if models == &["opencode-go/model".to_string()]
         ),
         "click on a discovered OpenCode Go model must enable it, got {out:?}",
+    );
+}
+
+fn seed_custom_models(state: &mut SettingsModalState) {
+    state.pager_snapshot.custom_models = vec![xai_grok_pager::settings::CustomModelRecord {
+        key: "zai:extra".to_string(),
+        model: "glm-extra".to_string(),
+        name: Some("Extra".to_string()),
+        provider: Some("zai".to_string()),
+        context_window: Some(500_000),
+        ..xai_grok_pager::settings::CustomModelRecord::default()
+    }];
+}
+
+#[test]
+fn enter_on_custom_models_group_opens_sheet_and_save_without_id_does_not_upsert() {
+    let mut s = make_state();
+    navigate_to(&mut s, "custom_models");
+    let out = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(matches!(
+        s.mode(),
+        SettingsModalMode::PickingGroup { child_idx: 0, .. }
+    ));
+    for _ in 0..9 {
+        let _ = handle_settings_key(&mut s, &press(KeyCode::Char('j')));
+    }
+    let out = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert!(
+        matches!(
+            out,
+            SettingsKeyOutcome::Action(Action::SetCustomModelSave(true))
+        ),
+        "Save toggle must dispatch SetCustomModelSave, got {out:?}"
+    );
+}
+
+#[test]
+fn space_on_saved_custom_model_dispatches_delete() {
+    let mut s = make_state();
+    seed_custom_models(&mut s);
+    navigate_to(&mut s, "custom_models");
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    let out = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert!(
+        matches!(
+            out,
+            SettingsKeyOutcome::Action(Action::DeleteCustomModel { ref key })
+                if key == "zai:extra"
+        ),
+        "deselecting a saved custom model must delete it, got {out:?}"
+    );
+}
+
+#[test]
+fn mouse_click_on_custom_models_group_opens_sub_sheet() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let group_row = row_idx_for(&s, "custom_models") as u16;
+    let out = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        group_row,
+    );
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(
+        matches!(s.mode(), SettingsModalMode::PickingGroup { .. }),
+        "click on Custom models must open the sub-sheet, got {:?}",
+        s.mode(),
     );
 }
 
@@ -2560,6 +2645,7 @@ fn registry_kind_membership_through_pr_14() {
             "contextual_hints.ssh_wrap",
             "contextual_hints.undo",
             "contextual_hints.word_select",
+            "custom_model_save",
             "diagnostics.crash_handler",
             "display_refresh_auto_cadence",
             "doom_loop_recovery.enabled",
@@ -2609,6 +2695,8 @@ fn registry_kind_membership_through_pr_14() {
             "auto_light_theme",
             "code_mode",
             "coding_data_sharing",
+            "custom_model_backend",
+            "custom_model_provider",
             "default_selected_permission",
             "hunk_tracker_mode",
             "image_generation_provider",
@@ -2634,10 +2722,16 @@ fn registry_kind_membership_through_pr_14() {
     );
 
     let string_keys = by_kind.remove("String").unwrap_or_default();
-    assert!(
-        string_keys.is_empty(),
-        "no String-kind settings should remain — `default_model` + `fork_secondary_model` \
-         migrated to DynamicEnum; got: {string_keys:?}",
+    assert_eq!(
+        string_keys,
+        vec![
+            "custom_model_base_url",
+            "custom_model_env_key",
+            "custom_model_id",
+            "custom_model_name",
+            "custom_model_slug",
+        ],
+        "String kind membership drift",
     );
 
     let dynamic_enum_keys = by_kind.remove("DynamicEnum").unwrap_or_default();
@@ -2655,7 +2749,7 @@ fn registry_kind_membership_through_pr_14() {
     let dynamic_multi_select_keys = by_kind.remove("DynamicMultiSelect").unwrap_or_default();
     assert_eq!(
         dynamic_multi_select_keys,
-        vec!["opencode_go_models"],
+        vec!["custom_models.list", "opencode_go_models"],
         "DynamicMultiSelect kind membership drift",
     );
 
@@ -2664,14 +2758,19 @@ fn registry_kind_membership_through_pr_14() {
     sorted_int.sort();
     assert_eq!(
         sorted_int,
-        vec!["max_thoughts_width", "scroll_lines", "scroll_speed"],
+        vec![
+            "custom_model_context_window",
+            "max_thoughts_width",
+            "scroll_lines",
+            "scroll_speed",
+        ],
         "Int kind membership drift (PR 8)",
     );
 
     let group_keys = by_kind.remove("Group").unwrap_or_default();
     assert_eq!(
         group_keys,
-        vec!["contextual_hints"],
+        vec!["contextual_hints", "custom_models"],
         "Group kind membership drift",
     );
 
@@ -2687,6 +2786,7 @@ fn registry_kind_membership_through_pr_14() {
             "opencode_go_api_key",
             "perplexity_api_key",
             "wafer_api_key",
+            "zai_api_key",
         ],
         "Secret kind membership drift",
     );
@@ -2716,6 +2816,8 @@ fn enum_settings_membership_through_pr_14() {
             "auto_light_theme",
             "code_mode",
             "coding_data_sharing",
+            "custom_model_backend",
+            "custom_model_provider",
             "default_selected_permission",
             "hunk_tracker_mode",
             "image_generation_provider",
@@ -2815,6 +2917,18 @@ fn defaults_round_trip_through_registry() {
             "wafer_api_key" => {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
             }
+            "zai_api_key" => {
+                SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
+            }
+            "custom_model_id" => SettingValue::String(String::new()),
+            "custom_model_slug" => SettingValue::String(String::new()),
+            "custom_model_name" => SettingValue::String(String::new()),
+            "custom_model_provider" => SettingValue::Enum(""),
+            "custom_model_base_url" => SettingValue::String(String::new()),
+            "custom_model_context_window" => SettingValue::Int(200_000),
+            "custom_model_backend" => SettingValue::Enum("chat_completions"),
+            "custom_model_env_key" => SettingValue::String(String::new()),
+            "custom_model_save" => SettingValue::Bool(false),
             "toolset.perplexity_web_search.enabled" => SettingValue::Bool(false),
             "toolset.web_search_source.xai" => SettingValue::Enum("xai"),
             "toolset.web_search_source.codex" => SettingValue::Enum("native"),

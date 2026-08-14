@@ -105,6 +105,64 @@ pub struct OwnedMultiSelectChoice {
 #[non_exhaustive]
 pub enum DynamicMultiSelectSource {
     OpenCodeGoModels,
+    CustomModels,
+}
+
+/// User `[model.<key>]` row returned by `open-grok/custom-models/*`.
+/// The secret itself is never echoed; only `has_api_key` is present.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct CustomModelRecord {
+    pub key: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_key: Option<String>,
+    #[serde(default)]
+    pub has_api_key: bool,
+}
+
+impl CustomModelRecord {
+    pub fn display_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(self.model.as_str())
+    }
+
+    pub fn description_line(&self) -> String {
+        let provider = self.provider.as_deref().unwrap_or("inherit");
+        let backend = self.api_backend.as_deref().unwrap_or("chat_completions");
+        match self.context_window {
+            Some(window) => format!("{} · {provider} · {backend} · {window} ctx", self.model),
+            None => format!("{} · {provider} · {backend}", self.model),
+        }
+    }
+}
+
+/// Catalog-key / `[model.<key>]` table suffix: letters, digits, `:`, `.`, `-`, `_`.
+pub fn custom_model_key_is_valid(key: &str) -> bool {
+    let trimmed = key.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains(['\n', '\r'])
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '.' | '-' | '_'))
+}
+
+/// Wire model id: non-empty, no newlines.
+pub fn custom_model_slug_is_valid(model: &str) -> bool {
+    let trimmed = model.trim();
+    !trimmed.is_empty() && !trimmed.contains(['\n', '\r'])
 }
 
 pub fn dynamic_multi_select_choices(
@@ -123,6 +181,16 @@ pub fn dynamic_multi_select_choices(
                     .opencode_go_enabled_models
                     .iter()
                     .any(|enabled| enabled == &model.id || enabled == &model.key),
+            })
+            .collect(),
+        DynamicMultiSelectSource::CustomModels => snapshot
+            .custom_models
+            .iter()
+            .map(|model| OwnedMultiSelectChoice {
+                canonical: model.key.clone(),
+                display: model.display_name().to_string(),
+                description: model.description_line(),
+                selected: true,
             })
             .collect(),
     }
@@ -372,6 +440,18 @@ pub struct PagerLocalSnapshot {
     pub zai_api_key_status: SecretStatus,
     pub opencode_go_models: Vec<xai_grok_shell::opencode_go_models::OpenCodeGoModelDescriptor>,
     pub opencode_go_enabled_models: Vec<String>,
+    /// User `[model.*]` entries from `open-grok/custom-models/list`.
+    pub custom_models: Vec<CustomModelRecord>,
+    /// Draft catalog key for the add-model form (not written until Save).
+    pub custom_model_id: String,
+    pub custom_model_slug: String,
+    pub custom_model_name: String,
+    pub custom_model_provider: String,
+    pub custom_model_base_url: String,
+    pub custom_model_context_window: i64,
+    pub custom_model_backend: String,
+    pub custom_model_env_key: String,
+    pub custom_model_save: bool,
     pub perplexity_web_search_enabled: bool,
     /// `[toolset.web_search_source]` selections (effective TOML merge).
     pub web_search_source: xai_grok_shell::tools::config::WebSearchSourceConfig,
@@ -453,6 +533,16 @@ impl Default for PagerLocalSnapshot {
             zai_api_key_status: SecretStatus::Missing,
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
+            custom_models: Vec::new(),
+            custom_model_id: String::new(),
+            custom_model_slug: String::new(),
+            custom_model_name: String::new(),
+            custom_model_provider: String::new(),
+            custom_model_base_url: String::new(),
+            custom_model_context_window: crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
+            custom_model_backend: "chat_completions".to_owned(),
+            custom_model_env_key: String::new(),
+            custom_model_save: false,
             perplexity_web_search_enabled: false,
             web_search_source: Default::default(),
             x_search_enabled: true,
@@ -502,6 +592,28 @@ pub fn canonical_voice_capture_mode(value: Option<&str>) -> &'static str {
 
 /// Canonicalize the persisted Kimi service selector. Unknown or missing values
 /// fail back to Platform to preserve the endpoint used by older releases.
+pub fn canonical_custom_model_provider(value: &str) -> &'static str {
+    match value.trim() {
+        "zai" => "zai",
+        "wafer" => "wafer",
+        "kimi" => "kimi",
+        "fireworks" => "fireworks",
+        "deepseek" => "deepseek",
+        "meta" => "meta",
+        "xai" => "xai",
+        "opencode_go" | "opencode-go" => "opencode_go",
+        _ => "",
+    }
+}
+
+pub fn canonical_custom_model_backend(value: &str) -> &'static str {
+    match value.trim() {
+        "responses" => "responses",
+        "messages" => "messages",
+        _ => "chat_completions",
+    }
+}
+
 pub fn canonical_kimi_api_endpoint(value: Option<&str>) -> &'static str {
     let raw = value.unwrap_or_default().trim();
     if raw.eq_ignore_ascii_case("code") {
@@ -573,6 +685,53 @@ impl PagerLocalSnapshot {
                 None
             }
         })
+    }
+
+    /// Copy add-model draft fields (not the saved-list cache) from `other`.
+    pub fn copy_custom_model_draft_from(&mut self, other: &Self) {
+        self.custom_model_id.clone_from(&other.custom_model_id);
+        self.custom_model_slug.clone_from(&other.custom_model_slug);
+        self.custom_model_name.clone_from(&other.custom_model_name);
+        self.custom_model_provider
+            .clone_from(&other.custom_model_provider);
+        self.custom_model_base_url
+            .clone_from(&other.custom_model_base_url);
+        self.custom_model_context_window = other.custom_model_context_window;
+        self.custom_model_backend
+            .clone_from(&other.custom_model_backend);
+        self.custom_model_env_key
+            .clone_from(&other.custom_model_env_key);
+        self.custom_model_save = other.custom_model_save;
+    }
+
+    pub fn clear_custom_model_draft(&mut self) {
+        self.custom_model_id.clear();
+        self.custom_model_slug.clear();
+        self.custom_model_name.clear();
+        self.custom_model_provider.clear();
+        self.custom_model_base_url.clear();
+        self.custom_model_context_window =
+            crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT;
+        self.custom_model_backend = "chat_completions".to_owned();
+        self.custom_model_env_key.clear();
+        self.custom_model_save = false;
+    }
+}
+
+static CUSTOM_MODELS_CACHE: std::sync::Mutex<Vec<CustomModelRecord>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Last successful `open-grok/custom-models/list` payload.
+pub fn cached_custom_models() -> Vec<CustomModelRecord> {
+    CUSTOM_MODELS_CACHE
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+pub fn store_cached_custom_models(models: Vec<CustomModelRecord>) {
+    if let Ok(mut guard) = CUSTOM_MODELS_CACHE.lock() {
+        *guard = models;
     }
 }
 
@@ -902,6 +1061,19 @@ pub fn current_value_for(
         "opencode_go_api_key" => Some(SettingValue::SecretStatus(pager.opencode_go_api_key_status)),
         "wafer_api_key" => Some(SettingValue::SecretStatus(pager.wafer_api_key_status)),
         "zai_api_key" => Some(SettingValue::SecretStatus(pager.zai_api_key_status)),
+        "custom_model_id" => Some(SettingValue::String(pager.custom_model_id.clone())),
+        "custom_model_slug" => Some(SettingValue::String(pager.custom_model_slug.clone())),
+        "custom_model_name" => Some(SettingValue::String(pager.custom_model_name.clone())),
+        "custom_model_provider" => Some(SettingValue::Enum(canonical_custom_model_provider(
+            &pager.custom_model_provider,
+        ))),
+        "custom_model_base_url" => Some(SettingValue::String(pager.custom_model_base_url.clone())),
+        "custom_model_context_window" => Some(SettingValue::Int(pager.custom_model_context_window)),
+        "custom_model_backend" => Some(SettingValue::Enum(canonical_custom_model_backend(
+            &pager.custom_model_backend,
+        ))),
+        "custom_model_env_key" => Some(SettingValue::String(pager.custom_model_env_key.clone())),
+        "custom_model_save" => Some(SettingValue::Bool(pager.custom_model_save)),
         "toolset.perplexity_web_search.enabled" => {
             Some(SettingValue::Bool(pager.perplexity_web_search_enabled))
         }
@@ -1689,6 +1861,47 @@ mod tests {
                         pager.plan_mode_active,
                     );
                 }
+                ("custom_models", SettingKind::Group { .. }) => {
+                    // Group row has no pager scalar default.
+                }
+                ("custom_models.list", SettingKind::DynamicMultiSelect { .. }) => {
+                    assert!(
+                        pager.custom_models.is_empty(),
+                        "custom models list must default empty"
+                    );
+                }
+                (
+                    "custom_model_id"
+                    | "custom_model_slug"
+                    | "custom_model_name"
+                    | "custom_model_base_url"
+                    | "custom_model_env_key",
+                    SettingKind::String { default, .. },
+                ) => {
+                    assert_eq!(*default, "", "{} draft strings default empty", meta.key);
+                }
+                ("custom_model_provider", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(*default, "", "custom_model_provider defaults to inherit");
+                    assert_eq!(pager.custom_model_provider, "");
+                }
+                ("custom_model_backend", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(*default, "chat_completions");
+                    assert_eq!(pager.custom_model_backend, "chat_completions");
+                }
+                ("custom_model_context_window", SettingKind::Int { default, .. }) => {
+                    assert_eq!(
+                        *default,
+                        crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT
+                    );
+                    assert_eq!(
+                        pager.custom_model_context_window,
+                        crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT
+                    );
+                }
+                ("custom_model_save", SettingKind::Bool { default }) => {
+                    assert!(!*default);
+                    assert!(!pager.custom_model_save);
+                }
                 _ => panic!(
                     "settings::defs::default_settings() contains PAGER entry `{}` with no \
                      matching arm in defaults_match_pager_state. Add an arm.",
@@ -2145,6 +2358,56 @@ mod tests {
             current_value_for("contextual_hints.plan_mode", &ui, &pager),
             Some(SettingValue::Bool(true)),
         );
+    }
+
+    #[test]
+    fn custom_models_group_and_draft_fields_registered() {
+        let reg = SettingsRegistry::defaults();
+        let group = reg.find("custom_models").expect("custom_models group");
+        let SettingKind::Group { children } = &group.kind else {
+            panic!("custom_models must be a Group");
+        };
+        assert_eq!(
+            *children,
+            &[
+                "custom_models.list",
+                "custom_model_id",
+                "custom_model_slug",
+                "custom_model_name",
+                "custom_model_provider",
+                "custom_model_base_url",
+                "custom_model_context_window",
+                "custom_model_backend",
+                "custom_model_env_key",
+                "custom_model_save",
+            ],
+        );
+        assert!(matches!(
+            reg.find("custom_models.list").map(|meta| &meta.kind),
+            Some(SettingKind::DynamicMultiSelect {
+                source: DynamicMultiSelectSource::CustomModels,
+            })
+        ));
+        let pager = PagerLocalSnapshot::default();
+        assert_eq!(
+            current_value_for("custom_model_id", &UiConfig::default(), &pager),
+            Some(SettingValue::String(String::new()))
+        );
+        assert_eq!(
+            current_value_for("custom_model_context_window", &UiConfig::default(), &pager),
+            Some(SettingValue::Int(
+                crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT
+            ))
+        );
+        assert_eq!(
+            current_value_for("custom_model_save", &UiConfig::default(), &pager),
+            Some(SettingValue::Bool(false))
+        );
+        assert!(custom_model_key_is_valid("zai:glm-special"));
+        assert!(custom_model_key_is_valid("my-ollama"));
+        assert!(!custom_model_key_is_valid(""));
+        assert!(!custom_model_key_is_valid("has space"));
+        assert!(!custom_model_slug_is_valid("bad\nid"));
     }
 
     /// The `compact_mode` description's row count must track the auto-compact
