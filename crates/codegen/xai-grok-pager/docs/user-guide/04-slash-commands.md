@@ -43,6 +43,10 @@ Show how the context window is being used: a category breakdown (system prompt, 
 
 Show session details — auth method, model, turn count, and context usage. Aliases: `/status`, `/info`.
 
+### `/cache`
+
+Show prompt-cache hit rate, prefix-break diagnostics, and recent turn records for the current session. Use this when cached-token counts drop unexpectedly: a rewrite of an earlier prefix section (model, effort, tools, system prompt, or an earlier message) breaks the KV cache at that point. Rewind/trim is reported as a shortened prefix, not a break. A 0% hit on a stable prefix with a forwarded cache key is a provider miss. Aliases: `/cache-status`, `/prompt-cache`. Headless ACP clients can send `/cache` as well.
+
 ### `/fork`
 
 Branch the current session into a new agent, keeping history up to this point.

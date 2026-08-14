@@ -144,7 +144,7 @@ Handlers live under `shell/src/extensions/` and are dispatched from `MvpAgent`�
 | Git / worktrees | `x.ai/git/*`, `x.ai/git/worktree/*` | `git.rs`, `worktree.rs` |
 | Search | `x.ai/search/*` | `search.rs` |
 | Terminal / PTY | `x.ai/terminal/*` | `terminal.rs` |
-| Session admin | `x.ai/session/*` (info, list, fork, rename, delete, updates, load_history, repair, …) | `session_admin.rs`, `session_updates.rs`, … |
+| Session admin | `x.ai/session/*` (info, list, fork, rename, delete, updates, load_history, repair, `cache`, …) | `session_admin.rs`, `session_updates.rs`, `cache.rs`, … |
 | History / rewind / compact | `x.ai/prompt_history`, `x.ai/rewind*`, `x.ai/compact_conversation*` | `prompt_history.rs`, `rewind.rs` |
 | Auth | `x.ai/auth/*`, `x.ai/getApiKey`, `x.ai/setApiKey` | `auth.rs` |
 | Hooks / plugins / marketplace | `x.ai/hooks/*`, `x.ai/plugins/*`, `x.ai/marketplace/*` | `hooks.rs`, `plugins.rs`, `marketplace.rs` |

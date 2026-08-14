@@ -267,8 +267,8 @@ pub(crate) fn session_cache_block_text(
         group_thousands(s.total_input_tokens),
     ));
     rows.push(format!(
-        "  Turns tracked:  {} ({} hits · {} partial · {} breaks)",
-        s.total_turns, s.hits, s.partial_hits, s.breaks,
+        "  Turns tracked:  {} ({} hits · {} partial · {} breaks · {} provider misses)",
+        s.total_turns, s.hits, s.partial_hits, s.breaks, s.provider_misses,
     ));
 
     if let Some(ref last_break) = s.last_break_diagnostic {
@@ -492,6 +492,7 @@ mod tests {
                 hits: 3,
                 partial_hits: 0,
                 breaks: 1,
+                provider_misses: 0,
                 last_break_diagnostic: Some("Cache break: 0% hit rate. Item #2 was pruned/trimmed".into()),
             },
             recent_turns: vec![
@@ -514,7 +515,7 @@ mod tests {
         };
         let text = session_cache_block_text(&resp);
         assert!(text.contains("Cache hit rate: 85.0% (8,500 of 10,000 input tokens cached)"), "{text}");
-        assert!(text.contains("Turns tracked:  4 (3 hits · 0 partial · 1 breaks)"), "{text}");
+        assert!(text.contains("Turns tracked:  4 (3 hits · 0 partial · 1 breaks · 0 provider misses)"), "{text}");
         assert!(text.contains("Last break:     Cache break: 0% hit rate. Item #2 was pruned/trimmed"), "{text}");
         assert!(text.contains("Turn #1 (loop 0) — 80.0% hit (2,500 in, 2,000 cached) · Cache hit: 80.0%"), "{text}");
     }

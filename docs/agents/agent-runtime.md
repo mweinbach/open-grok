@@ -217,6 +217,7 @@ Modules: `session/storage/`, `session/persistence.rs`, `session/compaction*.rs`,
 - Sandbox profile pinned for session life.
 - Codex remote compaction vs xAI compaction must not leak opaque items across providers.
 - Plan mode state is preserved across compact with reminders.
+- Prompt-cache telemetry lives in `session/cache_tracker.rs`. Main turns record usage into `CacheTracker`; `/cache` and `x.ai/session/cache` read it. Auxiliary recap/`/btw` calls must not record. Prefix sections are model → effort → temperature → cache key → tool choice → JSON schema → tools → hosted tools → items. Rewind is shortened (not a break). A 0% hit on a stable prefix with a forwarded cache key and prompt ≥ 1024 tokens is a provider miss. Summaries store hashes and labels only — never prompt text.
 
 ## Code Mode (runtime)
 

@@ -204,6 +204,8 @@ Also isolated:
 | Doom-loop opt-in | yes | no | no | no | no | no | no | no |
 | Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A | N/A | stateless fields; effort normalized to none/low/high/max | stateless fields; preserves low/medium/high/xhigh | N/A | N/A |
 | Prompt cache key | no | session id | no | no | no | no | no | no |
+
+`ConversationRequest::prompt_cache_key` reaches the wire only when `ApiBackend::forwards_prompt_cache_key()` is true (Responses). The session `CacheTracker` uses that flag to distinguish a provider miss (stable prefix, key forwarded, prompt ≥ 1024, 0 cached tokens) from "no cache support" (key not on the wire, or prompt too small). Do not infer cache support from a model slug.
 | Sticky turn state | no | `x-codex-turn-state` | no | no | no | no | no | no |
 | Unknown `response.*` events | strict | ignore unknown side-channels when opted | N/A | N/A | strict | strict | N/A | N/A |
 | Chat sanitization | — | — | clears temp/top_p/penalties | schema normalization | strips internal message model IDs | N/A | standard | per backend |
