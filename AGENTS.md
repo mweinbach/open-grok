@@ -163,10 +163,12 @@ After any non-xAI profile that denies xAI services, the session export boundary 
 | Repeated task | Repo skill |
 | --- | --- |
 | Build or change this checkout | [`develop-open-grok`](.agents/skills/develop-open-grok/SKILL.md) |
+| Coordinate parallel multi-agent waves and subagent swarms | [`coordinate-agent-teamwork`](.agents/skills/coordinate-agent-teamwork/SKILL.md) |
 | Add/change provider, model, auth, or wire behavior | [`change-open-grok-provider`](.agents/skills/change-open-grok-provider/SKILL.md) |
 | Prove compaction, resume, or subagent persistence | [`verify-open-grok-session`](.agents/skills/verify-open-grok-session/SKILL.md) |
 | Build and publish a release | [`release-open-grok`](.agents/skills/release-open-grok/SKILL.md) |
 | Compare or replay an upstream snapshot | [`sync-open-grok-upstream`](.agents/skills/sync-open-grok-upstream/SKILL.md) |
+
 
 ### 5.2 While coding
 
