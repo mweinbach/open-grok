@@ -100,6 +100,9 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         delivery_tools: std::cell::RefCell::new(Vec::new()),
         attach_non_interactive: std::cell::Cell::new(false),
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
+        prompt_cache: std::sync::Arc::new(parking_lot::Mutex::new(
+            xai_grok_sampling_types::PromptCacheTracker::default(),
+        )),
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(

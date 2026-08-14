@@ -3069,6 +3069,9 @@ mod inline_auto_compact_flow_tests {
             delivery_tools: std::cell::RefCell::new(Vec::new()),
             attach_non_interactive: std::cell::Cell::new(false),
             chat_state_handle,
+            prompt_cache: std::sync::Arc::new(parking_lot::Mutex::new(
+                xai_grok_sampling_types::PromptCacheTracker::default(),
+            )),
             current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
