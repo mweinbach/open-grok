@@ -995,7 +995,14 @@ fn show_cache_fetches_session_cache() {
 #[test]
 fn session_cache_complete_commits_block() {
     let mut app = test_app_with_agent();
-    let session_id = app.agents.get(&AgentId(0)).unwrap().session.session_id.clone().unwrap();
+    let session_id = app
+        .agents
+        .get(&AgentId(0))
+        .unwrap()
+        .session
+        .session_id
+        .clone()
+        .unwrap();
     let cache = Box::new(xai_grok_shell::extensions::cache::SessionCacheResponse {
         summary: xai_grok_shell::session::CacheSummary {
             total_input_tokens: 5000,
