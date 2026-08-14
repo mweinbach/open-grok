@@ -6,13 +6,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::WorkspaceRpc;
+use super::{RpcActivityClass, WorkspaceRpc};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HookRegistryReq {}
 
 impl WorkspaceRpc for HookRegistryReq {
     const METHOD: &'static str = "workspace.hook_registry";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = HookRegistryWire;
 }
 
@@ -194,7 +195,7 @@ mod tests {
                     "url": null,
                     "url_raw": null,
                     "timeout_ms": 5000,
-                    "source_dir": "/home/u/.opengrok/hooks",
+                    "source_dir": "/home/u/.grok/hooks",
                     "extra_env": { "FOO": "bar" },
                     "layer": "file"
                 }]
@@ -202,25 +203,5 @@ mod tests {
         });
         let wire: HookRegistryWire = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(&wire).unwrap(), json);
-    }
-
-    #[test]
-    fn hook_spec_wire_defaults_missing_layer_to_file() {
-        let json = serde_json::json!({
-            "name": "global/safety",
-            "event": "pre_tool_use",
-            "handler_type": "command",
-            "configured_matcher": null,
-            "enabled": true,
-            "command": "/bin/check.sh",
-            "command_raw": null,
-            "url": null,
-            "url_raw": null,
-            "timeout_ms": 5000,
-            "source_dir": "/home/u/.opengrok/hooks",
-            "extra_env": {}
-        });
-        let wire: HookSpecWire = serde_json::from_value(json).unwrap();
-        assert_eq!(wire.layer, "file");
     }
 }

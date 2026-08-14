@@ -913,8 +913,11 @@ pub(crate) fn get_or_open_session_writer(
     if let Some(existing) = writers.get(session_id) {
         return existing.value().clone();
     }
-    let dir = workspace_home.join("sessions").join(session_id);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    let sessions_root = workspace_home.join("sessions");
+    let dir = sessions_root.join(session_id);
+    let create = xai_grok_config::create_dir_all_owner_only(&dir);
+    xai_grok_config::set_dir_owner_only(&sessions_root);
+    if let Err(e) = create {
         tracing::warn!(
             session_id = %session_id,
             dir = %dir.display(),
@@ -955,6 +958,26 @@ mod tests {
             !sess_dir.exists(),
             "flag-off must not create the session dir or events.jsonl"
         );
+    }
+    /// Session-derived content outside ~/.opengrok/sessions: same owner-only rule,
+    /// including healing a loose pre-existing root from older builds.
+    #[cfg(unix)]
+    #[test]
+    fn flag_on_creates_owner_only_session_event_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let writers: DashMap<String, EventWriter> = DashMap::new();
+        let root = home.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = get_or_open_session_writer(true, &writers, home.path(), "sess-perm");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&root.join("sess-perm")),
+            0o700,
+            "session event dir must be 0700"
+        );
+        assert_eq!(mode(&root), 0o700, "loose sessions root must heal to 0700");
     }
     #[test]
     fn flag_on_opens_and_writes_real_content() {

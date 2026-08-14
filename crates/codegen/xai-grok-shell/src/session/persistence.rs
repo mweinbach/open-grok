@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use std::borrow::Cow;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +34,64 @@ use tokio::sync::{mpsc, watch};
 /// - Version 0: Legacy ChatRequestMessage format (default for old sessions)
 /// - Version 1: ConversationItem format (used for new sessions)
 pub const CHAT_FORMAT_VERSION: u8 = 1;
+
+/// Maximum Unicode scalars in a session title (`/rename`, dashboard editor,
+/// and the `x.ai/session/rename` ext boundary). Counted after control-strip
+/// and trim.
+pub const MAX_TITLE_SCALARS: usize = 100;
+
+/// UTF-8 byte ceiling before we bother stripping controls. 4 bytes/scalar
+/// plus slack so a handful of C0 bytes that will be stripped don't trip a
+/// false reject; anything larger is already over the scalar cap.
+pub const MAX_TITLE_BYTES: usize = MAX_TITLE_SCALARS * 4 + 64;
+
+/// C0/C1 plus the bidi/format overrides the dashboard rename editor
+/// already rejects. Shared by persist-drop and display-FFFD so the
+/// character class cannot drift.
+#[inline]
+pub fn is_forbidden_title_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Drop C0/C1 and bidi/format controls, then trim. The ext boundary, pull
+/// hydrate, and pager ingest share this so a title cannot carry terminal
+/// escapes or RTL overrides into `display_name` / `summary.json`.
+///
+/// Already-clean input is borrowed (trim is a subslice); only a title
+/// that actually contains forbidden chars allocates.
+pub fn sanitize_rename_title(title: &str) -> Cow<'_, str> {
+    if title.chars().any(is_forbidden_title_char) {
+        let mut cleaned: String = title
+            .chars()
+            .filter(|c| !is_forbidden_title_char(*c))
+            .collect();
+        let trimmed = cleaned.trim();
+        if trimmed.len() != cleaned.len() {
+            cleaned = trimmed.to_string();
+        }
+        Cow::Owned(cleaned)
+    } else {
+        Cow::Borrowed(title.trim())
+    }
+}
+
+/// Sanitize then cap. `None` when the result is blank. Overlong titles are
+/// truncated (ingest/pull defense); the ext rename path rejects instead.
+pub fn sanitize_and_cap_title(title: &str) -> Option<String> {
+    let cleaned = sanitize_rename_title(title);
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.chars().count() <= MAX_TITLE_SCALARS {
+        Some(cleaned.into_owned())
+    } else {
+        Some(cleaned.chars().take(MAX_TITLE_SCALARS).collect())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PersistenceContentChunk {
@@ -310,6 +369,13 @@ pub enum PersistenceMsg {
     },
     /// Replace the entire chat history (used for compaction)
     ReplaceChatHistory(Vec<ConversationItem>),
+    /// Destructive image-strip rewrite: back up the on-disk history first,
+    /// and only rewrite if the backup landed: recoverability gates the
+    /// destruction. Acks the combined disk outcome.
+    ReplaceChatHistoryForStripAndAck {
+        messages: Vec<ConversationItem>,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     CurrentModel {
         model_id: acp::ModelId,
         /// Provider contract for this model. This is persisted as a sticky
@@ -406,6 +472,14 @@ pub enum PersistenceMsg {
     /// Routed back through the persistence channel so the storage write
     /// stays sequential with other summary.json mutations.
     GeneratedTitle(String),
+    /// Manual `/rename` title. Rides this FIFO channel so the resulting
+    /// `SetTitle` cannot race a `GeneratedTitle` `SetTitle` out-of-band.
+    ManualTitleRenamed(String),
+    /// `/rename --auto`: reset [`crate::session::summary::SummaryGenerator`]
+    /// so the next content chunk regenerates. Storage is already cleared by
+    /// the ext handler; remote stores stay untouched until the fresh auto
+    /// title is adopted.
+    ResetTitleToAuto,
     /// Per-turn dashboard summary as `(text, prompt_id)`; replaces (`Some`)
     /// or clears (`None`, on conversation rewind) the previous one in
     /// `summary.json`.
@@ -841,12 +915,45 @@ fn resumed_session_sandbox_profile_in_root(
     None
 }
 
+/// Owner-only session dir + `<encoded-cwd>` shield, for writers that bypass
+/// a storage adapter's `init_session` (e.g. chat-kind sessions).
+pub(crate) fn ensure_owner_only_session_dir(info: &Info) -> std::io::Result<PathBuf> {
+    ensure_owner_only_session_dir_in(&grok_home(), info)
+}
+
+/// Inner implementation with an injectable grok home for tests.
+pub(crate) fn ensure_owner_only_session_dir_in(
+    grok_home: &Path,
+    info: &Info,
+) -> std::io::Result<PathBuf> {
+    let _ = crate::util::grok_home::ensure_sessions_cwd_dir_in(grok_home, &info.cwd);
+    let dir = session_dir_in(grok_home, info);
+    crate::util::grok_home::create_dir_all_owner_only(&dir)?;
+    Ok(dir)
+}
+
+/// `session_dir` with an injectable grok home (pure path computation).
+pub(crate) fn session_dir_in(grok_home: &Path, info: &Info) -> PathBuf {
+    crate::util::grok_home::sessions_cwd_dir_in(grok_home, &info.cwd).join(info.id.to_string())
+}
+
 /// Get file path for storing a large prompt.
 /// Creates the prompts subdirectory if it doesn't exist.
 /// Path format: `{session_dir}/prompts/prompt_{prompt_index}.txt`
 pub(crate) fn get_prompt_file_path(info: &Info, prompt_index: usize) -> PathBuf {
-    let prompts_dir = session_dir(info).join("prompts");
-    std::fs::create_dir_all(&prompts_dir).ok();
+    get_prompt_file_path_in(&grok_home(), info, prompt_index)
+}
+
+/// Inner implementation with an injectable grok home for tests.
+pub(crate) fn get_prompt_file_path_in(
+    grok_home: &Path,
+    info: &Info,
+    prompt_index: usize,
+) -> PathBuf {
+    // Best-effort; failures surface on the prompt-file write itself.
+    let _ = ensure_owner_only_session_dir_in(grok_home, info);
+    let prompts_dir = session_dir_in(grok_home, info).join("prompts");
+    let _ = crate::util::grok_home::create_dir_all_owner_only(&prompts_dir);
     prompts_dir.join(format!("prompt_{}.txt", prompt_index))
 }
 
@@ -2321,6 +2428,23 @@ impl SessionPersistence {
                         tracing::warn!(?e, "failed to replace chat history");
                     }
                 }
+                PersistenceMsg::ReplaceChatHistoryForStripAndAck {
+                    messages,
+                    respond_to,
+                } => {
+                    // Backup gates the rewrite; see `strip_rewrite_gated`.
+                    let result = crate::session::storage::strip_rewrite_gated(
+                        self.storage.as_ref(),
+                        &self.info,
+                        &messages,
+                    )
+                    .await;
+                    self.observe_io(&result);
+                    if let Err(e) = &result {
+                        tracing::warn!(?e, "image-strip history rewrite failed");
+                    }
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::CurrentModel {
                     model_id,
                     provider,
@@ -2501,12 +2625,27 @@ impl SessionPersistence {
                         }
                         Ok(false) => {
                             tracing::debug!(
-                                "skipped auto-generated title; session already has a title"
+                                "session already has a title on disk; discarding generated title"
                             );
                         }
                         Err(e) => {
                             tracing::warn!(?e, "failed to persist generated session title");
                         }
+                    }
+                }
+                PersistenceMsg::ManualTitleRenamed(title) => {
+                    if self.provider_boundary.allows_xai_export()
+                        && let Some(sync) = &self.remote_sync
+                    {
+                        sync.set_manual_title(title);
+                    }
+                }
+                PersistenceMsg::ResetTitleToAuto => {
+                    self.summary.reset();
+                    if self.provider_boundary.allows_xai_export()
+                        && let Some(sync) = &self.remote_sync
+                    {
+                        sync.clear_title();
                     }
                 }
                 PersistenceMsg::LastTurnSummary(summary) => {

@@ -69,6 +69,7 @@ impl AgentView {
             billing_surface_visible: slash_controller.billing_surface_visible(),
             workflows_available: slash_controller.workflows_available(),
             screen_mode: slash_controller.screen_mode(),
+            current_title: slash_controller.current_title(),
         };
         let Some(model_items) = cmd.suggest_args(&ctx, "") else {
             return false;

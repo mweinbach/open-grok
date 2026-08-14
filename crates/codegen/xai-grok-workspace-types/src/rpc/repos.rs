@@ -1,5 +1,5 @@
 //! Provisioned-repo listing (`workspace.repos_list`) and the on-disk
-//! in-sandbox manifest contract (`{workspace}/.opengrok/repos.json`).
+//! in-sandbox manifest contract (`{workspace}/.grok/repos.json`).
 //!
 //! The sandbox provisioner writes this manifest; the workspace list op
 //! reads it. Field names are the frontend/integration API — add optional
@@ -7,14 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::WorkspaceRpc;
+use super::{RpcActivityClass, WorkspaceRpc};
 
 /// Relative path of the provisioner manifest from the **sandbox**
 /// `workspace_directory` (pre-grove-rewrite init root, usually `/workspace`).
 /// Not relative to agent / workspace-server `--cwd` after a single-repo grove
 /// rewrite (`/workspace/app`). Writers and `workspace.repos_list` must join
 /// this to that sandbox root.
-pub const REPOS_MANIFEST_RELATIVE_PATH: &str = ".opengrok/repos.json";
+pub const REPOS_MANIFEST_RELATIVE_PATH: &str = ".grok/repos.json";
 
 /// Current on-disk / wire manifest version.
 pub const REPOS_MANIFEST_VERSION: u32 = 1;
@@ -25,6 +25,7 @@ pub struct ReposListReq {}
 
 impl WorkspaceRpc for ReposListReq {
     const METHOD: &'static str = "workspace.repos_list";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = ReposListResponse;
 }
 
@@ -69,7 +70,7 @@ impl RepoManifest {
         }
     }
 
-    /// Parse bytes from `{workspace}/.opengrok/repos.json`.
+    /// Parse bytes from `{workspace}/.grok/repos.json`.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
     }
@@ -86,11 +87,6 @@ mod tests {
     #[test]
     fn method_constant() {
         assert_eq!(ReposListReq::METHOD, "workspace.repos_list");
-    }
-
-    #[test]
-    fn repos_manifest_relative_path_is_opengrok() {
-        assert_eq!(REPOS_MANIFEST_RELATIVE_PATH, ".opengrok/repos.json");
     }
 
     #[test]

@@ -3599,7 +3599,7 @@ impl McpClient {
         // rmcp's default `ProtocolVersion` tracks its LATEST; pin explicitly
         // so the advertised protocol only changes deliberately, never as a
         // side effect of an rmcp bump.
-        .with_protocol_version(rmcp::model::ProtocolVersion::V_2025_06_18)
+        .with_protocol_version(rmcp::model::ProtocolVersion::V_2025_11_25)
     }
 
     /// Build the [`GrokClientHandler`] that drives `client.serve(...)`.
@@ -4166,6 +4166,16 @@ fn stdio_path_override(env: &[acp::EnvVariable]) -> Option<&str> {
         .map(|e| e.value.as_str())
 }
 
+fn apply_stdio_env(cmd: &mut Command, env: &[acp::EnvVariable], session_id: Option<&str>) {
+    for env_variable in env {
+        cmd.env(&env_variable.name, &env_variable.value);
+    }
+    if let Some(session_id) = session_id {
+        cmd.env("GROK_SESSION_ID", session_id);
+        cmd.env("OPENGROK_SESSION_ID", session_id);
+    }
+}
+
 /// Borrowed cross-cutting spawn context whose `scope`, when set, enrolls the stdio child for session-close reaping.
 pub struct McpSpawnCtx<'a> {
     pub(crate) session_id: Option<&'a str>,
@@ -4235,9 +4245,7 @@ pub async fn start_mcp_server(
             });
             let mut cmd = Command::new(&program);
             cmd.kill_on_drop(true).args(&spawn_args);
-            for env_variable in &env {
-                cmd.env(&env_variable.name, &env_variable.value);
-            }
+            apply_stdio_env(&mut cmd, &env, ctx.session_id);
             xai_grok_tools::util::detach_command(&mut cmd);
 
             let (transport, stderr_handle) = SafeTokioChildProcess::spawn(
@@ -7826,5 +7834,28 @@ mod tests {
             server: "srv".to_string(),
         };
         assert_eq!(ev.server_name(), Some("srv"));
+    }
+
+    #[test]
+    fn make_client_info_pins_protocol_version() {
+        assert_eq!(
+            McpClient::make_client_info("test-srv").protocol_version,
+            rmcp::model::ProtocolVersion::V_2025_11_25
+        );
+    }
+
+    #[test]
+    fn apply_stdio_env_session_id_cannot_be_shadowed() {
+        let mut cmd = Command::new("true");
+        let env = vec![acp::EnvVariable::new("GROK_SESSION_ID", "spoofed")];
+        apply_stdio_env(&mut cmd, &env, Some("sess-real"));
+
+        let value = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "GROK_SESSION_ID")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(value.as_deref(), Some("sess-real"));
     }
 }

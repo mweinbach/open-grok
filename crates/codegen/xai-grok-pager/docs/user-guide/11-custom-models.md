@@ -293,6 +293,33 @@ Wafer accepts standard client function tools. It has no native hosted web
 search, Responses API, OAuth flow, or xAI-only export path. Keep the Wafer API
 key provider-local; do not use `XAI_API_KEY` or an xAI session as a substitute.
 
+### Z AI
+
+Z AI serves GLM models over an OpenAI-compatible Chat Completions endpoint.
+Its provider catalog is dynamic: Open Grok queries `GET /models` at Z AI's
+GLM Coding Plan endpoint (`https://api.z.ai/api/coding/paas/v4` by default;
+override with `OPENGROK_ZAI_API_BASE_URL`) rather than relying on a static
+model list. Set `ZAI_API_KEY` (or connect it with `/login zai`) and pick one
+of the returned GLM model IDs:
+
+```toml
+[model.zai-model]
+model = "glm-5.2"
+name = "GLM 5.2"
+provider = "zai"
+base_url = "https://api.z.ai/api/coding/paas/v4"
+api_backend = "chat_completions"
+env_key = "ZAI_API_KEY"
+reasoning_effort = "high"   # low | medium | high | max on reasoning GLM models
+```
+
+Reasoning-capable GLM models accept `reasoning_effort` up to `max`; Open
+Grok sends Z AI's `thinking` mode switch automatically whenever an effort is
+set. Z AI accepts standard client function tools. It has no native hosted
+web search, Responses API, OAuth flow, or xAI-only export path. Keep the Z
+AI API key provider-local; do not use `XAI_API_KEY` or an xAI session as a
+substitute.
+
 ### Anthropic (Claude)
 
 Use Claude models directly via the Anthropic Messages API:

@@ -17,6 +17,7 @@ use crate::app::app_view::InputOutcome;
 use crate::input::line_editor::{LineEditOutcome, LineEditor};
 use crate::key;
 use crate::views::prompt_widget::PromptWidget;
+use xai_grok_shell::session::persistence::MAX_TITLE_SCALARS as MAX_RENAME_SCALARS;
 
 const PROMPT_MULTI_CLICK_MS: u128 = 300;
 
@@ -792,8 +793,6 @@ pub struct RenameDraft {
     pub row: DashboardRowId,
     editor: LineEditor,
 }
-
-const MAX_RENAME_SCALARS: usize = 100;
 
 impl RenameDraft {
     pub fn new(row: DashboardRowId, text: impl Into<String>) -> Self {
@@ -5737,11 +5736,19 @@ mod tests {
     /// Rename cap is honored exactly.
     #[test]
     fn rename_at_cap_drops_extra_char() {
-        let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "a".repeat(100));
+        assert_eq!(
+            MAX_RENAME_SCALARS,
+            xai_grok_shell::session::persistence::MAX_TITLE_SCALARS
+        );
+        assert_eq!(xai_grok_shell::session::persistence::MAX_TITLE_SCALARS, 100);
+        let mut draft = RenameDraft::new(
+            DashboardRowId::TopLevel(AgentId(0)),
+            "a".repeat(MAX_RENAME_SCALARS),
+        );
         let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
         let outcome = handle_rename_key(&mut draft, &key);
         assert!(matches!(outcome, InputOutcome::Changed));
-        assert_eq!(draft.text().chars().count(), 100);
+        assert_eq!(draft.text().chars().count(), MAX_RENAME_SCALARS);
         assert!(
             draft.text().ends_with('a'),
             "char at cap should NOT be replaced: got {:?}",
@@ -5752,11 +5759,14 @@ mod tests {
     /// under-cap appends correctly.
     #[test]
     fn rename_under_cap_appends() {
-        let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "a".repeat(99));
+        let mut draft = RenameDraft::new(
+            DashboardRowId::TopLevel(AgentId(0)),
+            "a".repeat(MAX_RENAME_SCALARS - 1),
+        );
         let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
         let outcome = handle_rename_key(&mut draft, &key);
         assert!(matches!(outcome, InputOutcome::Changed));
-        assert_eq!(draft.text().chars().count(), 100);
+        assert_eq!(draft.text().chars().count(), MAX_RENAME_SCALARS);
         assert!(draft.text().ends_with('b'));
     }
 

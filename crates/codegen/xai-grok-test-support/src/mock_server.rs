@@ -519,9 +519,14 @@ impl MockInferenceServer {
         self.overrides.release_completions();
     }
 
-    /// e.g. `http://127.0.0.1:12345/v1`
+    /// Base URL for inference calls (`http://127.0.0.1:PORT/v1`).
     pub fn url(&self) -> String {
         format!("http://{}/v1", self.addr)
+    }
+
+    /// Origin without the `/v1` inference prefix (`http://127.0.0.1:PORT`).
+    pub fn origin(&self) -> String {
+        format!("http://{}", self.addr)
     }
 
     pub fn request_count(&self) -> u32 {
@@ -535,6 +540,10 @@ impl MockInferenceServer {
 
     pub fn requests(&self) -> Vec<LogEntry> {
         self.log.entries.lock().unwrap().clone()
+    }
+
+    pub fn received_requests(&self) -> Vec<LogEntry> {
+        self.requests()
     }
 
     /// Bodies of all received requests, in arrival order (body-less requests
@@ -751,6 +760,10 @@ impl MockInferenceServer {
         let log_cc = log.clone();
         let log_rs = log.clone();
         let log_msg = log.clone();
+        let log_session_data = log.clone();
+        let log_session_upsert = log.clone();
+        let overrides_session_data = overrides.clone();
+        let overrides_session_upsert = overrides.clone();
         let mode_cc = response_mode.clone();
         let mode_rs = response_mode.clone();
         let mode_msg = response_mode;
@@ -1129,6 +1142,60 @@ impl MockInferenceServer {
                         }
                     },
                 ),
+            )
+            .route(
+                "/sessions/{id}/data",
+                post({
+                    let log = log_session_data;
+                    let overrides = overrides_session_data;
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          headers: HeaderMap,
+                          Json(body): Json<Value>| {
+                        let log = log.clone();
+                        let overrides = overrides.clone();
+                        async move {
+                            if let Some(reject) = overrides.auth_rejection(&headers) {
+                                return reject;
+                            }
+                            let auth = Self::extract_auth(&headers);
+                            log.record(
+                                "POST",
+                                &format!("/sessions/{id}/data"),
+                                Some(&body),
+                                auth.as_deref(),
+                                Self::headers_vec(&headers),
+                            );
+                            StatusCode::OK.into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/sessions/{id}",
+                put({
+                    let log = log_session_upsert;
+                    let overrides = overrides_session_upsert;
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          headers: HeaderMap,
+                          Json(body): Json<Value>| {
+                        let log = log.clone();
+                        let overrides = overrides.clone();
+                        async move {
+                            if let Some(reject) = overrides.auth_rejection(&headers) {
+                                return reject;
+                            }
+                            let auth = Self::extract_auth(&headers);
+                            log.record(
+                                "PUT",
+                                &format!("/sessions/{id}"),
+                                Some(&body),
+                                auth.as_deref(),
+                                Self::headers_vec(&headers),
+                            );
+                            StatusCode::OK.into_response()
+                        }
+                    }
+                }),
             )
             .route(
                 "/v1/storage",

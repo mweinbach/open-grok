@@ -64,6 +64,7 @@ mod tests {
                 billing_surface_visible: true,
                 workflows_available: available,
                 screen_mode: crate::app::ScreenMode::Fullscreen,
+                current_title: None,
             };
             assert!(WorkflowsCommand.visible(&ctx));
         }

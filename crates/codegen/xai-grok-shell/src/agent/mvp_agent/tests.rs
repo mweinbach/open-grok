@@ -6107,3 +6107,5 @@ mod soft_default_settings_emit {
 }
 #[cfg(feature = "dhat-heap")]
 mod dhat_soak;
+#[path = "tests/session_rename_tests.rs"]
+mod session_rename_tests;

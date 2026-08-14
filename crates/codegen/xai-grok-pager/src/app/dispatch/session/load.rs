@@ -118,6 +118,23 @@ pub(in crate::app::dispatch) fn focus_if_session_already_open(
     switch_to_agent(app, existing_id, SwitchCause::Load);
     Some(existing_id)
 }
+/// Matches effects `is_chat_path` after history-bypass clearing of
+/// `SessionFlags.chat_mode`: conversation-entry bit OR (sticky `--chat`
+/// and not local-disk history bypass). Gateway resumes (no bypass) are
+/// Chat; history-bypass local-disk rows stay Build.
+///
+/// Used by load and fork so `rename_kind()` matches the lane `LoadSession`
+/// is stamped onto.
+pub(in crate::app::dispatch) fn session_opens_as_chat(app: &AppView, chat_kind: bool) -> bool {
+    if chat_kind {
+        return true;
+    }
+    #[cfg(feature = "local-workspace")]
+    if app.welcome_history_load_as_build {
+        return false;
+    }
+    app.chat_mode
+}
 fn dispatch_load_session_ungated(
     app: &mut AppView,
     session_id: String,
@@ -207,6 +224,7 @@ fn dispatch_load_session_ungated(
     );
     agent.swarm_mode_active = app.current_ui.swarm_mode.unwrap_or(false);
     app.agents.insert(agent_id, agent);
+    let conversation_entry = session_opens_as_chat(app, chat_kind);
     let usage_command_visible = app.usage_command_visible();
     let agent_mut = app.agents.get_mut(&agent_id).unwrap();
     agent_mut.attached_as_viewer = true;
@@ -236,6 +254,7 @@ fn dispatch_load_session_ungated(
         &app.tier_restricted_commands,
     );
     agent_mut.chat_kind = chat_kind || app.chat_mode;
+    agent_mut.conversation_entry = conversation_entry;
     #[cfg(feature = "local-workspace")]
     {
         let history_build = app.welcome_history_load_as_build;
@@ -978,6 +997,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
     );
     agent.swarm_mode_active = app.current_ui.swarm_mode.unwrap_or(false);
     app.agents.insert(agent_id, agent);
+    let conversation_entry = session_opens_as_chat(app, false);
     let usage_command_visible = app.usage_command_visible();
     {
         let agent = app.agents.get_mut(&agent_id).unwrap();
@@ -1000,6 +1020,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             &app.tier_restricted_commands,
         );
         agent.chat_kind = app.chat_mode;
+        agent.conversation_entry = conversation_entry;
         #[cfg(feature = "local-workspace")]
         {
             let history_build = app.welcome_history_load_as_build;
@@ -1355,10 +1376,12 @@ pub(in crate::app::dispatch) fn handle_session_restored(
         return vec![];
     }
     let sid = clear_stale_session_id(app, &local_session_id);
+    let conversation_entry = session_opens_as_chat(app, false);
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "SessionRestored");
         agent.bind_session_id(sid);
         agent.chat_kind = app.chat_mode;
+        agent.conversation_entry = conversation_entry;
         #[cfg(feature = "local-workspace")]
         {
             let history_build = app.welcome_history_load_as_build;

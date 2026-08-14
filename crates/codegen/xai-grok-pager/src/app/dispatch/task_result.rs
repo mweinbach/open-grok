@@ -230,7 +230,7 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
         }
     }
 }
-fn apply_kimi_catalog(app: &mut AppView, model_state: acp::SessionModelState) {
+fn apply_catalog_to_sessions(app: &mut AppView, model_state: acp::SessionModelState) {
     let new_models = crate::acp::model_state::ModelState::from(Some(model_state));
     let fallback_current = new_models.current.clone();
     let mut app_models = new_models.clone();
@@ -2245,7 +2245,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 .unwrap_or_default();
             app.kimi_runtime_update_pending = false;
             if let Some(models) = models {
-                apply_kimi_catalog(app, models);
+                apply_catalog_to_sessions(app, models);
                 super::settings::ui::refresh_open_settings_modals(app);
             }
             if !configured && !kimi_credential_configured(effective_endpoint) {
@@ -2296,7 +2296,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
 
             if let Some(models) = models {
-                apply_kimi_catalog(app, models);
+                apply_catalog_to_sessions(app, models);
             }
             super::settings::setters::set_kimi_api_endpoint_inner(app, endpoint);
             app.kimi_effective_endpoint = effective_endpoint;
@@ -2518,11 +2518,16 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             last_turn_summary_gen,
         } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
-                if let Some((t, is_manual)) = title.filter(|(s, _)| !s.trim().is_empty()) {
+                if let Some((raw, is_manual)) = title
+                    && let Some(t) =
+                        xai_grok_shell::session::persistence::sanitize_and_cap_title(&raw)
+                {
                     if is_manual && agent.display_name.is_none() {
                         agent.display_name = Some(t.clone());
                     }
-                    agent.generated_session_title = Some(t);
+                    if agent.generated_session_title.is_none() {
+                        agent.generated_session_title = Some(t);
+                    }
                 }
                 if agent.last_turn_summary_gen == last_turn_summary_gen
                     && agent.last_turn_summary.is_none()
@@ -2955,7 +2960,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
 
             app.fireworks_runtime_update_pending = false;
             if let Some(models) = models {
-                apply_kimi_catalog(app, models);
+                apply_catalog_to_sessions(app, models);
                 super::settings::ui::refresh_open_settings_modals(app);
             }
             if !fireworks_credential_configured() {
@@ -3040,7 +3045,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             app.deepseek_runtime_update_pending = false;
             if let Some(models) = models {
-                apply_kimi_catalog(app, models);
+                apply_catalog_to_sessions(app, models);
                 super::settings::ui::refresh_open_settings_modals(app);
             }
             if !deepseek_credential_configured() {
@@ -3118,7 +3123,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             app.meta_runtime_update_pending = false;
             if let Some(models) = models {
-                apply_kimi_catalog(app, models);
+                apply_catalog_to_sessions(app, models);
                 super::settings::ui::refresh_open_settings_modals(app);
             }
             if !meta_credential_configured() {
@@ -3197,7 +3202,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             app.wafer_runtime_update_pending = false;
             if let Some(models) = models {
-                apply_kimi_catalog(app, models);
+                apply_catalog_to_sessions(app, models);
                 super::settings::ui::refresh_open_settings_modals(app);
             }
             if !wafer_credential_configured() {
@@ -3275,7 +3280,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             app.zai_runtime_update_pending = false;
             if let Some(models) = models {
-                apply_kimi_catalog(app, models);
+                apply_catalog_to_sessions(app, models);
                 super::settings::ui::refresh_open_settings_modals(app);
             }
             if !zai_credential_configured() {
@@ -3322,7 +3327,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 app.opencode_go_enabled_models = enabled_models;
             }
             if let Some(models) = models {
-                apply_kimi_catalog(app, models);
+                apply_catalog_to_sessions(app, models);
             }
             super::settings::ui::refresh_open_settings_modals(app);
 
@@ -3823,6 +3828,43 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                     .push_block(crate::scrollback::block::RenderBlock::system(format!(
                         "Couldn't rename session: {error}"
                     )));
+            }
+            vec![]
+        }
+        TaskResult::ResetSessionTitleComplete { agent_id } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                agent.title_unpin_committed = false;
+                agent
+                    .scrollback
+                    .push_block(crate::scrollback::block::RenderBlock::system(
+                        "Session title reset to auto",
+                    ));
+            }
+            vec![]
+        }
+        TaskResult::ResetSessionTitleFailed {
+            agent_id,
+            error,
+            previous_display_name,
+            previous_generated_title,
+        } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if agent.title_unpin_committed {
+                    agent.title_unpin_committed = false;
+                    agent
+                        .scrollback
+                        .push_block(crate::scrollback::block::RenderBlock::system(
+                            "Session title reset to auto",
+                        ));
+                } else {
+                    agent.display_name = previous_display_name;
+                    agent.generated_session_title = previous_generated_title;
+                    agent
+                        .scrollback
+                        .push_block(crate::scrollback::block::RenderBlock::system(format!(
+                            "Couldn't reset session title: {error}"
+                        )));
+                }
             }
             vec![]
         }

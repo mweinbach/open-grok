@@ -1334,6 +1334,72 @@ fn dashboard_peek_cycle_does_not_retire_the_nudge() {
         "the dashboard peek must not retire (or attribute) the nudge",
     );
 }
+#[test]
+fn dashboard_open_or_merges_session_is_worktree_when_probe_is_plain() {
+    let repo = crate::test_util::TempGitRepo::init("main");
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.cwd = repo.path.clone();
+        agent.session.is_worktree = true;
+        agent.is_worktree = false;
+        agent.current_branch = Some("stale".into());
+    }
+    app.active_view = ActiveView::Agent(id);
+    let _ = dispatch_open_dashboard(&mut app);
+    let agent = &app.agents[&id];
+    assert!(
+        agent.is_worktree,
+        "session.is_worktree must not be clobbered by a plain-repo probe"
+    );
+    assert_eq!(agent.current_branch.as_deref(), Some("main"));
+}
+#[test]
+fn dashboard_open_clears_stale_agent_is_worktree_when_probe_and_session_false() {
+    let repo = crate::test_util::TempGitRepo::init("main");
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.cwd = repo.path.clone();
+        agent.session.is_worktree = false;
+        agent.is_worktree = true;
+        agent.current_branch = Some("stale".into());
+    }
+    app.active_view = ActiveView::Agent(id);
+    let _ = dispatch_open_dashboard(&mut app);
+    let agent = &app.agents[&id];
+    assert!(
+        !agent.is_worktree,
+        "stale agent.is_worktree must clear when probe and session are false"
+    );
+    assert_eq!(agent.current_branch.as_deref(), Some("main"));
+}
+#[test]
+fn dashboard_open_detects_standalone_grok_worktree() {
+    let main = crate::test_util::TempGitRepo::init("main-only");
+    let clone = main.standalone_clone("wt-branch");
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.cwd = clone.path.clone();
+        agent.session.is_worktree = false;
+        agent.is_worktree = false;
+        agent.current_branch = Some("main-random".into());
+        agent.main_repo = None;
+    }
+    app.active_view = ActiveView::Agent(id);
+    let _ = dispatch_open_dashboard(&mut app);
+    let agent = &app.agents[&id];
+    assert!(agent.is_worktree);
+    assert_eq!(agent.current_branch.as_deref(), Some("wt-branch"));
+    assert_eq!(
+        agent.main_repo.as_deref(),
+        Some(crate::test_util::collapsed_path_display(&main.path).as_str())
+    );
+}
 /// Leader-mode independence: opening the dashboard works even when NOT in
 /// leader mode. The dashboard renders local sessions regardless; leader
 /// mode only adds the roster poll. Every entry point funnels through

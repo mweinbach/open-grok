@@ -440,7 +440,10 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
             )
             .await
         });
-        let steer_seen = steer.as_ref().map(|signal| signal.generation()).unwrap_or(0);
+        let steer_seen = steer
+            .as_ref()
+            .map(|signal| signal.generation())
+            .unwrap_or(0);
         let outcome = tokio::select! {
             biased;
             results = &mut scheduler => {
@@ -1968,9 +1971,16 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        assert!(swarm.is_finished(), "scheduler should finish after members complete");
+        assert!(
+            swarm.is_finished(),
+            "scheduler should finish after members complete"
+        );
         let results = swarm.slots.take_complete().expect("complete slots");
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r.outcome == MemberOutcome::Completed));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.outcome == MemberOutcome::Completed)
+        );
     }
 }

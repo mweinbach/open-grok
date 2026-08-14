@@ -310,6 +310,7 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -336,6 +337,7 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                         None,
                         None,
                         true,
+                        false,
                         None,
                         Some(ack_tx),
                         None,
@@ -805,6 +807,7 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -1119,6 +1122,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     StreamingTurnCapture::default(),
                 ),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -1411,63 +1415,52 @@ async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
         })
         .await;
 }
-/// Once armed, `maybe_inject_interrupt_reminder` injects the interrupt notice as
-/// a `<system-reminder>` user item exactly once (one-shot).
+/// Once armed, `maybe_apply_interrupt_envelope` frames non-verbatim queries
+/// in the interrupt envelope, and verbatim queries stay untouched.
 #[tokio::test(flavor = "current_thread")]
-async fn maybe_inject_interrupt_reminder_injects_once() {
+async fn maybe_apply_interrupt_envelope_frames_once() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (actor, _gateway_rx) = build_actor().await;
             actor.events.set_pending_interrupt_reminder();
-            actor.maybe_inject_interrupt_reminder().await;
-            let conversation = actor.chat_state_handle.get_conversation().await;
-            let reminder = match conversation.last() {
-                Some(ConversationItem::User(u)) => u,
-                other => {
-                    panic!("expected a trailing user system-reminder, got: {other:?}")
-                }
-            };
-            assert_eq!(
-                reminder.synthetic_reason,
-                Some(SyntheticReason::SystemReminder),
-                "interrupt notice must be a system-reminder"
-            );
-            let text = conversation
-                .last()
-                .expect("non-empty conversation")
-                .text_content();
+            let assembled = "<user_query>\nfollow-up after interrupt\n</user_query>";
+            let framed = actor.maybe_apply_interrupt_envelope(assembled.into(), false);
+            assert_eq!(framed, frame_user_turn(INTERRUPT_NOTE, assembled));
             assert!(
-                text.contains(crate::session::acp_session::INTERRUPT_REMINDER),
-                "reminder must carry the interrupt notice, got: {text}"
+                !actor.events.take_pending_interrupt_reminder(),
+                "interrupt envelope must be one-shot"
             );
-            assert!(!actor.events.take_pending_interrupt_reminder());
-            let len_before = conversation.len();
-            actor.maybe_inject_interrupt_reminder().await;
-            let after = actor.chat_state_handle.get_conversation().await;
-            assert_eq!(
-                after.len(),
-                len_before,
-                "interrupt reminder must be one-shot"
+            let unconsumed = actor.maybe_apply_interrupt_envelope(assembled.into(), false);
+            assert_eq!(unconsumed, assembled);
+
+            let (actor, _gateway_rx) = build_actor().await;
+            actor.events.set_pending_interrupt_reminder();
+            let assembled = "caller-owned follow-up";
+            let framed = actor.maybe_apply_interrupt_envelope(assembled.into(), true);
+            assert_eq!(framed, assembled, "verbatim text must stay byte-identical");
+            assert!(
+                !actor.events.take_pending_interrupt_reminder(),
+                "verbatim still consumes the one-shot"
             );
         })
         .await;
 }
-/// Integration (production wiring + ordering): with the one-shot armed, a real
-/// user turn driven through `handle_prompt` injects the interrupt
-/// `<system-reminder>` immediately before the user's message. The unit test
-/// above exercises only the helper in isolation; this guards the
-/// `PromptOrigin::User` call site in `handle_prompt` and the relative ordering.
-/// Synchronizes on the persist-ack (fires after both items are pushed, before
-/// the model call), then aborts the turn so the dead-URL model call can't hang.
+/// Integration: with the one-shot armed, a real user turn driven through
+/// `handle_prompt` frames the query in the same envelope as an interjection
+/// (lead-in + `<user_query>` + unfinished-task trailer) instead of a
+/// preceding `<system-reminder>`. Synchronizes on the persist-ack (fires
+/// after the user item is pushed, before the model call), then aborts the
+/// turn so the dead-URL model call can't hang.
 #[test]
-fn handle_prompt_injects_interrupt_reminder_before_user_message() {
+fn handle_prompt_frames_interrupt_on_user_message() {
     run_on_session_sized_stack(|| {
         Box::pin(async {
             let actor = actor_with_persistence_drain().await;
             actor.events.set_pending_interrupt_reminder();
+            let query = "follow-up after interrupt";
             let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
-                "follow-up after interrupt".to_string(),
+                query.to_string(),
             ))];
             let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             let actor_for_prompt = actor.clone();
@@ -1481,6 +1474,103 @@ fn handle_prompt_injects_interrupt_reminder_before_user_message() {
                         None,
                         None,
                         None,
+                        false,
+                        false,
+                        None,
+                        Some(ack_tx),
+                        None,
+                    )
+                    .await
+            });
+            assert!(ack_rx.await.is_ok(), "persist ack should resolve");
+            let conv = actor.chat_state_handle.get_conversation().await;
+            let user = conv
+                .iter()
+                .find(|item| {
+                    matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
+                        && item.text_content().contains(query)
+                })
+                .expect("the user message must be in the conversation");
+            let text = user.text_content();
+            let expected_assembled = format!("<user_query>\n{query}\n</user_query>");
+            assert_eq!(text, frame_user_turn(INTERRUPT_NOTE, &expected_assembled));
+            assert!(!actor.events.take_pending_interrupt_reminder());
+            prompt_task.abort();
+        })
+    });
+}
+/// Integration: a verbatim user turn must stay byte-identical to the caller
+/// text even when the interrupt one-shot is armed.
+#[test]
+fn handle_prompt_verbatim_skips_interrupt_envelope() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let actor = actor_with_persistence_drain().await;
+            actor.events.set_pending_interrupt_reminder();
+            let query = "caller-owned follow-up";
+            let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                query.to_string(),
+            ))];
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let actor_for_prompt = actor.clone();
+            let prompt_task = tokio::task::spawn_local(async move {
+                actor_for_prompt
+                    .handle_prompt(
+                        "interrupt-verbatim-test",
+                        prompt_blocks,
+                        PromptMode::Agent,
+                        None,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                        None,
+                        Some(ack_tx),
+                        None,
+                    )
+                    .await
+            });
+            assert!(ack_rx.await.is_ok(), "persist ack should resolve");
+            let conv = actor.chat_state_handle.get_conversation().await;
+            let user = conv
+                .iter()
+                .find(|item| {
+                    matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
+                        && item.text_content().contains(query)
+                })
+                .expect("the user message must be in the conversation");
+            assert_eq!(user.text_content(), query);
+            assert!(!user.text_content().contains(INTERRUPT_NOTE));
+            assert!(!actor.events.take_pending_interrupt_reminder());
+            prompt_task.abort();
+        })
+    });
+}
+/// Send-now must use the full interjection envelope (prefix + already-wrapped
+/// `<user_query>` + unfinished-task trailer), not the note prefix alone.
+#[test]
+fn handle_prompt_send_now_frames_interjection_envelope() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let actor = actor_with_persistence_drain().await;
+            let query = "create /tmp/A";
+            let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                query.to_string(),
+            ))];
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let actor_for_prompt = actor.clone();
+            let prompt_task = tokio::task::spawn_local(async move {
+                actor_for_prompt
+                    .handle_prompt(
+                        "send-now-envelope-test",
+                        prompt_blocks,
+                        PromptMode::Agent,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
                         true,
                         None,
                         Some(ack_tx),
@@ -1490,30 +1580,21 @@ fn handle_prompt_injects_interrupt_reminder_before_user_message() {
             });
             assert!(ack_rx.await.is_ok(), "persist ack should resolve");
             let conv = actor.chat_state_handle.get_conversation().await;
-            let user_idx = conv
+            let user = conv
                 .iter()
-                .position(|item| {
+                .find(|item| {
                     matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
-                        && item.text_content().contains("follow-up after interrupt")
+                        && item.text_content().contains(query)
                 })
-                .expect("the user message must be in the conversation");
-            assert!(
-                user_idx > 0,
-                "a reminder must precede the user message (found it at index 0)"
+                .expect("the send-now user message must be in the conversation");
+            let expected_assembled = format!("<user_query>\n{query}\n</user_query>");
+            assert_eq!(
+                user.text_content(),
+                frame_user_turn(
+                    xai_interjection_core::INTERJECTION_NOTE,
+                    &expected_assembled
+                )
             );
-            let preceding = &conv[user_idx - 1];
-            assert!(
-                matches!(preceding, ConversationItem::User(u)
-                    if u.synthetic_reason == Some(SyntheticReason::SystemReminder)),
-                "the item immediately before the user message must be a system-reminder, got: {preceding:?}"
-            );
-            assert!(
-                preceding
-                    .text_content()
-                    .contains(crate::session::acp_session::INTERRUPT_REMINDER),
-                "the preceding system-reminder must carry the interrupt notice"
-            );
-            assert!(!actor.events.take_pending_interrupt_reminder());
             prompt_task.abort();
         })
     });
@@ -1543,7 +1624,8 @@ fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
                         None,
                         None,
                         None,
-                        true,
+                        false,
+                        false,
                         None,
                         Some(ack_tx),
                         None,
@@ -1557,10 +1639,10 @@ fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
             );
             let conv = actor.chat_state_handle.get_conversation().await;
             assert!(
-                !conv.iter().any(|item| item
-                    .text_content()
-                    .contains(crate::session::acp_session::INTERRUPT_REMINDER)),
-                "a synthetic-origin turn must not inject the interrupt reminder"
+                !conv
+                    .iter()
+                    .any(|item| item.text_content().contains(INTERRUPT_NOTE)),
+                "a synthetic-origin turn must not inject the interrupt envelope"
             );
             prompt_task.abort();
         })
@@ -2565,6 +2647,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     StreamingTurnCapture::default(),
                 ),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: sampler_handle.clone(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),

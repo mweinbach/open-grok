@@ -34,6 +34,7 @@ fn login_argument_completion_lists_all_providers() {
             ("Meta API", "meta"),
             ("OpenCode Go", "opencode-go"),
             ("Wafer AI", "wafer"),
+            ("Z AI", "zai"),
         ]
     );
     for row in &snapshot.matches[2..] {
@@ -65,6 +66,7 @@ fn login_provider_completion_filters_by_provider_aliases() {
         ("go", "opencode-go"),
         ("opencode", "opencode-go"),
         ("wafer", "wafer"),
+        ("zai", "zai"),
         ("fireworks", "fireworks"),
     ] {
         let text = format!("/login {query}");

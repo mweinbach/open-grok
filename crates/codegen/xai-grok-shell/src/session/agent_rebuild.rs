@@ -667,7 +667,8 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         team_scope_id: "test-session".to_string(),
         blocking_wait_depth: Arc::new(crate::tools::tool_context::BlockingWaitState::new()),
         orchestration_steer:
-            xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal::new(),
+            xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal::new(
+            ),
         swarm_registry: xai_grok_tools::implementations::grok_build::SwarmRegistry::new(),
         respect_gitignore: false,
         scheduler_background_loops: true,
@@ -857,6 +858,7 @@ mod tests {
         assert!(s.allowed_for_provider(ModelProvider::Fireworks));
         assert!(s.allowed_for_provider(ModelProvider::DeepSeek));
         assert!(s.allowed_for_provider(ModelProvider::Wafer));
+        assert!(s.allowed_for_provider(ModelProvider::Zai));
         assert!(s.allowed_for_provider(ModelProvider::OpenCodeGo));
         assert!(!s.native_hosted_web_search_suppressed(ModelProvider::Codex));
         assert!(s.native_hosted_web_search_suppressed(ModelProvider::DeepSeek));
@@ -880,6 +882,7 @@ mod tests {
             ModelProvider::Fireworks,
             ModelProvider::DeepSeek,
             ModelProvider::Wafer,
+            ModelProvider::Zai,
             ModelProvider::OpenCodeGo,
         ] {
             assert!(!s.allowed_for_provider(provider), "{provider:?}");

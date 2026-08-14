@@ -187,7 +187,7 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
             && let Some(agent) = app.agents.get_mut(&id)
         {
             agent.current_branch = info.branch;
-            agent.is_worktree = info.is_worktree;
+            agent.is_worktree = info.is_worktree || agent.session.is_worktree;
             agent.main_repo = info.main_repo;
             agent.worktree_label = info.worktree_label;
         }
@@ -1918,7 +1918,8 @@ pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect>
     if trimmed.is_empty() {
         return vec![];
     }
-    let title: String = crate::views::session_title::sanitize_display_text(trimmed).into_owned();
+    let title: String =
+        xai_grok_shell::session::persistence::sanitize_rename_title(trimmed).into_owned();
     if title.is_empty() {
         return vec![];
     }
@@ -1927,6 +1928,7 @@ pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect>
     };
     let mut effects = Vec::new();
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        let kind = agent.rename_kind();
         if let Some(session_id) = agent.session.session_id.clone() {
             let cwd = agent.session.cwd.clone();
             agent.display_name = Some(title.clone());
@@ -1935,6 +1937,7 @@ pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect>
                 session_id,
                 title,
                 cwd,
+                kind,
             });
         } else {
             agent.display_name = Some(title);

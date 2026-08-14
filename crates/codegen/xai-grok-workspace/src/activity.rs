@@ -88,6 +88,11 @@ pub struct ActivityTracker {
     /// Window (ms) recent preview-proxy traffic withholds idle for; defaults to
     /// [`PREVIEW_ACTIVITY_WINDOW_MS`], overridable via the builder.
     preview_activity_window_ms: u64,
+    /// Window (ms) recent client mutation RPCs withhold idle for; defaults to
+    /// [`PREVIEW_ACTIVITY_WINDOW_MS`], overridable via the builder.
+    rpc_activity_window_ms: u64,
+    /// Epoch ms a client mutation RPC was last executed (`0` = none).
+    last_client_rpc_ms: AtomicU64,
     /// Epoch ms the pane's own status poll was last observed (`0` = none). Fed
     /// by the preview-activity scraper; withholds idle within
     /// [`preview_activity_window_ms`](Self::preview_activity_window_ms).
@@ -183,6 +188,8 @@ impl ActivityTracker {
             durability_idle_hold_max_ms,
             idle_ignores_background: false,
             preview_activity_window_ms: PREVIEW_ACTIVITY_WINDOW_MS,
+            rpc_activity_window_ms: PREVIEW_ACTIVITY_WINDOW_MS,
+            last_client_rpc_ms: AtomicU64::new(0),
             last_preview_status_ms: AtomicU64::new(0),
             last_preview_routed_ms: AtomicU64::new(0),
             preview_ws_tunnels_open: AtomicU64::new(0),
@@ -207,6 +214,13 @@ impl ActivityTracker {
     /// it from `StatusConfig`.
     pub fn with_preview_activity_window_ms(mut self, window_ms: u64) -> Self {
         self.preview_activity_window_ms = window_ms;
+        self
+    }
+
+    /// Override the client-RPC activity withhold window; the WorkspaceServer
+    /// sources it from `StatusConfig`.
+    pub fn with_rpc_activity_window_ms(mut self, window_ms: u64) -> Self {
+        self.rpc_activity_window_ms = window_ms;
         self
     }
 
@@ -242,6 +256,18 @@ impl ActivityTracker {
     pub fn note_preview_routed_activity(&self) {
         self.last_preview_routed_ms
             .store(now_ms(), Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    /// Record a client-driven mutation RPC (file write, git commit, …).
+    ///
+    /// Withholds `idle_since_ms` for
+    /// [`rpc_activity_window_ms`](Self::rpc_activity_window_ms) and wakes the
+    /// status publisher so the renewed "active" status reaches the server
+    /// promptly. Read/poll RPCs deliberately never call this — an unattended
+    /// tab polls but does not mutate, so it cannot pin its sandbox.
+    pub fn note_client_rpc_activity(&self) {
+        self.last_client_rpc_ms.store(now_ms(), Ordering::Relaxed);
         self.notify.notify_waiters();
     }
 
@@ -324,7 +350,7 @@ impl ActivityTracker {
             self.drain_status_fields();
         let (producers, durability_withhold) = self.durability_gate(queue_pending, breaker);
         let now = now_ms();
-        let (preview_withhold, preview_reason, preview_anchor) = self.preview_withholds_idle(now);
+        let (preview_withhold, preview_reason, preview_anchor) = self.client_withholds_idle(now);
         // Withhold idle on durability work OR preview activity, decided here
         // once so both snapshot paths agree (preview has no hold cap; 12h VM TTL backstops).
         let withhold_idle = durability_withhold || preview_withhold;
@@ -392,32 +418,45 @@ impl ActivityTracker {
         (producers, !hold_expired)
     }
 
-    /// Whether preview activity should withhold idle, and on what grounds.
+    /// Whether client activity (preview traffic or mutation RPCs) should
+    /// withhold idle, and on what grounds.
     ///
     /// Returns `(withhold, reason, anchor)`, where the anchor is the epoch-ms
     /// the current hold is measured from. Tiers are checked strongest first;
-    /// all three withhold identically today, only the accounting differs.
-    fn preview_withholds_idle(&self, now: u64) -> (bool, Option<IdleWithholdReason>, u64) {
+    /// all four withhold identically today, only the accounting differs.
+    fn client_withholds_idle(&self, now: u64) -> (bool, Option<IdleWithholdReason>, u64) {
         // Including process start means a young or freshly-restored workspace
         // can never look long-idle — the process restarts on restore, so this
-        // covers revived sessions without a separate minimum-age rule.
+        // covers revived sessions without a separate minimum-age rule. A
+        // mutation RPC is genuine use (unlike a status poll), so it advances
+        // the anchor like routed preview traffic: a continuously-mutating
+        // client is intentionally uncapped by the hub's hold ceiling (the VM
+        // TTL backstops it); the ceiling bounds only a stale stamp.
         let anchor = self
             .last_preview_routed_ms
             .load(Ordering::Relaxed)
+            .max(self.last_client_rpc_ms.load(Ordering::Relaxed))
             .max(self.last_call_completed_ms.load(Ordering::Relaxed))
             .max(self.started_at_ms);
 
         if self.has_preview_client_attached() {
             return (true, Some(IdleWithholdReason::PreviewAttached), anchor);
         }
-        if preview_activity_withholds_idle(
+        if activity_stamp_withholds_idle(
             now,
             self.last_preview_routed_ms.load(Ordering::Relaxed),
             self.preview_activity_window_ms,
         ) {
             return (true, Some(IdleWithholdReason::PreviewRouted), anchor);
         }
-        if preview_activity_withholds_idle(
+        if activity_stamp_withholds_idle(
+            now,
+            self.last_client_rpc_ms.load(Ordering::Relaxed),
+            self.rpc_activity_window_ms,
+        ) {
+            return (true, Some(IdleWithholdReason::ClientRpc), anchor);
+        }
+        if activity_stamp_withholds_idle(
             now,
             self.last_preview_status_ms.load(Ordering::Relaxed),
             self.preview_activity_window_ms,
@@ -940,7 +979,7 @@ fn durability_idle_hold_from_raw(raw: Option<String>) -> u64 {
 /// Whether a preview-activity stamp still withholds idle at `now`: true while it
 /// is within `window` ms. A zero stamp (no activity recorded) never withholds,
 /// and the window is exclusive at the boundary so it decays rather than pins.
-fn preview_activity_withholds_idle(now: u64, last_activity_ms: u64, window_ms: u64) -> bool {
+fn activity_stamp_withholds_idle(now: u64, last_activity_ms: u64, window_ms: u64) -> bool {
     last_activity_ms != 0 && now.saturating_sub(last_activity_ms) < window_ms
 }
 
@@ -1378,15 +1417,15 @@ mod tests {
     fn preview_activity_withholds_idle_window_boundaries() {
         let now = 10_000_000;
         assert!(
-            !preview_activity_withholds_idle(now, 0, PREVIEW_ACTIVITY_WINDOW_MS),
+            !activity_stamp_withholds_idle(now, 0, PREVIEW_ACTIVITY_WINDOW_MS),
             "a zero stamp (no activity ever) must never withhold"
         );
         assert!(
-            preview_activity_withholds_idle(now, now, PREVIEW_ACTIVITY_WINDOW_MS),
+            activity_stamp_withholds_idle(now, now, PREVIEW_ACTIVITY_WINDOW_MS),
             "activity right now withholds"
         );
         assert!(
-            preview_activity_withholds_idle(
+            activity_stamp_withholds_idle(
                 now,
                 now - (PREVIEW_ACTIVITY_WINDOW_MS - 1),
                 PREVIEW_ACTIVITY_WINDOW_MS
@@ -1394,7 +1433,7 @@ mod tests {
             "just inside the window withholds"
         );
         assert!(
-            !preview_activity_withholds_idle(
+            !activity_stamp_withholds_idle(
                 now,
                 now - PREVIEW_ACTIVITY_WINDOW_MS,
                 PREVIEW_ACTIVITY_WINDOW_MS
@@ -1402,7 +1441,7 @@ mod tests {
             "exactly at the window edge no longer withholds (decaying, exclusive)"
         );
         assert!(
-            !preview_activity_withholds_idle(
+            !activity_stamp_withholds_idle(
                 now,
                 now - (PREVIEW_ACTIVITY_WINDOW_MS + 5_000),
                 PREVIEW_ACTIVITY_WINDOW_MS
@@ -1467,6 +1506,13 @@ mod tests {
             "every reason carries a since-stamp so a reader can age the hold"
         );
 
+        t.note_client_rpc_activity();
+        assert_eq!(
+            t.snapshot().withhold_reason,
+            Some(IdleWithholdReason::ClientRpc),
+            "a client mutation outranks the status poll"
+        );
+
         t.note_preview_routed_activity();
         assert_eq!(
             t.snapshot().withhold_reason,
@@ -1483,6 +1529,42 @@ mod tests {
         );
         assert_eq!(s.preview_ws_tunnels_open, 1);
         assert!(!s.withhold_capped, "no ceilings configured yet");
+    }
+
+    #[test]
+    fn client_rpc_withholds_and_advances_the_anchor() {
+        let t = ActivityTracker::new();
+        let before = now_ms();
+        t.note_client_rpc_activity();
+
+        let s = t.snapshot();
+        assert!(
+            s.idle_since_ms.is_none(),
+            "a recent mutation withholds idle"
+        );
+        assert_eq!(s.withhold_reason, Some(IdleWithholdReason::ClientRpc));
+        assert!(
+            s.withhold_since_ms.is_some_and(|since| since >= before),
+            "a mutation is real use, so it advances the anchor (unlike a poll)"
+        );
+
+        let per_session = t.snapshot_session("some-session");
+        assert!(
+            per_session.idle_since_ms.is_none(),
+            "the hold is aggregate: per-session payloads withhold too"
+        );
+    }
+
+    #[test]
+    fn zero_rpc_window_disables_the_client_rpc_withhold() {
+        let t = ActivityTracker::new().with_rpc_activity_window_ms(0);
+        t.note_client_rpc_activity();
+        let s = t.snapshot();
+        assert!(
+            s.idle_since_ms.is_some(),
+            "window 0 is the kill switch: the stamp must never withhold"
+        );
+        assert_eq!(s.withhold_reason, None);
     }
 
     /// An HMR socket writes no activity stamps, so the counter must hold alone

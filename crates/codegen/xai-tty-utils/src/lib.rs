@@ -39,6 +39,9 @@
 use std::collections::HashMap;
 use std::io;
 
+mod child_wait;
+pub use child_wait::{is_child_wait_identity_uncertain, spawn_child_reaper, wait_child_bounded};
+
 mod process_resources;
 pub use process_resources::{ProcessResources, sample_process_memory, sample_process_resources};
 
@@ -169,6 +172,14 @@ pub fn detach_command(cmd: &mut tokio::process::Command) {
         use windows::Win32::System::Threading::CREATE_NO_WINDOW;
         cmd.creation_flags(CREATE_NO_WINDOW.0);
     }
+}
+
+/// Configure a short-lived search child ([`detach_command`], no stdin) that is
+/// killed and queued for reaping if its future is dropped (cancellation).
+pub fn detach_search_command(cmd: &mut tokio::process::Command) {
+    detach_command(cmd);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +383,40 @@ pub async fn reap_killed_bounded(
     }
 }
 
+/// True when `pid` is gone or a zombie awaiting reap — i.e. no longer running.
+/// Test/assertion observation only — production liveness checks must use
+/// [`ProcessGroup::has_live_members`], which counts zombies as live.
+#[cfg(unix)]
+pub fn process_not_running(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            // State is the first field after the parenthesized comm.
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .and_then(|rest| rest.trim_start().chars().next())
+                .is_some_and(|state| state == 'Z'),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        {
+            // Can't tell; report "running" so callers fail loudly.
+            Err(_) => false,
+            Ok(out) => {
+                let stat = String::from_utf8_lossy(&out.stdout);
+                let stat = stat.trim();
+                stat.is_empty() || stat.starts_with('Z')
+            }
+        }
+    }
+}
+
 /// Configure a command so the spawned child becomes the leader of a new
 /// process group.
 pub fn new_process_group(cmd: &mut tokio::process::Command) {
@@ -521,10 +566,29 @@ impl ProcessGroup {
         self.attach_pid(pid)
     }
 
-    /// Attach a `std::process::Child` (rather than tokio's). The PID is read via
-    /// `Child::id()`, which is valid until the child is reaped with `wait()`.
+    /// Attach a `std::process::Child` (rather than tokio's). The process must be
+    /// (or lead) its own group/job — e.g. spawned via [`new_process_group`] (Unix
+    /// `setpgid`) or a `detach_*` helper (Unix `setsid`) — otherwise `kill`
+    /// would signal the wrong group.
+    ///
+    /// Unix still goes through [`attach_pid`]. Windows uses the child's stable
+    /// process handle (`AsHandle`) rather than `OpenProcess` by PID.
     pub fn attach_std(&mut self, child: &std::process::Child) -> io::Result<()> {
-        self.attach_pid(child.id())
+        #[cfg(unix)]
+        {
+            self.attach_pid(child.id())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsHandle, AsRawHandle};
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+
+            let process_handle = HANDLE(child.as_handle().as_raw_handle());
+            // SAFETY: both handles are valid and borrowed for the duration of the call.
+            unsafe { AssignProcessToJobObject(self.job, process_handle) }
+                .map_err(|e| io::Error::other(format!("AssignProcessToJobObject: {e}")))
+        }
     }
 
     /// Attach an already-spawned process by raw PID. The process must be (or
@@ -1554,5 +1618,48 @@ mod tests {
         let foreign = if own == 2 { 3 } else { 2 };
         let id = ProcessGroupId::new(foreign).expect("foreign pgid should be accepted");
         assert_eq!(id.get(), foreign);
+    }
+
+    /// Pins the mechanism every search-tool spawn site relies on: the child is
+    /// detached into its own process group and killed when its `Child` drops.
+    #[cfg(unix)]
+    #[test]
+    fn detach_search_command_kills_child_on_drop() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let mut cmd = tokio::process::Command::new("/bin/sleep");
+            cmd.arg("30");
+            detach_search_command(&mut cmd);
+            #[allow(clippy::disallowed_methods)] // test child, killed on drop below
+            let child = cmd.spawn().expect("spawn sleep");
+            let pid = child.id().expect("child pid");
+
+            // The pre_exec setsid lands between fork and exec; poll until the
+            // child leaves our process group (pins the detach property).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)))
+                .expect("getpgid")
+                == nix::unistd::getpgrp()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleep (pid {pid}) stayed in our process group — not detached"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            drop(child);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !process_not_running(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleep (pid {pid}) still running 5s after its Child was dropped — leaked"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
     }
 }

@@ -75,6 +75,8 @@ impl ExportedMessage {
 pub struct ExportedMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_is_manual: Option<bool>,
     pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
@@ -112,8 +114,16 @@ pub struct ExportedMetadata {
 impl ExportedMetadata {
     /// Build metadata from a [`Summary`].
     pub(crate) fn from_summary(summary: &Summary) -> Self {
+        let (title, title_is_manual) = match summary.manual_title_opt() {
+            Some(pinned) => (Some(pinned), Some(true)),
+            None => (
+                Some(summary.session_summary.clone()).filter(|s| !s.is_empty()),
+                None,
+            ),
+        };
         Self {
-            title: Some(summary.session_summary.clone()).filter(|s| !s.is_empty()),
+            title,
+            title_is_manual,
             cwd: summary.info.cwd.clone(),
             model_id: Some(summary.current_model_id.0.to_string()),
             created_at: Some(summary.created_at.to_rfc3339()),
@@ -167,5 +177,68 @@ impl ExportedSession {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_summary() -> Summary {
+        let info = Info {
+            id: agent_client_protocol::SessionId::new("export-tests"),
+            cwd: "/repo".into(),
+        };
+        Summary::new(&info, agent_client_protocol::ModelId::new("test-model")).unwrap()
+    }
+
+    #[test]
+    fn from_summary_manual_pinned_title_sets_true_flag() {
+        let mut summary = test_summary();
+        summary.generated_title = Some("Pinned Title".into());
+        summary.title_is_manual = true;
+        summary.session_summary = "stale auto title".into();
+
+        let meta = ExportedMetadata::from_summary(&summary);
+        assert_eq!(meta.title.as_deref(), Some("Pinned Title"));
+        assert_eq!(meta.title_is_manual, Some(true));
+
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["title_is_manual"], true);
+        assert_eq!(json["title"], "Pinned Title");
+    }
+
+    #[test]
+    fn from_summary_auto_title_omits_manual_flag() {
+        let mut summary = test_summary();
+        summary.session_summary = "Auto Title".into();
+        summary.generated_title = None;
+        summary.title_is_manual = false;
+
+        let meta = ExportedMetadata::from_summary(&summary);
+        assert_eq!(meta.title.as_deref(), Some("Auto Title"));
+        assert_eq!(meta.title_is_manual, None);
+
+        let json = serde_json::to_value(&meta).unwrap();
+        assert!(
+            json.get("title_is_manual").is_none(),
+            "auto title must omit title_is_manual: {json}"
+        );
+        assert_eq!(json["title"], "Auto Title");
+    }
+
+    #[test]
+    fn from_summary_stale_flag_over_blank_generated_title_does_not_promote() {
+        let mut summary = test_summary();
+        summary.session_summary = "Auto Title".into();
+        summary.generated_title = Some("   ".into());
+        summary.title_is_manual = true;
+
+        let meta = ExportedMetadata::from_summary(&summary);
+        assert_eq!(meta.title.as_deref(), Some("Auto Title"));
+        assert_eq!(
+            meta.title_is_manual, None,
+            "stale title_is_manual over whitespace must not promote auto title to manual"
+        );
     }
 }

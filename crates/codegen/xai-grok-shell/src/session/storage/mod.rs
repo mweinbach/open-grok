@@ -1006,6 +1006,13 @@ pub trait StorageAdapter: Send + Sync {
         session_title: String,
     ) -> io::Result<bool>;
 
+    /// Clear a manual `/rename` pin (`/rename --auto`). Sets
+    /// `title_is_manual = false` and, when a pin was present, blanks
+    /// `generated_title` and `session_summary` so `display_title()` is
+    /// empty. Returns `true` iff a manual pin was actually cleared.
+    /// Idempotent when the title is not manual.
+    async fn reset_title_to_auto(&self, info: &Info) -> io::Result<bool>;
+
     /// Replace or clear (`None`) the per-turn dashboard summary
     /// (`(text, prompt_id)`) in `summary.json`; last-writer-wins.
     async fn set_last_turn_summary(
@@ -1192,6 +1199,12 @@ pub trait StorageAdapter: Send + Sync {
         messages: &[ConversationItem],
     ) -> io::Result<()>;
 
+    /// Copy the on-disk chat history before a destructive image-strip
+    /// rewrite (first backup wins), mirroring the `*.corrupt` quarantine.
+    /// Required, not defaulted: a new adapter must choose its
+    /// recoverability story explicitly.
+    async fn backup_chat_history_before_strip(&self, info: &Info) -> io::Result<()>;
+
     /// Copy session data from source to target, transforming session IDs
     /// The `options` parameter allows setting parent session tracking and model overrides.
     async fn copy_session_data(
@@ -1279,6 +1292,19 @@ pub trait StorageAdapter: Send + Sync {
         info: &Info,
         checkpoint_file: &str,
     ) -> io::Result<crate::extensions::notification::CompactionCheckpointFile>;
+}
+
+/// Backup-gated strip rewrite: the destructive rewrite runs only when the
+/// backup landed, so recoverability can never be silently forfeited (full
+/// disk, read-only volume). Factored out of the persistence actor so the
+/// gate ordering is testable against a real adapter.
+pub(crate) async fn strip_rewrite_gated(
+    storage: &dyn StorageAdapter,
+    info: &Info,
+    messages: &[ConversationItem],
+) -> io::Result<()> {
+    storage.backup_chat_history_before_strip(info).await?;
+    storage.replace_chat_history(info, messages).await
 }
 
 pub use jsonl::JsonlStorageAdapter;

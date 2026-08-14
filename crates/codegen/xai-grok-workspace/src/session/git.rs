@@ -413,6 +413,7 @@ pub fn change_type_from_git2_delta(delta: git2::Delta) -> ChangeType {
         git2::Delta::Renamed => ChangeType::Rename,
         git2::Delta::Copied => ChangeType::Copy,
         git2::Delta::Typechange => ChangeType::Typechange,
+        git2::Delta::Untracked => ChangeType::Untracked,
         other => {
             tracing::warn!(?other, "unexpected git delta type, treating as Edit");
             ChangeType::Edit
@@ -767,15 +768,20 @@ fn collect_diff_stats(
     pathspecs: Option<&[String]>,
     include_patch: bool,
 ) -> DiffStatsResult {
+    let base_ref = GitRef::parse(from);
+    let head_ref = GitRef::parse(to);
     let mut opts = DiffOptions::new();
     opts.ignore_submodules(true);
+    if matches!(head_ref, GitRef::Workdir) {
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true);
+    }
     if let Some(specs) = pathspecs {
         for spec in specs {
             opts.pathspec(spec);
         }
     }
-    let base_ref = GitRef::parse(from);
-    let head_ref = GitRef::parse(to);
     let diff = match create_diff(repo, &base_ref, &head_ref, false, &mut opts) {
         Some(d) => d,
         None => {
@@ -3780,6 +3786,31 @@ mod tests {
     fn test_parse_numstat_empty() {
         let stats = parse_numstat("");
         assert!(stats.is_empty());
+    }
+    #[tokio::test]
+    async fn diffs_head_to_working_reports_untracked_file_additions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        std::fs::write(tmp.path().join("README.md"), "hello\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        std::fs::write(tmp.path().join("new.txt"), "line1\nline2\nline3\n").unwrap();
+        let data = diffs(tmp.path(), None, "HEAD", "working", false, false, false)
+            .await
+            .unwrap();
+        let file = data
+            .files
+            .iter()
+            .find(|f| f.path == "new.txt")
+            .expect("untracked file missing from HEAD→working diff");
+        assert_eq!(file.additions, 3);
+        assert_eq!(file.deletions, 0);
+        assert!(matches!(file.change_type, ChangeType::Untracked));
     }
     #[test]
     fn test_parse_porcelain_v2_ordinary() {

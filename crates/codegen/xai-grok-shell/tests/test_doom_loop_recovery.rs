@@ -27,8 +27,6 @@ use xai_grok_test_support::{MockInferenceServer, MockModelEntry, ScriptedRespons
 
 const MODEL: &str = "test-model";
 
-/// A sampling client with the doom-loop check enabled (default tunables:
-/// `max_threshold` 8, `max_retries` 2).
 fn doom_loop_client(base_url: &str) -> Client {
     let mut config = test_sampler_config(base_url, ApiBackend::Responses, &[]);
     config.doom_loop_recovery = Some(Default::default());
@@ -579,7 +577,7 @@ async fn headless_config_enables_doom_loop_check_header() {
     for turn in turns {
         assert_eq!(
             turn.header("x-grok-doom-loop-check"),
-            Some("true"),
+            Some("1024"),
             "[doom_loop_recovery] enabled must reach the turn request header; requests:\n{}",
             server.request_log_summary()
         );

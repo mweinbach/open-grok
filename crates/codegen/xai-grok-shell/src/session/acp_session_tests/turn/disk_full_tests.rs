@@ -139,6 +139,7 @@ async fn run_prompt(
             None,
             None,
             true,
+            false,
             None,
             None,
             None,

@@ -143,6 +143,18 @@ async fn detect_continue_parent_work(
 // Tool implementation
 // ───────────────────────────────────────────────────────────────────────────
 
+pub const TASK_TOOL_NAME: &str = "task";
+
+/// True when `name` is a wire name of the subagent-spawn ("task") tool.
+///
+/// Accepts every spelling regardless of enabled features: names arrive over
+/// the wire from arbitrary toolsets. Spellings other than [`TASK_TOOL_NAME`]
+/// are defined downstream and pinned to this predicate by tests at their
+/// definition sites.
+pub fn is_task_tool_id(name: &str) -> bool {
+    matches!(name, TASK_TOOL_NAME | "Task" | "spawn_subagent")
+}
+
 #[derive(Debug, Default)]
 pub struct TaskTool;
 
@@ -235,7 +247,7 @@ impl xai_tool_runtime::Tool for TaskTool {
     type Output = ToolOutput;
 
     fn id(&self) -> xai_tool_protocol::ToolId {
-        xai_tool_protocol::ToolId::new("task").expect("valid tool id")
+        xai_tool_protocol::ToolId::new(TASK_TOOL_NAME).expect("valid tool id")
     }
 
     fn description(
@@ -680,6 +692,33 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use xai_tool_types::SubagentCapabilityMode;
+
+    #[test]
+    fn task_tool_id_predicate_accepts_all_wire_spellings() {
+        assert!(is_task_tool_id(
+            xai_tool_runtime::Tool::id(&TaskTool).as_str()
+        ));
+        for name in ["task", "Task", "spawn_subagent"] {
+            assert!(is_task_tool_id(name), "must accept {name:?}");
+        }
+    }
+
+    #[test]
+    fn task_tool_id_predicate_rejects_lookalikes() {
+        for name in [
+            "",
+            "TASK",
+            "tasks",
+            "spawn_subagents",
+            "Spawn_Subagent",
+            "task_output",
+            "kill_task",
+            "subagent",
+            " task",
+        ] {
+            assert!(!is_task_tool_id(name), "must reject {name:?}");
+        }
+    }
 
     /// Backend whose `ValidateType` events are auto-acked with `Ok`.
     fn make_backend() -> (

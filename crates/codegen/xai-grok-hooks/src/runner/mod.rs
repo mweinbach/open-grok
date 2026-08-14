@@ -41,14 +41,21 @@ pub(crate) struct GateHookJson {
 
 /// Interpret a [`GateHookJson`] as a [`HookDecision`]. An unknown decision value
 /// is an error so typos surface instead of failing open.
+///
+/// `fallback_reason` supplies the deny message when the JSON carries none
+/// (command hooks pass the first stderr line — the hook's feedback channel;
+/// HTTP hooks have no stderr and pass `None`).
 pub(crate) fn gate_json_to_decision(
     json: GateHookJson,
     hook_name: &str,
+    fallback_reason: Option<&str>,
 ) -> Result<HookDecision, String> {
     match json.decision.as_str() {
         "deny" => Ok(HookDecision::Deny {
             reason: json
                 .reason
+                .filter(|r| !r.trim().is_empty())
+                .or_else(|| fallback_reason.map(str::to_string))
                 .unwrap_or_else(|| format!("denied by hook '{hook_name}'")),
             hook_name: hook_name.to_string(),
         }),

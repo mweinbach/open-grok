@@ -169,12 +169,23 @@ pub enum SamplingError {
         /// `Some(false)` = request-content error, don't retry.
         /// `None` = header absent (old server or non-proxy origin).
         should_retry: Option<bool>,
+        /// The error envelope's `code` slot, parsed via [`ApiErrorCode`].
+        /// Dedicated code slots — nested envelopes, Responses-stream error
+        /// events — pass through verbatim; the flat envelope's overloaded
+        /// slot surfaces only semantic values. `None` when the body has no
+        /// envelope or carries no code.
+        error_code: Option<ApiErrorCode>,
     },
     #[error("reqwest error stream: {0}")]
     EventStreamError(String),
     /// Server-side stream error (sent as JSON within the SSE stream)
     #[error("stream error ({error_type}): {message}")]
-    StreamError { error_type: String, message: String },
+    StreamError {
+        error_type: String,
+        message: String,
+        /// The stream error envelope's `code` slot, when present.
+        code: Option<ApiErrorCode>,
+    },
     /// Per-chunk idle timeout — no SSE chunk received from the model within the
     /// configured deadline. NOT retryable: the model (or network path) is stuck,
     /// and replaying the same request would likely stall again.
@@ -195,6 +206,53 @@ pub enum SamplingError {
         triggers: Vec<String>,
         aborted_at_chunk: Option<u64>,
     },
+}
+
+/// Semantic `error.code` the server stamps on invalid-image rejections, on
+/// both non-stream error bodies and mid-stream SSE error events.
+pub const INVALID_IMAGE_ERROR_CODE: &str = "invalid_image";
+
+/// A wire `error.code`, parsed once at the boundary so classification
+/// compares variants instead of strings. `#[non_exhaustive]`: the next
+/// semantic code is a new variant, not another const and `||` chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApiErrorCode {
+    /// The server rejected an image ([`INVALID_IMAGE_ERROR_CODE`]).
+    InvalidImage,
+    /// Any other wire code, preserved verbatim (Responses-stream error
+    /// events pass arbitrary codes through).
+    Other(String),
+}
+
+impl ApiErrorCode {
+    pub fn parse(code: &str) -> Self {
+        match code {
+            INVALID_IMAGE_ERROR_CODE => Self::InvalidImage,
+            _ => Self::Other(code.to_string()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::InvalidImage => INVALID_IMAGE_ERROR_CODE,
+            Self::Other(code) => code,
+        }
+    }
+}
+
+/// Serializes as the plain wire string, so `Option<ApiErrorCode>` fields are
+/// byte-identical on the wire to the `Option<String>` they replaced.
+impl Serialize for ApiErrorCode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ApiErrorCode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(Self::parse(&String::deserialize(d)?))
+    }
 }
 
 impl SamplingError {
@@ -299,25 +357,45 @@ impl SamplingError {
         )
     }
 
-    /// The API rejected the request because an inline image could not be
-    /// processed. Matches both direct 400 and proxy-wrapped 500 responses.
-    /// Exact-case match — consistent with `is_encrypted_content_error`.
+    /// The server rejected the request because an image could not be
+    /// processed. [`INVALID_IMAGE_ERROR_CODE`] is the signal; the legacy
+    /// phrase match covers pre-code servers and relayed provider messages
+    /// that carry the same wording (they arrive as `Api` errors, so the
+    /// phrase arm applies to them too). Providers emitting neither the code
+    /// nor the phrase get no recovery. The `400 | 500` gate is deliberate
+    /// insurance against a mis-stamping server: recovery destroys request
+    /// images, so unexpected statuses (422, 415, ...) fail closed.
     ///
     /// Also matches Codex/OpenAI Responses rejections of the form
     /// `Invalid 'input[N].output[M].image_url' … invalid base64-encoded value`
     /// (and user-message `input_image` variants) so the sampler can strip
     /// images and retry once instead of hard-failing the turn.
     pub fn is_image_processing_error(&self) -> bool {
-        matches!(
-            self,
+        match self {
             SamplingError::Api {
                 status,
                 message,
+                error_code,
                 ..
-            } if matches!(status.as_u16(), 400 | 500)
-                && (message.contains("Could not process image")
-                    || is_codex_invalid_image_url_error(message))
-        )
+            } if matches!(status.as_u16(), 400 | 500) => {
+                *error_code == Some(ApiErrorCode::InvalidImage)
+                    || message.contains("Could not process image")
+                    || is_codex_invalid_image_url_error(message)
+            }
+            SamplingError::StreamError { code, .. } => *code == Some(ApiErrorCode::InvalidImage),
+            // Explicit like `is_retryable`: a new variant must state its
+            // image classification instead of silently defaulting to false.
+            SamplingError::Api { .. }
+            | SamplingError::Auth { .. }
+            | SamplingError::InvalidConfiguration(_)
+            | SamplingError::Http(_)
+            | SamplingError::Serialization(_)
+            | SamplingError::EventStreamError(_)
+            | SamplingError::IdleTimeout { .. }
+            | SamplingError::EmptyResponse { .. }
+            | SamplingError::MaxTokensTruncation
+            | SamplingError::DoomLoopDetected { .. } => false,
+        }
     }
 
     pub fn is_retryable(&self) -> bool {
@@ -435,7 +513,7 @@ impl From<serde_json::Error> for SamplingError {
     }
 }
 
-/// OpenAI-standard provider error format: `{"error": {"message": "...", "type": "..."}}`.
+/// OpenAI-standard provider error format: `{"error": {"message": "...", "type": "...", "code": "..."}}`.
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
     error: ErrorBody,
@@ -446,6 +524,8 @@ struct ErrorBody {
     message: Option<String>,
     #[serde(rename = "type")]
     kind: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
 }
 
 /// Flat error from the Grok proxy/gateway: `{"code": "...", "error": "..."}`.
@@ -456,23 +536,48 @@ struct FlatErrorResponse {
     code: Option<String>,
 }
 
-/// Extract `(error_type, message)` from either error format.
-fn try_parse_error(data: &str) -> Option<(String, String)> {
+/// Fields extracted from an error payload by [`try_parse_error`].
+struct ParsedError {
+    error_type: String,
+    message: String,
+    /// The envelope's `code` slot: nested envelopes pass through verbatim;
+    /// the flat envelope's slot is overloaded (gRPC kebab codes, type slots),
+    /// so only semantic values surface from it.
+    code: Option<ApiErrorCode>,
+}
+
+/// Extract the error fields from either error format.
+fn try_parse_error(data: &str) -> Option<ParsedError> {
     if let Ok(resp) = serde_json::from_str::<ErrorResponse>(data) {
-        return Some((
-            resp.error.kind.unwrap_or_else(|| "unknown".to_string()),
-            resp.error
+        return Some(ParsedError {
+            error_type: resp.error.kind.unwrap_or_else(|| "unknown".to_string()),
+            message: resp
+                .error
                 .message
                 .unwrap_or_else(|| "unknown error".to_string()),
-        ));
+            code: resp.error.code.as_deref().map(ApiErrorCode::parse),
+        });
     }
     if let Ok(flat) = serde_json::from_str::<FlatErrorResponse>(data) {
-        return Some((
-            flat.code.unwrap_or_else(|| "server_error".to_string()),
-            flat.error,
-        ));
+        let code = flat
+            .code
+            .as_deref()
+            .map(ApiErrorCode::parse)
+            .filter(|c| !matches!(c, ApiErrorCode::Other(_)));
+        return Some(ParsedError {
+            code,
+            error_type: flat.code.unwrap_or_else(|| "server_error".to_string()),
+            message: flat.error,
+        });
     }
     None
+}
+
+pub fn parse_error_code(bytes: &[u8]) -> Option<ApiErrorCode> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(try_parse_error)?
+        .code
 }
 
 /// Max chars of a structured (JSON) error message shown to users.
@@ -523,7 +628,11 @@ fn truncate_user_error(s: &str) -> String {
 /// Format a known JSON error envelope; `None` if the body is not structured.
 fn structured_error_message(bytes: &[u8]) -> Option<String> {
     let rigid = std::str::from_utf8(bytes).ok().and_then(try_parse_error);
-    if let Some((error_type, message)) = &rigid
+    if let Some(ParsedError {
+        error_type,
+        message,
+        ..
+    }) = &rigid
         && message != "unknown error"
     {
         if let Some(inner) = parse_provider_error_str(message)
@@ -544,7 +653,7 @@ fn structured_error_message(bytes: &[u8]) -> Option<String> {
     {
         return Some(parsed.display_message());
     }
-    rigid.map(|(_, message)| truncate_user_error(&message))
+    rigid.map(|parsed| truncate_user_error(&parsed.message))
 }
 
 /// Parse an API error body into a short string.
@@ -567,11 +676,16 @@ pub fn user_facing_api_error_message(status: StatusCode, bytes: &[u8]) -> String
 }
 
 pub fn try_parse_stream_error(data: &str) -> Option<SamplingError> {
-    let (error_type, message) = try_parse_error(data)?;
+    let ParsedError {
+        error_type,
+        message,
+        code,
+    } = try_parse_error(data)?;
     tracing::warn!(error_type, message, "Server-side stream error");
     Some(SamplingError::StreamError {
         error_type,
         message,
+        code,
     })
 }
 
@@ -630,6 +744,7 @@ mod tests {
             SamplingError::StreamError {
                 error_type: "overloaded_error".into(),
                 message: "Overloaded".into(),
+                code: None,
             }
             .is_overloaded()
         );
@@ -640,6 +755,7 @@ mod tests {
                 model_metadata: None,
                 retry_after_secs: None,
                 should_retry: None,
+                error_code: None,
             }
             .is_overloaded()
         );
@@ -650,6 +766,7 @@ mod tests {
                 model_metadata: None,
                 retry_after_secs: None,
                 should_retry: None,
+                error_code: None,
             }
             .is_overloaded()
         );
@@ -660,6 +777,7 @@ mod tests {
                 model_metadata: None,
                 retry_after_secs: None,
                 should_retry: None,
+                error_code: None,
             }
             .is_retryable()
         );
@@ -671,6 +789,7 @@ mod tests {
                 model_metadata: None,
                 retry_after_secs: None,
                 should_retry: None,
+                error_code: None,
             }
             .is_overloaded()
         );
@@ -683,6 +802,7 @@ mod tests {
                 model_metadata: None,
                 retry_after_secs: None,
                 should_retry: None,
+                error_code: None,
             }
             .is_overloaded()
         );
@@ -692,6 +812,7 @@ mod tests {
             !SamplingError::StreamError {
                 error_type: "invalid_request_error".into(),
                 message: "tool result mentions overloaded".into(),
+                code: None,
             }
             .is_overloaded()
         );
@@ -699,6 +820,7 @@ mod tests {
             SamplingError::StreamError {
                 error_type: "service_unavailable_error".into(),
                 message: "upstream capacity".into(),
+                code: None,
             }
             .is_overloaded()
         );
@@ -720,6 +842,7 @@ mod tests {
                     model_metadata: None,
                     retry_after_secs: None,
                     should_retry: None,
+                    error_code: None,
                 }
                 .is_overloaded(),
                 "expected overloaded for message: {msg}"
@@ -734,6 +857,7 @@ mod tests {
                     model_metadata: None,
                     retry_after_secs: None,
                     should_retry: None,
+                    error_code: None,
                 }
                 .is_overloaded(),
                 "expected not overloaded for message: {msg}"
@@ -749,6 +873,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: Some(false),
+            error_code: None,
         };
         assert!(vetoed_by_header.is_retry_vetoed());
 
@@ -758,6 +883,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(vetoed_by_context.is_retry_vetoed());
 
@@ -767,6 +893,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(!not_vetoed.is_retry_vetoed());
     }
@@ -803,12 +930,14 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(api.is_context_length_error());
         assert!(
             SamplingError::StreamError {
                 error_type: "overloaded_error".into(),
                 message: "prompt is too long".into(),
+                code: None,
             }
             .is_context_length_error()
         );
@@ -879,6 +1008,7 @@ mod tests {
             SamplingError::StreamError {
                 error_type,
                 message,
+                ..
             } => {
                 assert_eq!(error_type, "The service is currently unavailable");
                 assert_eq!(
@@ -1037,6 +1167,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(
             !err.is_auth_error(),
@@ -1052,6 +1183,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(
             err.is_auth_error(),
@@ -1094,6 +1226,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(err.is_rate_limited());
         assert!(err.is_retryable(), "429 should be retryable");
@@ -1109,6 +1242,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(!server_error.is_rate_limited());
 
@@ -1127,6 +1261,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: Some(42),
             should_retry: None,
+            error_code: None,
         };
         assert_eq!(err.retry_after(), Some(42));
     }
@@ -1139,6 +1274,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert_eq!(err.retry_after(), None);
     }
@@ -1160,6 +1296,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(err.is_encrypted_content_error());
         assert!(
@@ -1176,6 +1313,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(
             !err.is_encrypted_content_error(),
@@ -1191,6 +1329,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(
             !err.is_encrypted_content_error(),
@@ -1206,6 +1345,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(err.is_image_processing_error());
         assert!(!err.is_encrypted_content_error());
@@ -1223,6 +1363,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(
             err.is_image_processing_error(),
@@ -1238,6 +1379,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(err.is_image_processing_error());
     }
@@ -1250,6 +1392,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(!err.is_image_processing_error());
     }
@@ -1262,6 +1405,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(!err.is_image_processing_error());
     }
@@ -1274,6 +1418,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(
             !err.is_image_processing_error(),
@@ -1289,6 +1434,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         assert!(
             !err.is_retryable(),
@@ -1303,6 +1449,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         }
     }
 

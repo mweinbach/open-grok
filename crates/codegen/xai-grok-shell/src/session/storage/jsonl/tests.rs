@@ -2,7 +2,7 @@
 use super::*;
 use crate::session::info::Info;
 use crate::session::persistence::default_model_id;
-use crate::session::storage::SessionUpdate;
+use crate::session::storage::{CopySessionOptions, SessionUpdate};
 use crate::tools::todo::TodoState;
 use agent_client_protocol as acp;
 use tempfile::TempDir;
@@ -2026,6 +2026,73 @@ fn read_chat_history_quarantines_original_on_image_strip() {
             "pre-strip original must be preserved for recovery"
         );
 }
+/// The pre-strip backup copies the live file once; the first copy wins
+/// so a later strip cannot overwrite the earliest (fullest) backup.
+#[tokio::test]
+async fn backup_chat_history_before_strip_copies_once() {
+    let original = r#"{"type":"user","content":[{"type":"text","text":"with image"}]}"#;
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    let chat_path = adapter.chat_file(&info);
+    std::fs::create_dir_all(chat_path.parent().unwrap()).unwrap();
+    std::fs::write(&chat_path, original).unwrap();
+    adapter.backup_chat_history_before_strip(&info).await.unwrap();
+    let backup = chat_path.with_extension("jsonl.pre-strip");
+    assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            original,
+            "backup must capture the pre-strip file"
+        );
+    std::fs::write(&chat_path, "stripped").unwrap();
+    adapter.backup_chat_history_before_strip(&info).await.unwrap();
+    assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            original,
+            "first backup wins; a later strip must not overwrite it"
+        );
+}
+/// The gate itself: when the backup cannot be written, the destructive
+/// rewrite must not run: the live file keeps its images and the error
+/// surfaces to the caller.
+#[tokio::test]
+async fn strip_rewrite_gated_skips_rewrite_when_backup_fails() {
+    let original = r#"{"type":"user","content":[{"type":"text","text":"with image"}]}"#;
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    let chat_path = adapter.chat_file(&info);
+    std::fs::create_dir_all(chat_path.parent().unwrap()).unwrap();
+    std::fs::write(&chat_path, original).unwrap();
+    std::fs::create_dir(chat_path.with_extension("jsonl.pre-strip.tmp")).unwrap();
+    let result = crate::session::storage::strip_rewrite_gated(
+            &adapter,
+            &info,
+            &[ConversationItem::user("stripped")],
+        )
+        .await;
+    assert!(result.is_err(), "a failed backup must fail the strip");
+    assert_eq!(
+            std::fs::read_to_string(&chat_path).unwrap(),
+            original,
+            "the rewrite must not run when the backup failed"
+        );
+}
+/// A missing chat file (fresh session, strip before first write) must
+/// not error or create a backup.
+#[tokio::test]
+async fn backup_chat_history_before_strip_noops_without_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    adapter.backup_chat_history_before_strip(&info).await.unwrap();
+    assert!(
+            !adapter
+                .chat_file(&info)
+                .with_extension("jsonl.pre-strip")
+                .exists()
+        );
+}
 /// The exact incident shape: a partial record with the next record
 /// appended straight onto it (no newline in between — the log-and-continue
 /// append path pre-heal). The merged line fails with "expected `,` or `}`"
@@ -2405,5 +2472,95 @@ async fn load_session_without_updates_survives_merged_chat_line() {
             user_text(&loaded.chat_history),
             vec!["real turn"],
             "resume succeeds; only the merged record is dropped"
+        );
+}
+
+#[cfg(unix)]
+use crate::test_support::{set_unix_mode, unix_mode};
+
+#[tokio::test]
+#[cfg(unix)]
+async fn init_session_creates_owner_only_session_and_parent_dirs() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let session_dir = temp_dir
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(info.id.to_string());
+    assert_eq!(unix_mode(&session_dir), 0o700, "session dir must be 0700");
+    assert_eq!(
+            unix_mode(session_dir.parent().unwrap()),
+            0o700,
+            "<encoded-cwd> parent must be 0700"
+        );
+    assert_eq!(
+            unix_mode(&temp_dir.path().join("sessions")),
+            0o700,
+            "sessions root must be 0700"
+        );
+}
+
+/// Dirs loosened on disk (e.g. by an older grok) re-tighten on next touch.
+#[tokio::test]
+#[cfg(unix)]
+async fn init_session_retightens_loosened_existing_dirs() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let session_dir = temp_dir
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&info.cwd))
+        .join(info.id.to_string());
+    set_unix_mode(&session_dir, 0o755);
+    set_unix_mode(session_dir.parent().unwrap(), 0o755);
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    assert_eq!(unix_mode(&session_dir), 0o700);
+    assert_eq!(unix_mode(session_dir.parent().unwrap()), 0o700);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn copy_session_data_creates_owner_only_target_dir() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source = create_test_info();
+    adapter.init_session(&source, default_model_id()).await.unwrap();
+    let target = Info {
+        id: acp::SessionId::new("forked-session-456"),
+        cwd: source.cwd.clone(),
+    };
+    adapter
+        .copy_session_data(&source, &target, CopySessionOptions::default())
+        .await
+        .unwrap();
+    let target_dir = temp_dir
+        .path()
+        .join("sessions")
+        .join(crate::util::grok_home::encode_cwd_dirname(&target.cwd))
+        .join(target.id.to_string());
+    assert_eq!(unix_mode(&target_dir), 0o700);
+}
+
+/// Explicit-mode parents are caller-owned (temp roots in tests): never chmod'd.
+#[tokio::test]
+#[cfg(unix)]
+async fn explicit_session_dir_does_not_tighten_parent() {
+    let temp_dir = TempDir::new().unwrap();
+    let parent = temp_dir.path().join("caller-owned");
+    std::fs::create_dir(&parent).unwrap();
+    set_unix_mode(&parent, 0o755);
+    let child = parent.join("child-session");
+    let adapter = JsonlStorageAdapter::with_explicit_session_dir(child.clone());
+    adapter.init_session(&create_test_info(), default_model_id()).await.unwrap();
+    assert_eq!(unix_mode(&child), 0o700, "explicit dir must be tightened");
+    assert_eq!(
+            unix_mode(&parent),
+            0o755,
+            "caller-owned parent must not be chmod'd in Explicit mode"
         );
 }

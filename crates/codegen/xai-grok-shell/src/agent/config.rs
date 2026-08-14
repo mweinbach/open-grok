@@ -2653,6 +2653,11 @@ impl Config {
                 .max_retries
                 .or(remote.and_then(|s| s.max_retries))
                 .map_or(Policy::DEFAULT_MAX_RETRIES, Policy::clamp_max_retries),
+            window_tokens: self
+                .doom_loop_recovery
+                .window_tokens
+                .or(remote.and_then(|s| s.window_tokens))
+                .map_or(Policy::DEFAULT_RECOVERY_WINDOW_TOKENS, Policy::clamp_window_tokens),
         })
     }
     /// Automatic worktree GC policy. Precedence: env kill/dry-run >
@@ -10842,8 +10847,9 @@ reasoning_effort = "low"
         let p = default_cfg
             .resolve_doom_loop_recovery()
             .expect("default is ON");
-        assert_eq!(p.max_threshold, 8, "default tunables unchanged");
+        assert_eq!(p.max_threshold, 32, "default tunables unchanged");
         assert_eq!(p.max_retries, 2, "default tunables unchanged");
+        assert_eq!(p.window_tokens, 1024, "default tunables unchanged");
         let toml_off = Config {
             doom_loop_recovery: DoomLoopRecoverySettings {
                 enabled: Some(false),
@@ -10881,6 +10887,7 @@ reasoning_effort = "low"
                     enabled: Some(true),
                     max_threshold: Some(16),
                     max_retries: Some(1),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -10909,12 +10916,14 @@ reasoning_effort = "low"
                 enabled: Some(true),
                 max_threshold: Some(4),
                 max_retries: Some(3),
+                ..Default::default()
             },
             remote_settings: Some(crate::util::config::RemoteSettings {
                 doom_loop_recovery: Some(DoomLoopRecoverySettings {
                     enabled: Some(false),
                     max_threshold: Some(16),
                     max_retries: Some(1),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -11005,6 +11014,7 @@ reasoning_effort = "low"
                 enabled: Some(true),
                 max_threshold: Some(1_000),
                 max_retries: Some(99),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -11016,6 +11026,7 @@ reasoning_effort = "low"
                 enabled: Some(true),
                 max_threshold: Some(0),
                 max_retries: Some(0),
+                ..Default::default()
             },
             ..Default::default()
         };

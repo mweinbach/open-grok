@@ -732,8 +732,7 @@ impl SessionActor {
             }
             let merge_as_interjection = turn_running
                 && (orchestrating
-                    || (goal_active
-                        && Self::extract_bash_command(&item.prompt_blocks).is_none()));
+                    || (goal_active && Self::extract_bash_command(&item.prompt_blocks).is_none()));
             if merge_as_interjection {
                 if goal_active {
                     self.enqueue_prompt_as_planner_steering(&item);
