@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly REPOSITORY="mweinbach/open-grok"
+readonly REPOSITORY="chunsi-w/purr-grok"
 
 usage() {
     cat >&2 <<'EOF'

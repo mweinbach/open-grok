@@ -82,21 +82,21 @@ and config, providers, and development workflow).
 
 ## Install
 
-Prebuilt releases support **Apple Silicon macOS** (`arm64` / `aarch64`) and
-**64-bit Windows** (`x86_64`). Linux, Intel macOS, and Windows on Arm users
-should build from source for now.
+Prebuilt releases support **Apple Silicon macOS** (`arm64` / `aarch64`),
+**Linux** (`x86_64` / `aarch64`), and **64-bit Windows** (`x86_64`). Intel
+macOS and Windows on Arm users should build from source for now.
 
-Apple Silicon macOS And linux :
+Apple Silicon macOS / Linux:
 
 ```sh
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/chunsi-w/purr-grok/releases/latest/download/install.sh | bash
 open-grok --version
 ```
 
 64-bit Windows PowerShell:
 
 ```powershell
-irm https://github.com/mweinbach/open-grok/releases/latest/download/install.ps1 | iex
+irm https://github.com/chunsi-w/purr-grok/releases/latest/download/install.ps1 | iex
 open-grok --version
 ```
 
@@ -113,15 +113,15 @@ installer, export the override first so it is available to `bash`:
 
 ```sh
 export OPEN_GROK_BIN_DIR="$HOME/.local/bin"
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/chunsi-w/purr-grok/releases/latest/download/install.sh | bash
 ```
 
 Install a specific version by passing it to the script (with or without a
 leading `v`):
 
 ```sh
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh \
-  | bash -s -- v0.1.220-open-grok.24
+curl -fsSL https://github.com/chunsi-w/purr-grok/releases/latest/download/install.sh \
+  | bash -s -- v1.0.0-open-grok.61
 ```
 
 For local installer testing, `OPEN_GROK_RELEASE_BASE_URL` may point directly to

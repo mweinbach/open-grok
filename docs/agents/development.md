@@ -138,7 +138,7 @@ cargo test --locked -p xai-grok-shell --test codex_auth_contract -- <filter>
 | Embedded version | Build injects `GROK_VERSION` → `xai-grok-version` |
 | Public command | `open-grok` only |
 | Managed install path | `$OPENGROK_HOME/bin/open-grok` |
-| Update source | GitHub `mweinbach/open-grok` releases; SHA-256 verified |
+| Update source | GitHub `chunsi-w/purr-grok` releases; SHA-256 verified |
 | CLI | `open-grok update --check` / `open-grok update` |
 | Disable auto | `[cli] auto_update = false`, `--no-auto-update`, `OPENGROK_DISABLE_AUTOUPDATER=1` |
 | Release notes | `docs/releases/` |

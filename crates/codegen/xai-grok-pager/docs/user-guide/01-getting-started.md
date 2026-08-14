@@ -11,21 +11,21 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 
 ## Installation
 
-Install the latest Apple Silicon macOS release:
+Install the latest release on Apple Silicon macOS or Linux:
 
 ```bash
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/chunsi-w/purr-grok/releases/latest/download/install.sh | bash
 ```
 
 Install a specific version:
 
 ```bash
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash -s 0.1.220-open-grok.24
+curl -fsSL https://github.com/chunsi-w/purr-grok/releases/latest/download/install.sh | bash -s 1.0.0-open-grok.61
 ```
 
-The installer writes only `open-grok` under
+The installer selects the matching prebuilt artifact and writes only `open-grok` under
 `${OPENGROK_HOME:-$HOME/.opengrok}/bin`; it does not create or replace `grok`
-or `agent` commands. Build from source on other platforms.
+or `agent` commands. Build from source on Intel macOS or Windows on Arm.
 
 Verify the installation:
 

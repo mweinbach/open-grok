@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - .github/release-target
+      - .github/workflows/release.yml
   workflow_dispatch:
     inputs:
       tag:
@@ -21,7 +22,7 @@ concurrency:
 
 jobs:
   resolve:
-    name: Resolve and anchor release target
+    name: Resolve release target
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.target.outputs.tag }}
@@ -31,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve target and create missing tag
+      - name: Resolve release target
         id: target
         shell: bash
         env:
@@ -40,6 +41,10 @@ jobs:
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             tag="$REQUESTED_TAG"
+            if ! git show-ref --verify --quiet "refs/tags/$tag"; then
+              echo "Error: workflow_dispatch requires an existing tag: $tag" >&2
+              exit 1
+            fi
             sha="$(git rev-list -n 1 "$tag")"
           else
             read -r tag sha < .github/release-target
@@ -53,8 +58,7 @@ jobs:
           if git show-ref --verify --quiet "refs/tags/$tag"; then
             test "$(git rev-list -n 1 "$tag")" = "$resolved_sha"
           else
-            git tag "$tag" "$resolved_sha"
-            git push origin "refs/tags/$tag"
+            echo "Tag $tag is not present; the publish job will create it with the release API." >&2
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$resolved_sha" >> "$GITHUB_OUTPUT"
@@ -66,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 0
 
       - name: Verify tag and version
@@ -76,8 +80,8 @@ jobs:
           if ("v$version" -ne '${{ needs.resolve.outputs.tag }}') {
             throw "Tag/version mismatch: tag=${{ needs.resolve.outputs.tag }} version=$version"
           }
-          if (-not (git tag --points-at HEAD | Where-Object { $_ -eq '${{ needs.resolve.outputs.tag }}' })) {
-            throw 'Checked-out commit is not anchored by the requested tag.'
+          if ((git rev-parse HEAD).Trim() -ne '${{ needs.resolve.outputs.sha }}') {
+            throw 'Checked-out commit does not match the resolved release target.'
           }
 
       - name: Restore Cargo cache
@@ -124,7 +128,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 0
 
       - name: Verify tag and version
@@ -133,7 +137,7 @@ jobs:
           set -euo pipefail
           version="$(tr -d '\r\n' < OPEN_GROK_VERSION)"
           test "v${version}" = '${{ needs.resolve.outputs.tag }}'
-          git tag --points-at HEAD | grep -Fx '${{ needs.resolve.outputs.tag }}'
+          test "$(git rev-parse HEAD)" = '${{ needs.resolve.outputs.sha }}'
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
@@ -210,7 +214,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 0
 
       - name: Verify tag and version
@@ -219,7 +223,7 @@ jobs:
           set -euo pipefail
           version="$(tr -d '\r\n' < OPEN_GROK_VERSION)"
           test "v${version}" = '${{ needs.resolve.outputs.tag }}'
-          git tag --points-at HEAD | grep -Fx '${{ needs.resolve.outputs.tag }}'
+          test "$(git rev-parse HEAD)" = '${{ needs.resolve.outputs.sha }}'
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
@@ -302,7 +306,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
@@ -329,7 +333,7 @@ jobs:
           else
             gh release create '${{ needs.resolve.outputs.tag }}' release-assets/* \
               --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
+              --target '${{ needs.resolve.outputs.sha }}' \
               --title "Open Grok v${version}" \
               --notes-file "$notes" \
               --latest

