@@ -132,6 +132,24 @@ pub fn reset_oom_score_adj() -> io::Result<()> {
 #[cfg(unix)]
 pub const RESET_CHILD_OOM_ENV: &str = "GROK_TOOLS_RESET_CHILD_OOM";
 
+/// Lower this process's `oom_score_adj` to -900 so the kernel OOM killer
+/// prefers any ordinary child (score 0) while the server remains a last-resort
+/// victim (unlike -1000, which would exempt it entirely and can leave a capped
+/// cgroup with no eligible victim at all). Lowering the score needs
+/// root/`CAP_SYS_RESOURCE`; the error distinguishes a real misconfiguration
+/// (`PermissionDenied`) from an expected non-procfs environment (`NotFound`).
+/// The score is inherited across `fork`, so a caller that gets `Ok` MUST arm
+/// [`RESET_CHILD_OOM_ENV`] or its whole subtree inherits the protection.
+#[cfg(target_os = "linux")]
+pub fn protect_from_oom_kill() -> io::Result<()> {
+    std::fs::write("/proc/self/oom_score_adj", "-900\n")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn protect_from_oom_kill() -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 #[cfg(unix)]
 pub fn detach_from_tty_reset_oom() -> io::Result<()> {
     reset_oom_score_adj()?;
@@ -265,7 +283,7 @@ fn bind_to_parent_death(parent_pid: u32, armed_thread: std::thread::ThreadId) ->
 /// Bind the child's lifetime to the spawning process: on Linux the kernel
 /// delivers `SIGTERM` to the child when the parent dies
 /// (`PR_SET_PDEATHSIG`), so helper processes cannot outlive a crashed or
-/// killed open-grok and pile up on shared hosts. No-op on non-Linux platforms
+/// killed grok and pile up on shared hosts. No-op on non-Linux platforms
 /// (macOS and Windows have no pdeathsig equivalent).
 ///
 /// **Caveat: pdeathsig binds to the death of the spawning *thread*, not
@@ -309,7 +327,7 @@ pub fn kill_on_parent_death_std(cmd: &mut std::process::Command) {
 ///
 /// This is the child-side variant of [`kill_on_parent_death_std`] for protocol
 /// servers whose parents are not spawned from this workspace (IDE clients,
-/// the agent SDKs, and desktop clients all spawn `open-grok agent … stdio`): the
+/// the agent SDKs, `grok-desktop` all spawn `grok agent … stdio`): the
 /// child arms the binding itself at startup instead of relying on every
 /// external spawner to.
 ///
@@ -1002,6 +1020,49 @@ mod tests {
         detach_command(&mut cmd);
     }
 
+    /// Pins the mechanism every search-tool spawn site relies on: the child is
+    /// detached into its own process group and killed when its `Child` drops.
+    #[cfg(unix)]
+    #[test]
+    fn detach_search_command_kills_child_on_drop() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let mut cmd = tokio::process::Command::new("/bin/sleep");
+            cmd.arg("30");
+            detach_search_command(&mut cmd);
+            #[allow(clippy::disallowed_methods)] // test child, killed on drop below
+            let child = cmd.spawn().expect("spawn sleep");
+            let pid = child.id().expect("child pid");
+
+            // The pre_exec setsid lands between fork and exec; poll until the
+            // child leaves our process group (pins the detach property).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)))
+                .expect("getpgid")
+                == nix::unistd::getpgrp()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleep (pid {pid}) stayed in our process group — not detached"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            drop(child);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !process_not_running(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleep (pid {pid}) still running 5s after its Child was dropped — leaked"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+    }
+
     /// `None` when lowering our own score below 0 is not permitted (it needs
     /// `CAP_SYS_RESOURCE`).
     #[cfg(target_os = "linux")]
@@ -1029,6 +1090,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn detach_from_tty_reset_oom_resets_the_child() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(score) = child_oom_score_under(detach_from_tty_reset_oom) else {
             return;
         };
@@ -1041,6 +1105,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn plain_detach_from_tty_leaves_child_oom_score_inherited() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(score) = child_oom_score_under(detach_from_tty) else {
             return;
         };
@@ -1050,9 +1117,19 @@ mod tests {
         );
     }
 
+    /// Serializes every test that touches the process-global OOM state:
+    /// [`RESET_CHILD_OOM_ENV`] and `/proc/self/oom_score_adj` (mutated by both
+    /// [`child_oom_score_under`] and `protect_from_oom_kill`). Under parallel
+    /// `cargo test` these must not interleave.
+    #[cfg(target_os = "linux")]
+    static OOM_SCORE_ADJ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(target_os = "linux")]
     #[test]
     fn detach_pre_exec_hook_defaults_to_no_reset() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(score) = child_oom_score_under(detach_pre_exec_hook()) else {
             return;
         };
@@ -1060,6 +1137,47 @@ mod tests {
             score, "-500",
             "without the opt-in env the hook must not reset children"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_pre_exec_hook_selects_reset_when_env_armed() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: test-process env mutation, serialized with the sibling test
+        // by the lock above; the var is removed before returning.
+        unsafe { std::env::set_var(RESET_CHILD_OOM_ENV, "1") };
+        let hook = detach_pre_exec_hook();
+        unsafe { std::env::remove_var(RESET_CHILD_OOM_ENV) };
+        let Some(score) = child_oom_score_under(hook) else {
+            return;
+        };
+        assert_eq!(
+            score, "0",
+            "with the env armed the hook must reset the child's oom_score_adj"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protect_from_oom_kill_lowers_own_score_when_privileged() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let own = std::fs::read_to_string("/proc/self/oom_score_adj").expect("read own score");
+        let restore = own.trim().to_owned();
+        // Unprivileged (no CAP_SYS_RESOURCE) must surface as an error, never
+        // a silent no-op.
+        match protect_from_oom_kill() {
+            Ok(()) => {
+                let score =
+                    std::fs::read_to_string("/proc/self/oom_score_adj").expect("read own score");
+                assert_eq!("-900", score.trim());
+                let _ = std::fs::write("/proc/self/oom_score_adj", format!("{restore}\n"));
+            }
+            Err(e) => assert_eq!(io::ErrorKind::PermissionDenied, e.kind()),
+        }
     }
 
     #[test]
@@ -1618,48 +1736,5 @@ mod tests {
         let foreign = if own == 2 { 3 } else { 2 };
         let id = ProcessGroupId::new(foreign).expect("foreign pgid should be accepted");
         assert_eq!(id.get(), foreign);
-    }
-
-    /// Pins the mechanism every search-tool spawn site relies on: the child is
-    /// detached into its own process group and killed when its `Child` drops.
-    #[cfg(unix)]
-    #[test]
-    fn detach_search_command_kills_child_on_drop() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        rt.block_on(async {
-            let mut cmd = tokio::process::Command::new("/bin/sleep");
-            cmd.arg("30");
-            detach_search_command(&mut cmd);
-            #[allow(clippy::disallowed_methods)] // test child, killed on drop below
-            let child = cmd.spawn().expect("spawn sleep");
-            let pid = child.id().expect("child pid");
-
-            // The pre_exec setsid lands between fork and exec; poll until the
-            // child leaves our process group (pins the detach property).
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)))
-                .expect("getpgid")
-                == nix::unistd::getpgrp()
-            {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "sleep (pid {pid}) stayed in our process group — not detached"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-
-            drop(child);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !process_not_running(pid) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "sleep (pid {pid}) still running 5s after its Child was dropped — leaked"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        });
     }
 }

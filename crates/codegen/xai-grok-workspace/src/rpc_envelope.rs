@@ -3,16 +3,12 @@
 //!
 //! `error_code` uses a non-wildcard match so the compiler enforces
 //! coverage of new `WorkspaceError` variants.
-
-pub use xai_grok_workspace_types::rpc::{RpcEnvelope, RpcError};
-
 use crate::error::WorkspaceError;
-
+pub use xai_grok_workspace_types::rpc::{RpcEnvelope, RpcError};
 /// Build an error envelope from a `WorkspaceError`.
 pub fn envelope_err<T>(error: &WorkspaceError) -> RpcEnvelope<T> {
     RpcEnvelope::err_parts(error_code(error), error.to_string())
 }
-
 /// Map a `WorkspaceError` to its wire code string.
 ///
 /// Uses an exhaustive match with no wildcard -- the compiler will
@@ -34,7 +30,6 @@ pub fn error_code(err: &WorkspaceError) -> &'static str {
         WorkspaceError::InvalidHunkAction(_) => "invalid_hunk_action",
         WorkspaceError::HunkActionFailed(_) => "hunk_action_failed",
         WorkspaceError::HubError(_) => "hub_error",
-        WorkspaceError::DeployError { kind, .. } => kind.wire_code(),
         WorkspaceError::UnknownMethod(_) => "unknown_method",
         WorkspaceError::ExportArchiveLimitExceeded(_) => "export_archive_limit_exceeded",
         WorkspaceError::ExportGithub { kind, .. } => kind.wire_code(),
@@ -42,7 +37,6 @@ pub fn error_code(err: &WorkspaceError) -> &'static str {
         WorkspaceError::ToolsetExternallyOwned(_) => "toolset_externally_owned",
     }
 }
-
 /// Map a wire [`RpcError`] back to a [`WorkspaceError`].
 ///
 /// Known codes are mapped to their specific variants. Unknown codes
@@ -61,14 +55,6 @@ pub fn error_code(err: &WorkspaceError) -> &'static str {
 /// `HubError` message which contains the original error code as a
 /// prefix (e.g. `"capability_widening: ..."`).
 pub fn rpc_error_to_workspace(err: RpcError) -> WorkspaceError {
-    if let Some(kind) =
-        xai_grok_workspace_types::rpc::deploy::DeployError::from_wire_code(&err.code)
-    {
-        return WorkspaceError::DeployError {
-            kind,
-            message: err.message,
-        };
-    }
     if let Some(kind) =
         xai_grok_workspace_types::rpc::export_github::ExportGithubError::from_wire_code(&err.code)
     {
@@ -105,12 +91,10 @@ pub fn rpc_error_to_workspace(err: RpcError) -> WorkspaceError {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capability::CapabilityMode;
-
     /// Verify round-trip fidelity for every `WorkspaceError` variant.
     #[test]
     fn error_code_round_trip_all_variants() {
@@ -140,32 +124,15 @@ mod tests {
             WorkspaceError::ShuttingDown,
             WorkspaceError::ToolsetExternallyOwned("s".into()),
         ];
-        variants.extend(
-            xai_grok_workspace_types::rpc::deploy::DeployError::ALL
-                .into_iter()
-                .map(|kind| WorkspaceError::DeployError {
-                    kind,
-                    message: "deploy".into(),
-                }),
-        );
-
         for err in &variants {
             let code = error_code(err);
             assert!(!code.is_empty(), "code must not be empty for {err:?}");
-
-            // Round-trip through RpcError
             let rpc_err = RpcError {
                 code: code.to_owned(),
                 message: err.to_string(),
             };
             let recovered = rpc_error_to_workspace(rpc_err);
-            // The recovered error's code should match the original code
             let recovered_code = error_code(&recovered);
-
-            // Structured variants (CapabilityWidening, Unauthorized,
-            // MaxDepthExceeded) lose their fields on the wire and
-            // degrade to HubError, which is the expected behavior.
-            // Their error messages are preserved in the HubError string.
             match err {
                 WorkspaceError::CapabilityWidening { .. } => {
                     assert_eq!(recovered_code, "hub_error");
@@ -200,7 +167,7 @@ mod tests {
             }
         }
     }
-
+    /// Verify unknown codes degrade to HubError.
     #[test]
     fn export_github_codes_round_trip_typed() {
         for kind in xai_grok_workspace_types::rpc::export_github::ExportGithubError::ALL {
@@ -219,8 +186,6 @@ mod tests {
             );
         }
     }
-
-    /// Verify unknown codes degrade to HubError.
     #[test]
     fn unknown_code_degrades_to_hub_error() {
         let rpc_err = RpcError {
@@ -232,7 +197,6 @@ mod tests {
         let msg = recovered.to_string();
         assert!(msg.contains("future_new_variant"));
     }
-
     /// Verify serde round-trip of RpcEnvelope.
     #[test]
     fn envelope_serde_round_trip_ok() {
@@ -244,7 +208,6 @@ mod tests {
             Err(e) => panic!("expected Ok, got {e:?}"),
         }
     }
-
     /// Verify serde round-trip of RpcEnvelope error, through the
     /// `WorkspaceError` mapping in both directions.
     #[test]

@@ -91,8 +91,6 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::MemorySearch,
     ToolKind::MemoryGet,
     ToolKind::Task,
-    ToolKind::AgentSwarm,
-    ToolKind::AgentCollaboration,
     ToolKind::EnterPlan,
     ToolKind::ExitPlan,
     ToolKind::AskUser,
@@ -106,6 +104,8 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::Monitor,
     ToolKind::GoalUpdate,
     ToolKind::Workflow,
+    ToolKind::AgentSwarm,
+    ToolKind::AgentCollaboration,
     ToolKind::Other,
 ];
 
@@ -130,8 +130,7 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
 
     match kind {
         // Meta tools: always allowed.
-        Plan | EnterPlan | ExitPlan | AskUser | Skill | SearchTool | GoalUpdate
-        | AgentCollaboration => true,
+        Plan | EnterPlan | ExitPlan | AskUser | Skill | SearchTool | GoalUpdate => true,
 
         // Read class.
         Read | MemoryGet | MemorySearch => {
@@ -153,9 +152,8 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
         // Bash / shell.
         Execute => matches!(mode, M::Execute),
 
-        // Process control (background tasks, monitors).
-        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | AgentSwarm | Monitor
-        | Workflow => {
+        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | Monitor | Workflow
+        | AgentSwarm | AgentCollaboration => {
             matches!(mode, M::Execute)
         }
 

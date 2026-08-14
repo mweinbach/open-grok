@@ -41,7 +41,7 @@ pub enum PromptCompletionKind {
     /// Completed so goal continuation is not re-queued under an active goal.
     StationarityEnded,
     Cancelled {
-        category: Option<xai_file_utils::events::types::CancellationCategory>,
+        category: Option<xai_grok_session_events::types::CancellationCategory>,
         context: Option<CancellationContext>,
     },
     MaxTurnsReached {
@@ -595,6 +595,7 @@ pub enum SessionCommand {
     /// Routes through the ToolBridge's TerminalBackend (lock-free, Arc-shared).
     KillBackgroundTask {
         task_id: String,
+        source: xai_grok_tools::types::KillSource,
         respond_to: oneshot::Sender<Result<xai_grok_tools::types::KillOutcome, String>>,
     },
     DeleteScheduledTask {

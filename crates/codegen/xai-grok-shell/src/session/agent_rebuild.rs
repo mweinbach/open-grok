@@ -611,7 +611,6 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         terminal_backend: Arc::new(
             xai_grok_tools::computer::local::LocalTerminalBackend::new_local(
                 xai_grok_tools::computer::local::SearchShadowConfig::default(),
-                None,
             ),
         ),
         fs_backend: Arc::new(xai_grok_tools::computer::local::LocalFs),

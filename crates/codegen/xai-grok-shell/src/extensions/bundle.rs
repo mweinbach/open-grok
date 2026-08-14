@@ -945,13 +945,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
         let archive = make_test_archive(&[
-            ("bundle.json", br#"{"version":"archive-v1"}"#),
+            ("bundle.json", br#"{"version":"archive-v1"}"#.as_slice()),
             (
                 "subagents/personas/researcher.toml",
-                b"instructions = \"hello\"",
+                b"instructions = \"hello\"".as_slice(),
             ),
-            ("subagents/roles/reviewer.toml", b"description = \"review\""),
-            ("skills/commit/SKILL.md", b"# Commit skill"),
+            ("subagents/roles/reviewer.toml", b"description = \"review\"".as_slice()),
+            ("skills/commit/SKILL.md", b"# Commit skill".as_slice()),
         ]);
         let (proxy_base_url, server) = start_archive_bundle_server(archive).await;
         let result = sync_bundle_to_root(

@@ -173,7 +173,7 @@ static TEST_REDIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// Redirect all subsequent unified-log writes **and** snapshot reads to a
 /// per-process file under the system temp directory, so test binaries stop
 /// writing synthetic events into the developer's real
-/// `~/.opengrok/logs/unified.jsonl` (those bursts inflate exactly the counters
+/// `~/.grok/logs/unified.jsonl` (those bursts inflate exactly the counters
 /// an incident responder greps for). Runtime-activated rather than a cargo
 /// feature: Bazel compiles production and test targets with one shared
 /// feature set, so a feature gate would leak into production builds.
@@ -214,7 +214,7 @@ fn test_log_dir() -> &'static PathBuf {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "opengrok-unified-log-test-{}-{nanos}",
+            "grok-unified-log-test-{}-{nanos}",
             std::process::id()
         ));
         let mut builder = fs::DirBuilder::new();
@@ -259,7 +259,7 @@ fn open_writer() -> Option<LogWriter> {
 /// Open (creating if needed) a writer for an explicit path.
 ///
 /// Split from [`open_writer`] so a writer re-points at **its own** path when
-/// healing a stale handle rather than re-resolving `$OPENGROK_HOME` — which also
+/// healing a stale handle rather than re-resolving `$GROK_HOME` — which also
 /// makes the healing path testable against a temp directory.
 fn open_writer_at(path: PathBuf) -> Option<LogWriter> {
     if let Some(parent) = path.parent()
@@ -581,7 +581,7 @@ mod tests {
     use super::*;
 
     /// Pre-main, so no test in this binary can race the lazily-opened
-    /// writer onto the developer's real `~/.opengrok/logs/unified.jsonl`.
+    /// writer onto the developer's real `~/.grok/logs/unified.jsonl`.
     #[ctor::ctor]
     fn redirect_for_tests() {
         redirect_to_temp_for_tests();

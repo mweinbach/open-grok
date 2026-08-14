@@ -2103,7 +2103,12 @@ impl SessionActor {
         };
 
         let duration_ms = started_at.elapsed().as_millis() as u64;
-        let (status, outcome, content, raw_output) = match result {
+        let (status, outcome, content, raw_output): (
+            acp::ToolCallStatus,
+            crate::session::events::ToolOutcome,
+            Vec<CustomToolOutputContent>,
+            serde_json::Value,
+        ) = match result {
             Ok(output) => {
                 let text = output.text();
                 let content = output.content;

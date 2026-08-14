@@ -1,8 +1,8 @@
-//! Hub [`AuthProvider`] from `~/.opengrok/auth.json` for the standalone
+//! Hub [`AuthProvider`] from `~/.grok/auth.json` for the standalone
 //! `workspace_server` binary: loopback `ws://` uses a plain bearer, otherwise
 //! an auto-refreshing OIDC provider that persists rotated tokens to disk.
 //!
-//! The in-leader `open-grok workspace` exposure does NOT use this path — it sources
+//! The in-leader `grok workspace` exposure does NOT use this path — it sources
 //! an in-memory provider from the leader's `AuthManager` (see
 //! `LeaderAuthProvider`) to avoid racing the leader's own auth.json writer.
 
@@ -74,7 +74,7 @@ struct AuthEntry {
 
 pub fn default_auth_path() -> anyhow::Result<PathBuf> {
     let grok = xai_grok_config::user_grok_home()
-        .ok_or_else(|| anyhow::anyhow!("no user grok home (set $OPENGROK_HOME or $HOME)"))?;
+        .ok_or_else(|| anyhow::anyhow!("no user grok home (set $GROK_HOME or $HOME)"))?;
     Ok(grok.join("auth.json"))
 }
 
@@ -88,7 +88,7 @@ pub fn default_auth_path() -> anyhow::Result<PathBuf> {
 fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
     if !path.exists() {
         anyhow::bail!(
-            "No auth credentials found at {}. Run `open-grok login` first.",
+            "No auth credentials found at {}. Run `grok login` first.",
             path.display()
         );
     }
@@ -110,7 +110,7 @@ fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no OIDC auth entry found in {}. Run `open-grok login` first.",
+                "no OIDC auth entry found in {}. Run `grok login` first.",
                 path.display()
             )
         })
@@ -146,10 +146,10 @@ fn build_oidc_provider(
         builder = builder.expires_at(exp);
     }
 
+    // The SDK invokes `on_refresh` inside its async refresh path, and the
+    // persist below blocks on a cross-process file lock — run it on its own
+    // thread so a contended lock never stalls the runtime.
     builder = builder.on_refresh(Arc::new(move |event: &RefreshEvent| {
-        // The SDK invokes `on_refresh` inside its async refresh path, and the
-        // persist below blocks on a cross-process file lock — run it on its own
-        // thread so a contended lock never stalls the runtime.
         let auth_path = auth_path.clone();
         let scope_key = scope_key.clone();
         let event = event.clone();
@@ -328,7 +328,7 @@ fn write_json_atomic(path: &Path, value: &serde_json::Value) -> anyhow::Result<(
 }
 
 /// Build a hub auth provider for `hub_url`. `auth_config` overrides
-/// the default credential path (`~/.opengrok/auth.json`).
+/// the default credential path (`~/.grok/auth.json`).
 pub fn provider(
     hub_url: &Url,
     auth_config: Option<&Path>,
@@ -403,38 +403,6 @@ mod tests {
 
         let err = read_auth_entry(&path).unwrap_err();
         assert!(err.to_string().contains("no OIDC auth entry"));
-    }
-
-    /// With several OIDC entries (personal + enterprise login), the one with
-    /// the latest `expires_at` wins — that's the entry the user's grok
-    /// sessions actively refresh. Alphabetical-order selection could adopt a
-    /// different principal's refresh token and rotate it out from under the
-    /// shell.
-    #[test]
-    fn read_auth_entry_prefers_latest_expiry() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_auth_json(
-            dir.path(),
-            r#"{
-            "aaa-stale": { "key": "eyJ.a", "refresh_token": "rt-a", "oidc_issuer": "https://auth.x.ai", "expires_at": "2026-01-01T00:00:00Z" },
-            "zzz-active": { "key": "eyJ.z", "refresh_token": "rt-z", "oidc_issuer": "https://auth.x.ai", "expires_at": "2026-06-01T00:00:00Z" }
-        }"#,
-        );
-
-        let (key, entry) = read_auth_entry(&path).unwrap();
-        assert_eq!(key, "zzz-active", "latest expires_at must win");
-        assert_eq!(entry.refresh_token.as_deref(), Some("rt-z"));
-
-        // An entry with no expires_at never beats one with a timestamp.
-        let path = write_auth_json(
-            dir.path(),
-            r#"{
-            "aaa-with-expiry": { "key": "eyJ.a", "refresh_token": "rt-a", "oidc_issuer": "https://auth.x.ai", "expires_at": "2026-01-01T00:00:00Z" },
-            "zzz-no-expiry": { "key": "eyJ.z", "refresh_token": "rt-z", "oidc_issuer": "https://auth.x.ai" }
-        }"#,
-        );
-        let (key, _) = read_auth_entry(&path).unwrap();
-        assert_eq!(key, "aaa-with-expiry");
     }
 
     #[test]
@@ -567,6 +535,38 @@ mod tests {
         assert_eq!(updated["oidc"]["key"], "eyJ.new");
         assert_eq!(updated["oidc"]["refresh_token"], "rt-new");
         assert_eq!(updated["legacy"]["key"], "xai-old"); // untouched
+    }
+
+    /// With several OIDC entries (personal + enterprise login), the one with
+    /// the latest `expires_at` wins — that's the entry the user's grok
+    /// sessions actively refresh. Alphabetical-order selection could adopt a
+    /// different principal's refresh token and rotate it out from under the
+    /// shell.
+    #[test]
+    fn read_auth_entry_prefers_latest_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_auth_json(
+            dir.path(),
+            r#"{
+            "aaa-stale": { "key": "eyJ.a", "refresh_token": "rt-a", "oidc_issuer": "https://auth.x.ai", "expires_at": "2026-01-01T00:00:00Z" },
+            "zzz-active": { "key": "eyJ.z", "refresh_token": "rt-z", "oidc_issuer": "https://auth.x.ai", "expires_at": "2026-06-01T00:00:00Z" }
+        }"#,
+        );
+
+        let (key, entry) = read_auth_entry(&path).unwrap();
+        assert_eq!(key, "zzz-active", "latest expires_at must win");
+        assert_eq!(entry.refresh_token.as_deref(), Some("rt-z"));
+
+        // An entry with no expires_at never beats one with a timestamp.
+        let path = write_auth_json(
+            dir.path(),
+            r#"{
+            "aaa-with-expiry": { "key": "eyJ.a", "refresh_token": "rt-a", "oidc_issuer": "https://auth.x.ai", "expires_at": "2026-01-01T00:00:00Z" },
+            "zzz-no-expiry": { "key": "eyJ.z", "refresh_token": "rt-z", "oidc_issuer": "https://auth.x.ai" }
+        }"#,
+        );
+        let (key, _) = read_auth_entry(&path).unwrap();
+        assert_eq!(key, "aaa-with-expiry");
     }
 
     #[test]

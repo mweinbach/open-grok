@@ -1,17 +1,19 @@
 //! Standalone workspace ToolServer for remote sandboxes.
 //!
-//! Reads OIDC credentials from `~/.opengrok/auth.json`, connects to a
+//! Reads OIDC credentials from `~/.grok/auth.json`, connects to a
 //! server, exposes workspace tools, and refreshes tokens
 //! automatically.
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
+use xai_grok_diag_server::{self as diag_server, DiagHandle, ErrorClass};
 use xai_grok_workspace::config::WorkspaceServerMetadata;
-use xai_grok_workspace::daemonize;
-use xai_grok_workspace::diag_server::{self, DiagHandle, ErrorClass};
 use xai_grok_workspace::error::WorkspaceError;
-use xai_grok_workspace::preview_supervisor::{self, PreviewArgs, PreviewVisibility};
+use xai_grok_workspace_daemon::daemonize;
+use xai_grok_workspace_daemon::preview_supervisor::{
+    self, PreviewActivitySink, PreviewArgs, PreviewVisibility,
+};
 /// OTLP `service.name` for this binary's exported traces/logs/metrics and
 /// direct-OTLP fastrace export. Single source so the call sites can't drift.
 const SERVICE_NAME: &str = "prod_grok_workspace";
@@ -116,12 +118,10 @@ struct Args {
     )]
     upload_queue_enabled: bool,
     /// Fail `session.bind`s without an explicit toolset closed (RPC-only)
-    /// instead of widening to the built-in default catalog. Passed by the
-    /// sandbox service; doubles as a version tripwire (a stale revived binary
-    /// rejects the argv and never reports ready).
+    /// instead of widening to the built-in default catalog.
     #[arg(long)]
     require_explicit_toolset: bool,
-    /// Trust project-scoped LSP servers from `<repo>/.opengrok/lsp.json`.
+    /// Trust project-scoped LSP servers from `<repo>/.grok/lsp.json`.
     /// Defaults off; sandbox opts in only after workspace trust is established.
     #[arg(
         long,
@@ -210,6 +210,26 @@ impl PreviewCliArgs {
         }
     }
 }
+/// Binds the preview-activity scraper to the workspace `ActivityTracker`.
+///
+/// `xai-grok-workspace-daemon` deliberately does not depend on
+/// `xai-grok-workspace`, so this binary owns the one adapter between them.
+struct TrackerSink(std::sync::Arc<xai_grok_workspace::activity::ActivityTracker>);
+impl PreviewActivitySink for TrackerSink {
+    fn note_preview_routed_activity(&self) {
+        self.0.note_preview_routed_activity();
+    }
+    fn note_preview_status_activity(&self) {
+        self.0.note_preview_status_activity();
+    }
+    fn set_preview_attached(&self, ws_tunnels_open: u64, routed_in_flight: u64) {
+        self.0
+            .set_preview_attached(ws_tunnels_open, routed_in_flight);
+    }
+    fn preview_activity_window_ms(&self) -> u64 {
+        self.0.preview_activity_window_ms()
+    }
+}
 /// Capability manifest printed by `--capabilities`, consumed by the sandbox
 /// launcher to pick a launch protocol. Additions are backward-compatible.
 #[derive(Debug, serde::Serialize)]
@@ -232,6 +252,11 @@ fn main() -> anyhow::Result<()> {
         Some(ref p) => dunce::canonicalize(p)?,
         None => std::env::current_dir()?,
     };
+    let oom_protection = xai_tty_utils::protect_from_oom_kill();
+    #[cfg(unix)]
+    if oom_protection.is_ok() {
+        unsafe { std::env::set_var(xai_tty_utils::RESET_CHILD_OOM_ENV, "1") };
+    }
     let _pidfile_guard = if args.daemonize {
         let anchor = |p: PathBuf| if p.is_absolute() { p } else { cwd.join(p) };
         args.log_file = anchor(std::mem::take(&mut args.log_file));
@@ -254,9 +279,9 @@ fn main() -> anyhow::Result<()> {
         .worker_threads(xai_tty_utils::runtime::capped_worker_threads().get())
         .enable_all();
     let rt = xai_tty_utils::runtime::build_with_blocking_pool(&mut builder)?;
-    rt.block_on(run(args, cwd))
+    rt.block_on(run(args, cwd, oom_protection))
 }
-async fn run(args: Args, cwd: PathBuf) -> anyhow::Result<()> {
+async fn run(args: Args, cwd: PathBuf, oom_protection: std::io::Result<()>) -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -268,6 +293,10 @@ async fn run(args: Args, cwd: PathBuf) -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .with(donating.clone())
         .init();
+    match &oom_protection {
+        Ok(()) => tracing::info!("kernel OOM-kill protection active"),
+        Err(e) => tracing::info!(error = %e, "kernel OOM-kill protection not active"),
+    }
     let direct_otlp = match std::env::var("GROK_WORKSPACE_OTLP_ENDPOINT") {
         Ok(endpoint) if !endpoint.is_empty() => {
             match xai_tracing::init_fastrace(endpoint.clone(), SERVICE_NAME.to_owned(), None) {
@@ -349,6 +378,10 @@ async fn run(args: Args, cwd: PathBuf) -> anyhow::Result<()> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let diag_handle = diag_server::DiagHandle::new(launch_id);
+    {
+        let caps = xai_grok_workspace::image_capabilities::image_capabilities();
+        diag_handle.set_image_capabilities(caps.wire(), caps.is_declared());
+    }
     #[cfg(unix)]
     let diag_listener = diag_server::DiagListener::Unix(args.diag_socket);
     #[cfg(windows)]
@@ -375,7 +408,8 @@ async fn run(args: Args, cwd: PathBuf) -> anyhow::Result<()> {
         "Workspace server starting — sessions created dynamically via server bind"
     );
     let server_id = args.server_id.clone();
-    let status_config = xai_grok_workspace::StatusConfig::from_env();
+    let mut status_config = xai_grok_workspace::StatusConfig::from_env();
+    status_config.preview_control_port = args.preview.preview_control_port;
     let preview_shutdown = if args.preview.preview_enabled {
         let control_port = args.preview.preview_control_port;
         let cfg = args.preview.into_preview_args(cwd.clone());
@@ -413,7 +447,7 @@ async fn run(args: Args, cwd: PathBuf) -> anyhow::Result<()> {
     if let Some((tx, control_port)) = &preview_shutdown {
         tokio::spawn(preview_supervisor::supervise_preview_activity(
             *control_port,
-            ws_handle.activity_tracker().clone(),
+            std::sync::Arc::new(TrackerSink(ws_handle.activity_tracker().clone())),
             preview_scrape_interval,
             tx.subscribe(),
         ));
@@ -877,5 +911,28 @@ mod tests {
         let cfg = args.preview.into_preview_args(PathBuf::from("/workspace"));
         assert_eq!(cfg.visibility, Some(PreviewVisibility::Owner));
         assert_eq!(cfg.to_argv(), vec!["--visibility", "owner"]);
+    }
+    /// The scraper reports through `PreviewActivitySink`, so this adapter is the
+    /// only place the preview signal meets the tracker's idle accounting. The
+    /// scraper's own behavior is tested in `xai-grok-workspace-daemon`, and the
+    /// tracker's in `xai_grok_workspace::activity`; this covers the seam.
+    #[test]
+    fn tracker_sink_forwards_every_signal_to_the_activity_tracker() {
+        use xai_grok_workspace::activity::ActivityTracker;
+        let tracker = std::sync::Arc::new(ActivityTracker::new());
+        let sink = TrackerSink(std::sync::Arc::clone(&tracker));
+        assert_eq!(
+            sink.preview_activity_window_ms(),
+            tracker.preview_activity_window_ms()
+        );
+        sink.set_preview_attached(2, 1);
+        assert_eq!(tracker.preview_ws_tunnels_open(), 2);
+        assert!(tracker.snapshot().idle_since_ms.is_none());
+        sink.set_preview_attached(0, 0);
+        assert_eq!(tracker.preview_ws_tunnels_open(), 0);
+        sink.note_preview_routed_activity();
+        assert!(tracker.snapshot().idle_since_ms.is_none());
+        sink.note_preview_status_activity();
+        assert!(tracker.snapshot().idle_since_ms.is_none());
     }
 }

@@ -267,8 +267,7 @@ impl WorkspaceHandle {
                 self.shared
                     .activity_tracker
                     .turn_started(session_id, turn_number);
-                let handle = None;
-                handle
+                None
             }
             TurnBoundary::End {
                 prompt_index: Some(idx),
@@ -319,6 +318,20 @@ impl WorkspaceHandle {
                 self.shared
                     .activity_tracker
                     .turn_completed(session_id, turn_number, duration_ms);
+                if let Some(session) = self.session(session_id) {
+                    let roots = match crate::workspace_ops::materialized_git_roots(self).await {
+                        Ok(r) if !r.is_empty() => r,
+                        _ => vec![session.cwd().to_path_buf()],
+                    };
+                    for root in roots {
+                        let on_conv_branch = git::get_branch(&root)
+                            .await
+                            .is_some_and(|b| b.starts_with("conv/"));
+                        if on_conv_branch {
+                            git::commit_turn_if_dirty(&root, turn_number).await;
+                        }
+                    }
+                }
                 let handle = {
                     let _ = written;
                     None
@@ -939,7 +952,7 @@ mod tests {
         handle
             .on_turn_boundary("main", TurnBoundary::rewind_finalize(0))
             .await;
-        let store_root = cwd.join(".opengrok").join("rewind-checkpoints");
+        let store_root = cwd.join(".grok").join("rewind-checkpoints");
         assert!(
             !store_root.exists(),
             "flag-off finalize must not touch disk (legacy default)"
@@ -966,7 +979,7 @@ mod tests {
         );
         session.capture_hunk_delta(0).await;
         session.persist_checkpoint(0).await;
-        let store_root = cwd.join(".opengrok").join("rewind-checkpoints");
+        let store_root = cwd.join(".grok").join("rewind-checkpoints");
         assert!(store_root.exists(), "persist creates the durable store dir");
         let stored = session
             .checkpoint_store

@@ -1586,6 +1586,7 @@ fn reap_request_for_work(
             serde_json::value::to_raw_value(&KillTaskRequest {
                 session_id: session_id.0.to_string(),
                 task_id: id.clone(),
+                source: xai_grok_shell::extensions::task::TaskKillSource::Teardown,
             })?,
         ),
     };

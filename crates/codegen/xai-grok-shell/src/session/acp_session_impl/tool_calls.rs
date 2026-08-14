@@ -581,7 +581,7 @@ impl SessionActor {
                             }
                             other => format!("{other:?}"),
                         };
-                        self.emit_event(xai_file_utils::events::Event::McpToolCallCompleted {
+                        self.emit_event(xai_grok_session_events::Event::McpToolCallCompleted {
                             server_name: server.to_string(),
                             tool_name: tool.to_string(),
                             call_id: call_name.clone(),
@@ -1615,16 +1615,16 @@ impl SessionActor {
                 &call.function.name,
                 match &decision {
                     Decision::Allow | Decision::Ask => {
-                        xai_file_utils::events::types::PermissionDecision::Allow
+                        xai_grok_session_events::types::PermissionDecision::Allow
                     }
                     Decision::Reject(_) | Decision::PolicyDeny(_) => {
-                        xai_file_utils::events::types::PermissionDecision::Deny
+                        xai_grok_session_events::types::PermissionDecision::Deny
                     }
                     Decision::Cancelled => {
-                        xai_file_utils::events::types::PermissionDecision::Cancelled
+                        xai_grok_session_events::types::PermissionDecision::Cancelled
                     }
                     Decision::FollowupMessage(_) => {
-                        xai_file_utils::events::types::PermissionDecision::Followup
+                        xai_grok_session_events::types::PermissionDecision::Followup
                     }
                 },
                 perm_start,

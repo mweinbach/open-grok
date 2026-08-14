@@ -32,7 +32,7 @@ pub use context::TruncationConfig;
 pub use definition::{FunctionTool, ToolDefinition, ToolType};
 pub use image_generation_provider::ImageGenerationProvider;
 pub use memory_backend::MemoryBackend;
-pub use process_manager::{KillOutcome, TaskSnapshot, format_system_time_rfc3339};
+pub use process_manager::{KillOutcome, KillSource, TaskSnapshot, format_system_time_rfc3339};
 pub use schema::GrokIntegerSchema;
 pub use session_mode::SessionMode;
 pub use tool_index::{SearchSnapshot, ServerSummary, ToolIndex, ToolSearchIndex, ToolSearchResult};

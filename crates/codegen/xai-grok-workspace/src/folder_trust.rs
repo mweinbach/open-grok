@@ -3,7 +3,7 @@
 //! This is the client/workspace half of the folder-trust gate: it scans a
 //! workspace for repo-local code-exec configs, resolves the pure trust
 //! [`decide`] precedence, prompts (MVP stderr), and reads/writes the durable
-//! [`crate::trust::TrustStore`] (`~/.opengrok/trusted_folders.toml`). The
+//! [`crate::trust::TrustStore`] (`~/.grok/trusted_folders.toml`). The
 //! consume/gating half (the `DECISIONS` cache, `resolve_and_record`,
 //! `project_scope_allowed`, the loader filters) lives in `xai-grok-shell`.
 //!
@@ -110,7 +110,7 @@ pub fn decide_inputs_with_interactive(
         is_interactive,
         // An over-broad key (home / fs-root / non-absolute) can never be recorded
         // by the store, so decide() trusts it rather than prompt on a key that
-        // can't persist (Case 2: cwd IS $HOME, incl. the default `~/.opengrok`).
+        // can't persist (Case 2: cwd IS $HOME, incl. the default `~/.grok`).
         key_recordable: !crate::trust::is_unsafe_trust_root(key),
     }
 }
@@ -183,7 +183,7 @@ fn feature_enabled_for_build(remote: Option<&RemoteSettings>, is_local_build: bo
 /// Persist an explicit `--trust` grant for `cwd`'s workspace so repo-local
 /// servers are honored on the next resolve. Done client-side because trust is
 /// durable: even when the agent runs in a separate leader process it reads the
-/// same `~/.opengrok/trusted_folders.toml`. Best-effort; a write failure is logged,
+/// same `~/.grok/trusted_folders.toml`. Best-effort; a write failure is logged,
 /// not fatal.
 pub fn grant_folder_trust(cwd: &Path) {
     // Local/dev builds never gate, so there is nothing to grant: `--trust` is a
@@ -250,13 +250,13 @@ pub fn repo_configs_present(cwd: &Path) -> bool {
 /// marker order. Single source with [`repo_configs_present`] (which is
 /// `!repo_config_kinds(cwd).is_empty()`), so a folder that the gate fired on
 /// always has a non-empty, accurate kind list — no `[plugins].paths` /
-/// `[permission]` / `.claude` / `.opengrok/agents` / subdir-launch gaps. NOT itself
+/// `[permission]` / `.claude` / `.grok/agents` / subdir-launch gaps. NOT itself
 /// the trust gate.
 pub fn repo_config_kinds(cwd: &Path) -> Vec<&'static str> {
     collect_repo_config_kinds(cwd, false)
 }
 
-/// Whether a project `.opengrok/config.toml` `[permission]` value would contribute
+/// Whether a project `.grok/config.toml` `[permission]` value would contribute
 /// rules to the permission resolver. Mirrors the compact/verbose shapes that
 /// `permission::resolution` loads: non-empty `allow`/`deny`/`ask` string arrays,
 /// or a non-empty verbose `rules` array. Empty arrays / empty tables do not gate
@@ -330,7 +330,7 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     if !crate::project_config::find_mcp_json_files_in(&chain.dirs).is_empty() {
         hit!("mcp");
     }
-    // Project `.opengrok/config.toml` declaring repo-controlled code-exec or
+    // Project `.grok/config.toml` declaring repo-controlled code-exec or
     // permission policy: a non-empty `[mcp_servers]` table, a non-empty
     // `[plugins].paths` array, OR a contributing `[permission]` section.
     // `[plugins].paths` loads as auto-trusted ConfigPath plugins; `[permission]`
@@ -394,7 +394,7 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     // (the chain's `git_root`, the same root hook discovery resolves from via
     // `workspace_key`), NOT cwd, so root-level hooks are gated even when launched
     // from a subdir. A repo-local hook file/dir is repo-controlled code-exec that
-    // must be gated — else a hooks-only clone (e.g. `.opengrok/hooks/evil.json`) would
+    // must be gated — else a hooks-only clone (e.g. `.grok/hooks/evil.json`) would
     // resolve trusted and run ungated. Presence mirrors discovery's "something to
     // gate" check.
     let hook_root = chain.git_root.as_deref().unwrap_or(cwd);
@@ -476,7 +476,7 @@ pub fn prompt_for_trust(key: &Path) -> bool {
     let _ = writeln!(err);
     let _ = writeln!(
         err,
-        "This folder contains repo-local config (.mcp.json / .opengrok/lsp.json / hooks) \
+        "This folder contains repo-local config (.mcp.json / .grok/lsp.json / hooks) \
          that can run commands on your machine."
     );
     let _ = writeln!(err, "  Folder: {}", key.display());
@@ -744,9 +744,9 @@ mod tests {
     #[test]
     fn repo_configs_present_detects_project_hooks_file() {
         let tmp = repo_tmp();
-        let opengrok = tmp.path().join(".opengrok");
-        std::fs::create_dir_all(&opengrok).unwrap();
-        std::fs::write(opengrok.join("hooks"), "{}").unwrap();
+        let grok = tmp.path().join(".opengrok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(grok.join("hooks"), "{}").unwrap();
 
         assert!(repo_configs_present(tmp.path()));
         assert!(repo_config_kinds(tmp.path()).contains(&"hooks"));
@@ -756,9 +756,9 @@ mod tests {
     #[test]
     fn repo_configs_present_detects_dangling_project_hooks_symlink() {
         let tmp = repo_tmp();
-        let opengrok = tmp.path().join(".opengrok");
-        std::fs::create_dir_all(&opengrok).unwrap();
-        std::os::unix::fs::symlink("missing-hooks", opengrok.join("hooks")).unwrap();
+        let grok = tmp.path().join(".opengrok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::os::unix::fs::symlink("missing-hooks", grok.join("hooks")).unwrap();
 
         assert!(repo_configs_present(tmp.path()));
         assert!(repo_config_kinds(tmp.path()).contains(&"hooks"));
@@ -914,7 +914,7 @@ mod tests {
         );
     }
 
-    // OPENGROK_HOME-isolation idiom mirrored from this crate's `permission::claude_compat`
+    // GROK_HOME-isolation idiom mirrored from this crate's `permission::claude_compat`
     // tests (the workspace crate has no `serial_test`/`xai-grok-test-support`
     // dev-dep): nextest runs each test in its own process; `ENV_LOCK` serializes
     // the rare in-process `cargo test` thread, and `EnvVarGuard` restores the prior
@@ -961,7 +961,7 @@ mod tests {
     fn release_build_keeps_gate_when_enabled() {
         // A release-stamped build (is_local_build=false) honors the remote enable,
         // keeping today's gate. Isolate config so neither on-disk user/managed
-        // config nor an ambient env flag can override it: empty OPENGROK_HOME (no
+        // config nor an ambient env flag can override it: empty GROK_HOME (no
         // config.toml/managed_config.toml) + GROK_FOLDER_TRUST unset. nextest's
         // process-per-test makes grok_home()'s OnceLock pick up the temp dir.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -986,7 +986,7 @@ mod tests {
     fn local_build_ignores_explicit_env_optin() {
         // Auto-trust is absolute on a local build: even an explicit
         // GROK_FOLDER_TRUST=1 does NOT enable the feature (so a self-built grok
-        // never prompts). OPENGROK_HOME isolated so on-disk config can't influence it.
+        // never prompts). GROK_HOME isolated so on-disk config can't influence it.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _home = EnvVarGuard::set("OPENGROK_HOME", home.path());
@@ -998,7 +998,7 @@ mod tests {
     #[test]
     fn release_build_defaults_on() {
         // A release-stamped build with no env/config/managed/remote signal defaults
-        // the feature ON. Empty OPENGROK_HOME (no config.toml/managed config) +
+        // the feature ON. Empty GROK_HOME (no config.toml/managed config) +
         // GROK_FOLDER_TRUST unset so only the default applies.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
@@ -1030,7 +1030,7 @@ mod tests {
         // On a local/dev build the whole feature is inert. Both halves pin a guard
         // via a UNIQUE per-repo key (never store-file existence) so they hold under
         // single-process `cargo test` too. Assert ONLY when compiled unstamped
-        // (mirrors `is_local_build_honors_test_version_override`); OPENGROK_HOME-isolated
+        // (mirrors `is_local_build_honors_test_version_override`); GROK_HOME-isolated
         // and ENV_LOCK-serialized so toggling GROK_TEST_VERSION is race-safe.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
@@ -1078,7 +1078,7 @@ mod tests {
         // The store half of revoke, tested directly (not just via the shell
         // wrapper): a previously-trusted folder reports was_trusted=true AND gets
         // an explicit `set_untrusted` persisted, so it is untrusted on reload.
-        // OPENGROK_HOME-isolated so the seed/deny hit a temp store, not the real file.
+        // GROK_HOME-isolated so the seed/deny hit a temp store, not the real file.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set("OPENGROK_HOME", home.path());
@@ -1107,7 +1107,7 @@ mod tests {
         // cascades to the child (a spurious child `set_untrusted` would win
         // most-specific and break the cascade). This store half does NOT touch the
         // `DECISIONS` cache — that downgrade is the shell wrapper's job.
-        // OPENGROK_HOME-isolated so the grant writes to a temp store.
+        // GROK_HOME-isolated so the grant writes to a temp store.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set("OPENGROK_HOME", home.path());

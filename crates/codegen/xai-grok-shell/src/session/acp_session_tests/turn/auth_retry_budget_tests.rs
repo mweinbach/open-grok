@@ -320,7 +320,7 @@ fn fail_closed_401_is_uncharged_and_turn_survives() {
 /// generic budget message. Paused Tokio clock auto-advances the backoff ladder.
 #[test]
 fn authenticated_401s_still_exhaust_after_three_retries() {
-    run_on_session_sized_stack_paused(|| {
+    run_on_session_sized_stack(|| {
         Box::pin(async {
             let _trust = TrustLoopbackSessionAuth::enable();
             // The server only accepts a token the refresher never mints, so

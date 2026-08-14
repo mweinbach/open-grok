@@ -34,17 +34,25 @@ const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Default preview-activity withhold window. Sourced from the tracker's
 /// `PREVIEW_ACTIVITY_WINDOW_MS` so the two can't drift.
 const DEFAULT_PREVIEW_ACTIVITY_WINDOW_MS: u64 = crate::activity::PREVIEW_ACTIVITY_WINDOW_MS;
+/// Default client-RPC withhold window; `0` disables the withhold.
+const DEFAULT_RPC_ACTIVITY_WINDOW_MS: u64 = crate::activity::RPC_ACTIVITY_WINDOW_MS;
+/// Default client-presence withhold window when the keepalive is enabled.
+const DEFAULT_PRESENCE_ACTIVITY_WINDOW_MS: u64 = crate::activity::PRESENCE_ACTIVITY_WINDOW_MS;
 /// Default preview-activity scrape cadence. Must stay below the withhold window.
 const DEFAULT_PREVIEW_ACTIVITY_SCRAPE_INTERVAL_MS: u64 = 10_000;
-/// Default client-RPC activity idle-withhold window (60s).
-const DEFAULT_RPC_ACTIVITY_WINDOW_MS: u64 = 60_000;
-/// Maximum permitted client-RPC activity window (10 min).
-const MAX_RPC_ACTIVITY_WINDOW_MS: u64 = 600_000;
 /// Smallest window that still leaves room for a strictly-smaller scrape; only a
 /// broken config reaches it (the normal window is 60s).
 const MIN_PREVIEW_ACTIVITY_WINDOW_MS: u64 = 2;
 /// Scrape-interval floor; `0` would busy-loop the scraper.
 const MIN_PREVIEW_ACTIVITY_SCRAPE_INTERVAL_MS: u64 = 1;
+/// Ceiling on the client-RPC withhold window, so a seconds-for-ms typo cannot
+/// pin a sandbox for a day. `0` (the kill switch) is exempt.
+const MAX_RPC_ACTIVITY_WINDOW_MS: u64 = 600_000;
+/// Ceiling on the client-presence withhold window; `0` is exempt.
+const MAX_PRESENCE_ACTIVITY_WINDOW_MS: u64 = 600_000;
+const DEFAULT_PREVIEW_STATE_POLL_INTERVAL_MS: u64 = 5_000;
+/// Poll-interval floor; `0` would busy-loop the watcher against loopback.
+const MIN_PREVIEW_STATE_POLL_INTERVAL_MS: u64 = 100;
 
 /// Tunable timing/threshold constants for the workspace tool server.
 #[derive(Debug, Clone)]
@@ -86,12 +94,32 @@ pub struct StatusConfig {
     /// (`GROK_WORKSPACE_RPC_ACTIVITY_WINDOW_MS`); zero disables. Clamped to
     /// `MAX_RPC_ACTIVITY_WINDOW_MS` by [`validate`](Self::validate).
     pub rpc_activity_window: Duration,
+    /// Presence-keepalive kill-switch
+    /// (`GROK_WORKSPACE_PRESENCE_KEEPALIVE_ENABLED`, default OFF). Off ⇒ the
+    /// `ClientPresence` tier is wired with a zero window.
+    pub presence_keepalive_enabled: bool,
+    /// A visible client-presence note withholds idle for this window
+    /// (`GROK_WORKSPACE_PRESENCE_ACTIVITY_WINDOW_MS`); zero disables.
+    pub presence_activity_window: Duration,
+    /// Preview-state reporter kill-switch
+    /// (`GROK_WORKSPACE_PREVIEW_STATE_REPORTER_ENABLED`, default OFF).
+    pub preview_state_reporter_enabled: bool,
+    /// Poll cadence (`GROK_WORKSPACE_PREVIEW_STATE_POLL_INTERVAL_MS`);
+    /// floored by [`validate`](Self::validate).
+    pub preview_state_poll_interval: Duration,
+    /// Proxy loopback control port from the `--preview-control-port` CLI flag
+    /// (set by `workspace_server`, not env); `None` ⇒ the proxy default.
+    pub preview_control_port: Option<u16>,
     /// True when this container booted via the sandbox restore path, which
     /// injects `GROK_SESSION_RESTORED=true`; a first boot never does.
     pub session_restored: bool,
     /// True when restore injects `GROK_REVIVE_SCRIPT_CONFIGURED=true` (launchable
     /// revive configured); unset on first boot and non-launchable restores.
     pub revive_script_configured: bool,
+    /// True when restore injects `GROK_RESUME_NUDGE_DISABLED=true` (per-env
+    /// `resume_nudge_disabled` sandbox config): the session-resumed nudge is
+    /// suppressed at source for this boot.
+    pub resume_nudge_disabled: bool,
 }
 
 impl Default for StatusConfig {
@@ -113,8 +141,16 @@ impl Default for StatusConfig {
                 DEFAULT_PREVIEW_ACTIVITY_SCRAPE_INTERVAL_MS,
             ),
             rpc_activity_window: Duration::from_millis(DEFAULT_RPC_ACTIVITY_WINDOW_MS),
+            presence_keepalive_enabled: false,
+            presence_activity_window: Duration::from_millis(DEFAULT_PRESENCE_ACTIVITY_WINDOW_MS),
+            preview_state_reporter_enabled: false,
+            preview_state_poll_interval: Duration::from_millis(
+                DEFAULT_PREVIEW_STATE_POLL_INTERVAL_MS,
+            ),
+            preview_control_port: None,
             session_restored: false,
             revive_script_configured: false,
+            resume_nudge_disabled: false,
         }
     }
 }
@@ -163,8 +199,27 @@ impl StatusConfig {
                 "GROK_WORKSPACE_RPC_ACTIVITY_WINDOW_MS",
                 defaults.rpc_activity_window,
             ),
+            presence_keepalive_enabled: parse_or(
+                "GROK_WORKSPACE_PRESENCE_KEEPALIVE_ENABLED",
+                defaults.presence_keepalive_enabled,
+            ),
+            presence_activity_window: ms_or(
+                "GROK_WORKSPACE_PRESENCE_ACTIVITY_WINDOW_MS",
+                defaults.presence_activity_window,
+            ),
+            preview_state_reporter_enabled: parse_or(
+                "GROK_WORKSPACE_PREVIEW_STATE_REPORTER_ENABLED",
+                defaults.preview_state_reporter_enabled,
+            ),
+            preview_state_poll_interval: ms_or(
+                "GROK_WORKSPACE_PREVIEW_STATE_POLL_INTERVAL_MS",
+                defaults.preview_state_poll_interval,
+            ),
+            preview_control_port: defaults.preview_control_port,
             session_restored: std::env::var("GROK_SESSION_RESTORED").as_deref() == Ok("true"),
             revive_script_configured: std::env::var("GROK_REVIVE_SCRIPT_CONFIGURED").as_deref()
+                == Ok("true"),
+            resume_nudge_disabled: std::env::var("GROK_RESUME_NUDGE_DISABLED").as_deref()
                 == Ok("true"),
         };
         cfg.validate();
@@ -193,6 +248,17 @@ impl StatusConfig {
                 defaults.agent_connect_timeout,
             ),
         )
+    }
+
+    /// The `ClientPresence` withhold window the tracker is wired with: zero
+    /// unless the keepalive gate is on, so a window override alone can never
+    /// enable the dark feature.
+    pub fn effective_presence_activity_window(&self) -> Duration {
+        if self.presence_keepalive_enabled {
+            self.presence_activity_window
+        } else {
+            Duration::ZERO
+        }
     }
 
     /// Warn on (and, where load-bearing, repair) inconsistent values.
@@ -238,6 +304,24 @@ impl StatusConfig {
                 "GROK_WORKSPACE rpc activity window above cap; clamped"
             );
             self.rpc_activity_window = rpc_cap;
+        }
+        let presence_cap = Duration::from_millis(MAX_PRESENCE_ACTIVITY_WINDOW_MS);
+        if self.presence_activity_window > presence_cap {
+            tracing::warn!(
+                window = ?self.presence_activity_window,
+                clamped_window = ?presence_cap,
+                "GROK_WORKSPACE presence activity window above cap; clamped"
+            );
+            self.presence_activity_window = presence_cap;
+        }
+        let min_poll = Duration::from_millis(MIN_PREVIEW_STATE_POLL_INTERVAL_MS);
+        if self.preview_state_poll_interval < min_poll {
+            tracing::warn!(
+                poll_interval = ?self.preview_state_poll_interval,
+                floored_to = ?min_poll,
+                "GROK_WORKSPACE preview-state poll interval below floor; floored"
+            );
+            self.preview_state_poll_interval = min_poll;
         }
     }
 }
@@ -335,8 +419,43 @@ mod tests {
             Duration::from_secs(10)
         );
         assert_eq!(cfg.rpc_activity_window, Duration::from_secs(60));
+        assert!(!cfg.presence_keepalive_enabled);
+        assert_eq!(cfg.presence_activity_window, Duration::from_secs(90));
+        assert!(!cfg.preview_state_reporter_enabled);
+        assert_eq!(cfg.preview_state_poll_interval, Duration::from_secs(5));
         assert!(!cfg.session_restored);
         assert!(!cfg.revive_script_configured);
+    }
+
+    #[test]
+    fn preview_state_reporter_env_parses_and_floors() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let enabled_var = "GROK_WORKSPACE_PREVIEW_STATE_REPORTER_ENABLED";
+        let interval_var = "GROK_WORKSPACE_PREVIEW_STATE_POLL_INTERVAL_MS";
+
+        unsafe { std::env::set_var(enabled_var, "true") };
+        unsafe { std::env::set_var(interval_var, "0") };
+        let cfg = StatusConfig::from_env();
+        assert!(cfg.preview_state_reporter_enabled);
+        assert_eq!(
+            cfg.preview_state_poll_interval,
+            Duration::from_millis(MIN_PREVIEW_STATE_POLL_INTERVAL_MS),
+            "zero interval must be floored, not busy-loop"
+        );
+
+        unsafe { std::env::set_var(enabled_var, "yes") };
+        unsafe { std::env::set_var(interval_var, "2500") };
+        let cfg = StatusConfig::from_env();
+        assert!(
+            !cfg.preview_state_reporter_enabled,
+            "non-bool spelling falls back to the OFF default"
+        );
+        assert_eq!(cfg.preview_state_poll_interval, Duration::from_millis(2500));
+
+        unsafe { std::env::remove_var(enabled_var) };
+        unsafe { std::env::remove_var(interval_var) };
+        let cfg = StatusConfig::from_env();
+        assert!(!cfg.preview_state_reporter_enabled);
     }
 
     /// `parse_or` returns the default when the variable is unset. Uses a
@@ -450,8 +569,11 @@ mod tests {
             "GROK_WORKSPACE_PREVIEW_ACTIVITY_WINDOW_MS",
             "GROK_WORKSPACE_PREVIEW_ACTIVITY_SCRAPE_INTERVAL_MS",
             "GROK_WORKSPACE_RPC_ACTIVITY_WINDOW_MS",
+            "GROK_WORKSPACE_PRESENCE_KEEPALIVE_ENABLED",
+            "GROK_WORKSPACE_PRESENCE_ACTIVITY_WINDOW_MS",
             "GROK_SESSION_RESTORED",
             "GROK_REVIVE_SCRIPT_CONFIGURED",
+            "GROK_RESUME_NUDGE_DISABLED",
         ] {
             unsafe { std::env::remove_var(var) };
         }
@@ -474,11 +596,20 @@ mod tests {
             default.preview_activity_scrape_interval
         );
         assert_eq!(cfg.rpc_activity_window, default.rpc_activity_window);
+        assert_eq!(
+            cfg.presence_keepalive_enabled,
+            default.presence_keepalive_enabled
+        );
+        assert_eq!(
+            cfg.presence_activity_window,
+            default.presence_activity_window
+        );
         assert_eq!(cfg.session_restored, default.session_restored);
         assert_eq!(
             cfg.revive_script_configured,
             default.revive_script_configured
         );
+        assert_eq!(cfg.resume_nudge_disabled, default.resume_nudge_disabled);
     }
 
     #[test]
@@ -502,6 +633,18 @@ mod tests {
         let non_canonical = StatusConfig::from_env().revive_script_configured;
         unsafe { std::env::remove_var("GROK_REVIVE_SCRIPT_CONFIGURED") };
         assert!(configured);
+        assert!(!non_canonical);
+    }
+
+    #[test]
+    fn from_env_reads_resume_nudge_disabled_true_only() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("GROK_RESUME_NUDGE_DISABLED", "true") };
+        let disabled = StatusConfig::from_env().resume_nudge_disabled;
+        unsafe { std::env::set_var("GROK_RESUME_NUDGE_DISABLED", "1") };
+        let non_canonical = StatusConfig::from_env().resume_nudge_disabled;
+        unsafe { std::env::remove_var("GROK_RESUME_NUDGE_DISABLED") };
+        assert!(disabled);
         assert!(!non_canonical);
     }
 
@@ -600,6 +743,62 @@ mod tests {
         let cfg = StatusConfig::from_env();
         unsafe { std::env::remove_var("GROK_WORKSPACE_RPC_ACTIVITY_WINDOW_MS") };
         assert_eq!(cfg.rpc_activity_window, Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn from_env_reads_presence_activity_window() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("GROK_WORKSPACE_PRESENCE_ACTIVITY_WINDOW_MS", "45000") };
+        let cfg = StatusConfig::from_env();
+        unsafe { std::env::remove_var("GROK_WORKSPACE_PRESENCE_ACTIVITY_WINDOW_MS") };
+        assert_eq!(cfg.presence_activity_window, Duration::from_millis(45_000));
+    }
+
+    #[test]
+    fn presence_keepalive_env_gates_the_effective_window() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let enabled_var = "GROK_WORKSPACE_PRESENCE_KEEPALIVE_ENABLED";
+        let window_var = "GROK_WORKSPACE_PRESENCE_ACTIVITY_WINDOW_MS";
+
+        unsafe { std::env::remove_var(enabled_var) };
+        unsafe { std::env::set_var(window_var, "45000") };
+        let cfg = StatusConfig::from_env();
+        assert!(!cfg.presence_keepalive_enabled);
+        assert_eq!(cfg.effective_presence_activity_window(), Duration::ZERO);
+
+        unsafe { std::env::set_var(enabled_var, "true") };
+        let cfg = StatusConfig::from_env();
+        assert!(cfg.presence_keepalive_enabled);
+        assert_eq!(
+            cfg.effective_presence_activity_window(),
+            Duration::from_millis(45_000)
+        );
+
+        unsafe { std::env::set_var(enabled_var, "yes") };
+        let cfg = StatusConfig::from_env();
+        assert!(
+            !cfg.presence_keepalive_enabled,
+            "non-bool spelling falls back to the OFF default"
+        );
+
+        unsafe { std::env::remove_var(enabled_var) };
+        unsafe { std::env::remove_var(window_var) };
+    }
+
+    #[test]
+    fn validate_clamps_presence_activity_window_but_spares_the_kill_switch() {
+        for (window_ms, expected_ms) in [(0u64, 0u64), (90_000, 90_000), (86_400_000, 600_000)] {
+            let mut cfg = StatusConfig {
+                presence_activity_window: Duration::from_millis(window_ms),
+                ..StatusConfig::default()
+            };
+            cfg.validate();
+            assert_eq!(
+                cfg.presence_activity_window,
+                Duration::from_millis(expected_ms),
+                "window {window_ms}ms"
+            );
+        }
     }
 
     /// A configured agent timeout of `0` seconds is invalid (it would make

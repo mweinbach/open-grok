@@ -91,6 +91,8 @@ xai-grok-update = { path = "../xai-grok-update" }
 agent-client-protocol = { workspace = true }
 xai-acp-lib = { workspace = true }
 xai-file-utils = { path = "../xai-file-utils" }
+# Crash-recovery registry of open TUI sessions.
+xai-grok-active-sessions = { workspace = true }
 xai-grok-config = { workspace = true }
 # Voice dictation. `audio` (mic capture) is enabled on every target. On
 # macOS/Windows it links cpal; on Linux it compiles a subprocess-recorder
@@ -99,6 +101,8 @@ xai-grok-config = { workspace = true }
 xai-grok-voice = { path = "../xai-grok-voice", default-features = false, features = ["audio"] }
 xai-grok-shell = { workspace = true }
 xai-grok-workspace = { workspace = true }
+# Foreign coding-agent session discovery.
+xai-grok-foreign-sessions = { workspace = true }
 xai-token-estimation = { workspace = true }
 xai-grok-telemetry = { workspace = true }
 xai-fast-worktree = { path = "../xai-fast-worktree", features = ["metadata"] }

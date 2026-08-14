@@ -1,3 +1,11 @@
+//! On-disk cache for the xAI-published subagent bundle: personas, roles,
+//! agents, and skills written under `<grok home>/bundled`.
+//!
+//! Writes are checksum-tracked through `manifest.json`, so a file the user
+//! edited by hand is never overwritten and never pruned. Archive extraction
+//! is bounded (entry count, per-entry size, total decompressed size) and every
+//! path is sanitized before it is joined onto the cache root.
+
 use anyhow::{Context, Result, bail};
 use prod_mc_cli_chat_proxy_types::SubagentBundle;
 use serde::{Deserialize, Serialize};
@@ -19,7 +27,7 @@ struct ArchiveBundleMetadata {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BundleManifest {
+pub struct BundleManifest {
     pub version: String,
     pub checksums: HashMap<String, String>,
 }
@@ -83,11 +91,11 @@ struct BundleFile<'a> {
     content: &'a str,
 }
 
-pub(crate) fn bundled_root() -> PathBuf {
+pub fn bundled_root() -> PathBuf {
     xai_grok_config::grok_home().join(BUNDLED_DIR_NAME)
 }
 
-pub(crate) fn read_cached_manifest(root: &Path) -> Result<Option<BundleManifest>> {
+pub fn read_cached_manifest(root: &Path) -> Result<Option<BundleManifest>> {
     let manifest_path = manifest_path(root);
     let bytes = match std::fs::read(&manifest_path) {
         Ok(bytes) => bytes,
@@ -103,10 +111,7 @@ pub(crate) fn read_cached_manifest(root: &Path) -> Result<Option<BundleManifest>
         .map(Some)
 }
 
-pub(crate) fn write_bundle_to_cache(
-    root: &Path,
-    bundle: &SubagentBundle,
-) -> Result<BundleManifest> {
+pub fn write_bundle_to_cache(root: &Path, bundle: &SubagentBundle) -> Result<BundleManifest> {
     let old_manifest = read_cached_manifest(root)?.map(sanitize_manifest);
     ensure_bundle_dirs(root)?;
 
@@ -152,7 +157,7 @@ pub(crate) fn write_bundle_to_cache(
     Ok(next_manifest)
 }
 
-pub(crate) fn extract_bundle_archive(root: &Path, archive_bytes: &[u8]) -> Result<BundleManifest> {
+pub fn extract_bundle_archive(root: &Path, archive_bytes: &[u8]) -> Result<BundleManifest> {
     let decoder = flate2::read::GzDecoder::new(archive_bytes);
     let mut archive = tar::Archive::new(decoder);
 
@@ -260,7 +265,7 @@ pub(crate) fn extract_bundle_archive(root: &Path, archive_bytes: &[u8]) -> Resul
     Ok(next_manifest)
 }
 
-pub(crate) fn checksum_bytes(bytes: &[u8]) -> String {
+fn checksum_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
@@ -272,7 +277,7 @@ pub fn checksum_file(path: &Path) -> Result<String> {
     Ok(checksum_bytes(&bytes))
 }
 
-pub(crate) fn prune_removed_files(
+fn prune_removed_files(
     root: &Path,
     old_manifest: &BundleManifest,
     retained_checksums: &mut HashMap<String, String>,
@@ -414,7 +419,7 @@ fn map_archive_path_to_cache_path(archive_path: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn count_entries_by_prefix(manifest: &BundleManifest, prefix: &str) -> usize {
+pub fn count_entries_by_prefix(manifest: &BundleManifest, prefix: &str) -> usize {
     manifest
         .checksums
         .keys()
@@ -468,9 +473,9 @@ fn validate_bundle_name(kind: BundleFileKind, name: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) mod test_helpers {
-    pub(crate) fn make_test_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_helpers {
+    pub fn make_test_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(encoder);
         for &(path, content) in entries {
@@ -484,7 +489,7 @@ pub(crate) mod test_helpers {
         encoder.finish().unwrap()
     }
 
-    pub(crate) fn bundle_json(version: &str) -> String {
+    pub fn bundle_json(version: &str) -> String {
         format!(r#"{{"version":"{version}"}}"#)
     }
 }

@@ -74,12 +74,6 @@ fn sudo_alias_injection() -> String {
 /// functions, and aliases as base64-encoded replayable shell snippets.
 const DUMP_BASH_STATE_SCRIPT: &str = r##"
 dump_bash_state() {
-  local had_allexport=0
-  if [[ -o allexport ]]; then
-    had_allexport=1
-  fi
-  builtin set +a
-  builtin declare +x had_allexport 2>/dev/null || true
   set -euo pipefail
   if ! command -v base64 >/dev/null 2>&1; then
     echo "Error: base64 command is required" >&2
@@ -93,6 +87,7 @@ dump_bash_state() {
   _emit_encoded() {
     local content="$1"
     local var_name="$2"
+    builtin declare +x content var_name 2>/dev/null || true
     if [[ -n "$content" ]]; then
       builtin printf 'grok_snap_%s=$(command base64 -d <<'"'"'GROK_SNAP_EOF_%s'"'"'\n' "$var_name" "$var_name"
       command base64 <<<"$content" | command tr -d '\n'
@@ -106,29 +101,31 @@ dump_bash_state() {
 
   _emit "$PWD"
 
-  local env_vars
-  env_vars=$(builtin export -p 2>/dev/null | command grep -viE '_proxy=|GROK_SANDBOX|GROK_AGENT=|SUDO_ASKPASS|GROK_ASKPASS|ELECTRON_RUN_AS_NODE|SSH_AUTH_SOCK|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR|WAYLAND_DISPLAY|GPG_TTY' || true)
-  _emit_encoded "$env_vars" "ENV_VARS_B64"
-
   # errexit/pipefail here are this function's own `set -euo pipefail` (set is
   # shell-global in bash); replaying them would abort later user commands.
   local posix_opts
   posix_opts=$(builtin shopt -po 2>/dev/null | command grep -vE '^set [-+]o (nounset|errexit|pipefail)$' || true)
-  if [[ "$had_allexport" -eq 1 ]]; then
-    posix_opts+=$'\nset -o allexport'
-  fi
+  builtin set +a 2>/dev/null || true
+
+  local env_vars
+  env_vars=$(builtin export -p 2>/dev/null | command grep -viE '_proxy=|GROK_SANDBOX|GROK_AGENT=|SUDO_ASKPASS|GROK_ASKPASS|ELECTRON_RUN_AS_NODE|SSH_AUTH_SOCK|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR|WAYLAND_DISPLAY|GPG_TTY' || true)
+  builtin declare +x posix_opts env_vars 2>/dev/null || true
+  _emit_encoded "$env_vars" "ENV_VARS_B64"
   _emit_encoded "$posix_opts" "POSIX_OPTS_B64"
 
   local bash_opts
   bash_opts=$(builtin shopt -p 2>/dev/null || true)
+  builtin declare +x bash_opts 2>/dev/null || true
   _emit_encoded "$bash_opts" "BASH_OPTS_B64"
 
   local all_functions
   all_functions=$(builtin declare -f 2>/dev/null || true)
+  builtin declare +x all_functions 2>/dev/null || true
   _emit_encoded "$all_functions" "FUNCTIONS_B64"
 
   local aliases
   aliases=$(builtin alias -p 2>/dev/null || true)
+  builtin declare +x aliases 2>/dev/null || true
   _emit_encoded "$aliases" "ALIASES_B64"
 
   _emit "# end of bash state dump"
@@ -323,6 +320,7 @@ impl ShellState {
         }
         crate::util::apply_shell_environment_policy(&mut cmd, shell_env_policy);
         cmd.envs(crate::util::pager_env());
+        #[allow(clippy::disallowed_methods)] // one-shot init run, waited on here
         let mut child = cmd.spawn().map_err(|e| {
             crate::computer::types::ComputerError::io(format!(
                 "failed to spawn {shell:?} for shell state init: {e}"
@@ -926,6 +924,7 @@ mod tests {
 
         cmd.fd_mappings(prep.fd_mappings).unwrap();
 
+        #[allow(clippy::disallowed_methods)] // test fixture; the test reaps it
         let child = cmd.spawn().unwrap();
         // Drop cmd to release the FdMapping OwnedFds held in its pre_exec closure.
         // Without this, the parent keeps the write-end of the state-out pipe open,
@@ -983,6 +982,7 @@ mod tests {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         cmd.fd_mappings(prep.fd_mappings).unwrap();
+        #[allow(clippy::disallowed_methods)] // test fixture; the test reaps it
         let child = cmd.spawn().unwrap();
         drop(cmd);
 

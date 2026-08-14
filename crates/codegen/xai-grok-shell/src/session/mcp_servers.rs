@@ -4,9 +4,8 @@ pub use xai_grok_mcp::servers::{
     AcpServerEntry, HttpConfig, MCP_TOOL_NAME_DELIMITER, McpClient, McpClientTimeoutOverrides,
     McpConfigDiff, McpError, McpInitStrategy, McpMetaConfigMap, McpServerMetaConfig, McpServerName,
     McpService, McpSpawnCtx, McpState, McpTool, McpToolRegistration, OauthInteractivity,
-    SharedMcpPool, mcp_server_name, mcp_target_str, mcp_tool_name_prefix, mcp_transport_str,
-    parse_mcp_meta_config, parse_mcp_tool_name, qualified_mcp_tool_name,
-    sanitize_descriptor_segment, validate_tool_name,
+    SharedMcpPool, mcp_server_name, mcp_target_str, mcp_transport_str, parse_mcp_meta_config,
+    parse_mcp_tool_name, sanitize_descriptor_segment, validate_tool_name,
 };
 
 use std::collections::HashMap;
@@ -42,13 +41,13 @@ fn resolve_overrides(
 pub(crate) fn build_config_resolved_event(
     configs: &[acp::McpServer],
     cwd: &Path,
-) -> xai_file_utils::events::Event {
+) -> xai_grok_session_events::Event {
     let disabled: Vec<String> = crate::util::config::disabled_mcp_server_names(cwd)
         .into_iter()
         .collect();
     let servers = configs
         .iter()
-        .map(|c| xai_file_utils::events::McpConfigServer {
+        .map(|c| xai_grok_session_events::McpConfigServer {
             name: inner::mcp_server_name(c).to_string(),
             transport: inner::mcp_transport_str(c).to_string(),
             source:
@@ -59,7 +58,7 @@ pub(crate) fn build_config_resolved_event(
                 .to_string(),
         })
         .collect();
-    xai_file_utils::events::Event::McpConfigResolved { servers, disabled }
+    xai_grok_session_events::Event::McpConfigResolved { servers, disabled }
 }
 
 pub(crate) async fn start_mcp_server(
