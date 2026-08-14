@@ -1,6 +1,6 @@
 # Custom Models
 
-Grok connects to custom model endpoints for alternative providers, self-hosted models, and overriding built-in settings. This guide explains how to select models, configure endpoints, and integrate third-party providers.
+Grok connects to custom model endpoints for alternative providers, self-hosted models, and overriding built-in settings. This guide explains how to add models from Settings, select them, configure `[model.*]` endpoints, and integrate third-party providers.
 
 ---
 
@@ -72,9 +72,54 @@ To send provider-specific authentication or version headers -- for example, Anth
 
 ---
 
+## Settings → Custom models
+
+You can add, override, and remove custom models from the TUI without
+hand-editing `config.toml`. Open **Settings → Models → Custom models**.
+
+That group writes the same `[model.<key>]` tables documented below. You can
+still edit `~/.opengrok/config.toml` by hand for every field, including
+advanced options the form does not expose (`extra_headers`, `query_params`,
+`temperature`, and so on).
+
+### Existing models
+
+The group lists every `[model.*]` entry already in your user config. Each
+row is selected while the model is present. Deselect a row to delete that
+table only; other models and unrelated config stay as they are.
+
+### Add a model
+
+Fill the draft fields, then turn on **Save custom model**:
+
+| Field | What to enter |
+| --- | --- |
+| Catalog key | Table name / catalog key (`[model.<key>]`), for example `zai:glm-special` or `my-ollama`. Letters, digits, `:`, `.`, `-`, and `_` only; no spaces or newlines. |
+| Model id | Wire model id sent to the API. |
+| Name | Optional display name in the picker. |
+| Provider | `(inherit)` (empty) or `zai`, `wafer`, `kimi`, `fireworks`, `deepseek`, `meta`, `xai`, `opencode_go`. |
+| Base URL | Optional OpenAI-compatible endpoint. Leave blank for Z AI or Wafer to use that provider's default endpoint. |
+| Context window | Token window used for auto-compaction (`1000`–`4000000`; default `200000`). |
+| API backend | `chat_completions` (default), `responses`, or `messages`. |
+| Env key | Environment variable that holds the API key. Prefer this over putting a key in the file. |
+
+**Save custom model** requires a non-empty catalog key and model id. If
+either is missing, Open Grok shows a warning and does not write config.
+On success the draft fields clear, the new model appears in the list and
+the model picker, and Settings turns **Save custom model** back off.
+
+When you choose the Z AI provider and omit a base URL, Open Grok stores
+the GLM Coding Plan endpoint (`https://api.z.ai/api/coding/paas/v4`, or
+`OPENGROK_ZAI_API_BASE_URL` if set) and `env_key = "ZAI_API_KEY"`. Wafer
+does the same with `https://pass.wafer.ai/v1` and `WAFER_API_KEY`. That
+keeps API-key-only providers from inheriting an empty or xAI endpoint.
+
+---
+
 ## Configuring Custom Models
 
-Add custom model endpoints in `~/.opengrok/config.toml` under `[model.<name>]` sections:
+Add custom model endpoints in `~/.opengrok/config.toml` under `[model.<name>]`
+sections. **Settings → Models → Custom models** writes these same tables:
 
 ```toml
 [model.my-model]
@@ -106,7 +151,13 @@ Grok resolves the API key in this order:
 
 ### Context Window
 
-The `context_window` value tells Grok when to trigger auto-compaction. When you override a known model, Grok inherits that model's context window. When you define a new model and omit `context_window`, Grok defaults to 200,000 tokens, so set it explicitly to match your provider.
+The `context_window` value tells Grok when to trigger auto-compaction. The
+Context window field in **Settings → Models → Custom models** writes this
+same key. When you override a known model, Grok inherits that model's
+context window unless you set `context_window`. When you define a new model
+and omit `context_window`, Grok defaults to 200,000 tokens, so set it
+explicitly to match your provider. Z AI's live `/models` list does not
+include a window size; see [Z AI](#z-ai) for the curated defaults.
 
 ### Global Default Headers
 
@@ -188,9 +239,14 @@ When you override a built-in model, Grok starts with the default configuration (
 
 ### Priority Order
 
-1. Your config (`[model.*]`) -- highest priority
-2. Prefetched models from remote `/v1/models`
+1. Your config (`[model.*]`, including tables written from Settings) -- highest priority
+2. Live provider catalogs (Z AI and Wafer `/models`, plus other prefetched `/v1/models` lists)
 3. Hardcoded defaults -- lowest priority
+
+A live Z AI or Wafer catalog replace rebuilds that provider's picker
+entries, then Open Grok re-applies `[model.*]`. Custom models that the
+remote list does not return stay in the catalog, and field overrides on a
+live id (for example a larger `context_window`) win.
 
 ---
 
@@ -299,8 +355,16 @@ Z AI serves GLM models over an OpenAI-compatible Chat Completions endpoint.
 Its provider catalog is dynamic: Open Grok queries `GET /models` at Z AI's
 GLM Coding Plan endpoint (`https://api.z.ai/api/coding/paas/v4` by default;
 override with `OPENGROK_ZAI_API_BASE_URL`) rather than relying on a static
-model list. Set `ZAI_API_KEY` (or connect it with `/login zai`) and pick one
-of the returned GLM model IDs:
+model list. That `/models` response lists ids only — it does not include
+`context_window`, `context_length`, or `max_model_len`. Open Grok therefore
+assigns context windows from published GLM sizes: **glm-5.2** is
+**1,000,000** tokens (max output 131,072); other listed GLM text models are
+**200,000**. Override either value with `context_window` in `[model.*]` or
+the Context window field under **Settings → Models → Custom models**.
+
+Set `ZAI_API_KEY` (or connect it with `/login zai`) and pick one of the
+returned GLM model IDs. To add a GLM id that is not in the live list, use
+Settings or a `[model.*]` table with `provider = "zai"`:
 
 ```toml
 [model.zai-model]
@@ -310,8 +374,14 @@ provider = "zai"
 base_url = "https://api.z.ai/api/coding/paas/v4"
 api_backend = "chat_completions"
 env_key = "ZAI_API_KEY"
+context_window = 1000000
 reasoning_effort = "high"   # low | medium | high | max on reasoning GLM models
 ```
+
+User `[model.*]` entries win over the live catalog: a custom Z AI model
+that `/models` does not return stays in the picker, and an override on a
+live id (for example `[model.zai:glm-5.2]`) keeps your `context_window`
+after the catalog refreshes.
 
 Reasoning-capable GLM models accept `reasoning_effort` up to `max`; Open
 Grok sends Z AI's `thinking` mode switch automatically whenever an effort is

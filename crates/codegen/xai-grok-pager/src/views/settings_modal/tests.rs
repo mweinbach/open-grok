@@ -709,6 +709,114 @@ fn every_enum_setting_has_action_for_enum_commit_arm() {
     }
 }
 
+#[test]
+fn custom_models_registry_contains_group_and_draft_keys() {
+    let reg = SettingsRegistry::defaults();
+    for key in [
+        "custom_models",
+        "custom_models.list",
+        "custom_model_id",
+        "custom_model_slug",
+        "custom_model_name",
+        "custom_model_provider",
+        "custom_model_base_url",
+        "custom_model_context_window",
+        "custom_model_backend",
+        "custom_model_env_key",
+        "custom_model_save",
+    ] {
+        assert!(reg.find(key).is_some(), "missing setting `{key}`");
+    }
+}
+
+fn seed_custom_model_list(state: &mut SettingsModalState) {
+    state.pager_snapshot.custom_models = vec![crate::settings::CustomModelRecord {
+        key: "zai:extra".to_string(),
+        model: "glm-extra".to_string(),
+        name: Some("Extra".to_string()),
+        provider: Some("zai".to_string()),
+        context_window: Some(500_000),
+        ..crate::settings::CustomModelRecord::default()
+    }];
+}
+
+fn focus_setting(state: &mut SettingsModalState, target: &str) {
+    state.selected = state
+        .rows
+        .iter()
+        .position(|row| matches!(row, RowEntry::Setting { key, .. } if *key == target))
+        .unwrap_or_else(|| panic!("setting `{target}` must be a top-level row"));
+}
+
+#[test]
+fn save_custom_model_with_empty_id_or_slug_does_not_dispatch_upsert() {
+    let mut s = make_state();
+    focus_setting(&mut s, "custom_models");
+    let entered = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(entered, SettingsKeyOutcome::Changed));
+    // last child is Save custom model
+    for _ in 0..20 {
+        let _ = handle_settings_key(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        if matches!(
+            s.mode(),
+            SettingsModalMode::PickingGroup { child_idx: 9, .. }
+        ) {
+            break;
+        }
+    }
+    let outcome = handle_settings_key(
+        &mut s,
+        &KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    );
+    assert!(
+        matches!(
+            outcome,
+            SettingsKeyOutcome::Action(Action::SetCustomModelSave(true))
+        ),
+        "Save toggle must dispatch SetCustomModelSave, got {outcome:?}"
+    );
+}
+
+#[test]
+fn snapshot_constructors_include_custom_model_draft_fields() {
+    let snapshot = crate::settings::PagerLocalSnapshot::default();
+    assert!(snapshot.custom_models.is_empty());
+    assert_eq!(snapshot.custom_model_id, "");
+    assert_eq!(snapshot.custom_model_slug, "");
+    assert_eq!(
+        snapshot.custom_model_context_window,
+        crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT
+    );
+    assert_eq!(snapshot.custom_model_backend, "chat_completions");
+    assert!(!snapshot.custom_model_save);
+}
+
+#[test]
+fn deselecting_a_saved_custom_model_dispatches_delete() {
+    let mut s = make_state();
+    seed_custom_model_list(&mut s);
+    focus_setting(&mut s, "custom_models");
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    // first child is the saved-list multi-select
+    let entered = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(entered, SettingsKeyOutcome::Changed));
+    let outcome = handle_settings_key(
+        &mut s,
+        &KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    );
+    assert!(
+        matches!(
+            outcome,
+            SettingsKeyOutcome::Action(Action::DeleteCustomModel { ref key })
+                if key == "zai:extra"
+        ),
+        "deselecting a saved custom model must delete it, got {outcome:?}"
+    );
+}
+
 /// The previous behaviour truncated labels
 /// at `max_label_w` regardless of available area width. The new
 /// behaviour prefers to render the FULL label whenever the row's
@@ -930,6 +1038,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // Z AI isolated credential.
             "zai_api_key",
             "opencode_go_models",
+            "custom_models",
             "toolset.perplexity_web_search.enabled",
             "perplexity_api_key",
             "toolset.web_search_source.xai",

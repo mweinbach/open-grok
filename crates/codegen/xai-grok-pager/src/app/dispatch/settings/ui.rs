@@ -168,6 +168,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
         if let Some(state) = state_opt {
             state.rebuild_rows();
             state.ui_snapshot = ui_snapshot.clone();
+            let previous_draft = state.pager_snapshot.clone();
             state.pager_snapshot = crate::settings::PagerLocalSnapshot {
                 multiline_mode: agent.multiline_mode,
                 yolo_mode: agent.session.is_yolo(),
@@ -192,6 +193,17 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 zai_api_key_status,
                 opencode_go_models: app.opencode_go_models.clone(),
                 opencode_go_enabled_models: app.opencode_go_enabled_models.clone(),
+                custom_models: crate::settings::cached_custom_models(),
+                custom_model_id: String::new(),
+                custom_model_slug: String::new(),
+                custom_model_name: String::new(),
+                custom_model_provider: String::new(),
+                custom_model_base_url: String::new(),
+                custom_model_context_window:
+                    crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
+                custom_model_backend: "chat_completions".to_owned(),
+                custom_model_env_key: String::new(),
+                custom_model_save: false,
                 perplexity_web_search_enabled,
                 web_search_source,
                 x_search_enabled,
@@ -216,14 +228,18 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                     .scheduler_background_loops
                     .unwrap_or(scheduler_background_loops_seed),
             };
+            state
+                .pager_snapshot
+                .copy_custom_model_draft_from(&previous_draft);
         }
     }
-    if let Some(snapshot) = dashboard_snapshot
+    if let Some(mut snapshot) = dashboard_snapshot
         && let Some(state) = app
             .dashboard
             .as_mut()
             .and_then(|dashboard| dashboard.settings_modal.as_mut())
     {
+        snapshot.copy_custom_model_draft_from(&state.pager_snapshot);
         state.ui_snapshot = ui_snapshot;
         state.pager_snapshot = snapshot;
     }
@@ -340,6 +356,9 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
             generation: app.opencode_go_operation_generation,
         });
     }
+    effects.push(Effect::QueryCustomModels {
+        generation: super::setters::current_custom_models_generation(),
+    });
 
     let Some(agent) = app.agents.get_mut(&id) else {
         return effects;
@@ -387,6 +406,16 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         zai_api_key_status,
         opencode_go_models: app.opencode_go_models.clone(),
         opencode_go_enabled_models: app.opencode_go_enabled_models.clone(),
+        custom_models: crate::settings::cached_custom_models(),
+        custom_model_id: String::new(),
+        custom_model_slug: String::new(),
+        custom_model_name: String::new(),
+        custom_model_provider: String::new(),
+        custom_model_base_url: String::new(),
+        custom_model_context_window: crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
+        custom_model_backend: "chat_completions".to_owned(),
+        custom_model_env_key: String::new(),
+        custom_model_save: false,
         perplexity_web_search_enabled: app.perplexity_web_search_enabled,
         web_search_source: xai_grok_shell::util::config::load_web_search_source_sync(),
         x_search_enabled: xai_grok_shell::util::config::load_x_search_config_sync().enabled,
@@ -1129,6 +1158,16 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         zai_api_key_status: zai_api_key_status(),
         opencode_go_models: app.opencode_go_models.clone(),
         opencode_go_enabled_models: app.opencode_go_enabled_models.clone(),
+        custom_models: crate::settings::cached_custom_models(),
+        custom_model_id: String::new(),
+        custom_model_slug: String::new(),
+        custom_model_name: String::new(),
+        custom_model_provider: String::new(),
+        custom_model_base_url: String::new(),
+        custom_model_context_window: crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
+        custom_model_backend: "chat_completions".to_owned(),
+        custom_model_env_key: String::new(),
+        custom_model_save: false,
         perplexity_web_search_enabled: app.perplexity_web_search_enabled,
         web_search_source: xai_grok_shell::util::config::load_web_search_source_sync(),
         x_search_enabled: xai_grok_shell::util::config::load_x_search_config_sync().enabled,
@@ -1232,6 +1271,30 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("opencode_go_models", SettingValue::Bool(false)) => {
             Some(Action::SetOpenCodeGoEnabledModels { models: Vec::new() })
         }
+        ("custom_models.list", SettingValue::Bool(false)) => Some(Action::RefreshCustomModels),
+        ("custom_model_id", SettingValue::String(s)) => Some(Action::SetCustomModelId(s.clone())),
+        ("custom_model_slug", SettingValue::String(s)) => {
+            Some(Action::SetCustomModelSlug(s.clone()))
+        }
+        ("custom_model_name", SettingValue::String(s)) => {
+            Some(Action::SetCustomModelName(s.clone()))
+        }
+        ("custom_model_provider", SettingValue::Enum(s)) => {
+            Some(Action::SetCustomModelProvider((*s).to_owned()))
+        }
+        ("custom_model_base_url", SettingValue::String(s)) => {
+            Some(Action::SetCustomModelBaseUrl(s.clone()))
+        }
+        ("custom_model_context_window", SettingValue::Int(v)) => {
+            Some(Action::SetCustomModelContextWindow(*v))
+        }
+        ("custom_model_backend", SettingValue::Enum(s)) => {
+            Some(Action::SetCustomModelBackend((*s).to_owned()))
+        }
+        ("custom_model_env_key", SettingValue::String(s)) => {
+            Some(Action::SetCustomModelEnvKey(s.clone()))
+        }
+        ("custom_model_save", SettingValue::Bool(b)) => Some(Action::SetCustomModelSave(*b)),
         (
             "toolset.web_search_source.xai"
             | "toolset.web_search_source.codex"

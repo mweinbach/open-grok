@@ -1097,6 +1097,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "show_tips" => Some(Action::SetShowTips(new)),
         "auto_update" => Some(Action::SetAutoUpdate(new)),
         "display_refresh_auto_cadence" => Some(Action::SetDisplayRefreshAutoCadence(new)),
+        "custom_model_save" => Some(Action::SetCustomModelSave(new)),
         _ if crate::settings::is_local_feature_flag(key) => {
             Some(Action::SetLocalFeatureFlag { key, enabled: new })
         }
@@ -1192,6 +1193,8 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
         "default_selected_permission" => {
             Some(Action::SetDefaultSelectedPermission(choice.to_string()))
         }
+        "custom_model_provider" => Some(Action::SetCustomModelProvider(choice.to_string())),
+        "custom_model_backend" => Some(Action::SetCustomModelBackend(choice.to_string())),
         _ => None,
     }
 }
@@ -1239,6 +1242,11 @@ pub(super) fn action_for_string(
                     .map(Action::SetMemoryModel)
             }
         }
+        "custom_model_id" => Some(Action::SetCustomModelId(value)),
+        "custom_model_slug" => Some(Action::SetCustomModelSlug(value)),
+        "custom_model_name" => Some(Action::SetCustomModelName(value)),
+        "custom_model_base_url" => Some(Action::SetCustomModelBaseUrl(value)),
+        "custom_model_env_key" => Some(Action::SetCustomModelEnvKey(value)),
 
         _ => {
             let _ = value;
@@ -1254,6 +1262,7 @@ pub(super) fn action_for_int(key: SettingKey, value: i64) -> Option<Action> {
         "max_thoughts_width" => Some(Action::SetMaxThoughtsWidth(value)),
         "scroll_speed" => Some(Action::SetScrollSpeed(value)),
         "scroll_lines" => Some(Action::SetScrollLines(value)),
+        "custom_model_context_window" => Some(Action::SetCustomModelContextWindow(value)),
         _ => None,
     }
 }

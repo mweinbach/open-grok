@@ -158,8 +158,10 @@ fn handle_picking_enum(state: &mut SettingsModalState, key: &KeyEvent) -> Settin
                     action_for_string(setting_key, canonical, &state.pager_snapshot)
                 })
             } else {
-                picker_choice_at(state, setting_key, choices_idx)
-                    .and_then(|c| action_for_enum_commit(setting_key, c))
+                picker_choice_at(state, setting_key, choices_idx).and_then(|c| {
+                    custom_model_action_for_enum_commit(setting_key, c)
+                        .or_else(|| action_for_enum_commit(setting_key, c))
+                })
             };
             let kimi_provider_login = !close
                 && state.entry_point == SettingsEntryPoint::ProviderLogin
@@ -286,14 +288,7 @@ fn handle_picking_group(state: &mut SettingsModalState, key: &KeyEvent) -> Setti
             let Some(child_key) = children.get(child_idx).copied() else {
                 return SettingsKeyOutcome::Unchanged;
             };
-            let cur = match state.value_for(child_key) {
-                Some(SettingValue::Bool(b)) => b,
-                _ => return SettingsKeyOutcome::Unchanged,
-            };
-            match action_for_bool(child_key, !cur) {
-                Some(action) => SettingsKeyOutcome::Action(action),
-                None => SettingsKeyOutcome::Unchanged,
-            }
+            activate_group_child(state, child_key)
         }
         KeyCode::Esc => {
             state.transition_to_browse();
@@ -309,12 +304,20 @@ fn toggle_dynamic_multi_select(
     choice_idx: usize,
     choices: &[crate::settings::OwnedMultiSelectChoice],
 ) -> SettingsKeyOutcome {
-    if group_key != "opencode_go_models" {
-        return SettingsKeyOutcome::Unchanged;
-    }
     let Some(choice) = choices.get(choice_idx) else {
         return SettingsKeyOutcome::Unchanged;
     };
+    if group_key == "custom_models.list" || group_key == "custom_models" {
+        if !choice.selected {
+            return SettingsKeyOutcome::Unchanged;
+        }
+        return SettingsKeyOutcome::Action(Action::DeleteCustomModel {
+            key: choice.canonical.clone(),
+        });
+    }
+    if group_key != "opencode_go_models" {
+        return SettingsKeyOutcome::Unchanged;
+    }
     let mut enabled = state.pager_snapshot.opencode_go_enabled_models.clone();
     enabled.retain(|value| {
         value != &choice.canonical
@@ -330,6 +333,42 @@ fn toggle_dynamic_multi_select(
     enabled.sort();
     enabled.dedup();
     SettingsKeyOutcome::Action(Action::SetOpenCodeGoEnabledModels { models: enabled })
+}
+
+pub(crate) fn custom_model_action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
+    match key {
+        "custom_model_save" => Some(Action::SetCustomModelSave(new)),
+        _ => None,
+    }
+}
+
+pub(crate) fn custom_model_action_for_string(key: SettingKey, value: String) -> Option<Action> {
+    match key {
+        "custom_model_id" => Some(Action::SetCustomModelId(value)),
+        "custom_model_slug" => Some(Action::SetCustomModelSlug(value)),
+        "custom_model_name" => Some(Action::SetCustomModelName(value)),
+        "custom_model_base_url" => Some(Action::SetCustomModelBaseUrl(value)),
+        "custom_model_env_key" => Some(Action::SetCustomModelEnvKey(value)),
+        _ => None,
+    }
+}
+
+pub(crate) fn custom_model_action_for_int(key: SettingKey, value: i64) -> Option<Action> {
+    match key {
+        "custom_model_context_window" => Some(Action::SetCustomModelContextWindow(value)),
+        _ => None,
+    }
+}
+
+pub(crate) fn custom_model_action_for_enum_commit(
+    key: SettingKey,
+    choice: &'static str,
+) -> Option<Action> {
+    match key {
+        "custom_model_provider" => Some(Action::SetCustomModelProvider(choice.to_owned())),
+        "custom_model_backend" => Some(Action::SetCustomModelBackend(choice.to_owned())),
+        _ => None,
+    }
 }
 
 /// Common nav body for Up/Down (and j/k aliases) in the picker:
@@ -403,7 +442,8 @@ fn handle_editing_value(state: &mut SettingsModalState, key: &KeyEvent) -> Setti
             *validation_error = error;
             return SettingsKeyOutcome::Unchanged;
         }
-        let action = action_for_string(setting_key, text, &state.pager_snapshot);
+        let action = custom_model_action_for_string(setting_key, text.clone())
+            .or_else(|| action_for_string(setting_key, text, &state.pager_snapshot));
         state.transition_to_browse();
         return match action {
             Some(action) => SettingsKeyOutcome::Action(action),
@@ -838,10 +878,10 @@ fn handle_int_stepper(
         KeyCode::Enter => {
             // Commit. Buffer is guaranteed in-range by the
             // clamp on every step; parse + dispatch.
-            let action_opt = buffer
-                .parse::<i64>()
-                .ok()
-                .and_then(|i| action_for_int(setting_key, i));
+            let action_opt = buffer.parse::<i64>().ok().and_then(|i| {
+                custom_model_action_for_int(setting_key, i)
+                    .or_else(|| action_for_int(setting_key, i))
+            });
             state.transition_to_browse();
             match action_opt {
                 Some(action) => SettingsKeyOutcome::Action(action),
@@ -1597,10 +1637,107 @@ fn handle_group_mouse(
     let Some(child_key) = children.get(idx).copied() else {
         return SettingsKeyOutcome::Changed;
     };
-    let cur = matches!(state.value_for(child_key), Some(SettingValue::Bool(true)));
-    match action_for_bool(child_key, !cur) {
-        Some(action) => SettingsKeyOutcome::Action(action),
-        None => SettingsKeyOutcome::Changed,
+    activate_group_child(state, child_key)
+}
+
+fn activate_group_child(
+    state: &mut SettingsModalState,
+    child_key: SettingKey,
+) -> SettingsKeyOutcome {
+    let Some(meta) = state.registry.find(child_key) else {
+        return SettingsKeyOutcome::Unchanged;
+    };
+    match &meta.kind {
+        SettingKind::DynamicMultiSelect { .. } | SettingKind::Group { .. } => {
+            state.transition_to_picking_group(child_key, 0);
+            SettingsKeyOutcome::Changed
+        }
+        SettingKind::Bool { .. } => {
+            let cur = matches!(state.value_for(child_key), Some(SettingValue::Bool(true)));
+            custom_model_action_for_bool(child_key, !cur)
+                .or_else(|| action_for_bool(child_key, !cur))
+                .map(SettingsKeyOutcome::Action)
+                .unwrap_or(SettingsKeyOutcome::Unchanged)
+        }
+        SettingKind::Enum { .. } | SettingKind::DynamicEnum { .. } => {
+            if enter_child_enum_picker(state, child_key) {
+                SettingsKeyOutcome::Changed
+            } else {
+                SettingsKeyOutcome::Unchanged
+            }
+        }
+        SettingKind::String { .. } | SettingKind::Int { .. } => {
+            if enter_child_editor(state, child_key) {
+                SettingsKeyOutcome::Changed
+            } else {
+                SettingsKeyOutcome::Unchanged
+            }
+        }
+        SettingKind::Secret => SettingsKeyOutcome::Unchanged,
+    }
+}
+
+fn enter_child_enum_picker(state: &mut SettingsModalState, key: SettingKey) -> bool {
+    let Some(meta) = state.registry.find(key) else {
+        return false;
+    };
+    let SettingKind::Enum {
+        choices,
+        supports_preview,
+        ..
+    } = &meta.kind
+    else {
+        return false;
+    };
+    let current = state.value_for(key);
+    let choices_idx = match &current {
+        Some(SettingValue::Enum(cur)) => choices
+            .iter()
+            .position(|choice| choice.canonical == *cur)
+            .unwrap_or(0),
+        _ => 0,
+    };
+    let original = current.unwrap_or(SettingValue::Enum(
+        choices.first().map_or("", |c| c.canonical),
+    ));
+    state.transition_to_picking_enum(key, choices_idx, original, *supports_preview);
+    true
+}
+
+fn enter_child_editor(state: &mut SettingsModalState, key: SettingKey) -> bool {
+    let Some(meta) = state.registry.find(key) else {
+        return false;
+    };
+    let value = state.value_for(key);
+    match &meta.kind {
+        SettingKind::String {
+            default, validator, ..
+        } => {
+            let text = match value {
+                Some(SettingValue::String(text)) => text,
+                _ => (*default).to_string(),
+            };
+            let mut editor = crate::input::line_editor::LineEditor::default();
+            editor.set_text(text);
+            let validation_error = validate_string(
+                *validator,
+                editor.text(),
+                &state.pager_snapshot.available_models,
+            );
+            state.transition_to_editing_string(key, editor, *validator, validation_error);
+            true
+        }
+        SettingKind::Int {
+            default, min, max, ..
+        } => {
+            let buffer = match value {
+                Some(SettingValue::Int(value)) => value.to_string(),
+                _ => default.to_string(),
+            };
+            state.transition_to_editing_int(key, buffer, *min, *max);
+            true
+        }
+        _ => false,
     }
 }
 

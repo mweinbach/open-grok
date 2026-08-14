@@ -571,6 +571,90 @@ const CONTEXTUAL_HINTS_CHILDREN: &[&str] = &[
     "contextual_hints.ssh_wrap",
 ];
 
+/// Settings → Models → Custom models sub-sheet: saved entries plus the add-model draft.
+const CUSTOM_MODELS_CHILDREN: &[&str] = &[
+    "custom_models.list",
+    "custom_model_id",
+    "custom_model_slug",
+    "custom_model_name",
+    "custom_model_provider",
+    "custom_model_base_url",
+    "custom_model_context_window",
+    "custom_model_backend",
+    "custom_model_env_key",
+    "custom_model_save",
+];
+
+pub(crate) const CUSTOM_MODEL_CONTEXT_WINDOW_MIN: i64 = 1_000;
+pub(crate) const CUSTOM_MODEL_CONTEXT_WINDOW_MAX: i64 = 4_000_000;
+pub(crate) const CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT: i64 = 200_000;
+
+const CUSTOM_MODEL_PROVIDER_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "",
+        display: "(inherit)",
+        description: "Use the default provider for this catalog key.",
+    },
+    EnumChoice {
+        canonical: "zai",
+        display: "Z AI",
+        description: "api.z.ai GLM Coding Plan (ZAI_API_KEY).",
+    },
+    EnumChoice {
+        canonical: "wafer",
+        display: "Wafer AI",
+        description: "pass.wafer.ai Chat Completions (WAFER_API_KEY).",
+    },
+    EnumChoice {
+        canonical: "kimi",
+        display: "Kimi",
+        description: "Kimi Platform / Moonshot.",
+    },
+    EnumChoice {
+        canonical: "fireworks",
+        display: "Fireworks AI",
+        description: "Fireworks AI Chat Completions.",
+    },
+    EnumChoice {
+        canonical: "deepseek",
+        display: "DeepSeek",
+        description: "Direct DeepSeek API.",
+    },
+    EnumChoice {
+        canonical: "meta",
+        display: "Meta",
+        description: "Meta Model API.",
+    },
+    EnumChoice {
+        canonical: "xai",
+        display: "xAI",
+        description: "xAI Grok.",
+    },
+    EnumChoice {
+        canonical: "opencode_go",
+        display: "OpenCode Go",
+        description: "OpenCode Go catalog.",
+    },
+];
+
+const CUSTOM_MODEL_BACKEND_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "chat_completions",
+        display: "Chat Completions",
+        description: "OpenAI-compatible /v1/chat/completions.",
+    },
+    EnumChoice {
+        canonical: "responses",
+        display: "Responses",
+        description: "OpenAI-compatible /v1/responses.",
+    },
+    EnumChoice {
+        canonical: "messages",
+        display: "Messages",
+        description: "Anthropic-compatible /v1/messages.",
+    },
+];
+
 /// Web-search-source choices for providers whose default is xAI search.
 const WEB_SEARCH_SOURCE_XAI_DEFAULT_CHOICES: &[EnumChoice] = &[
     EnumChoice {
@@ -1267,6 +1351,161 @@ pub fn default_settings() -> Vec<SettingMeta> {
             kind: SettingKind::DynamicMultiSelect {
                 source: crate::settings::DynamicMultiSelectSource::OpenCodeGoModels,
             },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_models",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Custom models",
+            description: "Add or remove user [model.*] catalog entries without editing config.toml. Saving writes the same tables Settings already documents.",
+            keywords: &[
+                "custom", "model", "byok", "endpoint", "ollama", "zai", "wafer", "catalog",
+                "override",
+            ],
+            kind: SettingKind::Group {
+                children: CUSTOM_MODELS_CHILDREN,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_models.list",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Saved custom models",
+            description: "User [model.*] entries. Deselect a row to delete that table from config.toml.",
+            keywords: &["custom", "models", "saved", "delete", "remove"],
+            kind: SettingKind::DynamicMultiSelect {
+                source: crate::settings::DynamicMultiSelectSource::CustomModels,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_id",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Catalog key",
+            description: "Table name written as [model.<key>] (letters, digits, :, ., -, _). Example: zai:glm-special.",
+            keywords: &["custom", "model", "key", "id", "catalog"],
+            kind: SettingKind::String {
+                default: "",
+                validator: crate::settings::StringValidator::Any,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_slug",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Model id",
+            description: "Wire model id sent to the provider (the [model.<key>].model field).",
+            keywords: &["custom", "model", "slug", "id", "wire"],
+            kind: SettingKind::String {
+                default: "",
+                validator: crate::settings::StringValidator::Any,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_name",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Display name",
+            description: "Optional friendly name shown in the model picker.",
+            keywords: &["custom", "model", "name", "label"],
+            kind: SettingKind::String {
+                default: "",
+                validator: crate::settings::StringValidator::Any,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_provider",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Provider",
+            description: "Optional ModelProvider. Inherit leaves provider unset so the catalog key decides.",
+            keywords: &["custom", "model", "provider", "zai", "wafer", "kimi", "xai"],
+            kind: SettingKind::Enum {
+                default: "",
+                choices: CUSTOM_MODEL_PROVIDER_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_base_url",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Base URL",
+            description: "Optional API base URL. Z AI / Wafer fill their default when this is left empty.",
+            keywords: &["custom", "model", "base", "url", "endpoint"],
+            kind: SettingKind::String {
+                default: "",
+                validator: crate::settings::StringValidator::Any,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_context_window",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Context window",
+            description: "Token context window written to [model.<key>].context_window (1,000–4,000,000).",
+            keywords: &["custom", "model", "context", "window", "tokens"],
+            kind: SettingKind::Int {
+                default: CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
+                min: CUSTOM_MODEL_CONTEXT_WINDOW_MIN,
+                max: CUSTOM_MODEL_CONTEXT_WINDOW_MAX,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_backend",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "API backend",
+            description: "Wire protocol: chat_completions, responses, or messages.",
+            keywords: &["custom", "model", "backend", "api", "chat", "responses"],
+            kind: SettingKind::Enum {
+                default: "chat_completions",
+                choices: CUSTOM_MODEL_BACKEND_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_env_key",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Env key name",
+            description: "Optional environment variable that holds the API key. Prefer this over storing a key in config.toml.",
+            keywords: &["custom", "model", "env", "key", "credential"],
+            kind: SettingKind::String {
+                default: "",
+                validator: crate::settings::StringValidator::Any,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "custom_model_save",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Pager,
+            label: "Save custom model",
+            description: "Write the draft as [model.<key>] and refresh the catalog. Requires a catalog key and model id.",
+            keywords: &["custom", "model", "save", "add", "upsert"],
+            kind: SettingKind::Bool { default: false },
             restart_required: false,
             hidden_in_minimal: false,
         },

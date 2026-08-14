@@ -267,6 +267,10 @@ client_id = "0oa1b2c3d4e5f6g7h8i9"
 ### Custom models
 
 Add custom model endpoints to use alternative providers or self-hosted models.
+**Settings → Models → Custom models** writes the same `[model.<key>]` tables
+shown here (catalog key, wire id, name, provider, base URL, context window,
+backend, env key). Advanced fields such as `extra_headers` and `query_params`
+stay in this file. See [Custom Models](11-custom-models.md).
 
 ```toml
 [model.my-model]
