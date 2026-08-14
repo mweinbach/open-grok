@@ -321,6 +321,7 @@ mod tests {
             doom_loop_recovery: Some(DoomLoopRecoveryPolicy {
                 max_threshold: 8,
                 max_retries: 2,
+                ..Default::default()
             }),
             ..Default::default()
         };

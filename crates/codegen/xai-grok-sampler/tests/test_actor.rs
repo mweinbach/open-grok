@@ -1179,6 +1179,17 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
             Some("codex_cli_rs"),
             "Codex provider headers must survive filtering"
         );
+        // The ChatGPT Codex backend only serves the per-conversation prompt
+        // cache (keyed by body `prompt_cache_key`) when a session identity
+        // header is present; codex-rs sends all three on every request.
+        for name in ["session-id", "thread-id", "x-client-request-id"] {
+            assert_eq!(
+                headers.get(name).and_then(|value| value.to_str().ok()),
+                Some("codex-session-affinity"),
+                "Codex Responses request (streaming={streaming}) must carry \
+                 session affinity header {name}"
+            );
+        }
         assert_eq!(
             body["tools"],
             json!([{"type": "web_search", "external_web_access": true}])
@@ -1216,7 +1227,7 @@ async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
         assert_eq!(
             body.get("prompt_cache_key")
                 .and_then(serde_json::Value::as_str),
-            Some("must-not-leak"),
+            Some("codex-session-affinity"),
             "Codex HTTP prompt caching must use the stable session ID: {body}"
         );
         assert!(
@@ -1867,6 +1878,16 @@ async fn codex_compact_uses_unary_endpoint_auth_headers_and_exact_history() {
             .and_then(|value| value.to_str().ok()),
         Some("codex_cli_rs")
     );
+    // Compaction requests must keep the same cache affinity identity as the
+    // main turn requests so the compacted prefix lands in (and reads from)
+    // the session's prompt cache.
+    for name in ["session-id", "thread-id", "x-client-request-id"] {
+        assert_eq!(
+            headers.get(name).and_then(|value| value.to_str().ok()),
+            Some("session-cache-key"),
+            "Codex compact request must carry session affinity header {name}"
+        );
+    }
     assert_eq!(body["model"], "gpt-5.6-sol");
     assert_eq!(body["instructions"], "base instructions");
     assert_eq!(body["parallel_tool_calls"], true);

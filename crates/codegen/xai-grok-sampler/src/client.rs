@@ -4605,6 +4605,72 @@ mod tests {
         );
     }
 
+    /// The ChatGPT Codex backend activates the per-conversation prompt cache
+    /// (keyed by body `prompt_cache_key`) only when a session identity header
+    /// accompanies the request. Verified against
+    /// `/backend-api/codex/responses`: identical back-to-back requests report
+    /// `cached_tokens: 0` with the body key alone, and a full prefix hit once
+    /// `session-id`/`thread-id` are sent. codex-rs sends `session-id`,
+    /// `thread-id`, and `x-client-request-id` on every Responses request.
+    #[test]
+    fn codex_session_affinity_headers_enable_prompt_cache_routing() {
+        let headers = GrokRequestHeaders {
+            conv_id: "conv-1",
+            req_id: "req-1",
+            model_id: "model-1",
+            session_id: "session-1",
+            turn_idx: Some("7"),
+            agent_id: "agent-1",
+            deployment_id: None,
+            user_id: None,
+        };
+        let http = reqwest::Client::new();
+
+        let codex = headers
+            .apply_for_provider(http.post("https://example.test"), ModelProvider::Codex)
+            .build()
+            .expect("Codex request should build");
+        for name in ["session-id", "thread-id", "x-client-request-id"] {
+            assert_eq!(
+                codex
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok()),
+                Some("session-1"),
+                "Codex request must carry session affinity header {name}"
+            );
+        }
+
+        // xAI keeps its own metadata contract; the Codex identity headers
+        // must never cross providers.
+        let xai = headers
+            .apply_for_provider(http.post("https://example.test"), ModelProvider::Xai)
+            .build()
+            .expect("xAI request should build");
+        for name in ["session-id", "thread-id", "x-client-request-id"] {
+            assert!(
+                xai.headers().get(name).is_none(),
+                "xAI request must not carry Codex session affinity header {name}"
+            );
+        }
+
+        // Without a stable session id there is no affinity identity to send.
+        let anonymous = GrokRequestHeaders {
+            session_id: "",
+            ..headers
+        };
+        let codex_anonymous = anonymous
+            .apply_for_provider(http.post("https://example.test"), ModelProvider::Codex)
+            .build()
+            .expect("Codex request should build");
+        for name in ["session-id", "thread-id", "x-client-request-id"] {
+            assert!(
+                codex_anonymous.headers().get(name).is_none(),
+                "empty session id must not synthesize affinity header {name}"
+            );
+        }
+    }
+
     #[test]
     fn apply_env_http_headers_resolves_trims_skips_and_overrides() {
         let mut map = IndexMap::new();
