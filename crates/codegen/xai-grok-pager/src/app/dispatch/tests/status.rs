@@ -1007,6 +1007,8 @@ fn session_cache_complete_commits_block() {
         summary: xai_grok_shell::session::CacheSummary {
             total_input_tokens: 5000,
             total_cached_tokens: 4000,
+            steady_input_tokens: 4500,
+            steady_cached_tokens: 3600,
             overall_hit_rate_pct: 80.0,
             total_turns: 2,
             hits: 2,

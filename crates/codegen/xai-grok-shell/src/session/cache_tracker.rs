@@ -221,6 +221,14 @@ pub struct CacheTurnRecord {
 pub struct CacheSummary {
     pub total_input_tokens: u64,
     pub total_cached_tokens: u64,
+    /// Input tokens from steady-state turns only (excludes the cold first turn).
+    ///
+    /// The first request of a session cannot hit the cache by definition, so the
+    /// overall hit rate is computed over steady-state turns to avoid permanently
+    /// diluting it with the cold start.
+    pub steady_input_tokens: u64,
+    /// Cached tokens from steady-state turns only (excludes the cold first turn).
+    pub steady_cached_tokens: u64,
     pub overall_hit_rate_pct: f64,
     pub total_turns: usize,
     pub hits: usize,
@@ -435,7 +443,19 @@ impl CacheTracker {
 
         let diagnostic = match status {
             CacheStatus::FirstTurn => "First turn in session (cold cache).".to_string(),
-            CacheStatus::Hit => format!("Cache hit: {hit_rate_pct:.1}% ({cached_prompt_tokens}/{prompt_tokens} tokens cached)."),
+            CacheStatus::Hit => {
+                let mut d = format!(
+                    "Cache hit: {hit_rate_pct:.1}% ({cached_prompt_tokens}/{prompt_tokens} tokens cached)."
+                );
+                // A dip with an intact prefix is expected: the uncached remainder is
+                // content appended since the previous request, not an invalidation.
+                if hit_rate_pct < 90.0 && divergence.is_intact() {
+                    d.push_str(
+                        " Remaining tokens are new content appended since the previous request.",
+                    );
+                }
+                d
+            }
             CacheStatus::PartialHit => format!(
                 "Partial cache hit: {hit_rate_pct:.1}% ({cached_prompt_tokens}/{prompt_tokens} tokens cached). {}",
                 divergence.summary_diagnostic()
@@ -448,9 +468,15 @@ impl CacheTracker {
         self.summary.total_turns += 1;
         self.summary.total_input_tokens += prompt_tokens as u64;
         self.summary.total_cached_tokens += cached_prompt_tokens as u64;
-        if self.summary.total_input_tokens > 0 {
-            self.summary.overall_hit_rate_pct = (self.summary.total_cached_tokens as f64
-                / self.summary.total_input_tokens as f64)
+        if status != CacheStatus::FirstTurn {
+            self.summary.steady_input_tokens += prompt_tokens as u64;
+            self.summary.steady_cached_tokens += cached_prompt_tokens as u64;
+        }
+        // Overall hit rate covers steady-state turns only: the cold first turn
+        // cannot hit by definition and would permanently dilute the rate.
+        if self.summary.steady_input_tokens > 0 {
+            self.summary.overall_hit_rate_pct = (self.summary.steady_cached_tokens as f64
+                / self.summary.steady_input_tokens as f64)
                 * 100.0;
         }
 
@@ -993,8 +1019,73 @@ mod tests {
         assert_eq!(summary.total_turns, 2);
         assert_eq!(summary.total_input_tokens, 2500);
         assert_eq!(summary.total_cached_tokens, 1000);
+        // Steady-state excludes the cold first turn.
+        assert_eq!(summary.steady_input_tokens, 1500);
+        assert_eq!(summary.steady_cached_tokens, 1000);
         assert_eq!(summary.hits, 1);
         assert_eq!(summary.breaks, 0);
-        assert!((summary.overall_hit_rate_pct - 40.0).abs() < 0.1);
+        assert!((summary.overall_hit_rate_pct - 66.7).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_first_turn_only_summary_has_no_steady_state() {
+        let mut tracker = CacheTracker::new();
+        let req = ConversationRequest {
+            items: vec![ConversationItem::user("turn 1")],
+            ..Default::default()
+        };
+        let sum = CacheTracker::summarize_request(&req);
+        let rec = tracker.record_turn_outcome(None, "1", 0, 1000, 0, 100, sum);
+        assert_eq!(rec.status, CacheStatus::FirstTurn);
+
+        let summary = tracker.summary();
+        assert_eq!(summary.total_turns, 1);
+        assert_eq!(summary.total_input_tokens, 1000);
+        assert_eq!(summary.steady_input_tokens, 0);
+        assert_eq!(summary.steady_cached_tokens, 0);
+        assert_eq!(summary.overall_hit_rate_pct, 0.0);
+    }
+
+    #[test]
+    fn test_hit_dip_with_intact_prefix_explains_new_content() {
+        let mut tracker = CacheTracker::new();
+
+        let req1 = ConversationRequest {
+            items: vec![ConversationItem::user("turn 1")],
+            ..Default::default()
+        };
+        tracker.record_turn_outcome(
+            None,
+            "1",
+            0,
+            1000,
+            0,
+            100,
+            CacheTracker::summarize_request(&req1),
+        );
+
+        // Turn 2: large new append, half cached — Hit status at 50%.
+        let req2 = ConversationRequest {
+            items: vec![
+                ConversationItem::user("turn 1"),
+                ConversationItem::user("turn 2 with a large new append"),
+            ],
+            ..Default::default()
+        };
+        let rec2 = tracker.record_turn_outcome(
+            None,
+            "2",
+            1,
+            2000,
+            1000,
+            100,
+            CacheTracker::summarize_request(&req2),
+        );
+        assert_eq!(rec2.status, CacheStatus::Hit);
+        assert!(
+            rec2.diagnostic.contains("new content appended"),
+            "got: {}",
+            rec2.diagnostic
+        );
     }
 }

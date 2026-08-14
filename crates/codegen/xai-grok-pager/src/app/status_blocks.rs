@@ -260,12 +260,16 @@ pub(crate) fn session_cache_block_text(
     }
 
     let mut rows = Vec::new();
-    rows.push(format!(
-        "  Cache hit rate: {:.1}% ({} of {} input tokens cached)",
-        s.overall_hit_rate_pct,
-        group_thousands(s.total_cached_tokens),
-        group_thousands(s.total_input_tokens),
-    ));
+    if s.steady_input_tokens > 0 {
+        rows.push(format!(
+            "  Cache hit rate: {:.1}% ({} of {} steady-state input tokens cached; cold start excluded)",
+            s.overall_hit_rate_pct,
+            group_thousands(s.steady_cached_tokens),
+            group_thousands(s.steady_input_tokens),
+        ));
+    } else {
+        rows.push("  Cache hit rate: n/a (cold-start request only so far)".to_string());
+    }
     rows.push(format!(
         "  Turns tracked:  {} ({} hits · {} partial · {} breaks)",
         s.total_turns, s.hits, s.partial_hits, s.breaks,
@@ -278,15 +282,27 @@ pub(crate) fn session_cache_block_text(
     if !cache.recent_turns.is_empty() {
         rows.push("  Recent turns:".to_string());
         for rec in cache.recent_turns.iter().rev().take(10) {
-            rows.push(format!(
-                "    Turn #{} (loop {}) — {:.1}% hit ({} in, {} cached) · {}",
-                rec.turn_idx,
-                rec.loop_index,
-                rec.cache_hit_rate_pct,
-                group_thousands(rec.prompt_tokens as u64),
-                group_thousands(rec.cached_prompt_tokens as u64),
-                rec.diagnostic,
-            ));
+            if rec.status == xai_grok_shell::session::CacheStatus::FirstTurn {
+                // Cold start: no hit-rate percentage — the first request cannot
+                // hit the cache, so a percentage here reads like a failure.
+                rows.push(format!(
+                    "    Turn #{} (loop {}) — cold start ({} in) · {}",
+                    rec.turn_idx,
+                    rec.loop_index,
+                    group_thousands(rec.prompt_tokens as u64),
+                    rec.diagnostic,
+                ));
+            } else {
+                rows.push(format!(
+                    "    Turn #{} (loop {}) — {:.1}% hit ({} in, {} cached) · {}",
+                    rec.turn_idx,
+                    rec.loop_index,
+                    rec.cache_hit_rate_pct,
+                    group_thousands(rec.prompt_tokens as u64),
+                    group_thousands(rec.cached_prompt_tokens as u64),
+                    rec.diagnostic,
+                ));
+            }
         }
     }
 
@@ -486,7 +502,9 @@ mod tests {
         let resp = xai_grok_shell::extensions::cache::SessionCacheResponse {
             summary: xai_grok_shell::session::CacheSummary {
                 total_input_tokens: 10_000,
-                total_cached_tokens: 8_500,
+                total_cached_tokens: 6_575,
+                steady_input_tokens: 7_500,
+                steady_cached_tokens: 6_375,
                 overall_hit_rate_pct: 85.0,
                 total_turns: 4,
                 hits: 3,
@@ -499,6 +517,18 @@ mod tests {
                     turn_idx: "1".into(),
                     loop_index: 0,
                     prompt_tokens: 2500,
+                    cached_prompt_tokens: 200,
+                    completion_tokens: 150,
+                    cache_hit_rate_pct: 8.0,
+                    status: xai_grok_shell::session::CacheStatus::FirstTurn,
+                    divergence: xai_grok_shell::session::PrefixDivergence::FirstTurn,
+                    diagnostic: "First turn in session (cold cache).".into(),
+                    timestamp_rfc3339: "2026-08-14T00:00:00Z".into(),
+                },
+                xai_grok_shell::session::CacheTurnRecord {
+                    turn_idx: "2".into(),
+                    loop_index: 0,
+                    prompt_tokens: 2500,
                     cached_prompt_tokens: 2000,
                     completion_tokens: 150,
                     cache_hit_rate_pct: 80.0,
@@ -508,14 +538,49 @@ mod tests {
                         new_items: 1,
                     },
                     diagnostic: "Cache hit: 80.0%".into(),
-                    timestamp_rfc3339: "2026-08-14T00:00:00Z".into(),
+                    timestamp_rfc3339: "2026-08-14T00:01:00Z".into(),
                 },
             ],
         };
         let text = session_cache_block_text(&resp);
-        assert!(text.contains("Cache hit rate: 85.0% (8,500 of 10,000 input tokens cached)"), "{text}");
+        assert!(text.contains("Cache hit rate: 85.0% (6,375 of 7,500 steady-state input tokens cached; cold start excluded)"), "{text}");
         assert!(text.contains("Turns tracked:  4 (3 hits · 0 partial · 1 breaks)"), "{text}");
         assert!(text.contains("Last break:     Cache break: 0% hit rate. Item #2 was pruned/trimmed"), "{text}");
-        assert!(text.contains("Turn #1 (loop 0) — 80.0% hit (2,500 in, 2,000 cached) · Cache hit: 80.0%"), "{text}");
+        assert!(text.contains("Turn #1 (loop 0) — cold start (2,500 in) · First turn in session (cold cache)."), "{text}");
+        assert!(text.contains("Turn #2 (loop 0) — 80.0% hit (2,500 in, 2,000 cached) · Cache hit: 80.0%"), "{text}");
+    }
+
+    #[test]
+    fn session_cache_block_cold_start_only() {
+        let resp = xai_grok_shell::extensions::cache::SessionCacheResponse {
+            summary: xai_grok_shell::session::CacheSummary {
+                total_input_tokens: 2_500,
+                total_cached_tokens: 200,
+                steady_input_tokens: 0,
+                steady_cached_tokens: 0,
+                overall_hit_rate_pct: 0.0,
+                total_turns: 1,
+                hits: 0,
+                partial_hits: 0,
+                breaks: 0,
+                last_break_diagnostic: None,
+            },
+            recent_turns: vec![xai_grok_shell::session::CacheTurnRecord {
+                turn_idx: "1".into(),
+                loop_index: 0,
+                prompt_tokens: 2500,
+                cached_prompt_tokens: 200,
+                completion_tokens: 150,
+                cache_hit_rate_pct: 8.0,
+                status: xai_grok_shell::session::CacheStatus::FirstTurn,
+                divergence: xai_grok_shell::session::PrefixDivergence::FirstTurn,
+                diagnostic: "First turn in session (cold cache).".into(),
+                timestamp_rfc3339: "2026-08-14T00:00:00Z".into(),
+            }],
+        };
+        let text = session_cache_block_text(&resp);
+        assert!(text.contains("Cache hit rate: n/a (cold-start request only so far)"), "{text}");
+        assert!(text.contains("Turn #1 (loop 0) — cold start (2,500 in)"), "{text}");
+        assert!(!text.contains("% hit ("), "must not render a hit-rate percentage: {text}");
     }
 }

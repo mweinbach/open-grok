@@ -84,6 +84,8 @@ mod tests {
         let summary = CacheSummary {
             total_input_tokens: 1500,
             total_cached_tokens: 1200,
+            steady_input_tokens: 1500,
+            steady_cached_tokens: 1200,
             overall_hit_rate_pct: 80.0,
             total_turns: 1,
             hits: 1,
@@ -100,6 +102,8 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["summary"]["overallHitRatePct"], 80.0);
         assert_eq!(json["summary"]["totalCachedTokens"], 1200);
+        assert_eq!(json["summary"]["steadyInputTokens"], 1500);
+        assert_eq!(json["summary"]["steadyCachedTokens"], 1200);
         assert_eq!(json["recentTurns"][0]["cacheHitRatePct"], 80.0);
         assert_eq!(json["recentTurns"][0]["status"], "hit");
     }
