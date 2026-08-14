@@ -46,8 +46,8 @@ use super::session::modal::remove_agent_and_cleanup;
 use super::settings::ui::{apply_setting_rollback, refresh_open_settings_modals};
 use super::status::{
     handle_coding_data_sharing_failed, handle_coding_data_sharing_updated,
-    handle_context_info_complete, handle_session_usage_result, scrub_error_for_toast,
-    usage_modal_state_mut,
+    handle_context_info_complete, handle_session_cache_result, handle_session_usage_result,
+    scrub_error_for_toast, usage_modal_state_mut,
 };
 use super::transcript::{
     handle_hooks_list_loaded, handle_marketplace_list_loaded, handle_marketplace_updates_available,
@@ -230,6 +230,20 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
         }
     }
 }
+
+fn settings_modal_is_open(app: &AppView) -> bool {
+    use crate::views::modal::ActiveModal;
+    app.dashboard
+        .as_ref()
+        .is_some_and(|dashboard| dashboard.settings_modal.is_some())
+        || app.agents.values().any(|agent| {
+            matches!(
+                agent.active_modal,
+                Some(ActiveModal::Settings { .. } | ActiveModal::ResetSettingsConfirm { .. })
+            )
+        })
+}
+
 fn apply_catalog_to_sessions(app: &mut AppView, model_state: acp::SessionModelState) {
     let new_models = crate::acp::model_state::ModelState::from(Some(model_state));
     let fallback_current = new_models.current.clone();
@@ -3283,14 +3297,21 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 apply_catalog_to_sessions(app, models);
                 super::settings::ui::refresh_open_settings_modals(app);
             }
+            let mut effects = Vec::new();
+            if settings_modal_is_open(app) {
+                effects.push(crate::app::actions::Effect::QueryCustomModels {
+                    generation: super::settings::setters::current_custom_models_generation(),
+                });
+            }
             if !zai_credential_configured() {
                 app.show_toast(&format!(
                     "✓ Z AI API key {}; API key required and queued Z AI prompts remain paused",
                     if configured { "saved" } else { "cleared" },
                 ));
-                return vec![];
+                return effects;
             }
-            rebind_pending_zai_sessions(app, generation)
+            effects.extend(rebind_pending_zai_sessions(app, generation));
+            effects
         }
         TaskResult::ZaiModelRebindComplete {
             agent_id,
@@ -3302,6 +3323,48 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         } => handle_zai_model_rebind_complete(
             app, agent_id, session_id, model_id, effort, generation, result,
         ),
+        TaskResult::CustomModelsUpdated {
+            generation,
+            stale,
+            warning,
+            error,
+            models,
+            custom_models,
+        } => {
+            if stale || generation < super::settings::setters::current_custom_models_generation() {
+                return vec![];
+            }
+            if error.is_none() {
+                crate::settings::store_cached_custom_models(custom_models.clone());
+                super::settings::setters::apply_custom_models_list(app, custom_models);
+            }
+            let catalog_applied = models.is_some();
+            if let Some(models) = models {
+                apply_catalog_to_sessions(app, models);
+            }
+            super::settings::ui::refresh_open_settings_modals(app);
+            if let Some(error) = error {
+                app.show_toast(&format!(
+                    "✗ Could not update custom models: {}",
+                    scrub_error_for_toast(&error),
+                ));
+            } else if catalog_applied {
+                if let Some(warning) = warning {
+                    app.show_toast(&format!(
+                        "✓ Custom models updated; warning: {}",
+                        scrub_error_for_toast(&warning),
+                    ));
+                } else {
+                    app.show_toast("✓ Custom models updated");
+                }
+            } else if let Some(warning) = warning {
+                app.show_toast(&format!(
+                    "Custom models list warning: {}",
+                    scrub_error_for_toast(&warning),
+                ));
+            }
+            vec![]
+        }
         TaskResult::OpenCodeGoModelsUpdated {
             configured,
             mutation,
@@ -4018,6 +4081,26 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             &session_id,
             format!("Couldn't load session usage: {error}"),
             nonce,
+        ),
+        TaskResult::SessionCacheComplete {
+            agent_id,
+            session_id,
+            cache,
+        } => handle_session_cache_result(
+            app,
+            agent_id,
+            &session_id,
+            crate::app::status_blocks::session_cache_block_text(&cache),
+        ),
+        TaskResult::SessionCacheFailed {
+            agent_id,
+            session_id,
+            error,
+        } => handle_session_cache_result(
+            app,
+            agent_id,
+            &session_id,
+            format!("Couldn't load prompt cache telemetry: {error}"),
         ),
         TaskResult::FeedbackComplete { .. } => vec![],
         TaskResult::FeedbackFailed { agent_id, error } => {

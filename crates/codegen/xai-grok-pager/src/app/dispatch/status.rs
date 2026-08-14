@@ -415,6 +415,53 @@ pub(super) fn commit_session_usage_block(
     append_consumer_billing_surface(app, agent_id)
 }
 
+/// `/cache` handler — query prompt cache hit rate and diagnostics from shell.
+pub(super) fn dispatch_show_cache(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let session_id = {
+        let Some(agent) = app.agents.get_mut(&id) else {
+            return vec![];
+        };
+        agent.session.session_id.clone()
+    };
+    match session_id {
+        Some(session_id) => vec![Effect::FetchSessionCache {
+            agent_id: id,
+            session_id,
+        }],
+        None => {
+            if let Some(agent) = app.agents.get_mut(&id) {
+                push_and_page_flip(
+                    &mut agent.scrollback,
+                    RenderBlock::system(
+                        "Prompt cache telemetry is unavailable until the session starts.".to_string(),
+                    ),
+                );
+            }
+            vec![]
+        }
+    }
+}
+
+/// Commit a session cache telemetry block into scrollback.
+pub(super) fn handle_session_cache_result(
+    app: &mut AppView,
+    agent_id: AgentId,
+    session_id: &acp::SessionId,
+    text: String,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(session_id) {
+        return vec![];
+    }
+    push_and_page_flip(&mut agent.scrollback, RenderBlock::system(text));
+    vec![]
+}
+
 /// Combined consumer usage follow-up for `/usage`: fetch xAI billing and
 /// OpenAI Codex quota together. `usage_visible` gates only the xAI half —
 /// Codex quota loads independently whenever a Codex account is connected.

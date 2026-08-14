@@ -638,6 +638,106 @@ struct ZaiModelsApply {
     models: Option<acp::SessionModelState>,
 }
 
+struct CustomModelsApply {
+    warning: Option<String>,
+    models: Option<acp::SessionModelState>,
+    custom_models: Vec<crate::settings::CustomModelRecord>,
+}
+
+async fn apply_custom_models(
+    tx: &AcpAgentTx,
+    method: &'static str,
+    params: serde_json::Value,
+) -> Result<CustomModelsApply, String> {
+    let request = acp::ExtRequest::new(
+        method,
+        serde_json::value::to_raw_value(&params)
+            .expect("serialize custom models params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|error| format!("custom models update returned invalid JSON: {error}"))?;
+    if let Some(error) = envelope.get("error").filter(|value| !value.is_null()) {
+        return Err(sanitize_user_error(
+            error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("custom models update failed"),
+        ));
+    }
+    let result = envelope.get("result").unwrap_or(&envelope);
+    let warning = result
+        .get("warning")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_user_error);
+    let models = result
+        .get("models")
+        .cloned()
+        .map(serde_json::from_value::<acp::SessionModelState>)
+        .transpose()
+        .map_err(|error| format!("custom models update returned an invalid catalog: {error}"))?;
+    let custom_models = result
+        .get("custom_models")
+        .cloned()
+        .or_else(|| result.get("models").cloned().filter(|_| models.is_none()))
+        .map(serde_json::from_value::<Vec<crate::settings::CustomModelRecord>>)
+        .transpose()
+        .map_err(|error| format!("custom models update returned invalid records: {error}"))?
+        .unwrap_or_default();
+    Ok(CustomModelsApply {
+        warning,
+        models,
+        custom_models,
+    })
+}
+
+fn custom_models_list_params_models(
+    result: &serde_json::Value,
+) -> Result<Vec<crate::settings::CustomModelRecord>, String> {
+    result
+        .get("models")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("custom models list returned invalid records: {error}"))
+        .map(|models| models.unwrap_or_default())
+}
+
+async fn list_custom_models(tx: &AcpAgentTx) -> Result<CustomModelsApply, String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/custom-models/list",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize custom models list params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|error| format!("custom models list returned invalid JSON: {error}"))?;
+    if let Some(error) = envelope.get("error").filter(|value| !value.is_null()) {
+        return Err(sanitize_user_error(
+            error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("custom models list failed"),
+        ));
+    }
+    let result = envelope.get("result").unwrap_or(&envelope);
+    let warning = result
+        .get("warning")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_user_error);
+    Ok(CustomModelsApply {
+        warning,
+        models: None,
+        custom_models: custom_models_list_params_models(result)?,
+    })
+}
+
 async fn apply_zai_models(tx: &AcpAgentTx) -> Result<ZaiModelsApply, String> {
     let request = acp::ExtRequest::new(
         "open-grok/zai/models/apply",
@@ -1225,6 +1325,108 @@ pub(crate) fn execute(
                         models: None,
                         catalog: Vec::new(),
                         enabled_models: Vec::new(),
+                    },
+                }
+            });
+        }
+        Effect::QueryCustomModels { generation } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                match list_custom_models(&tx).await {
+                    Ok(applied) => TaskResult::CustomModelsUpdated {
+                        generation,
+                        stale: false,
+                        warning: applied.warning,
+                        error: None,
+                        models: applied.models,
+                        custom_models: applied.custom_models,
+                    },
+                    Err(error) => TaskResult::CustomModelsUpdated {
+                        generation,
+                        stale: false,
+                        warning: None,
+                        error: Some(error),
+                        models: None,
+                        custom_models: Vec::new(),
+                    },
+                }
+            });
+        }
+        Effect::UpsertCustomModel {
+            generation,
+            key,
+            model,
+            name,
+            provider,
+            base_url,
+            context_window,
+            api_backend,
+            env_key,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let mut params = serde_json::json!({
+                    "key": key,
+                    "model": model,
+                });
+                if let Some(name) = name {
+                    params["name"] = serde_json::Value::String(name);
+                }
+                if let Some(provider) = provider {
+                    params["provider"] = serde_json::Value::String(provider);
+                }
+                if let Some(base_url) = base_url {
+                    params["base_url"] = serde_json::Value::String(base_url);
+                }
+                if let Some(context_window) = context_window {
+                    params["context_window"] = serde_json::json!(context_window);
+                }
+                if let Some(api_backend) = api_backend {
+                    params["api_backend"] = serde_json::Value::String(api_backend);
+                }
+                if let Some(env_key) = env_key {
+                    params["env_key"] = serde_json::Value::String(env_key);
+                }
+                match apply_custom_models(&tx, "open-grok/custom-models/upsert", params).await {
+                    Ok(applied) => TaskResult::CustomModelsUpdated {
+                        generation,
+                        stale: false,
+                        warning: applied.warning,
+                        error: None,
+                        models: applied.models,
+                        custom_models: applied.custom_models,
+                    },
+                    Err(error) => TaskResult::CustomModelsUpdated {
+                        generation,
+                        stale: false,
+                        warning: None,
+                        error: Some(error),
+                        models: None,
+                        custom_models: Vec::new(),
+                    },
+                }
+            });
+        }
+        Effect::DeleteCustomModel { generation, key } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let params = serde_json::json!({ "key": key });
+                match apply_custom_models(&tx, "open-grok/custom-models/delete", params).await {
+                    Ok(applied) => TaskResult::CustomModelsUpdated {
+                        generation,
+                        stale: false,
+                        warning: applied.warning,
+                        error: None,
+                        models: applied.models,
+                        custom_models: applied.custom_models,
+                    },
+                    Err(error) => TaskResult::CustomModelsUpdated {
+                        generation,
+                        stale: false,
+                        warning: None,
+                        error: Some(error),
+                        models: None,
+                        custom_models: Vec::new(),
                     },
                 }
             });
@@ -5674,6 +5876,28 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::FetchSessionCache { agent_id, session_id } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    match fetch_session_cache(&session_id, &tx).await {
+                        Ok(cache) => {
+                            TaskResult::SessionCacheComplete {
+                                agent_id,
+                                session_id,
+                                cache: Box::new(cache),
+                            }
+                        }
+                        Err(error) => {
+                            TaskResult::SessionCacheFailed {
+                                agent_id,
+                                session_id,
+                                error,
+                            }
+                        }
+                    }
+                });
+        }
         Effect::SendFeedback { agent_id, session_id, feedback_text } => {
             use xai_grok_shell::session::ClientType;
             use xai_grok_shell::session::acp_types::ClientFeedbackInput;
@@ -6700,6 +6924,37 @@ async fn fetch_session_usage(
             "invalid session usage response".to_string()
         })?;
     Ok(parsed.usage)
+}
+/// `x.ai/session/cache` → [`SessionCacheResponse`].
+async fn fetch_session_cache(
+    session_id: &acp::SessionId,
+    tx: &AcpAgentTx,
+) -> Result<xai_grok_shell::extensions::cache::SessionCacheResponse, String> {
+    let request = acp::ExtRequest::new(
+        "x.ai/session/cache",
+        serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": session_id.0.to_string()
+        }))
+        .expect("serialize session/cache params")
+        .into(),
+    );
+    let resp = acp_send(request, tx)
+        .await
+        .map_err(|e| {
+            if i32::from(e.code) == i32::from(acp::Error::method_not_found().code) {
+                "not supported by this agent version".to_string()
+            } else {
+                sanitize_user_error(&e.to_string())
+            }
+        })?;
+    let parsed: xai_grok_shell::extensions::cache::SessionCacheResponse = serde_json::from_str(
+        resp.0.get(),
+    )
+    .map_err(|e| {
+        tracing::debug!("session cache deser failed: {e}");
+        "invalid session cache response".to_string()
+    })?;
+    Ok(parsed)
 }
 /// Shared `x.ai/session/rename` RPC for rename and `/rename --auto`.
 async fn session_rename_rpc(

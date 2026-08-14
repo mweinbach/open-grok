@@ -7,6 +7,7 @@ pub mod always_approve;
 pub mod announcements;
 pub mod auto;
 pub mod btw;
+pub mod cache;
 pub mod cd;
 pub mod compact;
 pub mod compact_mode;
@@ -145,6 +146,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(logout::LogoutCommand),
         Arc::new(import_claude::ImportClaudeCommand),
         Arc::new(usage::UsageCommand),
+        Arc::new(cache::CacheCommand),
         Arc::new(queue::QueueCommand),
         Arc::new(tasks::TasksCommand),
         Arc::new(release_notes::ReleaseNotesCommand),
