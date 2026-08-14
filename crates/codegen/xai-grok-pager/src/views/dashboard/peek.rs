@@ -971,6 +971,7 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
             // Blocked on a suppressed tool (task output / wait / sleep) → keep
             // the compact "Working" the peek showed before this was surfaced.
             Some(TurnActivity::Waiting(_)) => return "Working".to_string(),
+            Some(TurnActivity::WritingToolCall(_)) => return "Preparing".to_string(),
             // Turn running but no live activity (e.g. just granted a
             // permission and waiting for tool results / the next inference) →
             // "Working", never a stale response.

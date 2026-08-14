@@ -1188,9 +1188,9 @@ fn stale_workflows_result_does_not_repaint_replaced_session_modal() {
 }
 
 fn foreign_resume_hint(
-    tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool,
-) -> xai_grok_workspace::foreign_sessions::RecentForeignSession {
-    xai_grok_workspace::foreign_sessions::RecentForeignSession {
+    tool: xai_grok_foreign_sessions::ForeignSessionTool,
+) -> xai_grok_foreign_sessions::RecentForeignSession {
+    xai_grok_foreign_sessions::RecentForeignSession {
         tool,
         native_id: "native-session".into(),
         age: std::time::Duration::from_secs(30),
@@ -1201,7 +1201,7 @@ fn foreign_resume_hint(
 fn foreign_resume_results_require_launch_token_and_canonical_cwd() {
     let mut launch = test_app();
     launch.foreign_session_compat =
-        xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources {
+        xai_grok_foreign_sessions::EnabledForeignSessionSources {
             cursor: true,
             ..Default::default()
         };
@@ -1238,14 +1238,14 @@ fn foreign_resume_results_require_launch_token_and_canonical_cwd() {
             canonical_cwd: canonical_cwd.clone(),
             launch_token,
             hint: Some(foreign_resume_hint(
-                xai_grok_workspace::foreign_sessions::ForeignSessionTool::Cursor,
+                xai_grok_foreign_sessions::ForeignSessionTool::Cursor,
             )),
         }),
         &mut launch,
     );
     assert_eq!(
         launch.foreign_resume_hint().map(|hint| hint.tool),
-        Some(xai_grok_workspace::foreign_sessions::ForeignSessionTool::Cursor)
+        Some(xai_grok_foreign_sessions::ForeignSessionTool::Cursor)
     );
 
     let mut stale = test_app();
@@ -1263,7 +1263,7 @@ fn foreign_resume_results_require_launch_token_and_canonical_cwd() {
             canonical_cwd: canonical_cwd.clone(),
             launch_token: launch_token + 1,
             hint: Some(foreign_resume_hint(
-                xai_grok_workspace::foreign_sessions::ForeignSessionTool::Codex,
+                xai_grok_foreign_sessions::ForeignSessionTool::Codex,
             )),
         }),
         &mut stale,
@@ -1286,7 +1286,7 @@ fn foreign_resume_results_require_launch_token_and_canonical_cwd() {
 fn foreign_resume_result_rejects_startup_conflict_before_completion() {
     let mut app = test_app();
     app.foreign_session_compat =
-        xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources {
+        xai_grok_foreign_sessions::EnabledForeignSessionSources {
             cursor: true,
             ..Default::default()
         };
@@ -1310,7 +1310,7 @@ fn foreign_resume_result_rejects_startup_conflict_before_completion() {
             canonical_cwd,
             launch_token,
             hint: Some(foreign_resume_hint(
-                xai_grok_workspace::foreign_sessions::ForeignSessionTool::Cursor,
+                xai_grok_foreign_sessions::ForeignSessionTool::Cursor,
             )),
         }),
         &mut app,

@@ -1027,12 +1027,11 @@ impl DynamicResolver {
     }
 }
 impl TraceExportSource for DynamicResolver {
-    fn allows_upload(&self) -> bool {
-        self.provider_boundary.allows_xai_export()
-    }
-
     fn resolve(&self) -> TraceExportConfig {
         let mut config = self.base_config.clone();
+        if !self.provider_boundary.allows_xai_export() {
+            return config;
+        }
         if let crate::session::repo_changes::UploadMethod::Proxy {
             ref mut user_token, ..
         } = config.upload_method
@@ -1059,6 +1058,9 @@ impl TraceExportSource for DynamicResolver {
         xai_file_utils::gcs::StorageConfig::proxy_http_client(&self.with_auth())
     }
     fn has_usable_credential(&self) -> bool {
+        if !self.provider_boundary.allows_xai_export() {
+            return false;
+        }
         if let crate::session::repo_changes::UploadMethod::Proxy {
             deployment_key: Some(_),
             ..
@@ -1425,7 +1427,9 @@ pub(crate) async fn upload_trace_artifact_blocking(
 fn enqueue_outcome_is_durable(outcome: &EnqueueOutcome) -> bool {
     match outcome {
         EnqueueOutcome::Enqueued | EnqueueOutcome::Deduplicated => true,
-        EnqueueOutcome::FellBackToInline | EnqueueOutcome::Failed { .. } => false,
+        EnqueueOutcome::FellBackToInline
+        | EnqueueOutcome::Failed { .. }
+        | EnqueueOutcome::Skipped { .. } => false,
     }
 }
 /// Durable-accept a trace artifact for the flush-bounded blocking path: the

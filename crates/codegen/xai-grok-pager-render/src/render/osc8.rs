@@ -163,9 +163,9 @@ fn link_finder() -> &'static LinkFinder {
     })
 }
 
-/// One path segment without spaces (`main.rs`, `.opengrok`, `@scope`). Leading `.`
+/// One path segment without spaces (`main.rs`, `.grok`, `@scope`). Leading `.`
 /// matches dot-directories and `%` matches percent-encoded segments — grok
-/// session media lives under `~/.opengrok/sessions/%2F…/images/1.jpg`.
+/// session media lives under `~/.grok/sessions/%2F…/images/1.jpg`.
 const PATH_SEGMENT: &str = r"[a-zA-Z0-9_@.%][a-zA-Z0-9._+@%\-]*";
 
 /// Final path segment may contain *internal* spaces for macOS app bundles and
@@ -174,7 +174,7 @@ const PATH_SEGMENT: &str = r"[a-zA-Z0-9_@.%][a-zA-Z0-9._+@%\-]*";
 const PATH_SEGMENT_SPACED: &str =
     r"[a-zA-Z0-9_@.%][a-zA-Z0-9._+@%\-]*(?: [a-zA-Z0-9._+@%\-]+)+\.[a-zA-Z0-9][a-zA-Z0-9._+@%\-]*";
 
-/// Relative file path (`images/1.png`, `.opengrok/x.txt`) — one or more `/`-joined
+/// Relative file path (`images/1.png`, `.grok/x.txt`) — one or more `/`-joined
 /// directory segments plus a filename that has an extension. No leading `/`
 /// or `~` (those are the absolute forms). The required extension keeps
 /// slashed prose ("and/or", "TCP/IP") out; the caller still gates on the file
@@ -314,13 +314,19 @@ fn file_link_presentation_with_home(
 /// Web/scheme URLs, `mailto:`/`tel:`, and anchors return `None`.
 ///
 /// - **Absolute / `~`** paths resolve directly (must be an existing file).
-/// - **Relative** paths (`images/1.jpg`) resolve against `media_paths` — the
-///   absolute paths of media actually generated in this transcript — by
-///   matching a unique entry whose path ends with those components. This ties
-///   each short path to the exact file its message produced (correct across
-///   forks/resumes) and never opens an arbitrary or out-of-session file; an
-///   ambiguous or absent match is left unlinked.
-pub fn local_link_to_file_target(dest: &str, media_paths: &[PathBuf]) -> Option<LinkTarget> {
+/// - **Relative** paths (`images/1.jpg`, `src/main.rs`) resolve in two steps:
+///   1. Against `media_paths` (absolute paths of media generated in this transcript),
+///      by matching a unique entry whose path ends with those components. This binds
+///      each short path to the exact file its message produced (stable across forks and
+///      resumes); an ambiguous match is left unlinked rather than guessed.
+///   2. Failing that, against the session `cwd`: the path is joined to `cwd`, accepted
+///      only when it stays inside `cwd` (no `..` escape) and names an existing file.
+///      `cwd = None` disables this fallback (media only).
+pub fn local_link_to_file_target(
+    dest: &str,
+    media_paths: &[PathBuf],
+    cwd: Option<&Path>,
+) -> Option<LinkTarget> {
     let dest = dest.trim();
     if dest.is_empty() || dest.starts_with('#') || dest.contains("://") {
         return None;
@@ -334,20 +340,40 @@ pub fn local_link_to_file_target(dest: &str, media_paths: &[PathBuf]) -> Option<
     let resolved: PathBuf = if target.is_absolute() {
         target
     } else {
-        // Relative: match a single generated-media file ending with these
-        // components. Unique match only, so a forked transcript with a duplicate
-        // name resolves to neither rather than the wrong one.
-        let mut hits = media_paths.iter().filter(|p| p.ends_with(path));
-        let first = hits.next()?.clone();
-        if hits.next().is_some() {
-            return None;
-        }
-        first
+        relative_link_target(path, media_paths, cwd)?
     };
     if !resolved.is_file() {
         return None;
     }
     Some(LinkTarget::File(Arc::from(resolved)))
+}
+
+/// Resolve a *relative* markdown link destination to an absolute path.
+///
+/// Prefers a unique generated-media match (stable across forks/resumes); an
+/// ambiguous media match resolves to neither. When the path is not generated
+/// media, falls back to `cwd`-relative resolution that must stay inside `cwd`.
+/// The caller still gates on the result naming a real file.
+fn relative_link_target(
+    path: &Path,
+    media_paths: &[PathBuf],
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut hits = media_paths.iter().filter(|p| p.ends_with(path));
+    match (hits.next(), hits.next()) {
+        (Some(unique), None) => return Some(unique.clone()),
+        // Ambiguous generated-media reference (e.g. a fork with duplicate
+        // names): resolve to neither rather than opening the wrong file.
+        (Some(_), Some(_)) => return None,
+        _ => {}
+    }
+    // Not generated media: resolve against the session cwd, refusing any `..`
+    // that would escape it.
+    let cwd = cwd?;
+    let joined = xai_grok_paths::normalize_lexically(&cwd.join(path));
+    joined
+        .starts_with(xai_grok_paths::normalize_lexically(cwd))
+        .then_some(joined)
 }
 
 /// Convert a display-cell column to a `u16` suitable for overlay coordinates.
@@ -378,7 +404,7 @@ struct RowSegment {
 /// break, `Some("")` = mid-word wrap, `Some(" ")` = word wrap. Consecutive
 /// rows connected by `Some(..)` joiners are re-joined into one logical line
 /// before matching, so a long path or URL soft-wrapped across rows (imagine
-/// media lives at `~/.opengrok/sessions/%2F…/images/1.jpg`, which wraps in
+/// media lives at `~/.grok/sessions/%2F…/images/1.jpg`, which wraps in
 /// narrow panes) is detected whole and each row's fragment gets its own
 /// clickable overlay region. Spans within a row are likewise concatenated so
 /// styling boundaries never truncate a match.
@@ -631,7 +657,9 @@ fn scan_logical_line(
             let path = m
                 .as_str()
                 .trim_end_matches(['.', ',', ';', ':', '!', '?', ')']);
-            let Some(file_target) = local_link_to_file_target(path, media_paths) else {
+            // Bare relative paths in prose stay media-only (no cwd fallback), so ordinary
+            // `a/b.ext`-shaped prose is not over-linkified.
+            let Some(file_target) = local_link_to_file_target(path, media_paths, None) else {
                 continue;
             };
             let path_end = m.start() + path.len();
@@ -680,7 +708,7 @@ mod tests {
         let media = vec![dir.path().join("images/1.jpg")];
 
         // Short session-relative path matches the generated media by suffix.
-        let target = local_link_to_file_target("images/1.jpg", &media).unwrap();
+        let target = local_link_to_file_target("images/1.jpg", &media, None).unwrap();
         assert_eq!(target, LinkTarget::File(Arc::from(media[0].as_path())));
         let resolved = resolve_link_target(&target).expect("resolved target");
         let url = resolved.osc8_url.expect("OSC 8 URL");
@@ -697,13 +725,13 @@ mod tests {
         std::fs::write(dir.path().join("images/1.jpg"), b"x").unwrap();
         let media = vec![dir.path().join("images/1.jpg")];
 
-        assert!(local_link_to_file_target("https://x.ai", &media).is_none());
-        assert!(local_link_to_file_target("mailto:a@b.c", &media).is_none());
-        assert!(local_link_to_file_target("#section", &media).is_none());
-        // Relative path that isn't a known generated media file.
-        assert!(local_link_to_file_target("images/2.jpg", &media).is_none());
+        assert!(local_link_to_file_target("https://x.ai", &media, None).is_none());
+        assert!(local_link_to_file_target("mailto:a@b.c", &media, None).is_none());
+        assert!(local_link_to_file_target("#section", &media, None).is_none());
+        // Relative path that isn't a known generated media file (no cwd).
+        assert!(local_link_to_file_target("images/2.jpg", &media, None).is_none());
         // No known media at all.
-        assert!(local_link_to_file_target("images/1.jpg", &[]).is_none());
+        assert!(local_link_to_file_target("images/1.jpg", &[], None).is_none());
     }
 
     #[test]
@@ -719,9 +747,57 @@ mod tests {
             dir.path().join("a/images/1.jpg"),
             dir.path().join("b/images/1.jpg"),
         ];
-        assert!(local_link_to_file_target("images/1.jpg", &media).is_none());
+        assert!(local_link_to_file_target("images/1.jpg", &media, None).is_none());
         // A `..` never matches a clean absolute media path, so it can't escape.
-        assert!(local_link_to_file_target("../images/1.jpg", &media).is_none());
+        assert!(local_link_to_file_target("../images/1.jpg", &media, None).is_none());
+    }
+
+    #[test]
+    fn local_link_relative_resolves_existing_cwd_file() {
+        // A relative markdown destination that is not generated media resolves
+        // against the session cwd when the file exists.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), b"fn main() {}").unwrap();
+
+        let target = local_link_to_file_target("src/main.rs", &[], Some(dir.path())).unwrap();
+        assert_eq!(
+            target,
+            LinkTarget::File(Arc::from(dir.path().join("src/main.rs").as_path()))
+        );
+
+        // Missing file under cwd stays unlinked (is_file guard).
+        assert!(local_link_to_file_target("src/missing.rs", &[], Some(dir.path())).is_none());
+        // A directory is not a file.
+        assert!(local_link_to_file_target("src", &[], Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn local_link_cwd_fallback_refuses_parent_escape() {
+        // `..` must not escape the session cwd even if the target file exists.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.txt"), b"x").unwrap();
+        let cwd = dir.path().join("sub");
+        std::fs::create_dir(&cwd).unwrap();
+
+        assert!(local_link_to_file_target("../secret.txt", &[], Some(&cwd)).is_none());
+    }
+
+    #[test]
+    fn local_link_prefers_generated_media_over_cwd() {
+        // When a path matches both generated media and a cwd file, the unique
+        // media match wins (stable across forks/resumes).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/1.jpg"), b"media").unwrap();
+        let media = vec![dir.path().join("images/1.jpg")];
+
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cwd.path().join("images")).unwrap();
+        std::fs::write(cwd.path().join("images/1.jpg"), b"cwd").unwrap();
+
+        let target = local_link_to_file_target("images/1.jpg", &media, Some(cwd.path())).unwrap();
+        assert_eq!(target, LinkTarget::File(Arc::from(media[0].as_path())));
     }
 
     // ── tool_path_file_target ──
@@ -1253,10 +1329,9 @@ mod tests {
 
     #[test]
     fn scan_detects_grok_session_media_path() {
-        // Dot-directory (`.opengrok`), percent-encoded session segment, and a
+        // Dot-directory (`.grok`), percent-encoded session segment, and a
         // trailing sentence period — the shape of `image_gen` output prose.
-        let line =
-            make_line("Saved to /Users/alice/.opengrok/sessions/%2Fabc/00000000/images/1.jpg.");
+        let line = make_line("Saved to /Users/alice/.grok/sessions/%2Fabc/00000000/images/1.jpg.");
         let mut overlay = LinkOverlay::new();
         scan_unjoined(std::iter::once((0, &line)), 0, &[], &mut overlay);
 
@@ -1266,7 +1341,7 @@ mod tests {
                 .and_then(|resolved| resolved.osc8_url)
                 .expect("url"),
             // `%` is itself percent-encoded (`%25`) when building the file URL.
-            "file:///Users/alice/.opengrok/sessions/%252Fabc/00000000/images/1.jpg",
+            "file:///Users/alice/.grok/sessions/%252Fabc/00000000/images/1.jpg",
         );
     }
 
@@ -1276,9 +1351,8 @@ mod tests {
         // across visual rows (`joiner: Some("")` mid-word break). Previously
         // each row was scanned in isolation, so only the `/Users/alice`
         // fragment on the first row matched and became clickable.
-        let row0 = make_line(
-            "Image generated and saved to /Users/alice/.opengrok/sessions/%2FUsers%2Fali",
-        );
+        let row0 =
+            make_line("Image generated and saved to /Users/alice/.grok/sessions/%2FUsers%2Fali");
         let row1 = make_line("ce%2Fcode%2Fxai/00000000-0000-0000-0000-000000000001/images/1.jpg");
         let rows: Vec<(u16, &Line<'static>, Option<&str>)> =
             vec![(3, &row0, None), (4, &row1, Some(""))];
@@ -1286,7 +1360,7 @@ mod tests {
         scan_lines_for_url_overlays(rows.into_iter(), 2, &[], &mut overlay);
 
         assert_eq!(overlay.links().len(), 2, "one overlay region per row");
-        let expected_url = "file:///Users/alice/.opengrok/sessions/%252FUsers%252Fali\
+        let expected_url = "file:///Users/alice/.grok/sessions/%252FUsers%252Fali\
                             ce%252Fcode%252Fxai/00000000-0000-0000-0000-000000000001/images/1.jpg";
         for link in overlay.links() {
             assert_eq!(
@@ -1304,7 +1378,7 @@ mod tests {
         assert_eq!(
             l0.col_end,
             2 + UnicodeWidthStr::width(
-                "Image generated and saved to /Users/alice/.opengrok/sessions/%2FUsers%2Fali"
+                "Image generated and saved to /Users/alice/.grok/sessions/%2FUsers%2Fali"
             ) as u16
         );
         // Row 1: the continuation fragment covers the entire row.
@@ -1323,7 +1397,7 @@ mod tests {
     fn scan_wrapped_path_trailing_sentence_period_excluded() {
         // Wrapped path ending mid-sentence: trailing `.` on the last row is
         // trimmed from the clickable region.
-        let row0 = make_line("Saved to /Users/me/.opengrok/sessions/%2Fabc/019f3a86/ima");
+        let row0 = make_line("Saved to /Users/me/.grok/sessions/%2Fabc/019f3a86/ima");
         let row1 = make_line("ges/1.jpg. Enjoy!");
         let rows: Vec<(u16, &Line<'static>, Option<&str>)> =
             vec![(0, &row0, None), (1, &row1, Some(""))];
@@ -1336,7 +1410,7 @@ mod tests {
                 &*resolve_link_target(&link.target)
                     .and_then(|resolved| resolved.osc8_url)
                     .expect("url"),
-                "file:///Users/me/.opengrok/sessions/%252Fabc/019f3a86/images/1.jpg"
+                "file:///Users/me/.grok/sessions/%252Fabc/019f3a86/images/1.jpg"
             );
         }
         assert_eq!(overlay.links()[1].col_start, 0);

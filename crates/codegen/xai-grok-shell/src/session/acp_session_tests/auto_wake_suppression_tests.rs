@@ -110,10 +110,10 @@ fn pending_notification_cap_keeps_newest_entries() {
     let mut state = State {
         running_task: None,
         pending_inputs: std::collections::VecDeque::new(),
-        combine_edit_holds: std::collections::HashSet::new(),
         pending_notifications: Vec::new(),
         lifecycle_mutation: None,
         pending_web_search_reload: None,
+        combine_edit_holds: std::collections::HashSet::new(),
         notifications_suppressed: true,
         rewindable: false,
         front_message_committed: false,
@@ -275,11 +275,11 @@ async fn cancel_barrier_rejects_task_completion_wake_without_reporting_it() {
             drop(state);
             assert!(reservations.contains("bg-suppressed"));
             let res = resources.lock().await;
-            let reported = res.get::<xai_grok_tools::types::resources::State<
-                xai_grok_tools::reminders::task_completion::ReportedTaskCompletions,
-            >>();
             assert!(
-                reported.is_none_or(|reported| !reported.is_reported("bg-suppressed")),
+                res.get::<xai_grok_tools::types::resources::State<
+                    xai_grok_tools::reminders::task_completion::ReportedTaskCompletions,
+                >>()
+                .is_none(),
                 "declined admission must not report before user re-engagement"
             );
             drop(res);
@@ -413,8 +413,21 @@ async fn task_completion_wake_is_admitted_without_cancel_barrier() {
                 Some(crate::session::PromptOrigin::TaskCompleted { task_id }) if task_id == "bg-normal"
             ));
             drop(state);
+            let resources = actor
+                .agent
+                .borrow()
+                .tool_bridge()
+                .clone()
+                .shared_resources()
+                .await;
             assert!(
-                !already_reported(&actor, "bg-normal").await,
+                resources
+                    .lock()
+                    .await
+                    .get::<xai_grok_tools::types::resources::State<
+                        xai_grok_tools::reminders::task_completion::ReportedTaskCompletions,
+                    >>()
+                    .is_none(),
                 "queue acceptance alone must not mark the completion reported"
             );
             let actor_for_turn = actor.clone();
@@ -551,6 +564,7 @@ async fn genuine_user_start_consumes_deferred_completions_without_notification_t
                     kind: xai_grok_tools::computer::types::TaskKind::Monitor,
                     block_waited: false,
                     explicitly_killed: false,
+                    kill_result_delivered: false,
                     owner_session_id: None,
                     description: None,
                     is_backgrounded: false,
@@ -1349,9 +1363,9 @@ async fn already_reported(actor: &SessionActor, task_id: &str) -> bool {
     use xai_grok_tools::types::resources::State;
     let bridge = actor.agent.borrow().tool_bridge().clone();
     let resources = bridge.shared_resources().await;
-    let res = resources.lock().await;
-    res.get::<State<ReportedTaskCompletions>>()
-        .is_some_and(|reported| reported.is_reported(task_id))
+    let mut res = resources.lock().await;
+    let reported = res.get_or_default::<State<ReportedTaskCompletions>>();
+    !reported.mark_reported(task_id)
 }
 /// Pure decision: a goal-turn-origin task is dropped even when the blanket
 /// goal Active/Complete gate is OFF (status Blocked / paused / None) — the
@@ -1693,6 +1707,7 @@ fn completed_bash_task(id: &str) -> xai_grok_tools::computer::types::TaskSnapsho
         kind: Default::default(),
         block_waited: false,
         explicitly_killed: false,
+        kill_result_delivered: false,
         owner_session_id: None,
         description: None,
         is_backgrounded: false,

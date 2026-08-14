@@ -4,6 +4,8 @@
 //! minimal live region shows the sign-in flow itself — device or external-command
 //! flow, a sign-in error, the folder-trust question, or a brief "starting"
 //! transient once both gates are open — since minimal has no welcome screen.
+//! [`draw_live`](super::live::draw_live) computes a [`MinimalAuthHint`] from the
+//! app's [`AuthState`] + [`TrustState`] and renders it via [`render_auth`].
 
 use std::path::PathBuf;
 
@@ -12,78 +14,61 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use xai_grok_pager::app::app_view::{AuthState, PrimaryProvider, TrustState};
+use xai_grok_pager::app::app_view::{AuthState, TrustState};
 use xai_grok_pager::theme::Theme;
 
 /// What the minimal live region shows when there is no active agent yet: the
-/// in-region sign-in flow (device or external-command), a sign-in error, or a
-/// brief "starting" transient once authenticated. Computed from [`AuthState`]
-/// before the draw closure so the closure can own it.
+/// in-region sign-in flow (device or external-command), a sign-in error, the
+/// folder-trust question, or a brief "starting" transient once authenticated
+/// (and trusted). Computed before the draw closure so the closure can own it.
 pub(super) enum MinimalAuthHint {
-    /// Neither selected provider has a usable credential yet.
-    ChooseProvider { error: Option<String> },
     /// Interactive sign-in underway — show the URL (when known) and the device
     /// code (when the URL carries one). Covers device flow and the external
     /// command flow (where the provider opens its own browser; `url` may be
     /// `None`).
     SigningIn {
-        provider: PrimaryProvider,
         url: Option<String>,
         code: Option<String>,
     },
     /// The last sign-in attempt failed; show the error.
     Failed(String),
-    /// Authenticated, but the cwd has untrusted repo-local config.
+    /// Authenticated, but the cwd has untrusted repo-local config — ask before
+    /// creating a session. Input (y/Enter trust, n/Esc quit) is handled by the
+    /// welcome interceptor in `AppView::handle_input`; this is render-only.
     TrustFolder { workspace: PathBuf },
-    /// Authenticated — the session is being created (brief transient).
+    /// Authenticated (+ trusted) — the session is being created (brief transient).
     Starting,
 }
 
-/// Resolve the owner of the welcome auth flow independently from the active
-/// model provider. Bare `/login` is always xAI—even from a Codex tab—while the
-/// first-launch chooser records its explicit selection.
-pub(super) fn minimal_auth_provider(
-    _active_provider: PrimaryProvider,
-    startup_selection: Option<PrimaryProvider>,
-) -> PrimaryProvider {
-    startup_selection.unwrap_or(PrimaryProvider::Xai)
-}
-
-/// Map the app's [`AuthState`] to what the no-agent live region should show.
-#[cfg(test)]
+/// Map the app's auth + trust state to what the no-agent live region should show.
+///
+/// Mirrors the welcome screen's gate order: trust is only offered after auth is
+/// `Done`, when the user has access and is not ZDR-blocked (those gates already
+/// block sessions, and the input interceptor only answers trust under the same
+/// conditions).
 pub(super) fn minimal_auth_hint(
     auth: &AuthState,
-    primary_provider: PrimaryProvider,
-) -> MinimalAuthHint {
-    minimal_auth_hint_with_trust(auth, primary_provider, &TrustState::Done, true, false)
-}
-
-/// Map auth + trust gates to the minimal live-region surface while preserving
-/// the selected provider label used by the fork's multi-provider onboarding.
-pub(super) fn minimal_auth_hint_with_trust(
-    auth: &AuthState,
-    primary_provider: PrimaryProvider,
     trust: &TrustState,
     has_access: bool,
     is_zdr_blocked: bool,
 ) -> MinimalAuthHint {
     match auth {
-        AuthState::ProviderChoice { error } => MinimalAuthHint::ChooseProvider {
-            error: error.clone(),
-        },
         AuthState::Authenticating { auth_url, .. } => MinimalAuthHint::SigningIn {
-            provider: primary_provider,
             url: auth_url.clone(),
             code: auth_url
                 .as_deref()
                 .and_then(device_user_code)
                 .map(str::to_owned),
         },
+        AuthState::ProviderChoice { error: Some(err) } => MinimalAuthHint::Failed(err.clone()),
+        AuthState::ProviderChoice { error: None } => MinimalAuthHint::SigningIn {
+            url: None,
+            code: None,
+        },
         AuthState::Pending { error: Some(err) } => MinimalAuthHint::Failed(err.clone()),
         // Login is starting (auto-triggered at startup) — the URL arrives via
         // AuthUrlReady, which flips us to `Authenticating`.
         AuthState::Pending { error: None } => MinimalAuthHint::SigningIn {
-            provider: primary_provider,
             url: None,
             code: None,
         },
@@ -100,31 +85,44 @@ pub(super) fn minimal_auth_hint_with_trust(
     }
 }
 
-/// Rows the no-agent live region needs for `hint` (before path wrap).
+/// Rows the no-agent live region needs for `hint` (before path wrap). Used by
+/// the overlay host so the viewport grows enough to show the trust question
+/// instead of clipping to the idle prompt height.
 pub(super) fn auth_hint_rows(hint: &MinimalAuthHint, width: u16) -> u16 {
     match hint {
-        MinimalAuthHint::ChooseProvider { error } => 5 + u16::from(error.is_some()),
-        MinimalAuthHint::SigningIn { url: None, .. } => 3,
+        // header + blank + "Opening browser…"
+        MinimalAuthHint::SigningIn { url: None, code: _ } => 3,
+        // header + blank + "Open this URL" + url rows + optional code block +
+        // blank + "Waiting…"
         MinimalAuthHint::SigningIn {
             url: Some(url),
             code,
-            ..
         } => {
-            let code_rows = if code.is_some() { 2 } else { 0 };
-            3 + wrapped_char_rows(url, width) + code_rows + 2
+            let url_rows = wrapped_char_rows(url, width);
+            let code_rows = if code.is_some() { 2 } else { 0 }; // blank + "Code: …"
+            3 + url_rows + code_rows + 2
         }
+        // "Sign-in failed" + blank + error
         MinimalAuthHint::Failed(_) => 3,
+        // question + path rows + blank + 2 warning + blank + 2 menu + blank + hint
         MinimalAuthHint::TrustFolder { workspace } => {
-            1 + wrapped_char_rows(&workspace.display().to_string(), width) + 1 + 2 + 1 + 2 + 1 + 1
+            let path = workspace.display().to_string();
+            let path_rows = wrapped_char_rows(&path, width);
+            1 + path_rows + 1 + 2 + 1 + 2 + 1 + 1
         }
         MinimalAuthHint::Starting => 1,
     }
 }
 
+/// How many rows `text` needs when painted char-by-char at `width` (no
+/// wrap-inserted spaces) — same layout as [`render_url`].
 fn wrapped_char_rows(text: &str, width: u16) -> u16 {
     let width = width.max(1) as usize;
     let chars = text.chars().filter(|c| !c.is_control()).count();
-    chars.max(1).div_ceil(width) as u16
+    if chars == 0 {
+        return 1;
+    }
+    chars.div_ceil(width) as u16
 }
 
 /// Parse the device-flow `user_code` from a verification URL (`None` if absent
@@ -192,8 +190,8 @@ fn render_url(
     y.saturating_add(1)
 }
 
-/// Render the sign-in flow (or transient status) in the live region when no
-/// agent exists yet. Top-aligned in `area`; clips to its height.
+/// Render the sign-in / trust flow (or transient status) in the live region when
+/// no agent exists yet. Top-aligned in `area`; clips to its height.
 pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &MinimalAuthHint) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -207,77 +205,13 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
         .bg(Color::Reset);
 
     match hint {
-        MinimalAuthHint::ChooseProvider { error } => {
+        MinimalAuthHint::SigningIn { url, code } => {
             y = put_line(
                 buf,
                 area,
                 y,
                 bottom,
-                Line::from(Span::styled("Choose your provider", bold)),
-            );
-            if let Some(error) = error {
-                y = put_line(
-                    buf,
-                    area,
-                    y,
-                    bottom,
-                    Line::from(Span::styled(
-                        error.clone(),
-                        Style::default().fg(theme.warning).bg(Color::Reset),
-                    )),
-                );
-            }
-            y = put_line(buf, area, y, bottom, Line::default());
-            y = put_line(
-                buf,
-                area,
-                y,
-                bottom,
-                Line::from(vec![
-                    Span::styled("[c] ", bold),
-                    Span::styled("ChatGPT Codex", gray),
-                ]),
-            );
-            y = put_line(
-                buf,
-                area,
-                y,
-                bottom,
-                Line::from(vec![
-                    Span::styled("[x] ", bold),
-                    Span::styled("xAI Grok", gray),
-                ]),
-            );
-            let _ = put_line(
-                buf,
-                area,
-                y,
-                bottom,
-                Line::from(vec![Span::styled("[q] ", bold), Span::styled("Quit", gray)]),
-            );
-        }
-        MinimalAuthHint::SigningIn {
-            provider,
-            url,
-            code,
-        } => {
-            let provider_name = match provider {
-                PrimaryProvider::Codex => "ChatGPT Codex",
-                PrimaryProvider::Xai => "xAI Grok",
-                PrimaryProvider::Kimi => "Kimi",
-                PrimaryProvider::Fireworks => "Fireworks AI",
-                PrimaryProvider::DeepSeek => "DeepSeek",
-                PrimaryProvider::Meta => "Meta API",
-                PrimaryProvider::Wafer => "Wafer AI",
-                PrimaryProvider::Zai => "Z AI",
-                PrimaryProvider::OpenCodeGo => "OpenCode Go",
-            };
-            y = put_line(
-                buf,
-                area,
-                y,
-                bottom,
-                Line::from(Span::styled(format!("Sign in to {provider_name}"), bold)),
+                Line::from(Span::styled("Sign in to Grok", bold)),
             );
             y = put_line(buf, area, y, bottom, Line::default());
             match url {
@@ -358,6 +292,7 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
             );
         }
         MinimalAuthHint::TrustFolder { workspace } => {
+            // Mirrors `render_welcome_trust` copy, flush-left for minimal.
             y = put_line(
                 buf,
                 area,
@@ -383,7 +318,7 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
                 y,
                 bottom,
                 Line::from(Span::styled(
-                    "Open Grok may run or modify contents in this directory,",
+                    "Grok Build may run or modify contents in this directory,",
                     gray,
                 )),
             );
@@ -421,7 +356,10 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
                 area,
                 y,
                 bottom,
-                Line::from(Span::styled("Enter or y to trust · n or Esc to quit", gray)),
+                Line::from(Span::styled(
+                    "Enter or y to trust \u{00b7} n or Esc to quit",
+                    gray,
+                )),
             );
         }
         MinimalAuthHint::Starting => {
@@ -460,6 +398,8 @@ mod tests {
     fn auth_hint_maps_auth_state() {
         use xai_grok_pager::app::app_view::AuthMode;
 
+        let trust_done = TrustState::Done;
+
         // Device flow → SigningIn carrying the URL and the parsed code.
         let st = AuthState::Authenticating {
             request_seq: 1,
@@ -467,8 +407,8 @@ mod tests {
             auth_url: Some("https://accounts.x.ai/device?user_code=ABCD-EFGH".into()),
             mode: AuthMode::Device,
         };
-        match minimal_auth_hint(&st, PrimaryProvider::Xai) {
-            MinimalAuthHint::SigningIn { url, code, .. } => {
+        match minimal_auth_hint(&st, &trust_done, true, false) {
+            MinimalAuthHint::SigningIn { url, code } => {
                 assert_eq!(
                     url.as_deref(),
                     Some("https://accounts.x.ai/device?user_code=ABCD-EFGH")
@@ -485,8 +425,8 @@ mod tests {
             auth_url: Some("https://provider.example/login".into()),
             mode: AuthMode::Command,
         };
-        match minimal_auth_hint(&st, PrimaryProvider::Xai) {
-            MinimalAuthHint::SigningIn { url, code, .. } => {
+        match minimal_auth_hint(&st, &trust_done, true, false) {
+            MinimalAuthHint::SigningIn { url, code } => {
                 assert_eq!(url.as_deref(), Some("https://provider.example/login"));
                 assert!(code.is_none());
             }
@@ -494,14 +434,7 @@ mod tests {
         }
 
         assert!(matches!(
-            minimal_auth_hint(
-                &AuthState::ProviderChoice { error: None },
-                PrimaryProvider::Codex,
-            ),
-            MinimalAuthHint::ChooseProvider { error: None }
-        ));
-        assert!(matches!(
-            minimal_auth_hint(&AuthState::Done, PrimaryProvider::Xai),
+            minimal_auth_hint(&AuthState::Done, &trust_done, true, false),
             MinimalAuthHint::Starting
         ));
         assert!(matches!(
@@ -509,113 +442,41 @@ mod tests {
                 &AuthState::Pending {
                     error: Some("nope".into())
                 },
-                PrimaryProvider::Xai,
+                &trust_done,
+                true,
+                false
             ),
             MinimalAuthHint::Failed(_)
         ));
     }
 
     #[test]
-    fn active_codex_model_does_not_relabel_an_xai_auth_flow() {
-        let provider = minimal_auth_provider(PrimaryProvider::Codex, None);
-        assert_eq!(provider, PrimaryProvider::Xai);
-        let state = AuthState::Authenticating {
-            request_seq: 3,
-            handle: None,
-            auth_url: Some("https://accounts.x.ai/oauth2/device".into()),
-            mode: xai_grok_pager::app::app_view::AuthMode::Device,
-        };
-        let hint = minimal_auth_hint(&state, provider);
-        assert!(matches!(
-            hint,
-            MinimalAuthHint::SigningIn {
-                provider: PrimaryProvider::Xai,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn pending_folder_trust_is_shown_after_auth_without_losing_provider_routing() {
+    fn auth_hint_maps_pending_trust_after_auth() {
         let trust = TrustState::Pending {
             workspace: PathBuf::from("/tmp/untrusted-repo"),
         };
-        assert!(matches!(
-            minimal_auth_hint_with_trust(
-                &AuthState::Done,
-                PrimaryProvider::Xai,
-                &trust,
-                true,
-                false,
-            ),
-            MinimalAuthHint::TrustFolder { workspace }
-                if workspace == PathBuf::from("/tmp/untrusted-repo")
-        ));
-        assert!(matches!(
-            minimal_auth_hint_with_trust(
-                &AuthState::Done,
-                PrimaryProvider::Xai,
-                &trust,
-                false,
-                false,
-            ),
-            MinimalAuthHint::Starting
-        ));
-        assert!(matches!(
-            minimal_auth_hint_with_trust(
-                &AuthState::Done,
-                PrimaryProvider::Xai,
-                &trust,
-                true,
-                true,
-            ),
-            MinimalAuthHint::Starting
-        ));
-    }
-
-    #[test]
-    fn render_auth_shows_folder_trust_question() {
-        let theme = Theme::current();
-        let area = Rect::new(0, 0, 80, 14);
-        let mut buf = Buffer::empty(area);
-        render_auth(
-            &mut buf,
-            area,
-            &theme,
-            &MinimalAuthHint::TrustFolder {
-                workspace: PathBuf::from("/home/agent/project"),
-            },
-        );
-        let mut text = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                if let Some(cell) = buf.cell((x, y)) {
-                    text.push_str(cell.symbol());
-                }
+        match minimal_auth_hint(&AuthState::Done, &trust, true, false) {
+            MinimalAuthHint::TrustFolder { workspace } => {
+                assert_eq!(workspace, PathBuf::from("/tmp/untrusted-repo"));
             }
+            _ => panic!("expected TrustFolder"),
         }
-        assert!(text.contains("Do you trust the contents of this directory?"));
-        assert!(text.contains("/home/agent/project"));
-        assert!(text.contains("Open Grok may run or modify contents"));
-        assert!(text.contains("Yes, proceed"));
-        assert!(text.contains("No, quit"));
-    }
 
-    #[test]
-    fn codex_session_resume_uses_explicit_codex_auth_label() {
-        let provider = minimal_auth_provider(PrimaryProvider::Xai, Some(PrimaryProvider::Codex));
-        let state = AuthState::Authenticating {
-            request_seq: 4,
-            handle: None,
-            auth_url: None,
-            mode: xai_grok_pager::app::app_view::AuthMode::Command,
-        };
+        // Access / ZDR gates suppress the trust question (matches welcome +
+        // the input interceptor).
         assert!(matches!(
-            minimal_auth_hint(&state, provider),
-            MinimalAuthHint::SigningIn {
-                provider: PrimaryProvider::Codex,
-                ..
-            }
+            minimal_auth_hint(&AuthState::Done, &trust, false, false),
+            MinimalAuthHint::Starting
+        ));
+        assert!(matches!(
+            minimal_auth_hint(&AuthState::Done, &trust, true, true),
+            MinimalAuthHint::Starting
+        ));
+
+        // Trust is not offered while auth is still in flight.
+        assert!(matches!(
+            minimal_auth_hint(&AuthState::Pending { error: None }, &trust, true, false),
+            MinimalAuthHint::SigningIn { .. }
         ));
     }
 
@@ -625,20 +486,12 @@ mod tests {
         let area = Rect::new(0, 0, 80, 12);
         let mut buf = Buffer::empty(area);
         let hint = MinimalAuthHint::SigningIn {
-            provider: PrimaryProvider::Xai,
             url: Some("https://accounts.x.ai/device?user_code=ABCD-EFGH".into()),
             code: Some("ABCD-EFGH".into()),
         };
         render_auth(&mut buf, area, &theme, &hint);
-        let mut text = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                if let Some(c) = buf.cell((x, y)) {
-                    text.push_str(c.symbol());
-                }
-            }
-        }
-        assert!(text.contains("Sign in to xAI Grok"), "header: {text:?}");
+        let text = buffer_text(&buf, area);
+        assert!(text.contains("Sign in to Grok"), "header: {text:?}");
         assert!(text.contains("accounts.x.ai/device"), "url: {text:?}");
         assert!(text.contains("ABCD-EFGH"), "device code: {text:?}");
         assert!(
@@ -648,28 +501,50 @@ mod tests {
     }
 
     #[test]
-    fn render_auth_names_chatgpt_codex_during_codex_oauth() {
+    fn render_auth_shows_trust_question() {
         let theme = Theme::current();
-        let area = Rect::new(0, 0, 80, 6);
+        let area = Rect::new(0, 0, 80, 14);
         let mut buf = Buffer::empty(area);
-        let hint = MinimalAuthHint::SigningIn {
-            provider: PrimaryProvider::Codex,
-            url: None,
-            code: None,
+        let hint = MinimalAuthHint::TrustFolder {
+            workspace: PathBuf::from("/home/agent/project"),
         };
         render_auth(&mut buf, area, &theme, &hint);
+        let text = buffer_text(&buf, area);
+        assert!(
+            text.contains("Do you trust the contents of this directory?"),
+            "question: {text:?}"
+        );
+        assert!(
+            text.contains("/home/agent/project"),
+            "workspace path: {text:?}"
+        );
+        assert!(text.contains("Yes, proceed"), "yes option: {text:?}");
+        assert!(text.contains("No, quit"), "no option: {text:?}");
+        assert!(text.contains("Enter or y to trust"), "hint line: {text:?}");
+        assert!(text.contains("posing security risks"), "warning: {text:?}");
+    }
+
+    #[test]
+    fn auth_hint_rows_covers_trust_path_wrap() {
+        let long = "x".repeat(200);
+        let hint = MinimalAuthHint::TrustFolder {
+            workspace: PathBuf::from(long),
+        };
+        let rows = auth_hint_rows(&hint, 40);
+        // path alone needs 5 rows at width 40 (200/40); total well above base.
+        assert!(rows >= 12, "expected room for wrapped path, got {rows}");
+    }
+
+    fn buffer_text(buf: &Buffer, area: Rect) -> String {
         let mut text = String::new();
         for y in 0..area.height {
             for x in 0..area.width {
-                if let Some(cell) = buf.cell((x, y)) {
-                    text.push_str(cell.symbol());
+                if let Some(c) = buf.cell((x, y)) {
+                    text.push_str(c.symbol());
                 }
             }
+            text.push('\n');
         }
-        assert!(
-            text.contains("Sign in to ChatGPT Codex"),
-            "header: {text:?}"
-        );
-        assert!(!text.contains("Sign in to Grok"), "header: {text:?}");
+        text
     }
 }

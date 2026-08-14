@@ -1086,7 +1086,7 @@ pub struct AppView {
     pub session_picker_list_seq: u64,
     /// Resolved compat-session cells used before checking resume-skill paths.
     pub(crate) foreign_session_compat:
-        xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources,
+        xai_grok_foreign_sessions::EnabledForeignSessionSources,
     /// Monotonic picker scan sequence, bumped on every open and close.
     pub(crate) foreign_session_scan_seq: u64,
     /// Coalesces obsolete foreign scans across welcome and modal pickers.
@@ -1786,6 +1786,19 @@ impl AppView {
     /// defers session creation until answered.
     pub fn session_startup_allowed(&self) -> bool {
         matches!(self.auth_state, AuthState::Done) && matches!(self.trust_state, TrustState::Done)
+    }
+    /// Whether startup type-ahead captured while the app was loading may be
+    /// replayed into the input channel: every startup screen that consumes raw
+    /// keystrokes must be resolved so the composer is the active consumer.
+    /// Mirrors the folder-trust interceptor's gate (auth Done, has access, not
+    /// ZDR-blocked) plus trust Done. When this is false at launch the captured
+    /// prompt is dropped rather than replayed (see `event_loop::run`), so e.g. a
+    /// prompt starting with "n" cannot answer the folder-trust question and quit.
+    pub fn ready_for_startup_typeahead(&self) -> bool {
+        matches!(self.auth_state, AuthState::Done)
+            && self.has_access()
+            && !self.is_zdr_blocked()
+            && matches!(self.trust_state, TrustState::Done)
     }
     /// Extract `GateInfo` from `RemoteSettings`.
     pub fn gate_from_settings(
@@ -8369,7 +8382,7 @@ pub(crate) mod tests {
     fn welcome_ctrl_u_update_keeps_priority_over_foreign_resume() {
         let mut app = test_app();
         app.foreign_session_compat =
-            xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources {
+            xai_grok_foreign_sessions::EnabledForeignSessionSources {
                 cursor: true,
                 ..Default::default()
             };
@@ -8389,8 +8402,8 @@ pub(crate) mod tests {
         app.apply_foreign_resume_detection(
             launch_token,
             &canonical_cwd,
-            Some(xai_grok_workspace::foreign_sessions::RecentForeignSession {
-                tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool::Cursor,
+            Some(xai_grok_foreign_sessions::RecentForeignSession {
+                tool: xai_grok_foreign_sessions::ForeignSessionTool::Cursor,
                 native_id: "cursor-session".into(),
                 age: std::time::Duration::from_secs(30),
             }),
@@ -10740,8 +10753,10 @@ pub(crate) mod tests {
             other => panic!("expected SubmitAuthCode, got {:?}", other),
         }
     }
+    /// A bare `Moved` after a press means the release was lost: the press
+    /// must end, never promote into a selection.
     #[test]
-    fn moved_with_button_held_promotes_pending_scrollback_drag() {
+    fn moved_after_press_ends_gesture_instead_of_promoting() {
         let mut app = test_app_with_agent();
         let id = super::super::agent::AgentId(0);
         let agent = app.agents.get_mut(&id).unwrap();
@@ -10784,8 +10799,9 @@ pub(crate) mod tests {
         assert!(agent.drag_selection.is_none());
         assert!(matches!(app.handle_input(&moved), InputOutcome::Changed));
         let agent = app.agents.get(&id).unwrap();
-        assert!(agent.pending_text_drag.is_some());
-        assert!(agent.drag_selection.is_some());
+        assert!(!agent.left_mouse_down, "lost release ended the press");
+        assert!(agent.pending_text_drag.is_none());
+        assert!(agent.drag_selection.is_none(), "hover must not select");
     }
     #[test]
     fn moved_without_button_does_not_promote_pending_scrollback_drag() {

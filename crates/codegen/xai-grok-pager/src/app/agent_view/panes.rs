@@ -870,8 +870,11 @@ mod paste_routing_tests {
         );
         assert_eq!(agent.prompt.text(), "hidden prompt");
         agent.scrollback_search = None;
-        let outcome = agent.handle_input(&Event::Paste("still ignored".to_owned()), &registry);
-        assert!(matches!(outcome, InputOutcome::Unchanged));
+        let outcome = agent.handle_input(&Event::Paste("forwarded".to_owned()), &registry);
+        assert!(matches!(
+            outcome,
+            InputOutcome::ActionThenForward(crate::app::actions::Action::FocusPrompt)
+        ));
         assert_eq!(agent.prompt.text(), "hidden prompt");
     }
 }

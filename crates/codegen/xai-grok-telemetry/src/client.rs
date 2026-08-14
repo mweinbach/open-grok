@@ -124,6 +124,7 @@ impl TelemetryClient {
 fn normalize_tier(tier: &str) -> String {
     match tier {
         "SuperGrok Heavy" | "supergrok_heavy" => "supergrok_heavy",
+        "SuperGrok Plus" | "supergrok_plus" => "supergrok_plus",
         "SuperGrok" | "supergrok" => "supergrok",
         "SuperGrok Lite" | "supergrok_lite" => "supergrok_lite",
         "X Premium+" | "x_premium_plus" => "x_premium_plus",
@@ -513,6 +514,8 @@ mod tests {
         assert_eq!(normalize_tier("X Premium+"), "x_premium_plus");
         assert_eq!(normalize_tier("X Premium"), "x_premium");
         assert_eq!(normalize_tier("SuperGrok Lite"), "supergrok_lite");
+        assert_eq!(normalize_tier("SuperGrok Plus"), "supergrok_plus");
+        assert_eq!(normalize_tier("supergrok_plus"), "supergrok_plus");
         // API key is a dedicated Mixpanel segment — never free.
         assert_eq!(normalize_tier("API Key"), "api_key");
         assert_eq!(normalize_tier("api_key"), "api_key");

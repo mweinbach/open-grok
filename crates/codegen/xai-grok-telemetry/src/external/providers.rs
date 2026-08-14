@@ -319,7 +319,7 @@ fn grpc_tls_candidates(
     }
     let mut base =
         ClientTlsConfig::new().trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    // Process-wide `OPENGROK_EXTRA_CA_BUNDLE` roots (fail-open by that crate's
+    // Process-wide `GROK_EXTRA_CA_BUNDLE` roots (fail-open by that crate's
     // contract), matching what the HTTP transport applies via
     // `with_extra_root_certificates_blocking` — the same corporate/MITM CA
     // must work on both transports.
@@ -861,7 +861,7 @@ mod tests {
         ));
     }
 
-    /// The DER→PEM re-encode used for `OPENGROK_EXTRA_CA_BUNDLE` must produce a
+    /// The DER→PEM re-encode used for `GROK_EXTRA_CA_BUNDLE` must produce a
     /// bundle other PEM parsers can read back, one block per DER.
     #[test]
     fn ders_to_pem_bundle_roundtrips() {

@@ -1498,7 +1498,7 @@ async fn foreign_scan_task_echoes_sequence_without_enabled_sources() {
     execute(
         Effect::ScanForeignSessions {
             cwd: PathBuf::from("/path/that/must/not/be-read"),
-            compat: xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources::default(),
+            compat: xai_grok_foreign_sessions::EnabledForeignSessionSources::default(),
             grok_home: PathBuf::from("/path/that/must/not/be-read"),
             coordinator: app_coordinator.clone(),
             seq: 41,
@@ -1551,7 +1551,7 @@ async fn foreign_resume_detection_runs_as_task_result() {
     let (quit, _) = execute(
         Effect::DetectForeignResumeHint {
             canonical_cwd: canonical_cwd.clone(),
-            compat: xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources::default(),
+            compat: xai_grok_foreign_sessions::EnabledForeignSessionSources::default(),
             grok_home: PathBuf::from("/path/that/must/not-be-read"),
             launch_token: 8,
         },

@@ -2542,7 +2542,7 @@ fn persona_injection_into_empty_conversation() {
 mod cancellation_error_message_tests {
     use super::super::cancellation_error_message;
     use crate::session::commands::CancellationContext;
-    use xai_file_utils::events::types::CancellationCategory;
+    use xai_grok_session_events::types::CancellationCategory;
     #[test]
     fn permission_rejected_with_context() {
         let ctx = CancellationContext {

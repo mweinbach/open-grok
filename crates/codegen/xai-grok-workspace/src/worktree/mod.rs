@@ -36,6 +36,160 @@ pub use xai_grok_workspace_types::rpc::worktree::{
 
 const WORKTREE_LOG: &str = "xai_worktree";
 
+/// True when `path` is on a grove FUSE mount. Fast btrfs CoW cannot snapshot
+/// FUSE; callers must fall back to a plain git checkout ([`WorktreeType::Git`]).
+/// `fusectl` is not a guest mount (never match `/^fuse/` blindly).
+pub(crate) fn is_grove_fuse_mount(path: &Path) -> bool {
+    if path_looks_like_grove_store(path) {
+        return true;
+    }
+    let abs = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if path_looks_like_grove_store(&abs) {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    longest_covering_fstype(&text, &abs).is_some_and(|fstype| {
+        let f = fstype.to_ascii_lowercase();
+        (f == "fuse" || f.starts_with("fuse.")) && f != "fusectl"
+    })
+}
+
+fn path_looks_like_grove_store(path: &Path) -> bool {
+    path.to_string_lossy().contains("/var/lib/grove/")
+}
+
+/// Unescape the octal escapes the kernel writes for whitespace/backslash in
+/// `/proc/self/mountinfo` fields (space=`\040`, tab=`\011`, newline=`\012`,
+/// backslash=`\134`). Without this a mount point containing a space never
+/// matches a real path.
+fn unescape_mountinfo_field(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    // Accumulate raw bytes (not `as char`, which mis-maps bytes >= 0x80 to
+    // U+0080..U+00FF and splits multi-byte UTF-8): copy verbatim and reassemble
+    // once, so non-ASCII mount points survive the longest-prefix compare.
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 4 <= bytes.len()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+            && let Ok(code) = u8::from_str_radix(&s[i + 1..i + 4], 8)
+        {
+            out.push(code);
+            i += 4;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn longest_covering_fstype<'a>(mountinfo: &'a str, path: &Path) -> Option<&'a str> {
+    let path_s = path.to_string_lossy();
+    let mut best_mp = String::new();
+    let mut best_fs: Option<&'a str> = None;
+    for line in mountinfo.lines() {
+        // Tolerate malformed/blank rows: `continue` (not `?`) so a single bad
+        // line cannot abort the whole scan and drop an earlier valid cover.
+        let mut sides = line.splitn(2, " - ");
+        let (Some(left), Some(right)) = (sides.next(), sides.next()) else {
+            continue;
+        };
+        let Some(mp_raw) = left.split_whitespace().nth(4) else {
+            continue;
+        };
+        let Some(fstype) = right.split_whitespace().next() else {
+            continue;
+        };
+        // Mount points are octal-escaped in mountinfo; unescape before comparing.
+        let mp = unescape_mountinfo_field(mp_raw);
+        let covers = path_s == mp || path_s.starts_with(&format!("{mp}/")) || mp == "/";
+        if covers && mp.len() >= best_mp.len() {
+            best_mp = mp;
+            best_fs = Some(fstype);
+        }
+    }
+    best_fs
+}
+
+#[cfg(test)]
+mod grove_fuse_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn grove_store_path_is_detected() {
+        assert!(path_looks_like_grove_store(Path::new(
+            "/var/lib/grove/repos/app/worktree"
+        )));
+        assert!(!path_looks_like_grove_store(Path::new("/workspace/app")));
+    }
+
+    #[test]
+    fn mountinfo_prefers_longest_cover_and_skips_unrelated() {
+        let info = "\
+15 20 0:21 / / rw - ext4 /dev/sda1 rw\n\
+25 15 0:47 / /sys/fs/fuse/connections rw - fusectl fusectl rw\n\
+36 15 0:52 / /workspace/app rw - fuse.grove grove rw\n";
+        assert_eq!(
+            longest_covering_fstype(info, Path::new("/workspace/app/src")),
+            Some("fuse.grove")
+        );
+        assert_eq!(
+            longest_covering_fstype(info, Path::new("/home")),
+            Some("ext4")
+        );
+    }
+
+    #[test]
+    fn mountinfo_unescapes_octal_mount_points() {
+        // Mount point with a space is octal-escaped as `\040` in mountinfo.
+        let info = "15 20 0:21 / / rw - ext4 /dev/sda1 rw\n\
+             36 15 0:52 / /workspace/my\\040app rw - fuse.grove grove rw\n";
+        assert_eq!(
+            longest_covering_fstype(info, Path::new("/workspace/my app/src")),
+            Some("fuse.grove")
+        );
+    }
+
+    #[test]
+    fn mountinfo_skips_malformed_rows_without_aborting() {
+        // A blank line and a row with no " - " separator must not abort the scan
+        // and drop the valid grove cover that follows.
+        let info = "15 20 0:21 / / rw - ext4 /dev/sda1 rw\n\
+             \n\
+             this line has no separator and should be skipped\n\
+             36 15 0:52 / /workspace/app rw - fuse.grove grove rw\n";
+        assert_eq!(
+            longest_covering_fstype(info, Path::new("/workspace/app/src")),
+            Some("fuse.grove")
+        );
+    }
+
+    #[test]
+    fn unescape_mountinfo_field_handles_escapes_and_plain() {
+        assert_eq!(unescape_mountinfo_field("/a/b"), "/a/b");
+        assert_eq!(unescape_mountinfo_field("/a\\040b"), "/a b");
+        assert_eq!(unescape_mountinfo_field("/a\\134b"), "/a\\b");
+    }
+
+    #[test]
+    fn is_grove_fuse_mount_matches_store_layout() {
+        assert!(is_grove_fuse_mount(Path::new(
+            "/var/lib/grove/repos/app/worktree"
+        )));
+        assert!(!is_grove_fuse_mount(Path::new("/tmp/not-a-grove-path")));
+    }
+}
+
 /// Map a [`WorktreeType`] to the fast-worktree crate's `CreationMode`.
 pub(crate) fn to_creation_mode(t: WorktreeType) -> xai_fast_worktree::CreationMode {
     match t {
@@ -621,18 +775,18 @@ pub fn resolve_label_collision(base_dir: &Path, label: &str) -> String {
 
 /// Resolve the grok home for worktree paths via the **same** resolver used for
 /// `worktrees.db` (`xai_fast_worktree::resolve_grok_home`), so checkout dirs and
-/// the metadata DB always live under the same `.opengrok` tree. That resolver
+/// the metadata DB always live under the same `.grok` tree. That resolver
 /// canonicalizes its `$HOME` fallback to match `xai_grok_config::grok_home()`,
 /// so worktree paths also agree with trust/hooks and other grok-home paths.
 fn grok_home() -> std::path::PathBuf {
     xai_fast_worktree::resolve_grok_home().unwrap_or_else(|_| {
         dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join(".opengrok")
+            .join(".grok")
     })
 }
 
-/// Returns `~/.opengrok/worktrees/<repo_slug>` for the given git root.
+/// Returns `~/.grok/worktrees/<repo_slug>` for the given git root.
 ///
 /// Uses [`repo_slug`] to derive a collision-resistant directory name from
 /// the last two meaningful path components.
@@ -641,10 +795,10 @@ pub fn worktree_base_dir(git_root: &Path) -> std::path::PathBuf {
     grok_home().join("worktrees").join(slug)
 }
 
-/// Resolves the worktree base directory (`~/.opengrok/worktrees/<repo_name>`)
+/// Resolves the worktree base directory (`~/.grok/worktrees/<repo_name>`)
 /// for a given source path, correctly handling grok-managed worktrees.
 ///
-/// When `source_path` is already under `~/.opengrok/worktrees/<repo>/...`, the
+/// When `source_path` is already under `~/.grok/worktrees/<repo>/...`, the
 /// repo name is derived from the directory structure directly. This avoids
 /// `find_main_repo_root_from_path`, which misidentifies standalone worktrees
 /// as the main repo root (returning the worktree itself instead of the
@@ -694,7 +848,7 @@ pub fn label_from_path(worktree_path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Walk up from `cwd` (staying within `~/.opengrok/worktrees/`) to its registered
+/// Walk up from `cwd` (staying within `~/.grok/worktrees/`) to its registered
 /// worktree record.
 ///
 /// Shared resolver for [`lookup_worktree_label`] and [`touch_worktree_for_cwd`];
@@ -728,7 +882,7 @@ fn worktree_record_for_cwd(cwd: &str) -> Option<(WorktreeDb, WorktreeRecord)> {
 /// The recorded source repo of the grok-managed worktree containing `cwd`, if any.
 ///
 /// Thin wrapper over [`worktree_record_for_cwd`] that drops the DB handle;
-/// returns `None` (without DB I/O) for paths outside `~/.opengrok/worktrees/`.
+/// returns `None` (without DB I/O) for paths outside `~/.grok/worktrees/`.
 pub(crate) fn source_repo_for_cwd(cwd: &str) -> Option<std::path::PathBuf> {
     worktree_record_for_cwd(cwd).map(|(_db, rec)| rec.source_repo)
 }
@@ -935,6 +1089,17 @@ pub async fn create_worktree_streaming<N: WorktreeNotificationSender>(
     // Determine worktree type, preserving the .git.is_dir() guard for Standalone mode.
     // A linked worktree has a `.git` *file* pointing to the main repo; a real repo has a `.git` *directory*.
     let requested_type = req.worktree_type.unwrap_or(WorktreeType::Linked);
+    let requested_type = if is_grove_fuse_mount(Path::new(&req.source_path)) {
+        tracing::info!(
+            target: WORKTREE_LOG,
+            session_id = %session_id,
+            source = %req.source_path,
+            "grove FUSE source: disabling fast-worktree CoW, using git checkout"
+        );
+        WorktreeType::Git
+    } else {
+        requested_type
+    };
     let git_dir_is_directory = std::path::Path::new(&req.source_path).join(".git").is_dir();
     let creation_mode = if requested_type == WorktreeType::Standalone {
         if git_dir_is_directory {
@@ -1414,7 +1579,7 @@ impl From<CreateWorktreeFromWorktreeRequestWire> for CreateWorktreeFromWorktreeR
 
 /// Resolve the target worktree path for a fork operation.
 ///
-/// When the source path is already inside `~/.opengrok/worktrees/<repo>/`, the
+/// When the source path is already inside `~/.grok/worktrees/<repo>/`, the
 /// repo name is derived from the directory structure rather than calling
 /// `find_main_repo_root_from_path` (which would return the standalone
 /// worktree root itself, causing nested paths).
@@ -2272,7 +2437,7 @@ pub async fn remove_jj_workspace(workspace_path: &str) -> Result<()> {
 
 /// Request to resume an existing session in a fresh worktree.
 ///
-/// ACP equivalent of `open-grok -w -r <session_id>` (optionally with `--ref`).
+/// ACP equivalent of `grok -w -r <session_id>` (optionally with `--ref`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeSessionInWorktreeRequest {
@@ -2452,7 +2617,7 @@ pub fn worktree_auto_gc_layer_from_settings(
     }
 }
 
-/// Env + `$OPENGROK_HOME/config.toml` only — **`remote=None` is intentional**.
+/// Env + `$GROK_HOME/config.toml` only — **`remote=None` is intentional**.
 ///
 /// Workspace handle startup has no remote-settings blob (unlike shell agent
 /// init, which resolves env > TOML > remote). Remote `worktree_auto_gc`
@@ -2548,7 +2713,7 @@ pub fn candidate_worktree_cwds_for_same_repo(current_cwd: &std::path::Path) -> R
     ))
 }
 
-/// Scan `~/.opengrok/worktrees/<repo_name>/` for subdirectories not tracked
+/// Scan `~/.grok/worktrees/<repo_name>/` for subdirectories not tracked
 /// in the DB. Returns a sorted list of absolute directory paths.
 fn scan_worktree_dirs_on_disk(main_repo_root: &std::path::Path) -> Vec<String> {
     let base = worktree_base_dir(main_repo_root);
@@ -2668,7 +2833,7 @@ mod tests {
         std::fs::write(wt.join("tracked.txt"), "edited").unwrap();
         std::fs::write(wt.join("untracked.txt"), "brand new").unwrap();
 
-        let ref_name = "refs/open-grok/subagents/dispose-1";
+        let ref_name = "refs/grok/subagents/dispose-1";
         let returned = snapshot_and_remove_subagent_worktree(&wt, &repo, ref_name)
             .await
             .unwrap();
@@ -2694,7 +2859,7 @@ mod tests {
         std::fs::write(wt.join("tracked.txt"), "edited").unwrap();
         std::fs::write(wt.join("untracked.txt"), "brand new").unwrap();
 
-        let ref_name = "refs/open-grok/subagents/dispose-2";
+        let ref_name = "refs/grok/subagents/dispose-2";
         snapshot_and_remove_subagent_worktree(&wt, &repo, ref_name)
             .await
             .unwrap();
@@ -2741,7 +2906,7 @@ mod tests {
         std::fs::write(wt.join("tracked.txt"), "edited").unwrap();
         std::fs::write(wt.join("untracked.txt"), "brand new").unwrap();
 
-        let ref_name = "refs/open-grok/subagents/standalone-1";
+        let ref_name = "refs/grok/subagents/standalone-1";
         let returned = snapshot_subagent_worktree(&wt, &repo, ref_name)
             .await
             .unwrap();
@@ -2791,7 +2956,7 @@ mod tests {
         let result = snapshot_and_remove_subagent_worktree(
             &not_a_worktree,
             &not_a_worktree,
-            "refs/open-grok/subagents/dispose-3",
+            "refs/grok/subagents/dispose-3",
         )
         .await;
 
@@ -2809,12 +2974,12 @@ mod tests {
     // regardless of how the caller binds the fixture's return.
     use crate::LockedTestEnv;
 
-    /// Point `OPENGROK_HOME` at an isolated tempdir (`resolve_grok_home` re-reads
+    /// Point `GROK_HOME` at an isolated tempdir (`resolve_grok_home` re-reads
     /// the env per call by design) and register one worktree record at
     /// `<home>/worktrees/repo/wt` with no `last_accessed_at`.
     ///
     /// Returns `(env, home, worktree dir)`; the [`LockedTestEnv`] holds the lock
-    /// and restores `OPENGROK_HOME` on drop (before releasing the lock), so the
+    /// and restores `GROK_HOME` on drop (before releasing the lock), so the
     /// caller may bind it any way.
     fn worktree_db_fixture(
         temp: &tempfile::TempDir,

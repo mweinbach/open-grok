@@ -730,9 +730,9 @@ pub struct WorkspaceConfig {
     pub event_buffer_capacity: usize,
     /// Pluggable [`SessionContext`] / [`ToolRegistryBuilder`] producer.
     pub session_factory: Arc<dyn SessionContextFactory>,
-    /// Global hook sources (e.g. `~/.claude/settings.json`, `~/.opengrok/hooks/`).
+    /// Global hook sources (e.g. `~/.claude/settings.json`, `~/.grok/hooks/`).
     pub hook_global_sources: Vec<HookSourceConfig>,
-    /// Project-scoped hook sources (e.g. `<project>/.opengrok/hooks/`).
+    /// Project-scoped hook sources (e.g. `<project>/.grok/hooks/`).
     pub hook_project_sources: Vec<HookSourceConfig>,
     /// Skill discovery configuration: additional skill paths and
     /// path-prefix ignore list. Stored on `WorkspaceShared` for
@@ -758,7 +758,7 @@ pub struct WorkspaceConfig {
     /// Runtime-tunable timing/threshold config for the tool server.
     pub status_config: crate::status_config::StatusConfig,
     /// Folder-trust verdict for repo-local (project-scoped) LSP servers from
-    /// `<cwd>/.opengrok/lsp.json`: `false` drops them at load, `true` keeps them. The
+    /// `<cwd>/.grok/lsp.json`: `false` drops them at load, `true` keeps them. The
     /// shell caller resolves the verdict and threads it in; callers without a
     /// folder-trust decision pass `true`.
     pub project_lsp_trusted: bool,
@@ -931,7 +931,7 @@ impl std::fmt::Debug for AgentSessionConfig {
 pub enum HookSourceConfig {
     /// A single JSON settings file (e.g. `~/.claude/settings.json`).
     SettingsFile(PathBuf),
-    /// A directory of `*.json` hook files (e.g. `~/.opengrok/hooks/`).
+    /// A directory of `*.json` hook files (e.g. `~/.grok/hooks/`).
     Directory(PathBuf),
 }
 /// Filesystem isolation strategy for a forked session.

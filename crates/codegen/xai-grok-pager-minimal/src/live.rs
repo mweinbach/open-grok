@@ -96,14 +96,8 @@ pub(super) fn prompt_style(
 /// Draw the pinned live region (tail + status + prompt) into the inline viewport.
 pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
     let force_todos = minimal_api::minimal_show_todos(app);
-    // `primary_provider` is the active model, not necessarily the owner of an
-    // auth flow: bare `/login` from a Codex tab still signs in to xAI. Only the
-    // first-launch chooser sets an explicit provider selection.
-    let auth_provider =
-        crate::auth::minimal_auth_provider(app.primary_provider, app.startup_provider_selection);
-    let auth_hint = crate::auth::minimal_auth_hint_with_trust(
+    let auth_hint = crate::auth::minimal_auth_hint(
         &app.auth_state,
-        auth_provider,
         &app.trust_state,
         app.has_access(),
         app.is_zdr_blocked(),
@@ -333,6 +327,7 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
                 &mut agent.last_btw_selection_model,
                 None,
                 &[],
+                None,
             );
             agent.last_btw_area = btw_area;
         }

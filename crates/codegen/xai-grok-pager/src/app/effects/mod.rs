@@ -2411,7 +2411,7 @@ pub(crate) fn execute(
                     }
                     let summaries = tokio::task::spawn_blocking(move || {
                             let _permit = permit;
-                            xai_grok_workspace::foreign_sessions::scan_foreign_sessions(
+                            xai_grok_foreign_sessions::scan_foreign_sessions(
                                 &cwd,
                                 enabled,
                             )
@@ -2464,7 +2464,7 @@ pub(crate) fn execute(
                             compat,
                             &grok_home,
                             |enabled| async move {
-                                tokio::task::spawn_blocking(move || xai_grok_workspace::foreign_sessions::most_recent_foreign_session(
+                                tokio::task::spawn_blocking(move || xai_grok_foreign_sessions::most_recent_foreign_session(
                                         &cwd_for_scan,
                                         enabled,
                                         crate::app::foreign_sessions::RESUME_HINT_WINDOW,
@@ -3470,7 +3470,11 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::KillBgTask { session_id, task_id } => {
+        Effect::KillBgTask {
+            session_id,
+            task_id,
+            source,
+        } => {
             let tx = acp_tx.clone();
             let sid = session_id.0.to_string();
             tasks
@@ -3478,6 +3482,7 @@ pub(crate) fn execute(
                     let params = xai_grok_shell::extensions::task::KillTaskRequest {
                         session_id: sid.clone(),
                         task_id: task_id.clone(),
+                        source,
                     };
                     let req = acp::ExtRequest::new(
                         "x.ai/task/kill",

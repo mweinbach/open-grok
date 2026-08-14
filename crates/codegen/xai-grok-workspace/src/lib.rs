@@ -10,15 +10,12 @@ pub mod activity;
 pub mod capability;
 pub mod channel;
 pub mod config;
-pub mod daemonize;
-pub mod diag_server;
 pub mod discovery;
 pub mod envrc;
 pub mod error;
 pub mod export_github;
 pub mod file_system;
 pub mod folder_trust;
-pub mod foreign_sessions;
 pub mod fs_notify;
 pub(crate) mod git_odb;
 pub mod handle;
@@ -27,10 +24,11 @@ pub mod hub_auth;
 pub mod hub_channel;
 pub mod hub_ids;
 pub mod hub_server;
+pub mod image_capabilities;
 pub mod mcp;
 pub mod permission;
-pub mod preview_supervisor;
 pub mod project_config;
+pub mod publish;
 pub mod recovery;
 mod restore_fetch;
 pub use restore_fetch::{EnsureCommitsOutcome, ensure_commits_reachable};
@@ -77,10 +75,10 @@ pub fn init_metrics() {
     hub_server::init_metrics();
 }
 /// Crate-wide lock serializing every test that mutates the process-global
-/// environment (`OPENGROK_HOME`, `HOME`, …). nextest isolates each test in its own
+/// environment (`GROK_HOME`, `HOME`, …). nextest isolates each test in its own
 /// process, but `cargo test --lib` shares ONE process across threads, so
 /// per-module locks don't serialize cross-module — a peer test in another module
-/// can clobber `OPENGROK_HOME` mid-test. A single shared lock (used by every
+/// can clobber `GROK_HOME` mid-test. A single shared lock (used by every
 /// env-mutating test module) is required for that single-process run to be
 /// race-free.
 #[cfg(test)]

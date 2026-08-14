@@ -219,19 +219,13 @@ pub struct ClassifierMessage {
     pub text: String,
 }
 
-/// One recent context turn the classifier sees. Conversation turns include
-/// user text and assistant tool use (assistant text and tool results are
-/// excluded); prompted permission decisions are tracked separately by the
-/// permission manager and appended chronologically.
+/// One recent transcript turn the classifier sees. Includes user text +
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassifierTurn {
     /// A user text turn.
     UserText(String),
     /// An assistant tool_use block: tool name + compact JSON args (or raw detail).
     AssistantToolUse { tool: String, args: String },
-    /// A permission decision explicitly made by the user after seeing a prompt.
-    /// Approval records permission for the requested action; it does not claim
-    /// that the tool subsequently completed successfully (or ran at all).
     PermissionDecision {
         tool: String,
         args: String,
@@ -305,8 +299,7 @@ fn neutralize_headings(text: &str) -> String {
 /// populates `turns` (compacted) and `project_instructions` (AGENTS.md).
 #[derive(Debug, Clone, Default)]
 pub struct ClassifierContext {
-    /// Recent conversation turns followed by bounded prompted permission
-    /// decisions retained by the permission manager.
+    /// Recent turns, chronological: user text + assistant tool_use only.
     pub turns: Vec<ClassifierTurn>,
     /// Project AGENTS.md ("what the main agent sees"); None when absent.
     pub project_instructions: Option<String>,
@@ -1297,12 +1290,8 @@ pub fn mcp_access_detail(name: &str, input: &serde_json::Value) -> String {
         .into_owned()
 }
 
-/// Maximum rendered argument length retained for one prompted decision turn.
 pub const CLASSIFIER_TURN_MAX_LEN: usize = 400;
 
-/// Render bounded arguments for a prompted permission decision. Bash commands
-/// retain their tool-call JSON shape; other access kinds reuse the detail the
-/// user saw. This records the permission decision only, not tool completion.
 pub fn permission_decision_args(access: &AccessKind, access_detail: Option<&str>) -> String {
     let raw = match access {
         AccessKind::Bash(cmd) => serde_json::json!({ "command": cmd }).to_string(),

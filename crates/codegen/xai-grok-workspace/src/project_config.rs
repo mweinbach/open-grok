@@ -1,5 +1,5 @@
 //! Project config-file discovery: locating repo-local `.mcp.json` and
-//! `.opengrok/config.toml` files by walking from `cwd` up to the git root.
+//! `.grok/config.toml` files by walking from `cwd` up to the git root.
 //!
 //! These pure `git2` + filesystem walks are shared by the shell's config
 //! loaders and the folder-trust gate's `repo_configs_present`.
@@ -41,7 +41,7 @@ pub(crate) fn find_mcp_json_files_in(chain_dirs: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// True when `config_path` is `$OPENGROK_HOME/config.toml` (user tier, not project).
+/// True when `config_path` is `$GROK_HOME/config.toml` (user tier, not project).
 fn is_user_grok_config_file(config_path: &Path) -> bool {
     let Some(user_home) = xai_grok_config::user_grok_home() else {
         return false;
@@ -57,12 +57,12 @@ fn is_user_grok_config_file(config_path: &Path) -> bool {
     canonical_config == canonical_user
 }
 
-/// Find all `.opengrok/config.toml` files from `cwd` upward to the git repo root.
+/// Find all `.grok/config.toml` files from `cwd` upward to the git repo root.
 /// Returns paths ordered from repo root (lowest priority) to cwd (highest priority),
 /// matching the convention used by skills and AGENTS.md discovery.
 ///
-/// If no git repo is found, only checks `cwd/.opengrok/config.toml`. Excludes the
-/// user-global config so `cwd == $HOME` does not treat `~/.opengrok/config.toml` as
+/// If no git repo is found, only checks `cwd/.grok/config.toml`. Excludes the
+/// user-global config so `cwd == $HOME` does not treat `~/.grok/config.toml` as
 /// a project overlay.
 pub fn find_project_configs(cwd: &Path) -> Vec<PathBuf> {
     find_project_configs_in(&RepoDirChain::resolve(cwd).dirs)

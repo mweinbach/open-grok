@@ -80,9 +80,6 @@ pub enum TraceUploadReason {
     ZdrTeam,
     /// `[telemetry] trace_upload = false` in config.
     FeatureOff,
-    /// The active model belongs to a non-xAI provider. Provider content and
-    /// diagnostics are not uploaded to xAI implicitly.
-    ProviderBoundary,
     /// No grok.com auth or deployment key.
     NoCredentials,
     /// Direct-to-bucket S3 upload.
@@ -93,6 +90,8 @@ pub enum TraceUploadReason {
     DirectGcs,
     /// Session handle not found (edge case).
     SessionNotFound,
+    /// Non-xAI provider or export boundary disabled trace uploads.
+    ProviderBoundary,
 }
 
 impl TraceUploadReason {
@@ -100,12 +99,12 @@ impl TraceUploadReason {
         match self {
             Self::ZdrTeam => "zdr_team",
             Self::FeatureOff => "feature_off",
-            Self::ProviderBoundary => "provider_boundary",
             Self::NoCredentials => "no_credentials",
             Self::DirectS3 => "direct_s3",
             Self::Proxy => "proxy",
             Self::DirectGcs => "direct_gcs",
             Self::SessionNotFound => "session_not_found",
+            Self::ProviderBoundary => "provider_boundary",
         }
     }
 
@@ -170,10 +169,6 @@ mod tests {
     fn as_str_values_are_stable() {
         assert_eq!(TraceUploadReason::ZdrTeam.as_str(), "zdr_team");
         assert_eq!(TraceUploadReason::FeatureOff.as_str(), "feature_off");
-        assert_eq!(
-            TraceUploadReason::ProviderBoundary.as_str(),
-            "provider_boundary"
-        );
         assert_eq!(TraceUploadReason::NoCredentials.as_str(), "no_credentials");
         assert_eq!(TraceUploadReason::DirectS3.as_str(), "direct_s3");
         assert_eq!(TraceUploadReason::Proxy.as_str(), "proxy");

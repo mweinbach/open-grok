@@ -105,6 +105,12 @@ impl std::fmt::Debug for TransportLivenessHandle {
     }
 }
 
+impl TransportLivenessHandle {
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+}
+
 /// Spawn a one-shot transport-liveness poller for a `Ready` client.
 ///
 /// # Parameters

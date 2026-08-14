@@ -49,7 +49,7 @@ const AUTH_LOCK_WAIT: std::time::Duration =
 // (multiple async tasks / sessions) and across separate processes (leader
 // mode disabled, multiple `grok` invocations).
 //
-// Layer 1 (cross-process): filesystem lock at $OPENGROK_HOME/mcp_auth_{safe_name}.lock
+// Layer 1 (cross-process): filesystem lock at $GROK_HOME/mcp_auth_{safe_name}.lock
 // Layer 2 (in-process):    watch channel so only one task runs the flow
 // ---------------------------------------------------------------------------
 
@@ -201,6 +201,12 @@ async fn authenticate_with_fs_lock(
         }
     };
 
+    // Bounded, non-blocking poll instead of an unbounded `flock(LOCK_EX)`:
+    // the leader can legitimately hold this lock for minutes (user consent),
+    // but an abandoned/wedged leader must not park followers forever. On
+    // timeout we fall back to running our own flow (same as lock-acquisition
+    // failure), which the token-changed re-check below keeps from producing a
+    // duplicate consent when the leader did finish.
     let lock_file = tokio::task::spawn_blocking(move || {
         use std::os::unix::io::AsRawFd;
         let fd = lock_file.as_raw_fd();

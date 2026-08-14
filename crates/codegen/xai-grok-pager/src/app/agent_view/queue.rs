@@ -144,7 +144,7 @@ impl AgentView {
         use crate::acp::tracker::{TurnActivity, WaitingReason};
         matches!(
             self.resolve_turn_activity(),
-            Some(TurnActivity::Waiting(WaitingReason::Subagent))
+            Some(TurnActivity::Waiting(WaitingReason::Subagent { .. }))
         )
     }
 

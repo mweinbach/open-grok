@@ -2930,10 +2930,11 @@ impl MvpAgent {
         &self,
         session_id: &str,
         task_id: &str,
+        source: xai_grok_tools::types::KillSource,
     ) -> Result<xai_grok_tools::types::KillOutcome, String> {
         let sid = acp::SessionId::new(session_id);
         if let Some(handle) = self.get_session_handle(&sid) {
-            handle.kill_background_task(task_id).await
+            handle.kill_background_task(task_id, source).await
         } else {
             Err("session not found".to_string())
         }

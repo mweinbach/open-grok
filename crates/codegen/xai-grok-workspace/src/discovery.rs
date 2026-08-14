@@ -147,12 +147,12 @@ pub fn discover_plugins(
 // Project config
 // ---------------------------------------------------------------------------
 
-/// Load the project config from `<root_cwd>/.opengrok/config.toml`.
+/// Load the project config from `<root_cwd>/.grok/config.toml`.
 ///
 /// Returns `Value::Null` if the file does not exist or cannot be
 /// parsed. Non-fatal errors are logged.
 pub fn load_project_config(root_cwd: &Path) -> Value {
-    let config_path = root_cwd.join(".opengrok").join("config.toml");
+    let config_path = root_cwd.join(".grok").join("config.toml");
     match xai_grok_config::load_config_file(&config_path) {
         Ok(toml::Value::Table(ref t)) if t.is_empty() => {
             // The config loader returns an empty table when the file
@@ -253,7 +253,7 @@ mod tests {
     // ---- Skill discovery tests ----
 
     // Note: `list_skills` also discovers user-scoped skills from
-    // `~/.opengrok/skills/`, so on a developer machine the result may be
+    // `~/.grok/skills/`, so on a developer machine the result may be
     // non-empty even for an empty workspace. Tests below check for
     // specific skills rather than asserting emptiness.
 
@@ -355,7 +355,7 @@ mod tests {
         );
     }
 
-    // Discovery also scans the real `~/.opengrok`, so fixtures use test-unique names.
+    // Discovery also scans the real `~/.grok`, so fixtures use test-unique names.
     #[tokio::test]
     async fn discover_agents_md_receives_normalized_rule_content() {
         let tmp = tempfile::tempdir().unwrap();
@@ -415,16 +415,12 @@ mod tests {
     // ---- Plugin discovery tests ----
 
     // Note: `discover_plugins` also discovers user-scoped plugins
-    // from `~/.opengrok/plugins/`, so tests check for specific plugins.
+    // from `~/.grok/plugins/`, so tests check for specific plugins.
 
     #[test]
     fn discover_plugins_finds_manifest_plugin() {
         let tmp = tempfile::tempdir().unwrap();
-        let plugins_dir = tmp
-            .path()
-            .join(".opengrok")
-            .join("plugins")
-            .join("test-plugin");
+        let plugins_dir = tmp.path().join(".opengrok").join("plugins").join("test-plugin");
         fs::create_dir_all(&plugins_dir).unwrap();
         fs::write(
             plugins_dir.join("plugin.json"),
@@ -449,11 +445,7 @@ mod tests {
     #[test]
     fn discover_plugins_json_has_expected_fields() {
         let tmp = tempfile::tempdir().unwrap();
-        let plugins_dir = tmp
-            .path()
-            .join(".opengrok")
-            .join("plugins")
-            .join("field-test");
+        let plugins_dir = tmp.path().join(".opengrok").join("plugins").join("field-test");
         fs::create_dir_all(plugins_dir.join("skills")).unwrap();
         fs::write(
             plugins_dir.join("plugin.json"),
@@ -492,7 +484,7 @@ mod tests {
     #[test]
     fn load_project_config_reads_toml_as_json() {
         let tmp = tempfile::tempdir().unwrap();
-        let grok_dir = tmp.path().join(".opengrok");
+        let grok_dir = tmp.path().join(".grok");
         fs::create_dir_all(&grok_dir).unwrap();
         fs::write(
             grok_dir.join("config.toml"),

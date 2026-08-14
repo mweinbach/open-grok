@@ -67,7 +67,7 @@ pub enum ContextualTipKind {
     SmallScreen,
     /// Double-click fold/nav path → tip to enable Word select in settings.
     WordSelect,
-    /// SSH session without `open-grok wrap` → tip to wrap the ssh command locally.
+    /// SSH session without `grok wrap` → tip to wrap the ssh command locally.
     SshWrap,
 }
 
@@ -159,13 +159,13 @@ impl CliUpdateInstaller {
 /// as `--trigger=<value>`; [`CliUpdateTrigger::as_str`] and `FromStr` are
 /// the one rendering (round-trip pinned with the wire values in tests).
 ///
-/// Volume caveat: one-shot `open-grok update` resolves telemetry from disk+env
+/// Volume caveat: one-shot `grok update` resolves telemetry from disk+env
 /// only, so `user_command` under-reports relative to the in-process
 /// `leader_converge` — the triggers are not directly comparable.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CliUpdateTrigger {
-    /// A human ran `open-grok update` or accepted an update prompt.
+    /// A human ran `grok update` or accepted an update prompt.
     UserCommand,
     /// TUI/stdio launch check spawned a detached update child.
     AutoBackground,
@@ -1332,7 +1332,7 @@ pub struct ActionStationarityStop {
 #[derive(Serialize)]
 pub struct ToolCallCompleted {
     pub tool_name: String,
-    pub outcome: xai_file_utils::events::types::ToolOutcome,
+    pub outcome: xai_grok_session_events::types::ToolOutcome,
     pub duration_ms: u64,
     /// Primary file path of the call, for the external stream only
     /// (`#[serde(skip)]`: never serialized to product events/analytics). Always reduced to
@@ -1667,7 +1667,7 @@ pub struct ClipboardCopy {
     pub osc52_ok: bool,
     /// Evidence classification: `confirmed` | `unverified` | `failed`.
     pub delivery: &'static str,
-    /// An explicit `open-grok wrap` OSC 52 sink was active.
+    /// An explicit `grok wrap` OSC 52 sink was active.
     pub osc52_sink: bool,
     /// The process was inside a container without a display server.
     pub container_no_display: bool,
@@ -1975,7 +1975,7 @@ impl CliUpdateChannel {
     }
 }
 
-/// One attempt to download + activate a new `open-grok` binary. Analytics name:
+/// One attempt to download + activate a new `grok` binary. Analytics name:
 /// `grok-shell-cli_update`. Emitted on failure too; failures carry the
 /// typed `error_kind` only — freeform strings leak home paths.
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -2615,24 +2615,6 @@ mod tests {
     }
 
     #[test]
-    fn plugin_cta_installed_includes_error_category_when_some() {
-        let v = serde_json::to_value(PluginCtaInstalled {
-            plugin_name: "figma".into(),
-            success: false,
-            error_category: Some("not_found".into()),
-        })
-        .unwrap();
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "plugin_name": "figma",
-                "success": false,
-                "error_category": "not_found",
-            })
-        );
-    }
-
-    #[test]
     fn cli_update_event_name_and_serde() {
         assert_eq!(CliUpdate::NAME, "cli_update");
         let ok = serde_json::to_value(CliUpdate {
@@ -2735,5 +2717,23 @@ mod tests {
                 "{private:?} must bucket to other"
             );
         }
+    }
+
+    #[test]
+    fn plugin_cta_installed_includes_error_category_when_some() {
+        let v = serde_json::to_value(PluginCtaInstalled {
+            plugin_name: "figma".into(),
+            success: false,
+            error_category: Some("not_found".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "plugin_name": "figma",
+                "success": false,
+                "error_category": "not_found",
+            })
+        );
     }
 }

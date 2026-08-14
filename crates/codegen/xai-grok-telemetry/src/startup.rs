@@ -80,8 +80,6 @@ pub enum Owner {
     Agent,
 }
 
-/// The kind of agent process a connect attempt targets. `label` is the
-/// telemetry token; `Display` is the prose in user-facing errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, serde::Serialize)]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -93,15 +91,6 @@ pub enum AgentKind {
 impl AgentKind {
     pub fn label(self) -> &'static str {
         self.into()
-    }
-}
-
-impl std::fmt::Display for AgentKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Embedded => "the embedded agent",
-            Self::Leader => "the Open Grok leader",
-        })
     }
 }
 
@@ -182,35 +171,35 @@ impl StartupTimer {
     /// layers can name the same step and it is measured once.
     pub fn enter(&self, phase: StartupPhase) {
         let now = Instant::now();
-        let mut g = self.lock();
-        if let Some((current_phase, _)) = g.current {
-            if current_phase == phase {
+        {
+            let mut g = self.lock();
+            if matches!(g.current, Some((open, _)) if open == phase) {
                 return;
             }
+            if let Some((prev, t0)) = g.current.take() {
+                g.completed.push((prev, now.saturating_duration_since(t0)));
+            }
+            g.current = Some((phase, now));
         }
-        if let Some((prev_phase, started_at)) = g.current.take() {
-            g.completed
-                .push((prev_phase, now.saturating_duration_since(started_at)));
-        }
-        g.current = Some((phase, now));
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        tracing::info!(phase = %phase.label(), elapsed_ms, "startup phase");
+        crate::unified_log::info(
+            STARTUP_PHASE_MSG,
+            None,
+            Some(serde_json::json!({ "phase": phase.label(), "elapsed_ms": elapsed_ms })),
+        );
     }
 
-    /// Close any currently-open phase (e.g. at connect success or timeout).
-    pub fn close_open_phase(&self) {
+    fn close_open_phase(&self) {
         let now = Instant::now();
         let mut g = self.lock();
-        if let Some((phase, started_at)) = g.current.take() {
-            g.completed
-                .push((phase, now.saturating_duration_since(started_at)));
+        if let Some((prev, t0)) = g.current.take() {
+            g.completed.push((prev, now.saturating_duration_since(t0)));
         }
     }
 
     pub fn set_auth_mode(&self, mode: AuthMode) {
         self.lock().auth_mode = mode;
-    }
-
-    pub fn set_owner(&self, owner: Owner) {
-        self.lock().owner = owner;
     }
 
     pub fn auth_mode(&self) -> AuthMode {

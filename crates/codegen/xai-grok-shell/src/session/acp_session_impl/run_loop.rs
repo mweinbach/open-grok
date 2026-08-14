@@ -775,9 +775,9 @@ pub(super) async fn run_session(
                                 .await;
                             let _ = respond_to.send(result);
                         }
-                        SessionCommand::KillBackgroundTask { task_id, respond_to } => {
+                        SessionCommand::KillBackgroundTask { task_id, source, respond_to } => {
                             let result = session.agent.borrow().tool_bridge()
-                                .kill_background_task(&task_id)
+                                .kill_background_task(&task_id, source)
                                 .await
                                 .map_err(|e| e.to_string());
                             let _ = respond_to.send(result);
@@ -1370,8 +1370,11 @@ pub(super) async fn run_session(
                             }
 
                             for name in &diff.removed {
-                                let prefix =
-                                    crate::session::mcp_servers::mcp_tool_name_prefix(name);
+                                let prefix = format!(
+                                    "{}{}",
+                                    name,
+                                    crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+                                );
                                 let removed_count = session
                                     .agent
                                     .borrow()
@@ -1391,7 +1394,7 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ToggleMcpServer { server_name, enabled, server_config, respond_to } => {
-                            session.events.emit(xai_file_utils::events::Event::McpServerToggled {
+                            session.events.emit(xai_grok_session_events::Event::McpServerToggled {
                                 server_name: server_name.clone(),
                                 enabled,
                             });
@@ -1455,8 +1458,11 @@ pub(super) async fn run_session(
                             }
 
                             for name in &diff.removed {
-                                let prefix =
-                                    crate::session::mcp_servers::mcp_tool_name_prefix(name);
+                                let prefix = format!(
+                                    "{}{}",
+                                    name,
+                                    crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+                                );
                                 let removed_count = session
                                     .agent
                                     .borrow()
@@ -1567,20 +1573,12 @@ pub(super) async fn run_session(
                                 });
                                 continue;
                             }
-                            let Some(qualified) =
-                                crate::session::mcp_servers::qualified_mcp_tool_name(
-                                    &server_name,
-                                    &tool_name,
-                                )
-                            else {
-                                let _ = respond_to.send(Err(
-                                    acp::Error::invalid_params().data(format!(
-                                        "MCP tool '{}::{}' cannot be represented as a provider-safe tool name",
-                                        server_name, tool_name
-                                    )),
-                                ));
-                                continue;
-                            };
+                            let qualified = format!(
+                                "{}{}{}",
+                                server_name,
+                                crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER,
+                                tool_name,
+                            );
                             let mut mcp_state = session.mcp_state.lock().await;
 
                             if enabled {

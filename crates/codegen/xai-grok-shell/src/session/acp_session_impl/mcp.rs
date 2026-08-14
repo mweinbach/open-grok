@@ -82,7 +82,15 @@ impl SessionActor {
         >,
     ) {
         let qualified_name = reg.name.clone();
-        let unqualified = reg.tool_name.clone();
+        let prefix = format!(
+            "{}{}",
+            server_name,
+            crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+        );
+        let unqualified = qualified_name
+            .strip_prefix(&prefix)
+            .unwrap_or(&qualified_name)
+            .to_string();
         if let Some(meta) = reg.meta.as_ref() {
             mcp_state
                 .mcp_tool_meta
@@ -623,7 +631,11 @@ impl SessionActor {
     /// Unregister `server`'s tools from the bridge after stdio restart
     /// exhaustion, so the model stops calling a now-absent client.
     pub(crate) fn unregister_server_tools(&self, server: &str) {
-        let prefix = crate::session::mcp_servers::mcp_tool_name_prefix(server);
+        let prefix = format!(
+            "{}{}",
+            server,
+            crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+        );
         let removed = self
             .agent
             .borrow()
@@ -894,7 +906,7 @@ impl SessionActor {
             } else {
                 mcp_state.cancel_init();
                 self.events
-                    .emit(xai_file_utils::events::Event::McpInitCancelled {
+                    .emit(xai_grok_session_events::Event::McpInitCancelled {
                         reason: MCP_INIT_CANCELLED_CONFIG_CHANGED.to_string(),
                     });
             }
@@ -966,7 +978,7 @@ impl SessionActor {
             } else {
                 mcp_state.cancel_init();
                 self.events
-                    .emit(xai_file_utils::events::Event::McpInitCancelled {
+                    .emit(xai_grok_session_events::Event::McpInitCancelled {
                         reason: MCP_INIT_CANCELLED_CONFIG_CHANGED.to_string(),
                     });
             }
@@ -1047,7 +1059,7 @@ impl SessionActor {
                         .iter()
                         .find(|c| mcp_server_name(c) == sname.as_str());
                     self.events
-                        .emit(xai_file_utils::events::Event::McpServerFailed {
+                        .emit(xai_grok_session_events::Event::McpServerFailed {
                             server_name: sname,
                             transport: cfg.map(|c| mcp_transport_str(c).to_string()),
                             target: cfg.map(mcp_target_str),
@@ -1069,7 +1081,7 @@ impl SessionActor {
             if mcp_state.generation() != generation {
                 mcp_state.cancel_init();
                 self.events
-                    .emit(xai_file_utils::events::Event::McpInitCancelled {
+                    .emit(xai_grok_session_events::Event::McpInitCancelled {
                         reason: MCP_INIT_CANCELLED_CONFIG_CHANGED.to_string(),
                     });
                 return;
@@ -1160,7 +1172,7 @@ impl SessionActor {
                     let server_name = client.server_name().to_string();
                     let server_start = std::time::Instant::now();
                     let timeout_sec = client.startup_timeout_sec();
-                    ew.emit(xai_file_utils::events::Event::McpServerStarting {
+                    ew.emit(xai_grok_session_events::Event::McpServerStarting {
                         server_name: server_name.clone(),
                         transport: transport.clone(),
                         target,
@@ -1236,7 +1248,7 @@ impl SessionActor {
                         generation,
                         mcp_state.generation()
                     );
-                    event_writer.emit(xai_file_utils::events::Event::McpInitCancelled {
+                    event_writer.emit(xai_grok_session_events::Event::McpInitCancelled {
                         reason: MCP_INIT_CANCELLED_CONFIG_CHANGED.to_string(),
                     });
                     return;
@@ -1257,11 +1269,28 @@ impl SessionActor {
                                 "MCP handshake succeeded",
                             );
                             let tool_count = registrations.len() as u32;
-                            let registered_tool_names: Vec<String> =
-                                registrations.iter().map(|r| r.tool_name.clone()).collect();
+                            let registered_tool_names: Vec<String> = registrations
+                                .iter()
+                                .map(|r| {
+                                    let prefix = format!(
+                                        "{}{}",
+                                        server_name,
+                                        crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+                                    );
+                                    r.name.strip_prefix(&prefix).unwrap_or(&r.name).to_string()
+                                })
+                                .collect();
                             for reg in registrations {
                                 let qualified_name = reg.name.clone();
-                                let unqualified = reg.tool_name.clone();
+                                let prefix = format!(
+                                    "{}{}",
+                                    server_name,
+                                    crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+                                );
+                                let unqualified = qualified_name
+                                    .strip_prefix(&prefix)
+                                    .unwrap_or(&qualified_name)
+                                    .to_string();
                                 if let Some(meta) = reg.meta.as_ref() {
                                     mcp_state
                                         .mcp_tool_meta
@@ -1311,7 +1340,7 @@ impl SessionActor {
                                             e
                                         );
                                         event_writer
-                                            .emit(xai_file_utils::events::Event::McpToolRegistrationFailed {
+                                            .emit(xai_grok_session_events::Event::McpToolRegistrationFailed {
                                                 server_name: server_name.clone(),
                                                 tool_name: qualified_name.clone(),
                                                 error: e.to_string(),
@@ -1346,7 +1375,7 @@ impl SessionActor {
                                 .get(server_name.as_str())
                                 .copied()
                                 .unwrap_or("unknown");
-                            event_writer.emit(xai_file_utils::events::Event::McpServerConnected {
+                            event_writer.emit(xai_grok_session_events::Event::McpServerConnected {
                                 server_name: server_name.clone(),
                                 transport: transport_str.to_string(),
                                 tool_count,
@@ -1371,15 +1400,15 @@ impl SessionActor {
                         }
                         Err((server_name, ref e, needs_auth, elapsed, timeout_sec)) => {
                             let error_cat = if needs_auth {
-                                xai_file_utils::events::McpErrorCategory::AuthRequired
+                                xai_grok_session_events::McpErrorCategory::AuthRequired
                             } else {
                                 e.error_category()
                             };
                             let error_type_label = match error_cat {
-                                xai_file_utils::events::McpErrorCategory::AuthRequired => {
+                                xai_grok_session_events::McpErrorCategory::AuthRequired => {
                                     xai_grok_telemetry::events::McpErrorType::Auth
                                 }
-                                xai_file_utils::events::McpErrorCategory::Timeout => {
+                                xai_grok_session_events::McpErrorCategory::Timeout => {
                                     xai_grok_telemetry::events::McpErrorType::Timeout
                                 }
                                 _ => xai_grok_telemetry::events::McpErrorType::HandshakeFailed,
@@ -1408,7 +1437,7 @@ impl SessionActor {
                                 None,
                                 Some(error_type_label.as_str()),
                             );
-                            event_writer.emit(xai_file_utils::events::Event::McpServerFailed {
+                            event_writer.emit(xai_grok_session_events::Event::McpServerFailed {
                                 server_name: server_name.clone(),
                                 transport: Some(transport_str.to_string()),
                                 target: server_target_map.get(server_name.as_str()).cloned(),
@@ -1465,7 +1494,7 @@ impl SessionActor {
                         is_reinit,
                     },
                 );
-                event_writer.emit(xai_file_utils::events::Event::McpInitCompleted {
+                event_writer.emit(xai_grok_session_events::Event::McpInitCompleted {
                     total_servers: server_count,
                     succeeded: servers_succeeded,
                     failed: servers_failed,
@@ -1494,7 +1523,15 @@ impl SessionActor {
                 let mut mcp_state = mcp_state_bg.lock().await;
                 for reg in regs {
                     let qualified_name = reg.name.clone();
-                    let unqualified = reg.tool_name.clone();
+                    let prefix = format!(
+                        "{}{}",
+                        server_name,
+                        crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
+                    );
+                    let unqualified = qualified_name
+                        .strip_prefix(&prefix)
+                        .unwrap_or(&qualified_name)
+                        .to_string();
                     if let Some(meta) = reg.meta.as_ref() {
                         mcp_state
                             .mcp_tool_meta

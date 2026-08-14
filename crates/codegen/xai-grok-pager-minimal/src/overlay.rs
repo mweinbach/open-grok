@@ -231,20 +231,16 @@ fn compute_target(app: &mut AppView, term_h: u16, width: u16) -> u16 {
     let content_w = width as usize;
 
     let ActiveView::Agent(id) = &app.active_view else {
-        let auth_provider = super::auth::minimal_auth_provider(
-            app.primary_provider,
-            app.startup_provider_selection,
-        );
-        let hint = super::auth::minimal_auth_hint_with_trust(
+        // No agent yet: size for the in-region sign-in / folder-trust UI so the
+        // trust question isn't clipped to the idle prompt height.
+        let hint = super::auth::minimal_auth_hint(
             &app.auth_state,
-            auth_provider,
             &app.trust_state,
             app.has_access(),
             app.is_zdr_blocked(),
         );
-        return super::auth::auth_hint_rows(&hint, width)
-            .max(base)
-            .min(ceiling);
+        let needed = super::auth::auth_hint_rows(&hint, width);
+        return needed.max(base).min(ceiling);
     };
     let id = *id;
     // Snapshot mode/multiline before the mut agent borrow so `prompt_style` can

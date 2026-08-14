@@ -88,6 +88,19 @@ pub(super) fn get_active_agent_mut(app: &mut AppView) -> Option<&mut AgentView> 
     None
 }
 
+/// Child view when a fullscreen subagent overlay is open.
+///
+/// Unlike [`get_active_agent_mut`], never falls back to the parent.
+/// Overlay cancel uses this so the overlay-open check and cancel target cannot disagree.
+pub(super) fn active_subagent_view_mut(app: &mut AppView) -> Option<&mut AgentView> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return None;
+    };
+    let agent = app.agents.get_mut(&id)?;
+    let child_sid = agent.active_subagent.clone()?;
+    agent.subagent_views.get_mut(&child_sid).map(|b| &mut **b)
+}
+
 /// Get the agent currently visible on an agent surface, including an agent
 /// attached inside the dashboard session overlay. This is intentionally
 /// separate from [`get_active_agent_mut`]: most dispatch actions remain scoped
@@ -156,6 +169,16 @@ pub(super) fn reseed_tip_for_new_session(app: &mut AppView) {
 pub(super) fn show_welcome(app: &mut AppView) {
     app.active_view = ActiveView::Welcome;
     app.welcome_announcement = WelcomeAnnouncementState::default();
+    // Drop stale welcome workspace one-shot / ACK so a later create/load
+    // cannot inherit an override from a deferred or abandoned NewSession.
+    #[cfg(feature = "local-workspace")]
+    {
+        app.welcome_session_local_workspace = None;
+        app.welcome_local_workspace_ack_pending = false;
+        // Abandoning a session/restore must not leak history bypass into the
+        // next welcome LoadSession / SessionFlags.chat_mode batch.
+        app.welcome_history_load_as_build = false;
+    }
 }
 
 /// Restore the view a mid-session auth flow launched from, falling back to the
@@ -164,9 +187,7 @@ pub(super) fn show_welcome(app: &mut AppView) {
 pub(super) fn restore_auth_return_view(app: &mut AppView, return_view: ActiveView) {
     match return_view {
         ActiveView::Agent(id) if app.agents.contains_key(&id) => {
-            app.active_view = ActiveView::Agent(id);
-            let effects = app.sync_primary_provider_from_active_agent();
-            app.pending_effects.extend(effects);
+            app.active_view = ActiveView::Agent(id)
         }
         ActiveView::AgentDashboard => {
             app.active_view = ActiveView::AgentDashboard;
@@ -262,14 +283,6 @@ pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, cause: SwitchC
         _ => None,
     };
     app.active_view = ActiveView::Agent(target);
-    // A placeholder created before `session/new` has no authoritative model
-    // yet; preserve the planned startup provider until the create response.
-    // Bound-session tab switches, however, must immediately re-anchor global
-    // provider access state to the tab's actual model.
-    if app.agents[&target].session.session_id.is_some() {
-        let effects = app.sync_primary_provider_from_active_agent();
-        app.pending_effects.extend(effects);
-    }
     // Re-anchor the global permission-mode mirror to the now-active agent so the
     // cycle's `sync_active_auto_flag` (which derives from the global) can't copy a
     // different agent's stale Auto/Always-Approve onto this one. Per-session
@@ -300,6 +313,7 @@ pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, cause: SwitchC
     // Seed the auto feature gate on the (possibly new) active agent's slash
     // registry.
     app.sync_permission_mode_slash_gate();
+    let _ = app.sync_primary_provider_from_active_agent();
     surface_yolo_launch_block_notice(app, target);
 
     if matches!(cause, SwitchCause::New | SwitchCause::Fork)

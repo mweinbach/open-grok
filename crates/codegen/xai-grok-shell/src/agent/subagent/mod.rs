@@ -32,7 +32,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
-use xai_file_utils::events::types::CancellationCategory;
+use xai_grok_session_events::types::CancellationCategory;
 use xai_grok_agent::config::{McpInheritance, ModelOverride, PermissionMode};
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_sampling_types::conversation::ConversationItem;
@@ -2280,7 +2280,7 @@ async fn signals_snapshot_counts(child_handle: &SessionHandle) -> (u32, u32) {
         .unwrap_or((0, 0))
 }
 fn cancellation_error_message(
-    category: Option<xai_file_utils::events::types::CancellationCategory>,
+    category: Option<xai_grok_session_events::types::CancellationCategory>,
     context: Option<&crate::session::commands::CancellationContext>,
 ) -> String {
     let detail = context.and_then(|ctx| {
