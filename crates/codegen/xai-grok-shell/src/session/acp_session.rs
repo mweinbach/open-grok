@@ -103,10 +103,10 @@ pub(crate) use auth_retry::{
 };
 #[path = "acp_session_impl/goal.rs"]
 mod goal;
-#[path = "acp_session_impl/interjection.rs"]
-mod interjection;
 #[path = "acp_session_impl/image_strip.rs"]
 mod image_strip;
+#[path = "acp_session_impl/interjection.rs"]
+mod interjection;
 #[path = "acp_session_impl/tool_calls.rs"]
 mod tool_calls;
 #[path = "acp_session_impl/turn.rs"]
@@ -786,6 +786,8 @@ pub(crate) struct SessionActor {
     git_head_enabled: bool,
     /// Shared models manager for etag-triggered refresh from response headers.
     pub(crate) models_manager: crate::agent::models::ModelsManager,
+    /// Prompt cache hit rate and break diagnostics tracker.
+    pub(crate) cache_tracker: std::cell::RefCell<crate::session::cache_tracker::CacheTracker>,
     /// Stable display path for forked sessions (original project path).
     ///
     /// Used by `build_user_message_prefix` (user-message `Workspace Path`),

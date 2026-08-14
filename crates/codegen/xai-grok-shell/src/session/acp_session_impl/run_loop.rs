@@ -769,6 +769,12 @@ pub(super) async fn run_session(
                             let info = session.build_session_info().await;
                             let _ = responds_to.send(info);
                         }
+                        SessionCommand::GetCacheInfo { responds_to } => {
+                            let tracker = session.cache_tracker.borrow();
+                            let summary = tracker.summary();
+                            let recent = tracker.recent_turns().to_vec();
+                            let _ = responds_to.send((summary, recent));
+                        }
                         SessionCommand::BackgroundForegroundCommand { tool_call_id, respond_to } => {
                             let result = session.agent.borrow().tool_bridge()
                                 .background_foreground_command(&tool_call_id)
