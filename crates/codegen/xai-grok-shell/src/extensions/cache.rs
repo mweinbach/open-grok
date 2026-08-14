@@ -48,9 +48,9 @@ async fn handle_session_cache(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
         .send(SessionCommand::GetCacheInfo { responds_to: tx })
         .map_err(|_| acp::Error::internal_error().data("session actor channel closed"))?;
 
-    let (summary, recent_turns) = rx
-        .await
-        .map_err(|_| acp::Error::internal_error().data("session actor dropped cache query reply"))?;
+    let (summary, recent_turns) = rx.await.map_err(|_| {
+        acp::Error::internal_error().data("session actor dropped cache query reply")
+    })?;
 
     to_raw_response(&SessionCacheResponse {
         summary,

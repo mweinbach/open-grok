@@ -2846,11 +2846,7 @@ impl SessionActor {
                     "tokens_per_sec": tokens_per_sec,
                 })),
             );
-            let turn_idx_str = self
-                .chat_state_handle
-                .get_prompt_index()
-                .await
-                .to_string();
+            let turn_idx_str = self.chat_state_handle.get_prompt_index().await.to_string();
             if let Some(usage) = response.usage.as_ref() {
                 self.cache_tracker.borrow_mut().record_turn_outcome(
                     Some(self.session_info.id.0.as_ref()),

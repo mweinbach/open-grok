@@ -1588,10 +1588,7 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                matches!(
-                    outcome,
-                    SlashCommandOutcome::Builtin(BuiltinAction::Cache)
-                ),
+                matches!(outcome, SlashCommandOutcome::Builtin(BuiltinAction::Cache)),
                 "{alias}"
             );
         }
@@ -2172,7 +2169,13 @@ mod tests {
             );
         }
         // Always-on commands are still present.
-        for required in ["compact", "always-approve", "context", "session-info", "cache"] {
+        for required in [
+            "compact",
+            "always-approve",
+            "context",
+            "session-info",
+            "cache",
+        ] {
             assert!(
                 names.iter().any(|n| n == required),
                 "{required} should be present, got: {names:?}",
@@ -2788,7 +2791,13 @@ mod tests {
                 "{forbidden} must not be advertised under default fail-closed availability, got: {names:?}",
             );
         }
-        for required in ["compact", "always-approve", "context", "session-info", "cache"] {
+        for required in [
+            "compact",
+            "always-approve",
+            "context",
+            "session-info",
+            "cache",
+        ] {
             assert!(
                 names.iter().any(|n| n == required),
                 "AlwaysOn {required} must always be advertised, got: {names:?}",

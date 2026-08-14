@@ -167,18 +167,11 @@ pub enum PrefixDivergence {
     /// Structured-output JSON schema changed between turns.
     JsonSchemaChanged,
     /// System prompt changed between turns (lengths only; no prompt text).
-    SystemPromptChanged {
-        prev_len: usize,
-        curr_len: usize,
-    },
+    SystemPromptChanged { prev_len: usize, curr_len: usize },
     /// Tool definitions were added, removed, reordered, or modified.
-    ToolsChanged {
-        diff: String,
-    },
+    ToolsChanged { diff: String },
     /// Hosted tool definitions were added, removed, reordered, or modified.
-    HostedToolsChanged {
-        diff: String,
-    },
+    HostedToolsChanged { diff: String },
     /// Conversation item at `index` diverged from the previous turn.
     ItemDiverged {
         index: usize,
@@ -235,10 +228,7 @@ impl PrefixDivergence {
             Self::PromptCacheKeyChanged => "Prompt cache key changed.".to_string(),
             Self::ToolChoiceChanged => "Tool choice policy changed.".to_string(),
             Self::JsonSchemaChanged => "JSON schema changed.".to_string(),
-            Self::SystemPromptChanged {
-                prev_len,
-                curr_len,
-            } => {
+            Self::SystemPromptChanged { prev_len, curr_len } => {
                 format!(
                     "System prompt diverged (length changed from {prev_len} to {curr_len} bytes)."
                 )
@@ -428,10 +418,9 @@ impl CacheTracker {
                 .map(|effort| format!("{effort:?}").to_lowercase()),
             temperature_bits: request.temperature.map(f32::to_bits),
             prompt_cache_key: request.prompt_cache_key.clone(),
-            tool_choice_hash: request
-                .tool_choice
-                .as_ref()
-                .map_or(0, |choice| hash_json(&serde_json::to_value(choice).unwrap_or_default())),
+            tool_choice_hash: request.tool_choice.as_ref().map_or(0, |choice| {
+                hash_json(&serde_json::to_value(choice).unwrap_or_default())
+            }),
             json_schema_hash: request.json_schema.as_ref().map_or(0, hash_json),
             tools,
             hosted_tool_names,
@@ -844,7 +833,13 @@ fn summarize_item(item: &ConversationItem) -> (String, Option<String>, usize, bo
                     }
                 }
             }
-            (user_kind_label(u.synthetic_reason.as_ref()), None, len, false, has_images)
+            (
+                user_kind_label(u.synthetic_reason.as_ref()),
+                None,
+                len,
+                false,
+                has_images,
+            )
         }
         ConversationItem::Assistant(a) => {
             let text_len = a.content.len();
@@ -1123,7 +1118,10 @@ mod tests {
             Some(&CacheTracker::summarize_request(&req1)),
             &CacheTracker::summarize_request(&req2),
         );
-        assert!(matches!(div, PrefixDivergence::ReasoningEffortChanged { .. }));
+        assert!(matches!(
+            div,
+            PrefixDivergence::ReasoningEffortChanged { .. }
+        ));
     }
 
     #[test]
