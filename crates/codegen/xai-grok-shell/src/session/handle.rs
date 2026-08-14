@@ -71,6 +71,9 @@ pub struct SessionHandle {
     pub hunk_tracker_handle: HunkTrackerHandle,
     /// Actor-based chat state handle — lets callers inspect final conversation state.
     pub chat_state_handle: xai_chat_state::ChatStateHandle,
+    /// Main-turn prompt-cache tracker shared with the session actor.
+    pub prompt_cache:
+        std::sync::Arc<parking_lot::Mutex<xai_grok_sampling_types::PromptCacheTracker>>,
     /// Handle to session signals (used for completion tracking)
     pub signals_handle: super::signals::SessionSignalsHandle,
     /// Shared gate controlling whether the session actor forwards

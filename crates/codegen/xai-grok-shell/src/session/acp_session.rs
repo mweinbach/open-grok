@@ -191,6 +191,8 @@ mod rewind;
 mod run_loop;
 #[path = "acp_session_impl/session_setup.rs"]
 mod session_setup;
+#[path = "acp_session_impl/prompt_cache.rs"]
+mod prompt_cache;
 #[path = "acp_session_impl/side_call.rs"]
 mod side_call;
 #[path = "acp_session_impl/turn_end.rs"]
@@ -673,6 +675,10 @@ pub(crate) struct SessionActor {
     /// Also stores credentials (api_key, optional extra access key,
     /// client_version) opaquely.
     pub(crate) chat_state_handle: xai_chat_state::ChatStateHandle,
+    /// Main-turn prompt-cache prefix tracker. Auxiliary calls must not
+    /// record here — they would poison the next turn's prefix diff.
+    pub(crate) prompt_cache:
+        std::sync::Arc<parking_lot::Mutex<xai_grok_sampling_types::PromptCacheTracker>>,
     /// Current running prompt/turn id, shared with SessionHandle.
     pub(crate) current_prompt_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) unattributed_background_usage: std::sync::atomic::AtomicBool,

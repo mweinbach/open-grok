@@ -1387,6 +1387,9 @@ fn make_test_handle(
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         hunk_tracker_handle,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
+        prompt_cache: std::sync::Arc::new(parking_lot::Mutex::new(
+            xai_grok_sampling_types::PromptCacheTracker::default(),
+        )),
         signals_handle: crate::session::signals::SessionSignalsHandle::new(),
         gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         mcp_servers: vec![],
@@ -2198,6 +2201,14 @@ fn session_usage_request(session_id: &str) -> acp::ExtRequest {
             .into(),
     )
 }
+fn session_cache_request(session_id: &str) -> acp::ExtRequest {
+    acp::ExtRequest::new(
+        "x.ai/session/cache",
+        serde_json::value::to_raw_value(&serde_json::json!({ "sessionId": session_id }))
+            .unwrap()
+            .into(),
+    )
+}
 #[tokio::test(flavor = "current_thread")]
 async fn session_usage_unknown_session_is_resource_not_found() {
     let agent = build_minimal_agent_for_tests();
@@ -2221,6 +2232,32 @@ async fn session_usage_dead_chat_state_actor_fails_closed() {
             .await
             .expect_err("dead chat-state actor");
     assert_eq!(err.code, acp::Error::internal_error().code);
+}
+#[tokio::test(flavor = "current_thread")]
+async fn session_cache_unknown_session_is_resource_not_found() {
+    let agent = build_minimal_agent_for_tests();
+    let err = crate::extensions::cache::handle(&agent, &session_cache_request("no-such-session"))
+        .await
+        .expect_err("unknown session");
+    assert_eq!(
+        err.code,
+        acp::Error::resource_not_found(None::<String>).code
+    );
+}
+#[tokio::test(flavor = "current_thread")]
+async fn session_cache_empty_tracker_returns_report() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("cache-empty-sess");
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.info.id = sid.clone();
+    agent.insert_resident(&sid, handle);
+    let resp = crate::extensions::cache::handle(&agent, &session_cache_request("cache-empty-sess"))
+        .await
+        .expect("live session");
+    let parsed: crate::extensions::cache::SessionCacheResponse =
+        serde_json::from_str(resp.0.get()).expect("cache response");
+    assert_eq!(parsed.report.calls, 0);
+    assert!(parsed.text.contains("no model calls yet"));
 }
 /// The session responses publish the value THIS session's spawn pinned, so a
 /// client describing `/loop` fires can never contradict what the fires do.

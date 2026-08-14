@@ -1710,6 +1710,9 @@ pub(crate) async fn spawn_session_actor(
     let resolved_tool_overrides: std::sync::Arc<
         arc_swap::ArcSwapOption<xai_grok_sampling_types::ToolOverrides>,
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+    let prompt_cache = std::sync::Arc::new(parking_lot::Mutex::new(
+        xai_grok_sampling_types::PromptCacheTracker::default(),
+    ));
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
         session_info: session_info.clone(),
         auth_method_id,
@@ -1730,6 +1733,7 @@ pub(crate) async fn spawn_session_actor(
         mcp_strategy: std::cell::Cell::new(mcp_strategy),
         initial_client_mcp_servers: initial_client_mcp_servers.clone(),
         chat_state_handle,
+        prompt_cache: prompt_cache.clone(),
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: current_prompt_id.clone(),
         pending_interactions: pending_interactions.clone(),
@@ -2279,6 +2283,7 @@ pub(crate) async fn spawn_session_actor(
             resolved_tool_overrides,
             hunk_tracker_handle,
             chat_state_handle: chat_state_handle_for_handle,
+            prompt_cache,
             signals_handle,
             gateway_enabled,
             mcp_servers,

@@ -7,6 +7,10 @@ pub mod types;
 // `SamplingClient` -- the two have identical method sets, so call-sites
 // compile unchanged.
 pub use self::conversation::*;
+pub use xai_grok_sampling_types::{
+    CacheBreak, CacheCallOutcome, CachePrefixDiff, PromptCacheReport, PromptCacheTracker,
+    cache_hit_rate, format_cache_hit_rate,
+};
 pub use self::error::{ResponseModelMetadata, Result, SamplingError};
 pub use self::types::*;
 pub use xai_grok_sampler::ApiBackend;

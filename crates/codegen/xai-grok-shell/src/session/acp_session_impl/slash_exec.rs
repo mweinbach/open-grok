@@ -412,6 +412,11 @@ impl SessionActor {
                 self.send_host_turn_slash_command_output(&text).await;
                 ok_end_turn(0, None)
             }
+            BuiltinAction::Cache => {
+                let text = self.prompt_cache.lock().snapshot().format_report();
+                self.send_host_turn_slash_command_output(&text).await;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::PluginsAdd { path } => {
                 if path.is_empty() {
                     self.send_host_turn_slash_command_output(

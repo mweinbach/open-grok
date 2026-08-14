@@ -14,10 +14,15 @@ pub(crate) fn log_prompt_cache_hit(
     let Some(usage) = response.usage.as_ref() else {
         return;
     };
+    let hit_rate = xai_grok_sampling_types::cache_hit_rate(
+        u64::from(usage.cached_prompt_tokens),
+        u64::from(usage.prompt_tokens),
+    );
     tracing::info!(
         call,
         cached_prompt_tokens = usage.cached_prompt_tokens,
         prompt_tokens = usage.prompt_tokens,
+        hit_rate = xai_grok_sampling_types::format_cache_hit_rate(hit_rate),
         cache_key_forwarded = backend.forwards_prompt_cache_key(),
         "auxiliary call prompt cache"
     );

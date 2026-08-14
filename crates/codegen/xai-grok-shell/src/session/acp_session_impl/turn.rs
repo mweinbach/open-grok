@@ -2845,6 +2845,14 @@ impl SessionActor {
                 })),
             );
             if let Some(usage) = response.usage.as_ref() {
+                self.record_and_log_prompt_cache(
+                    &request,
+                    usage,
+                    api_backend.forwards_prompt_cache_key(),
+                    loop_index,
+                );
+            }
+            if let Some(usage) = response.usage.as_ref() {
                 self.chat_state_handle
                     .record_token_usage(u64::from(usage.total_tokens));
                 self.send_available_commands_update().await;
