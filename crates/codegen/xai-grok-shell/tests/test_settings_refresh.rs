@@ -183,6 +183,7 @@ async fn test_doom_loop_recovery_settings_round_trip() {
                 enabled: Some(true),
                 max_threshold: Some(16),
                 max_retries: Some(1),
+                ..Default::default()
             }),
             ..Default::default()
         });
