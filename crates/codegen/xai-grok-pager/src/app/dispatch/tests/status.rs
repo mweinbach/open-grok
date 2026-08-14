@@ -969,6 +969,65 @@ fn show_usage_with_redirect_url_fetches_session_only() {
     assert_eq!(agent_scrollback_len(&app), before);
 }
 
+#[test]
+fn show_cache_on_welcome_screen_is_noop() {
+    let mut app = test_app();
+    let effects = dispatch(Action::ShowCache, &mut app);
+    assert!(
+        effects.is_empty(),
+        "ShowCache with no active agent should be a no-op"
+    );
+}
+
+#[test]
+fn show_cache_fetches_session_cache() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::ShowCache, &mut app);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::FetchSessionCache { agent_id, .. }] if *agent_id == AgentId(0)
+        ),
+        "got: {effects:?}"
+    );
+}
+
+#[test]
+fn session_cache_complete_commits_block() {
+    let mut app = test_app_with_agent();
+    let session_id = app
+        .agents
+        .get(&AgentId(0))
+        .unwrap()
+        .session
+        .session_id
+        .clone()
+        .unwrap();
+    let cache = Box::new(xai_grok_shell::extensions::cache::SessionCacheResponse {
+        summary: xai_grok_shell::session::CacheSummary {
+            total_input_tokens: 5000,
+            total_cached_tokens: 4000,
+            overall_hit_rate_pct: 80.0,
+            total_turns: 2,
+            hits: 2,
+            partial_hits: 0,
+            breaks: 0,
+            last_break_diagnostic: None,
+        },
+        recent_turns: vec![],
+    });
+    let before = agent_scrollback_len(&app);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionCacheComplete {
+            agent_id: AgentId(0),
+            session_id,
+            cache,
+        }),
+        &mut app,
+    );
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+}
+
 // ── Minimal update-notice tests ──────────────────────────────────────
 
 #[test]

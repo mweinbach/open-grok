@@ -193,10 +193,19 @@ pub(crate) fn session_usage_block_text(
     }
 
     let mut rows = Vec::new();
+    let cache_suffix = if t.input_tokens > 0 && t.cached_read_tokens > 0 {
+        format!(
+            " ({} cached · {:.1}% hit rate)",
+            group_thousands(t.cached_read_tokens),
+            t.cache_hit_rate_pct()
+        )
+    } else {
+        format!(" ({} cached)", group_thousands(t.cached_read_tokens))
+    };
     rows.push(format!(
-        "  Input tokens:   {} ({} cached)",
+        "  Input tokens:   {}{}",
         group_thousands(t.input_tokens),
-        group_thousands(t.cached_read_tokens),
+        cache_suffix,
     ));
     rows.push(format!(
         "  Output tokens:  {} ({} reasoning)",
@@ -217,8 +226,13 @@ pub(crate) fn session_usage_block_text(
     if usage.model_usage.len() > 1 {
         rows.push("  By model:".to_string());
         for (model, m) in &usage.model_usage {
+            let cache_str = if m.input_tokens > 0 && m.cached_read_tokens > 0 {
+                format!(" · {:.1}% cache hit", m.cache_hit_rate_pct())
+            } else {
+                String::new()
+            };
             rows.push(format!(
-                "    {model} — {} in / {} out · {}",
+                "    {model} — {} in / {} out{cache_str} · {}",
                 group_thousands(m.input_tokens),
                 group_thousands(m.output_tokens),
                 format_cost(m),
@@ -232,6 +246,52 @@ pub(crate) fn session_usage_block_text(
 
     join_header_rows(
         "Session usage (since start or last resume):".to_string(),
+        rows,
+    )
+}
+
+/// `/cache` body — prompt cache hit rates, break diagnostics, and recent turn history.
+pub(crate) fn session_cache_block_text(
+    cache: &xai_grok_shell::extensions::cache::SessionCacheResponse,
+) -> String {
+    let s = &cache.summary;
+    if s.total_turns == 0 {
+        return "Prompt cache telemetry: no turns recorded yet in this session.".to_string();
+    }
+
+    let mut rows = Vec::new();
+    rows.push(format!(
+        "  Cache hit rate: {:.1}% ({} of {} input tokens cached)",
+        s.overall_hit_rate_pct,
+        group_thousands(s.total_cached_tokens),
+        group_thousands(s.total_input_tokens),
+    ));
+    rows.push(format!(
+        "  Turns tracked:  {} ({} hits · {} partial · {} breaks)",
+        s.total_turns, s.hits, s.partial_hits, s.breaks,
+    ));
+
+    if let Some(ref last_break) = s.last_break_diagnostic {
+        rows.push(format!("  Last break:     {last_break}"));
+    }
+
+    if !cache.recent_turns.is_empty() {
+        rows.push("  Recent turns:".to_string());
+        for rec in cache.recent_turns.iter().rev().take(10) {
+            rows.push(format!(
+                "    Turn #{} (loop {}) — {:.1}% hit ({} in, {} cached) · {}",
+                rec.turn_idx,
+                rec.loop_index,
+                rec.cache_hit_rate_pct,
+                group_thousands(rec.prompt_tokens as u64),
+                group_thousands(rec.cached_prompt_tokens as u64),
+                rec.diagnostic,
+            ));
+        }
+    }
+
+    join_header_rows(
+        "Prompt Cache Telemetry & Diagnostics:".to_string(),
         rows,
     )
 }
@@ -407,5 +467,55 @@ mod tests {
             format_queue_row(3, "first\nsecond\nthird"),
             "  #3  first  (+2 more lines)"
         );
+    }
+
+    #[test]
+    fn session_cache_block_empty() {
+        let resp = xai_grok_shell::extensions::cache::SessionCacheResponse {
+            summary: Default::default(),
+            recent_turns: vec![],
+        };
+        assert_eq!(
+            session_cache_block_text(&resp),
+            "Prompt cache telemetry: no turns recorded yet in this session."
+        );
+    }
+
+    #[test]
+    fn session_cache_block_formats_summary_and_turns() {
+        let resp = xai_grok_shell::extensions::cache::SessionCacheResponse {
+            summary: xai_grok_shell::session::CacheSummary {
+                total_input_tokens: 10_000,
+                total_cached_tokens: 8_500,
+                overall_hit_rate_pct: 85.0,
+                total_turns: 4,
+                hits: 3,
+                partial_hits: 0,
+                breaks: 1,
+                last_break_diagnostic: Some("Cache break: 0% hit rate. Item #2 was pruned/trimmed".into()),
+            },
+            recent_turns: vec![
+                xai_grok_shell::session::CacheTurnRecord {
+                    turn_idx: "1".into(),
+                    loop_index: 0,
+                    prompt_tokens: 2500,
+                    cached_prompt_tokens: 2000,
+                    completion_tokens: 150,
+                    cache_hit_rate_pct: 80.0,
+                    status: xai_grok_shell::session::CacheStatus::Hit,
+                    divergence: xai_grok_shell::session::PrefixDivergence::PrefixIntact {
+                        preserved_items: 4,
+                        new_items: 1,
+                    },
+                    diagnostic: "Cache hit: 80.0%".into(),
+                    timestamp_rfc3339: "2026-08-14T00:00:00Z".into(),
+                },
+            ],
+        };
+        let text = session_cache_block_text(&resp);
+        assert!(text.contains("Cache hit rate: 85.0% (8,500 of 10,000 input tokens cached)"), "{text}");
+        assert!(text.contains("Turns tracked:  4 (3 hits · 0 partial · 1 breaks)"), "{text}");
+        assert!(text.contains("Last break:     Cache break: 0% hit rate. Item #2 was pruned/trimmed"), "{text}");
+        assert!(text.contains("Turn #1 (loop 0) — 80.0% hit (2,500 in, 2,000 cached) · Cache hit: 80.0%"), "{text}");
     }
 }

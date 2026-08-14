@@ -179,6 +179,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         git_head_enabled: false,
         models_manager: Default::default(),
+        cache_tracker: std::cell::RefCell::new(crate::session::cache_tracker::CacheTracker::new()),
         display_cwd: std::sync::OnceLock::new(),
         active_agent_type: parking_lot::Mutex::new(None),
         queue_exit_reminder_on_approved_exit: Arc::new(std::sync::atomic::AtomicBool::new(false)),

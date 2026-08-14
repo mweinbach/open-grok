@@ -2566,6 +2566,8 @@ impl SessionActor {
                 .tool_context
                 .clamp_task_model_request(request.max_output_tokens)
                 .map_err(|message| acp::Error::internal_error().data(message))?;
+            let request_summary =
+                crate::session::cache_tracker::CacheTracker::summarize_request(&request);
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
             });
@@ -2843,6 +2845,20 @@ impl SessionActor {
                     "reasoning_tokens": reasoning_tokens,
                     "tokens_per_sec": tokens_per_sec,
                 })),
+            );
+            let turn_idx_str = self
+                .chat_state_handle
+                .get_prompt_index()
+                .await
+                .to_string();
+            self.cache_tracker.borrow_mut().record_turn_outcome(
+                Some(self.session_info.id.0.as_ref()),
+                &turn_idx_str,
+                loop_index,
+                prompt_tokens.unwrap_or(0),
+                cached_prompt_tokens.unwrap_or(0),
+                completion_tokens.unwrap_or(0),
+                request_summary,
             );
             if let Some(usage) = response.usage.as_ref() {
                 self.chat_state_handle

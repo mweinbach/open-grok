@@ -675,6 +675,19 @@ pub enum Action {
         models: Vec<String>,
     },
     RefreshOpenCodeGoModels,
+    SetCustomModelId(String),
+    SetCustomModelSlug(String),
+    SetCustomModelName(String),
+    SetCustomModelProvider(String),
+    SetCustomModelBaseUrl(String),
+    SetCustomModelContextWindow(i64),
+    SetCustomModelBackend(String),
+    SetCustomModelEnvKey(String),
+    SetCustomModelSave(bool),
+    DeleteCustomModel {
+        key: String,
+    },
+    RefreshCustomModels,
     SetPerplexityWebSearch(bool),
     SetPerplexityApiKey {
         key: crate::settings::SecretInput,
@@ -838,6 +851,8 @@ pub enum Action {
     ShowContextInfo,
     /// `/usage` — session token/cost, plus consumer credits when visible.
     ShowUsage,
+    /// `/cache` — view prompt cache hit rate, prefix divergence, and break diagnostics.
+    ShowCache,
     /// `/usage manage` — open consumer billing (no-op if surface hidden).
     ManageBilling,
     /// Commit a read-only list of the queued prompts as a system block
@@ -1631,6 +1646,24 @@ pub enum Effect {
     },
     QueryOpenCodeGoModels {
         generation: u64,
+    },
+    QueryCustomModels {
+        generation: u64,
+    },
+    UpsertCustomModel {
+        generation: u64,
+        key: String,
+        model: String,
+        name: Option<String>,
+        provider: Option<String>,
+        base_url: Option<String>,
+        context_window: Option<u64>,
+        api_backend: Option<String>,
+        env_key: Option<String>,
+    },
+    DeleteCustomModel {
+        generation: u64,
+        key: String,
     },
     UpdatePerplexityWebSearch {
         enabled: Option<bool>,
@@ -2483,6 +2516,11 @@ pub enum Effect {
         /// Usage-modal fetch generation; echoed back on the task result.
         nonce: u64,
     },
+    /// Fetch prompt cache metrics and diagnostics via `x.ai/session/cache`.
+    FetchSessionCache {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
     /// Re-fetch remote settings to check subscription gate.
     RefreshGate,
     /// Spawn a debounce sleep task for shell suggestions. `agent_id` rides
@@ -2720,6 +2758,14 @@ pub enum TaskResult {
         models: Option<acp::SessionModelState>,
         catalog: Vec<xai_grok_shell::opencode_go_models::OpenCodeGoModelDescriptor>,
         enabled_models: Vec<String>,
+    },
+    CustomModelsUpdated {
+        generation: u64,
+        stale: bool,
+        warning: Option<String>,
+        error: Option<String>,
+        models: Option<acp::SessionModelState>,
+        custom_models: Vec<crate::settings::CustomModelRecord>,
     },
     /// Completion of a Wafer credential update and dynamic catalog refresh.
     WaferApiKeyUpdated {
@@ -3295,6 +3341,18 @@ pub enum TaskResult {
         session_id: acp::SessionId,
         error: String,
         nonce: u64,
+    },
+    /// `/cache` prompt cache metrics fetched.
+    SessionCacheComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        cache: Box<xai_grok_shell::extensions::cache::SessionCacheResponse>,
+    },
+    /// `/cache` prompt cache metrics fetch failed.
+    SessionCacheFailed {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        error: String,
     },
     /// Feedback submitted successfully (fire-and-forget).
     FeedbackComplete {
