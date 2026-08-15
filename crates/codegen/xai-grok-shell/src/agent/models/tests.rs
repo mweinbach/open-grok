@@ -2036,6 +2036,7 @@ fn make_entry_config_with_id(
         // tool-mode / reasoning-summary contracts unless a test opts in.
         provider: xai_grok_sampling_types::ModelProvider::default(),
         tool_mode: None,
+        subagent_context_default: None,
         codex_multi_agent_v2: false,
         context_window: std::num::NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,

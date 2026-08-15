@@ -6,9 +6,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::implementations::grok_build::task::types::{
-    SessionIdResource, SubagentEvent, SubagentEventSender, SubagentLoopUnitActiveRequest,
-    SubagentOwner, SubagentQueryRequest, SubagentRequest, SubagentRuntimeOverrides,
-    SubagentSnapshotStatus, SubagentSpawnRequest,
+    SessionIdResource, SubagentContextRequest, SubagentEvent, SubagentEventSender,
+    SubagentLoopUnitActiveRequest, SubagentOwner, SubagentQueryRequest, SubagentRequest,
+    SubagentRuntimeOverrides, SubagentSnapshotStatus, SubagentSpawnRequest,
 };
 use crate::notification::types::ToolNotificationHandle;
 use crate::notification::{
@@ -714,7 +714,7 @@ impl SchedulerActor {
             run_in_background: true,
             surface_completion: true,
             await_to_completion: false,
-            fork_context: false,
+            context: SubagentContextRequest::FRESH,
             owner: SubagentOwner::Task,
             // A child of the actor's token, so shutdown cancels a fire the
             // coordinator still has queued at the concurrent limit.

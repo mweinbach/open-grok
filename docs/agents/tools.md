@@ -299,6 +299,12 @@ Paths under `xai-grok-tools/src/implementations/` unless noted.
 | MCP meta | `search_tool`, `use_tool` | `search_tool/`, `use_tool/` | BM25 discover + dispatch; stable top-level set |
 | Deploy | `deploy_app` | `grok_build/deploy_app_stub.rs` | Service-gated stub |
 
+### Subagent context (`task.context`)
+
+- `task` exposes an optional `context` parameter (`"fork" | "fresh"`). Omitted, the child model's catalog `subagent_context_default` decides (e.g. `gpt-5.6-sol` defaults to forked); models without a default spawn fresh. `resume_from` always wins over any fork.
+- Internally `SubagentRequest.context` is a `SubagentContextRequest` (`Explicit(Fork|Fresh) | Default`); harness callers (goal pipeline, workflows, swarm) always pass an explicit mode.
+- Fork routing happens in the shell after model resolution: same child/parent model → verbatim raw-items fork (the incomplete mid-turn tail, e.g. the dangling spawn call itself, is trimmed) that also inherits the parent's prompt-cache affinity id; different models → plaintext `<forked_context>` digest (reasoning summaries and tool traces only — raw or encrypted provider payloads never cross a model boundary). See [subagents.md](subagents.md) for bootstrap, digest, and cache-reuse bounds.
+
 ### Agent swarms
 
 - `agent_swarm` launches an ordered foreground cohort through the same `SubagentBackend` as `task`; it is not a separate child runtime.

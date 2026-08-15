@@ -581,9 +581,6 @@ pub(crate) async fn run_shell_child(
         )
         .await;
     }
-    if request.fork_context {
-        effective_runtime.model = Some(ctx.model_id.0.to_string());
-    }
     let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
         effective_runtime.model.as_deref(),
         &request.subagent_type,
@@ -686,6 +683,32 @@ pub(crate) async fn run_shell_child(
             return child_run_output(failure_result(&request, &message), completion_data, None);
         }
     }
+    // Effective context mode: explicit `context` param > child-model catalog
+    // default > fresh. A resolved fork then splits on model identity: same
+    // model as the parent mirrors raw items (verbatim path), a different
+    // model gets the plaintext digest (raw items never cross the boundary).
+    let child_context_default = crate::agent::config::find_model_by_id(
+        &ctx.available_models,
+        effective_model_id.0.as_ref(),
+    )
+    .and_then(|entry| entry.info().subagent_context_default);
+    let fork_directive = ForkDirective::resolve(
+        request.context,
+        child_context_default,
+        effective_model_id.0.as_ref(),
+        ctx.model_id.0.as_ref(),
+    );
+    if fork_directive != ForkDirective::None {
+        tracing::info!(
+            subagent_id = %request.id,
+            requested = ?request.context,
+            model_default = ?child_context_default,
+            child_model = %effective_model_id.0,
+            parent_model = %ctx.model_id.0,
+            directive = ?fork_directive,
+            "Resolved subagent fork directive"
+        );
+    }
     ctx.provider_boundary
         .observe(effective_sampling_config.provider);
     if !effective_sampling_config
@@ -733,6 +756,7 @@ pub(crate) async fn run_shell_child(
         &child_session_dir,
         effective_model_id.0.as_ref(),
         effective_sampling_config.context_window,
+        fork_directive,
     )
     .await
     {
@@ -1319,6 +1343,10 @@ pub(crate) async fn run_shell_child(
             parent_session_id: Some(ctx.parent_session_id.clone()),
             subagent_type: Some(request.subagent_type.clone()),
             preserve_inherited_system: verbatim_mirror_fork,
+            // Verbatim same-model forks share the parent's request prefix, so
+            // the child inherits the parent's prompt-cache identity to hit
+            // the server-side cache the parent already warmed.
+            cache_affinity_id: verbatim_mirror_fork.then(|| ctx.parent_session_id.clone()),
             subagent_status_tx: child_status_tx,
             multi_agent_policy_enabled: Some(multi_agent_policy_enabled),
             ..Default::default()

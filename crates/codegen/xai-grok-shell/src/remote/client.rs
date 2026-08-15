@@ -888,6 +888,18 @@ pub(crate) fn parse_remote_model_value(
         Some(value) => Some(serde_json::from_value(value.clone()).ok()?),
         None => None,
     };
+    // Unknown/malformed values ignore-forward (None) rather than rejecting
+    // the whole entry: this default is advisory, not load-bearing.
+    let subagent_context_default = [
+        obj.get("subagentContextDefault"),
+        obj.get("subagent_context_default"),
+        meta.and_then(|m| m.get("subagentContextDefault")),
+        meta.and_then(|m| m.get("subagent_context_default")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !value.is_null())
+    .and_then(|value| serde_json::from_value(value.clone()).ok());
     Some(crate::agent::config::ModelEntryConfig {
         id,
         model,
@@ -904,6 +916,7 @@ pub(crate) fn parse_remote_model_value(
         api_backend,
         provider,
         tool_mode,
+        subagent_context_default,
         codex_multi_agent_v2: false,
         context_window,
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")

@@ -623,6 +623,13 @@ pub struct StartupHints {
     /// holds the parent's System and overwriting it would bust the cache prefix.
     #[serde(default)]
     pub preserve_inherited_system: bool,
+    /// Prompt-cache identity inherited from the parent session on verbatim
+    /// same-model forks. Applied to every turn request as
+    /// `x_grok_cache_affinity_id` so providers that key server-side prompt
+    /// caching on a session identity (Codex) hit the parent's cached prefix.
+    /// Runtime-only: never accepted from ACP client metadata.
+    #[serde(skip)]
+    pub cache_affinity_id: Option<String>,
     /// Tool names (as the model sees them, e.g. `server__tool`) through which
     /// this session delivers user-visible output. Declared by headless
     /// surfaces whose users never see the model's plain-text responses —

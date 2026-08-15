@@ -50,7 +50,7 @@ impl coordinator::ChildRunner for ShellChildRunner {
             if let Some(handle) = parent_handle {
                 ctx.parent_mcp_pool = handle.snapshot_mcp_pool().await;
                 ctx.client_hooks = handle.snapshot_client_hooks().await;
-                if run.request.fork_context {
+                if run.request.context.may_fork() {
                     let parent_tools = handle.snapshot_tool_definitions().await;
                     ctx.parent_tool_snapshot = (!parent_tools.function_tools.is_empty()
                         || parent_tools.resolved_policy.is_some())

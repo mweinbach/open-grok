@@ -1700,6 +1700,12 @@ pub struct CreateResponseWrapper {
     pub x_grok_deployment_id: Option<String>,
     pub x_grok_user_id: Option<String>,
 
+    /// Prompt-cache identity override (see
+    /// `ConversationRequest::x_grok_cache_affinity_id`). Used for
+    /// `prompt_cache_key` and Codex session-affinity headers instead of
+    /// `x_grok_session_id` when set.
+    pub x_grok_cache_affinity_id: Option<String>,
+
     /// Optional tracing context (e.g., where to persist the finalized request payload).
     pub trace: Option<Box<dyn TraceContext>>,
 
@@ -1738,6 +1744,7 @@ impl CreateResponseWrapper {
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,
+            x_grok_cache_affinity_id: None,
             trace: None,
             extra_tool_entries: vec![],
             named_custom_tool_outputs: vec![],

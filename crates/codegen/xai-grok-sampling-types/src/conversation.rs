@@ -1073,6 +1073,12 @@ pub struct ConversationRequest {
     pub x_grok_agent_id: Option<String>,
     pub x_grok_deployment_id: Option<String>,
     pub x_grok_user_id: Option<String>,
+    /// Prompt-cache identity override. When set (e.g. a verbatim same-model
+    /// forked subagent inheriting its parent's cache), providers that key
+    /// server-side prompt caching on a session identity use this instead of
+    /// `x_grok_session_id` for `prompt_cache_key` and session-affinity
+    /// headers. Telemetry headers keep the real session id.
+    pub x_grok_cache_affinity_id: Option<String>,
     /// Optional opaque tracing context (e.g., where to persist the finalized request payload).
     /// Consumers downcast via `trace.as_ref().unwrap().as_any().downcast_ref::<T>()`.
     pub trace: Option<Box<dyn TraceContext>>,

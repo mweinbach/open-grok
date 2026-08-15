@@ -2220,6 +2220,72 @@ async fn codex_response_metadata_is_forward_compatible_and_replays_turn_state() 
     );
 }
 
+/// A verbatim same-model forked child owns a fresh session id but must reuse
+/// the parent's warmed prompt cache: `x_grok_cache_affinity_id` (set from the
+/// parent session id at spawn) overrides the session identity for both the
+/// body `prompt_cache_key` and the Codex session-affinity headers, while the
+/// child's own session id never reaches the wire as a cache identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_fork_cache_affinity_overrides_session_identity() {
+    use std::sync::Mutex;
+
+    let captured: Arc<Mutex<Vec<(HeaderMap, serde_json::Value)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(
+            move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_handler);
+                async move {
+                    captured.lock().unwrap().push((headers, body));
+                    Sse::new(stream::iter(
+                        sse_events_to_axum(sse::responses_api_reasoning_and_text_events(
+                            "routing",
+                            "ok",
+                            "gpt-5.6-sol",
+                        ))
+                        .into_iter()
+                        .map(Ok::<_, std::convert::Infallible>),
+                    ))
+                }
+            },
+        ),
+    );
+    let server = MockServer::spawn(app).await;
+    let mut config = responses_config(server.base_url(), None);
+    config.provider = ModelProvider::Codex;
+    config.model = "gpt-5.6-sol".into();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+
+    let mut request = user_request("forked child turn");
+    request.x_grok_session_id = Some("child-session".into());
+    request.x_grok_cache_affinity_id = Some("parent-session".into());
+    handle
+        .submit_and_collect(RequestId::from("fork-affinity-1"), request)
+        .await
+        .expect("forked child request should complete");
+    server.shutdown();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let (headers, body) = &captured[0];
+    for name in ["session-id", "thread-id", "x-client-request-id"] {
+        assert_eq!(
+            headers.get(name).and_then(|value| value.to_str().ok()),
+            Some("parent-session"),
+            "verbatim fork must inherit the parent cache identity in {name}"
+        );
+    }
+    assert_eq!(
+        body.get("prompt_cache_key")
+            .and_then(serde_json::Value::as_str),
+        Some("parent-session"),
+        "prompt_cache_key must be the inherited affinity id: {body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_turn_state_replays_across_responses_and_compact_then_resets() {
     use std::sync::Mutex;

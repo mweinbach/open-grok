@@ -382,7 +382,7 @@ fn auto_wake_test_request(id: &str) -> SubagentRequest {
         run_in_background: true,
         surface_completion: true,
         await_to_completion: false,
-        fork_context: false,
+        context: SubagentContextRequest::FRESH,
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
     }
@@ -1177,7 +1177,7 @@ fn verbatim_fork_keeps_items_byte_for_byte_when_small() {
         );
 }
 #[test]
-fn verbatim_fork_falls_back_to_summary_on_incomplete_tail() {
+fn verbatim_fork_incomplete_tail_trims_to_clean_boundary() {
     use xai_grok_sampling_types::conversation::{
         AssistantItem, ContentPart, ConversationItem, ToolCall,
     };
@@ -1201,17 +1201,25 @@ fn verbatim_fork_falls_back_to_summary_on_incomplete_tail() {
     let ctx = verbatim_or_normalize_fork(items, 256_000);
     assert_eq!(ctx.source, InitialContextSource::Forked);
     assert!(
-            !ctx.verbatim_fork,
-            "an incomplete (dangling tool call) tail must fall back to summary"
+            ctx.verbatim_fork,
+            "an incomplete (dangling tool call) tail must be trimmed, staying verbatim"
         );
-    assert_eq!(ctx.prefix_len, Some(2));
+    assert_eq!(
+        ctx.prefix_len,
+        Some(4),
+        "only the dangling assistant call is dropped"
+    );
+    assert!(matches!(
+        ctx.conversation.last(),
+        Some(ConversationItem::User(_))
+    ));
     assert!(
-            ctx.conversation.iter().any(|i| {
+            !ctx.conversation.iter().any(|i| {
                 matches!(i, ConversationItem::User(u)
                     if u.content.iter().any(|p| matches!(p,
                         ContentPart::Text { text } if text.contains("<background_context>"))))
             }),
-            "summarized fallback must produce a background_context blob"
+            "a trimmed verbatim fork must not summarize into a background blob"
         );
 }
 #[test]
@@ -1261,9 +1269,32 @@ fn verbatim_fork_falls_back_to_summary_when_oversize() {
         );
 }
 #[test]
-fn verbatim_fork_empty_after_filter_fails_open_to_new() {
+fn verbatim_fork_lone_user_item_is_inherited_verbatim() {
+    // A parent that spawns mid first turn (user asked, assistant not yet
+    // recorded) still has inheritable context: the user's question itself.
     use xai_grok_sampling_types::conversation::ConversationItem;
     let items = vec![ConversationItem::user("/goal do the thing")];
+    let ctx = verbatim_or_normalize_fork(items, 256_000);
+    assert_eq!(ctx.source, InitialContextSource::Forked);
+    assert!(ctx.verbatim_fork);
+    assert_eq!(ctx.prefix_len, Some(1));
+}
+#[test]
+fn verbatim_fork_empty_after_filter_fails_open_to_new() {
+    // No clean boundary with content anywhere (mid-turn dangling call only)
+    // and nothing survives the fork filter: fail open to a fresh spawn.
+    use xai_grok_sampling_types::conversation::{AssistantItem, ConversationItem, ToolCall};
+    let items = vec![ConversationItem::Assistant(AssistantItem {
+        content: String::new().into(),
+        tool_calls: vec![ToolCall {
+            id: "tc1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }],
+        model_id: None,
+        model_fingerprint: None,
+        reasoning_effort: None,
+    })];
     let ctx = verbatim_or_normalize_fork(items, 256_000);
     assert_eq!(ctx.source, InitialContextSource::New);
     assert!(!ctx.verbatim_fork);
@@ -1338,7 +1369,90 @@ fn fork_context_normalized_only_for_summarized() {
             summarized.verbatim_fork
         ));
 }
-fn bootstrap_test_request(fork_context: bool) -> SubagentRequest {
+/// A model-initiated `task` spawn leaves the parent history mid-turn: the
+/// tail is the dangling spawn call (often preceded by reasoning). The
+/// verbatim mirror must trim just that incomplete tail instead of falling
+/// back to the summarized path, so the child keeps the parent's cached
+/// prefix byte-for-byte.
+#[test]
+fn verbatim_fork_trims_dangling_mid_turn_tail() {
+    use xai_grok_sampling_types::conversation::{ConversationItem, ToolCall, ToolResultItem};
+    let assistant_with_call = |id: &str, name: &str| {
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }])
+    };
+    let items = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("read the version file"),
+        assistant_with_call("call-read", "read_file"),
+        ConversationItem::ToolResult(ToolResultItem {
+            tool_call_id: "call-read".into(),
+            content: "1.0.0".into(),
+            images: Vec::new(),
+            ordered_content: Vec::new(),
+        }),
+        ConversationItem::assistant("the version is 1.0.0"),
+        ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item(
+            "spawning a subagent",
+        )),
+        assistant_with_call("call-task", "task"),
+    ];
+    let out = verbatim_or_normalize_fork(items, 256_000);
+    assert!(
+        out.verbatim_fork,
+        "mid-turn fork must stay verbatim by trimming the dangling tail"
+    );
+    assert_eq!(out.source, InitialContextSource::Forked);
+    assert_eq!(
+        out.prefix_len,
+        Some(5),
+        "the dangling task call and its reasoning must be trimmed"
+    );
+    assert_eq!(out.conversation.len(), 5);
+    assert!(matches!(
+        out.conversation.last(),
+        Some(ConversationItem::Assistant(a)) if a.content.as_ref() == "the version is 1.0.0"
+    ));
+
+    // Partially resolved parallel calls trim back to the last clean boundary.
+    let parallel = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("q"),
+        ConversationItem::assistant_tool_calls(vec![
+            ToolCall {
+                id: "call-a".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            ToolCall {
+                id: "call-b".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+        ]),
+        ConversationItem::ToolResult(ToolResultItem {
+            tool_call_id: "call-a".into(),
+            content: "a".into(),
+            images: Vec::new(),
+            ordered_content: Vec::new(),
+        }),
+    ];
+    let out = verbatim_or_normalize_fork(parallel, 256_000);
+    assert!(out.verbatim_fork);
+    assert_eq!(
+        out.prefix_len,
+        Some(2),
+        "an assistant item with an unresolved call must be trimmed entirely"
+    );
+    assert!(matches!(
+        out.conversation.last(),
+        Some(ConversationItem::User(_))
+    ));
+}
+fn bootstrap_test_request(fork: bool) -> SubagentRequest {
     SubagentRequest {
         id: "bootstrap-test".into(),
         prompt: "plan".into(),
@@ -1353,7 +1467,11 @@ fn bootstrap_test_request(fork_context: bool) -> SubagentRequest {
         run_in_background: false,
         surface_completion: false,
         await_to_completion: false,
-        fork_context,
+        context: if fork {
+            SubagentContextRequest::FORK
+        } else {
+            SubagentContextRequest::FRESH
+        },
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
     }
@@ -1374,6 +1492,7 @@ async fn bootstrap_no_fork_is_new() {
             Path::new("/tmp"),
             "m",
             128_000,
+            ForkDirective::None,
         )
         .await;
     match out {
@@ -1403,6 +1522,7 @@ async fn bootstrap_fork_without_parent_fails_open() {
             Path::new("/tmp"),
             "m",
             128_000,
+            ForkDirective::Verbatim,
         )
         .await;
     match out {
@@ -1443,6 +1563,7 @@ async fn bootstrap_fork_live_parent_chat_state_is_forked_with_marker() {
             Path::new("/tmp"),
             "m",
             128_000,
+            ForkDirective::Verbatim,
         )
         .await;
     match out {
@@ -1487,6 +1608,138 @@ async fn bootstrap_fork_live_parent_chat_state_is_forked_with_marker() {
                     !text.contains("<background_context>"),
                     "verbatim mirror must NOT wrap items in a background_context blob: {text}"
                 );
+        }
+        BootstrapInitialContext::ResumeAbort(m) => panic!("unexpected abort: {m}"),
+    }
+}
+/// `ForkDirective::resolve` precedence: explicit request > child-model
+/// catalog default > fresh; a resolved fork is verbatim only when the child
+/// and parent models match, otherwise it routes to the digest path.
+#[test]
+fn fork_directive_resolution_precedence_and_model_routing() {
+    use xai_tool_types::SubagentContextMode as Mode;
+    // Explicit fresh always wins, even over a fork model default.
+    assert_eq!(
+        ForkDirective::resolve(SubagentContextRequest::FRESH, Some(Mode::Fork), "m", "m"),
+        ForkDirective::None,
+    );
+    // Explicit fork ignores a fresh model default.
+    assert_eq!(
+        ForkDirective::resolve(SubagentContextRequest::FORK, Some(Mode::Fresh), "m", "m"),
+        ForkDirective::Verbatim,
+    );
+    // Default defers to the child model's catalog default.
+    assert_eq!(
+        ForkDirective::resolve(SubagentContextRequest::Default, Some(Mode::Fork), "m", "m"),
+        ForkDirective::Verbatim,
+    );
+    assert_eq!(
+        ForkDirective::resolve(SubagentContextRequest::Default, Some(Mode::Fresh), "m", "m"),
+        ForkDirective::None,
+    );
+    // No default at all falls back to fresh.
+    assert_eq!(
+        ForkDirective::resolve(SubagentContextRequest::Default, None, "m", "m"),
+        ForkDirective::None,
+    );
+    // A resolved fork across differing models becomes a digest fork.
+    assert_eq!(
+        ForkDirective::resolve(
+            SubagentContextRequest::FORK,
+            None,
+            "kimi-k3",
+            "gpt-5.6-sol"
+        ),
+        ForkDirective::Digest,
+    );
+    assert_eq!(
+        ForkDirective::resolve(
+            SubagentContextRequest::Default,
+            Some(Mode::Fork),
+            "gpt-5.6-sol",
+            "grok-4.6"
+        ),
+        ForkDirective::Digest,
+    );
+}
+/// A cross-model digest fork seeds the child with a plaintext
+/// `<forked_context>` digest (system placeholder + user digest, prefix 2)
+/// and never copies raw parent items — encrypted Codex payloads must not
+/// appear in the seeded conversation.
+#[tokio::test]
+async fn bootstrap_digest_fork_seeds_plaintext_digest_without_raw_items() {
+    use xai_grok_sampling_types::conversation::{
+        BackendToolCallItem, BackendToolKind, CodexRawInputItem, ContentPart, ConversationItem,
+    };
+    const MARKER: &str = "UNIQUE_DIGEST_FORK_MARKER_abc123";
+    let req = bootstrap_test_request(true);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    let chat = spawn_test_parent_chat_state("gpt-5.6-sol");
+    chat.replace_conversation(vec![
+        ConversationItem::system("parent system prompt"),
+        ConversationItem::user(format!("{MARKER} investigate the flaky test")),
+        ConversationItem::BackendToolCall(BackendToolCallItem {
+            kind: BackendToolKind::CodexRawInput(CodexRawInputItem {
+                id: "raw-1".to_string(),
+                raw: serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": "SECRET_ENCRYPTED_BLOB"
+                }),
+                cross_provider_fallback: Some("earlier compacted context".to_string()),
+            }),
+        }),
+        ConversationItem::assistant("found the race in the scheduler"),
+    ]);
+    ctx.parent_chat_state = Some(chat);
+    ctx.parent_session_info = None;
+    let child = SessionInfo {
+        id: acp::SessionId::new("child-boot-digest"),
+        cwd: "/tmp".into(),
+    };
+    let out = bootstrap_initial_context(
+            &req,
+            None,
+            &ctx,
+            &child,
+            Path::new("/tmp"),
+            "kimi-k3",
+            128_000,
+            ForkDirective::Digest,
+        )
+        .await;
+    match out {
+        BootstrapInitialContext::Ready(ic) => {
+            assert_eq!(ic.source, InitialContextSource::Forked);
+            assert!(ic.copy_error.is_none());
+            assert!(!ic.verbatim_fork, "digest forks are never verbatim");
+            assert_eq!(ic.prefix_len, Some(2));
+            assert_eq!(ic.conversation.len(), 2);
+            assert!(matches!(ic.conversation[0], ConversationItem::System(_)));
+            let ConversationItem::User(ref seeded) = ic.conversation[1] else {
+                panic!("digest fork must seed a user item: {:?}", ic.conversation);
+            };
+            let text: String = seeded
+                .content
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            assert!(text.contains("<forked_context>"), "digest wrapper: {text}");
+            assert!(text.contains(MARKER), "parent user text in digest: {text}");
+            assert!(
+                text.contains("earlier compacted context"),
+                "cross-provider fallback must be used for opaque stretches: {text}"
+            );
+            assert!(
+                !text.contains("SECRET_ENCRYPTED_BLOB"),
+                "encrypted Codex payloads must never leak into a digest: {text}"
+            );
+            assert!(
+                !text.contains("parent system prompt"),
+                "parent system prompt must not be replayed to the child: {text}"
+            );
         }
         BootstrapInitialContext::ResumeAbort(m) => panic!("unexpected abort: {m}"),
     }
@@ -2051,6 +2304,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             api_backend: Default::default(),
             provider: Default::default(),
             tool_mode: None,
+            subagent_context_default: None,
             codex_multi_agent_v2: false,
             auth_scheme: Default::default(),
             extra_headers: Default::default(),

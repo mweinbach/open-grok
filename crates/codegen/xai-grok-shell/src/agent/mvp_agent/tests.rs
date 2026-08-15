@@ -2750,6 +2750,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             api_backend: crate::sampling::ApiBackend::default(),
             provider: Default::default(),
             tool_mode: None,
+            subagent_context_default: None,
             codex_multi_agent_v2: false,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),

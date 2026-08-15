@@ -29,9 +29,9 @@ use crate::{
         types::{
             CurrentPromptIdResource, ForegroundWaitKind, ModelOverrideProvenance,
             OrchestrationSteerSignal, SWARM_RATE_LIMIT_RETRY_BASE_MS, SessionIdResource,
-            SubagentDepthCounter, SubagentForegroundWait, SubagentRateLimitDecision,
-            SubagentRequest, SubagentResult, SubagentRuntimeOverrides, SubagentStatusEvent,
-            SubagentValidateTypeOutcome, SwarmMemberMeta, TaskModelValidator,
+            SubagentContextRequest, SubagentDepthCounter, SubagentForegroundWait,
+            SubagentRateLimitDecision, SubagentRequest, SubagentResult, SubagentRuntimeOverrides,
+            SubagentStatusEvent, SubagentValidateTypeOutcome, SwarmMemberMeta, TaskModelValidator,
             swarm_rate_limit_backoff,
         },
     },
@@ -887,7 +887,7 @@ fn build_member_request(
         // The swarm scheduler, rather than the ordinary task foreground
         // budget, owns member timeout and aggregation.
         await_to_completion: true,
-        fork_context: false,
+        context: SubagentContextRequest::FRESH,
         owner: crate::implementations::grok_build::task::types::SubagentOwner::Swarm,
         cancel_token: context.cancellation.child_token(),
     }

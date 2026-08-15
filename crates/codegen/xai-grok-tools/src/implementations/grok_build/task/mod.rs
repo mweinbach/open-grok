@@ -517,7 +517,10 @@ impl xai_tool_runtime::Tool for TaskTool {
             // Model-spawned subagents must still appear in the idle reminder.
             surface_completion: true,
             await_to_completion: false,
-            fork_context: false,
+            context: input
+                .context
+                .map(SubagentContextRequest::Explicit)
+                .unwrap_or_default(),
             owner: SubagentOwner::Task,
             cancel_token: child_cancellation,
         };
@@ -801,6 +804,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -835,6 +839,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -870,6 +875,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -902,6 +908,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -961,6 +968,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -1018,6 +1026,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -1079,6 +1088,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -1143,6 +1153,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -1188,6 +1199,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -1297,6 +1309,7 @@ mod tests {
             cwd: None,
             model: None,
             reasoning_effort: None,
+            context: None,
             task_id: None,
         }
     }
@@ -1821,6 +1834,7 @@ mod tests {
             cwd: None,
             model: Some("test-model".into()),
             reasoning_effort: Some("high".into()),
+            context: None,
             task_id: Some("task-123".into()),
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2093,6 +2107,7 @@ mod tests {
             cwd: None,
             model: None,
             reasoning_effort: None,
+            context: None,
             task_id: None,
         })
         .unwrap();
@@ -2103,7 +2118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_task_spawn_sets_fork_context_false() {
+    async fn model_task_spawn_without_context_defers_to_model_default() {
         let (backend, mut rx) = make_backend();
         let mut resources = Resources::new();
         resources.insert(backend);
@@ -2114,9 +2129,10 @@ mod tests {
         let shared = resources.into_shared();
         let handle = tokio::spawn(async move {
             let request = unwrap_spawn(rx.recv().await.unwrap());
-            assert!(
-                !request.fork_context,
-                "model-spawned task must not set fork_context"
+            assert_eq!(
+                request.context,
+                SubagentContextRequest::Default,
+                "model-spawned task without a context arg must defer to the child model's default"
             );
             request
                 .respond_with(|request| SubagentResult {
@@ -2143,6 +2159,85 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
+                task_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn context_param_parses_wire_strings_and_aliases() {
+        use xai_tool_types::SubagentContextMode;
+        for (raw, expected) in [
+            ("fork", SubagentContextMode::Fork),
+            ("forked", SubagentContextMode::Fork),
+            ("fresh", SubagentContextMode::Fresh),
+            ("new", SubagentContextMode::Fresh),
+        ] {
+            let input: TaskToolInput = serde_json::from_str(&format!(
+                r#"{{"description": "d", "prompt": "p", "context": "{raw}"}}"#
+            ))
+            .unwrap_or_else(|e| panic!("context {raw:?} must parse: {e}"));
+            assert_eq!(input.context, Some(expected), "context {raw:?}");
+        }
+        let schema_json = serde_json::to_string(&schemars::schema_for!(TaskToolInput)).unwrap();
+        assert!(
+            schema_json.contains("\"context\""),
+            "TaskToolInput JSON schema must expose the context parameter"
+        );
+    }
+
+    /// An explicit `context` arg becomes an explicit request (it must not be
+    /// left to the child model's catalog default), and it coexists with
+    /// `resume_from` on the wire — resume precedence is enforced downstream
+    /// in the shell bootstrap, not by dropping the field here.
+    #[tokio::test]
+    async fn explicit_context_threads_to_request_alongside_resume_from() {
+        let (backend, mut rx) = make_backend();
+        let mut resources = Resources::new();
+        resources.insert(backend);
+        resources.insert(SubagentDepthCounter(0));
+        resources.insert(SessionIdResource("parent".to_string()));
+        resources.insert(CurrentPromptIdResource("prompt-1".to_string()));
+
+        let shared = resources.into_shared();
+        let handle = tokio::spawn(async move {
+            let request = unwrap_spawn(rx.recv().await.unwrap());
+            assert_eq!(
+                request.context,
+                SubagentContextRequest::FORK,
+                "explicit context=fork must thread through as an explicit request"
+            );
+            assert_eq!(request.resume_from.as_deref(), Some("prev-id"));
+            request
+                .respond_with(|request| SubagentResult {
+                    success: true,
+                    output: "ok".into(),
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+
+        let _ = xai_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx(shared),
+            TaskToolInput {
+                description: "d".into(),
+                prompt: "p".into(),
+                subagent_type: "general-purpose".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: Some("prev-id".into()),
+                cwd: None,
+                model: None,
+                reasoning_effort: None,
+                context: Some(xai_tool_types::SubagentContextMode::Fork),
                 task_id: None,
             },
         )
@@ -2180,6 +2275,7 @@ mod tests {
             cwd: None,
             model: None,
             reasoning_effort: None,
+            context: None,
             task_id: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2227,6 +2323,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2294,6 +2391,7 @@ mod tests {
                     cwd: None,
                     model: None,
                     reasoning_effort: None,
+                    context: None,
                     task_id: None,
                 },
             )
@@ -2341,6 +2439,7 @@ mod tests {
             cwd: None,
             model: None,
             reasoning_effort: None,
+            context: None,
             task_id: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2370,6 +2469,7 @@ mod tests {
                 cwd: Some("/tmp".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2425,6 +2525,7 @@ mod tests {
                 cwd: Some("".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2476,6 +2577,7 @@ mod tests {
                 cwd: Some("null".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2527,6 +2629,7 @@ mod tests {
                 cwd: Some("  ".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2581,6 +2684,7 @@ mod tests {
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2616,6 +2720,7 @@ mod tests {
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2672,6 +2777,7 @@ mod tests {
                     cwd: Some(sentinel.into()),
                     model: None,
                     reasoning_effort: None,
+                    context: None,
                     task_id: None,
                 },
             )
@@ -2726,6 +2832,7 @@ mod tests {
                 cwd: Some("/tmp".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2784,6 +2891,7 @@ mod tests {
                 cwd: Some("\"/tmp".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2837,6 +2945,7 @@ mod tests {
                 cwd: Some("/tmp".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )
@@ -2886,6 +2995,7 @@ mod tests {
                 cwd: Some("/tmp/some-dir".into()),
                 model: None,
                 reasoning_effort: None,
+                context: None,
                 task_id: None,
             },
         )

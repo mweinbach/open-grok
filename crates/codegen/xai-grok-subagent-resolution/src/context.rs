@@ -109,7 +109,7 @@ pub fn normalize_forked_context(items: Vec<ConversationItem>) -> (Vec<Conversati
 /// `xai-grok-shell/src/session/storage/jsonl.rs` (it truncates to the last
 /// complete turn before this counts them). Keep their notions of a "complete
 /// turn" in sync if the turn item model changes.
-fn count_complete_turns(items: &[&ConversationItem]) -> Vec<usize> {
+pub(crate) fn count_complete_turns(items: &[&ConversationItem]) -> Vec<usize> {
     let mut turn_ends = Vec::new();
     let mut i = 0;
     while i < items.len() {
@@ -162,7 +162,7 @@ fn count_complete_turns(items: &[&ConversationItem]) -> Vec<usize> {
 /// Also strips skill instruction blocks that follow `</command-args>` tags,
 /// since these are orchestration instructions for the parent session's
 /// skill execution, not relevant context for the child.
-fn strip_fork_noise(text: &str) -> String {
+pub(crate) fn strip_fork_noise(text: &str) -> String {
     if !text.contains('<') {
         let mut result = collapse_blank_lines(text);
         trim_string_in_place(&mut result);
@@ -347,7 +347,7 @@ fn render_item_to_background(out: &mut String, item: &ConversationItem) {
 }
 
 /// Render a summary of early conversation items (files mentioned, tools used).
-fn render_summary(out: &mut String, items: &[&ConversationItem]) {
+pub(crate) fn render_summary(out: &mut String, items: &[&ConversationItem]) {
     let mut tools_used = BTreeSet::new();
     let mut user_messages = 0u32;
     let mut assistant_messages = 0u32;
@@ -381,7 +381,7 @@ fn render_summary(out: &mut String, items: &[&ConversationItem]) {
 /// ensuring correct behavior with multi-byte UTF-8 content (e.g. emoji,
 /// CJK characters). Returns the full string if it has `max_chars` or
 /// fewer characters.
-fn truncate_str(s: &str, max_chars: usize) -> &str {
+pub(crate) fn truncate_str(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((byte_offset, _)) => &s[..byte_offset],
         None => s, // string has <= max_chars characters

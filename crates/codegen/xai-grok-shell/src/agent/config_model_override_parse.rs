@@ -712,6 +712,7 @@ mod tests {
             use_concise: Some(true),
             agent_type: Some("agent".into()),
             tool_mode: Some(ToolMode::CodeModeOnly),
+            subagent_context_default: Some(xai_tool_types::SubagentContextMode::Fork),
             inference_idle_timeout_secs: Some(60),
             max_retries: Some(3),
             hidden: Some(false),

@@ -24,6 +24,7 @@ use xai_grok_sampling_types::{
     ApiBackend, ModelProvider, ModelServiceTier, ReasoningEffort, ReasoningEffortOption,
     ReasoningSummary, SERVICE_TIER_FAST_NAME, SERVICE_TIER_FAST_REQUEST_VALUE, ToolMode,
 };
+use xai_tool_types::SubagentContextMode;
 
 pub(crate) const CODEX_MODELS_CACHE_FILE: &str = "codex_models_cache.json";
 pub(crate) const CODEX_CLIENT_VERSION_ENV: &str = "OPENGROK_CODEX_CLIENT_VERSION";
@@ -234,6 +235,11 @@ struct CodexWireModel {
     supports_search_tool: bool,
     #[serde(default)]
     tool_mode: Option<String>,
+    /// Optional server-selected subagent context default (`"fresh"` /
+    /// `"fork"` / `"forked"`). Unknown values are ignored, falling back to
+    /// the embedded catalog default.
+    #[serde(default)]
+    subagent_context_default: Option<String>,
     #[serde(default)]
     multi_agent_version: Option<String>,
     /// Deprecated Codex field; treat `fast` as a priority service tier.
@@ -591,6 +597,20 @@ impl CodexModelsClient {
                 return None;
             }
         };
+        info.subagent_context_default = match wire.subagent_context_default.as_deref() {
+            None => None,
+            Some(value) => match parse_subagent_context_default(value) {
+                Some(mode) => Some(mode),
+                None => {
+                    tracing::debug!(
+                        model = slug,
+                        subagent_context_default = value,
+                        "ignoring unknown Codex subagent_context_default value"
+                    );
+                    None
+                }
+            },
+        };
         info.codex_multi_agent_v2 = wire.multi_agent_version.as_deref() == Some("v2");
         info.agent_type = "codex".to_owned();
         info.hidden = !wire.visibility.is_list_visible();
@@ -871,6 +891,17 @@ fn parse_tool_mode(value: Option<&str>) -> Result<Option<ToolMode>, String> {
     }
 }
 
+/// Parse a wire `subagent_context_default` value. Unlike [`parse_tool_mode`],
+/// unknown values are ignore-forward (`None`) rather than skipping the model:
+/// this flag only tunes subagent spawning and must never hide a usable model.
+fn parse_subagent_context_default(value: &str) -> Option<SubagentContextMode> {
+    match value {
+        "fresh" => Some(SubagentContextMode::Fresh),
+        "fork" | "forked" => Some(SubagentContextMode::Fork),
+        _ => None,
+    }
+}
+
 fn effective_context_window(raw: Option<i64>, percent: i64) -> Option<std::num::NonZeroU64> {
     let raw = raw?;
     if raw <= 0 || percent <= 0 {
@@ -1004,7 +1035,8 @@ mod tests {
                     "effective_context_window_percent": 95,
                     "supports_search_tool": true,
                     "tool_mode": "code_mode_only",
-                    "multi_agent_version": "v2"
+                    "multi_agent_version": "v2",
+                    "subagent_context_default": "forked"
                 },
                 {
                     "slug": "hidden-model",
@@ -1012,7 +1044,8 @@ mod tests {
                     "visibility": "hide",
                     "supported_in_api": false,
                     "priority": 2,
-                    "context_window": 200000
+                    "context_window": 200000,
+                    "subagent_context_default": "telepathic"
                 },
                 {
                     "slug": "unknown-tool-mode",
@@ -1211,6 +1244,17 @@ mod tests {
         assert_eq!(live.entry.info.provider, ModelProvider::Codex);
         assert_eq!(live.entry.info.api_backend, ApiBackend::Responses);
         assert_eq!(live.entry.info.tool_mode, Some(ToolMode::CodeModeOnly));
+        assert_eq!(
+            live.entry.info.subagent_context_default,
+            Some(xai_tool_types::SubagentContextMode::Fork),
+            "wire 'forked' must parse into the fork context default"
+        );
+        let hidden = &catalog.models[1];
+        assert_eq!(hidden.slug(), "hidden-model");
+        assert_eq!(
+            hidden.entry.info.subagent_context_default, None,
+            "unknown subagent_context_default values must ignore-forward"
+        );
         assert!(live.entry.info.codex_multi_agent_v2);
         assert!(live.entry.info.supports_backend_search);
         assert!(live.entry.info.supports_reasoning_summary_parameter);

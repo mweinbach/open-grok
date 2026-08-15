@@ -1917,6 +1917,7 @@ impl SamplingClient {
             agent_id: payload.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
+            cache_affinity_id: None,
         };
         let SentRequest {
             builder,
@@ -1981,6 +1982,7 @@ impl SamplingClient {
             agent_id: payload.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
+            cache_affinity_id: None,
         };
         let SentRequest {
             builder,
@@ -2149,9 +2151,12 @@ impl SamplingClient {
         inner.instructions = (!instructions.is_empty()).then(|| instructions.to_owned());
         inner.parallel_tool_calls = Some(true);
         if inner.prompt_cache_key.is_none() {
-            inner.prompt_cache_key = self
-                .provider_adapter
-                .prompt_cache_key(request.x_grok_session_id.as_deref());
+            inner.prompt_cache_key = self.provider_adapter.prompt_cache_key(
+                request
+                    .x_grok_cache_affinity_id
+                    .as_deref()
+                    .or(request.x_grok_session_id.as_deref()),
+            );
         }
         if remote_v2 {
             inner.store = Some(false);
@@ -2282,9 +2287,13 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(&endpoint);
-        let builder = self
-            .provider_adapter
-            .apply_session_affinity_headers(builder, request.x_grok_session_id.as_deref());
+        let builder = self.provider_adapter.apply_session_affinity_headers(
+            builder,
+            request
+                .x_grok_cache_affinity_id
+                .as_deref()
+                .or(request.x_grok_session_id.as_deref()),
+        );
         let response = builder
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&request_body)
@@ -2384,9 +2393,13 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(&endpoint);
-        let builder = self
-            .provider_adapter
-            .apply_session_affinity_headers(builder, request.x_grok_session_id.as_deref());
+        let builder = self.provider_adapter.apply_session_affinity_headers(
+            builder,
+            request
+                .x_grok_cache_affinity_id
+                .as_deref()
+                .or(request.x_grok_session_id.as_deref()),
+        );
         let response = builder
             .headers(beta_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
@@ -2496,9 +2509,12 @@ impl SamplingClient {
         // this provider-scoped so xAI's request body remains unchanged, and
         // preserve an explicit cache key if a caller supplied one.
         if request.inner.prompt_cache_key.is_none() {
-            request.inner.prompt_cache_key = self
-                .provider_adapter
-                .prompt_cache_key(request.x_grok_session_id.as_deref());
+            request.inner.prompt_cache_key = self.provider_adapter.prompt_cache_key(
+                request
+                    .x_grok_cache_affinity_id
+                    .as_deref()
+                    .or(request.x_grok_session_id.as_deref()),
+            );
         }
 
         Ok(())
@@ -2535,6 +2551,7 @@ impl SamplingClient {
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
+            cache_affinity_id: request.x_grok_cache_affinity_id.as_deref(),
         };
         let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
             tracing::error!("Failed to serialize responses request: {}", e);
@@ -2699,6 +2716,7 @@ impl SamplingClient {
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
+            cache_affinity_id: request.x_grok_cache_affinity_id.as_deref(),
         };
         let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
         let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
@@ -2969,6 +2987,7 @@ impl SamplingClient {
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
+            cache_affinity_id: None,
         };
         let SentRequest {
             builder,
@@ -3086,6 +3105,7 @@ impl SamplingClient {
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
+            cache_affinity_id: None,
         };
         let SentRequest {
             builder,
@@ -3411,6 +3431,7 @@ impl SamplingClient {
         let x_grok_conv_id = request.x_grok_conv_id.clone();
         let x_grok_req_id = request.x_grok_req_id.clone();
         let x_grok_session_id = request.x_grok_session_id.clone();
+        let x_grok_cache_affinity_id = request.x_grok_cache_affinity_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
@@ -3432,6 +3453,7 @@ impl SamplingClient {
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
+        wrapper.x_grok_cache_affinity_id = x_grok_cache_affinity_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
@@ -3461,6 +3483,7 @@ impl SamplingClient {
         let x_grok_conv_id = request.x_grok_conv_id.clone();
         let x_grok_req_id = request.x_grok_req_id.clone();
         let x_grok_session_id = request.x_grok_session_id.clone();
+        let x_grok_cache_affinity_id = request.x_grok_cache_affinity_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
@@ -3482,6 +3505,7 @@ impl SamplingClient {
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
+        wrapper.x_grok_cache_affinity_id = x_grok_cache_affinity_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
@@ -4566,6 +4590,7 @@ mod tests {
             agent_id: "agent-1",
             deployment_id: Some("deployment-1"),
             user_id: Some("user-1"),
+            cache_affinity_id: None,
         };
         let http = reqwest::Client::new();
         let xai = headers
@@ -4623,6 +4648,7 @@ mod tests {
             agent_id: "agent-1",
             deployment_id: None,
             user_id: None,
+            cache_affinity_id: None,
         };
         let http = reqwest::Client::new();
 

@@ -1264,27 +1264,78 @@ fn forked_initial_context(
 /// (unanswered tool calls), a trailing ToolResult (mid-turn), or a trailing
 /// user/reasoning means the prefix would be incoherent, so the caller falls back
 /// to the summarized path instead of partial-trimming.
-fn conversation_tail_is_complete(
+/// Length of the longest prefix that ends at a clean fork boundary: no
+/// dangling tool calls, and a terminal item a provider accepts before an
+/// appended user prompt (assistant text, a paired tool output, or a user
+/// message).
+///
+/// A model-initiated `task` spawn happens mid-turn, so the live parent history
+/// typically ends with the dangling `task` call itself (often preceded by a
+/// reasoning item). Trimming that incomplete tail keeps the remainder
+/// byte-identical to what the parent already sent — and the provider already
+/// cached — instead of abandoning the verbatim mirror entirely.
+fn clean_fork_prefix_len(
     items: &[xai_grok_sampling_types::conversation::ConversationItem],
-) -> bool {
-    matches!(
-        items.last(),
-        Some(ConversationItem::Assistant(a)) if a.tool_calls.is_empty()
-    )
+) -> usize {
+    fn prefix_is_clean(prefix: &[ConversationItem]) -> bool {
+        match prefix.last() {
+            Some(
+                ConversationItem::User(_)
+                | ConversationItem::Assistant(_)
+                | ConversationItem::ToolResult(_)
+                | ConversationItem::CustomToolOutput(_),
+            ) => {}
+            // Reasoning / backend-call / system tails are mid-turn artifacts.
+            _ => return false,
+        }
+        // Custom-tool (Code Mode `exec`) calls store an encoded envelope in
+        // `ToolCall.id`; normalize everything to the provider call id so
+        // custom calls pair with both `CustomToolOutput` rows and legacy
+        // encoded `ToolResult` rows.
+        fn plain_call_id(id: &str) -> &str {
+            xai_grok_sampling_types::conversation::decode_custom_tool_call_id(id)
+                .map(|(call_id, _)| call_id)
+                .unwrap_or(id)
+        }
+        let mut dangling: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for item in prefix {
+            match item {
+                ConversationItem::Assistant(a) => {
+                    dangling.extend(a.tool_calls.iter().map(|c| c.call_id()));
+                }
+                ConversationItem::ToolResult(r) => {
+                    dangling.remove(plain_call_id(&r.tool_call_id));
+                }
+                ConversationItem::CustomToolOutput(o) => {
+                    dangling.remove(o.call_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        dangling.is_empty()
+    }
+    let mut len = items.len();
+    while len > 0 {
+        if prefix_is_clean(&items[..len]) {
+            return len;
+        }
+        len -= 1;
+    }
+    0
 }
 /// Decide the live-fork context.
 ///
-/// Verbatim mirror (the cache-preserving path): when the parent fits the child
-/// window (same 80% guard as resume) AND ends at a clean turn boundary, keep the
-/// items BYTE-FOR-BYTE. We deliberately do NOT run `fork_filter_chat` here — its
+/// Verbatim mirror (the cache-preserving path): when the parent's clean prefix
+/// fits the child window (same 80% guard as resume), keep those items
+/// BYTE-FOR-BYTE. We deliberately do NOT run `fork_filter_chat` here — its
 /// step 1 strips synthetic-reason user items (`<system-reminder>`s, drained
 /// monitor events, doom-loop warnings) that the parent actually sent and cached;
 /// stripping them would diverge the child prefix at the first removed item and
-/// cap radix reuse there. At planner spawn the conversation is between turns
-/// (the `/goal` user message is not yet pushed), so the tail is already complete
-/// and no trimming is needed; an incomplete tail falls back to summarized.
+/// cap radix reuse there. Only the incomplete trailing turn is trimmed
+/// (`clean_fork_prefix_len`): between-turn spawns (goal planner) already end
+/// clean, and a mid-turn `task` spawn drops just the dangling spawn call.
 ///
-/// Summarized fallback (oversize OR incomplete tail): the reasoning-aware
+/// Summarized fallback (oversize or no clean prefix): the reasoning-aware
 /// `fork_filter_chat` drops synthetics + trims the incomplete tail, then
 /// `normalize_forked_context` summarizes. (This is the ONLY path that filters;
 /// the verbatim path never does.)
@@ -1307,16 +1358,22 @@ fn verbatim_or_normalize_fork(
             verbatim_fork: false,
         };
     }
-    let estimated_tokens = xai_chat_state::estimate_conversation_tokens(&items);
     const SAFE_FORK_PERCENT: u64 = 80;
     let threshold = child_context_window * SAFE_FORK_PERCENT / 100;
-    if estimated_tokens <= threshold && conversation_tail_is_complete(&items) {
-        let prefix_len = items.len();
+    let clean_len = clean_fork_prefix_len(&items);
+    let clean_has_content = items[..clean_len]
+        .iter()
+        .any(|i| !matches!(i, ConversationItem::System(_)));
+    if clean_has_content
+        && xai_chat_state::estimate_conversation_tokens(&items[..clean_len]) <= threshold
+    {
+        let mut conversation = items;
+        conversation.truncate(clean_len);
         return InitialContext {
             source: InitialContextSource::Forked,
             copy_error: None,
-            prefix_len: Some(prefix_len),
-            conversation: items,
+            prefix_len: Some(clean_len),
+            conversation,
             verbatim_fork: true,
         };
     }
@@ -1393,6 +1450,40 @@ enum BootstrapInitialContext {
     /// Explicit resume_from failed — abort spawn (fail closed).
     ResumeAbort(String),
 }
+/// How the child's initial context is seeded, resolved in `handle_request`
+/// after the effective child model is known: explicit `context` param >
+/// child-model `subagent_context_default` > fresh; a resolved fork then
+/// splits on model identity (same model = verbatim, different = digest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForkDirective {
+    /// Fresh spawn — no inherited history.
+    None,
+    /// Same-model fork: parent raw items copied verbatim (window/tail guards,
+    /// summarized `<background_context>` fallback).
+    Verbatim,
+    /// Cross-model fork: parent history rendered into a plaintext
+    /// `<forked_context>` digest. Raw items never cross the model boundary.
+    Digest,
+}
+impl ForkDirective {
+    /// Resolve the directive from the caller's context request, the child
+    /// model's catalog default, and the resolved child/parent model ids.
+    pub(crate) fn resolve(
+        requested: SubagentContextRequest,
+        child_model_default: Option<xai_tool_types::SubagentContextMode>,
+        child_model_id: &str,
+        parent_model_id: &str,
+    ) -> Self {
+        if requested.resolve(child_model_default) != xai_tool_types::SubagentContextMode::Fork {
+            return Self::None;
+        }
+        if child_model_id == parent_model_id {
+            Self::Verbatim
+        } else {
+            Self::Digest
+        }
+    }
+}
 /// Phase 3: resume (fail-closed on copy error) > fork (live then disk, fail-open) > New.
 /// Unresolved non-empty resume is aborted by the caller before this runs.
 async fn bootstrap_initial_context(
@@ -1403,13 +1494,14 @@ async fn bootstrap_initial_context(
     child_session_dir: &std::path::Path,
     effective_model_id: &str,
     child_context_window: u64,
+    fork: ForkDirective,
 ) -> BootstrapInitialContext {
-    if request.fork_context && request.resume_from.is_some() {
+    if fork != ForkDirective::None && request.resume_from.is_some() {
         tracing::info!(
             subagent_id = %request.id,
             resume_from = ?request.resume_from,
             resume_resolved = resume_source.is_some(),
-            "resume_from and fork_context both set; resolved resume wins (fail-closed on copy error, never forks)"
+            "resume_from and fork context both set; resolved resume wins (fail-closed on copy error, never forks)"
         );
     }
     if let Some(source) = resume_source {
@@ -1484,7 +1576,7 @@ async fn bootstrap_initial_context(
             )),
         };
     }
-    if !request.fork_context {
+    if fork == ForkDirective::None {
         return BootstrapInitialContext::Ready(InitialContext {
             source: InitialContextSource::New,
             copy_error: None,
@@ -1492,6 +1584,16 @@ async fn bootstrap_initial_context(
             conversation: vec![],
             verbatim_fork: false,
         });
+    }
+    if fork == ForkDirective::Digest {
+        return digest_fork_initial_context(
+            request,
+            ctx,
+            child_session_info,
+            effective_model_id,
+            child_context_window,
+        )
+        .await;
     }
     let live_items = match ctx.parent_chat_state.as_ref() {
         Some(chat_state) => {
@@ -1589,7 +1691,7 @@ async fn bootstrap_initial_context(
     tracing::warn!(
         subagent_id = %request.id,
         subagent_type = %request.subagent_type,
-        "fork_context=true but no live parent conversation or parent_session_info; falling back to fresh"
+        "fork requested but no live parent conversation or parent_session_info; falling back to fresh"
     );
     BootstrapInitialContext::Ready(InitialContext {
         source: InitialContextSource::New,
@@ -1598,6 +1700,158 @@ async fn bootstrap_initial_context(
         conversation: vec![],
         verbatim_fork: false,
     })
+}
+/// Fraction of the child's context window budgeted for the cross-model fork
+/// digest (in tokens; converted to characters at ~4 chars/token).
+const DIGEST_BUDGET_PERCENT: u64 = 35;
+/// Floor for the digest character budget so tiny context windows still get a
+/// usable digest.
+const DIGEST_MIN_BUDGET_CHARS: usize = 8_000;
+/// Cap on the plaintext source fed to the LLM compaction pass.
+const DIGEST_LLM_SOURCE_CAP_CHARS: usize = 240_000;
+/// Cross-model fork: render the parent history into a plaintext
+/// `<forked_context>` digest and seed the child with
+/// `[System(placeholder), User(digest)]` (prefix 2, mirroring the
+/// summarized-fork shape). Raw parent items never reach the child, so
+/// provider isolation holds by construction. Fails open to a fresh spawn.
+async fn digest_fork_initial_context(
+    request: &SubagentRequest,
+    ctx: &SubagentSpawnContext,
+    child_session_info: &SessionInfo,
+    effective_model_id: &str,
+    child_context_window: u64,
+) -> BootstrapInitialContext {
+    let fresh = |copy_error: String| {
+        BootstrapInitialContext::Ready(InitialContext {
+            source: InitialContextSource::New,
+            copy_error: Some(copy_error),
+            prefix_len: None,
+            conversation: vec![],
+            verbatim_fork: false,
+        })
+    };
+    // Live parent conversation, else read-only disk fallback (no copy: the
+    // child never persists raw parent items on the digest path).
+    let mut items = match ctx.parent_chat_state.as_ref() {
+        Some(chat_state) => chat_state.get_conversation().await,
+        None => vec![],
+    };
+    if items.is_empty()
+        && let Some(ref parent_info) = ctx.parent_session_info
+    {
+        let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
+            crate::util::grok_home::grok_home(),
+        );
+        let parent_dir = session::persistence::session_dir(parent_info);
+        items = storage
+            .load_chat_history_from_dir(&parent_dir)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "digest fork: failed to load parent history from disk");
+                vec![]
+            });
+    }
+    if !items
+        .iter()
+        .any(|i| !matches!(i, ConversationItem::System(_)))
+    {
+        return fresh("parent conversation unavailable".to_string());
+    }
+    let budget_chars = ((child_context_window * DIGEST_BUDGET_PERCENT / 100) as usize)
+        .saturating_mul(4)
+        .max(DIGEST_MIN_BUDGET_CHARS);
+    let plan =
+        xai_grok_subagent_resolution::digest::plan_forked_context_digest(&items, budget_chars);
+    let earlier_summary = if !plan.fits && plan.earlier_items > 0 {
+        let source = xai_grok_subagent_resolution::digest::digest_earlier_source_text(
+            &items,
+            plan.earlier_items,
+            DIGEST_LLM_SOURCE_CAP_CHARS,
+        );
+        llm_digest_summary(ctx, &source).await
+    } else {
+        None
+    };
+    let digest = xai_grok_subagent_resolution::digest::render_forked_context_digest(
+        &items,
+        budget_chars,
+        &plan,
+        earlier_summary.as_deref(),
+    );
+    tracing::info!(
+        subagent_id = %request.id,
+        subagent_type = %request.subagent_type,
+        parent_items = items.len(),
+        digest_chars = digest.len(),
+        budget_chars,
+        llm_compacted = earlier_summary.is_some(),
+        "Seeded cross-model forked child with context digest"
+    );
+    stamp_live_fork_session_metadata(
+        child_session_info,
+        &ctx.parent_session_id,
+        request.parent_prompt_id.clone(),
+        effective_model_id,
+        Some(2),
+        "forked_digest",
+    );
+    BootstrapInitialContext::Ready(InitialContext {
+        source: InitialContextSource::Forked,
+        copy_error: None,
+        prefix_len: Some(2),
+        conversation: vec![
+            ConversationItem::system(String::new()),
+            ConversationItem::user(&digest),
+        ],
+        verbatim_fork: false,
+    })
+}
+/// One-shot LLM compaction of the digest's earlier portion, routed on the
+/// parent's own model and credentials (`ctx.sampling_config`). Fails open:
+/// any error or timeout returns `None` and the deterministic metadata
+/// summary stands in.
+async fn llm_digest_summary(ctx: &SubagentSpawnContext, source: &str) -> Option<String> {
+    use crate::sampling::ConversationRequest;
+    const DIGEST_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+    let client = match crate::sampling::Client::new(ctx.sampling_config.clone()) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = %e, "digest fork: failed to build compaction client");
+            return None;
+        }
+    };
+    let request = ConversationRequest::from_items(vec![
+        ConversationItem::system(
+            "You compress agent conversation history. Summarize the transcript below into a \
+             dense briefing for another agent that continues the work: goals, key findings, \
+             files/paths touched, decisions made, and current state. Preserve concrete \
+             identifiers (paths, symbols, commands, error messages). Plain text only, no \
+             preamble.",
+        ),
+        ConversationItem::user(source),
+    ])
+    .with_model(&ctx.sampling_config.model)
+    .with_max_output_tokens(4_000);
+    let response = match tokio::time::timeout(
+        DIGEST_LLM_TIMEOUT,
+        client.conversation_collect(request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "digest fork: LLM compaction failed; using deterministic summary");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("digest fork: LLM compaction timed out; using deterministic summary");
+            return None;
+        }
+    };
+    let text = response
+        .assistant()
+        .map(|a| a.content.trim().to_string())
+        .unwrap_or_default();
+    if text.is_empty() { None } else { Some(text) }
 }
 /// Resolve the effective working directory for a child session.
 ///

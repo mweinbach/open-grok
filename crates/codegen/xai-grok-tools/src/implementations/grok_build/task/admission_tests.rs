@@ -1,7 +1,9 @@
 use pretty_assertions::assert_eq;
 
 use super::{Admission, AdmissionDecision, AdmissionError, LimitBehavior, SubagentLimits};
-use crate::implementations::grok_build::task::types::{SubagentOwner, SubagentRequest};
+use crate::implementations::grok_build::task::types::{
+    SubagentContextRequest, SubagentOwner, SubagentRequest,
+};
 
 fn request(parent_session_id: &str) -> SubagentRequest {
     SubagentRequest {
@@ -18,7 +20,7 @@ fn request(parent_session_id: &str) -> SubagentRequest {
         run_in_background: false,
         surface_completion: false,
         await_to_completion: true,
-        fork_context: false,
+        context: SubagentContextRequest::FRESH,
         owner: SubagentOwner::Task,
         cancel_token: tokio_util::sync::CancellationToken::new(),
     }

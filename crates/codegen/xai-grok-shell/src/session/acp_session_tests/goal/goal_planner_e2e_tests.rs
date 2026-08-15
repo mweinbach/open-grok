@@ -82,7 +82,10 @@ fn spawn_planner_coordinator_capturing(
         while let Some(ev) = rx.recv().await {
             if let SubagentEvent::Spawn(req) = ev {
                 count_task.fetch_add(1, SeqOrd::SeqCst);
-                fork_log.lock().unwrap().push(req.fork_context);
+                fork_log
+                    .lock()
+                    .unwrap()
+                    .push(req.context.is_explicit_fork());
                 surface_log.lock().unwrap().push(req.surface_completion);
                 model_log
                     .lock()

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use xai_grok_session_events::EventWriter;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::types::{
-    SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
+    SubagentContextRequest, SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
 };
 use xai_tool_types::SubagentCapabilityMode;
 
@@ -182,7 +182,7 @@ impl ChannelSpawner {
             // Harness-internal: never surface to the model's idle reminder.
             surface_completion: false,
             await_to_completion: false,
-            fork_context: false,
+            context: SubagentContextRequest::FRESH,
             owner: SubagentOwner::Task,
             cancel_token: tokio_util::sync::CancellationToken::new(),
         };
@@ -645,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn channel_spawner_request_is_harness_internal_and_read_only() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
         use xai_tool_types::SubagentCapabilityMode;
 

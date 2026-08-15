@@ -310,6 +310,60 @@ Pass prior `subagent_id` (same as `resume_from_hint` on completed output).
 
 Blank / `"null"` resume ids treated as absent (`is_valid_resume_id`).
 
+## Initial context: fresh, forked (verbatim), forked (digest)
+
+A child's starting conversation is resolved in `bootstrap_initial_context`
+(`agent/subagent/mod.rs`), driven by a `ForkDirective` computed in
+`handle_subagent_request` **after** the effective child model is resolved:
+
+1. **Context mode**: explicit `context` param on the `task` tool
+   (`"fork" | "fresh"`) > child model's catalog `subagent_context_default`
+   (e.g. `gpt-5.6-sol` defaults to `forked`) > fresh. Internal harness callers
+   (goal pipeline, workflows, swarm) pass an explicit mode and never defer to
+   model metadata. `resume_from` always wins over any fork request.
+2. **Routing**: a resolved fork with `child model == parent model` takes the
+   **verbatim** path; differing models take the **digest** path. Forks no
+   longer pin the child to the parent model.
+
+| Directive | Child seed | Persistence |
+| --- | --- | --- |
+| `None` (fresh) | System + task prompt only | Normal new session |
+| `Verbatim` (same model) | Parent raw items mirrored (≤80% window + clean-tail guards; summarized `<background_context>` fallback) | Fork-copied via live chat state or disk fallback |
+| `Digest` (cross-model) | `[System(placeholder), User(<forked_context> digest)]`, prefix 2 | Raw parent items are **never** written into the child |
+
+### Cross-model digest
+
+Built in `xai-grok-subagent-resolution/src/digest.rs` from the parent's live
+conversation (disk read-only fallback): user/assistant text, reasoning
+**summaries** only, tool calls as name + condensed args + truncated output.
+Codex-opaque stretches render their `cross_provider_fallback` text; raw
+payloads and `encrypted_content` never appear, so provider isolation holds by
+construction. Budget is ~35% of the child context window (≥8k chars). If the
+deterministic digest exceeds the budget, the earlier portion gets one LLM
+compaction pass routed on the **parent's** own model/credentials
+(`llm_digest_summary`, fail-open to the deterministic metadata summary), and
+recent turns stay verbatim.
+
+### Prompt-cache affinity (same-model verbatim forks)
+
+A verbatim fork replays the parent's exact conversation prefix under a new
+session id. The spawn sets `StartupHints.cache_affinity_id` to the parent
+session id; the turn loop copies it to
+`ConversationRequest.x_grok_cache_affinity_id`, and the sampler prefers it
+over the session id for both the Responses `prompt_cache_key` and the Codex
+`session-id`/`thread-id`/`x-client-request-id` affinity headers (fallback:
+session id). Digest forks and fresh spawns inherit nothing.
+
+Measured ceiling (ChatGPT Codex backend, probed live): the prompt cache is
+content-keyed over the byte-exact rendered prefix, which starts with the
+**tool schemas and instructions** — removing a single tool or drifting the
+instructions zeroes the cached span, while identity headers alone neither
+grant nor deny reuse. A depth-1 child never carries the spawn tools
+(`task`/`agent_swarm`/`workflow` strip is a locked invariant), so its wire
+prefix legitimately diverges from the parent's and full cross-session reuse
+is bounded by that; the verbatim conversation mirror still maximizes overlap
+and keeps the child's own subsequent loops at ~95%+ self-hit.
+
 ## Session directories and `subagents/` meta
 
 Children are **full sessions** under the normal session layout:

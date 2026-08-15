@@ -2558,6 +2558,7 @@ impl SessionActor {
             );
             let mut request = request;
             request.x_grok_session_id = Some(self.session_info.id.to_string());
+            request.x_grok_cache_affinity_id = self.startup_hints.cache_affinity_id.clone();
             request.x_grok_turn_idx =
                 Some(self.chat_state_handle.get_prompt_index().await.to_string());
             request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());

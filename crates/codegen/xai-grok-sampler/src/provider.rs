@@ -55,6 +55,10 @@ pub struct ProviderRequestHeaders<'a> {
     pub agent_id: &'a str,
     pub deployment_id: Option<&'a str>,
     pub user_id: Option<&'a str>,
+    /// Prompt-cache identity override (verbatim same-model forks inherit the
+    /// parent's). Drives session-affinity headers only; the `x-grok-*`
+    /// telemetry headers keep `session_id`.
+    pub cache_affinity_id: Option<&'a str>,
 }
 
 impl ProviderRequestHeaders<'_> {
@@ -159,7 +163,8 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
         builder: RequestBuilder,
         headers: ProviderRequestHeaders<'_>,
     ) -> RequestBuilder {
-        let builder = self.apply_session_affinity_headers(builder, Some(headers.session_id));
+        let affinity_id = headers.cache_affinity_id.unwrap_or(headers.session_id);
+        let builder = self.apply_session_affinity_headers(builder, Some(affinity_id));
         if self.profile().request_metadata == RequestMetadataPolicy::XGrokHeaders {
             headers.apply_x_grok(builder)
         } else {

@@ -110,6 +110,19 @@ pub struct TaskToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Initial-context mode for the subagent.
+    #[schemars(
+        description = "Initial context for the subagent: \"fork\" (the child starts with a copy \
+            of this conversation's context, so it already knows the investigation so far — use \
+            when the child continues or extends your current work) or \"fresh\" (the child starts \
+            with only its system prompt and your task prompt — use for independent, parallel, or \
+            unrelated work). If omitted, the default depends on the child's model. With \"fork\", \
+            still write a self-contained task prompt; the forked context supplements it. Ignored \
+            when resume_from is set."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<SubagentContextMode>,
+
     /// Optional reasoning effort for this subagent.
     #[schemars(
         description = "Optional reasoning effort for this agent. Supported values are none, \
@@ -343,6 +356,32 @@ impl SubagentCapabilityMode {
             Self::ReadWrite => "read-write",
             Self::Execute => "execute",
             Self::All => "all",
+        }
+    }
+}
+
+/// Initial-context mode for a spawned subagent: does the child start fresh or
+/// with a copy of the parent's conversation context?
+///
+/// Used both as the model-facing `context` argument of the `task` tool and as
+/// the per-model catalog default (`subagent_context_default`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentContextMode {
+    /// Child starts with only its system prompt and the task prompt.
+    #[serde(alias = "Fresh", alias = "new", alias = "clean")]
+    Fresh,
+    /// Child starts with the parent's conversation context.
+    #[serde(alias = "Fork", alias = "forked", alias = "Forked")]
+    Fork,
+}
+
+impl SubagentContextMode {
+    /// Canonical wire string (matches the serde `snake_case` representation).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Fork => "fork",
         }
     }
 }
@@ -1506,6 +1545,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            context: None,
             reasoning_effort: None,
             task_id: None,
         };

@@ -1,4 +1,5 @@
 use super::*;
+use crate::implementations::grok_build::task::types::SubagentContextRequest;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -60,7 +61,7 @@ async fn channel_backend_spawn_success() {
         run_in_background: false,
         surface_completion: true,
         await_to_completion: false,
-        fork_context: false,
+        context: SubagentContextRequest::FRESH,
         owner: super::super::types::SubagentOwner::Task,
         cancel_token: tokio_util::sync::CancellationToken::new(),
     };
@@ -94,7 +95,7 @@ async fn channel_backend_spawn_closed_channel() {
         run_in_background: false,
         surface_completion: true,
         await_to_completion: false,
-        fork_context: false,
+        context: SubagentContextRequest::FRESH,
         owner: super::super::types::SubagentOwner::Task,
         cancel_token: tokio_util::sync::CancellationToken::new(),
     };
@@ -242,7 +243,7 @@ async fn orchestrator_spawn_future_drop_cancels_but_task_drop_does_not() {
             run_in_background: false,
             surface_completion: false,
             await_to_completion: true,
-            fork_context: false,
+            context: SubagentContextRequest::FRESH,
             owner,
             cancel_token: tokio_util::sync::CancellationToken::new(),
         }
@@ -297,7 +298,7 @@ async fn channel_backend_spawn_result_dropped() {
         run_in_background: false,
         surface_completion: true,
         await_to_completion: false,
-        fork_context: false,
+        context: SubagentContextRequest::FRESH,
         owner: super::super::types::SubagentOwner::Task,
         cancel_token: tokio_util::sync::CancellationToken::new(),
     };

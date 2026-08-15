@@ -21,6 +21,7 @@
 pub mod config;
 pub mod context;
 pub mod definition;
+pub mod digest;
 pub mod overrides;
 pub mod resume;
 pub mod types;

@@ -4,9 +4,10 @@ use crate::implementations::grok_build::task::backend::{ChannelBackend, Subagent
 use crate::implementations::grok_build::task::types::{
     AgentMailboxIdentity, AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDeliveryStatus,
     SubagentCancelRequest, SubagentCancelTarget, SubagentClearUsageNotAppliedRequest,
-    SubagentCompletionsRequest, SubagentListActiveRequest, SubagentLoopUnitActiveRequest,
-    SubagentMarkUsageNotAppliedRequest, SubagentOutstandingReply, SubagentOutstandingRequest,
-    SubagentOwner, SubagentRegistryCounts, SubagentRequest, SubagentSnapshotStatus,
+    SubagentCompletionsRequest, SubagentContextRequest, SubagentListActiveRequest,
+    SubagentLoopUnitActiveRequest, SubagentMarkUsageNotAppliedRequest, SubagentOutstandingReply,
+    SubagentOutstandingRequest, SubagentOwner, SubagentRegistryCounts, SubagentRequest,
+    SubagentSnapshotStatus,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -190,7 +191,7 @@ fn request(id: &str, background: bool) -> SubagentRequest {
         run_in_background: background,
         surface_completion: true,
         await_to_completion: false,
-        fork_context: false,
+        context: SubagentContextRequest::FRESH,
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
     }

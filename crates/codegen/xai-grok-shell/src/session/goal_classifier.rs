@@ -28,7 +28,7 @@ use std::time::Duration;
 use xai_grok_session_events::EventWriter;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::types::{
-    SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
+    SubagentContextRequest, SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
 };
 
 // Constants
@@ -620,7 +620,7 @@ impl ChannelSpawner {
             // Harness-internal: never surface to the model's idle reminder.
             surface_completion: false,
             await_to_completion: false,
-            fork_context: false,
+            context: SubagentContextRequest::FRESH,
             owner: SubagentOwner::Task,
             cancel_token: tokio_util::sync::CancellationToken::new(),
         };
@@ -2445,7 +2445,7 @@ mod tests {
     #[tokio::test]
     async fn channel_spawner_request_is_harness_internal() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2496,7 +2496,7 @@ mod tests {
     #[tokio::test]
     async fn channel_spawner_applies_per_index_model_to_request() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2568,7 +2568,7 @@ mod tests {
     #[tokio::test]
     async fn channel_spawner_inherit_index_leaves_model_none() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let spawner = ChannelSpawner {
@@ -5824,7 +5824,7 @@ mod tests {
     async fn cold_fallback_after_resume_failure_carries_pool0_model_on_request() {
         use std::sync::Mutex as StdMutex;
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
 
         // (model, resume_from) per spawn, in spawn order.
@@ -6219,7 +6219,7 @@ mod tests {
     #[tokio::test]
     async fn channel_spawner_blocks_until_subagent_result() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();

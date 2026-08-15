@@ -1,6 +1,7 @@
 //! Unit-level resume and close: request translation, kind resolution, and
 //! close ordering. Protocol behavior is asserted on the wire in
 //! `tests/acp_session_setup_wire.rs`.
+use crate::agent::mvp_agent::acp_agent::LoadModelSelectionOrigin;
 use crate::agent::mvp_agent::session_lifecycle::{
     CLOSE_INTAKE_WAIT, CLOSE_TOTAL_BUDGET, CloseOutcome,
 };
@@ -8,7 +9,6 @@ use crate::agent::mvp_agent::session_setup::{
     AttachOperation, AttachPolicy, RESUME_REFUSES_CHAT, RESUME_REFUSES_EXTRA_DIRS,
     load_request_for_resume, resume_reuses_active_model,
 };
-use crate::agent::mvp_agent::acp_agent::LoadModelSelectionOrigin;
 use crate::session::SessionLiveState;
 use agent_client_protocol as acp;
 use pretty_assertions::assert_eq;

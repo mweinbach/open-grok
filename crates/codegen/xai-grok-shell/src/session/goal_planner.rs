@@ -13,7 +13,7 @@ use std::sync::Arc;
 use xai_grok_session_events::EventWriter;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::types::{
-    SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
+    SubagentContextRequest, SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
 };
 
 // Shared per-role model override + spawn-and-retry-once fail-open wrapper
@@ -374,7 +374,7 @@ impl ChannelSpawner {
             // Harness-internal: never surface to the model's idle reminder.
             surface_completion: false,
             await_to_completion: false,
-            fork_context: true,
+            context: SubagentContextRequest::FORK,
             owner: SubagentOwner::Task,
             cancel_token: self.cancel_token.clone(),
         };
@@ -669,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn channel_spawner_request_is_harness_internal() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1280,7 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn channel_spawner_threads_harness_override_to_request() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let spawner = ChannelSpawner {
@@ -1582,7 +1582,7 @@ mod tests {
     #[tokio::test]
     async fn planner_retries_to_inherit_instead_of_failing_closed() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
         let plan_file = tmp_plan_file("retry-failopen");
         let plan_for_coord = plan_file.clone();
@@ -1655,7 +1655,7 @@ mod tests {
     async fn planner_cancellation_pauses_as_aborted_without_retry() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            SubagentContextRequest, SubagentEvent, SubagentResult,
         };
         let plan_file = tmp_plan_file("cancel-aborted");
         let spawns = Arc::new(AtomicUsize::new(0));

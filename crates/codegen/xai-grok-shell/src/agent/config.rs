@@ -21,6 +21,7 @@ use xai_grok_sampling_types::{
 use xai_grok_tools::types::compat::{
     COMPAT_CELLS, CompatConfig, CompatConfigToml, CompatRemoteKey, CompatSurface, CompatVendor,
 };
+use xai_tool_types::SubagentContextMode;
 /// The mode in which the agent is running.
 /// Determines behavior like relay sync enablement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3728,6 +3729,9 @@ fn merge_remote_provider_partition(
         if entry.info.tool_mode.is_none() {
             entry.info.tool_mode = donor.info.tool_mode;
         }
+        if entry.info.subagent_context_default.is_none() {
+            entry.info.subagent_context_default = donor.info.subagent_context_default;
+        }
         if entry.info.reasoning_efforts.is_empty() && !donor.info.reasoning_efforts.is_empty() {
             entry.info.reasoning_efforts = donor.info.reasoning_efforts.clone();
             entry.info.supports_reasoning_effort = donor.info.supports_reasoning_effort;
@@ -3910,6 +3914,9 @@ pub fn resolve_model_list_with_provider_catalogs(
                     if entry.info.tool_mode.is_none() {
                         entry.info.tool_mode = donor.info.tool_mode;
                     }
+                    if entry.info.subagent_context_default.is_none() {
+                        entry.info.subagent_context_default = donor.info.subagent_context_default;
+                    }
                 }
                 if resolved.contains_key(key) {
                     tracing::debug!(model_key = %key, "prefetched model overriding default");
@@ -4054,7 +4061,12 @@ pub fn resolve_model_list_with_provider_catalogs(
     }
     {
         let default_cw = DEFAULT_CONTEXT_WINDOW;
-        type DonorMetadata = (std::num::NonZeroU64, ApiBackend, Option<ToolMode>);
+        type DonorMetadata = (
+            std::num::NonZeroU64,
+            ApiBackend,
+            Option<ToolMode>,
+            Option<SubagentContextMode>,
+        );
         let mut donors: std::collections::HashMap<
             ModelProvider,
             std::collections::HashMap<String, DonorMetadata>,
@@ -4069,6 +4081,7 @@ pub fn resolve_model_list_with_provider_catalogs(
                     entry.info.context_window,
                     entry.info.api_backend,
                     entry.info.tool_mode,
+                    entry.info.subagent_context_default,
                 ),
             );
         }
@@ -4076,7 +4089,7 @@ pub fn resolve_model_list_with_provider_catalogs(
             let Some(provider_donors) = donors.get(&entry.info.provider) else {
                 continue;
             };
-            if let Some((donor_cw, donor_backend, donor_tool_mode)) =
+            if let Some((donor_cw, donor_backend, donor_tool_mode, donor_subagent_context)) =
                 provider_donors.get(&entry.info.model)
             {
                 if entry.info.context_window.get() == default_cw {
@@ -4095,6 +4108,9 @@ pub fn resolve_model_list_with_provider_catalogs(
                 }
                 if entry.info.tool_mode.is_none() {
                     entry.info.tool_mode = *donor_tool_mode;
+                }
+                if entry.info.subagent_context_default.is_none() {
+                    entry.info.subagent_context_default = *donor_subagent_context;
                 }
             }
         }
@@ -4239,6 +4255,8 @@ struct DefaultModelJson {
     env_key: Option<EnvKeys>,
     /// Model-selected tool presentation. `None` keeps the direct-tool default.
     tool_mode: Option<ToolMode>,
+    /// Default initial-context mode for subagents on this model. Absent = fresh.
+    subagent_context_default: Option<SubagentContextMode>,
     /// Codex model-catalog execution contract. Unknown versions stay disabled.
     multi_agent_version: Option<String>,
     #[serde(default = "default_agent_type")]
@@ -4372,6 +4390,7 @@ fn default_models(
                 api_backend: m.api_backend,
                 provider: m.provider,
                 tool_mode: m.tool_mode,
+                subagent_context_default: m.subagent_context_default,
                 codex_multi_agent_v2: m.provider == ModelProvider::Codex
                     && m.multi_agent_version.as_deref() == Some("v2"),
                 auth_scheme: None,
@@ -4450,6 +4469,10 @@ pub struct ModelEntryConfig {
     /// requirement; other Responses-backed routes follow the user preference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<ToolMode>,
+    /// Default initial-context mode for subagents running on this model
+    /// (`"fresh"` | `"forked"`). Absent means fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_context_default: Option<SubagentContextMode>,
     /// Whether this Codex model advertises `multi_agent_version = "v2"`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub codex_multi_agent_v2: bool,
@@ -4586,6 +4609,7 @@ pub struct ConfigModelOverride {
     pub provider: Option<ModelProvider>,
     pub auth_scheme: Option<AuthScheme>,
     pub tool_mode: Option<ToolMode>,
+    pub subagent_context_default: Option<SubagentContextMode>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
     #[serde(default)]
@@ -4680,6 +4704,7 @@ impl ConfigModelOverride {
                 entry.info.base_url.clear();
             }
             entry.info.tool_mode = None;
+            entry.info.subagent_context_default = None;
             entry.info.codex_multi_agent_v2 = false;
             entry.info.auth_scheme = AuthScheme::default();
             entry.info.extra_headers.clear();
@@ -4731,6 +4756,9 @@ impl ConfigModelOverride {
         }
         if let Some(v) = self.tool_mode {
             entry.info.tool_mode = Some(v);
+        }
+        if let Some(v) = self.subagent_context_default {
+            entry.info.subagent_context_default = Some(v);
         }
         if !self.extra_headers.is_empty() {
             entry.info.extra_headers = self.extra_headers.clone();
@@ -4849,6 +4877,10 @@ pub struct ModelInfo {
     /// hard requirement; otherwise the session preference decides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<ToolMode>,
+    /// Default initial-context mode for subagents running on this model when
+    /// the `task` call doesn't pass an explicit `context`. `None` means fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_context_default: Option<SubagentContextMode>,
     /// Live Codex multi-agent protocol capability. This is provider metadata,
     /// independent from which reasoning efforts happen to be advertised.
     #[serde(default)]
@@ -4934,6 +4966,7 @@ impl ModelInfo {
             api_backend: ApiBackend::default(),
             provider: ModelProvider::default(),
             tool_mode: None,
+            subagent_context_default: None,
             codex_multi_agent_v2: false,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
@@ -4978,6 +5011,7 @@ impl ModelInfo {
             api_backend: entry.api_backend,
             provider: entry.provider,
             tool_mode: entry.tool_mode,
+            subagent_context_default: entry.subagent_context_default,
             codex_multi_agent_v2: entry.codex_multi_agent_v2,
             auth_scheme: entry.auth_scheme.unwrap_or_default(),
             extra_headers: entry.extra_headers.clone(),
@@ -5970,6 +6004,7 @@ pub fn resolve_aux_model_sampling_config(
                 api_backend: ApiBackend::Responses,
                 provider: ModelProvider::Xai,
                 tool_mode: None,
+                subagent_context_default: None,
                 codex_multi_agent_v2: false,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
@@ -6363,6 +6398,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             api_backend: ApiBackend::Responses,
             provider: ModelProvider::Xai,
             tool_mode: None,
+            subagent_context_default: None,
             codex_multi_agent_v2: false,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
@@ -7850,6 +7886,7 @@ reasoning_effort = "low"
                 api_backend: ApiBackend::default(),
                 provider: ModelProvider::default(),
                 tool_mode: None,
+                subagent_context_default: None,
                 codex_multi_agent_v2: false,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
@@ -8535,6 +8572,49 @@ reasoning_effort = "low"
             Some(CompactionAtTokens::Fixed(367_000)),
         );
     }
+    /// The built-in catalog opts `gpt-5.6-sol` into forked subagent context by
+    /// default while leaving other models on the fresh-spawn behavior.
+    #[test]
+    fn default_catalog_sets_sol_subagent_context_default_to_fork() {
+        use xai_tool_types::SubagentContextMode;
+        let cfg = Config::default();
+        let models = resolve_model_list(&cfg, None);
+        let sol = models.get("gpt-5.6-sol").expect("sol in default catalog");
+        assert_eq!(
+            sol.info.subagent_context_default,
+            Some(SubagentContextMode::Fork),
+        );
+        let grok = models
+            .get(crate::models::default_model())
+            .expect("default model in catalog");
+        assert_eq!(grok.info.subagent_context_default, None);
+    }
+
+    /// `subagent_context_default` accepts a `[model.*]` TOML override and is
+    /// cleared when the same override changes the provider (stale metadata
+    /// must not leak across providers).
+    #[test]
+    fn user_override_parses_subagent_context_default_from_toml() {
+        use xai_tool_types::SubagentContextMode;
+        let dm = crate::models::default_model();
+        let raw_config: toml::Value = toml::from_str(&format!(
+            r#"
+            [model."{dm}"]
+            subagent_context_default = "fork"
+            "#,
+        ))
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let model = resolve_model_list(&cfg, None)
+            .get(dm)
+            .expect("model should exist")
+            .clone();
+        assert_eq!(
+            model.info.subagent_context_default,
+            Some(SubagentContextMode::Fork),
+        );
+    }
+
     #[test]
     fn user_override_parses_compactions_remaining_from_toml() {
         use xai_grok_sampling_types::CompactionsRemaining;
@@ -9212,6 +9292,7 @@ reasoning_effort = "low"
             api_backend: ApiBackend::default(),
             provider: ModelProvider::default(),
             tool_mode: None,
+            subagent_context_default: None,
             codex_multi_agent_v2: false,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
@@ -9377,6 +9458,7 @@ reasoning_effort = "low"
             api_backend: ApiBackend::default(),
             provider: ModelProvider::default(),
             tool_mode: None,
+            subagent_context_default: None,
             codex_multi_agent_v2: false,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
@@ -9834,6 +9916,7 @@ reasoning_effort = "low"
             api_backend: ApiBackend::default(),
             provider: ModelProvider::default(),
             tool_mode: None,
+            subagent_context_default: None,
             codex_multi_agent_v2: false,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
@@ -13854,6 +13937,7 @@ default = "grok-4.5"
                 api_backend,
                 provider: ModelProvider::default(),
                 tool_mode: None,
+                subagent_context_default: None,
                 codex_multi_agent_v2: false,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),

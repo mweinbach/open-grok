@@ -344,6 +344,7 @@
       "api_backend": "responses",
       "provider": "codex",
       "tool_mode": "code_mode_only",
+      "subagent_context_default": "forked",
       "multi_agent_version": "v2",
       "agent_type": "codex",
       "supported_in_api": false,

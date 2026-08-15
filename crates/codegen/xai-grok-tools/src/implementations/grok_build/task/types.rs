@@ -23,6 +23,7 @@ use std::{fmt, sync::Arc, time::Duration};
 use educe::Educe;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use xai_tool_types::SubagentContextMode;
 use xai_tool_types::{SubagentCapabilityMode, SubagentIsolationMode, WaitMode};
 
 use crate::register_resource;
@@ -136,6 +137,48 @@ impl PartialEq for SwarmMemberMeta {
 
 impl Eq for SwarmMemberMeta {}
 
+/// How a spawn wants the child's initial context resolved.
+///
+/// `Default` defers to the effective child model's `subagent_context_default`
+/// catalog flag (fresh when unset); `Explicit` is a caller decision — either
+/// the model-facing `context` argument of the `task` tool or a harness caller
+/// that requires a specific mode (goal planner forks; swarm members, loop
+/// units, and harness-internal helpers stay fresh).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubagentContextRequest {
+    /// No explicit choice: resolve from the child model's catalog default.
+    #[default]
+    Default,
+    /// Explicit caller choice; never overridden by model metadata.
+    Explicit(SubagentContextMode),
+}
+
+impl SubagentContextRequest {
+    pub const FORK: Self = Self::Explicit(SubagentContextMode::Fork);
+    pub const FRESH: Self = Self::Explicit(SubagentContextMode::Fresh);
+
+    /// Effective mode given the child model's catalog default.
+    pub fn resolve(self, model_default: Option<SubagentContextMode>) -> SubagentContextMode {
+        match self {
+            Self::Explicit(mode) => mode,
+            Self::Default => model_default.unwrap_or(SubagentContextMode::Fresh),
+        }
+    }
+
+    /// True only for a caller-explicit fork (used to preserve the legacy
+    /// "fork pins the parent model" behavior for harness callers).
+    pub fn is_explicit_fork(self) -> bool {
+        self == Self::FORK
+    }
+
+    /// True when the spawn may still resolve to a fork (explicit fork, or
+    /// deferred to model metadata). Used by spawn-context builders that must
+    /// capture fork-only parent state before the effective mode is known.
+    pub fn may_fork(self) -> bool {
+        self != Self::FRESH
+    }
+}
+
 /// Plain spawn request emitted by `TaskTool`.
 #[derive(Debug, Clone)]
 pub struct SubagentRequest {
@@ -174,9 +217,11 @@ pub struct SubagentRequest {
     /// subagents like the goal planner/classifier that the model must never see.
     pub surface_completion: bool,
     pub await_to_completion: bool,
-    /// Harness-only: seed child with normalized parent conversation, then append
-    /// `prompt`. Not on TaskToolInput. Successful `resume_from` takes precedence.
-    pub fork_context: bool,
+    /// Requested initial-context mode. `Explicit` comes from the model-facing
+    /// `context` argument or a harness caller; `Default` resolves from the
+    /// effective child model's `subagent_context_default`. Successful
+    /// `resume_from` takes precedence over any fork.
+    pub context: SubagentContextRequest,
     pub owner: SubagentOwner,
     pub cancel_token: CancellationToken,
 }
