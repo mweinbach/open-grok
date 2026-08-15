@@ -4515,6 +4515,51 @@ async fn build_request_preserves_small_old_images() {
     );
 }
 
+/// Request-time prune must stay on when the last API `prompt_tokens` is the
+/// already-pruned size. Gating on that figure alone unlatches prune and
+/// flaps the KV-cache prefix every other loop.
+#[tokio::test]
+async fn request_prune_stays_on_when_api_reports_pruned_prompt_size() {
+    let h = TestHarness::with_context_window(10_000);
+
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q1"));
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("a1"));
+    h.handle.push_tool_result(ConversationItem::tool_result(
+        "old-skill",
+        "x".repeat(24_000),
+    ));
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q2"));
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q3"));
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q4"));
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q5"));
+
+    // Provider reported the pruned clone (~40% of a 10k window). The
+    // unpruned conversation is still ~6k tokens (24k bytes / 4).
+    h.handle.record_token_usage(4_000);
+
+    let req = h
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+
+    let trimmed = req.items.iter().any(|item| match item {
+        ConversationItem::ToolResult(tr) => tr.content.contains("[…trimmed…]"),
+        _ => false,
+    });
+    assert!(
+        trimmed,
+        "unpruned conversation over 50% must keep request-time prune on, \
+         even when the last API prompt_tokens is under the threshold"
+    );
+}
+
 /// Prefix stability after tool result pruning. When context utilization
 /// exceeds 50%, old tool results are soft-trimmed or hard-cleared, but
 /// this happens on a clone -- items outside the pruned region must

@@ -6,6 +6,7 @@ use xai_grok_sampling_types::{
 };
 
 use super::ChatStateActor;
+use super::state::estimate_conversation_tokens;
 use crate::events::ChatStateEvent;
 use crate::types::PruningConfig;
 
@@ -44,8 +45,18 @@ impl ChatStateActor {
         conv_id: String,
         req_id: String,
     ) -> ConversationRequest {
+        // Gate on the unpruned in-memory conversation, not the last API
+        // `prompt_tokens`. Soft-trim runs on a request clone only, so the
+        // provider's next usage report is the already-pruned size. Using that
+        // figure alone unlatches pruning and flaps the KV-cache prefix every
+        // other loop (full request → prune → small report → full request).
+        // `max` with the last API total still lets a tokenizer-backed count
+        // start pruning when the bytes/4 estimate is low; once pruning has
+        // started the estimate stays high because retained history is not
+        // soft-trimmed.
+        let unpruned_tokens = estimate_conversation_tokens(&self.state.conversation);
         let needs_prune = should_prune(
-            self.state.total_tokens,
+            unpruned_tokens.max(self.state.total_tokens),
             self.state.sampling_config.context_window,
         );
         let mut memory_reminder = memory_reminder;
@@ -94,7 +105,7 @@ impl ChatStateActor {
 
             // Step 2: Prune old tool results if context is > 50% utilized
             if needs_prune {
-                prune_conversation(&mut items, &self.pruning_config);
+                prune_conversation(&mut items, &self.pruning_config, self.state.prompt_index);
             }
 
             // Step 3: Inject memory reminder into the system message
@@ -163,14 +174,39 @@ pub(crate) fn should_prune(total_tokens: u64, context_window: std::num::NonZeroU
     total_tokens > context_window.get() / 2
 }
 
+/// `User` items that are not real prompt turns (interjections, reminders).
+///
+/// `prompt_index` counts real turns. Extra `User` items would otherwise make
+/// old tool results look older than they are and get trimmed a turn early.
+pub(crate) fn count_synthetic_user_items(
+    conversation: &[ConversationItem],
+    prompt_index: usize,
+) -> usize {
+    let total_user_items = conversation
+        .iter()
+        .filter(|i| matches!(i, ConversationItem::User(_)))
+        .count();
+    total_user_items.saturating_sub(prompt_index)
+}
+
 /// Prune old, large tool results from the conversation in place.
 ///
 /// Turn age is estimated by walking backward through the conversation and
 /// counting `User` items to determine which "turn" each tool result belongs to.
-pub(crate) fn prune_conversation(conversation: &mut [ConversationItem], config: &PruningConfig) {
+/// `prompt_index` raises the keep/hard-clear thresholds by the number of
+/// synthetic `User` items so interjections do not age tool results early.
+pub(crate) fn prune_conversation(
+    conversation: &mut [ConversationItem],
+    config: &PruningConfig,
+    prompt_index: usize,
+) {
     if !config.enabled {
         return;
     }
+
+    let synthetic_count = count_synthetic_user_items(conversation, prompt_index);
+    let keep_last_n_turns = config.keep_last_n_turns.saturating_add(synthetic_count);
+    let hard_clear_age_turns = config.hard_clear_age_turns.saturating_add(synthetic_count);
 
     let mut turn_from_end: usize = 0;
     let mut seen_first_user = false;
@@ -185,14 +221,14 @@ pub(crate) fn prune_conversation(conversation: &mut [ConversationItem], config: 
         }
 
         // Never prune recent turns.
-        if turn_from_end < config.keep_last_n_turns {
+        if turn_from_end < keep_last_n_turns {
             continue;
         }
 
         match &mut conversation[i] {
             ConversationItem::ToolResult(tool_result) => {
                 // Hard clear: very old tool results → replace entirely.
-                if turn_from_end >= config.hard_clear_age_turns {
+                if turn_from_end >= hard_clear_age_turns {
                     tool_result.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
                     tool_result.images.clear();
                     tool_result.ordered_content.clear();
@@ -227,7 +263,7 @@ pub(crate) fn prune_conversation(conversation: &mut [ConversationItem], config: 
                 }
             }
             ConversationItem::CustomToolOutput(output) => {
-                if turn_from_end >= config.hard_clear_age_turns {
+                if turn_from_end >= hard_clear_age_turns {
                     output.content = vec![xai_grok_sampling_types::CustomToolOutputContent::text(
                         HARD_CLEAR_PLACEHOLDER,
                     )];
@@ -741,10 +777,57 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        prune_conversation(&mut conv, &config);
+        prune_conversation(&mut conv, &config, 0);
         if let ConversationItem::ToolResult(ref tr) = conv[0] {
             assert_eq!(tr.content.len(), 10_000);
         }
+    }
+
+    #[test]
+    fn prune_conversation_does_not_age_from_synthetic_users() {
+        // keep_last_n=1 would trim the tool after one extra User item.
+        // A synthetic interjection must not count as that extra turn.
+        let mut conv = vec![
+            ConversationItem::user("real q1"),
+            ConversationItem::tool_result("c1", "x".repeat(8_000)),
+            ConversationItem::interjection("peer ping"),
+            ConversationItem::user("real q2"),
+        ];
+        let config = PruningConfig {
+            keep_last_n_turns: 1,
+            ..Default::default()
+        };
+        // Two real turns (prompt_index=2) + one synthetic User.
+        prune_conversation(&mut conv, &config, 2);
+        let ConversationItem::ToolResult(ref tr) = conv[1] else {
+            panic!("expected tool result");
+        };
+        assert!(
+            !tr.content.contains(SOFT_TRIM_SEPARATOR),
+            "synthetic User items must not age a tool result into the trim window"
+        );
+    }
+
+    #[test]
+    fn prune_conversation_still_trims_after_enough_real_turns() {
+        let mut conv = vec![
+            ConversationItem::user("real q1"),
+            ConversationItem::tool_result("c1", "x".repeat(8_000)),
+            ConversationItem::user("real q2"),
+            ConversationItem::user("real q3"),
+        ];
+        let config = PruningConfig {
+            keep_last_n_turns: 1,
+            ..Default::default()
+        };
+        prune_conversation(&mut conv, &config, 3);
+        let ConversationItem::ToolResult(ref tr) = conv[1] else {
+            panic!("expected tool result");
+        };
+        assert!(
+            tr.content.contains(SOFT_TRIM_SEPARATOR),
+            "a tool result older than keep_last_n real turns must still soft-trim"
+        );
     }
 
     #[test]

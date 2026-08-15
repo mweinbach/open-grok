@@ -330,13 +330,10 @@ impl ChatStateActor {
         // User items.  This guarantees a tool result is never cleared before
         // `hard_clear_age_turns` REAL turns have elapsed, regardless of how many
         // synthetic messages the session contains.
-        let total_user_items = self
-            .state
-            .conversation
-            .iter()
-            .filter(|i| matches!(i, ConversationItem::User(_)))
-            .count();
-        let synthetic_count = total_user_items.saturating_sub(self.state.prompt_index);
+        let synthetic_count = super::request_builder::count_synthetic_user_items(
+            &self.state.conversation,
+            self.state.prompt_index,
+        );
         let effective_threshold = self
             .pruning_config
             .hard_clear_age_turns
