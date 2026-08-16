@@ -56,7 +56,8 @@ When Code Mode Only is effective:
 4. A JavaScript cell may complete, yield for nested tool calls, or continue in the
    background. `wait` resumes or terminates a yielded cell by identifier.
 5. Tool results and errors cross the JavaScript boundary without losing their
-   structured content.
+   structured content. Successful nested `apply_patch` may resolve to `{}`;
+   failed patches must reject the JS promise with the patcher's diagnostic.
 6. The JavaScript runtime is persistent for a compatible agent timeline,
    replaced on rewind or incompatible provider/transport changes, and disposed
    when that session ends. Stale callbacks and yielded cell IDs fail closed.

@@ -247,7 +247,8 @@ JS calls `await tools.search_replace(...)` etc. The exec tool description enumer
 3. **`prepare_tool_call`** — same as model tools: parse, **plan-mode edit gate**, PreToolUse hooks, permissions, path locks, auth-retry eligibility.
 4. Dispatch via workspace / tool bridge (`call_with_auth_retry`).
 5. Encode structured result for V8 (`code_mode_result()`); fire PostToolUse when configured.
-6. Nested tools **emit ordinary ACP tool cards** (user-visible).
+6. Failed `apply_patch` **rejects** the JS promise (`code_mode_rejection()`) after the ACP card is emitted. Successful patches still resolve to `{}`. Do not resolve failures as `{}` — the model will treat the edit as a no-op and never see the closest-match diagnostic.
+7. Nested tools **emit ordinary ACP tool cards** (user-visible).
 
 Plan mode, hooks, and permission YOLO therefore apply equally to nested edits — see [editing.md](editing.md) and [agent-runtime.md](agent-runtime.md).
 

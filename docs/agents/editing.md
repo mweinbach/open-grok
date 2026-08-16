@@ -52,6 +52,7 @@ Access kind is edit-like (`AccessKind::Edit("apply_patch")`). While plan mode is
 - Preserve pure parser/apply separation so tests can cover without full shell.
 - Do not special-case plan mode inside the tool; the gate is in shell `prepare_tool_call`.
 - Keep Codex wire compatibility unless `docs/codex-provider-port.md` is updated deliberately.
+- In Code Mode, a failed patch must reject `await tools.apply_patch(...)`. Resolving `{}` on `ApplicationError` / `ParseError` / `EmptyPatch` hides the diagnostic from the model (the TUI card still shows failed).
 
 ## Hashline and OpenCode packs
 

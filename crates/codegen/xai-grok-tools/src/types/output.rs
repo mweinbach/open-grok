@@ -680,12 +680,12 @@ impl ToolOutput {
     ///
     /// The aggregate enum uses an internal `type` tag for persistence and
     /// protocol translation. That tag is an implementation detail and must
-    /// not leak into the nested-tool API. Codex also deliberately returns an
-    /// empty object for `apply_patch`, because the filesystem mutation is the
-    /// result and the model does not need the patcher's verbose transcript.
+    /// not leak into the nested-tool API. Successful `apply_patch` still
+    /// resolves to an empty object (the filesystem mutation is the result).
+    /// Failed patches must not use this path — see [`Self::code_mode_rejection`].
     pub fn code_mode_result(&self) -> Result<serde_json::Value, serde_json::Error> {
         match self {
-            ToolOutput::ApplyPatch(_) => Ok(serde_json::json!({})),
+            ToolOutput::ApplyPatch(ApplyPatchOutput::Success { .. }) => Ok(serde_json::json!({})),
             // Shape image reads for the code-mode `image()` helper, which
             // accepts `{image_url, detail?}`: `image(result)` attaches the
             // picture to the cell output as vision input. The raw
@@ -716,6 +716,24 @@ impl ToolOutput {
                 }
                 Ok(value)
             }
+        }
+    }
+
+    /// Error text that should reject the Code Mode JavaScript promise.
+    ///
+    /// Nested `apply_patch` is not appended as a top-level function result.
+    /// A successful patch resolves to `{}` by contract, so a failed patch
+    /// that also resolves to `{}` looks like a successful no-op and the
+    /// model never sees the closest-match diagnostic. Rejecting forces
+    /// `await tools.apply_patch(...)` to throw into the exec cell.
+    pub fn code_mode_rejection(&self) -> Option<String> {
+        match self {
+            ToolOutput::ApplyPatch(
+                ApplyPatchOutput::ParseError(msg)
+                | ApplyPatchOutput::ApplicationError(msg)
+                | ApplyPatchOutput::EmptyPatch(msg),
+            ) => Some(msg.clone()),
+            _ => None,
         }
     }
 
@@ -2799,10 +2817,49 @@ mod tests {
             serde_json::json!({ "answer": 42 })
         );
         assert_eq!(
-            ToolOutput::ApplyPatch(ApplyPatchOutput::EmptyPatch("unused".into()))
-                .code_mode_result()
-                .unwrap(),
+            ToolOutput::ApplyPatch(ApplyPatchOutput::Success {
+                files: Vec::new(),
+                tool_output_for_prompt: "Updated /repo/src/main.rs".into(),
+            })
+            .code_mode_result()
+            .unwrap(),
             serde_json::json!({})
+        );
+        assert_eq!(
+            ToolOutput::ApplyPatch(ApplyPatchOutput::Success {
+                files: Vec::new(),
+                tool_output_for_prompt: "Updated /repo/src/main.rs".into(),
+            })
+            .code_mode_rejection(),
+            None
+        );
+
+        let failed = ToolOutput::ApplyPatch(ApplyPatchOutput::ApplicationError(
+            "Failed to find expected lines in /repo/src/main.rs".into(),
+        ));
+        assert_eq!(
+            failed.code_mode_result().unwrap(),
+            serde_json::json!({
+                "ApplicationError": "Failed to find expected lines in /repo/src/main.rs"
+            })
+        );
+        assert_eq!(
+            failed.code_mode_rejection().as_deref(),
+            Some("Failed to find expected lines in /repo/src/main.rs")
+        );
+        assert_eq!(
+            ToolOutput::ApplyPatch(ApplyPatchOutput::EmptyPatch(
+                "No files were modified.".into()
+            ))
+            .code_mode_rejection()
+            .as_deref(),
+            Some("No files were modified.")
+        );
+        assert_eq!(
+            ToolOutput::ApplyPatch(ApplyPatchOutput::ParseError("Invalid patch: boom".into()))
+                .code_mode_rejection()
+                .as_deref(),
+            Some("Invalid patch: boom")
         );
     }
 

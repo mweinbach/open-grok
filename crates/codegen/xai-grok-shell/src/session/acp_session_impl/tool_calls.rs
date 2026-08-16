@@ -1135,6 +1135,11 @@ impl SessionActor {
                         .or_else(|| prepared.dispatch_target_name.clone())
                         .unwrap_or_else(|| prepared.tool_name.clone());
                     let drained = DrainedToolSuccess::new(tool_result);
+                    // Reject failed apply_patch into JS *after* the ACP card is
+                    // emitted. The TUI already shows ApplicationError; without
+                    // this reject, Code Mode resolves `{}` and the model treats
+                    // a failed edit as a successful no-op.
+                    let code_mode_rejection = drained.output().code_mode_rejection();
                     let structured = drained.output().code_mode_result().map_err(|error| {
                         format!("failed to encode `{tool_name}` output: {error}")
                     })?;
@@ -1178,6 +1183,9 @@ impl SessionActor {
                             Some(hook_tool_name),
                         )
                         .await;
+                    }
+                    if let Some(message) = code_mode_rejection {
+                        return Err(message);
                     }
                     Ok(structured)
                 }
