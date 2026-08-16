@@ -9,7 +9,8 @@
 //!
 //! The first line of the failure message stays byte-identical to codex
 //! (`Failed to find expected lines in <path>:\n<lines>`); everything produced
-//! here is appended after it.
+//! here is appended after it, including a line-by-line list of expected
+//! vs actual for the lines that actually differed.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -23,6 +24,8 @@ const MAX_FALLBACK_FILE_LINES: usize = 20_000;
 const MIN_REPORT_SIMILARITY: f32 = 0.3;
 /// Cap on lines echoed back from the matched region.
 const MAX_DISPLAY_LINES: usize = 20;
+/// Cap on explicit expected-vs-actual mismatch rows.
+const MAX_MISMATCH_LINES: usize = 8;
 /// Number of vote-anchored candidate windows to refine with full scoring.
 const MAX_CANDIDATE_STARTS: usize = 5;
 
@@ -76,13 +79,66 @@ pub fn diagnose_missing_lines(
     if m.len > MAX_DISPLAY_LINES {
         let _ = writeln!(out, "\t… ({} more lines)", m.len - MAX_DISPLAY_LINES);
     }
+    if let Some(mismatches) = format_line_mismatches(lines, pattern, m.start) {
+        let _ = write!(out, "\n\n{mismatches}");
+    }
     if m.similarity >= 0.999 && m.start < search_start {
         let _ = write!(
             out,
-            "These lines exist but occur BEFORE the position where the previous hunk matched; hunks must be ordered top-to-bottom within the file."
+            "\nThese lines exist but occur BEFORE the position where the previous hunk matched; hunks must be ordered top-to-bottom within the file."
         );
     }
     out.trim_end().to_string()
+}
+
+/// Line-by-line expected-vs-actual for the closest window.
+///
+/// The prefix already echoes the full expected hunk; this section names the
+/// lines that actually differed so the model does not have to visually
+/// diff two similar blocks.
+fn format_line_mismatches(
+    lines: &[String],
+    pattern: &[String],
+    match_start: usize,
+) -> Option<String> {
+    let pattern = trim_trailing_blank(pattern);
+    if pattern.is_empty() {
+        return None;
+    }
+
+    let mut rows: Vec<String> = Vec::new();
+    for (offset, expected) in pattern.iter().enumerate() {
+        let file_idx = match_start + offset;
+        match lines.get(file_idx) {
+            Some(actual) if actual == expected => {}
+            Some(actual) => {
+                let note = if actual.trim() == expected.trim() {
+                    " (whitespace differs)"
+                } else {
+                    ""
+                };
+                rows.push(format!(
+                    "  L{} expected: {expected:?}{note}\n       actual:   {actual:?}",
+                    file_idx + 1
+                ));
+            }
+            None => rows.push(format!(
+                "  (after EOF) expected: {expected:?}\n               actual:   <end of file>"
+            )),
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+
+    let total = rows.len();
+    let mut out = format!("Did not match ({total} of {} lines):\n", pattern.len());
+    let shown = total.min(MAX_MISMATCH_LINES);
+    out.push_str(&rows[..shown].join("\n"));
+    if total > shown {
+        let _ = write!(out, "\n  … ({} more mismatched lines)", total - shown);
+    }
+    Some(out)
 }
 
 /// Find the window of the file most similar to `pattern`.
@@ -284,6 +340,23 @@ mod tests {
         assert!(msg.contains("Closest match in f.txt at lines 2-4"), "{msg}");
         assert!(msg.contains("(similarity:"), "{msg}");
         assert!(msg.contains("2\tbeta"), "{msg}");
+        assert!(msg.contains("Did not match (1 of 3 lines):"), "{msg}");
+        assert!(msg.contains("L4 expected: \"epsilon\""), "{msg}");
+        assert!(msg.contains("actual:   \"delta\""), "{msg}");
+        assert!(
+            !msg.contains("L2 expected:"),
+            "exact matches must not be listed: {msg}"
+        );
+    }
+
+    #[test]
+    fn diagnose_notes_whitespace_only_mismatches() {
+        let lines = to_vec(&["fn foo() {", "\treturn 1;", "}"]);
+        let pattern = to_vec(&["fn foo() {", "    return 1;", "}"]);
+        let msg = diagnose_missing_lines(&lines, &pattern, &PathBuf::from("w.rs"), 0);
+        assert!(msg.contains("Did not match (1 of 3 lines):"), "{msg}");
+        assert!(msg.contains("(whitespace differs)"), "{msg}");
+        assert!(msg.contains("L2 expected:"), "{msg}");
     }
 
     #[test]

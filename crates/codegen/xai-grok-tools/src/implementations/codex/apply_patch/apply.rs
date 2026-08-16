@@ -354,6 +354,9 @@ mod tests {
             msg.contains("4\tvar showingExerciseEditor = false"),
             "{msg}"
         );
+        assert!(msg.contains("Did not match"), "{msg}");
+        assert!(msg.contains("expected:"), "{msg}");
+        assert!(msg.contains("actual:"), "{msg}");
     }
 
     #[test]

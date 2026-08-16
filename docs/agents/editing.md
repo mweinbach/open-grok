@@ -53,6 +53,7 @@ Access kind is edit-like (`AccessKind::Edit("apply_patch")`). While plan mode is
 - Do not special-case plan mode inside the tool; the gate is in shell `prepare_tool_call`.
 - Keep Codex wire compatibility unless `docs/codex-provider-port.md` is updated deliberately.
 - In Code Mode, a failed patch must reject `await tools.apply_patch(...)`. Resolving `{}` on `ApplicationError` / `ParseError` / `EmptyPatch` hides the diagnostic from the model (the TUI card still shows failed).
+- Missing-hunk errors must keep the expected lines (codex prefix) **and** list the lines that did not match against the closest file region (`expected:` / `actual:`). Do not report only the closest match.
 
 ## Hashline and OpenCode packs
 
