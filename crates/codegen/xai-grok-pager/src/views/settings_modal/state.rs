@@ -599,6 +599,14 @@ impl SettingsModalState {
         self.try_open_provider_login_secret("zai_api_key")
     }
 
+    pub fn try_open_runinfra_provider_login(&mut self) -> bool {
+        self.try_open_provider_login_secret("runinfra_api_key")
+    }
+
+    pub fn try_open_gemini_provider_login(&mut self) -> bool {
+        self.try_open_provider_login_secret("gemini_api_key")
+    }
+
     /// Advance a focused Kimi login from its service selector to the matching
     /// credential editor while keeping the provider-login close semantics.
     pub(crate) fn advance_kimi_provider_login_to_secret(&mut self, endpoint: &'static str) -> bool {

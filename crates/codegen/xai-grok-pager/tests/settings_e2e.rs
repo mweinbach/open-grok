@@ -61,6 +61,8 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "opencode_go_api_key",
     "wafer_api_key",
     "zai_api_key",
+    "runinfra_api_key",
+    "gemini_api_key",
     "opencode_go_models",
     "custom_models",
     "custom_models.list",
@@ -777,6 +779,8 @@ fn enter_on_each_provider_api_key_opens_matching_empty_secret_editor() {
         "opencode_go_api_key",
         "wafer_api_key",
         "zai_api_key",
+        "runinfra_api_key",
+        "gemini_api_key",
         "perplexity_api_key",
     ] {
         let mut s = make_state();
@@ -1329,6 +1333,8 @@ fn mouse_click_on_each_provider_key_value_opens_matching_secret_editor() {
         "opencode_go_api_key",
         "wafer_api_key",
         "zai_api_key",
+        "runinfra_api_key",
+        "gemini_api_key",
         "perplexity_api_key",
     ] {
         let mut s = make_state();
@@ -2847,11 +2853,13 @@ fn registry_kind_membership_through_pr_14() {
         vec![
             "deepseek_api_key",
             "fireworks_api_key",
+            "gemini_api_key",
             "kimi_api_key",
             "kimi_code_api_key",
             "meta_api_key",
             "opencode_go_api_key",
             "perplexity_api_key",
+            "runinfra_api_key",
             "wafer_api_key",
             "zai_api_key",
         ],
@@ -2990,6 +2998,12 @@ fn defaults_round_trip_through_registry() {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
             }
             "zai_api_key" => {
+                SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
+            }
+            "runinfra_api_key" => {
+                SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
+            }
+            "gemini_api_key" => {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
             }
             "custom_model_id" => SettingValue::String(String::new()),

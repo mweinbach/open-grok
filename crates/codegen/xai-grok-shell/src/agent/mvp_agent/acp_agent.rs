@@ -120,6 +120,32 @@ pub(super) fn zai_models_apply_payload(
     }
 }
 
+pub(super) fn runinfra_models_apply_payload(
+    refreshed: Result<bool, String>,
+    models: acp::SessionModelState,
+) -> serde_json::Value {
+    match refreshed {
+        Ok(refreshed) => serde_json::json!({ "refreshed": refreshed, "models": models }),
+        Err(warning) => {
+            tracing::warn!(%warning, "RunInfra model query failed; returning current models");
+            serde_json::json!({ "refreshed": false, "warning": warning, "models": models })
+        }
+    }
+}
+
+pub(super) fn gemini_models_apply_payload(
+    refreshed: Result<bool, String>,
+    models: acp::SessionModelState,
+) -> serde_json::Value {
+    match refreshed {
+        Ok(refreshed) => serde_json::json!({ "refreshed": refreshed, "models": models }),
+        Err(warning) => {
+            tracing::warn!(%warning, "Gemini model query failed; returning current models");
+            serde_json::json!({ "refreshed": false, "warning": warning, "models": models })
+        }
+    }
+}
+
 pub(super) fn custom_models_mutation_payload(
     models: acp::SessionModelState,
     custom_models: Vec<crate::custom_models::CustomModelPublicRecord>,
@@ -2622,6 +2648,56 @@ impl acp::Agent for MvpAgent {
                     available.values().cloned().collect(),
                 );
                 crate::extensions::to_ext_response(Ok(zai_models_apply_payload(
+                    refreshed, models,
+                )))
+            }
+            "open-grok/runinfra/models/apply" => {
+                let cancelled_subagents = crate::agent::subagent::cancel_for_provider_runtime_change(
+                    &self.subagent_provider_registry,
+                    xai_grok_sampling_types::ModelProvider::Runinfra,
+                );
+                if cancelled_subagents > 0 {
+                    tracing::warn!(
+                        cancelled_subagents,
+                        "cancelled subagents before RunInfra runtime credential change"
+                    );
+                }
+                let refreshed = self
+                    .models_manager
+                    .apply_runinfra_credential_change()
+                    .await
+                    .map_err(|error| error.to_string());
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(runinfra_models_apply_payload(
+                    refreshed, models,
+                )))
+            }
+            "open-grok/gemini/models/apply" => {
+                let cancelled_subagents = crate::agent::subagent::cancel_for_provider_runtime_change(
+                    &self.subagent_provider_registry,
+                    xai_grok_sampling_types::ModelProvider::Gemini,
+                );
+                if cancelled_subagents > 0 {
+                    tracing::warn!(
+                        cancelled_subagents,
+                        "cancelled subagents before Gemini runtime credential change"
+                    );
+                }
+                let refreshed = self
+                    .models_manager
+                    .apply_gemini_credential_change()
+                    .await
+                    .map_err(|error| error.to_string());
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(gemini_models_apply_payload(
                     refreshed, models,
                 )))
             }

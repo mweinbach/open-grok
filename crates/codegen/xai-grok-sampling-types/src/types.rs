@@ -1136,6 +1136,19 @@ pub enum ModelProvider {
     Wafer,
     #[serde(alias = "z_ai", alias = "z-ai")]
     Zai,
+    #[serde(alias = "run_infra", alias = "run-infra")]
+    Runinfra,
+    /// Google Gemini API / AI Studio OpenAI-compatible Chat Completions
+    /// (`https://generativelanguage.googleapis.com/v1beta/openai/`).
+    #[serde(
+        rename = "gemini",
+        alias = "google",
+        alias = "google_gemini",
+        alias = "ai_studio",
+        alias = "aistudio",
+        alias = "gemini_api"
+    )]
+    Gemini,
 }
 
 /// Provider-specific wire contract used by the Responses API.
@@ -1454,6 +1467,46 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
+    /// RunInfra's OpenAI-compatible Chat Completions API. Hosted models
+    /// reason by default and accept ordinary client-side function tools.
+    /// RunInfra's `/v1/responses` route is a chat-completions compatibility
+    /// adapter, not a first-class Responses dialect, so this profile stays
+    /// Chat-only. No hosted tools, native web search, or OAuth.
+    pub const RUNINFRA: Self = Self {
+        provider: ModelProvider::Runinfra,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: None,
+            messages: false,
+        },
+        code_mode_transport: CodeModeTransport::Unsupported,
+        hosted_tool_dialect: None,
+        native_web_search: false,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
+    /// Google Gemini API / AI Studio OpenAI-compatible Chat Completions.
+    /// Gemini 3 models reason by default and accept ordinary client-side
+    /// function tools. This profile stays Chat-only: the official OpenAI
+    /// compatibility surface is `chat/completions`, not a first-class
+    /// Responses dialect. No hosted tools, native web search, or OAuth.
+    pub const GEMINI: Self = Self {
+        provider: ModelProvider::Gemini,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: None,
+            messages: false,
+        },
+        code_mode_transport: CodeModeTransport::Unsupported,
+        hosted_tool_dialect: None,
+        native_web_search: false,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
     pub const fn id(self) -> &'static str {
         self.provider.as_str()
     }
@@ -1498,6 +1551,14 @@ impl ProviderProfile {
         self.provider.is_zai()
     }
 
+    pub const fn is_runinfra(self) -> bool {
+        self.provider.is_runinfra()
+    }
+
+    pub const fn is_gemini(self) -> bool {
+        self.provider.is_gemini()
+    }
+
     pub const fn allows_xai_services(self) -> bool {
         self.xai_services.allows()
     }
@@ -1528,6 +1589,8 @@ impl ModelProvider {
             Self::OpenCodeGo => "opencode_go",
             Self::Wafer => "wafer",
             Self::Zai => "zai",
+            Self::Runinfra => "runinfra",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -1543,6 +1606,8 @@ impl ModelProvider {
             Self::OpenCodeGo => "OpenCode Go",
             Self::Wafer => "Wafer AI",
             Self::Zai => "Z AI",
+            Self::Runinfra => "RunInfra",
+            Self::Gemini => "Google Gemini",
         }
     }
 
@@ -1582,6 +1647,14 @@ impl ModelProvider {
         matches!(self, Self::Zai)
     }
 
+    pub const fn is_runinfra(self) -> bool {
+        matches!(self, Self::Runinfra)
+    }
+
+    pub const fn is_gemini(self) -> bool {
+        matches!(self, Self::Gemini)
+    }
+
     /// Return the built-in provider's complete behavior policy.
     pub const fn profile(self) -> ProviderProfile {
         match self {
@@ -1594,6 +1667,8 @@ impl ModelProvider {
             Self::OpenCodeGo => ProviderProfile::OPEN_CODE_GO,
             Self::Wafer => ProviderProfile::WAFER,
             Self::Zai => ProviderProfile::ZAI,
+            Self::Runinfra => ProviderProfile::RUNINFRA,
+            Self::Gemini => ProviderProfile::GEMINI,
         }
     }
 }
@@ -1973,6 +2048,38 @@ mod tests {
                 session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
                 xai_services: XaiServicePolicy::Denied,
             },
+            Case {
+                provider: ModelProvider::Runinfra,
+                id: "runinfra",
+                name: "RunInfra",
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: None,
+                    messages: false,
+                },
+                code_mode_transport: CodeModeTransport::Unsupported,
+                hosted_tools: None,
+                native_web_search: false,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+                xai_services: XaiServicePolicy::Denied,
+            },
+            Case {
+                provider: ModelProvider::Gemini,
+                id: "gemini",
+                name: "Google Gemini",
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: None,
+                    messages: false,
+                },
+                code_mode_transport: CodeModeTransport::Unsupported,
+                hosted_tools: None,
+                native_web_search: false,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+                xai_services: XaiServicePolicy::Denied,
+            },
         ];
 
         for case in cases {
@@ -1996,6 +2103,8 @@ mod tests {
             assert_eq!(profile.is_open_code_go(), case.provider.is_open_code_go());
             assert_eq!(profile.is_wafer(), case.provider.is_wafer());
             assert_eq!(profile.is_zai(), case.provider.is_zai());
+            assert_eq!(profile.is_runinfra(), case.provider.is_runinfra());
+            assert_eq!(profile.is_gemini(), case.provider.is_gemini());
             assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
             for backend in [
                 ApiBackend::ChatCompletions,

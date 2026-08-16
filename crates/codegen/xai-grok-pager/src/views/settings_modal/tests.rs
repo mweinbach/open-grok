@@ -1038,6 +1038,10 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "wafer_api_key",
             // Z AI isolated credential.
             "zai_api_key",
+            // RunInfra isolated credential.
+            "runinfra_api_key",
+            // Google Gemini isolated credential.
+            "gemini_api_key",
             "opencode_go_models",
             "custom_models",
             "toolset.perplexity_web_search.enabled",

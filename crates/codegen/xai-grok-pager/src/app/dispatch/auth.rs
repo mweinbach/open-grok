@@ -31,6 +31,8 @@ pub(super) fn dispatch_open_login_provider_picker(app: &mut AppView) -> Vec<Effe
     let opencode_go_status = super::settings::ui::opencode_go_api_key_status();
     let wafer_status = super::settings::ui::wafer_api_key_status();
     let zai_status = super::settings::ui::zai_api_key_status();
+    let runinfra_status = super::settings::ui::runinfra_api_key_status();
+    let gemini_status = super::settings::ui::gemini_api_key_status();
     let items = crate::slash::commands::login::provider_items(
         Some(kimi_status),
         Some(fireworks_status),
@@ -39,6 +41,8 @@ pub(super) fn dispatch_open_login_provider_picker(app: &mut AppView) -> Vec<Effe
         Some(opencode_go_status),
         Some(wafer_status),
         Some(zai_status),
+        Some(runinfra_status),
+        Some(gemini_status),
     );
     if let Some(agent) = get_visible_agent_mut(app) {
         agent.active_modal = Some(crate::views::modal::ActiveModal::ArgPicker {
@@ -159,6 +163,8 @@ fn select_startup_model(
             PrimaryProvider::OpenCodeGo => "OpenCode Go",
             PrimaryProvider::Wafer => "Wafer AI",
             PrimaryProvider::Zai => "Z AI",
+            PrimaryProvider::Runinfra => "RunInfra",
+            PrimaryProvider::Gemini => "Google Gemini",
         };
         return Err(if allow_provider_fallback {
             format!("No visible {provider_name} model is available. Check model filters and retry.")

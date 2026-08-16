@@ -360,6 +360,8 @@ pub enum WebSearchSourceTarget {
     Meta,
     Wafer,
     Zai,
+    Runinfra,
+    Gemini,
     OpenCodeGo,
 }
 
@@ -382,6 +384,8 @@ impl WebSearchSourceTarget {
             ModelProvider::Meta => Self::Meta,
             ModelProvider::Wafer => Self::Wafer,
             ModelProvider::Zai => Self::Zai,
+            ModelProvider::Runinfra => Self::Runinfra,
+            ModelProvider::Gemini => Self::Gemini,
             ModelProvider::OpenCodeGo => Self::OpenCodeGo,
         }
     }
@@ -402,6 +406,8 @@ pub struct WebSearchSourceConfig {
     pub meta: Option<WebSearchSource>,
     pub wafer: Option<WebSearchSource>,
     pub zai: Option<WebSearchSource>,
+    pub runinfra: Option<WebSearchSource>,
+    pub gemini: Option<WebSearchSource>,
     pub opencode_go: Option<WebSearchSource>,
 }
 
@@ -418,6 +424,8 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::Meta => self.meta,
             WebSearchSourceTarget::Wafer => self.wafer,
             WebSearchSourceTarget::Zai => self.zai,
+            WebSearchSourceTarget::Runinfra => self.runinfra,
+            WebSearchSourceTarget::Gemini => self.gemini,
             WebSearchSourceTarget::OpenCodeGo => self.opencode_go,
         }
     }
@@ -434,6 +442,8 @@ impl WebSearchSourceConfig {
             | WebSearchSourceTarget::DeepSeek
             | WebSearchSourceTarget::Wafer
             | WebSearchSourceTarget::Zai
+            | WebSearchSourceTarget::Runinfra
+            | WebSearchSourceTarget::Gemini
             | WebSearchSourceTarget::OpenCodeGo => WebSearchSource::Xai,
         }
     }
@@ -456,6 +466,8 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::Meta => self.meta = source,
             WebSearchSourceTarget::Wafer => self.wafer = source,
             WebSearchSourceTarget::Zai => self.zai = source,
+            WebSearchSourceTarget::Runinfra => self.runinfra = source,
+            WebSearchSourceTarget::Gemini => self.gemini = source,
             WebSearchSourceTarget::OpenCodeGo => self.opencode_go = source,
         }
     }
@@ -551,6 +563,8 @@ impl WebSearchCandidates {
             | WebSearchSourceTarget::DeepSeek
             | WebSearchSourceTarget::Wafer
             | WebSearchSourceTarget::Zai
+            | WebSearchSourceTarget::Runinfra
+            | WebSearchSourceTarget::Gemini
             | WebSearchSourceTarget::OpenCodeGo => WebSearchSource::Xai,
         }
     }
@@ -583,6 +597,8 @@ impl WebSearchCandidates {
                 | ModelProvider::DeepSeek
                 | ModelProvider::Wafer
                 | ModelProvider::Zai
+                | ModelProvider::Runinfra
+                | ModelProvider::Gemini
                 | ModelProvider::OpenCodeGo => WebSearchConfig::Disabled,
                 // For xAI, "native" and the xAI client tool are the same
                 // service — keep the client declaration as today.

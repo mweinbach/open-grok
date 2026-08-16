@@ -688,6 +688,18 @@ pub enum Action {
     },
     /// Remove the UI-stored Z AI credential.
     ClearZaiApiKey,
+    /// Save the RunInfra API key from the dedicated masked editor.
+    SetRuninfraApiKey {
+        key: crate::settings::SecretInput,
+    },
+    /// Remove the UI-stored RunInfra credential.
+    ClearRuninfraApiKey,
+    /// Save the Google Gemini API key from the dedicated masked editor.
+    SetGeminiApiKey {
+        key: crate::settings::SecretInput,
+    },
+    /// Remove the UI-stored Google Gemini credential.
+    ClearGeminiApiKey,
     SetOpenCodeGoEnabledModels {
         models: Vec<String>,
     },
@@ -822,6 +834,10 @@ pub enum Action {
     OpenWaferApiKeyEditor,
     /// Open Settings directly in the secure Z AI API-key editor.
     OpenZaiApiKeyEditor,
+    /// Open Settings directly in the secure RunInfra API-key editor.
+    OpenRuninfraApiKeyEditor,
+    /// Open Settings directly in the secure Google Gemini API-key editor.
+    OpenGeminiApiKeyEditor,
     /// Start the concrete xAI login flow (welcome screen, picker, or re-auth).
     Login,
     /// Connect the independent OpenAI Codex OAuth account in the browser.
@@ -1663,6 +1679,16 @@ pub enum Effect {
         generation: u64,
         key: Option<crate::settings::SecretInput>,
     },
+    /// Update the RunInfra credential, then refresh its dynamic model catalog.
+    UpdateRuninfraApiKey {
+        generation: u64,
+        key: Option<crate::settings::SecretInput>,
+    },
+    /// Update the Google Gemini credential, then refresh its dynamic model catalog.
+    UpdateGeminiApiKey {
+        generation: u64,
+        key: Option<crate::settings::SecretInput>,
+    },
     UpdateOpenCodeGoEnabledModels {
         generation: u64,
         models: Vec<String>,
@@ -1746,6 +1772,20 @@ pub enum Effect {
         generation: u64,
     },
     RebindZaiModel {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+    },
+    RebindRuninfraModel {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+    },
+    RebindGeminiModel {
         agent_id: AgentId,
         session_id: acp::SessionId,
         model_id: acp::ModelId,
@@ -2808,6 +2848,24 @@ pub enum TaskResult {
         error: Option<String>,
         models: Option<acp::SessionModelState>,
     },
+    /// Completion of a RunInfra credential update and dynamic catalog refresh.
+    RuninfraApiKeyUpdated {
+        configured: bool,
+        generation: u64,
+        stale: bool,
+        warning: Option<String>,
+        error: Option<String>,
+        models: Option<acp::SessionModelState>,
+    },
+    /// Completion of a Google Gemini credential update and dynamic catalog refresh.
+    GeminiApiKeyUpdated {
+        configured: bool,
+        generation: u64,
+        stale: bool,
+        warning: Option<String>,
+        error: Option<String>,
+        models: Option<acp::SessionModelState>,
+    },
     /// Completion of an automatic Fireworks sampler/model rebind.
     FireworksModelRebindComplete {
         agent_id: AgentId,
@@ -2854,6 +2912,24 @@ pub enum TaskResult {
     },
     /// Completion of an automatic Z AI sampler/model rebind.
     ZaiModelRebindComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+        result: Result<(), SwitchModelError>,
+    },
+    /// Completion of an automatic RunInfra sampler/model rebind.
+    RuninfraModelRebindComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+        result: Result<(), SwitchModelError>,
+    },
+    /// Completion of an automatic Google Gemini sampler/model rebind.
+    GeminiModelRebindComplete {
         agent_id: AgentId,
         session_id: acp::SessionId,
         model_id: acp::ModelId,

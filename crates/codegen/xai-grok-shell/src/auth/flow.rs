@@ -1175,6 +1175,52 @@ pub fn run_cli_zai_logout() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Store a RunInfra API key supplied by a command or client integration.
+///
+/// RunInfra credentials are provider-local API keys, not xAI sessions, so this
+/// deliberately never updates the xAI auth manager or its scope.
+pub fn run_cli_runinfra_login(api_key: &str) -> anyhow::Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        anyhow::bail!("RunInfra API key cannot be empty");
+    }
+    crate::auth::store_runinfra_api_key(&grok_home::grok_home(), api_key)
+        .map_err(|e| anyhow::anyhow!("Failed to save RunInfra API key: {e}"))?;
+    eprintln!("Connected RunInfra API key.");
+    Ok(())
+}
+
+/// Remove only the stored RunInfra API key.
+pub fn run_cli_runinfra_logout() -> anyhow::Result<()> {
+    crate::auth::clear_runinfra_api_key(&grok_home::grok_home())
+        .map_err(|e| anyhow::anyhow!("Failed to clear RunInfra API key: {e}"))?;
+    eprintln!("Signed out of RunInfra.");
+    Ok(())
+}
+
+/// Store a Gemini API key supplied by a command or client integration.
+///
+/// Gemini credentials are provider-local API keys, not xAI sessions, so this
+/// deliberately never updates the xAI auth manager or its scope.
+pub fn run_cli_gemini_login(api_key: &str) -> anyhow::Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        anyhow::bail!("Gemini API key cannot be empty");
+    }
+    crate::auth::store_gemini_api_key(&grok_home::grok_home(), api_key)
+        .map_err(|e| anyhow::anyhow!("Failed to save Gemini API key: {e}"))?;
+    eprintln!("Connected Google Gemini API key.");
+    Ok(())
+}
+
+/// Remove only the stored Gemini API key.
+pub fn run_cli_gemini_logout() -> anyhow::Result<()> {
+    crate::auth::clear_gemini_api_key(&grok_home::grok_home())
+        .map_err(|e| anyhow::anyhow!("Failed to clear Gemini API key: {e}"))?;
+    eprintln!("Signed out of Google Gemini.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

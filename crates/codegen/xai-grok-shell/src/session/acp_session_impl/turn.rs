@@ -2808,6 +2808,21 @@ impl SessionActor {
                         .data("Z AI API-key authentication cannot be refreshed automatically"));
                 }
                 SamplerTurnOutcome::RefreshAuthAndResubmit {
+                    provider: xai_grok_sampling_types::ModelProvider::Runinfra,
+                    ..
+                } => {
+                    return Err(acp::Error::internal_error().data(
+                        "RunInfra API-key authentication cannot be refreshed automatically",
+                    ));
+                }
+                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                    provider: xai_grok_sampling_types::ModelProvider::Gemini,
+                    ..
+                } => {
+                    return Err(acp::Error::internal_error()
+                        .data("Gemini API-key authentication cannot be refreshed automatically"));
+                }
+                SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::OpenCodeGo,
                     ..
                 } => {

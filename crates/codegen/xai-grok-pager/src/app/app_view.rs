@@ -423,6 +423,8 @@ pub enum PrimaryProvider {
     OpenCodeGo,
     Wafer,
     Zai,
+    Runinfra,
+    Gemini,
 }
 
 pub const CODEX_STARTUP_MODEL_ID: &str = "gpt-5.6-sol";
@@ -466,6 +468,21 @@ impl PrimaryProvider {
             || provider.eq_ignore_ascii_case("z-ai")
         {
             Some(Self::Zai)
+        } else if provider.eq_ignore_ascii_case("runinfra")
+            || provider.eq_ignore_ascii_case("run_infra")
+            || provider.eq_ignore_ascii_case("run-infra")
+        {
+            Some(Self::Runinfra)
+        } else if provider.eq_ignore_ascii_case("gemini")
+            || provider.eq_ignore_ascii_case("google")
+            || provider.eq_ignore_ascii_case("google_gemini")
+            || provider.eq_ignore_ascii_case("google-gemini")
+            || provider.eq_ignore_ascii_case("ai_studio")
+            || provider.eq_ignore_ascii_case("ai-studio")
+            || provider.eq_ignore_ascii_case("aistudio")
+            || provider.eq_ignore_ascii_case("gemini_api")
+        {
+            Some(Self::Gemini)
         } else {
             None
         }
@@ -780,6 +797,12 @@ pub struct AppView {
     pub(crate) zai_operation_generation: u64,
     pub(crate) zai_runtime_update_pending: bool,
     pub(crate) pending_zai_rebind_agents: std::collections::HashSet<AgentId>,
+    pub(crate) runinfra_operation_generation: u64,
+    pub(crate) runinfra_runtime_update_pending: bool,
+    pub(crate) pending_runinfra_rebind_agents: std::collections::HashSet<AgentId>,
+    pub(crate) gemini_operation_generation: u64,
+    pub(crate) gemini_runtime_update_pending: bool,
+    pub(crate) pending_gemini_rebind_agents: std::collections::HashSet<AgentId>,
     pub(crate) opencode_go_models:
         Vec<xai_grok_shell::opencode_go_models::OpenCodeGoModelDescriptor>,
     pub(crate) opencode_go_enabled_models: Vec<String>,
@@ -1554,6 +1577,28 @@ impl AppView {
         }
     }
 
+    pub(crate) fn cancel_pending_runinfra_rebind(&mut self, agent_id: AgentId) -> bool {
+        let removed = self.pending_runinfra_rebind_agents.remove(&agent_id);
+        if let Some(agent) = self.agents.get_mut(&agent_id) {
+            let was_pending = agent.session.provider_rebind_pending;
+            agent.session.provider_rebind_pending = false;
+            removed || was_pending
+        } else {
+            removed
+        }
+    }
+
+    pub(crate) fn cancel_pending_gemini_rebind(&mut self, agent_id: AgentId) -> bool {
+        let removed = self.pending_gemini_rebind_agents.remove(&agent_id);
+        if let Some(agent) = self.agents.get_mut(&agent_id) {
+            let was_pending = agent.session.provider_rebind_pending;
+            agent.session.provider_rebind_pending = false;
+            removed || was_pending
+        } else {
+            removed
+        }
+    }
+
     /// Finishes startup if this view still holds the obligation; does nothing after.
     pub(crate) fn finish_startup(&mut self, outcome: xai_grok_telemetry::startup::StartupOutcome) {
         xai_grok_telemetry::startup::PendingStartup::finish_held(
@@ -1593,7 +1638,9 @@ impl AppView {
             | PrimaryProvider::Meta
             | PrimaryProvider::OpenCodeGo
             | PrimaryProvider::Wafer
-            | PrimaryProvider::Zai => {
+            | PrimaryProvider::Zai
+            | PrimaryProvider::Runinfra
+            | PrimaryProvider::Gemini => {
                 // Preserve the xAI snapshot only when crossing out of xAI.
                 // A non-xAI <-> non-xAI transition sees already-cleared
                 // controls and must not overwrite the saved xAI state with
@@ -1933,6 +1980,12 @@ impl AppView {
             zai_operation_generation: 0,
             zai_runtime_update_pending: false,
             pending_zai_rebind_agents: Default::default(),
+            runinfra_operation_generation: 0,
+            runinfra_runtime_update_pending: false,
+            pending_runinfra_rebind_agents: Default::default(),
+            gemini_operation_generation: 0,
+            gemini_runtime_update_pending: false,
+            pending_gemini_rebind_agents: Default::default(),
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
             perplexity_web_search_enabled: false,
@@ -6584,6 +6637,12 @@ pub(crate) mod tests {
             zai_operation_generation: 0,
             zai_runtime_update_pending: false,
             pending_zai_rebind_agents: Default::default(),
+            runinfra_operation_generation: 0,
+            runinfra_runtime_update_pending: false,
+            pending_runinfra_rebind_agents: Default::default(),
+            gemini_operation_generation: 0,
+            gemini_runtime_update_pending: false,
+            pending_gemini_rebind_agents: Default::default(),
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
             perplexity_web_search_enabled: false,

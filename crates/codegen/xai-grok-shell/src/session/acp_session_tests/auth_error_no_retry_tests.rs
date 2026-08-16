@@ -1091,6 +1091,75 @@ fn turn_auth_refresh_route_is_provider_and_provenance_aware() {
     );
 }
 
+/// Field log 2026-08-14: a Codex OAuth 401 ("token has been invalidated")
+/// was classified through the xAI `AuthManager`. A still-valid xAI session
+/// made the remedy `SelfHealing` / `auth_transient`, so the pager hid the
+/// re-auth banner and appended "no need to run /login" under the Codex
+/// reconnect hint.
+#[tokio::test(flavor = "current_thread")]
+async fn codex_401_does_not_inherit_xai_self_healing_remedy() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_dir, am) = auth_manager_with_valid_token("xai-session-still-valid");
+            let (actor, mut persistence_rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "invalidated-codex-access-token".to_string(),
+            )
+            .await;
+
+            let mut chat_config = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has sampling config");
+            chat_config.provider = xai_grok_sampling_types::ModelProvider::Codex;
+            chat_config.model = "gpt-5.6-sol".to_string();
+            actor.chat_state_handle.update_sampling_config(chat_config);
+
+            let result = actor
+                .handle_sampling_failure_with_policy(auth_error(), false)
+                .await;
+            assert!(
+                result.is_err(),
+                "a Codex 401 with refresh already spent must be terminal"
+            );
+
+            let mut found = None;
+            while let Ok(msg) = persistence_rx.try_recv() {
+                if let PersistenceMsg::Update(SessionUpdate::Xai(notif)) = msg
+                    && let XaiSessionUpdate::RetryState(RetryState::Failed {
+                        error_type,
+                        message,
+                    }) = notif.update
+                {
+                    found = Some((error_type, message));
+                }
+            }
+            let (error_type, message) = found.expect("expected RetryState::Failed");
+            assert_eq!(
+                error_type, "auth",
+                "Codex 401 must stay `auth` so the pager shows the re-auth banner; \
+                 got {error_type} (xAI SelfHealing leaks `auth_transient`)"
+            );
+            assert!(
+                is_reauthable_failure(Some(error_type.as_str()), &message),
+                "the banner gate must treat this Codex 401 as reauthable: {message}"
+            );
+            assert!(
+                message.contains("login --codex"),
+                "the terminal message must keep the Codex reconnect hint: {message}"
+            );
+            assert!(
+                !message.contains("no need to run /login"),
+                "xAI SelfHealing advice must not be appended to a Codex 401: {message}"
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn missing_codex_oauth_clears_any_static_authorization_fallback() {
     let local = tokio::task::LocalSet::new();

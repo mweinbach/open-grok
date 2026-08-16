@@ -17,6 +17,8 @@ pub(crate) fn provider_items(
     opencode_go_status: Option<crate::settings::SecretStatus>,
     wafer_status: Option<crate::settings::SecretStatus>,
     zai_status: Option<crate::settings::SecretStatus>,
+    runinfra_status: Option<crate::settings::SecretStatus>,
+    gemini_status: Option<crate::settings::SecretStatus>,
 ) -> Vec<ArgItem> {
     let api_key_description = |status: Option<crate::settings::SecretStatus>| match status {
         Some(status) => format!("API key · {}", status.display()),
@@ -29,6 +31,8 @@ pub(crate) fn provider_items(
     let opencode_go_description = api_key_description(opencode_go_status);
     let wafer_description = api_key_description(wafer_status);
     let zai_description = api_key_description(zai_status);
+    let runinfra_description = api_key_description(runinfra_status);
+    let gemini_description = api_key_description(gemini_status);
     vec![
         ArgItem {
             display: "xAI Grok".to_owned(),
@@ -85,6 +89,21 @@ pub(crate) fn provider_items(
             insert_text: "zai".to_owned(),
             description: zai_description,
         },
+        ArgItem {
+            display: "RunInfra".to_owned(),
+            match_text: "runinfra run infra api key chat completions hosted models deepseek qwen"
+                .to_owned(),
+            insert_text: "runinfra".to_owned(),
+            description: runinfra_description,
+        },
+        ArgItem {
+            display: "Google Gemini".to_owned(),
+            match_text:
+                "gemini google google gemini ai studio aistudio api key chat completions models"
+                    .to_owned(),
+            insert_text: "gemini".to_owned(),
+            description: gemini_description,
+        },
     ]
 }
 
@@ -103,8 +122,12 @@ pub(crate) fn provider_action(args: &str) -> Result<Action, String> {
         "opencode" | "opencode-go" | "opencode_go" | "go" => Ok(Action::OpenOpenCodeGoApiKeyEditor),
         "wafer" | "wafer-ai" | "wafer_ai" => Ok(Action::OpenWaferApiKeyEditor),
         "zai" | "z-ai" | "z_ai" => Ok(Action::OpenZaiApiKeyEditor),
+        "runinfra" | "run-infra" | "run_infra" => Ok(Action::OpenRuninfraApiKeyEditor),
+        "gemini" | "google" | "ai-studio" | "aistudio" | "google-gemini" => {
+            Ok(Action::OpenGeminiApiKeyEditor)
+        }
         _ => Err(format!(
-            "Unknown provider: {}. Use /login xai, /login codex, /login kimi, /login fireworks, /login deepseek, /login meta, /login wafer, /login zai, or /login opencode-go",
+            "Unknown provider: {}. Use /login xai, /login codex, /login kimi, /login fireworks, /login deepseek, /login meta, /login wafer, /login zai, /login runinfra, /login gemini, or /login opencode-go",
             args.trim()
         )),
     }
@@ -116,11 +139,11 @@ impl SlashCommand for LoginCommand {
     }
 
     fn description(&self) -> &str {
-        "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, or OpenCode Go"
+        "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, RunInfra, Google Gemini, or OpenCode Go"
     }
 
     fn usage(&self) -> &str {
-        "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|zai|opencode-go]"
+        "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|zai|runinfra|gemini|opencode-go]"
     }
 
     fn takes_args(&self) -> bool {
@@ -132,7 +155,9 @@ impl SlashCommand for LoginCommand {
     }
 
     fn suggest_args(&self, _ctx: &AppCtx, _args_query: &str) -> Option<Vec<ArgItem>> {
-        Some(provider_items(None, None, None, None, None, None, None))
+        Some(provider_items(
+            None, None, None, None, None, None, None, None, None,
+        ))
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {

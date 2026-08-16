@@ -2544,6 +2544,8 @@ fn live_provider_entry(
     entry.info.base_url = match provider {
         xai_grok_sampling_types::ModelProvider::Zai => crate::zai_models::api_base_url(),
         xai_grok_sampling_types::ModelProvider::Wafer => crate::wafer_models::api_base_url(),
+        xai_grok_sampling_types::ModelProvider::Runinfra => crate::runinfra_models::api_base_url(),
+        xai_grok_sampling_types::ModelProvider::Gemini => crate::gemini_models::api_base_url(),
         _ => entry.info.base_url,
     };
     (key.to_owned(), entry)
@@ -2682,5 +2684,139 @@ fn config_models_survive_and_override_wafer_catalog_replace() {
         .expect("non-Wafer custom models must be untouched by a Wafer catalog apply");
     assert_eq!(custom.info.model, "llama3");
     assert_ne!(custom.info.provider, ModelProvider::Wafer);
+    assert_eq!(custom.info.context_window.get(), 128_000);
+}
+
+#[test]
+fn config_models_survive_and_override_runinfra_catalog_replace() {
+    use xai_grok_sampling_types::ModelProvider;
+
+    let mut cfg = config::Config::default();
+    cfg.config_models.insert(
+        "runinfra:extra".to_string(),
+        config::ConfigModelOverride {
+            model: Some("workspace-deploy".to_string()),
+            provider: Some(ModelProvider::Runinfra),
+            context_window: Some(400_000),
+            base_url: Some("https://api.runinfra.ai/v1".to_string()),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "runinfra:deepseek-v4-flash".to_string(),
+        config::ConfigModelOverride {
+            context_window: Some(750_000),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "my-ollama".to_string(),
+        config::ConfigModelOverride {
+            model: Some("llama3".to_string()),
+            context_window: Some(128_000),
+            base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let runinfra_live = IndexMap::from([live_provider_entry(
+        "runinfra:deepseek-v4-flash",
+        "deepseek-v4-flash",
+        ModelProvider::Runinfra,
+        1_048_576,
+    )]);
+
+    let catalog = resolve_model_catalog_with_live_runinfra_entries(&cfg, None, Some(runinfra_live));
+
+    let extra = catalog
+        .get("runinfra:extra")
+        .expect("custom RunInfra model must survive a live catalog that omits it");
+    assert_eq!(extra.info.model, "workspace-deploy");
+    assert_eq!(extra.info.provider, ModelProvider::Runinfra);
+    assert_eq!(extra.info.context_window.get(), 400_000);
+
+    let overridden = catalog
+        .get("runinfra:deepseek-v4-flash")
+        .expect("live RunInfra catalog entry must remain after override");
+    assert_eq!(overridden.info.model, "deepseek-v4-flash");
+    assert_eq!(overridden.info.provider, ModelProvider::Runinfra);
+    assert_eq!(
+        overridden.info.context_window.get(),
+        750_000,
+        "user [model.runinfra:deepseek-v4-flash] context_window must win over the live catalog"
+    );
+
+    let custom = catalog
+        .get("my-ollama")
+        .expect("non-RunInfra custom models must be untouched by a RunInfra catalog apply");
+    assert_eq!(custom.info.model, "llama3");
+    assert_ne!(custom.info.provider, ModelProvider::Runinfra);
+    assert_eq!(custom.info.context_window.get(), 128_000);
+}
+
+#[test]
+fn config_models_survive_and_override_gemini_catalog_replace() {
+    use xai_grok_sampling_types::ModelProvider;
+
+    let mut cfg = config::Config::default();
+    cfg.config_models.insert(
+        "gemini:extra".to_string(),
+        config::ConfigModelOverride {
+            model: Some("gemini-extra".to_string()),
+            provider: Some(ModelProvider::Gemini),
+            context_window: Some(400_000),
+            base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string()),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "gemini:gemini-3.7-flash".to_string(),
+        config::ConfigModelOverride {
+            context_window: Some(750_000),
+            ..Default::default()
+        },
+    );
+    cfg.config_models.insert(
+        "my-ollama".to_string(),
+        config::ConfigModelOverride {
+            model: Some("llama3".to_string()),
+            context_window: Some(128_000),
+            base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let gemini_live = IndexMap::from([live_provider_entry(
+        "gemini:gemini-3.7-flash",
+        "gemini-3.7-flash",
+        ModelProvider::Gemini,
+        1_048_576,
+    )]);
+
+    let catalog = resolve_model_catalog_with_live_gemini_entries(&cfg, None, Some(gemini_live));
+
+    let extra = catalog
+        .get("gemini:extra")
+        .expect("custom Gemini model must survive a live catalog that omits it");
+    assert_eq!(extra.info.model, "gemini-extra");
+    assert_eq!(extra.info.provider, ModelProvider::Gemini);
+    assert_eq!(extra.info.context_window.get(), 400_000);
+
+    let overridden = catalog
+        .get("gemini:gemini-3.7-flash")
+        .expect("live Gemini catalog entry must remain after override");
+    assert_eq!(overridden.info.model, "gemini-3.7-flash");
+    assert_eq!(overridden.info.provider, ModelProvider::Gemini);
+    assert_eq!(
+        overridden.info.context_window.get(),
+        750_000,
+        "user [model.gemini:gemini-3.7-flash] context_window must win over the live catalog"
+    );
+
+    let custom = catalog
+        .get("my-ollama")
+        .expect("non-Gemini custom models must be untouched by a Gemini catalog apply");
+    assert_eq!(custom.info.model, "llama3");
+    assert_ne!(custom.info.provider, ModelProvider::Gemini);
     assert_eq!(custom.info.context_window.get(), 128_000);
 }

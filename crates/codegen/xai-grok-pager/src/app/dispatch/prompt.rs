@@ -623,6 +623,10 @@ pub(super) fn dispatch_send_prompt_inner(
                     wafer_api_key_status: crate::app::dispatch::settings::ui::wafer_api_key_status(
                     ),
                     zai_api_key_status: crate::app::dispatch::settings::ui::zai_api_key_status(),
+                    runinfra_api_key_status:
+                        crate::app::dispatch::settings::ui::runinfra_api_key_status(),
+                    gemini_api_key_status:
+                        crate::app::dispatch::settings::ui::gemini_api_key_status(),
                     opencode_go_models: app.opencode_go_models.clone(),
                     opencode_go_enabled_models: app.opencode_go_enabled_models.clone(),
                     custom_models: crate::settings::cached_custom_models(),

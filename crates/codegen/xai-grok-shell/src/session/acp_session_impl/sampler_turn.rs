@@ -1606,6 +1606,20 @@ impl SessionActor {
                     );
                     false
                 }
+                xai_grok_sampling_types::ModelProvider::Runinfra => {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        "RunInfra API-key authentication cannot be refreshed; surfacing 401",
+                    );
+                    false
+                }
+                xai_grok_sampling_types::ModelProvider::Gemini => {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        "Gemini API-key authentication cannot be refreshed; surfacing 401",
+                    );
+                    false
+                }
                 xai_grok_sampling_types::ModelProvider::OpenCodeGo => {
                     tracing::warn!(
                         session_id = %self.session_info.id.0,
@@ -1822,12 +1836,21 @@ impl SessionActor {
         } else {
             error.kind.as_str()
         };
+        // xAI AuthRemedy describes the xAI credential store only. Applying it
+        // to a Codex (or other non-xAI) 401 relabels a provider-local login as
+        // `auth_transient`, appends "no need to run /login", and hides the
+        // re-auth banner (`is_reauthable_failure` excludes that type).
         let (error_type, detailed_message) = match self.auth_manager.as_ref() {
-            Some(auth_manager) if error_type == "auth" => self.apply_auth_remedy(
-                &auth_manager.auth_remedy_after_server_rejection(),
-                detailed_message,
-                error.status_code,
-            ),
+            Some(auth_manager)
+                if error_type == "auth"
+                    && request_provider == xai_grok_sampling_types::ModelProvider::Xai =>
+            {
+                self.apply_auth_remedy(
+                    &auth_manager.auth_remedy_after_server_rejection(),
+                    detailed_message,
+                    error.status_code,
+                )
+            }
             _ => (error_type, detailed_message),
         };
         self.log_terminal_failure(

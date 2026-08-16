@@ -438,6 +438,10 @@ pub struct PagerLocalSnapshot {
     pub wafer_api_key_status: SecretStatus,
     /// Status-only mirror for the Z AI API-key source.
     pub zai_api_key_status: SecretStatus,
+    /// Status-only mirror for the RunInfra API-key source.
+    pub runinfra_api_key_status: SecretStatus,
+    /// Status-only mirror for the Google Gemini API-key source.
+    pub gemini_api_key_status: SecretStatus,
     pub opencode_go_models: Vec<xai_grok_shell::opencode_go_models::OpenCodeGoModelDescriptor>,
     pub opencode_go_enabled_models: Vec<String>,
     /// User `[model.*]` entries from `open-grok/custom-models/list`.
@@ -531,6 +535,8 @@ impl Default for PagerLocalSnapshot {
             opencode_go_api_key_status: SecretStatus::Missing,
             wafer_api_key_status: SecretStatus::Missing,
             zai_api_key_status: SecretStatus::Missing,
+            runinfra_api_key_status: SecretStatus::Missing,
+            gemini_api_key_status: SecretStatus::Missing,
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
             custom_models: Vec::new(),
@@ -595,6 +601,9 @@ pub fn canonical_voice_capture_mode(value: Option<&str>) -> &'static str {
 pub fn canonical_custom_model_provider(value: &str) -> &'static str {
     match value.trim() {
         "zai" => "zai",
+        "runinfra" | "run-infra" | "run_infra" => "runinfra",
+        "gemini" | "google" | "google_gemini" | "google-gemini" | "ai_studio" | "ai-studio"
+        | "aistudio" | "gemini_api" => "gemini",
         "wafer" => "wafer",
         "kimi" => "kimi",
         "fireworks" => "fireworks",
@@ -1064,6 +1073,8 @@ pub fn current_value_for(
         "opencode_go_api_key" => Some(SettingValue::SecretStatus(pager.opencode_go_api_key_status)),
         "wafer_api_key" => Some(SettingValue::SecretStatus(pager.wafer_api_key_status)),
         "zai_api_key" => Some(SettingValue::SecretStatus(pager.zai_api_key_status)),
+        "runinfra_api_key" => Some(SettingValue::SecretStatus(pager.runinfra_api_key_status)),
+        "gemini_api_key" => Some(SettingValue::SecretStatus(pager.gemini_api_key_status)),
         "custom_model_id" => Some(SettingValue::String(pager.custom_model_id.clone())),
         "custom_model_slug" => Some(SettingValue::String(pager.custom_model_slug.clone())),
         "custom_model_name" => Some(SettingValue::String(pager.custom_model_name.clone())),
@@ -1442,6 +1453,8 @@ mod tests {
                     | "opencode_go_api_key"
                     | "wafer_api_key"
                     | "zai_api_key"
+                    | "runinfra_api_key"
+                    | "gemini_api_key"
                     | "perplexity_api_key",
                     SettingKind::Secret,
                 ) => {

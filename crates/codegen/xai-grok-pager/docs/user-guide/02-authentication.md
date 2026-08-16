@@ -118,6 +118,54 @@ function tools but no native hosted web search. Its key and model catalog
 remain isolated from other providers and Z AI sessions cannot export data
 to xAI-only services.
 
+### RunInfra
+
+RunInfra uses an isolated API key with the OpenAI-compatible Chat Completions
+API. It does not use Open Grok's xAI or Codex login flows. Set the key before
+starting Open Grok, or connect it in a session with `/login runinfra`
+(Settings → Models → RunInfra API key):
+
+```bash
+export RUNINFRA_GATEWAY_KEY="rp_..."
+open-grok
+```
+
+`RUNINFRA_API_KEY` is accepted as an alias. The default base URL is
+`https://api.runinfra.ai/v1`; override it with
+`OPENGROK_RUNINFRA_API_BASE_URL`. Models are discovered from `GET /v1/models`
+with a curated hosted fallback when the endpoint is unavailable. Known hosted
+models reason by default; `deepseek-v4-flash` defaults to max effort.
+RunInfra supports standard client function tools but no native hosted web
+search. Its key and model catalog remain isolated from other providers and
+RunInfra sessions cannot export data to xAI-only services.
+
+### Google Gemini
+
+Google Gemini (AI Studio) uses an isolated API key with the OpenAI-compatible
+Chat Completions API. It does not use Open Grok's xAI or Codex login flows. Set
+the key before starting Open Grok, or connect it in a session with
+`/login gemini` (Settings → Models → Google Gemini API key):
+
+```bash
+export GEMINI_API_KEY="..."
+open-grok
+```
+
+`GOOGLE_API_KEY` is accepted as an alias. The default base URL is
+`https://generativelanguage.googleapis.com/v1beta/openai/`; override it with
+`OPENGROK_GEMINI_API_BASE_URL`. Trusted hosts are HTTPS
+`generativelanguage.googleapis.com` only. The curated models are
+`gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`, and
+`gemini-3.1-pro-preview` (catalog keys `gemini:{id}`); live `/models` enrich
+those entries only. Gemini 3 cannot use reasoning effort `none`.
+`gemini-3.7-flash` and `gemini-3.1-pro-preview` reject `minimal`
+(low/medium/high); `gemini-3.6-flash` and `gemini-3.5-flash-lite` offer
+minimal/low/medium/high. Defaults: Medium, Medium, Minimal, and High
+respectively. Google Gemini supports standard client function tools but no
+native hosted web search, Responses API, or OAuth. Its key and model catalog
+remain isolated from other providers and Gemini sessions cannot export data to
+xAI-only services.
+
 ---
 
 ## OIDC (Customer SSO)

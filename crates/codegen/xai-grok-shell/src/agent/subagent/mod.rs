@@ -1132,6 +1132,8 @@ fn refresh_kimi_sampling_config_for_spawn(
             | ModelProvider::DeepSeek
             | ModelProvider::Wafer
             | ModelProvider::Zai
+            | ModelProvider::Runinfra
+            | ModelProvider::Gemini
     ) {
         return Ok(());
     }

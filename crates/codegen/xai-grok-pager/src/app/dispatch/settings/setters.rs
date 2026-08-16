@@ -141,6 +141,44 @@ fn next_zai_operation_generation(app: &mut AppView) -> u64 {
     app.zai_operation_generation
 }
 
+fn remember_loaded_runinfra_sessions(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models)
+            == Some(PrimaryProvider::Runinfra)
+        {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_runinfra_rebind_agents.extend(targets);
+}
+
+fn next_runinfra_operation_generation(app: &mut AppView) -> u64 {
+    app.runinfra_operation_generation = app.runinfra_operation_generation.wrapping_add(1).max(1);
+    app.runinfra_runtime_update_pending = true;
+    app.runinfra_operation_generation
+}
+
+fn remember_loaded_gemini_sessions(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models)
+            == Some(PrimaryProvider::Gemini)
+        {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_gemini_rebind_agents.extend(targets);
+}
+
+fn next_gemini_operation_generation(app: &mut AppView) -> u64 {
+    app.gemini_operation_generation = app.gemini_operation_generation.wrapping_add(1).max(1);
+    app.gemini_runtime_update_pending = true;
+    app.gemini_operation_generation
+}
+
 fn remember_loaded_perplexity_sessions(app: &mut AppView) {
     let mut targets = Vec::new();
     for (&agent_id, agent) in &mut app.agents {
@@ -416,6 +454,52 @@ pub(in crate::app::dispatch) fn clear_zai_api_key(app: &mut AppView) -> Vec<Effe
     let generation = next_zai_operation_generation(app);
     app.show_toast("Removing Z AI API key…");
     vec![Effect::UpdateZaiApiKey {
+        generation,
+        key: None,
+    }]
+}
+
+pub(in crate::app::dispatch) fn set_runinfra_api_key(
+    app: &mut AppView,
+    key: SecretInput,
+) -> Vec<Effect> {
+    remember_loaded_runinfra_sessions(app);
+    let generation = next_runinfra_operation_generation(app);
+    app.show_toast("Saving RunInfra API key and refreshing models…");
+    vec![Effect::UpdateRuninfraApiKey {
+        generation,
+        key: Some(key),
+    }]
+}
+
+pub(in crate::app::dispatch) fn clear_runinfra_api_key(app: &mut AppView) -> Vec<Effect> {
+    remember_loaded_runinfra_sessions(app);
+    let generation = next_runinfra_operation_generation(app);
+    app.show_toast("Removing RunInfra API key…");
+    vec![Effect::UpdateRuninfraApiKey {
+        generation,
+        key: None,
+    }]
+}
+
+pub(in crate::app::dispatch) fn set_gemini_api_key(
+    app: &mut AppView,
+    key: SecretInput,
+) -> Vec<Effect> {
+    remember_loaded_gemini_sessions(app);
+    let generation = next_gemini_operation_generation(app);
+    app.show_toast("Saving Google Gemini API key and refreshing models…");
+    vec![Effect::UpdateGeminiApiKey {
+        generation,
+        key: Some(key),
+    }]
+}
+
+pub(in crate::app::dispatch) fn clear_gemini_api_key(app: &mut AppView) -> Vec<Effect> {
+    remember_loaded_gemini_sessions(app);
+    let generation = next_gemini_operation_generation(app);
+    app.show_toast("Removing Google Gemini API key…");
+    vec![Effect::UpdateGeminiApiKey {
         generation,
         key: None,
     }]
@@ -2685,6 +2769,10 @@ pub(in crate::app::dispatch) fn set_default_model(
         Some(PrimaryProvider::Wafer)
     } else if app.pending_zai_rebind_agents.contains(&aid) {
         Some(PrimaryProvider::Zai)
+    } else if app.pending_runinfra_rebind_agents.contains(&aid) {
+        Some(PrimaryProvider::Runinfra)
+    } else if app.pending_gemini_rebind_agents.contains(&aid) {
+        Some(PrimaryProvider::Gemini)
     } else {
         Some(PrimaryProvider::Kimi)
     };
@@ -2718,6 +2806,12 @@ pub(in crate::app::dispatch) fn set_default_model(
                 }
                 Some(PrimaryProvider::Zai) => {
                     app.cancel_pending_zai_rebind(aid);
+                }
+                Some(PrimaryProvider::Runinfra) => {
+                    app.cancel_pending_runinfra_rebind(aid);
+                }
+                Some(PrimaryProvider::Gemini) => {
+                    app.cancel_pending_gemini_rebind(aid);
                 }
                 Some(PrimaryProvider::Xai | PrimaryProvider::Codex) | None => {}
             }

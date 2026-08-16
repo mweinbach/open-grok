@@ -442,6 +442,8 @@ const KIMI_CODE_API_KEY_SCOPE: &str = "kimi_code::api_key";
 const PERPLEXITY_API_KEY_SCOPE: &str = "perplexity::api_key";
 pub const WAFER_API_KEY_SCOPE: &str = "wafer::api_key";
 pub const ZAI_API_KEY_SCOPE: &str = "zai::api_key";
+pub const RUNINFRA_API_KEY_SCOPE: &str = "runinfra::api_key";
+pub const GEMINI_API_KEY_SCOPE: &str = "gemini::api_key";
 
 fn kimi_api_key_scope(endpoint: KimiApiEndpoint) -> String {
     match endpoint {
@@ -697,6 +699,72 @@ pub fn clear_zai_api_key(grok_home: &Path) -> std::io::Result<()> {
     clear_scoped_api_key(grok_home, ZAI_API_KEY_SCOPE)
 }
 
+/// Read the RunInfra API key from its isolated auth.json scope.
+pub fn read_runinfra_api_key(grok_home: &Path) -> Option<String> {
+    let path = grok_home.join("auth.json");
+    let map = read_auth_json(&path).ok()?;
+    map.get(RUNINFRA_API_KEY_SCOPE)
+        .map(|auth| auth.key.clone())
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// Return whether a non-empty RunInfra credential exists without cloning it.
+pub fn runinfra_api_key_is_configured(grok_home: &Path) -> bool {
+    let path = grok_home.join("auth.json");
+    let Ok(map) = read_auth_json(&path) else {
+        return false;
+    };
+    map.get(RUNINFRA_API_KEY_SCOPE)
+        .is_some_and(|auth| !auth.key.trim().is_empty())
+}
+
+/// Store a RunInfra API key in the provider-isolated auth.json scope.
+pub fn store_runinfra_api_key(grok_home: &Path, api_key: &str) -> std::io::Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return clear_runinfra_api_key(grok_home);
+    }
+    store_scoped_api_key(grok_home, RUNINFRA_API_KEY_SCOPE, api_key)
+}
+
+/// Clear only the RunInfra API-key scope.
+pub fn clear_runinfra_api_key(grok_home: &Path) -> std::io::Result<()> {
+    clear_scoped_api_key(grok_home, RUNINFRA_API_KEY_SCOPE)
+}
+
+/// Read the Gemini API key from its isolated auth.json scope.
+pub fn read_gemini_api_key(grok_home: &Path) -> Option<String> {
+    let path = grok_home.join("auth.json");
+    let map = read_auth_json(&path).ok()?;
+    map.get(GEMINI_API_KEY_SCOPE)
+        .map(|auth| auth.key.clone())
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// Return whether a non-empty Gemini credential exists without cloning it.
+pub fn gemini_api_key_is_configured(grok_home: &Path) -> bool {
+    let path = grok_home.join("auth.json");
+    let Ok(map) = read_auth_json(&path) else {
+        return false;
+    };
+    map.get(GEMINI_API_KEY_SCOPE)
+        .is_some_and(|auth| !auth.key.trim().is_empty())
+}
+
+/// Store a Gemini API key in the provider-isolated auth.json scope.
+pub fn store_gemini_api_key(grok_home: &Path, api_key: &str) -> std::io::Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return clear_gemini_api_key(grok_home);
+    }
+    store_scoped_api_key(grok_home, GEMINI_API_KEY_SCOPE, api_key)
+}
+
+/// Clear only the Gemini API-key scope.
+pub fn clear_gemini_api_key(grok_home: &Path) -> std::io::Result<()> {
+    clear_scoped_api_key(grok_home, GEMINI_API_KEY_SCOPE)
+}
+
 #[cfg(test)]
 mod provider_api_key_tests {
     use super::*;
@@ -874,6 +942,83 @@ mod provider_api_key_tests {
         store_zai_api_key(dir.path(), "  ").unwrap();
 
         assert!(read_zai_api_key(dir.path()).is_none());
+        assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
+    }
+
+    #[test]
+    fn runinfra_key_round_trip_and_clear_preserve_unrelated_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        store_api_key(dir.path(), "xai-secret").unwrap();
+        store_zai_api_key(dir.path(), "zai-secret").unwrap();
+        store_runinfra_api_key(dir.path(), "runinfra-secret").unwrap();
+
+        assert_eq!(
+            read_runinfra_api_key(dir.path()).as_deref(),
+            Some("runinfra-secret")
+        );
+        assert!(runinfra_api_key_is_configured(dir.path()));
+        assert_eq!(
+            read_provider_api_key(dir.path(), ModelProvider::Runinfra).as_deref(),
+            Some("runinfra-secret")
+        );
+
+        clear_runinfra_api_key(dir.path()).unwrap();
+
+        assert!(read_runinfra_api_key(dir.path()).is_none());
+        assert!(!runinfra_api_key_is_configured(dir.path()));
+        assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
+        assert_eq!(read_zai_api_key(dir.path()).as_deref(), Some("zai-secret"));
+    }
+
+    #[test]
+    fn empty_runinfra_key_clears_only_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        store_runinfra_api_key(dir.path(), "runinfra-secret").unwrap();
+        store_api_key(dir.path(), "xai-secret").unwrap();
+
+        store_runinfra_api_key(dir.path(), "  ").unwrap();
+
+        assert!(read_runinfra_api_key(dir.path()).is_none());
+        assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
+    }
+
+    #[test]
+    fn gemini_key_round_trip_and_clear_preserve_unrelated_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        store_api_key(dir.path(), "xai-secret").unwrap();
+        store_runinfra_api_key(dir.path(), "runinfra-secret").unwrap();
+        store_gemini_api_key(dir.path(), "gemini-secret").unwrap();
+
+        assert_eq!(
+            read_gemini_api_key(dir.path()).as_deref(),
+            Some("gemini-secret")
+        );
+        assert!(gemini_api_key_is_configured(dir.path()));
+        assert_eq!(
+            read_provider_api_key(dir.path(), ModelProvider::Gemini).as_deref(),
+            Some("gemini-secret")
+        );
+
+        clear_gemini_api_key(dir.path()).unwrap();
+
+        assert!(read_gemini_api_key(dir.path()).is_none());
+        assert!(!gemini_api_key_is_configured(dir.path()));
+        assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
+        assert_eq!(
+            read_runinfra_api_key(dir.path()).as_deref(),
+            Some("runinfra-secret")
+        );
+    }
+
+    #[test]
+    fn empty_gemini_key_clears_only_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        store_gemini_api_key(dir.path(), "gemini-secret").unwrap();
+        store_api_key(dir.path(), "xai-secret").unwrap();
+
+        store_gemini_api_key(dir.path(), "  ").unwrap();
+
+        assert!(read_gemini_api_key(dir.path()).is_none());
         assert_eq!(read_api_key(dir.path()).as_deref(), Some("xai-secret"));
     }
 

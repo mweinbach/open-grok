@@ -1,6 +1,6 @@
 # Multi-provider architecture
 
-How Open Grok treats **xAI**, **OpenAI Codex**, **Kimi** (Platform vs Code), **Fireworks AI**, **DeepSeek API direct**, **Meta API**, **Wafer AI**, and **OpenCode Go** without leaking credentials, tools, or opaque history.
+How Open Grok treats **xAI**, **OpenAI Codex**, **Kimi** (Platform vs Code), **Fireworks AI**, **DeepSeek API direct**, **Meta API**, **Wafer AI**, **Z AI**, **RunInfra**, **Google Gemini**, and **OpenCode Go** without leaking credentials, tools, or opaque history.
 
 **Canonical contracts:**
 
@@ -39,6 +39,8 @@ Adapters (credential-free): `xai-grok-sampler/src/provider.rs`.
 | Meta API | Responses | Meta | OpenAI hosted search + client functions | API key only | **denied** |
 | Wafer AI | Chat | none | client function tools | API key only | **denied** |
 | Z AI | Chat | none | client function tools | API key only | **denied** |
+| RunInfra | Chat | none | client function tools | API key only | **denied** |
+| Google Gemini | Chat | none | client function tools | API key only | **denied** |
 | OpenCode Go | Chat, Messages (per model) | none | client function tools | API key only | **denied** |
 
 ### Wafer AI ([wafer.ai](https://www.wafer.ai/))
@@ -73,6 +75,42 @@ curated windows by case-insensitive prefix (most-specific first): `glm-5.2`
 endpoint ever sends one, wins over the curated value. After a live Z AI (or
 Wafer) catalog replace, user `[model.*]` / `cfg.config_models` are re-applied
 so custom entries and field overrides survive.
+
+### RunInfra ([runinfra.ai](https://runinfra.ai/))
+
+RunInfra is an isolated, API-key-only OpenAI-compatible provider. Its base URL
+is `https://api.runinfra.ai/v1` (overridable via
+`OPENGROK_RUNINFRA_API_BASE_URL`); use Chat Completions only — `/v1/responses`
+is a compatibility adapter, not a real Responses dialect. Auth is Bearer
+(`RUNINFRA_GATEWAY_KEY`, alias `RUNINFRA_API_KEY`; keys start with `rp_`).
+Stored keys are sent only to `https://api.runinfra.ai`. Live `GET /v1/models`
+is authoritative when present (including `context_window` / `max_output_tokens`
+when > 0); a curated hosted fallback keeps the picker populated when the
+endpoint is empty or unreachable. Known hosted models reason by default:
+`deepseek-v4-flash` defaults to Max and rewrites High/Xhigh/Max/Ultra to
+`max`; `qwen3-8-2-4t-a95b` cannot turn thinking off; other known hosted ids
+expose none/low/medium/high/max (High default). Unknown live deployments stay
+fail-closed with no reasoning menu. RunInfra accepts standard client function
+tools, does not provide native hosted web search, and must not receive xAI
+credentials, private metadata, or xAI-only exports.
+
+### Google Gemini (AI Studio)
+
+Google Gemini is an isolated, API-key-only OpenAI-compatible Chat Completions
+provider. Its base URL is
+`https://generativelanguage.googleapis.com/v1beta/openai/` (overridable via
+`OPENGROK_GEMINI_API_BASE_URL`). Auth is Bearer (`GEMINI_API_KEY`, alias
+`GOOGLE_API_KEY`). Stored keys are sent only to
+`https://generativelanguage.googleapis.com`. Live `/models` enrich-only updates
+the curated four models (`gemini-3.7-flash`, `gemini-3.6-flash`,
+`gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`); catalog keys use
+`gemini:{id}`. Gemini 3 cannot use reasoning effort `none`. `gemini-3.7-flash`
+and `gemini-3.1-pro-preview` reject `minimal` (menu is low/medium/high);
+`gemini-3.6-flash` and `gemini-3.5-flash-lite` offer minimal/low/medium/high.
+Defaults: 3.7-flash Medium, 3.6-flash Medium, 3.5-flash-lite Minimal,
+3.1-pro-preview High. Gemini accepts standard client function tools, has no
+Responses dialect, hosted tools, or native search, and must not receive xAI
+credentials or xAI-only exports.
 
 ## Layer map (paths)
 
@@ -118,6 +156,14 @@ Z AI
   xai-grok-shell/src/zai_models.rs              # dynamic /models catalog + curated fallback, trusted host
   auth/storage.rs                               # zai::api_key (generic provider scope)
 
+RunInfra
+  xai-grok-shell/src/runinfra_models.rs         # live /models catalog + curated hosted fallback, trusted host
+  auth/storage.rs                               # runinfra::api_key (generic provider scope)
+
+Google Gemini
+  xai-grok-shell/src/gemini_models.rs           # curated four models + live /models enrich-only, trusted host
+  auth/storage.rs                               # gemini::api_key (generic provider scope)
+
 OpenCode Go
   xai-grok-shell/src/opencode_go_models.rs      # live availability + models.dev protocol mapping
   auth/storage.rs                               # opencode_go::api_key (generic provider scope)
@@ -149,6 +195,8 @@ Home root: `$OPENGROK_HOME` or `~/.opengrok` via `xai_grok_config::grok_home()`.
 | Meta API | `auth.json` scope `meta::api_key` or `META_API_KEY` | Settings / `/login meta` / environment |
 | Wafer AI | `auth.json` scope `wafer::api_key` | Settings / `/login wafer` |
 | Z AI | `auth.json` scope `zai::api_key` or `ZAI_API_KEY` | Settings / `/login zai` / environment |
+| RunInfra | `auth.json` scope `runinfra::api_key` or `RUNINFRA_GATEWAY_KEY` / `RUNINFRA_API_KEY` | Settings / `/login runinfra` / environment |
+| Google Gemini | `auth.json` scope `gemini::api_key` or `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Settings / `/login gemini` / environment |
 | OpenCode Go | `auth.json` scope `opencode_go::api_key` | Settings / `/login opencode-go` |
 | Perplexity Search fallback | `auth.json` scope `perplexity::api_key` | Settings |
 | Both providers | — | `logout --all` |
@@ -172,17 +220,19 @@ Also isolated:
 8. **OpenCode Go is opt-in per model.** Its live `/models` IDs are intersected with canonical metadata; unsupported or unclassified models are omitted. The enabled list defaults empty, and only enabled entries reach normal model settings or subagent selection.
 9. **OpenCode Go transport is model-owned.** `@ai-sdk/anthropic` entries use Messages + `x-api-key`; OpenAI-compatible entries use Chat Completions + Bearer. Never choose the protocol from the provider alone.
 10. **Wafer AI is API-key-only and provider-local.** `WAFER_API_KEY` is sent only to `https://pass.wafer.ai/v1`; its dynamic `/models` catalog, client function tools, and standard metadata do not inherit xAI behavior. Wafer has no native hosted web search.
-11. **xAI-only services** (relay, some uploads, etc.) close via monotonic export boundary after non-xAI denied profiles. Compatibility field name remains `ever_used_codex` even when the triggering provider is not Codex; subagents mark the parent tree.
-12. **Image generation is explicitly routed.** The default `grok` route uses
+11. **RunInfra is API-key-only and provider-local.** `RUNINFRA_GATEWAY_KEY` / `RUNINFRA_API_KEY` are sent only to `https://api.runinfra.ai`; its live `/models` catalog, client function tools, and standard metadata do not inherit xAI behavior. RunInfra has no native hosted web search and no Responses dialect.
+12. **Google Gemini is API-key-only and provider-local.** `GEMINI_API_KEY` / `GOOGLE_API_KEY` are sent only to `https://generativelanguage.googleapis.com`; its curated catalog (live enrich-only), client function tools, and standard metadata do not inherit xAI behavior. Gemini has no native hosted web search and no Responses dialect.
+13. **xAI-only services** (relay, some uploads, etc.) close via monotonic export boundary after non-xAI denied profiles. Compatibility field name remains `ever_used_codex` even when the triggering provider is not Codex; subagents mark the parent tree.
+14. **Image generation is explicitly routed.** The default `grok` route uses
     xAI Imagine credentials and remains hidden outside eligible xAI sessions.
     Selecting `openai` in Settings is an explicit cross-provider opt-in: it
     uses only the isolated Codex OAuth store (ChatGPT login — no OpenAI API
     key path, mirroring upstream's `uses_codex_backend` gate), calls the Codex
     Images endpoint, blocks known ChatGPT Free accounts, and never reuses an
     xAI credential. Video generation remains xAI-only.
-13. **Hosted search** is dialect-scoped: xAI web/X search vs OpenAI `web_search`. Optional client search fallbacks are declared only when the provider profile permits them. Never infer this from model names or URLs.
-14. **Opaque history** (e.g. Codex compaction carriers, xAI-only items) is projected only by the matching dialect.
-15. **Standalone search is route-scoped.** Official Codex OAuth Responses
+15. **Hosted search** is dialect-scoped: xAI web/X search vs OpenAI `web_search`. Optional client search fallbacks are declared only when the provider profile permits them. Never infer this from model names or URLs.
+16. **Opaque history** (e.g. Codex compaction carriers, xAI-only items) is projected only by the matching dialect.
+17. **Standalone search is route-scoped.** Official Codex OAuth Responses
     routes default to the provider-local `/alpha/search` endpoint. API-key and
     custom Responses routes must opt in with
     `supports_standalone_web_search = true`; when unavailable, hosted search

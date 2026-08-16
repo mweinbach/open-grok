@@ -1648,6 +1648,422 @@ fn finish_zai_rebind(app: &mut AppView, agent_id: crate::app::agent::AgentId) {
     }
 }
 
+fn capture_runinfra_sessions_created_during_update(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models)
+            == Some(PrimaryProvider::Runinfra)
+        {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_runinfra_rebind_agents.extend(targets);
+}
+
+fn pending_runinfra_model(models: &crate::acp::model_state::ModelState) -> Option<acp::ModelId> {
+    let is_runinfra = |model_id: &acp::ModelId| {
+        PrimaryProvider::for_model(models, model_id) == Some(PrimaryProvider::Runinfra)
+    };
+    models
+        .current
+        .clone()
+        .filter(|id| is_runinfra(id))
+        .or_else(|| models.available.keys().find(|id| is_runinfra(id)).cloned())
+}
+
+fn rebind_pending_runinfra_sessions(app: &mut AppView, generation: u64) -> Vec<Effect> {
+    let targets = app
+        .pending_runinfra_rebind_agents
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let mut effects = Vec::new();
+    let mut completed = Vec::new();
+    for agent_id in targets {
+        let Some(agent) = app.agents.get_mut(&agent_id) else {
+            completed.push(agent_id);
+            continue;
+        };
+        if !agent.session.provider_rebind_pending || agent.session.model_switch_pending {
+            continue;
+        }
+        let Some(session_id) = agent.session.session_id.clone() else {
+            continue;
+        };
+        let Some(model_id) = pending_runinfra_model(&agent.session.models) else {
+            agent.scrollback.push_block(RenderBlock::system(
+                "No RunInfra model is available for this session; queued prompts are paused. Adjust the model allowlist or switch this tab to another provider.".to_owned(),
+            ));
+            continue;
+        };
+        let effort = (agent.session.models.current.as_ref() == Some(&model_id))
+            .then_some(agent.session.models.reasoning_effort)
+            .flatten();
+        agent.session.model_switch_pending = true;
+        effects.push(Effect::RebindRuninfraModel {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+        });
+    }
+    for agent_id in completed {
+        app.pending_runinfra_rebind_agents.remove(&agent_id);
+    }
+    effects
+}
+
+fn after_runinfra_session_ready(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    mut effects: Vec<Effect>,
+) -> Vec<Effect> {
+    if app.runinfra_runtime_update_pending {
+        if let Some(agent) = app.agents.get_mut(&agent_id)
+            && PrimaryProvider::for_current_model(&agent.session.models)
+                == Some(PrimaryProvider::Runinfra)
+        {
+            agent.session.provider_rebind_pending = true;
+            app.pending_runinfra_rebind_agents.insert(agent_id);
+        }
+        return effects;
+    }
+    if app.pending_runinfra_rebind_agents.contains(&agent_id)
+        && app.agents.get(&agent_id).is_some_and(|agent| {
+            agent.session.provider_rebind_pending && !agent.session.model_switch_pending
+        })
+    {
+        effects.extend(rebind_pending_runinfra_sessions(
+            app,
+            app.runinfra_operation_generation,
+        ));
+    }
+    effects
+}
+
+fn mark_runtime_pending_runinfra_session(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    incoming_models: Option<&acp::SessionModelState>,
+) {
+    if !app.runinfra_runtime_update_pending && app.runinfra_operation_generation == 0 {
+        return;
+    }
+    let incoming = incoming_models
+        .cloned()
+        .map(|models| crate::acp::model_state::ModelState::from(Some(models)));
+    let is_runinfra = incoming.as_ref().map_or_else(
+        || {
+            app.agents.get(&agent_id).is_some_and(|agent| {
+                PrimaryProvider::for_current_model(&agent.session.models)
+                    == Some(PrimaryProvider::Runinfra)
+            })
+        },
+        |models| PrimaryProvider::for_current_model(models) == Some(PrimaryProvider::Runinfra),
+    );
+    if incoming.is_some() && !is_runinfra {
+        app.cancel_pending_runinfra_rebind(agent_id);
+    } else if is_runinfra && let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.provider_rebind_pending = true;
+        app.pending_runinfra_rebind_agents.insert(agent_id);
+    }
+}
+
+fn finish_runinfra_rebind(app: &mut AppView, agent_id: crate::app::agent::AgentId) {
+    app.pending_runinfra_rebind_agents.remove(&agent_id);
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.provider_rebind_pending = false;
+        agent.session.model_switch_pending = false;
+    }
+}
+
+fn handle_runinfra_model_rebind_complete(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    session_id: acp::SessionId,
+    model_id: acp::ModelId,
+    effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
+    generation: u64,
+    result: Result<(), crate::app::actions::SwitchModelError>,
+) -> Vec<Effect> {
+    let still_owned = app.pending_runinfra_rebind_agents.contains(&agent_id);
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        app.pending_runinfra_rebind_agents.remove(&agent_id);
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(&session_id) {
+        if !agent.session.provider_rebind_pending {
+            app.pending_runinfra_rebind_agents.remove(&agent_id);
+            return vec![];
+        }
+        if agent.session.model_switch_pending {
+            return vec![];
+        }
+        return rebind_pending_runinfra_sessions(app, app.runinfra_operation_generation);
+    }
+    if !still_owned || !agent.session.provider_rebind_pending {
+        agent.session.model_switch_pending = false;
+        let Some(target_model) = agent.session.models.current.clone() else {
+            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+        };
+        if target_model == model_id {
+            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+        };
+        let Some(current_session_id) = agent.session.session_id.clone() else {
+            agent.session.provider_rebind_pending = true;
+            return vec![];
+        };
+        let target_effort = agent.session.models.reasoning_effort;
+        agent.session.provider_rebind_pending = true;
+        agent.session.model_switch_pending = true;
+        return vec![Effect::SwitchModel {
+            agent_id,
+            session_id: current_session_id,
+            model_id: target_model,
+            effort: target_effort,
+            service_tier: None,
+            prev_model_id: None,
+        }];
+    }
+    agent.session.model_switch_pending = false;
+    if generation != app.runinfra_operation_generation {
+        return rebind_pending_runinfra_sessions(app, app.runinfra_operation_generation);
+    }
+    match result {
+        Ok(()) => agent.session.models.set_current(model_id, effort),
+        Err(error) => {
+            agent.scrollback.push_block(RenderBlock::system(format!(
+                "Couldn't refresh the RunInfra session after its credential changed; queued prompts are paused. Update the RunInfra key or switch this tab to another provider. ({})",
+                match error {
+                    crate::app::actions::SwitchModelError::Other(message) => {
+                        scrub_error_for_toast(&message)
+                    }
+                    crate::app::actions::SwitchModelError::IncompatibleAgent { .. } => {
+                        "the current agent is incompatible with the selected RunInfra model".to_owned()
+                    }
+                },
+            )));
+            return vec![];
+        }
+    }
+    finish_runinfra_rebind(app, agent_id);
+    let mut effects = crate::app::dispatch::maybe_drain_queue_and_note_peek(app, agent_id);
+    if matches!(app.active_view, ActiveView::Agent(active) if active == agent_id) {
+        effects.extend(app.sync_primary_provider_from_active_agent());
+    }
+    effects
+}
+
+fn capture_gemini_sessions_created_during_update(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models)
+            == Some(PrimaryProvider::Gemini)
+        {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_gemini_rebind_agents.extend(targets);
+}
+
+fn pending_gemini_model(models: &crate::acp::model_state::ModelState) -> Option<acp::ModelId> {
+    let is_gemini = |model_id: &acp::ModelId| {
+        PrimaryProvider::for_model(models, model_id) == Some(PrimaryProvider::Gemini)
+    };
+    models
+        .current
+        .clone()
+        .filter(|id| is_gemini(id))
+        .or_else(|| models.available.keys().find(|id| is_gemini(id)).cloned())
+}
+
+fn rebind_pending_gemini_sessions(app: &mut AppView, generation: u64) -> Vec<Effect> {
+    let targets = app
+        .pending_gemini_rebind_agents
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let mut effects = Vec::new();
+    let mut completed = Vec::new();
+    for agent_id in targets {
+        let Some(agent) = app.agents.get_mut(&agent_id) else {
+            completed.push(agent_id);
+            continue;
+        };
+        if !agent.session.provider_rebind_pending || agent.session.model_switch_pending {
+            continue;
+        }
+        let Some(session_id) = agent.session.session_id.clone() else {
+            continue;
+        };
+        let Some(model_id) = pending_gemini_model(&agent.session.models) else {
+            agent.scrollback.push_block(RenderBlock::system(
+                "No Google Gemini model is available for this session; queued prompts are paused. Adjust the model allowlist or switch this tab to another provider.".to_owned(),
+            ));
+            continue;
+        };
+        let effort = (agent.session.models.current.as_ref() == Some(&model_id))
+            .then_some(agent.session.models.reasoning_effort)
+            .flatten();
+        agent.session.model_switch_pending = true;
+        effects.push(Effect::RebindGeminiModel {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+        });
+    }
+    for agent_id in completed {
+        app.pending_gemini_rebind_agents.remove(&agent_id);
+    }
+    effects
+}
+
+fn after_gemini_session_ready(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    mut effects: Vec<Effect>,
+) -> Vec<Effect> {
+    if app.gemini_runtime_update_pending {
+        if let Some(agent) = app.agents.get_mut(&agent_id)
+            && PrimaryProvider::for_current_model(&agent.session.models)
+                == Some(PrimaryProvider::Gemini)
+        {
+            agent.session.provider_rebind_pending = true;
+            app.pending_gemini_rebind_agents.insert(agent_id);
+        }
+        return effects;
+    }
+    if app.pending_gemini_rebind_agents.contains(&agent_id)
+        && app.agents.get(&agent_id).is_some_and(|agent| {
+            agent.session.provider_rebind_pending && !agent.session.model_switch_pending
+        })
+    {
+        effects.extend(rebind_pending_gemini_sessions(
+            app,
+            app.gemini_operation_generation,
+        ));
+    }
+    effects
+}
+
+fn mark_runtime_pending_gemini_session(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    incoming_models: Option<&acp::SessionModelState>,
+) {
+    if !app.gemini_runtime_update_pending && app.gemini_operation_generation == 0 {
+        return;
+    }
+    let incoming = incoming_models
+        .cloned()
+        .map(|models| crate::acp::model_state::ModelState::from(Some(models)));
+    let is_gemini = incoming.as_ref().map_or_else(
+        || {
+            app.agents.get(&agent_id).is_some_and(|agent| {
+                PrimaryProvider::for_current_model(&agent.session.models)
+                    == Some(PrimaryProvider::Gemini)
+            })
+        },
+        |models| PrimaryProvider::for_current_model(models) == Some(PrimaryProvider::Gemini),
+    );
+    if incoming.is_some() && !is_gemini {
+        app.cancel_pending_gemini_rebind(agent_id);
+    } else if is_gemini && let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.provider_rebind_pending = true;
+        app.pending_gemini_rebind_agents.insert(agent_id);
+    }
+}
+
+fn finish_gemini_rebind(app: &mut AppView, agent_id: crate::app::agent::AgentId) {
+    app.pending_gemini_rebind_agents.remove(&agent_id);
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.session.provider_rebind_pending = false;
+        agent.session.model_switch_pending = false;
+    }
+}
+
+fn handle_gemini_model_rebind_complete(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    session_id: acp::SessionId,
+    model_id: acp::ModelId,
+    effort: Option<xai_grok_shell::sampling::types::ReasoningEffort>,
+    generation: u64,
+    result: Result<(), crate::app::actions::SwitchModelError>,
+) -> Vec<Effect> {
+    let still_owned = app.pending_gemini_rebind_agents.contains(&agent_id);
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        app.pending_gemini_rebind_agents.remove(&agent_id);
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(&session_id) {
+        if !agent.session.provider_rebind_pending {
+            app.pending_gemini_rebind_agents.remove(&agent_id);
+            return vec![];
+        }
+        if agent.session.model_switch_pending {
+            return vec![];
+        }
+        return rebind_pending_gemini_sessions(app, app.gemini_operation_generation);
+    }
+    if !still_owned || !agent.session.provider_rebind_pending {
+        agent.session.model_switch_pending = false;
+        let Some(target_model) = agent.session.models.current.clone() else {
+            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+        };
+        if target_model == model_id {
+            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+        };
+        let Some(current_session_id) = agent.session.session_id.clone() else {
+            agent.session.provider_rebind_pending = true;
+            return vec![];
+        };
+        let target_effort = agent.session.models.reasoning_effort;
+        agent.session.provider_rebind_pending = true;
+        agent.session.model_switch_pending = true;
+        return vec![Effect::SwitchModel {
+            agent_id,
+            session_id: current_session_id,
+            model_id: target_model,
+            effort: target_effort,
+            service_tier: None,
+            prev_model_id: None,
+        }];
+    }
+    agent.session.model_switch_pending = false;
+    if generation != app.gemini_operation_generation {
+        return rebind_pending_gemini_sessions(app, app.gemini_operation_generation);
+    }
+    match result {
+        Ok(()) => agent.session.models.set_current(model_id, effort),
+        Err(error) => {
+            agent.scrollback.push_block(RenderBlock::system(format!(
+                "Couldn't refresh the Google Gemini session after its credential changed; queued prompts are paused. Update the Google Gemini key or switch this tab to another provider. ({})",
+                match error {
+                    crate::app::actions::SwitchModelError::Other(message) => {
+                        scrub_error_for_toast(&message)
+                    }
+                    crate::app::actions::SwitchModelError::IncompatibleAgent { .. } => {
+                        "the current agent is incompatible with the selected Google Gemini model".to_owned()
+                    }
+                },
+            )));
+            return vec![];
+        }
+    }
+    finish_gemini_rebind(app, agent_id);
+    let mut effects = crate::app::dispatch::maybe_drain_queue_and_note_peek(app, agent_id);
+    if matches!(app.active_view, ActiveView::Agent(active) if active == agent_id) {
+        effects.extend(app.sync_primary_provider_from_active_agent());
+    }
+    effects
+}
+
 fn handle_zai_model_rebind_complete(
     app: &mut AppView,
     agent_id: crate::app::agent::AgentId,
@@ -1995,6 +2411,22 @@ fn zai_credential_configured() -> bool {
         || xai_grok_shell::auth::provider_api_key_is_configured(
             &xai_grok_tools::util::grok_home::grok_home(),
             xai_grok_shell::sampling::types::ModelProvider::Zai,
+        )
+}
+
+fn runinfra_credential_configured() -> bool {
+    xai_grok_shell::runinfra_models::environment_api_key_is_configured()
+        || xai_grok_shell::auth::provider_api_key_is_configured(
+            &xai_grok_tools::util::grok_home::grok_home(),
+            xai_grok_shell::sampling::types::ModelProvider::Runinfra,
+        )
+}
+
+fn gemini_credential_configured() -> bool {
+    xai_grok_shell::gemini_models::environment_api_key_is_configured()
+        || xai_grok_shell::auth::provider_api_key_is_configured(
+            &xai_grok_tools::util::grok_home::grok_home(),
+            xai_grok_shell::sampling::types::ModelProvider::Gemini,
         )
 }
 
@@ -2351,6 +2783,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             mark_runtime_pending_opencode_go_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_wafer_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_zai_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_runinfra_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_gemini_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_perplexity_session(app, agent_id, new_models.as_ref());
             let effects = handle_session_created(
                 app,
@@ -2365,7 +2799,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let effects = after_meta_session_ready(app, agent_id, effects);
             let effects = after_opencode_go_session_ready(app, agent_id, effects);
             let effects = after_wafer_session_ready(app, agent_id, effects);
-            after_zai_session_ready(app, agent_id, effects)
+            let effects = after_zai_session_ready(app, agent_id, effects);
+            {
+                let effects = after_runinfra_session_ready(app, agent_id, effects);
+                after_gemini_session_ready(app, agent_id, effects)
+            }
         }
         TaskResult::SessionFailed { agent_id, error } => {
             handle_session_failed(app, agent_id, error)
@@ -2385,6 +2823,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             mark_runtime_pending_opencode_go_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_wafer_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_zai_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_runinfra_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_gemini_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_perplexity_session(app, agent_id, new_models.as_ref());
             let effects = handle_worktree_session_created(
                 app,
@@ -2401,7 +2841,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let effects = after_meta_session_ready(app, agent_id, effects);
             let effects = after_opencode_go_session_ready(app, agent_id, effects);
             let effects = after_wafer_session_ready(app, agent_id, effects);
-            after_zai_session_ready(app, agent_id, effects)
+            let effects = after_zai_session_ready(app, agent_id, effects);
+            {
+                let effects = after_runinfra_session_ready(app, agent_id, effects);
+                after_gemini_session_ready(app, agent_id, effects)
+            }
         }
         TaskResult::WorktreeForked {
             agent_id,
@@ -2505,6 +2949,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             mark_runtime_pending_opencode_go_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_wafer_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_zai_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_runinfra_session(app, agent_id, new_models.as_ref());
+            mark_runtime_pending_gemini_session(app, agent_id, new_models.as_ref());
             mark_runtime_pending_perplexity_session(app, agent_id, new_models.as_ref());
             let effects = handle_session_loaded(
                 app,
@@ -2523,7 +2969,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let effects = after_meta_session_ready(app, agent_id, effects);
             let effects = after_opencode_go_session_ready(app, agent_id, effects);
             let effects = after_wafer_session_ready(app, agent_id, effects);
-            after_zai_session_ready(app, agent_id, effects)
+            let effects = after_zai_session_ready(app, agent_id, effects);
+            {
+                let effects = after_runinfra_session_ready(app, agent_id, effects);
+                after_gemini_session_ready(app, agent_id, effects)
+            }
         }
         TaskResult::SessionMetaFromDisk {
             agent_id,
@@ -2635,6 +3085,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             mark_runtime_pending_opencode_go_session(app, agent_id, None);
             mark_runtime_pending_wafer_session(app, agent_id, None);
             mark_runtime_pending_zai_session(app, agent_id, None);
+            mark_runtime_pending_runinfra_session(app, agent_id, None);
+            mark_runtime_pending_gemini_session(app, agent_id, None);
             let effects = handle_session_restored(app, agent_id, local_session_id);
             let effects = after_kimi_session_ready(app, agent_id, effects);
             let effects = after_fireworks_session_ready(app, agent_id, effects);
@@ -2642,7 +3094,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let effects = after_meta_session_ready(app, agent_id, effects);
             let effects = after_opencode_go_session_ready(app, agent_id, effects);
             let effects = after_wafer_session_ready(app, agent_id, effects);
-            after_zai_session_ready(app, agent_id, effects)
+            let effects = after_zai_session_ready(app, agent_id, effects);
+            {
+                let effects = after_runinfra_session_ready(app, agent_id, effects);
+                after_gemini_session_ready(app, agent_id, effects)
+            }
         }
         TaskResult::SessionRestoreFailed { agent_id, error } => {
             handle_session_restore_failed(app, agent_id, error)
@@ -2778,6 +3234,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             let held_by_opencode_go = app.pending_opencode_go_rebind_agents.contains(&agent_id);
             let held_by_wafer = app.pending_wafer_rebind_agents.contains(&agent_id);
             let held_by_zai = app.pending_zai_rebind_agents.contains(&agent_id);
+            let held_by_runinfra = app.pending_runinfra_rebind_agents.contains(&agent_id);
+            let held_by_gemini = app.pending_gemini_rebind_agents.contains(&agent_id);
             let left_kimi = switch_succeeded
                 && !held_by_fireworks
                 && !held_by_deepseek
@@ -2785,6 +3243,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 && !held_by_opencode_go
                 && !held_by_wafer
                 && !held_by_zai
+                && !held_by_runinfra
+                && !held_by_gemini
                 && target_provider != Some(PrimaryProvider::Kimi);
             if left_kimi {
                 app.cancel_pending_kimi_rebind(agent_id);
@@ -2822,6 +3282,18 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 switch_succeeded && held_by_zai && target_provider != Some(PrimaryProvider::Zai);
             if left_zai {
                 app.cancel_pending_zai_rebind(agent_id);
+            }
+            let left_runinfra = switch_succeeded
+                && held_by_runinfra
+                && target_provider != Some(PrimaryProvider::Runinfra);
+            if left_runinfra {
+                app.cancel_pending_runinfra_rebind(agent_id);
+            }
+            let left_gemini = switch_succeeded
+                && held_by_gemini
+                && target_provider != Some(PrimaryProvider::Gemini);
+            if left_gemini {
+                app.cancel_pending_gemini_rebind(agent_id);
             }
             let mut effects = handle_switch_model_complete(
                 app,
@@ -2886,6 +3358,46 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 effects.extend(rebind_pending_opencode_go_sessions(
                     app,
                     app.opencode_go_operation_generation,
+                ));
+            }
+            if app.pending_wafer_rebind_agents.contains(&agent_id)
+                && app.agents.get(&agent_id).is_some_and(|agent| {
+                    agent.session.provider_rebind_pending && !agent.session.model_switch_pending
+                })
+            {
+                effects.extend(rebind_pending_wafer_sessions(
+                    app,
+                    app.wafer_operation_generation,
+                ));
+            }
+            if app.pending_zai_rebind_agents.contains(&agent_id)
+                && app.agents.get(&agent_id).is_some_and(|agent| {
+                    agent.session.provider_rebind_pending && !agent.session.model_switch_pending
+                })
+            {
+                effects.extend(rebind_pending_zai_sessions(
+                    app,
+                    app.zai_operation_generation,
+                ));
+            }
+            if app.pending_runinfra_rebind_agents.contains(&agent_id)
+                && app.agents.get(&agent_id).is_some_and(|agent| {
+                    agent.session.provider_rebind_pending && !agent.session.model_switch_pending
+                })
+            {
+                effects.extend(rebind_pending_runinfra_sessions(
+                    app,
+                    app.runinfra_operation_generation,
+                ));
+            }
+            if app.pending_gemini_rebind_agents.contains(&agent_id)
+                && app.agents.get(&agent_id).is_some_and(|agent| {
+                    agent.session.provider_rebind_pending && !agent.session.model_switch_pending
+                })
+            {
+                effects.extend(rebind_pending_gemini_sessions(
+                    app,
+                    app.gemini_operation_generation,
                 ));
             }
             effects
@@ -3321,6 +3833,178 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             generation,
             result,
         } => handle_zai_model_rebind_complete(
+            app, agent_id, session_id, model_id, effort, generation, result,
+        ),
+        TaskResult::RuninfraApiKeyUpdated {
+            configured,
+            generation,
+            stale,
+            warning,
+            error,
+            models,
+        } => {
+            if stale || generation != app.runinfra_operation_generation {
+                return vec![];
+            }
+            capture_runinfra_sessions_created_during_update(app);
+            let storage_succeeded = error.is_none();
+            super::settings::ui::refresh_open_settings_modals(app);
+            let credential_status = super::settings::ui::runinfra_api_key_status();
+            let runtime_apply_unconfirmed = warning.is_some() && models.is_none();
+            if let Some(error) = error {
+                app.show_toast(&format!(
+                    "✗ Could not {} RunInfra API key: {}; queued RunInfra prompts remain paused",
+                    if configured { "save" } else { "remove" },
+                    scrub_error_for_toast(&error),
+                ));
+            } else {
+                let message = if configured {
+                    if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
+                        "✓ RunInfra API key saved to UI storage; environment key remains active"
+                            .to_owned()
+                    } else if warning.is_some() {
+                        "✓ RunInfra API key saved".to_owned()
+                    } else {
+                        "✓ RunInfra API key saved; models refreshed".to_owned()
+                    }
+                } else if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
+                    "✓ UI-stored RunInfra API key cleared; environment key remains active"
+                        .to_owned()
+                } else {
+                    "✓ UI-stored RunInfra API key cleared".to_owned()
+                };
+                if let Some(warning) = warning {
+                    app.show_toast(&format!(
+                        "{message}; model query warning: {}{}",
+                        scrub_error_for_toast(&warning),
+                        if runtime_apply_unconfirmed {
+                            "; queued RunInfra prompts remain paused"
+                        } else {
+                            ""
+                        },
+                    ));
+                } else {
+                    app.show_toast(&message);
+                }
+            }
+            if !storage_succeeded || runtime_apply_unconfirmed {
+                return vec![];
+            }
+            app.runinfra_runtime_update_pending = false;
+            if let Some(models) = models {
+                apply_catalog_to_sessions(app, models);
+                super::settings::ui::refresh_open_settings_modals(app);
+            }
+            let mut effects = Vec::new();
+            if settings_modal_is_open(app) {
+                effects.push(crate::app::actions::Effect::QueryCustomModels {
+                    generation: super::settings::setters::current_custom_models_generation(),
+                });
+            }
+            if !runinfra_credential_configured() {
+                app.show_toast(&format!(
+                    "✓ RunInfra API key {}; API key required and queued RunInfra prompts remain paused",
+                    if configured { "saved" } else { "cleared" },
+                ));
+                return effects;
+            }
+            effects.extend(rebind_pending_runinfra_sessions(app, generation));
+            effects
+        }
+        TaskResult::RuninfraModelRebindComplete {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+            result,
+        } => handle_runinfra_model_rebind_complete(
+            app, agent_id, session_id, model_id, effort, generation, result,
+        ),
+        TaskResult::GeminiApiKeyUpdated {
+            configured,
+            generation,
+            stale,
+            warning,
+            error,
+            models,
+        } => {
+            if stale || generation != app.gemini_operation_generation {
+                return vec![];
+            }
+            capture_gemini_sessions_created_during_update(app);
+            let storage_succeeded = error.is_none();
+            super::settings::ui::refresh_open_settings_modals(app);
+            let credential_status = super::settings::ui::gemini_api_key_status();
+            let runtime_apply_unconfirmed = warning.is_some() && models.is_none();
+            if let Some(error) = error {
+                app.show_toast(&format!(
+                    "✗ Could not {} Google Gemini API key: {}; queued Google Gemini prompts remain paused",
+                    if configured { "save" } else { "remove" },
+                    scrub_error_for_toast(&error),
+                ));
+            } else {
+                let message = if configured {
+                    if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
+                        "✓ Google Gemini API key saved to UI storage; environment key remains active"
+                            .to_owned()
+                    } else if warning.is_some() {
+                        "✓ Google Gemini API key saved".to_owned()
+                    } else {
+                        "✓ Google Gemini API key saved; models refreshed".to_owned()
+                    }
+                } else if credential_status == crate::settings::SecretStatus::EnvironmentOverride {
+                    "✓ UI-stored Google Gemini API key cleared; environment key remains active"
+                        .to_owned()
+                } else {
+                    "✓ UI-stored Google Gemini API key cleared".to_owned()
+                };
+                if let Some(warning) = warning {
+                    app.show_toast(&format!(
+                        "{message}; model query warning: {}{}",
+                        scrub_error_for_toast(&warning),
+                        if runtime_apply_unconfirmed {
+                            "; queued Google Gemini prompts remain paused"
+                        } else {
+                            ""
+                        },
+                    ));
+                } else {
+                    app.show_toast(&message);
+                }
+            }
+            if !storage_succeeded || runtime_apply_unconfirmed {
+                return vec![];
+            }
+            app.gemini_runtime_update_pending = false;
+            if let Some(models) = models {
+                apply_catalog_to_sessions(app, models);
+                super::settings::ui::refresh_open_settings_modals(app);
+            }
+            let mut effects = Vec::new();
+            if settings_modal_is_open(app) {
+                effects.push(crate::app::actions::Effect::QueryCustomModels {
+                    generation: super::settings::setters::current_custom_models_generation(),
+                });
+            }
+            if !gemini_credential_configured() {
+                app.show_toast(&format!(
+                    "✓ Google Gemini API key {}; API key required and queued Google Gemini prompts remain paused",
+                    if configured { "saved" } else { "cleared" },
+                ));
+                return effects;
+            }
+            effects.extend(rebind_pending_gemini_sessions(app, generation));
+            effects
+        }
+        TaskResult::GeminiModelRebindComplete {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+            result,
+        } => handle_gemini_model_rebind_complete(
             app, agent_id, session_id, model_id, effort, generation, result,
         ),
         TaskResult::CustomModelsUpdated {

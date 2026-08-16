@@ -706,6 +706,30 @@ mod tests {
         }
     }
     #[test]
+    fn login_runinfra_selects_secure_api_key_editor() {
+        for provider in [" runinfra ", "run-infra", "run_infra"] {
+            assert!(matches!(
+                run_login(provider),
+                CommandResult::Action(Action::OpenRuninfraApiKeyEditor)
+            ));
+        }
+    }
+    #[test]
+    fn login_gemini_selects_secure_api_key_editor() {
+        for provider in [
+            " gemini ",
+            "google",
+            "ai-studio",
+            "aistudio",
+            "google-gemini",
+        ] {
+            assert!(matches!(
+                run_login(provider),
+                CommandResult::Action(Action::OpenGeminiApiKeyEditor)
+            ));
+        }
+    }
+    #[test]
     fn login_provider_picker_lists_all_providers_with_status() {
         let items = login::provider_items(
             Some(crate::settings::SecretStatus::Stored),
@@ -714,6 +738,8 @@ mod tests {
             Some(crate::settings::SecretStatus::EnvironmentOverride),
             Some(crate::settings::SecretStatus::Missing),
             Some(crate::settings::SecretStatus::Stored),
+            Some(crate::settings::SecretStatus::Stored),
+            Some(crate::settings::SecretStatus::Missing),
             Some(crate::settings::SecretStatus::Stored),
         );
         assert_eq!(
@@ -730,7 +756,9 @@ mod tests {
                 "meta",
                 "opencode-go",
                 "wafer",
-                "zai"
+                "zai",
+                "runinfra",
+                "gemini"
             ]
         );
         assert_eq!(items[2].description, "API key · saved");
@@ -739,6 +767,9 @@ mod tests {
         assert_eq!(items[5].description, "API key · environment override");
         assert_eq!(items[6].description, "API key · not configured");
         assert_eq!(items[7].description, "API key · saved");
+        assert_eq!(items[8].description, "API key · saved");
+        assert_eq!(items[9].description, "API key · not configured");
+        assert_eq!(items[10].description, "API key · saved");
     }
     #[test]
     fn logout_bare_preserves_xai_flow() {

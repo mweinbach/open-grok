@@ -97,8 +97,8 @@ Fill the draft fields, then turn on **Save custom model**:
 | Catalog key | Table name / catalog key (`[model.<key>]`), for example `zai:glm-special` or `my-ollama`. Letters, digits, `:`, `.`, `-`, and `_` only; no spaces or newlines. |
 | Model id | Wire model id sent to the API. |
 | Name | Optional display name in the picker. |
-| Provider | `(inherit)` (empty) or `zai`, `wafer`, `kimi`, `fireworks`, `deepseek`, `meta`, `xai`, `opencode_go`. |
-| Base URL | Optional OpenAI-compatible endpoint. Leave blank for Z AI or Wafer to use that provider's default endpoint. |
+| Provider | `(inherit)` (empty) or `zai`, `runinfra`, `gemini`, `wafer`, `kimi`, `fireworks`, `deepseek`, `meta`, `xai`, `opencode_go`. |
+| Base URL | Optional OpenAI-compatible endpoint. Leave blank for Z AI, RunInfra, Google Gemini, or Wafer to use that provider's default endpoint. |
 | Context window | Token window used for auto-compaction (`1000`–`4000000`; default `200000`). |
 | API backend | `chat_completions` (default), `responses`, or `messages`. |
 | Env key | Environment variable that holds the API key. Prefer this over putting a key in the file. |
@@ -110,8 +110,12 @@ the model picker, and Settings turns **Save custom model** back off.
 
 When you choose the Z AI provider and omit a base URL, Open Grok stores
 the GLM Coding Plan endpoint (`https://api.z.ai/api/coding/paas/v4`, or
-`OPENGROK_ZAI_API_BASE_URL` if set) and `env_key = "ZAI_API_KEY"`. Wafer
-does the same with `https://pass.wafer.ai/v1` and `WAFER_API_KEY`. That
+`OPENGROK_ZAI_API_BASE_URL` if set) and `env_key = "ZAI_API_KEY"`. RunInfra
+does the same with `https://api.runinfra.ai/v1` and `RUNINFRA_GATEWAY_KEY`.
+Google Gemini defaults to
+`https://generativelanguage.googleapis.com/v1beta/openai/` and
+`env_key = "GEMINI_API_KEY"`.
+Wafer does the same with `https://pass.wafer.ai/v1` and `WAFER_API_KEY`. That
 keeps API-key-only providers from inheriting an empty or xAI endpoint.
 
 ---
@@ -240,10 +244,10 @@ When you override a built-in model, Grok starts with the default configuration (
 ### Priority Order
 
 1. Your config (`[model.*]`, including tables written from Settings) -- highest priority
-2. Live provider catalogs (Z AI and Wafer `/models`, plus other prefetched `/v1/models` lists)
+2. Live provider catalogs (Z AI, RunInfra, Google Gemini, and Wafer `/models`, plus other prefetched `/v1/models` lists)
 3. Hardcoded defaults -- lowest priority
 
-A live Z AI or Wafer catalog replace rebuilds that provider's picker
+A live Z AI, RunInfra, Google Gemini, or Wafer catalog replace rebuilds that provider's picker
 entries, then Open Grok re-applies `[model.*]`. Custom models that the
 remote list does not return stay in the catalog, and field overrides on a
 live id (for example a larger `context_window`) win.
@@ -389,6 +393,75 @@ set. Z AI accepts standard client function tools. It has no native hosted
 web search, Responses API, OAuth flow, or xAI-only export path. Keep the Z
 AI API key provider-local; do not use `XAI_API_KEY` or an xAI session as a
 substitute.
+
+### RunInfra
+
+RunInfra serves a small hosted Chat Completions lineup at
+`https://api.runinfra.ai/v1`. Open Grok queries `GET /v1/models` and uses
+that list as the picker when it returns models; a curated fallback
+(`deepseek-v4-flash`, `nemotron-3-5-lightning-30b`, `qwen3-8-2-4t-a95b`,
+`qwen3-8-27b`) keeps the picker populated when the endpoint is unreachable.
+Wire `context_window` and `max_output_tokens` win when the live catalog
+sends values greater than zero.
+
+Set `RUNINFRA_GATEWAY_KEY` (or `RUNINFRA_API_KEY`, or connect it with
+`/login runinfra`) and pick one of the returned ids. To add an id that is
+not in the live list, use Settings or a `[model.*]` table with
+`provider = "runinfra"`:
+
+```toml
+[model.runinfra-flash]
+model = "deepseek-v4-flash"
+name = "DeepSeek V4 Flash"
+provider = "runinfra"
+base_url = "https://api.runinfra.ai/v1"
+api_backend = "chat_completions"
+env_key = "RUNINFRA_GATEWAY_KEY"
+context_window = 1048576
+reasoning_effort = "max"   # none | low | medium | high | max
+```
+
+User `[model.*]` entries win over the live catalog. Known hosted models
+reason by default; `deepseek-v4-flash` defaults to max and rewrites
+high/xhigh/max to `max`. `qwen3-8-2-4t-a95b` cannot turn thinking off.
+Unknown live deployments do not get a reasoning menu. RunInfra accepts
+standard client function tools. It has no native hosted web search,
+Responses API, OAuth flow, or xAI-only export path. Keep the RunInfra API
+key provider-local; do not use `XAI_API_KEY` or an xAI session as a
+substitute.
+
+### Google Gemini
+
+Google Gemini (AI Studio) serves curated Chat Completions models at
+`https://generativelanguage.googleapis.com/v1beta/openai/`. Open Grok keeps
+four curated entries (`gemini-3.7-flash`, `gemini-3.6-flash`,
+`gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`) under catalog keys
+`gemini:{id}`; live `/models` enrich those entries only.
+
+Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`, or connect it with `/login gemini`)
+and pick one of the curated ids. To add an id that is not curated, use
+Settings or a `[model.*]` table with `provider = "gemini"`:
+
+```toml
+[model.gemini-flash]
+model = "gemini-3.6-flash"
+name = "Gemini 3.6 Flash"
+provider = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+api_backend = "chat_completions"
+env_key = "GEMINI_API_KEY"
+context_window = 1048576
+reasoning_effort = "medium"   # see model-specific menus below
+```
+
+Gemini 3 cannot use reasoning effort `none`. `gemini-3.7-flash` and
+`gemini-3.1-pro-preview` reject `minimal` (menu is low/medium/high);
+`gemini-3.6-flash` and `gemini-3.5-flash-lite` offer minimal/low/medium/high.
+Defaults: 3.7-flash Medium, 3.6-flash Medium, 3.5-flash-lite Minimal,
+3.1-pro-preview High. Google Gemini accepts standard client function tools.
+It has no native hosted web search, Responses API, OAuth flow, or xAI-only
+export path. Keep the Gemini API key provider-local; do not use `XAI_API_KEY`
+or an xAI session as a substitute.
 
 ### Anthropic (Claude)
 

@@ -221,6 +221,20 @@ fn apply_provider_endpoint_defaults(record: &mut CustomModelRecord) {
                 record.env_key = Some(crate::wafer_models::WAFER_API_KEY_ENV.to_owned());
             }
         }
+        Some("runinfra" | "run_infra" | "run-infra") if record.base_url.is_none() => {
+            record.base_url = Some(crate::runinfra_models::api_base_url());
+            if record.env_key.is_none() {
+                record.env_key = Some(crate::runinfra_models::RUNINFRA_GATEWAY_KEY_ENV.to_owned());
+            }
+        }
+        Some("gemini" | "google" | "google_gemini" | "ai_studio" | "aistudio" | "gemini_api")
+            if record.base_url.is_none() =>
+        {
+            record.base_url = Some(crate::gemini_models::api_base_url());
+            if record.env_key.is_none() {
+                record.env_key = Some(crate::gemini_models::GEMINI_API_KEY_ENV.to_owned());
+            }
+        }
         _ => {}
     }
 }
@@ -236,9 +250,13 @@ fn parse_provider(raw: &str) -> Result<ModelProvider> {
         "opencode_go" | "opencode-go" | "open_code_go" => Ok(ModelProvider::OpenCodeGo),
         "wafer" | "wafer_ai" => Ok(ModelProvider::Wafer),
         "zai" | "z_ai" | "z-ai" => Ok(ModelProvider::Zai),
+        "runinfra" | "run_infra" | "run-infra" => Ok(ModelProvider::Runinfra),
+        "gemini" | "google" | "google_gemini" | "ai_studio" | "aistudio" | "gemini_api" => {
+            Ok(ModelProvider::Gemini)
+        }
         other => bail!(
             "invalid provider `{other}`; expected xai, codex, kimi, fireworks, \
-             deepseek, meta, wafer, zai, or opencode_go"
+             deepseek, meta, wafer, zai, runinfra, gemini, or opencode_go"
         ),
     }
 }
@@ -373,6 +391,34 @@ mod tests {
         assert_eq!(
             wafer.env_key.as_deref(),
             Some(crate::wafer_models::WAFER_API_KEY_ENV)
+        );
+
+        let (runinfra, _) = normalize_custom_model(CustomModelRecord {
+            provider: Some("runinfra".into()),
+            ..record("runinfra:extra", "workspace-deploy")
+        })
+        .unwrap();
+        assert_eq!(
+            runinfra.base_url.as_deref(),
+            Some(crate::runinfra_models::api_base_url().as_str())
+        );
+        assert_eq!(
+            runinfra.env_key.as_deref(),
+            Some(crate::runinfra_models::RUNINFRA_GATEWAY_KEY_ENV)
+        );
+
+        let (gemini, _) = normalize_custom_model(CustomModelRecord {
+            provider: Some("gemini".into()),
+            ..record("gemini:extra", "gemini-extra")
+        })
+        .unwrap();
+        assert_eq!(
+            gemini.base_url.as_deref(),
+            Some(crate::gemini_models::api_base_url().as_str())
+        );
+        assert_eq!(
+            gemini.env_key.as_deref(),
+            Some(crate::gemini_models::GEMINI_API_KEY_ENV)
         );
     }
 

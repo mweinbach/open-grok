@@ -85,6 +85,14 @@ static ZAI_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 static ZAI_MUTATION_QUEUE: LazyLock<KimiMutationQueue> = LazyLock::new(KimiMutationQueue::new);
 static NEXT_ZAI_TRANSPORT_TOKEN: AtomicU64 = AtomicU64::new(0);
 static LATEST_ZAI_MUTATION: AtomicU64 = AtomicU64::new(0);
+static RUNINFRA_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static RUNINFRA_MUTATION_QUEUE: LazyLock<KimiMutationQueue> = LazyLock::new(KimiMutationQueue::new);
+static NEXT_RUNINFRA_TRANSPORT_TOKEN: AtomicU64 = AtomicU64::new(0);
+static LATEST_RUNINFRA_MUTATION: AtomicU64 = AtomicU64::new(0);
+static GEMINI_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static GEMINI_MUTATION_QUEUE: LazyLock<KimiMutationQueue> = LazyLock::new(KimiMutationQueue::new);
+static NEXT_GEMINI_TRANSPORT_TOKEN: AtomicU64 = AtomicU64::new(0);
+static LATEST_GEMINI_MUTATION: AtomicU64 = AtomicU64::new(0);
 
 /// Admission queue for Kimi mutations.
 ///
@@ -738,6 +746,80 @@ async fn list_custom_models(tx: &AcpAgentTx) -> Result<CustomModelsApply, String
     })
 }
 
+fn next_runinfra_transport_token() -> u64 {
+    NEXT_RUNINFRA_TRANSPORT_TOKEN
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
+}
+
+fn next_gemini_transport_token() -> u64 {
+    NEXT_GEMINI_TRANSPORT_TOKEN
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
+}
+
+struct RuninfraModelsApply {
+    warning: Option<String>,
+    models: Option<acp::SessionModelState>,
+}
+
+async fn apply_runinfra_models(tx: &AcpAgentTx) -> Result<RuninfraModelsApply, String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/runinfra/models/apply",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize RunInfra models apply params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|error| format!("RunInfra models apply returned invalid JSON: {error}"))?;
+    let result = envelope.get("result").unwrap_or(&envelope);
+    let warning = result
+        .get("warning")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_user_error);
+    let models = result
+        .get("models")
+        .cloned()
+        .map(serde_json::from_value::<acp::SessionModelState>)
+        .transpose()
+        .map_err(|error| format!("RunInfra models apply returned an invalid catalog: {error}"))?;
+    Ok(RuninfraModelsApply { warning, models })
+}
+
+struct GeminiModelsApply {
+    warning: Option<String>,
+    models: Option<acp::SessionModelState>,
+}
+
+async fn apply_gemini_models(tx: &AcpAgentTx) -> Result<GeminiModelsApply, String> {
+    let request = acp::ExtRequest::new(
+        "open-grok/gemini/models/apply",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize Gemini models apply params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("{error}")))?;
+    let envelope: serde_json::Value = serde_json::from_str(response.0.get())
+        .map_err(|error| format!("Gemini models apply returned invalid JSON: {error}"))?;
+    let result = envelope.get("result").unwrap_or(&envelope);
+    let warning = result
+        .get("warning")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_user_error);
+    let models = result
+        .get("models")
+        .cloned()
+        .map(serde_json::from_value::<acp::SessionModelState>)
+        .transpose()
+        .map_err(|error| format!("Gemini models apply returned an invalid catalog: {error}"))?;
+    Ok(GeminiModelsApply { warning, models })
+}
+
 async fn apply_zai_models(tx: &AcpAgentTx) -> Result<ZaiModelsApply, String> {
     let request = acp::ExtRequest::new(
         "open-grok/zai/models/apply",
@@ -1083,6 +1165,146 @@ pub(crate) fn execute(
                         generation,
                         stale: !is_latest_kimi_transport_token(
                             &LATEST_WAFER_MUTATION,
+                            transport_token,
+                        ),
+                        warning: Some(warning),
+                        error: None,
+                        models: None,
+                    },
+                }
+            });
+        }
+        Effect::UpdateRuninfraApiKey { generation, key } => {
+            let transport_token = next_runinfra_transport_token();
+            publish_kimi_transport_token(&LATEST_RUNINFRA_MUTATION, transport_token);
+            let mut mutation_ticket = RUNINFRA_MUTATION_QUEUE.enqueue();
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                mutation_ticket.wait_turn().await;
+                let configured = key.is_some();
+                let _guard = RUNINFRA_MUTATION_LOCK.lock().await;
+                if !is_latest_kimi_transport_token(&LATEST_RUNINFRA_MUTATION, transport_token) {
+                    return TaskResult::RuninfraApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: true,
+                        warning: None,
+                        error: None,
+                        models: None,
+                    };
+                }
+                let grok_home = xai_grok_tools::util::grok_home::grok_home();
+                let storage_result = match key.as_ref() {
+                    Some(secret) => xai_grok_shell::auth::store_provider_api_key(
+                        &grok_home,
+                        xai_grok_shell::sampling::types::ModelProvider::Runinfra,
+                        secret.expose(),
+                    ),
+                    None => xai_grok_shell::auth::clear_provider_api_key(
+                        &grok_home,
+                        xai_grok_shell::sampling::types::ModelProvider::Runinfra,
+                    ),
+                };
+                if let Err(error) = storage_result {
+                    return TaskResult::RuninfraApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_RUNINFRA_MUTATION,
+                            transport_token,
+                        ),
+                        warning: None,
+                        error: Some(sanitize_user_error(&error.to_string())),
+                        models: None,
+                    };
+                }
+                match apply_runinfra_models(&tx).await {
+                    Ok(applied) => TaskResult::RuninfraApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_RUNINFRA_MUTATION,
+                            transport_token,
+                        ),
+                        warning: applied.warning,
+                        error: None,
+                        models: applied.models,
+                    },
+                    Err(warning) => TaskResult::RuninfraApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_RUNINFRA_MUTATION,
+                            transport_token,
+                        ),
+                        warning: Some(warning),
+                        error: None,
+                        models: None,
+                    },
+                }
+            });
+        }
+        Effect::UpdateGeminiApiKey { generation, key } => {
+            let transport_token = next_gemini_transport_token();
+            publish_kimi_transport_token(&LATEST_GEMINI_MUTATION, transport_token);
+            let mut mutation_ticket = GEMINI_MUTATION_QUEUE.enqueue();
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                mutation_ticket.wait_turn().await;
+                let configured = key.is_some();
+                let _guard = GEMINI_MUTATION_LOCK.lock().await;
+                if !is_latest_kimi_transport_token(&LATEST_GEMINI_MUTATION, transport_token) {
+                    return TaskResult::GeminiApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: true,
+                        warning: None,
+                        error: None,
+                        models: None,
+                    };
+                }
+                let grok_home = xai_grok_tools::util::grok_home::grok_home();
+                let storage_result = match key.as_ref() {
+                    Some(secret) => xai_grok_shell::auth::store_provider_api_key(
+                        &grok_home,
+                        xai_grok_shell::sampling::types::ModelProvider::Gemini,
+                        secret.expose(),
+                    ),
+                    None => xai_grok_shell::auth::clear_provider_api_key(
+                        &grok_home,
+                        xai_grok_shell::sampling::types::ModelProvider::Gemini,
+                    ),
+                };
+                if let Err(error) = storage_result {
+                    return TaskResult::GeminiApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_GEMINI_MUTATION,
+                            transport_token,
+                        ),
+                        warning: None,
+                        error: Some(sanitize_user_error(&error.to_string())),
+                        models: None,
+                    };
+                }
+                match apply_gemini_models(&tx).await {
+                    Ok(applied) => TaskResult::GeminiApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_GEMINI_MUTATION,
+                            transport_token,
+                        ),
+                        warning: applied.warning,
+                        error: None,
+                        models: applied.models,
+                    },
+                    Err(warning) => TaskResult::GeminiApiKeyUpdated {
+                        configured,
+                        generation,
+                        stale: !is_latest_kimi_transport_token(
+                            &LATEST_GEMINI_MUTATION,
                             transport_token,
                         ),
                         warning: Some(warning),
@@ -4059,6 +4281,96 @@ pub(crate) fn execute(
                     }
                 });
                 TaskResult::WaferModelRebindComplete {
+                    agent_id,
+                    session_id,
+                    model_id,
+                    effort,
+                    generation,
+                    result,
+                }
+            });
+        }
+        Effect::RebindRuninfraModel {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let meta = effort.map(|eff| {
+                    use xai_grok_shell::sampling::types::{
+                        REASONING_EFFORT_META_KEY, reasoning_effort_meta_value,
+                    };
+                    let mut metadata = acp::Meta::new();
+                    metadata.insert(
+                        REASONING_EFFORT_META_KEY.to_string(),
+                        reasoning_effort_meta_value(eff),
+                    );
+                    metadata
+                });
+                let request =
+                    acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone())
+                        .meta(meta);
+                let result = acp_send(request, &tx).await.map(|_| ()).map_err(|error| {
+                    if let Some(typed) =
+                        xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError::from_acp_error(&error)
+                    {
+                        SwitchModelError::IncompatibleAgent {
+                            error: typed,
+                            prev_model_id: None,
+                        }
+                    } else {
+                        SwitchModelError::Other(sanitize_user_error(&error.to_string()))
+                    }
+                });
+                TaskResult::RuninfraModelRebindComplete {
+                    agent_id,
+                    session_id,
+                    model_id,
+                    effort,
+                    generation,
+                    result,
+                }
+            });
+        }
+        Effect::RebindGeminiModel {
+            agent_id,
+            session_id,
+            model_id,
+            effort,
+            generation,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let meta = effort.map(|eff| {
+                    use xai_grok_shell::sampling::types::{
+                        REASONING_EFFORT_META_KEY, reasoning_effort_meta_value,
+                    };
+                    let mut metadata = acp::Meta::new();
+                    metadata.insert(
+                        REASONING_EFFORT_META_KEY.to_string(),
+                        reasoning_effort_meta_value(eff),
+                    );
+                    metadata
+                });
+                let request =
+                    acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone())
+                        .meta(meta);
+                let result = acp_send(request, &tx).await.map(|_| ()).map_err(|error| {
+                    if let Some(typed) =
+                        xai_grok_shell::agent::config::ModelSwitchIncompatibleAgentError::from_acp_error(&error)
+                    {
+                        SwitchModelError::IncompatibleAgent {
+                            error: typed,
+                            prev_model_id: None,
+                        }
+                    } else {
+                        SwitchModelError::Other(sanitize_user_error(&error.to_string()))
+                    }
+                });
+                TaskResult::GeminiModelRebindComplete {
                     agent_id,
                     session_id,
                     model_id,

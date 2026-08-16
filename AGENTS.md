@@ -61,7 +61,7 @@ Full crate map: [`docs/agents/architecture.md`](docs/agents/architecture.md).
 
 1. **Do not fall back to `~/.grok`.** Open Grok state is `$OPENGROK_HOME` / `~/.opengrok` / project `.opengrok/`.
 2. **Do not edit root `Cargo.toml`.** Change the relevant crate manifest.
-3. **Keep providers isolated.** xAI, Codex, Kimi Platform, Kimi Code, Fireworks AI, DeepSeek direct, Wafer AI, and OpenCode Go credentials, catalogs, caches, hosted tools, and opaque history must not cross. See [`docs/provider-architecture.md`](docs/provider-architecture.md).
+3. **Keep providers isolated.** xAI, Codex, Kimi Platform, Kimi Code, Fireworks AI, DeepSeek direct, Wafer AI, Z AI, RunInfra, Google Gemini, and OpenCode Go credentials, catalogs, caches, hosted tools, and opaque history must not cross. See [`docs/provider-architecture.md`](docs/provider-architecture.md).
 4. **Provider identity comes from model metadata**, never from a model slug or URL alone.
 5. **API backend ≠ credentials.** Selecting Responses does not select Codex OAuth; an explicit model API key wins over OAuth.
 6. **Plan mode is not permission YOLO.** Edit gating for plan mode runs in the shell tool path (`plan_mode_edit_gate`), before hooks/permissions. Do not “fix” plan mode only inside the permission manager.
@@ -145,6 +145,8 @@ Three independent axes: **`ApiBackend`** × **`ProviderProfile`** × **`AuthSche
 | DeepSeek direct | `auth.json` scope `deepseek::api_key` | Chat + Responses (V4 Flash); `/login deepseek` |
 | Wafer AI | `auth.json` scope `wafer::api_key` | Chat Completions; dynamic `/models`; `/login wafer` |
 | Z AI | `auth.json` scope `zai::api_key` | Chat Completions (GLM); dynamic `/models` + curated fallback; Coding Plan endpoint default; `/login zai` |
+| RunInfra | `auth.json` scope `runinfra::api_key` | Chat Completions; live `/models` + curated hosted fallback; `/login runinfra` |
+| Google Gemini | `auth.json` scope `gemini::api_key` | Chat Completions; live `/models` enrich-only + curated four models; `/login gemini` |
 
 After any non-xAI profile that denies xAI services, the session export boundary closes monotonically (compatibility field still named `ever_used_codex`).
 

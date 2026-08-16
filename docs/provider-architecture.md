@@ -32,6 +32,9 @@ Codex provider does not override an explicit model API key.
 | DeepSeek direct | Chat, Responses (V4 Flash) | DeepSeek | OpenAI | yes (V4 Flash) | standard only | provider API key | denied |
 | Meta API | Responses | Meta | OpenAI | yes | standard only | provider API key | denied |
 | Wafer AI | Chat | none | client function tools | no | standard only | provider API key | denied |
+| Z AI | Chat | none | client function tools | no | standard only | provider API key | denied |
+| RunInfra | Chat | none | client function tools | no | standard only | provider API key | denied |
+| Google Gemini | Chat | none | client function tools | no | standard only | provider API key | denied |
 | OpenCode Go | Chat, Messages | none | client function tools | no | standard only | provider API key | denied |
 
 The sampler's built-in `ProviderAdapter` registry applies the transport policy
@@ -67,6 +70,26 @@ Wafer AI is a plain OpenAI-compatible Chat Completions provider at
 models from `GET /v1/models`, and exposes only standard client function tools.
 It has no native hosted web-search capability and never inherits xAI request
 metadata, credentials, or exports.
+
+Z AI is a plain OpenAI-compatible Chat Completions provider at the GLM Coding
+Plan endpoint: it uses provider-local API-key auth, discovers models from
+`GET /models` with a curated fallback, and exposes only standard client
+function tools.
+
+RunInfra is a plain OpenAI-compatible Chat Completions provider at
+`https://api.runinfra.ai/v1`: it uses provider-local API-key auth
+(`RUNINFRA_GATEWAY_KEY` / `RUNINFRA_API_KEY`), discovers models from
+`GET /v1/models` with a curated hosted fallback, and exposes only standard
+client function tools. It has no Responses dialect, hosted tools, native web
+search, or xAI export path. Stored keys stay on `https://api.runinfra.ai`.
+
+Google Gemini (AI Studio) is a plain OpenAI-compatible Chat Completions
+provider at `https://generativelanguage.googleapis.com/v1beta/openai/`: it uses
+provider-local API-key auth (`GEMINI_API_KEY` / `GOOGLE_API_KEY`), enriches the
+curated four-model catalog from live `/models`, and exposes only standard
+client function tools. It has no Responses dialect, hosted tools, native web
+search, or xAI export path. Stored keys stay on
+`https://generativelanguage.googleapis.com`.
 
 `ConversationRequest` and `ConversationResponse` remain provider neutral.
 Provider-native opaque history is retained with a typed backend item and is

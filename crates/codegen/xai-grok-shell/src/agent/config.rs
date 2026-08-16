@@ -4345,6 +4345,14 @@ fn default_models(
                 m.base_url = Some(crate::zai_models::api_base_url());
                 m.env_key = Some(EnvKeys::single(crate::zai_models::ZAI_API_KEY_ENV));
             }
+            if m.provider == ModelProvider::Runinfra {
+                m.base_url = Some(crate::runinfra_models::api_base_url());
+                m.env_key = Some(crate::runinfra_models::env_keys());
+            }
+            if m.provider == ModelProvider::Gemini {
+                m.base_url = Some(crate::gemini_models::api_base_url());
+                m.env_key = Some(crate::gemini_models::env_keys());
+            }
             let key = m.id.clone().unwrap_or_else(|| m.model.clone());
             let context_window = m
                 .context_window
@@ -4698,6 +4706,8 @@ impl ConfigModelOverride {
                 | ModelProvider::DeepSeek
                 | ModelProvider::Wafer
                 | ModelProvider::Zai
+                | ModelProvider::Runinfra
+                | ModelProvider::Gemini
                 | ModelProvider::OpenCodeGo => ApiBackend::ChatCompletions,
             };
             if self.base_url.is_none() {
@@ -5608,6 +5618,9 @@ fn trusted_built_in_session_endpoint(provider: ModelProvider, base_url: &str) ->
                     && crate::opencode_go_models::is_trusted_api_base_url(base_url))
                 || (provider.is_wafer() && crate::wafer_models::is_trusted_api_base_url(base_url))
                 || (provider.is_zai() && crate::zai_models::is_trusted_api_base_url(base_url))
+                || (provider.is_runinfra()
+                    && crate::runinfra_models::is_trusted_api_base_url(base_url))
+                || (provider.is_gemini() && crate::gemini_models::is_trusted_api_base_url(base_url))
         }
         xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
             crate::util::is_xai_api_bearer_url(base_url)
@@ -7595,6 +7608,14 @@ reasoning_effort = "low"
             .expect("store Meta key");
         store_provider_api_key(home.path(), ModelProvider::Wafer, "wafer-stored-secret")
             .expect("store Wafer key");
+        store_provider_api_key(
+            home.path(),
+            ModelProvider::Runinfra,
+            "runinfra-stored-secret",
+        )
+        .expect("store RunInfra key");
+        store_provider_api_key(home.path(), ModelProvider::Gemini, "gemini-stored-secret")
+            .expect("store Gemini key");
 
         let mut meta = test_model_entry(
             "meta:muse-spark-1.2",
@@ -7640,6 +7661,56 @@ reasoning_effort = "low"
                 .is_none()
         );
         assert!(!wafer_proxy.has_usable_provider_credentials_at(home.path()));
+
+        let mut runinfra = test_model_entry(
+            "runinfra:deepseek-v4-flash",
+            crate::runinfra_models::RUNINFRA_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        runinfra.info.provider = ModelProvider::Runinfra;
+        runinfra.env_key = Some(crate::runinfra_models::env_keys());
+        let runinfra_creds = resolve_credentials_at_home(&runinfra, None, home.path());
+        assert_eq!(
+            runinfra_creds.api_key.as_deref(),
+            Some("runinfra-stored-secret")
+        );
+        assert!(runinfra.has_usable_provider_credentials_at(home.path()));
+
+        let mut runinfra_proxy = runinfra.clone();
+        runinfra_proxy.info.base_url = "https://proxy.example/v1".to_owned();
+        assert!(
+            resolve_credentials_at_home(&runinfra_proxy, None, home.path())
+                .api_key
+                .is_none()
+        );
+        assert!(!runinfra_proxy.has_usable_provider_credentials_at(home.path()));
+
+        let mut gemini = test_model_entry(
+            "gemini:gemini-3.7-flash",
+            crate::gemini_models::GEMINI_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        gemini.info.provider = ModelProvider::Gemini;
+        gemini.env_key = Some(crate::gemini_models::env_keys());
+        let gemini_creds = resolve_credentials_at_home(&gemini, None, home.path());
+        assert_eq!(
+            gemini_creds.api_key.as_deref(),
+            Some("gemini-stored-secret")
+        );
+        assert!(gemini.has_usable_provider_credentials_at(home.path()));
+
+        let mut gemini_proxy = gemini.clone();
+        gemini_proxy.info.base_url = "https://proxy.example/v1".to_owned();
+        assert!(
+            resolve_credentials_at_home(&gemini_proxy, None, home.path())
+                .api_key
+                .is_none()
+        );
+        assert!(!gemini_proxy.has_usable_provider_credentials_at(home.path()));
     }
 
     #[test]

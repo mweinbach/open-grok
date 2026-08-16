@@ -154,6 +154,11 @@ fn model_provider_label(info: &acp::ModelInfo) -> Option<&str> {
         Some("opencode_go" | "opencode-go") => Some("OpenCode Go"),
         Some("wafer" | "wafer_ai") => Some("Wafer AI"),
         Some("zai" | "z_ai" | "z-ai") => Some("Z AI"),
+        Some("runinfra" | "run_infra" | "run-infra") => Some("RunInfra"),
+        Some(
+            "gemini" | "google" | "google_gemini" | "google-gemini" | "ai_studio" | "ai-studio"
+            | "aistudio" | "gemini_api",
+        ) => Some("Google Gemini"),
         Some(provider) => Some(provider),
         None => None,
     }

@@ -506,6 +506,84 @@ impl ProviderAdapter for ZaiProvider {
     }
 }
 
+/// RunInfra is an OpenAI-compatible Chat Completions provider. It keeps
+/// `reasoning_effort` (hosted models reason by default) and remaps DeepSeek
+/// V4 Flash's high/xhigh/max values to the `max` token the gateway honors.
+/// It still drops Grok-internal `service_tier` and per-message `model_id`.
+#[derive(Debug)]
+pub struct RuninfraProvider;
+
+impl ProviderAdapter for RuninfraProvider {
+    fn provider(&self) -> ModelProvider {
+        ModelProvider::Runinfra
+    }
+
+    fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
+        request.service_tier = None;
+        for message in &mut request.messages {
+            message.model_id = None;
+        }
+        if request.model.as_deref() == Some("deepseek-v4-flash")
+            && let Some(effort) = request.reasoning_effort
+        {
+            request.reasoning_effort = Some(normalize_runinfra_deepseek_v4_flash_effort(effort));
+        }
+    }
+}
+
+fn normalize_runinfra_deepseek_v4_flash_effort(effort: ReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ReasoningEffort::High
+        | ReasoningEffort::Xhigh
+        | ReasoningEffort::Max
+        | ReasoningEffort::Ultra => ReasoningEffort::Max,
+        other => other,
+    }
+}
+
+/// Google Gemini API / AI Studio OpenAI-compatible Chat Completions.
+/// Keeps `reasoning_effort` (the official thinking control) and remaps
+/// values Gemini 3 rejects. Does not send Z AI `thinking` or Gemini-native
+/// `thinking_level` — those overlap `reasoning_effort` and 400.
+#[derive(Debug)]
+pub struct GeminiProvider;
+
+impl ProviderAdapter for GeminiProvider {
+    fn provider(&self) -> ModelProvider {
+        ModelProvider::Gemini
+    }
+
+    fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
+        request.service_tier = None;
+        request.thinking = None;
+        for message in &mut request.messages {
+            message.model_id = None;
+        }
+        request.reasoning_effort = request
+            .reasoning_effort
+            .and_then(|effort| normalize_gemini_reasoning_effort(request.model.as_deref(), effort));
+    }
+}
+
+fn gemini_rejects_minimal(model: Option<&str>) -> bool {
+    matches!(model, Some("gemini-3.7-flash" | "gemini-3.1-pro-preview"))
+}
+
+fn normalize_gemini_reasoning_effort(
+    model: Option<&str>,
+    effort: ReasoningEffort,
+) -> Option<ReasoningEffort> {
+    match effort {
+        // Gemini 3 cannot turn thinking fully off; omit so the model default applies.
+        ReasoningEffort::None => None,
+        ReasoningEffort::Minimal if gemini_rejects_minimal(model) => Some(ReasoningEffort::Low),
+        ReasoningEffort::Xhigh | ReasoningEffort::Max | ReasoningEffort::Ultra => {
+            Some(ReasoningEffort::High)
+        }
+        other => Some(other),
+    }
+}
+
 fn normalize_fireworks_schema(schema: &mut Value) {
     match schema {
         Value::Bool(true) => {
@@ -612,9 +690,11 @@ static META_PROVIDER: MetaProvider = MetaProvider;
 static OPEN_CODE_GO_PROVIDER: OpenCodeGoProvider = OpenCodeGoProvider;
 static WAFER_PROVIDER: WaferProvider = WaferProvider;
 static ZAI_PROVIDER: ZaiProvider = ZaiProvider;
+static RUNINFRA_PROVIDER: RuninfraProvider = RuninfraProvider;
+static GEMINI_PROVIDER: GeminiProvider = GeminiProvider;
 
 /// Complete registry for the built-in providers.
-pub static PROVIDER_REGISTRY: [ProviderRegistration; 9] = [
+pub static PROVIDER_REGISTRY: [ProviderRegistration; 11] = [
     ProviderRegistration {
         provider: ModelProvider::Xai,
         adapter: &XAI_PROVIDER,
@@ -651,6 +731,14 @@ pub static PROVIDER_REGISTRY: [ProviderRegistration; 9] = [
         provider: ModelProvider::Zai,
         adapter: &ZAI_PROVIDER,
     },
+    ProviderRegistration {
+        provider: ModelProvider::Runinfra,
+        adapter: &RUNINFRA_PROVIDER,
+    },
+    ProviderRegistration {
+        provider: ModelProvider::Gemini,
+        adapter: &GEMINI_PROVIDER,
+    },
 ];
 
 /// Look up the stateless transport adapter for a built-in provider.
@@ -667,6 +755,8 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
         ModelProvider::OpenCodeGo => PROVIDER_REGISTRY[6].adapter,
         ModelProvider::Wafer => PROVIDER_REGISTRY[7].adapter,
         ModelProvider::Zai => PROVIDER_REGISTRY[8].adapter,
+        ModelProvider::Runinfra => PROVIDER_REGISTRY[9].adapter,
+        ModelProvider::Gemini => PROVIDER_REGISTRY[10].adapter,
     }
 }
 
@@ -958,6 +1048,8 @@ mod tests {
             ModelProvider::OpenCodeGo,
             ModelProvider::Wafer,
             ModelProvider::Zai,
+            ModelProvider::Runinfra,
+            ModelProvider::Gemini,
         ];
         assert_eq!(PROVIDER_REGISTRY.len(), expected.len());
         for provider in expected {
@@ -985,6 +1077,8 @@ mod tests {
             ModelProvider::OpenCodeGo,
             ModelProvider::Wafer,
             ModelProvider::Zai,
+            ModelProvider::Runinfra,
+            ModelProvider::Gemini,
         ] {
             let mut request = base_request();
             let original = request.clone();
@@ -1102,6 +1196,19 @@ mod tests {
         assert!(zai.validate_backend(&ApiBackend::ChatCompletions).is_ok());
         assert!(zai.validate_backend(&ApiBackend::Responses).is_err());
         assert!(zai.validate_backend(&ApiBackend::Messages).is_err());
+
+        let runinfra = provider_adapter(ModelProvider::Runinfra);
+        assert_eq!(runinfra.prompt_cache_key(Some("session")), None);
+        assert!(!runinfra.supports_turn_state(&ApiBackend::Responses));
+        assert!(!runinfra.sends_doom_loop_opt_in());
+        assert!(!runinfra.normalizes_response_events());
+        assert!(
+            runinfra
+                .validate_backend(&ApiBackend::ChatCompletions)
+                .is_ok()
+        );
+        assert!(runinfra.validate_backend(&ApiBackend::Responses).is_err());
+        assert!(runinfra.validate_backend(&ApiBackend::Messages).is_err());
     }
 
     #[test]
@@ -1304,6 +1411,126 @@ mod tests {
         assert_eq!(
             wire["thinking"],
             serde_json::json!({"type": "enabled", "clear_thinking": false})
+        );
+    }
+
+    #[test]
+    fn runinfra_keeps_reasoning_and_rewrites_deepseek_v4_flash_effort() {
+        use xai_grok_sampling_types::types::{ChatRequestMessage, ToolDefinition};
+
+        let assistant = ChatRequestMessage::assistant("previous turn", "deepseek-v4-flash", None);
+        let mut request = ChatCompletionRequest::new("deepseek-v4-flash", vec![assistant]);
+        request.temperature = Some(0.7);
+        request.reasoning_effort = Some(ReasoningEffort::High);
+        request.service_tier = Some("priority".to_owned());
+        request.tools = Some(vec![ToolDefinition::function(
+            "lookup",
+            Some("Look up a value"),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"]
+            }),
+        )]);
+
+        provider_adapter(ModelProvider::Runinfra).sanitize_chat_request(&mut request);
+
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| message.model_id.is_none())
+        );
+        assert_eq!(request.service_tier, None);
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Max));
+        assert!(request.thinking.is_none());
+        assert_eq!(request.temperature, Some(0.7));
+        let wire = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(wire["reasoning_effort"], "max");
+        assert!(wire.get("thinking").is_none());
+        assert_eq!(wire["tools"][0]["function"]["name"], "lookup");
+
+        let mut other =
+            ChatCompletionRequest::new("qwen3-8-27b", vec![ChatRequestMessage::user("hi")]);
+        other.reasoning_effort = Some(ReasoningEffort::High);
+        provider_adapter(ModelProvider::Runinfra).sanitize_chat_request(&mut other);
+        assert_eq!(other.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            normalize_runinfra_deepseek_v4_flash_effort(ReasoningEffort::None),
+            ReasoningEffort::None
+        );
+        assert_eq!(
+            normalize_runinfra_deepseek_v4_flash_effort(ReasoningEffort::Xhigh),
+            ReasoningEffort::Max
+        );
+    }
+
+    #[test]
+    fn gemini_keeps_reasoning_and_rewrites_unsupported_efforts() {
+        use xai_grok_sampling_types::types::{ChatRequestMessage, ToolDefinition};
+
+        let assistant = ChatRequestMessage::assistant("previous turn", "gemini-3.7-flash", None);
+        let mut request = ChatCompletionRequest::new("gemini-3.7-flash", vec![assistant]);
+        request.temperature = Some(0.7);
+        request.reasoning_effort = Some(ReasoningEffort::Minimal);
+        request.service_tier = Some("priority".to_owned());
+        request.thinking = Some(ChatThinkingMode::enabled());
+        request.tools = Some(vec![ToolDefinition::function(
+            "lookup",
+            Some("Look up a value"),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"]
+            }),
+        )]);
+
+        provider_adapter(ModelProvider::Gemini).sanitize_chat_request(&mut request);
+
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| message.model_id.is_none())
+        );
+        assert_eq!(request.service_tier, None);
+        assert!(request.thinking.is_none());
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(request.temperature, Some(0.7));
+        let wire = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(wire["reasoning_effort"], "low");
+        assert!(wire.get("thinking").is_none());
+        assert_eq!(wire["tools"][0]["function"]["name"], "lookup");
+
+        let mut none_off =
+            ChatCompletionRequest::new("gemini-3.6-flash", vec![ChatRequestMessage::user("hi")]);
+        none_off.reasoning_effort = Some(ReasoningEffort::None);
+        provider_adapter(ModelProvider::Gemini).sanitize_chat_request(&mut none_off);
+        assert_eq!(none_off.reasoning_effort, None);
+
+        let mut lite = ChatCompletionRequest::new(
+            "gemini-3.5-flash-lite",
+            vec![ChatRequestMessage::user("hi")],
+        );
+        lite.reasoning_effort = Some(ReasoningEffort::Minimal);
+        provider_adapter(ModelProvider::Gemini).sanitize_chat_request(&mut lite);
+        assert_eq!(lite.reasoning_effort, Some(ReasoningEffort::Minimal));
+
+        let mut pro = ChatCompletionRequest::new(
+            "gemini-3.1-pro-preview",
+            vec![ChatRequestMessage::user("hi")],
+        );
+        pro.reasoning_effort = Some(ReasoningEffort::Ultra);
+        provider_adapter(ModelProvider::Gemini).sanitize_chat_request(&mut pro);
+        assert_eq!(pro.reasoning_effort, Some(ReasoningEffort::High));
+
+        assert_eq!(
+            normalize_gemini_reasoning_effort(Some("gemini-3.7-flash"), ReasoningEffort::Minimal),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            normalize_gemini_reasoning_effort(Some("gemini-3.6-flash"), ReasoningEffort::Minimal),
+            Some(ReasoningEffort::Minimal)
         );
     }
 
