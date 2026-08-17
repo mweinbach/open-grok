@@ -1,4 +1,4 @@
-//! ConversationRequest assembly — image compaction, pruning, repair, memory injection.
+//! ConversationRequest assembly — image compaction, repair, memory injection.
 
 use xai_grok_sampling_types::{
     ContentPart, ConversationItem, ConversationRequest, CustomToolOutputContent, ToolSpec,
@@ -6,7 +6,6 @@ use xai_grok_sampling_types::{
 };
 
 use super::ChatStateActor;
-use super::state::estimate_conversation_tokens;
 use crate::events::ChatStateEvent;
 use crate::types::PruningConfig;
 
@@ -23,10 +22,17 @@ impl ChatStateActor {
     /// Build a `ConversationRequest` from the current actor state.
     ///
     /// 1. Evict oldest inline images when the inline-image bytes near 50 MB
-    /// 2. Prune old tool results if over 50% context utilization
-    /// 3. Optionally persist the memory reminder into actor state
-    /// 4. Inject memory reminder into the request clone (if needed)
-    /// 5. Assemble and return the `ConversationRequest`
+    /// 2. Optionally persist the memory reminder into actor state
+    /// 3. Inject memory reminder into the request clone (if needed)
+    /// 4. Assemble and return the `ConversationRequest`
+    ///
+    /// Tool-result soft-trim / hard-clear is **not** applied here. Rewriting
+    /// already-sent items on the hot request path busts the prompt-cache
+    /// prefix and costs more than it saves. Call
+    /// [`crate::ChatStateHandle::prune_for_fresh_input`] (or
+    /// [`prune_conversation`] on a compact-model clone) only when the
+    /// next model request is already a cold prefix — compaction or a
+    /// model swap.
     ///
     /// # Repair invariant
     ///
@@ -45,20 +51,6 @@ impl ChatStateActor {
         conv_id: String,
         req_id: String,
     ) -> ConversationRequest {
-        // Gate on the unpruned in-memory conversation, not the last API
-        // `prompt_tokens`. Soft-trim runs on a request clone only, so the
-        // provider's next usage report is the already-pruned size. Using that
-        // figure alone unlatches pruning and flaps the KV-cache prefix every
-        // other loop (full request → prune → small report → full request).
-        // `max` with the last API total still lets a tokenizer-backed count
-        // start pruning when the bytes/4 estimate is low; once pruning has
-        // started the estimate stays high because retained history is not
-        // soft-trimmed.
-        let unpruned_tokens = estimate_conversation_tokens(&self.state.conversation);
-        let needs_prune = should_prune(
-            unpruned_tokens.max(self.state.total_tokens),
-            self.state.sampling_config.context_window,
-        );
         let mut memory_reminder = memory_reminder;
         if let Some(reminder) = memory_reminder.as_deref()
             && persist_memory_reminder
@@ -83,7 +75,7 @@ impl ChatStateActor {
         let body_bytes = conversation_body_bytes(&self.state.conversation);
         let inline_images = inline_image_count(&self.state.conversation);
         let needs_image_compaction = body_bytes >= IMAGE_COMPACT_TRIGGER_BYTES;
-        let needs_mutation = needs_prune || memory_reminder.is_some() || needs_image_compaction;
+        let needs_mutation = memory_reminder.is_some() || needs_image_compaction;
 
         // Only allocate the mutable working copy when a mutation path is taken.
         let mut eviction: Option<ImageEvictionOutcome> = None;
@@ -103,12 +95,7 @@ impl ChatStateActor {
                 ));
             }
 
-            // Step 2: Prune old tool results if context is > 50% utilized
-            if needs_prune {
-                prune_conversation(&mut items, &self.pruning_config, self.state.prompt_index);
-            }
-
-            // Step 3: Inject memory reminder into the system message
+            // Step 2: Inject memory reminder into the system message
             if let Some(reminder) = memory_reminder {
                 inject_memory_reminder(&mut items, &reminder);
             }
@@ -136,7 +123,7 @@ impl ChatStateActor {
             });
         }
 
-        // Step 4: Assemble request
+        // Step 3: Assemble request
         ConversationRequest {
             items,
             tools: tool_definitions,
@@ -167,13 +154,6 @@ impl ChatStateActor {
 // Pruning (standalone functions, no actor state needed)
 // ============================================================================
 
-/// Check whether pruning should run based on context utilization.
-///
-/// Returns `true` when `total_tokens` exceeds 50% of `context_window`.
-pub(crate) fn should_prune(total_tokens: u64, context_window: std::num::NonZeroU64) -> bool {
-    total_tokens > context_window.get() / 2
-}
-
 /// `User` items that are not real prompt turns (interjections, reminders).
 ///
 /// `prompt_index` counts real turns. Extra `User` items would otherwise make
@@ -195,13 +175,17 @@ pub(crate) fn count_synthetic_user_items(
 /// counting `User` items to determine which "turn" each tool result belongs to.
 /// `prompt_index` raises the keep/hard-clear thresholds by the number of
 /// synthetic `User` items so interjections do not age tool results early.
-pub(crate) fn prune_conversation(
+///
+/// This rewrites already-sent items and must only run when the next model
+/// request is already a cold prefix (compaction input or a model swap).
+/// Returns the number of tool results that changed.
+pub fn prune_conversation(
     conversation: &mut [ConversationItem],
     config: &PruningConfig,
     prompt_index: usize,
-) {
+) -> usize {
     if !config.enabled {
-        return;
+        return 0;
     }
 
     let synthetic_count = count_synthetic_user_items(conversation, prompt_index);
@@ -210,6 +194,7 @@ pub(crate) fn prune_conversation(
 
     let mut turn_from_end: usize = 0;
     let mut seen_first_user = false;
+    let mut changed = 0usize;
 
     for i in (0..conversation.len()).rev() {
         if matches!(&conversation[i], ConversationItem::User(_)) {
@@ -229,9 +214,15 @@ pub(crate) fn prune_conversation(
             ConversationItem::ToolResult(tool_result) => {
                 // Hard clear: very old tool results → replace entirely.
                 if turn_from_end >= hard_clear_age_turns {
-                    tool_result.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
-                    tool_result.images.clear();
-                    tool_result.ordered_content.clear();
+                    let already_cleared = tool_result.content.as_ref() == HARD_CLEAR_PLACEHOLDER
+                        && tool_result.images.is_empty()
+                        && tool_result.ordered_content.is_empty();
+                    if !already_cleared {
+                        tool_result.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
+                        tool_result.images.clear();
+                        tool_result.ordered_content.clear();
+                        changed += 1;
+                    }
                     continue;
                 }
 
@@ -260,13 +251,20 @@ pub(crate) fn prune_conversation(
                         vec![xai_grok_sampling_types::CustomToolOutputContent::text(
                             trimmed,
                         )];
+                    changed += 1;
                 }
             }
             ConversationItem::CustomToolOutput(output) => {
                 if turn_from_end >= hard_clear_age_turns {
-                    output.content = vec![xai_grok_sampling_types::CustomToolOutputContent::text(
-                        HARD_CLEAR_PLACEHOLDER,
-                    )];
+                    let already_cleared = output.text_content() == HARD_CLEAR_PLACEHOLDER
+                        && output.content.len() == 1;
+                    if !already_cleared {
+                        output.content =
+                            vec![xai_grok_sampling_types::CustomToolOutputContent::text(
+                                HARD_CLEAR_PLACEHOLDER,
+                            )];
+                        changed += 1;
+                    }
                     continue;
                 }
                 let source = output.text_content();
@@ -276,11 +274,13 @@ pub(crate) fn prune_conversation(
                     output.content = vec![xai_grok_sampling_types::CustomToolOutputContent::text(
                         format!("{head}{SOFT_TRIM_SEPARATOR}{tail}"),
                     )];
+                    changed += 1;
                 }
             }
             _ => {}
         }
     }
+    changed
 }
 
 // ============================================================================
@@ -760,15 +760,6 @@ fn safe_char_slice_tail(s: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn should_prune_gating() {
-        use std::num::NonZeroU64;
-        let cw = NonZeroU64::new(10000).unwrap();
-        assert!(!should_prune(1000, cw)); // 10%
-        assert!(should_prune(6000, cw)); // 60%
-        assert!(!should_prune(5000, cw)); // 50% exact (> not >=)
-    }
 
     #[test]
     fn prune_disabled_is_noop() {

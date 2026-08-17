@@ -1,12 +1,11 @@
 //! Mutation handlers for the ChatStateActor.
 
 use xai_grok_sampling_types::{
-    ContentPart, ConversationItem, DanglingToolCallReason, dedup_duplicate_tool_results,
+    ConversationItem, DanglingToolCallReason, dedup_duplicate_tool_results,
     repair_dangling_tool_calls,
 };
 
 use super::ChatStateActor;
-use super::request_builder::HARD_CLEAR_PLACEHOLDER;
 use crate::events::ChatStateEvent;
 use crate::types::ChatStateSnapshot;
 
@@ -35,8 +34,9 @@ pub(super) enum HistoryRewrite {
     /// an active capture's boundary → snapshot + rebase. Token totals
     /// untouched.
     IntegrityRepair,
-    /// Old tool-result hard-clear: content shrinks, item count and ordering
-    /// unchanged → capture offsets stay valid. Token totals untouched.
+    /// Fresh-input tool-result prune (compaction / model swap): content
+    /// shrinks, item count and ordering unchanged → capture offsets stay
+    /// valid. Token totals untouched.
     RetainedPrune,
     /// Server-confirmed image strip: parts replaced in place
     /// (`strip_images_by_url`'s invariant), token totals untouched so the
@@ -240,10 +240,6 @@ impl ChatStateActor {
     /// tool calls, the conversation may have dangling tool call IDs. This
     /// method repairs them before appending the new message so the on-disk
     /// and in-memory state stay consistent.
-    ///
-    /// Also runs [`prune_retained_conversation`] to eagerly hard-clear very
-    /// old tool results from the in-memory state, bounding long-session
-    /// retained memory without waiting for the context-window threshold.
     pub(super) fn push_user_message(&mut self, item: ConversationItem) {
         self.push_user_message_with_repair_reason(item, DanglingToolCallReason::UserCancelled);
     }
@@ -266,196 +262,45 @@ impl ChatStateActor {
         );
         self.persistence.persist_message(&item);
         self.state.conversation.push(item);
-        self.prune_retained_conversation();
     }
 
-    /// Eagerly hard-clear tool results from very old turns in the retained
-    /// in-memory conversation, freeing the actual string bytes.
+    /// Apply tool-result prune in place because the next model request is
+    /// already a cold prefix (compaction input or a model swap).
     ///
-    /// Unlike the API-copy pruning in `build_conversation_request` (which runs
-    /// on a *clone* only when context > 50% full), this operates on
-    /// `self.state.conversation` directly and runs after every user turn.
-    ///
-    /// # What this does
-    ///
-    /// Only **hard-clears** are applied (no soft-trim).  Soft-trimming is a
-    /// context-management operation that changes what the model sees;
-    /// hard-clearing is a memory-management operation that replaces content
-    /// that is so old the model should not need it again.  The threshold is
-    /// controlled by `PruningConfig::hard_clear_age_turns`.
-    ///
-    /// # Retained-memory measurement
-    ///
-    /// When any clearing occurs, a `tracing::debug!` event reports:
-    /// - `hard_cleared` — number of tool results cleared
-    /// - `bytes_freed` — approximate bytes recovered (sum of content lengths)
-    /// - `conversation_len` — total item count after the pass
-    ///
-    /// # Synthetic User items and turn-age accuracy
-    ///
-    /// The shell can inject synthetic `User` items mid-turn (e.g. system
-    /// corrective warnings) without calling `increment_prompt_index`.  These
-    /// do not represent real user turns.  The backward scan here counts every
-    /// `User` item as a turn boundary, so synthetic items would normally cause
-    /// old tool results to appear older than they really are.
-    ///
-    /// This is compensated by raising the effective clearing threshold by the
-    /// number of synthetic User items (`total_user_items - prompt_index`).
-    /// The result: a tool result is never cleared before `hard_clear_age_turns`
-    /// REAL turns have elapsed, even in sessions with many synthetic messages.
-    ///
-    /// # Replay / rewind correctness
-    ///
-    /// `updates.jsonl` is **never touched**, so cross-compaction
-    /// `replay_to_prompt` is unaffected.  The pruned `chat_history.jsonl`
-    /// on disk mirrors the in-memory state — both lose old bulk content but
-    /// `updates.jsonl` retains the original data for replay.
-    pub(super) fn prune_retained_conversation(&mut self) -> usize {
+    /// Soft-trim plus hard-clear. Do **not** call this on the incremental
+    /// request path — rewriting already-sent items busts the prompt cache.
+    pub(super) fn prune_for_fresh_input(&mut self) -> usize {
         if !self.pruning_config.enabled {
             return 0;
         }
-        // Fast exit: not enough turns have elapsed for any hard-clear to apply.
-        if self.state.prompt_index < self.pruning_config.hard_clear_age_turns {
-            return 0;
-        }
-
-        // Compute how many synthetic User items exist (system reminders, etc.).
-        // Synthetic User items are NOT real user turns — they are injected by the
-        // shell mid-turn and do not increment `prompt_index`.  The naive backward
-        // scan counts every User item as a turn boundary, so synthetic items make
-        // old tool results appear older than they really are and can cause
-        // premature hard-clears.
-        //
-        // Fix: raise the effective clearing threshold by the number of synthetic
-        // User items.  This guarantees a tool result is never cleared before
-        // `hard_clear_age_turns` REAL turns have elapsed, regardless of how many
-        // synthetic messages the session contains.
-        let synthetic_count = super::request_builder::count_synthetic_user_items(
-            &self.state.conversation,
-            self.state.prompt_index,
-        );
-        let effective_threshold = self
-            .pruning_config
-            .hard_clear_age_turns
-            .saturating_add(synthetic_count);
-
-        let before_bytes = self.conversation_content_bytes();
-        let (cleared, _) = self.rewrite_history(HistoryRewrite::RetainedPrune, |conversation| {
-            let mut cleared = 0usize;
-            let mut turn_from_end: usize = 0;
-            let mut seen_first_user = false;
-
-            for i in (0..conversation.len()).rev() {
-                if matches!(&conversation[i], ConversationItem::User(_)) {
-                    if seen_first_user {
-                        turn_from_end += 1;
-                    }
-                    seen_first_user = true;
-                    continue;
-                }
-
-                if turn_from_end < effective_threshold {
-                    continue;
-                }
-
-                match &mut conversation[i] {
-                    ConversationItem::ToolResult(result) => {
-                        if result.content.as_ref() != HARD_CLEAR_PLACEHOLDER
-                            || !result.images.is_empty()
-                            || !result.ordered_content.is_empty()
-                        {
-                            result.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
-                            result.images.clear();
-                            result.ordered_content.clear();
-                            cleared += 1;
-                        }
-                    }
-                    ConversationItem::CustomToolOutput(output) => {
-                        if output.text_content() != HARD_CLEAR_PLACEHOLDER
-                            || output.content.len() != 1
-                        {
-                            output.content =
-                                vec![xai_grok_sampling_types::CustomToolOutputContent::text(
-                                    HARD_CLEAR_PLACEHOLDER,
-                                )];
-                            cleared += 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            cleared
+        let prompt_index = self.state.prompt_index;
+        let config = self.pruning_config.clone();
+        let (changed, _) = self.rewrite_history(HistoryRewrite::RetainedPrune, |conversation| {
+            super::request_builder::prune_conversation(conversation, &config, prompt_index)
         });
-
-        if cleared > 0 {
-            let after_bytes = self.conversation_content_bytes();
-            tracing::debug!(
-                hard_cleared = cleared,
-                bytes_freed = before_bytes.saturating_sub(after_bytes),
-                conversation_len = self.state.conversation.len(),
-                "ChatState: in-memory tool-result prune"
+        if changed > 0 {
+            tracing::info!(
+                pruned = changed,
+                prompt_index,
+                "ChatState: pruned tool results for a fresh-input request"
             );
         }
-
-        cleared
+        changed
     }
 
-    /// Approximate byte footprint of all string content in the conversation.
-    ///
-    /// Used for before/after measurement logging when pruning runs.
-    /// Sums the byte lengths of all string fields; does not allocate.
-    fn conversation_content_bytes(&self) -> usize {
-        self.state
-            .conversation
-            .iter()
-            .map(|item| match item {
-                ConversationItem::System(s) => s.content.len(),
-                ConversationItem::User(u) => u
-                    .content
-                    .iter()
-                    .map(|p| match p {
-                        ContentPart::Text { text } => text.len(),
-                        ContentPart::Image { url } => url.len(),
-                    })
-                    .sum::<usize>(),
-                ConversationItem::Assistant(a) => a.content.len(),
-                ConversationItem::ToolResult(tr) => {
-                    if tr.ordered_content.is_empty() {
-                        tr.content.len()
-                    } else {
-                        tr.ordered_content
-                            .iter()
-                            .map(|part| match part {
-                                xai_grok_sampling_types::CustomToolOutputContent::Text { text } => {
-                                    text.len()
-                                }
-                                xai_grok_sampling_types::CustomToolOutputContent::Image {
-                                    url,
-                                    ..
-                                } => url.len(),
-                            })
-                            .sum()
-                    }
-                }
-                ConversationItem::CustomToolOutput(output) => output
-                    .content
-                    .iter()
-                    .map(|part| match part {
-                        xai_grok_sampling_types::CustomToolOutputContent::Text { text } => {
-                            text.len()
-                        }
-                        xai_grok_sampling_types::CustomToolOutputContent::Image { url, .. } => {
-                            url.len()
-                        }
-                    })
-                    .sum(),
-                ConversationItem::BackendToolCall(b) => b.estimated_content_len(),
-                ConversationItem::Reasoning(r) => {
-                    xai_grok_sampling_types::reasoning_item_text(r).len()
-                        + r.encrypted_content.as_deref().map(str::len).unwrap_or(0)
-                }
-            })
-            .sum()
+    /// Return a pruned clone for a compact-model request without mutating
+    /// retained history. Compact already uses a different prompt, so the
+    /// prefix is cold; shrinking old tool results there only saves tokens.
+    pub(super) fn pruned_conversation_clone(&self) -> Vec<ConversationItem> {
+        let mut items = self.state.conversation.clone();
+        if self.pruning_config.enabled {
+            super::request_builder::prune_conversation(
+                &mut items,
+                &self.pruning_config,
+                self.state.prompt_index,
+            );
+        }
+        items
     }
 
     /// Record accumulated token usage and emit an event.

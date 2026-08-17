@@ -415,9 +415,11 @@ You configure flush under `[compaction]`, not `[memory]`, because it is a compac
 
 You configure pruning under `[compaction]`, not `[memory]`, because it is a compaction behavior.
 
+Pruning rewrites already-sent tool results, so Open Grok only applies it when the next model request is already a cold prefix: compaction (the compact-model input) or a model swap. Incremental turns keep tool results byte-stable so the prompt cache can hit.
+
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `true` | Enable tool-result pruning |
+| `enabled` | `true` | Enable tool-result pruning on compaction and model swap |
 | `keep_last_n_turns` | `3` | Number of recent turns whose tool results are never pruned |
 | `soft_trim_threshold` | `4000` | Character threshold above which old tool results are soft-trimmed |
 | `soft_trim_head` | `1500` | Characters kept from the start of a soft-trimmed result |

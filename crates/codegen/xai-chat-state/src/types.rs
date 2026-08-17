@@ -66,8 +66,10 @@ pub struct NotificationMeta {
 
 /// Configuration for tool-result pruning.
 ///
-/// Prunes old, large tool results from the conversation to reclaim context space.
-/// Two modes: soft trim (keep head + tail) and hard clear (replace entirely).
+/// Prunes old, large tool results when the next model request is already a
+/// cold prefix (compaction or a model swap). Two modes: soft trim (keep
+/// head + tail) and hard clear (replace entirely). Incremental turns keep
+/// already-sent items byte-stable so the prompt cache can hit.
 #[derive(Debug, Clone)]
 pub struct PruningConfig {
     /// Whether pruning is enabled.

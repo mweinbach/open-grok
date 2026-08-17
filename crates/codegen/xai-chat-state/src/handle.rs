@@ -158,6 +158,16 @@ impl ChatStateHandle {
             .send(ChatStateCommand::UpdateSamplingConfig { config });
     }
 
+    /// Soft-trim / hard-clear old tool results because the next request is
+    /// already a cold prefix (model swap). Returns how many items changed.
+    pub async fn prune_for_fresh_input(&self) -> usize {
+        self.query("PruneForFreshInput", |reply| {
+            ChatStateCommand::PruneForFreshInput { reply }
+        })
+        .await
+        .unwrap_or(0)
+    }
+
     /// Track that the agent edited a file path.
     pub fn record_agent_edited_path(&self, path: String) {
         let _ = self
@@ -345,7 +355,8 @@ impl ChatStateHandle {
     }
 
     /// Build a ConversationRequest from the current state.
-    /// Prunes, repairs, injects memory, and returns a ready-to-send request.
+    /// Repairs, injects memory, and returns a ready-to-send request.
+    /// Does not rewrite already-sent tool results.
     pub async fn build_request(
         &self,
         tool_definitions: Vec<ToolSpec>,
@@ -367,6 +378,16 @@ impl ChatStateHandle {
             }
         })
         .await
+    }
+
+    /// Clone the conversation and prune old tool results without mutating
+    /// retained history. Used as compact-model input (already a cold prefix).
+    pub async fn pruned_conversation_clone(&self) -> Vec<ConversationItem> {
+        self.query("PrunedConversationClone", |reply| {
+            ChatStateCommand::PrunedConversationClone { reply }
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Get a clone of the full conversation.

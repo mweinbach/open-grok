@@ -1499,7 +1499,7 @@ impl SessionActor {
         let (conv_len, system_message, full_conversation) = tokio::join!(
             self.chat_state_handle.get_conversation_len(),
             self.chat_state_handle.get_system_message(),
-            self.chat_state_handle.get_conversation(),
+            self.chat_state_handle.pruned_conversation_clone(),
         );
         let provider_conversation = full_conversation.clone();
         let segment_messages = if self.compaction.compaction_mode.writes_segments() {
@@ -1845,7 +1845,7 @@ impl SessionActor {
                                 error = %message,
                                 "Compaction input overflowed deterministically; stepping down the input ladder to avoid an incompactable state"
                             );
-                            let conv = self.chat_state_handle.get_conversation().await;
+                            let conv = self.chat_state_handle.pruned_conversation_clone().await;
                             request_turns = match stage {
                                 InputStage::VerbatimFitted => {
                                     let budget = context_window

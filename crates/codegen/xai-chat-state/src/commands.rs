@@ -114,6 +114,10 @@ pub enum ChatStateCommand {
     /// Update the sampling config (e.g., model switch).
     UpdateSamplingConfig { config: SamplingConfig },
 
+    /// Soft-trim / hard-clear old tool results because the next request is
+    /// already a cold prefix (model swap). Returns how many items changed.
+    PruneForFreshInput { reply: oneshot::Sender<usize> },
+
     /// Track that the agent edited a file path.
     RecordAgentEditedPath { path: String },
 
@@ -372,6 +376,12 @@ pub enum ChatStateCommand {
         reply: oneshot::Sender<ConversationCounts>,
     },
 
+    /// Clone the conversation and prune old tool results without mutating
+    /// retained history. Used as compact-model input.
+    PrunedConversationClone {
+        reply: oneshot::Sender<Vec<ConversationItem>>,
+    },
+
     /// Get the first `System` message in the conversation, if any.
     ///
     /// Cheaper than `GetConversation` when only the system prompt is needed
@@ -411,6 +421,8 @@ mod tests {
         };
         let _ = ChatStateCommand::RecordTokenUsage { total_tokens: 100 };
         let _ = ChatStateCommand::IncrementPromptIndex;
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::PruneForFreshInput { reply: tx };
         let _ = ChatStateCommand::UpdateSamplingConfig {
             config: SamplingConfig {
                 base_url: String::new(),
@@ -449,6 +461,9 @@ mod tests {
         let _ = ChatStateCommand::Flush;
 
         // Queries
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::PrunedConversationClone { reply: tx };
+
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetConversation { reply: tx };
 

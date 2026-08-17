@@ -373,6 +373,8 @@ impl Default for MemoryFlushConfig {
 }
 
 /// Tool-result pruning configuration (`[compaction.pruning]`).
+///
+/// Applied on compaction and model swap only — not on incremental turns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PruningConfig {

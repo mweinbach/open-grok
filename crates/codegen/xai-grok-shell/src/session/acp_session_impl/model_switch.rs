@@ -302,6 +302,7 @@ impl SessionActor {
                 }
             )),
         );
+        self.chat_state_handle.prune_for_fresh_input().await;
         self.chat_state_handle
             .update_sampling_config(xai_grok_sampling_types::SamplingConfig {
                 base_url: sampling_config.base_url.clone(),

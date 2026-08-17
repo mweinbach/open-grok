@@ -36,12 +36,12 @@ pub mod types;
 pub mod usage;
 
 // Re-export main types for convenience
-pub use actor::ChatStateActor;
 pub use actor::state::{
     estimate_conversation_tokens, estimate_item_tokens, estimate_messages_tokens,
     estimate_system_message_tokens, estimate_tool_definition_tokens,
     estimate_tool_definitions_tokens,
 };
+pub use actor::{ChatStateActor, prune_conversation};
 pub use commands::{ModelMetadata, StrictAppendAck, StrictAppendError};
 pub use compaction_mode::CompactionMode;
 pub use compaction_transcript::CompactionDetail;

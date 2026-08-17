@@ -10,6 +10,8 @@ mod queries;
 pub(crate) mod request_builder;
 pub mod state;
 
+pub use request_builder::prune_conversation;
+
 #[cfg(test)]
 mod tests;
 
@@ -203,6 +205,9 @@ impl ChatStateActor {
             ChatStateCommand::UpdateSamplingConfig { config } => {
                 self.state.sampling_config = config;
             }
+            ChatStateCommand::PruneForFreshInput { reply } => {
+                let _ = reply.send(self.prune_for_fresh_input());
+            }
             ChatStateCommand::RecordAgentEditedPath { path } => {
                 self.state.agent_edited_paths.insert(path);
             }
@@ -324,6 +329,9 @@ impl ChatStateActor {
                     req_id,
                 );
                 let _ = reply.send(request);
+            }
+            ChatStateCommand::PrunedConversationClone { reply } => {
+                let _ = reply.send(self.pruned_conversation_clone());
             }
             ChatStateCommand::GetConversation { reply } => {
                 tracing::debug!(

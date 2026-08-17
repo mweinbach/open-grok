@@ -866,7 +866,8 @@ async fn compaction_reseed_excludes_post_response_deltas_from_overhead() {
 async fn compaction_overhead_unaffected_by_pruning_after_last_response() {
     let h = TestHarness::new();
 
-    // 12 turns of large tool results so default pruning (10-turn age) fires.
+    // 12 turns of large tool results so default pruning (10-turn age) fires
+    // when an explicit fresh-input prune runs (model swap / compaction).
     let mut conv = Vec::new();
     for i in 0..12 {
         conv.push(ConversationItem::user(format!("q{i}")));
@@ -884,8 +885,8 @@ async fn compaction_overhead_unaffected_by_pruning_after_last_response() {
     let provider_total = estimate_at_response + estimate_at_response / 2;
     h.handle.record_token_usage(provider_total);
 
-    // Triggers pruning: old tool results are hard-cleared in place.
     h.handle.push_user_message(ConversationItem::user("new q"));
+    let _ = h.handle.prune_for_fresh_input().await;
     let pruned_estimate = crate::estimate_conversation_tokens(&h.handle.get_conversation().await);
     assert!(
         pruned_estimate + 20_000 < estimate_at_response,
@@ -3389,8 +3390,8 @@ async fn push_turns(handle: &crate::handle::ChatStateHandle, turns: usize, conte
     let _ = handle.get_conversation_len().await;
 }
 
-/// After fewer turns than `hard_clear_age_turns` the retained conversation
-/// must not be touched (fast-exit path).
+/// After fewer turns than `hard_clear_age_turns` an explicit fresh-input
+/// prune must not rewrite retained tool results (keep window covers them).
 #[tokio::test]
 async fn prune_retained_no_op_when_session_is_young() {
     use crate::actor::ChatStateActor;
@@ -3402,6 +3403,7 @@ async fn prune_retained_no_op_when_session_is_young() {
     let token = tokio_util::sync::CancellationToken::new();
     let config = PruningConfig {
         hard_clear_age_turns: 10,
+        keep_last_n_turns: 10,
         ..Default::default()
     };
     let handle = ChatStateActor::spawn_with_pruning(
@@ -3415,6 +3417,7 @@ async fn prune_retained_no_op_when_session_is_young() {
 
     // Push 5 turns — below the hard_clear_age_turns threshold of 10.
     push_turns(&handle, 5, 10_000).await;
+    let _ = handle.prune_for_fresh_input().await;
 
     // All tool results must be untouched.
     let conv = handle.get_conversation().await;
@@ -3429,8 +3432,8 @@ async fn prune_retained_no_op_when_session_is_young() {
     }
 }
 
-/// After `hard_clear_age_turns + 1` turns, tool results from the oldest
-/// turns must be hard-cleared in the in-memory conversation.
+/// After `hard_clear_age_turns + 1` turns, an explicit fresh-input prune
+/// hard-clears tool results from the oldest turns.
 #[tokio::test]
 async fn prune_retained_hard_clears_old_tool_results() {
     use crate::actor::ChatStateActor;
@@ -3456,6 +3459,7 @@ async fn prune_retained_hard_clears_old_tool_results() {
 
     // Push 8 turns — turns 0..2 will be older than hard_clear_age_turns=5.
     push_turns(&handle, 8, 5_000).await;
+    let _ = handle.prune_for_fresh_input().await;
 
     let conv = handle.get_conversation().await;
     // Turns are laid out as [User, Assistant, ToolResult] * 8.
@@ -3508,6 +3512,7 @@ async fn prune_retained_disabled_is_noop() {
     );
 
     push_turns(&handle, 6, 10_000).await;
+    let _ = handle.prune_for_fresh_input().await;
 
     let conv = handle.get_conversation().await;
     for item in &conv {
@@ -3551,6 +3556,7 @@ async fn prune_retained_bounds_long_session_footprint() {
     );
 
     push_turns(&handle, TURNS, CONTENT_LEN).await;
+    let _ = handle.prune_for_fresh_input().await;
 
     let conv = handle.get_conversation().await;
 
@@ -3620,6 +3626,7 @@ async fn prune_retained_rewind_still_correct() {
 
     // Push 6 turns: [User, Assistant, ToolResult] * 6 = 18 items.
     push_turns(&handle, 6, 1_000).await;
+    let _ = handle.prune_for_fresh_input().await;
 
     // Rewind to prompt index 3 (keep turns 0..3 = 9 items).
     handle.truncate_to_prompt_index(3).await;
@@ -3673,7 +3680,7 @@ async fn prune_retained_synthetic_user_does_not_advance_age() {
     let token = tokio_util::sync::CancellationToken::new();
     let config = PruningConfig {
         hard_clear_age_turns: 5,
-        keep_last_n_turns: 1,
+        keep_last_n_turns: 10,
         ..Default::default()
     };
     let handle = ChatStateActor::spawn_with_pruning(
@@ -3701,9 +3708,10 @@ async fn prune_retained_synthetic_user_does_not_advance_age() {
     handle.push_user_message(ConversationItem::user("⚠️ doom-loop warning 1"));
     handle.push_user_message(ConversationItem::user("⚠️ doom-loop warning 2"));
 
-    // Fourth real turn starts: prompt_index → 4, pruning fires inside push_user_message.
+    // Fourth real turn starts: prompt_index → 4, then an explicit fresh-input prune.
     handle.push_user_message(ConversationItem::user("real q3"));
     handle.increment_prompt_index(); // prompt_index = 4
+    let _ = handle.prune_for_fresh_input().await;
 
     // Sync
     let conv = handle.get_conversation().await;
@@ -4515,11 +4523,11 @@ async fn build_request_preserves_small_old_images() {
     );
 }
 
-/// Request-time prune must stay on when the last API `prompt_tokens` is the
-/// already-pruned size. Gating on that figure alone unlatches prune and
-/// flaps the KV-cache prefix every other loop.
+/// Incremental requests must not rewrite already-sent tool results, even
+/// when the unpruned conversation is over 50% of the context window.
+/// Soft-trim is reserved for compaction / model-swap (fresh prefix).
 #[tokio::test]
-async fn request_prune_stays_on_when_api_reports_pruned_prompt_size() {
+async fn request_does_not_prune_when_over_half_context() {
     let h = TestHarness::with_context_window(10_000);
 
     h.handle.increment_prompt_index();
@@ -4539,9 +4547,7 @@ async fn request_prune_stays_on_when_api_reports_pruned_prompt_size() {
     h.handle.increment_prompt_index();
     h.handle.push_user_message(ConversationItem::user("q5"));
 
-    // Provider reported the pruned clone (~40% of a 10k window). The
-    // unpruned conversation is still ~6k tokens (24k bytes / 4).
-    h.handle.record_token_usage(4_000);
+    h.handle.record_token_usage(8_000);
 
     let req = h
         .handle
@@ -4551,21 +4557,24 @@ async fn request_prune_stays_on_when_api_reports_pruned_prompt_size() {
 
     let trimmed = req.items.iter().any(|item| match item {
         ConversationItem::ToolResult(tr) => tr.content.contains("[…trimmed…]"),
+        ConversationItem::CustomToolOutput(out) => out.text_content().contains("[…trimmed…]"),
         _ => false,
     });
     assert!(
-        trimmed,
-        "unpruned conversation over 50% must keep request-time prune on, \
-         even when the last API prompt_tokens is under the threshold"
+        !trimmed,
+        "incremental requests must keep already-sent tool results intact"
     );
+    let full = req.items.iter().any(|item| match item {
+        ConversationItem::ToolResult(tr) => tr.content.len() == 24_000,
+        _ => false,
+    });
+    assert!(full, "the 24k tool result must be sent in full");
 }
 
-/// Prefix stability after tool result pruning. When context utilization
-/// exceeds 50%, old tool results are soft-trimmed or hard-cleared, but
-/// this happens on a clone -- items outside the pruned region must
-/// remain identical.
+/// Incremental turns over 50% context must stay byte-prefix-stable,
+/// including large already-sent tool results.
 #[tokio::test]
-async fn prefix_stable_after_tool_result_pruning() {
+async fn prefix_stable_with_large_tool_results_over_half_context() {
     let h = TestHarness::with_context_window(10_000);
 
     h.handle.push_user_message(ConversationItem::system("sys"));
@@ -4573,7 +4582,7 @@ async fn prefix_stable_after_tool_result_pruning() {
     h.handle
         .push_assistant_response(ConversationItem::assistant("a1"));
     h.handle
-        .push_tool_result(ConversationItem::tool_result("c1", "x".repeat(500)));
+        .push_tool_result(ConversationItem::tool_result("c1", "x".repeat(8_000)));
     h.handle.push_user_message(ConversationItem::user("q2"));
 
     let req1 = h
@@ -4585,7 +4594,7 @@ async fn prefix_stable_after_tool_result_pruning() {
     h.handle
         .push_assistant_response(ConversationItem::assistant("a2"));
     h.handle
-        .push_tool_result(ConversationItem::tool_result("c2", "y".repeat(500)));
+        .push_tool_result(ConversationItem::tool_result("c2", "y".repeat(8_000)));
     h.handle.push_user_message(ConversationItem::user("q3"));
     h.handle.record_token_usage(6000); // > 50% of 10k context
 
@@ -4595,45 +4604,51 @@ async fn prefix_stable_after_tool_result_pruning() {
         .await
         .unwrap();
 
-    let body1 = serialize_via_public_api(&req1);
-    let body2 = serialize_via_public_api(&req2);
-    let input1 = body1["input"].as_array().unwrap();
-    let input2 = body2["input"].as_array().unwrap();
+    assert_prefix_stable_pair(&req1, &req2, "large tool results over 50% context");
+}
 
-    assert_eq!(
-        input1[0], input2[0],
-        "system prompt must be stable after pruning"
-    );
+/// An explicit fresh-input prune (model swap / compaction) may rewrite old
+/// tool results; that is the one allowed cache-breaking shrink.
+#[tokio::test]
+async fn prune_for_fresh_input_trims_old_tool_results() {
+    let h = TestHarness::with_context_window(10_000);
+
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q1"));
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("a1"));
+    h.handle.push_tool_result(ConversationItem::tool_result(
+        "old-skill",
+        "x".repeat(8_000),
+    ));
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q2"));
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q3"));
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q4"));
+    h.handle.increment_prompt_index();
+    h.handle.push_user_message(ConversationItem::user("q5"));
+
+    let changed = h.handle.prune_for_fresh_input().await;
     assert!(
-        input2.len() >= input1.len(),
-        "pruned request should still have >= items"
+        changed > 0,
+        "fresh-input prune must rewrite the old 8k result"
     );
 
-    let extract_user_texts = |input: &[serde_json::Value]| -> Vec<String> {
-        input
-            .iter()
-            .filter_map(|v| {
-                if v.get("role").and_then(|r| r.as_str()) == Some("user") {
-                    v.get("content").and_then(|c| c.as_str()).map(String::from)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-    let users1 = extract_user_texts(input1);
-    let users2 = extract_user_texts(input2);
-    let mut idx2 = 0;
-    for u1 in &users1 {
-        while idx2 < users2.len() && &users2[idx2] != u1 {
-            idx2 += 1;
-        }
-        assert!(
-            idx2 < users2.len(),
-            "user message {u1:?} from req1 must appear in req2 in same order"
-        );
-        idx2 += 1;
-    }
+    let req = h
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+    let trimmed = req.items.iter().any(|item| match item {
+        ConversationItem::ToolResult(tr) => tr.content.contains("[…trimmed…]"),
+        _ => false,
+    });
+    assert!(
+        trimmed,
+        "fresh-input prune must soft-trim the old tool result"
+    );
 }
 
 /// `BackendToolCall` items (web search) must serialize stably across
