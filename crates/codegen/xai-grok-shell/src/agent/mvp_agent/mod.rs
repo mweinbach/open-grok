@@ -741,6 +741,16 @@ pub struct MvpAgent {
     /// leader's auto-update checker, which cannot read the `!Send` maps. Expires
     /// when the actor exits. See [`crate::agent::activity::AgentActivity`].
     pub(crate) activity: crate::agent::activity::AgentActivity,
+    /// Session bus host (presence publisher + peer-message listener) for
+    /// this process. `None` until `initialize()` starts it — and stays
+    /// `None` when disabled by config or when startup failed (fail-open:
+    /// the process runs bus-less). Must live on the `MvpAgent` LocalSet for
+    /// the process lifetime; dropping it withdraws our presence.
+    pub(crate) session_bus_host: RefCell<Option<crate::session_bus::SessionBusHost>>,
+    /// LEADER-SAFE(shared): `Send + Sync` bus client for tool resources;
+    /// `SessionBusClient::disabled()` until the host starts. Read at
+    /// session-build time, after `initialize()` has run.
+    pub(crate) session_bus_client: RefCell<crate::session_bus::SessionBusClient>,
     /// LEADER-SAFE(per-session). Per-session resources (turn, live state,
     /// unavailable model, bridge, dispatch lock) released on one-drop.
     session_registry: SessionRegistry,
@@ -1444,6 +1454,7 @@ mod resource_telemetry;
 mod session_registry;
 mod session_lifecycle;
 mod subagent_coordinator;
+mod session_bus_host;
 mod agent_ops;
 mod acp_agent;
 mod session_setup;

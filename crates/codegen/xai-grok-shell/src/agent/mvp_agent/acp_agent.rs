@@ -282,6 +282,7 @@ impl acp::Agent for MvpAgent {
         xai_grok_telemetry::unified_log::info("agent initialized", None, None);
         xai_grok_telemetry::startup::mark_agent_serving();
         self.start_subagent_coordinator();
+        self.start_session_bus();
         if self.cfg.borrow().remote_settings.is_none() {
             self.spawn_settings_reapply();
         }

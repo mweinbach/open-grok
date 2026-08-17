@@ -2501,6 +2501,8 @@ impl MvpAgent {
         let activity = crate::agent::activity::AgentActivity::default();
         let instance = Self {
             activity,
+            session_bus_host: RefCell::new(None),
+            session_bus_client: RefCell::new(crate::session_bus::SessionBusClient::disabled()),
             session_registry: SessionRegistry::default(),
             resident_roster_titles: RefCell::new(HashMap::new()),
             initialize_request: OnceLock::new(),
@@ -4166,6 +4168,9 @@ impl MvpAgent {
         let mut startup_hints = startup_hints_from_meta(session_meta, init.meta.as_ref());
         // Runtime-only: restored from summary, never accepted from ACP client metadata.
         startup_hints.previous_turn_model = previous_turn_model;
+        // Session-bus presence inputs, captured before the spec below moves
+        // the owned values.
+        let bus_announce_session = !startup_hints.is_subagent;
         let hunk_plan = plan_hunk_tracking(
             init
                 .client_capabilities
@@ -4425,6 +4430,7 @@ impl MvpAgent {
                 sampling_config,
                 origin_client.clone(),
             );
+        let bus_model_id = session_model_id.0.to_string();
         // Authenticate the effective model after agent-profile pinning. The
         // preliminary/default model may belong to the other provider.
         match sampling_config.provider.profile().session_auth {
@@ -4721,6 +4727,7 @@ impl MvpAgent {
             });
             spawn_session_on_thread(
                     session_info.clone(),
+                    self.session_bus_client.borrow().clone(),
                     self.gateway.clone(),
                     sampling_config,
                     credentials,
@@ -4926,6 +4933,12 @@ impl MvpAgent {
             });
         self.notify_session_cwd_for_watch(std::path::Path::new(&session_info.cwd));
         self.activity.register_session(&session_info.id.0, &handle);
+        // Announce root sessions on the machine-local session bus. The
+        // heartbeat probe refreshes busy/idle and reaps exits; this is the
+        // only registration a session needs.
+        if bus_announce_session {
+            self.register_session_on_bus(&session_info.id.0, &session_info.cwd, Some(bus_model_id));
+        }
         if let Some(old) = self.insert_resident(&session_info.id, handle)
             && let Some(scope) = &old.tool_context.process_scope
         {

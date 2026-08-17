@@ -203,6 +203,7 @@ impl MvpAgent {
     /// resumable on disk, so it must NOT be marked "done" upstream. Genuine
     /// terminal closes go through [`MvpAgent::close_active_session`].
     pub(crate) fn remove_session(&self, id: &acp::SessionId) {
+        self.unregister_session_from_bus(&id.0);
         let _ = self
             .subagent_event_tx
             .send(xai_grok_tools::implementations::grok_build::task::types::SubagentEvent::TeardownSession {

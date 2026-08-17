@@ -265,6 +265,7 @@ mod cli_catchall_drop_tests {
 )]
 pub(crate) async fn spawn_session_actor(
     session_info: SessionInfo,
+    session_bus_client: crate::session_bus::SessionBusClient,
     gateway: GatewaySender,
     sampling_config: SamplingConfig,
     credentials: xai_chat_state::Credentials,
@@ -1127,6 +1128,7 @@ pub(crate) async fn spawn_session_actor(
     );
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
         working_directory: tool_context.cwd.as_path().to_path_buf(),
+        session_bus_client,
         terminal_backend: terminal_backend.clone(),
         fs_backend: fs_backend.clone(),
         tools_notification_handle: tools_notification_handle.clone(),
@@ -1305,6 +1307,8 @@ pub(crate) async fn spawn_session_actor(
             .surfaces_local_date(),
         &conversation,
     );
+    let recovered_user_info_hash = recover_user_info_fingerprint(&conversation);
+    let recovered_rules_hash = recover_rules_fingerprint(&conversation);
     persist_chat_history_jsonl_sync(&session_info, &conversation);
     chat_state_handle.replace_conversation(conversation);
     let feedback_client = feedback_proxy_url.map(|base_url| {
@@ -1904,6 +1908,8 @@ pub(crate) async fn spawn_session_actor(
         deferred_prefix: TaskSlot::new(),
         extension_registry: session_extension_registry(weak.clone()),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
+        last_announced_user_info_hash: std::cell::Cell::new(recovered_user_info_hash),
+        last_announced_rules_hash: std::cell::Cell::new(recovered_rules_hash),
         prefix_carries_fallback_date: std::cell::Cell::new(initial_prefix_carries_fallback_date),
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
@@ -2362,6 +2368,7 @@ struct SessionInitResult {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_session_on_thread(
     session_info: SessionInfo,
+    session_bus_client: crate::session_bus::SessionBusClient,
     gateway: GatewaySender,
     sampling_config: SamplingConfig,
     credentials: xai_chat_state::Credentials,
@@ -2538,6 +2545,7 @@ pub(crate) async fn spawn_session_on_thread(
                 let (handle, permission_events_rx, system_prompt, session_done_rx) =
                     match spawn_session_actor(
                         session_info,
+                        session_bus_client,
                         gateway,
                         sampling_config,
                         credentials,

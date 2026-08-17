@@ -814,6 +814,23 @@ pub enum SessionUpdate {
         status: String,
         created_at_ms: u64,
     },
+    /// Auditable message from a peer Open Grok session on the session bus
+    /// (possibly another process or project). Persisted in the recipient's
+    /// `updates.jsonl` so resume/rewind keep the timeline, and rendered as a
+    /// bounded-preview card. The body remains model-authored untrusted input
+    /// and never carries user-consent or permission semantics.
+    PeerSessionMessage {
+        message_id: String,
+        from_session_id: String,
+        /// Display project name of the sender's workspace.
+        from_project: String,
+        to_session_id: String,
+        body: String,
+        /// `"delivered_interjection"` (queued into a running turn) or
+        /// `"delivered_wake"` (woke an idle session).
+        status: String,
+        created_at_ms: u64,
+    },
     /// A subagent session has finished (success, failure, or cancellation).
     ///
     /// Sent on the PARENT session's notification channel.

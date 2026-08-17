@@ -1316,6 +1316,9 @@ pub(crate) async fn run_shell_child(
     };
     let spawn_result = session::spawn_session_on_thread(
         child_session_info,
+        // v1: cross-session identity belongs to root sessions; subagent
+        // sessions run bus-less (tools report the bus as disabled).
+        crate::session_bus::SessionBusClient::disabled(),
         gateway.clone(),
         effective_sampling_config,
         credentials,

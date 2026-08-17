@@ -217,6 +217,9 @@ pub(crate) struct AgentRebuildSpec {
     pub multi_agent_policy_enabled: bool,
     pub session_id_str: String,
     pub team_scope_id: String,
+    /// Machine-local session bus client for the cross-process
+    /// session-collaboration tools; `disabled()` when the bus is off.
+    pub session_bus_client: crate::session_bus::SessionBusClient,
     pub blocking_wait_depth: Arc<crate::tools::tool_context::BlockingWaitState>,
     pub orchestration_steer:
         xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal,
@@ -351,6 +354,7 @@ impl AgentRebuildSpec {
             multi_agent_policy_enabled: _,
             session_id_str,
             team_scope_id,
+            session_bus_client,
             blocking_wait_depth,
             orchestration_steer,
             swarm_registry,
@@ -556,6 +560,30 @@ impl AgentRebuildSpec {
                 agent.tool_bridge().update_resource(buffer).await;
             }
         }
+        // Cross-process session collaboration: the bus client is per
+        // process; the identity (self id + project label) is per session.
+        // Installed unconditionally — a disabled bus yields informative
+        // tool errors instead of missing tools.
+        {
+            use xai_grok_tools::implementations::grok_build::session_collaboration::SessionBusResource;
+            let project =
+                crate::session_bus::project_name_from_cwd(&working_directory.to_string_lossy());
+            let backend = std::sync::Arc::new(
+                crate::session_bus::collaboration::ShellSessionCollaboration::new(
+                    session_bus_client.clone(),
+                    session_id_str.clone(),
+                    project.clone(),
+                ),
+            );
+            agent
+                .tool_bridge()
+                .update_resource(SessionBusResource::new(
+                    backend,
+                    session_id_str.clone(),
+                    project,
+                ))
+                .await;
+        }
         agent
             .tool_bridge()
             .update_resource(xai_grok_tools::types::resources::RespectGitignore(
@@ -677,6 +705,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         multi_agent_policy_enabled: true,
         session_id_str: "test-session".to_string(),
         team_scope_id: "test-session".to_string(),
+        session_bus_client: crate::session_bus::SessionBusClient::disabled(),
         blocking_wait_depth: Arc::new(crate::tools::tool_context::BlockingWaitState::new()),
         orchestration_steer:
             xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal::new(

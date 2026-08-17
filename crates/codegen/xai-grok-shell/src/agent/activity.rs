@@ -131,6 +131,19 @@ impl AgentActivity {
         self.lock_live_sessions().len()
     }
 
+    /// `(session_id, busy)` for every live registered session — the
+    /// session-bus heartbeat probe. Sessions whose actor exited are absent
+    /// (entries expire with their actor), and `busy` mirrors the per-session
+    /// half of [`AgentActivity::is_busy`] (running turn or parked blocking
+    /// interaction). Subagent sessions are registered here too; the bus
+    /// filters to the ids it hosts.
+    pub fn live_session_states(&self) -> Vec<(String, bool)> {
+        self.lock_live_sessions()
+            .iter()
+            .map(|e| (e.id.clone(), e.is_busy()))
+            .collect()
+    }
+
     /// Send [`SessionCommand::Shutdown`] to every live session actor
     /// (replay-buffer flush → hooks → memory save → actor returns) and wait
     /// up to `grace` for the actors to exit, observed via

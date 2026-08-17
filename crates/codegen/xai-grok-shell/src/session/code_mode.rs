@@ -87,6 +87,9 @@ pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
             | "send_message"
             | "followup_task"
             | "wait_agent"
+            | "list_sessions"
+            | "read_session"
+            | "message_session"
     )
 }
 

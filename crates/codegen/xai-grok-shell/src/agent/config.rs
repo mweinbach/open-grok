@@ -1433,6 +1433,10 @@ pub struct Config {
     pub goal: GoalConfig,
     #[serde(default)]
     pub workflows: WorkflowsConfig,
+    /// `[session_bus]` section: machine-local cross-process session
+    /// collaboration (presence + peer messaging). See [`SessionBusConfig`].
+    #[serde(default)]
+    pub session_bus: SessionBusConfig,
     /// `[doom_loop_recovery]` section: the shared settings struct — ONE type
     /// serves this TOML table and the remote remote settings `doom_loop_recovery`
     /// object. See [`crate::util::config::DoomLoopRecoverySettings`].
@@ -1897,6 +1901,7 @@ impl Default for Config {
             features: Features::default(),
             goal: GoalConfig::default(),
             workflows: WorkflowsConfig::default(),
+            session_bus: SessionBusConfig::default(),
             doom_loop_recovery: crate::util::config::DoomLoopRecoverySettings::default(),
             worktree: WorktreeConfigSection::default(),
             auto_mode: AutoModeConfig::default(),
@@ -5361,6 +5366,25 @@ pub struct AntigravityConfig {
 pub struct WorkflowsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+}
+/// `[session_bus]` section: the machine-local session bus (presence
+/// directory under `$OPENGROK_HOME/session-bus/` plus direct peer-socket
+/// messaging between Open Grok processes). Enabled by default; set
+/// `enabled = false` to run a process bus-less (no presence announced, no
+/// peer messages sent or received).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionBusConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl Config {
+    /// Whether the session bus should start for this process (default
+    /// `true`).
+    pub fn session_bus_enabled(&self) -> bool {
+        self.session_bus.enabled.unwrap_or(true)
+    }
 }
 /// `[auto_mode]` section: server-side configuration for Auto permission mode.
 /// ONE struct serves both the local `[auto_mode]` TOML table and the remote

@@ -797,6 +797,10 @@ impl SessionActor {
         self.maybe_inject_mcp_reminder().await;
         self.maybe_inject_mcp_connecting_reminder().await;
         self.maybe_inject_date_rollover_reminder().await;
+        if matches!(&origin, super::super::PromptOrigin::User) {
+            self.maybe_inject_user_info_update_reminder().await;
+            self.maybe_inject_project_rules_update_reminder().await;
+        }
         self.inject_plan_mode_reminders().await;
         self.inject_resumed_tasks_reminder();
         if matches!(&origin, super::super::PromptOrigin::User) {
@@ -873,6 +877,11 @@ impl SessionActor {
                     ConversationItem::subagent_completed(user_message)
                 }
                 super::super::PromptOrigin::AgentMessage { .. } => {
+                    ConversationItem::agent_message(user_message)
+                }
+                super::super::PromptOrigin::PeerSessionMessage { .. } => {
+                    // Same chat-state treatment as team agent mail: a
+                    // synthetic user item flagged as model-authored input.
                     ConversationItem::agent_message(user_message)
                 }
                 super::super::PromptOrigin::WorkflowCompleted { .. } => {

@@ -78,6 +78,13 @@ pub enum PromptOrigin {
     AgentMessage {
         message_id: String,
     },
+    /// Follow-up turn injected by a peer Open Grok session on the session
+    /// bus (possibly from another project or process). Delivery semantics
+    /// mirror [`Self::AgentMessage`]; the envelope frames the body as
+    /// untrusted peer input.
+    PeerSessionMessage {
+        message_id: String,
+    },
     WorkflowCompleted {
         completion_id: String,
     },
@@ -118,6 +125,10 @@ impl PromptOrigin {
             Self::AgentMessage {
                 message_id: message_id.to_string(),
             }
+        } else if let Some(message_id) = prompt_id.strip_prefix("peer-message-") {
+            Self::PeerSessionMessage {
+                message_id: message_id.to_string(),
+            }
         } else if let Some(completion_id) = prompt_id.strip_prefix("workflow-completed-") {
             Self::WorkflowCompleted {
                 completion_id: completion_id.to_string(),
@@ -152,6 +163,7 @@ impl PromptOrigin {
             Self::TaskCompleted { .. }
             | Self::SubagentCompleted { .. }
             | Self::AgentMessage { .. }
+            | Self::PeerSessionMessage { .. }
             | Self::WorkflowCompleted { .. }
             | Self::NotificationDrain
             | Self::GoalSummary
@@ -162,7 +174,7 @@ impl PromptOrigin {
         match self {
             Self::TaskCompleted { task_id } => Some(task_id),
             Self::SubagentCompleted { subagent_id } => Some(subagent_id),
-            Self::AgentMessage { .. } => None,
+            Self::AgentMessage { .. } | Self::PeerSessionMessage { .. } => None,
             Self::WorkflowCompleted { completion_id } => Some(completion_id),
             Self::User
             | Self::NotificationDrain

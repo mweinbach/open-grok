@@ -863,6 +863,14 @@ pub enum SessionCommand {
     AgentMessage {
         message: xai_grok_tools::implementations::grok_build::task::types::AgentMailboxMessage,
     },
+    /// Wake this session with a message from a peer Open Grok session on the
+    /// session bus (possibly another project or process). Same delivery
+    /// semantics as [`SessionCommand::AgentMessage`]: interjection boundary
+    /// when a turn is running, synthetic wake-up prompt when idle. The body
+    /// is model-authored untrusted input, never user consent.
+    PeerSessionMessage {
+        message: crate::session_bus::PeerSessionMessage,
+    },
     /// Trigger a model turn so the model can print a visible goal progress
     /// summary.  The goal orchestrator injects a system reminder into context
     /// (via `push_parent_reminder`) *before* sending this command.  The session
