@@ -37,10 +37,15 @@ mod windows_impl {
 
     /// Leader-flavored [`crate::local_ipc::LocalIpcListener`] with the
     /// leader pipe prefix baked in.
-    pub(super) struct LeaderListener(crate::local_ipc::LocalIpcListener);
+    ///
+    /// These items are `pub` inside this private module so `transport` can
+    /// re-export them as `pub(super)` to `leader::{server,client}`. `pub(super)`
+    /// here would only reach `transport`, and Rust then treats the re-export as
+    /// private (the Unix aliases work because `tokio`'s types are public).
+    pub struct LeaderListener(crate::local_ipc::LocalIpcListener);
 
     impl LeaderListener {
-        pub(super) fn bind<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<Self> {
             Ok(Self(crate::local_ipc::bind(
                 path.as_ref(),
                 LEADER_PIPE_PREFIX,
@@ -49,7 +54,7 @@ mod windows_impl {
 
         /// Mirrors `UnixListener::accept`'s tuple shape; the peer half is a
         /// unit (named pipes carry no peer address).
-        pub(super) async fn accept(&self) -> io::Result<(LeaderStream, ())> {
+        pub async fn accept(&self) -> io::Result<(LeaderStream, ())> {
             let (stream, peer) = self.0.accept().await?;
             Ok((LeaderStream(stream), peer))
         }
@@ -57,10 +62,10 @@ mod windows_impl {
 
     /// Leader-flavored [`crate::local_ipc::LocalIpcStream`] with the leader
     /// pipe prefix baked in.
-    pub(super) struct LeaderStream(crate::local_ipc::LocalIpcStream);
+    pub struct LeaderStream(crate::local_ipc::LocalIpcStream);
 
     impl LeaderStream {
-        pub(super) async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
             Ok(Self(
                 crate::local_ipc::connect(path.as_ref(), LEADER_PIPE_PREFIX).await?,
             ))
