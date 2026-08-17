@@ -298,6 +298,15 @@ pub enum PermissionCommand {
     SetClassifierTranscript(Vec<super::auto_mode::ClassifierTurn>),
     /// Project AGENTS.md instructions for classifier context (None clears).
     SetProjectInstructions(Option<String>),
+    /// Append session-scoped allow rules at runtime (e.g. a working
+    /// directory added mid-session via `/add-dir`). Standard precedence
+    /// applies: deny/ask rules still outrank appended allows.
+    AddSessionRules {
+        rules: Vec<PermissionRule>,
+    },
+    /// Drop every runtime-appended session rule (config layers untouched).
+    /// Used before re-granting a rebuilt working-directory set.
+    ResetSessionRules,
     /// Reset per-tool permission state back to defaults.
     ResetState,
     Shutdown,

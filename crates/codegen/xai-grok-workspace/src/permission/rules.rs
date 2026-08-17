@@ -351,6 +351,26 @@ pub(crate) fn strip_bash_colon_wildcard(pattern: String) -> String {
     }
 }
 
+/// Allow rules granting file Read/Edit inside `dir`, for a working directory
+/// added to a live session (e.g. `/add-dir`). `dir` must be canonicalized by
+/// the caller; the pattern is absolute so it matches tool operands directly
+/// (the evaluator joins only *relative* operands against the session cwd).
+///
+/// Deny/ask rules always outrank these allows (deny > ask > allow), so a
+/// narrower deny inside the added directory still wins.
+pub fn working_directory_rules(dir: &std::path::Path) -> Vec<PermissionRule> {
+    let pattern = format!("{}/**", dir.display());
+    [ToolFilter::Read, ToolFilter::Edit]
+        .into_iter()
+        .map(|tool| PermissionRule {
+            action: RuleAction::Allow,
+            tool,
+            pattern: Some(pattern.clone()),
+            pattern_mode: PatternMode::Glob,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +391,21 @@ mod tests {
             assert_eq!(rule.pattern.as_deref(), expected_pattern, "{rule_str}");
             assert_eq!(rule.pattern_mode, PatternMode::Glob, "{rule_str}");
         }
+    }
+
+    /// `/add-dir` synthesizes exactly one Read and one Edit allow rule per
+    /// directory, as absolute glob patterns so they match without joining
+    /// to the session cwd.
+    #[test]
+    fn working_directory_rules_cover_read_and_edit() {
+        let rules = working_directory_rules(std::path::Path::new("/tmp/proj"));
+        assert_eq!(rules.len(), 2, "one Read + one Edit rule");
+        for rule in &rules {
+            assert_eq!(rule.action, RuleAction::Allow);
+            assert_eq!(rule.pattern.as_deref(), Some("/tmp/proj/**"));
+            assert_eq!(rule.pattern_mode, PatternMode::Glob);
+        }
+        assert!(rules.iter().any(|r| r.tool == ToolFilter::Read));
+        assert!(rules.iter().any(|r| r.tool == ToolFilter::Edit));
     }
 }

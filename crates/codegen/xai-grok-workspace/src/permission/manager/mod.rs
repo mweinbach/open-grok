@@ -33,7 +33,7 @@ use crate::permission::state::{
 };
 use crate::permission::types::{
     AccessKind, ClientType, Decision, EditPolicy, PermissionCommand, PermissionEvent,
-    PermissionResolution, PromptPolicy, RequestPathContext,
+    PermissionResolution, PermissionRule, PromptPolicy, RequestPathContext,
 };
 use xai_grok_mcp::servers::parse_mcp_qualified_name;
 use xai_grok_paths::AbsPathBuf;
@@ -897,6 +897,29 @@ impl PermissionHandle {
         }
     }
 
+    /// Append session-scoped allow rules at runtime (e.g. `/add-dir`).
+    /// No-op under [`PermissionHandle::AllowAll`] (everything is already
+    /// allowed) and for a shut-down actor.
+    pub fn add_session_rules(&self, rules: Vec<PermissionRule>) {
+        if let PermissionHandle::Actor { cmd_tx, .. } = self
+            && !rules.is_empty()
+            && let Err(e) = cmd_tx.send(PermissionCommand::AddSessionRules { rules })
+        {
+            tracing::error!(?e, "failed to send add-session-rules command");
+        }
+    }
+
+    /// Drop every runtime-appended session rule (config layers untouched).
+    /// Subagent-shared managers lose them everywhere, which is exactly the
+    /// desired semantics: the grant was session-working-dir-scoped.
+    pub fn reset_session_rules(&self) {
+        if let PermissionHandle::Actor { cmd_tx, .. } = self
+            && let Err(e) = cmd_tx.send(PermissionCommand::ResetSessionRules)
+        {
+            tracing::error!(?e, "failed to send reset-session-rules command");
+        }
+    }
+
     /// Update the project AGENTS.md instructions used by the auto-mode classifier.
     pub fn set_project_instructions(&self, instructions: Option<String>) {
         if let PermissionHandle::Actor { cmd_tx, .. } = self
@@ -1468,7 +1491,7 @@ fn spawn_permission_manager_with_pin(
             .map(|c| c.prompt_policy)
             .unwrap_or_default();
         // Compile permission policy once; reused for every access check.
-        let compiled_policy = permission_config.map(CompiledPolicy::new);
+        let mut compiled_policy = permission_config.map(CompiledPolicy::new);
         // Pre-built domain matcher for web_fetch allowlist (from resolved WebFetchConfig).
         let static_domain_matcher = DomainMatcher::new(&web_fetch_allowed_domains);
         // WHY: the built-in default allowlist is web_fetch's egress boundary,
@@ -1521,6 +1544,34 @@ fn spawn_permission_manager_with_pin(
                 }
                 PermissionCommand::SetProjectInstructions(instructions) => {
                     project_instructions = instructions;
+                }
+                PermissionCommand::AddSessionRules { rules } => {
+                    // No config policy exists (manager spawned with None)?
+                    // Materialize one from the appended rules so they still
+                    // evaluate — with the default Ask prompt policy, matching
+                    // the None path's behavior for everything else.
+                    match compiled_policy.as_mut() {
+                        Some(policy) => policy.append_rules(rules),
+                        None => {
+                            let mut config = crate::permission::types::PermissionConfig::default();
+                            config.rules = rules;
+                            compiled_policy = Some(CompiledPolicy::new(config));
+                        }
+                    }
+                    tracing::info!(
+                        rule_count = compiled_policy
+                            .as_ref()
+                            .map(|p| p.rule_count())
+                            .unwrap_or(0),
+                        "Appended session-scoped permission rules"
+                    );
+                }
+                PermissionCommand::ResetSessionRules => {
+                    let dropped = compiled_policy
+                        .as_mut()
+                        .map(|policy| policy.reset_session_rules())
+                        .unwrap_or(0);
+                    tracing::info!(dropped, "Reset session-scoped permission rules");
                 }
                 PermissionCommand::ResetState => {
                     state = PermissionState::default();

@@ -90,6 +90,10 @@ pub struct CompiledPolicy {
     /// `config.rules`/`matchers`. Precomputed so the auto-mode narrow-allow
     /// check doesn't re-probe every rule on every request.
     catchall: Vec<bool>,
+    /// How many trailing rules came from runtime session appends
+    /// ([`Self::append_rules`]) rather than config layers. Removal truncates
+    /// exactly these, never a config rule.
+    session_rule_count: usize,
 }
 
 impl CompiledPolicy {
@@ -127,7 +131,71 @@ impl CompiledPolicy {
             has_bash_command_restrictions,
             has_bash_allow_rules,
             catchall,
+            session_rule_count: 0,
         }
+    }
+
+    /// Number of compiled rules (config + appended session rules).
+    pub fn rule_count(&self) -> usize {
+        self.config.rules.len()
+    }
+
+    /// Append runtime session-scoped allow rules (e.g. from `/add-dir`) and
+    /// refresh the derived gates. Rules keep the standard precedence — deny
+    /// and ask rules from any layer still outrank appended allows.
+    pub fn append_rules(&mut self, rules: Vec<PermissionRule>) {
+        if rules.is_empty() {
+            return;
+        }
+        self.matchers.extend(rules.iter().map(|rule| {
+            rule.pattern
+                .as_deref()
+                .filter(|p| *p != "*")
+                .and_then(|p| glob::Pattern::new(p).ok())
+        }));
+        self.session_rule_count += rules.len();
+        self.config.rules.extend(rules);
+        self.refresh_derived_gates();
+    }
+
+    /// Drop every runtime-appended session rule, leaving config-layer rules
+    /// untouched. Returns how many were dropped. Used when a working
+    /// directory is removed and the session scope is rebuilt from the
+    /// remaining set.
+    pub fn reset_session_rules(&mut self) -> usize {
+        let dropped = self.session_rule_count;
+        if dropped == 0 {
+            return 0;
+        }
+        let keep = self.config.rules.len() - dropped;
+        self.config.rules.truncate(keep);
+        self.matchers.truncate(keep);
+        self.session_rule_count = 0;
+        self.refresh_derived_gates();
+        dropped
+    }
+
+    /// Recompute the derived gate flags after a rule-list mutation. The
+    /// appended rules are allow-only today, so the deny/ask gates cannot
+    /// flip on — but deriving from the full list keeps that true by
+    /// construction rather than by assumption.
+    fn refresh_derived_gates(&mut self) {
+        self.has_file_restrictions = self.config.rules.iter().any(|rule| {
+            matches!(rule.action, RuleAction::Deny | RuleAction::Ask)
+                && matches!(
+                    rule.tool,
+                    ToolFilter::Read | ToolFilter::Edit | ToolFilter::Any
+                )
+        });
+        self.has_bash_command_restrictions = self.config.rules.iter().any(|rule| {
+            matches!(rule.action, RuleAction::Deny | RuleAction::Ask)
+                && matches!(rule.tool, ToolFilter::Bash | ToolFilter::Any)
+        });
+        self.has_bash_allow_rules = self.config.rules.iter().any(|rule| {
+            matches!(rule.action, RuleAction::Allow)
+                && matches!(rule.tool, ToolFilter::Bash | ToolFilter::Any)
+        });
+        self.catchall = self.config.rules.iter().map(rule_is_catchall).collect();
     }
 
     /// Evaluate managed Bash/Any deny/ask command rules against every chained
@@ -1289,6 +1357,56 @@ mod tests {
         ]);
         let result = evaluate_policy(&AccessKind::Bash("rm -rf /".into()), &policy);
         assert!(matches!(result, Some(Decision::Reject(_))));
+    }
+
+    /// Session working-directory rules (`/add-dir`) are appended at runtime
+    /// and must be removable without touching configured rules: appending
+    /// grants the added root, resetting drops exactly the appended slice.
+    #[test]
+    fn append_session_rules_grant_and_reset_restores() {
+        use crate::permission::rules::working_directory_rules;
+        let config = PermissionConfig::new(vec![bash_rule(RuleAction::Allow, "cargo *")]);
+        let mut compiled = CompiledPolicy::new(config);
+        let baseline = compiled.rule_count();
+        assert_eq!(baseline, 1);
+
+        // Outside the added root: no decision (falls through to prompts).
+        let outside = AccessKind::Edit("/elsewhere/file.rs".to_string());
+        assert!(compiled.evaluate(&outside).is_none());
+
+        let added = working_directory_rules(std::path::Path::new("/tmp/proj"));
+        compiled.append_rules(added);
+        assert_eq!(compiled.rule_count(), baseline + 2);
+
+        // Reads and edits under the added root are allowed…
+        let inside_edit = AccessKind::Edit("/tmp/proj/src/main.rs".to_string());
+        assert!(matches!(
+            compiled.evaluate(&inside_edit),
+            Some(Decision::Allow)
+        ));
+        let inside_read = AccessKind::Read(Some("/tmp/proj/README.md".to_string()));
+        assert!(matches!(
+            compiled.evaluate(&inside_read),
+            Some(Decision::Allow)
+        ));
+        // …the configured rule still works, and outside stays undecided.
+        assert!(matches!(
+            compiled.evaluate(&AccessKind::Bash("cargo build".into())),
+            Some(Decision::Allow)
+        ));
+        assert!(compiled.evaluate(&outside).is_none());
+
+        // Reset drops exactly the appended rules, leaving config intact.
+        assert_eq!(compiled.reset_session_rules(), 2);
+        assert_eq!(compiled.rule_count(), baseline);
+        assert!(compiled.evaluate(&inside_edit).is_none());
+        assert!(matches!(
+            compiled.evaluate(&AccessKind::Bash("cargo build".into())),
+            Some(Decision::Allow)
+        ));
+        // A second reset is a no-op, not an underflow.
+        assert_eq!(compiled.reset_session_rules(), 0);
+        assert_eq!(compiled.rule_count(), baseline);
     }
 
     #[test]
