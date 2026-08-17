@@ -1684,6 +1684,7 @@ impl SessionActor {
             request.hosted_tools = compaction_hosted_tools;
             request.reasoning_effort = sampling_config.reasoning_effort;
             request.x_grok_session_id = Some(self.session_info.id.0.to_string());
+            request.x_grok_cache_affinity_id = Some(self.prompt_cache_affinity_id());
             let (replacement, attempts, remote_v2) = self
                 .run_codex_remote_compact_request(
                     sampling_client,

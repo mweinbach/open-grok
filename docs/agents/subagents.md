@@ -347,12 +347,16 @@ recent turns stay verbatim.
 ### Prompt-cache affinity (same-model verbatim forks)
 
 A verbatim fork replays the parent's exact conversation prefix under a new
-session id. The spawn sets `StartupHints.cache_affinity_id` to the parent
-session id; the turn loop copies it to
-`ConversationRequest.x_grok_cache_affinity_id`, and the sampler prefers it
-over the session id for both the Responses `prompt_cache_key` and the Codex
-`session-id`/`thread-id`/`x-client-request-id` affinity headers (fallback:
-session id). Digest forks and fresh spawns inherit nothing.
+session id. The spawn sets `StartupHints.cache_affinity_id` to the parent's
+prompt-cache identity (the parent's persisted key, else the parent session
+id) and writes the same value to `summary.cache_affinity_id`. The turn loop
+copies it to `ConversationRequest.x_grok_cache_affinity_id`, and the sampler
+prefers it over the session id for both the Responses `prompt_cache_key` and
+the Codex `session-id`/`thread-id`/`x-client-request-id` affinity headers
+(fallback: session id). `session/load` and `resume_from` restore the
+persisted key so a process restart still *tries* the warmed cache; a server
+TTL miss after idle is acceptable. Digest forks and fresh spawns inherit
+nothing (they pin their own session id).
 
 Measured ceiling (ChatGPT Codex backend, probed live): the prompt cache is
 content-keyed over the byte-exact rendered prefix, which starts with the

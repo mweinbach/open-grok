@@ -535,6 +535,7 @@ fn write_summary(
         reasoning_effort: None,
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
+        cache_affinity_id: None,
     };
     let summary_path = session_dir.join("summary.json");
     let bytes = serde_json::to_vec_pretty(&summary).expect("serialize summary");

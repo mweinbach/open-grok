@@ -1113,6 +1113,15 @@ pub struct Summary {
     /// Prompt id of the turn `last_turn_summary` describes (provenance).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn_summary_prompt_id: Option<String>,
+    /// Stable prompt-cache identity for this session. Providers that key
+    /// server-side prefix caching on a session id (Codex `prompt_cache_key`
+    /// and session-affinity headers; xAI `x-grok-session-id` fallback) reuse
+    /// this value across process restarts. Fresh sessions pin their own id;
+    /// verbatim same-model forks inherit the source's identity so resume can
+    /// still *try* to hit the warmed cache. A server TTL miss after idle is
+    /// expected; changing the key on resume would guarantee a miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_affinity_id: Option<String>,
 }
 
 /// Current `grok_home` as a UTF-8 string, or `None` if the path isn't valid UTF-8.
@@ -1124,6 +1133,32 @@ pub(crate) fn grok_home_string() -> Option<String> {
 
 pub fn default_model_id() -> acp::ModelId {
     acp::ModelId::new(crate::models::default_model())
+}
+
+fn nonempty_cache_affinity(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Resolve the prompt-cache identity a live actor should stamp on requests.
+/// A persisted override wins; otherwise the session id is the stable key.
+pub(crate) fn resolve_prompt_cache_affinity_id(
+    session_id: &str,
+    persisted: Option<&str>,
+) -> String {
+    nonempty_cache_affinity(persisted).unwrap_or_else(|| session_id.to_owned())
+}
+
+/// Read `summary.json` from an already-known session directory and restore
+/// its prompt-cache identity. `None` when the file is missing, unreadable,
+/// or has no recoverable key (callers then fall back to the session id).
+pub(crate) fn cache_affinity_from_session_dir(dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(dir.join("summary.json")).ok()?;
+    serde_json::from_slice::<Summary>(&bytes)
+        .ok()?
+        .restore_cache_affinity_id()
 }
 
 impl Summary {
@@ -1174,7 +1209,31 @@ impl Summary {
             reasoning_effort: None,
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
+            cache_affinity_id: nonempty_cache_affinity(Some(info.id.0.as_ref())),
         })
+    }
+
+    /// Persisted prompt-cache identity, if this summary recorded one.
+    ///
+    /// Legacy verbatim same-model forks stamped no key; those turns used the
+    /// parent session id, so resume recovers that rather than minting the
+    /// child's id (which would guarantee a miss). User-initiated `"fork"`
+    /// sessions historically keyed on their own id and must keep doing so.
+    pub fn restore_cache_affinity_id(&self) -> Option<String> {
+        if let Some(id) = nonempty_cache_affinity(self.cache_affinity_id.as_deref()) {
+            return Some(id);
+        }
+        if self.fork_context_source.as_deref() == Some("forked_verbatim") {
+            return nonempty_cache_affinity(self.parent_session_id.as_deref());
+        }
+        None
+    }
+
+    /// Identity to send on sampling requests: persisted key, else this
+    /// session's id.
+    pub fn prompt_cache_affinity_id(&self) -> String {
+        self.restore_cache_affinity_id()
+            .unwrap_or_else(|| self.info.id.0.to_string())
     }
 
     /// Whether this session should be excluded from history listings.
@@ -1241,6 +1300,82 @@ mod is_hidden_tests {
             )
             .unwrap()
         }
+    }
+
+    #[test]
+    fn new_summary_pins_session_id_as_cache_affinity() {
+        let summary = Summary::new(
+            &Info {
+                id: acp::SessionId::new("sess-cache"),
+                cwd: "/tmp".into(),
+            },
+            default_model_id(),
+        )
+        .unwrap();
+        assert_eq!(summary.cache_affinity_id.as_deref(), Some("sess-cache"));
+        assert_eq!(summary.prompt_cache_affinity_id(), "sess-cache");
+        assert_eq!(
+            summary.restore_cache_affinity_id().as_deref(),
+            Some("sess-cache")
+        );
+    }
+
+    #[test]
+    fn restore_cache_affinity_prefers_persisted_override() {
+        let mut summary = summary_with_kind(None);
+        summary.cache_affinity_id = Some("parent-key".into());
+        assert_eq!(
+            summary.restore_cache_affinity_id().as_deref(),
+            Some("parent-key")
+        );
+        assert_eq!(summary.prompt_cache_affinity_id(), "parent-key");
+    }
+
+    #[test]
+    fn restore_cache_affinity_recovers_legacy_verbatim_fork() {
+        let mut summary = summary_with_kind(Some("subagent_fork"));
+        summary.cache_affinity_id = None;
+        summary.fork_context_source = Some("forked_verbatim".into());
+        summary.parent_session_id = Some("parent-sess".into());
+        assert_eq!(
+            summary.restore_cache_affinity_id().as_deref(),
+            Some("parent-sess")
+        );
+    }
+
+    #[test]
+    fn restore_cache_affinity_does_not_rewrite_legacy_user_fork() {
+        let mut summary = summary_with_kind(Some("fork"));
+        summary.cache_affinity_id = None;
+        summary.parent_session_id = Some("parent-sess".into());
+        assert_eq!(summary.restore_cache_affinity_id(), None);
+        assert_eq!(summary.prompt_cache_affinity_id(), "test");
+    }
+
+    #[test]
+    fn old_summary_without_cache_affinity_deserializes() {
+        let json = r#"{
+            "info": { "id": "old-session", "cwd": "/tmp" },
+            "session_summary": "",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "num_messages": 0,
+            "num_chat_messages": 0,
+            "current_model_id": "test-model"
+        }"#;
+        let summary: Summary = serde_json::from_str(json).unwrap();
+        assert!(summary.cache_affinity_id.is_none());
+        assert_eq!(summary.prompt_cache_affinity_id(), "old-session");
+    }
+
+    #[test]
+    fn resolve_prompt_cache_affinity_id_prefers_persisted() {
+        assert_eq!(
+            resolve_prompt_cache_affinity_id("sess", Some("parent")),
+            "parent"
+        );
+        assert_eq!(resolve_prompt_cache_affinity_id("sess", Some("  ")), "sess");
+        assert_eq!(resolve_prompt_cache_affinity_id("sess", None), "sess");
     }
 
     #[test]

@@ -53,6 +53,7 @@ impl SessionActor {
     /// Temperature stays unset: cli-chat-proxy may inject a `thinking` config, and the Messages API then requires temperature == 1.
     pub(crate) fn parent_cached_request(&self, call: AuxCall) -> ConversationRequest {
         let session_id = self.session_info.id.to_string();
+        let cache_affinity_id = self.prompt_cache_affinity_id();
         // Only the Responses mapping sends the cache key. On the other backends the conv id is what ties a call to its conversation,
         // so it has to stay the parent session id; the `btw-`/`recap-` label still shows up in `x_grok_req_id`.
         let conv_id = if call.backend.forwards_prompt_cache_key() {
@@ -70,9 +71,10 @@ impl SessionActor {
             reasoning_effort: call.reasoning_effort,
             x_grok_conv_id: Some(conv_id),
             x_grok_req_id: Some(call.req_id),
-            x_grok_session_id: Some(session_id.clone()),
+            x_grok_session_id: Some(session_id),
+            x_grok_cache_affinity_id: Some(cache_affinity_id.clone()),
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
-            prompt_cache_key: Some(session_id),
+            prompt_cache_key: Some(cache_affinity_id),
             ..Default::default()
         }
     }

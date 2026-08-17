@@ -1410,6 +1410,21 @@ fn fork_context_normalized(source: &InitialContextSource, verbatim_fork: bool) -
     matches!(source, InitialContextSource::Forked) && !verbatim_fork
 }
 /// Stamp `subagent_fork` / `forked` on the child summary (live path; disk copy already stamps).
+fn parent_prompt_cache_affinity(ctx: &SubagentSpawnContext) -> String {
+    let parent_dir = ctx
+        .parent_session_info
+        .as_ref()
+        .map(session::persistence::session_dir)
+        .unwrap_or_else(|| {
+            session::persistence::session_dir(&SessionInfo {
+                id: acp::SessionId::new(ctx.parent_session_id.clone()),
+                cwd: ctx.parent_cwd.to_string_lossy().into_owned(),
+            })
+        });
+    session::persistence::cache_affinity_from_session_dir(&parent_dir)
+        .unwrap_or_else(|| ctx.parent_session_id.clone())
+}
+
 fn stamp_live_fork_session_metadata(
     child_session_info: &SessionInfo,
     parent_session_id: &str,
@@ -1417,6 +1432,7 @@ fn stamp_live_fork_session_metadata(
     model_id: &str,
     inherited_prefix_len: Option<usize>,
     fork_context_source: &str,
+    cache_affinity_id: Option<String>,
 ) {
     let dir = match session::persistence::ensure_owner_only_session_dir(child_session_info) {
         Ok(dir) => dir,
@@ -1441,6 +1457,9 @@ fn stamp_live_fork_session_metadata(
     summary.fork_parent_prompt_id = parent_prompt_id;
     summary.inherited_prefix_len = inherited_prefix_len;
     summary.forked_at = Some(chrono::Utc::now());
+    if let Some(cache_affinity_id) = cache_affinity_id {
+        summary.cache_affinity_id = Some(cache_affinity_id);
+    }
     if let Ok(bytes) = serde_json::to_vec_pretty(summary)
         && let Err(e) = std::fs::write(&summary_path, bytes)
     {
@@ -1627,6 +1646,9 @@ async fn bootstrap_initial_context(
                 effective_model_id,
                 ctx_out.prefix_len,
                 marker,
+                ctx_out
+                    .verbatim_fork
+                    .then(|| parent_prompt_cache_affinity(ctx)),
             );
         }
         return BootstrapInitialContext::Ready(ctx_out);
@@ -1795,6 +1817,7 @@ async fn digest_fork_initial_context(
         effective_model_id,
         Some(2),
         "forked_digest",
+        None,
     );
     BootstrapInitialContext::Ready(InitialContext {
         source: InitialContextSource::Forked,

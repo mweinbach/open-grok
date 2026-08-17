@@ -488,6 +488,8 @@ fn fork_summary(
     let resolved_tool_policy = (target_model_id == source_model_id)
         .then_some(source.resolved_tool_policy)
         .flatten();
+    // Compute before moving `source` fields that do not implement Copy.
+    let cache_affinity_id = Some(source.prompt_cache_affinity_id());
     Summary {
         info: target_info.clone(),
         cwd_generation: source.cwd_generation,
@@ -548,6 +550,10 @@ fn fork_summary(
         } else {
             source.last_turn_summary_prompt_id
         },
+        // Resume and forks keep the source's cache identity so a later
+        // session/load still *tries* the warmed prompt cache. Server TTL
+        // may have expired; a new key would guarantee a miss.
+        cache_affinity_id,
     }
 }
 

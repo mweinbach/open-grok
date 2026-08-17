@@ -1143,6 +1143,11 @@ async fn copy_fork_provenance_persisted_in_summary() {
         data.summary.fork_parent_prompt_id.as_deref(),
         Some("prompt-42")
     );
+    assert_eq!(
+        data.summary.cache_affinity_id.as_deref(),
+        Some("src-prov"),
+        "fork copy must inherit the source session's prompt-cache identity"
+    );
 }
 
 #[tokio::test]
@@ -1186,6 +1191,41 @@ async fn copy_session_data_inherits_source_summary_fields() {
     assert_eq!(loaded.head_commit.as_deref(), Some("abc123"));
     assert_eq!(loaded.head_branch.as_deref(), Some("feature-branch"));
     assert_eq!(loaded.sandbox_profile.as_deref(), Some("workspace"));
+}
+
+#[tokio::test]
+async fn copy_session_data_inherits_source_cache_affinity_override() {
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source_info = Info {
+        id: acp::SessionId::new("src-affinity"),
+        cwd: "/src".to_string(),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+    let mut src_summary = adapter.read_summary_sync(&source_info).unwrap();
+    src_summary.cache_affinity_id = Some("root-parent-key".to_string());
+    adapter
+        .write_summary_sync(&source_info, &src_summary)
+        .unwrap();
+
+    let target_info = Info {
+        id: acp::SessionId::new("tgt-affinity"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(&source_info, &target_info, CopySessionOptions::default())
+        .await
+        .unwrap();
+
+    let loaded = adapter.load_summary(&target_info).await.unwrap();
+    assert_eq!(
+        loaded.cache_affinity_id.as_deref(),
+        Some("root-parent-key"),
+        "resume/fork copy must keep the source's inherited cache key"
+    );
 }
 
 async fn assert_copy_clears_pending_relocation(fork_filter: bool) {

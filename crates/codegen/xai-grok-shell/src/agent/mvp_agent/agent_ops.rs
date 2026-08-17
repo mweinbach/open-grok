@@ -4075,6 +4075,7 @@ impl MvpAgent {
             persisted_workflow_runs,
             persisted_announcement_state,
             previous_turn_model,
+            cache_affinity_id,
             resolved_tool_policy_override,
             persist_initial_model,
             session_meta,
@@ -4168,6 +4169,7 @@ impl MvpAgent {
         let mut startup_hints = startup_hints_from_meta(session_meta, init.meta.as_ref());
         // Runtime-only: restored from summary, never accepted from ACP client metadata.
         startup_hints.previous_turn_model = previous_turn_model;
+        startup_hints.cache_affinity_id = cache_affinity_id;
         // Session-bus presence inputs, captured before the spec below moves
         // the owned values.
         let bus_announce_session = !startup_hints.is_subagent;

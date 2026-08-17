@@ -1346,10 +1346,14 @@ pub(crate) async fn run_shell_child(
             parent_session_id: Some(ctx.parent_session_id.clone()),
             subagent_type: Some(request.subagent_type.clone()),
             preserve_inherited_system: verbatim_mirror_fork,
-            // Verbatim same-model forks share the parent's request prefix, so
-            // the child inherits the parent's prompt-cache identity to hit
-            // the server-side cache the parent already warmed.
-            cache_affinity_id: verbatim_mirror_fork.then(|| ctx.parent_session_id.clone()),
+            // Verbatim forks inherit the parent's cache identity. Resume
+            // copies already wrote that key into the child's summary, so
+            // restore it here instead of minting the new child session id.
+            cache_affinity_id: if verbatim_mirror_fork {
+                Some(super::parent_prompt_cache_affinity(&ctx))
+            } else {
+                crate::session::persistence::cache_affinity_from_session_dir(&child_session_dir)
+            },
             subagent_status_tx: child_status_tx,
             multi_agent_policy_enabled: Some(multi_agent_policy_enabled),
             ..Default::default()

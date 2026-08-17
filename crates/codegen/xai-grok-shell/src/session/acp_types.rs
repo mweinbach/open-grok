@@ -623,11 +623,12 @@ pub struct StartupHints {
     /// holds the parent's System and overwriting it would bust the cache prefix.
     #[serde(default)]
     pub preserve_inherited_system: bool,
-    /// Prompt-cache identity inherited from the parent session on verbatim
-    /// same-model forks. Applied to every turn request as
-    /// `x_grok_cache_affinity_id` so providers that key server-side prompt
-    /// caching on a session identity (Codex) hit the parent's cached prefix.
-    /// Runtime-only: never accepted from ACP client metadata.
+    /// Prompt-cache identity for this session. Fresh sessions use their own
+    /// id; verbatim same-model forks inherit the parent's. Applied to every
+    /// turn as `x_grok_cache_affinity_id` so providers that key server-side
+    /// prompt caching on a session identity (Codex) can reuse a warmed
+    /// prefix after resume. Runtime-only: never accepted from ACP client
+    /// metadata. Restored from `summary.cache_affinity_id` on `session/load`.
     #[serde(skip)]
     pub cache_affinity_id: Option<String>,
     /// Tool names (as the model sees them, e.g. `server__tool`) through which
@@ -672,6 +673,20 @@ impl StartupHints {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_hints_ignore_client_cache_affinity_id() {
+        let json = serde_json::json!({
+            "nonInteractive": true,
+            "cacheAffinityId": "injected-by-client"
+        });
+        let hints: StartupHints = serde_json::from_value(json).unwrap();
+        assert!(hints.non_interactive);
+        assert!(
+            hints.cache_affinity_id.is_none(),
+            "ACP clients must not be able to inject cache_affinity_id"
+        );
+    }
 
     #[test]
     fn should_show_model_fingerprint_truth_table() {

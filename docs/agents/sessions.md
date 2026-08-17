@@ -145,6 +145,7 @@ See `Summary` in `persistence.rs`. Agents editing resume or export must respect:
 | `sandbox_profile` | Pinned for session life on resume |
 | `parent_session_id` / `forked_at` / `session_kind` | Fork / subagent / worktree lineage |
 | `inherited_prefix_len` | Compaction preserves fork inherited prefix |
+| `cache_affinity_id` | Sticky prompt-cache identity (session id, or inherited parent id on verbatim forks). Restored onto `StartupHints` on `session/load` so resume still *tries* the warmed cache; a server TTL miss after idle is acceptable |
 | `prompt_display_cwd` | Display path for worktree forks (not real worktree path) |
 | `source_workspace_dir` | Group worktree sessions under origin workspace |
 | `last_active_at` | Advanced only by local content append (not remote metadata writes) |
@@ -230,6 +231,7 @@ JsonlStorageAdapter       (filesystem; optional torn-tail heal on append)
 - Resume identity for UI/transcript: **`updates.jsonl` is source of truth** for the ACP stream; `chat_history.jsonl` is the model conversation (post-compaction).
 - Sandbox profile from summary is restored for the session life (do not silently fall back to config default).
 - `agent_name` + `current_model_id` drive harness rebuild without catalog re-inference.
+- `cache_affinity_id` is restored onto `StartupHints` and stamped on every turn / side-call / remote-compact request. Resume must keep the same key so the provider can still serve a warmed prefix; a miss after server TTL is acceptable.
 
 ### Fork
 

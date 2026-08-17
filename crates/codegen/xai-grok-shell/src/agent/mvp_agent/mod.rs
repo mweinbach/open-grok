@@ -262,6 +262,9 @@ pub(crate) struct SessionSpawnOptions<'a> {
         crate::session::announcement_state::AnnouncementState,
     >,
     pub previous_turn_model: Option<crate::session::compaction_config::PreviousModelInfo>,
+    /// Prompt-cache identity restored from `summary.json`. Runtime-only on
+    /// `StartupHints` (never accepted from ACP client metadata).
+    pub cache_affinity_id: Option<String>,
     /// Validated cold-resume policy for the actor's initial provider route.
     pub resolved_tool_policy_override:
         Option<crate::session::tool_surface::ResolvedToolPolicy>,
@@ -443,6 +446,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         persisted_workflow_runs: Vec::new(),
         persisted_announcement_state: None,
         previous_turn_model: None,
+        cache_affinity_id: None,
         resolved_tool_policy_override: None,
         persist_initial_model: true,
         session_meta,

@@ -176,6 +176,9 @@ pub(crate) mod hydrate {
             reasoning_effort: None,
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
+            // Same remote session id is reused locally; pin it so resume
+            // after a later process restart still sends the original key.
+            cache_affinity_id: Some(info.id.0.to_string()),
         };
 
         let json = serde_json::to_string_pretty(&summary)?;

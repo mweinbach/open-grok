@@ -1184,6 +1184,15 @@ pub(crate) struct TraceConfigTemplate {
     pub(crate) upload_method: crate::session::repo_changes::UploadMethod,
 }
 impl SessionActor {
+    /// Stable prompt-cache identity stamped on every sampling request.
+    /// Inherited parent keys survive resume; otherwise this is the session id.
+    pub(crate) fn prompt_cache_affinity_id(&self) -> String {
+        crate::session::persistence::resolve_prompt_cache_affinity_id(
+            self.session_info.id.0.as_ref(),
+            self.startup_hints.cache_affinity_id.as_deref(),
+        )
+    }
+
     /// Get the signals handle for tracking session events.
     fn signals_handle(&self) -> SessionSignalsHandle {
         self.feedback_manager.signals_handle()

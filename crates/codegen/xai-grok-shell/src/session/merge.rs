@@ -494,6 +494,7 @@ mod tests {
             reasoning_effort: None,
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
+            cache_affinity_id: None,
         }
     }
 

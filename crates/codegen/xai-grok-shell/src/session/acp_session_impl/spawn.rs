@@ -1720,6 +1720,13 @@ pub(crate) async fn spawn_session_actor(
     };
     let doom_loop_recovery = effective_config.resolve_doom_loop_recovery();
     let previous_turn_model = startup_hints.previous_turn_model.take();
+    if startup_hints
+        .cache_affinity_id
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        startup_hints.cache_affinity_id = Some(session_info.id.to_string());
+    }
     let resolved_tool_overrides: std::sync::Arc<
         arc_swap::ArcSwapOption<xai_grok_sampling_types::ToolOverrides>,
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
