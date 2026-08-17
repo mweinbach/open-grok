@@ -109,6 +109,7 @@ Under `$OPENGROK_HOME/sessions/<encoded-cwd>/<session-id>/`:
 | `tool_state.json` | Persisted tool state (e.g. todo bridge); optional copy on fork |
 | `signals.json` | Session signals snapshot |
 | `announcement_state.json` | MCP / skill announcement dedup |
+| `working_dirs.json` | `/add-dir` working set (canonicalized extra roots; restored on resume) |
 
 ### Rewind / compaction
 

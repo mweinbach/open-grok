@@ -100,6 +100,22 @@ Rename the current session. Alias: `/title`.
 /rename new session title
 ```
 
+### `/add-dir <path>` and `/remove-dir <path>`
+
+Add or remove a directory from the **active session's** working set. The session keeps its original directory and gains (or loses) the extra root for file reads and edits, without restarting anything.
+
+```
+/add-dir ../other-project
+/remove-dir ../other-project
+```
+
+- The added directory gets session-scoped read/edit allow rules; your existing deny and ask rules still take precedence.
+- The set is persisted with the session (`working_dirs.json` in the session directory) and restored on `/resume`, and the model is told about the change so it can use the new directory.
+- Subagents spawned after the change inherit the widened scope.
+- Removing the last extra directory returns the session to its original directory only.
+
+These differ from `/cd`, which only changes where **new** dashboard sessions spawn and never touches a live session.
+
 ---
 
 ## Model and Mode

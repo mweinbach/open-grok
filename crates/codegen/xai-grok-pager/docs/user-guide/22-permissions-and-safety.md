@@ -368,6 +368,10 @@ Rules naming an unrecognized tool (for example `Agent(model:opus)`) are skipped 
 
 Rules from every source are merged into one set and evaluated by severity, not order: any matching `deny` rejects, otherwise any matching `ask` prompts, otherwise any matching `allow` approves. When no rule matches, the request falls through to the built-in auto-approvals and then the prompt policy, as described in [How a Tool Call Is Authorized](#how-a-tool-call-is-authorized).
 
+### Session Working Directories (`/add-dir`)
+
+`/add-dir <path>` appends session-scoped `allow` rules (read and edit) for one extra directory tree on top of the merged rule set; `/remove-dir <path>` takes it back out. These runtime rules live only in the session — they are not written to any settings file, they are restored on session resume, and they never outrank a `deny` or `ask` rule from any source. See the [slash commands reference](04-slash-commands.md) for the full behavior.
+
 ---
 
 ## Interactive Approvals and Where They Persist

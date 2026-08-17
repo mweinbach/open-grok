@@ -123,8 +123,13 @@ Evaluation is **order-independent severity**: **deny > ask > allow**. Merge orde
 | Native project config | every `.opengrok/config.toml` from git root → cwd |
 | Claude settings | `~/.claude/settings*.json`, project `.claude/settings*.json` |
 | CLI | `--allow` / `--deny` (session start) |
+| Session working dirs | runtime-appended per session via `/add-dir` (see below) |
 
 Compact TOML form (`deny = ["Read(...)"]`) and verbose `[[permission.rules]]` are both accepted (`resolution.rs` / `rules.rs`).
+
+### Session working directories (`/add-dir`)
+
+`x.ai/session/add_working_directory` / `remove_working_directory` ext methods append or remove **runtime-only** allow rules (Read + Edit, absolute `<dir>/**` globs) through `PermissionCommand::AddSessionRules` / `ResetSessionRules`. `CompiledPolicy` tracks the appended count so a reset truncates exactly the runtime slice — configured layers are never touched. The set persists in the session dir (`working_dirs.json`), is restored (without re-disclosure) on resume, and is disclosed to the model as an `<environment-update source="working_set">` system reminder. Subagents inherit the widened scope via the shared `PermissionHandle`.
 
 ### Rule string DSL (`rules.rs`)
 
