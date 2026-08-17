@@ -87,16 +87,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Refreshing version/commit build metadata..." >&2
 cd "$repo_root"
-cargo clean \
-    --quiet \
-    --profile release-dist \
-    --target "$target_triple" \
-    -p xai-grok-pager-bin \
-    -p xai-grok-pager \
-    -p xai-grok-tools
-
 echo "Building Open Grok ${version} (${commit})..." >&2
 GROK_VERSION="$version" \
     GROK_TOOLS_BUNDLE_RG_PATH="$rg_path" \
@@ -107,7 +98,8 @@ GROK_VERSION="$version" \
     --features release-dist \
     --target "$target_triple" \
     -p xai-grok-pager-bin \
-    --bin open-grok
+    --bin open-grok \
+    --timings
 
 source_binary="${repo_root}/target/${target_triple}/release-dist/open-grok"
 if [[ ! -x "$source_binary" ]]; then

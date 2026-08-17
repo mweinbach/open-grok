@@ -109,18 +109,13 @@ $releaseInstaller = Join-Path $distDir 'install.ps1'
 $releaseLicense = Join-Path $distDir 'LICENSE'
 $releaseNotices = Join-Path $distDir 'THIRD-PARTY-NOTICES'
 
-Write-Host 'Refreshing version/commit build metadata...'
 Set-Location $repoRoot
-cargo clean --quiet --profile release-dist --target $targetTriple `
-    -p xai-grok-pager-bin -p xai-grok-pager -p xai-grok-tools
-if ($LASTEXITCODE -ne 0) { throw 'Error: cargo clean failed' }
-
 Write-Host "Building Open Grok $version ($commit)..."
 $env:GROK_VERSION = $version
 $env:CARGO_INCREMENTAL = '0'
 $env:PROTOC = $protocPath
 cargo build --locked --profile release-dist --features release-dist `
-    --target $targetTriple -p xai-grok-pager-bin --bin open-grok
+    --target $targetTriple -p xai-grok-pager-bin --bin open-grok --timings
 if ($LASTEXITCODE -ne 0) { throw 'Error: cargo build failed' }
 
 $sourceBinary = Join-Path $repoRoot "target\$targetTriple\release-dist\open-grok.exe"

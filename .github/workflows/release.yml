@@ -27,7 +27,7 @@ jobs:
       tag: ${{ steps.target.outputs.tag }}
       sha: ${{ steps.target.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -63,8 +63,12 @@ jobs:
     name: Windows x86_64
     needs: resolve
     runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_RELEASE_DIST_CODEGEN_UNITS: 4
+      CARGO_PROFILE_RELEASE_DIST_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
@@ -83,7 +87,7 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ runner.os }}-${{ runner.arch }}
+          shared-key: release-fast-v1-${{ runner.os }}-${{ runner.arch }}
           cache-on-failure: true
           cache-workspace-crates: true
 
@@ -92,7 +96,7 @@ jobs:
         run: .\scripts\build-windows-release.ps1
 
       - name: Upload Windows assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-release
           if-no-files-found: error
@@ -105,8 +109,12 @@ jobs:
     name: macOS Apple Silicon
     needs: resolve
     runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_RELEASE_DIST_CODEGEN_UNITS: 4
+      CARGO_PROFILE_RELEASE_DIST_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
@@ -122,7 +130,7 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ runner.os }}-${{ runner.arch }}
+          shared-key: release-fast-v1-${{ runner.os }}-${{ runner.arch }}
           cache-on-failure: true
           cache-workspace-crates: true
 
@@ -166,6 +174,14 @@ jobs:
         shell: bash
         run: ./scripts/build-macos-release.sh
 
+      - name: Upload macOS Cargo timings on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-cargo-timings
+          if-no-files-found: ignore
+          path: target/cargo-timings/
+
       - name: Smoke macOS installer
         shell: bash
         run: |
@@ -180,7 +196,7 @@ jobs:
           "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
 
       - name: Upload macOS and common assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-release
           if-no-files-found: error
@@ -198,12 +214,12 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
