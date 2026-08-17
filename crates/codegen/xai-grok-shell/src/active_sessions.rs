@@ -170,7 +170,8 @@ fn write_data_file_atomic(
     })
 }
 
-fn is_pid_alive(pid: u32) -> bool {
+/// PID liveness probe (also used by the session bus presence GC).
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let pid_i = match i32::try_from(pid) {
