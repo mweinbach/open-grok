@@ -826,6 +826,33 @@ pub(super) fn handle_session_notification_with_origin(
             ));
             true
         }
+        XaiSessionUpdate::PeerSessionMessage {
+            from_session_id,
+            from_project,
+            to_session_id,
+            body,
+            status,
+            ..
+        } => {
+            // Same bounded-preview card treatment as agent-team mail: the
+            // full body lives in updates.jsonl; scrollback shows a preview.
+            let preview = if body.chars().count() > 500 {
+                format!("{}…", body.chars().take(500).collect::<String>())
+            } else {
+                body
+            };
+            let status_label = match status.as_str() {
+                "delivered_interjection" => "queued into running turn",
+                "delivered_wake" => "woke idle session",
+                other => other,
+            };
+            agent.scrollback.push_block(RenderBlock::System(
+                crate::scrollback::blocks::SystemMessageBlock::new(format!(
+                    "Peer session message ({status_label}) · {from_session_id} [{from_project}] → {to_session_id}\n{preview}"
+                )),
+            ));
+            true
+        }
         XaiSessionUpdate::SubagentFinished {
             child_session_id,
             status,
