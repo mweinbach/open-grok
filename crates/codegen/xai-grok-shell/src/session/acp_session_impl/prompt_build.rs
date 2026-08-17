@@ -392,6 +392,64 @@ mod install_system_prompt_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod rewrite_zero_turn_prefix_tests {
+    use super::SessionActor;
+    use xai_grok_sampling_types::conversation::ConversationItem;
+
+    #[test]
+    fn rewrite_zero_turn_prefix_skips_after_assistant_progress() {
+        let mut conv = vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("<user_info>old</user_info>"),
+            ConversationItem::user("hello"),
+            ConversationItem::assistant("hi"),
+        ];
+        SessionActor::rewrite_zero_turn_prefix(
+            &mut conv,
+            "<user_info>new</user_info>".into(),
+            false,
+        );
+        match &conv[1] {
+            ConversationItem::User(u) => {
+                let text = match &u.content[0] {
+                    xai_grok_sampling_types::conversation::ContentPart::Text { text } => {
+                        text.as_ref()
+                    }
+                    _ => panic!("expected text"),
+                };
+                assert_eq!(text, "<user_info>old</user_info>");
+            }
+            other => panic!("expected user prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_zero_turn_prefix_replaces_before_any_assistant() {
+        let mut conv = vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("<user_info>old</user_info>"),
+        ];
+        SessionActor::rewrite_zero_turn_prefix(
+            &mut conv,
+            "<user_info>new</user_info>".into(),
+            false,
+        );
+        match &conv[1] {
+            ConversationItem::User(u) => {
+                let text = match &u.content[0] {
+                    xai_grok_sampling_types::conversation::ContentPart::Text { text } => {
+                        text.as_ref()
+                    }
+                    _ => panic!("expected text"),
+                };
+                assert_eq!(text, "<user_info>new</user_info>");
+            }
+            other => panic!("expected user prefix, got {other:?}"),
+        }
+    }
+}
 pub(super) const LARGE_PROMPT_THRESHOLD: usize = 25_000;
 pub(super) const TRUNCATED_PROMPT_PREFIX_SIZE: usize = 25_000;
 /// Percent of the bounded-prompt budget given to the query (capped; rest is context head).
@@ -527,6 +585,13 @@ impl SessionActor {
         new_prefix: String,
         drop_startup_skill_reminder: bool,
     ) {
+        if conversation_has_model_progress(conversation) {
+            tracing::info!(
+                "rewrite_zero_turn_prefix: conversation already has model progress; \
+                 leaving cached prefix intact"
+            );
+            return;
+        }
         let is_prefix_slot = matches!(
             conversation.get(1),
             Some(ConversationItem::User(u)) if u.synthetic_reason.is_none()
@@ -603,6 +668,8 @@ impl SessionActor {
             .set(chrono::Local::now().date_naive());
         self.prefix_carries_fallback_date
             .set(prefix_carries_fallback_date);
+        let rules = self.agent.borrow().prompt_context().agents_md_files.clone();
+        self.record_announced_environment(&out, &rules);
         out
     }
     fn gather_partitioned_rules(

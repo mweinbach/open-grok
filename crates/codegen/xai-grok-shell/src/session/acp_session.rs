@@ -162,6 +162,9 @@ use tasks_cancel::*;
 mod reminders;
 use reminders::*;
 pub use reminders::{CollectedTodoGateInput, TodoGateInput, evaluate_todo_gate};
+#[path = "acp_session_impl/environment_update.rs"]
+mod environment_update;
+use environment_update::*;
 #[path = "acp_session_impl/laziness_classifier.rs"]
 mod laziness_classifier;
 pub(crate) use laziness_classifier::*;
@@ -968,6 +971,11 @@ pub(crate) struct SessionActor {
     /// compaction, model switch) or a date-rollover `<system-reminder>`. Plain resume reuses the
     /// cached prefix. Drives [`SessionActor::maybe_inject_date_rollover_reminder`].
     pub(crate) last_announced_local_date: std::cell::Cell<chrono::NaiveDate>,
+    /// Identity hash of the last `<user_info>` announced to the model (date
+    /// line excluded). `None` until the prefix is built or resume recovery runs.
+    pub(crate) last_announced_user_info_hash: std::cell::Cell<Option<u64>>,
+    /// Hash of the last AGENTS.md / rules snapshot announced to the model.
+    pub(crate) last_announced_rules_hash: std::cell::Cell<Option<u64>>,
     /// True when the render-failure fallback stamped a date into a date-free template's prefix, so
     /// [`SessionActor::maybe_inject_date_rollover_reminder`] still rolls it over.
     pub(crate) prefix_carries_fallback_date: std::cell::Cell<bool>,

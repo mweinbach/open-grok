@@ -303,6 +303,7 @@ Full provider contracts: [providers.md](providers.md) (compaction table), [`../c
 5. Prefire pass-1 caches are invalidated by prefix fingerprint (edit/rewind/branch).
 6. Memory flush can run **before** compact (`helpers/memory_flush.rs`); `is_flushing` suppresses auto-compact during flush.
 7. After compaction, reset `last_idle_flush_conversation_len` so idle flush does not skip incorrectly.
+8. **Environment updates are append-only.** The first-turn `<user_info>` prefix and the spawn-time AGENTS.md `ProjectInstructions` item stay frozen for prompt-cache stability. Date rollover, cwd relocation, live `user_info` identity changes (os/shell/workspace), and AGENTS.md / rules file edits are injected as later hidden `<system-reminder>` / `<environment-update>` items — never by rewriting the cached prefix. Git status in the prefix is still a startup snapshot.
 
 ---
 
