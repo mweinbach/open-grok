@@ -121,6 +121,12 @@ Subagents **inherit** the parent `PermissionHandle` (including always-approve). 
   `wait_agent`) let live children coordinate without exposing peer transcripts.
 - Deep map: [`docs/agents/subagents.md`](docs/agents/subagents.md).
 
+### 4.4b Session bus (cross-process collaboration)
+
+- Live sessions on one machine discover each other through `$OPENGROK_HOME/session-bus/` presence files (per process) and message each other over per-process IPC sockets — no hub daemon.
+- Models get `list_sessions` / `read_session` / `message_session` tools; delivery reuses the interjection/idle-wake mailbox. Peer bodies are untrusted model input, never user consent.
+- Root sessions only; `[session_bus] enabled = false` opts out. Deep map: [`docs/agents/session-bus.md`](docs/agents/session-bus.md).
+
 ### 4.5 Code Mode
 
 When Code Mode is effective (an OpenAI Codex Code Mode Only model requirement wins over Settings):
@@ -272,6 +278,7 @@ Project rules for **user projects** (not this repo’s own guide) are documented
 | [`docs/agents/acp.md`](docs/agents/acp.md) | ACP transports, methods, extensions, reverse-RPC, meta keys, leader |
 | [`docs/agents/sessions.md`](docs/agents/sessions.md) | Session dirs, persistence, resume/fork/rewind, compaction host, idle flush |
 | [`docs/agents/subagents.md`](docs/agents/subagents.md) | Spawn, coordinator, depth, worktrees, resume, usage, orphans |
+| [`docs/agents/session-bus.md`](docs/agents/session-bus.md) | Machine-local session bus: presence, peer messaging, list/read/message tools |
 | [`docs/agents/editing.md`](docs/agents/editing.md) | File edits, hunks, plan-mode edits, Code Mode nested edits |
 | [`docs/agents/code-mode.md`](docs/agents/code-mode.md) | Code Mode / Only, V8, exec/wait, nested tools, transport UI |
 | [`docs/agents/tools.md`](docs/agents/tools.md) | Tool packs, registry, taxonomy, major tools, caps, how to add a tool |

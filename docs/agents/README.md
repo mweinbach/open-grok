@@ -15,6 +15,7 @@ This directory is for **contributors and AI coding agents** working on the Open 
 | [acp.md](acp.md) | ACP transports, methods, extensions, reverse-RPC, meta keys, leader, headless |
 | [sessions.md](sessions.md) | Session identity, on-disk layout, persistence actor, resume/fork/rewind, idle flush/dream |
 | [subagents.md](subagents.md) | Task spawn, coordinator drain, depth, isolation, resume, usage fold, orphan reconcile |
+| [session-bus.md](session-bus.md) | Machine-local cross-session bus: presence, peer messaging, list/read/message tools |
 | [editing.md](editing.md) | How file edits work (`search_replace`, `apply_patch`, hunks, plan mode, Code Mode) |
 | [code-mode.md](code-mode.md) | Code Mode / Only, V8 runtime, exec/wait, nested tools, transport UI, lifecycle |
 | [tools.md](tools.md) | Tool packs, registry/finalize, taxonomy, major tools, caps, Computer Hub, add-a-tool checklist |
