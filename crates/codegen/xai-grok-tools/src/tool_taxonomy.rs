@@ -119,6 +119,35 @@ impl ToolKind {
         }
     }
 }
+/// First-party tool names whose argument streams benefit from action-oriented
+/// preparation labels while the model is still writing the call.
+pub const WRITING_TOOL_WIRE_NAMES: &[(&str, ToolKind)] = &[
+    ("write", ToolKind::Write),
+    ("search_replace", ToolKind::Edit),
+    ("edit", ToolKind::Edit),
+    ("hashline_edit", ToolKind::Edit),
+    ("apply_patch", ToolKind::Edit),
+    ("run_terminal_command", ToolKind::Execute),
+    ("run_terminal_cmd", ToolKind::Execute),
+    ("bash", ToolKind::Execute),
+    ("todo_write", ToolKind::Plan),
+    ("todowrite", ToolKind::Plan),
+    ("workflow", ToolKind::Workflow),
+    ("image_gen", ToolKind::ImageGen),
+    ("image_edit", ToolKind::ImageGen),
+    ("image_to_video", ToolKind::ImageToVideo),
+    ("reference_to_video", ToolKind::ReferenceToVideo),
+    ("ask_user_question", ToolKind::AskUser),
+];
+
+/// Return the semantic kind for a long-argument first-party tool wire name.
+pub fn writing_tool_kind(wire_name: &str) -> Option<ToolKind> {
+    WRITING_TOOL_WIRE_NAMES
+        .iter()
+        .find(|(name, _)| *name == wire_name)
+        .map(|&(_, kind)| kind)
+}
+
 impl schemars::JsonSchema for ToolKind {
     fn schema_name() -> Cow<'static, str> {
         "ToolKind".into()
@@ -265,6 +294,18 @@ mod tests {
         assert!(!ToolKind::Edit.is_read_only());
         assert!(!ToolKind::Execute.is_read_only());
         assert!(!ToolKind::Delete.is_read_only());
+    }
+    #[test]
+    fn writing_tool_kind_maps_long_argument_tools_only() {
+        assert_eq!(writing_tool_kind("write"), Some(ToolKind::Write));
+        assert_eq!(writing_tool_kind("apply_patch"), Some(ToolKind::Edit));
+        assert_eq!(
+            writing_tool_kind("run_terminal_command"),
+            Some(ToolKind::Execute)
+        );
+        assert_eq!(writing_tool_kind("read_file"), None);
+        assert_eq!(writing_tool_kind(crate::USE_TOOL_NAME), None);
+        assert_eq!(writing_tool_kind(crate::SEARCH_TOOL_NAME), None);
     }
     #[test]
     fn namespace_round_trips_snake_case_with_pascal_aliases() {

@@ -89,7 +89,10 @@ pub(crate) const MINIMAL_BLOCK_GAP: u16 = 0;
 /// by this rule — any later in-place fill of that entry never reaches the
 /// terminal. Handlers that fill placeholders (e.g. `SessionRecap`) must check
 /// `ScrollbackState::is_committed` and append a fresh block instead.
-pub fn is_committable(entry: &ScrollbackEntry, turn_running: bool, is_last: bool) -> bool {
+pub fn is_committable(state: &ScrollbackState, i: usize, turn_running: bool) -> bool {
+    let Some(entry) = state.get(i) else {
+        return false;
+    };
     // A block awaiting user input (permission / ask_user_question) holds the
     // frontier in EVERY turn state, not just mid-turn: its rendered form is
     // still going to change when the prompt resolves, so committing it
@@ -107,11 +110,21 @@ pub fn is_committable(entry: &ScrollbackEntry, turn_running: bool, is_last: bool
     }
     // Running, mid-turn. Two block kinds are safe to commit despite a set
     // `is_running` flag: a BgTask lifecycle block (finalized event; flag is
-    // animation-only — see above), and a non-last agent message (the tracker has
-    // provably moved past it). A running **tool** may still update its result,
-    // and the **last** non-BgTask entry may still be streaming, so both stay live.
+    // animation-only — see above), and an agent message whose later sibling
+    // proves the tracker moved on. A running **tool** may still update its
+    // result, and a still-open agent stream (last, or only followed by
+    // interleaved thinking) must stay live.
     matches!(entry.block, RenderBlock::BgTask(_))
-        || (!is_last && matches!(entry.block, RenderBlock::AgentMessage(_)))
+        || (matches!(entry.block, RenderBlock::AgentMessage(_))
+            && agent_message_stream_closed(state, i))
+}
+
+fn agent_message_stream_closed(state: &ScrollbackState, i: usize) -> bool {
+    ((i + 1)..state.len()).any(|j| {
+        state
+            .get(j)
+            .is_some_and(|entry| !matches!(entry.block, RenderBlock::Thinking(_)))
+    })
 }
 
 /// The display mode a block should be committed in (minimal mode, print-once).
@@ -159,11 +172,10 @@ enum Step {
 
 /// Classify the entry at `i` relative to the commit frontier.
 fn classify(state: &ScrollbackState, i: usize, turn_running: bool) -> Step {
-    let is_last = i + 1 >= state.len();
     match state.get(i) {
         None => Step::Stop,
         Some(e) if minimal_api::is_committed(state, e) => Step::Skip,
-        Some(e) if !is_committable(e, turn_running, is_last) => Step::Stop,
+        Some(_) if !is_committable(state, i, turn_running) => Step::Stop,
         Some(_) => Step::Commit,
     }
 }

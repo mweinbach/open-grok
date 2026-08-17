@@ -182,7 +182,7 @@ impl xai_tool_runtime::Tool for GlobTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         crate::util::detach_command(&mut cmd);
-        cmd.stdin(Stdio::null());
+        cmd.stdin(xai_tty_utils::null_stdio());
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,

@@ -98,7 +98,7 @@ fn running_agent_message_commits_once_a_later_block_exists() {
     assert_eq!(commit_collect(&mut s), Vec::<usize>::new());
     assert_eq!(minimal_api::commit_scan_cursor(&s), 0);
 
-    // A later block (the tracker moved on) proves the message is done → it
+    // A later tool (the tracker moved on) proves the message is done → it
     // commits even though its is_running flag still lingers. The new
     // last/running entry stays in the live tail.
     s.push(running("tool"));

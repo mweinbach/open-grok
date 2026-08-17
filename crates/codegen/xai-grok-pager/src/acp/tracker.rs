@@ -185,9 +185,38 @@ impl WritingToolCall {
             Some(name) if xai_grok_tools::is_task_tool_id(name) => {
                 format!("Writing subagent prompt{ordinal}…")
             }
+            Some(xai_grok_tools::USE_TOOL_NAME) => {
+                format!("Preparing MCP tool{ordinal}…")
+            }
+            Some(xai_grok_tools::SEARCH_TOOL_NAME) => {
+                format!("Searching MCP tools{ordinal}…")
+            }
             Some(name) => {
-                let name = xai_grok_workspace::permission::mcp_pretty_name_if_qualified(name);
-                format!("Preparing {}{ordinal}…", clamp_activity_subject(&name))
+                use xai_grok_tools::types::tool::ToolKind;
+                let copy =
+                    xai_grok_tools::tool_taxonomy::writing_tool_kind(name).and_then(|kind| {
+                        match kind {
+                            ToolKind::Write => Some("Writing file"),
+                            ToolKind::Edit => Some("Writing edit"),
+                            ToolKind::Execute => Some("Writing command"),
+                            ToolKind::Plan => Some("Updating todo list"),
+                            ToolKind::Workflow => Some("Writing workflow"),
+                            ToolKind::ImageGen => Some("Writing image prompt"),
+                            ToolKind::ImageToVideo | ToolKind::ReferenceToVideo => {
+                                Some("Writing video prompt")
+                            }
+                            ToolKind::AskUser => Some("Preparing question"),
+                            _ => None,
+                        }
+                    });
+                match copy {
+                    Some(copy) => format!("{copy}{ordinal}…"),
+                    None => {
+                        let name =
+                            xai_grok_workspace::permission::mcp_pretty_name_if_qualified(name);
+                        format!("Preparing {}{ordinal}…", clamp_activity_subject(&name))
+                    }
+                }
             }
             None => format!("Preparing tool call{ordinal}…"),
         }

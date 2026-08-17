@@ -2295,9 +2295,42 @@ fn activity_writing_tool_call_labels_and_redraws() {
     let Some(TurnActivity::WritingToolCall(writing)) = tracker.activity() else {
         panic!("expected WritingToolCall activity");
     };
-    assert_eq!(writing.label(), "Preparing write…");
+    assert_eq!(writing.label(), "Writing file…");
     assert!(!tracker.note_tool_call_arguments_delta(None, 0));
     assert!(!tracker.note_tool_call_arguments_delta(Some("write"), 0));
+}
+
+#[test]
+fn activity_writing_tool_call_labels_first_party_writing_tools() {
+    for (name, expected) in [
+        ("write", "Writing file…"),
+        ("search_replace", "Writing edit…"),
+        ("apply_patch", "Writing edit…"),
+        ("run_terminal_command", "Writing command…"),
+        ("todo_write", "Updating todo list…"),
+        ("workflow", "Writing workflow…"),
+        ("image_gen", "Writing image prompt…"),
+        ("reference_to_video", "Writing video prompt…"),
+        ("ask_user_question", "Preparing question…"),
+        ("use_tool", "Preparing MCP tool…"),
+        ("search_tool", "Searching MCP tools…"),
+        ("read_file", "Preparing read_file…"),
+    ] {
+        let mut tracker = AcpUpdateTracker::new();
+        tracker.note_tool_call_arguments_delta(Some(name), 0);
+        let Some(TurnActivity::WritingToolCall(writing)) = tracker.activity() else {
+            panic!("expected WritingToolCall activity for {name:?}");
+        };
+        assert_eq!(writing.label(), expected, "label for {name:?}");
+    }
+
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.note_tool_call_arguments_delta(Some("apply_patch"), 0);
+    tracker.note_tool_call_arguments_delta(Some("apply_patch"), 1);
+    let Some(TurnActivity::WritingToolCall(writing)) = tracker.activity() else {
+        panic!("expected WritingToolCall activity");
+    };
+    assert_eq!(writing.label(), "Writing edit (2)…");
 }
 /// A silent delta stream expires from the spinner but stays visible to
 /// lost-response recovery as a dead-stream signal; a new delta re-reveals.

@@ -8,6 +8,9 @@ use crate::types::output::{SearchToolOutput, ToolOutput};
 use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::types::tool_index::ToolIndex;
 
+/// Wire name of the MCP discovery tool.
+pub const SEARCH_TOOL_NAME: &str = "search_tool";
+
 /// Maximum length for MCP tool/server descriptions. Matches the common
 /// `MAX_MCP_DESCRIPTION_LENGTH` constant. Descriptions exceeding this are truncated.
 pub const MAX_MCP_DESCRIPTION_LENGTH: usize = 2048;
@@ -227,7 +230,7 @@ impl xai_tool_runtime::Tool for SearchTool {
     type Output = ToolOutput;
 
     fn id(&self) -> xai_tool_protocol::ToolId {
-        xai_tool_protocol::ToolId::new("search_tool").expect("valid tool id")
+        xai_tool_protocol::ToolId::new(SEARCH_TOOL_NAME).expect("valid tool id")
     }
 
     fn description(
