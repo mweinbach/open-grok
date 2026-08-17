@@ -819,6 +819,68 @@
         assert!(!apply_session_event(&update, &mut session, &mut scrollback, false));
     }
 
+    #[test]
+    fn child_tool_call_delta_sets_writing_activity_when_enabled() {
+        crate::appearance::cache::set_stream_tool_calls(true);
+        let mut agent = make_agent(Some("root-sess"));
+        let child_sid = "child-sess-delta";
+        agent
+            .subagent_sessions
+            .insert(child_sid.into(), make_subagent_info(child_sid));
+        let child_view = make_agent(Some(child_sid));
+        agent
+            .subagent_views
+            .insert(child_sid.into(), Box::new(child_view));
+
+        let update = XaiSessionUpdate::ToolCallDeltaChunk {
+            tool_call_id: Some("call_1".into()),
+            tool_index: 0,
+            name: Some("write".into()),
+            arguments_delta: Some("{\"path\":".into()),
+        };
+        assert!(handle_child_session_notification(
+            update, child_sid, &mut agent, false
+        ));
+        let child = agent.subagent_views.get(child_sid).expect("child view");
+        assert!(matches!(
+            child.session.tracker.activity(),
+            Some(crate::acp::tracker::TurnActivity::WritingToolCall(_))
+        ));
+    }
+
+    #[test]
+    fn child_tool_call_delta_is_ignored_when_streaming_disabled() {
+        crate::appearance::cache::set_stream_tool_calls(false);
+        let mut agent = make_agent(Some("root-sess"));
+        let child_sid = "child-sess-delta-off";
+        agent
+            .subagent_sessions
+            .insert(child_sid.into(), make_subagent_info(child_sid));
+        let child_view = make_agent(Some(child_sid));
+        agent
+            .subagent_views
+            .insert(child_sid.into(), Box::new(child_view));
+
+        let update = XaiSessionUpdate::ToolCallDeltaChunk {
+            tool_call_id: Some("call_1".into()),
+            tool_index: 0,
+            name: Some("write".into()),
+            arguments_delta: Some("{\"path\":".into()),
+        };
+        assert!(!handle_child_session_notification(
+            update, child_sid, &mut agent, false
+        ));
+        let child = agent.subagent_views.get(child_sid).expect("child view");
+        assert!(
+            !matches!(
+                child.session.tracker.activity(),
+                Some(crate::acp::tracker::TurnActivity::WritingToolCall(_))
+            ),
+            "disabled setting must not surface writing-tool activity"
+        );
+        crate::appearance::cache::set_stream_tool_calls(true);
+    }
+
     // ── handle_child_session_notification ──────────────────────────────
 
     #[test]

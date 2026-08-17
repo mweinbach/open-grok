@@ -1429,6 +1429,37 @@ pub(in crate::app::dispatch) fn set_show_thinking_blocks(
     }]
 }
 
+pub(super) fn set_stream_tool_calls_inner(app: &mut AppView, new: bool) {
+    crate::appearance::cache::set_stream_tool_calls(new);
+    app.current_ui.stream_tool_calls = Some(new);
+}
+
+/// Set whether to request incremental tool-call argument streaming.
+///
+/// SHELL-OWNED: cache mirror + `[ui].stream_tool_calls` via `Effect::PersistSetting`.
+/// Live-applied on the next inference request for hosts that support a
+/// request flag; the TUI writing-tool spinner follows the same switch.
+pub(in crate::app::dispatch) fn set_stream_tool_calls(app: &mut AppView, new: bool) -> Vec<Effect> {
+    let prev = crate::appearance::cache::load_stream_tool_calls();
+    if prev == new {
+        return vec![];
+    }
+    set_stream_tool_calls_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(
+        target: "settings",
+        key = "stream_tool_calls",
+        value = new,
+        "setting changed",
+    );
+    app.show_toast(&save_success_toast("Stream tool calls", new));
+    vec![Effect::PersistSetting {
+        key: "stream_tool_calls",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
 pub(super) fn set_group_tool_verbs_inner(app: &mut AppView, new: bool) {
     crate::appearance::cache::set_group_tool_verbs(new);
     // Expansion ids describe the OLD grouping shape; drop them so stale ids

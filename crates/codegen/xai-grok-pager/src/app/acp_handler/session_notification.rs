@@ -1456,6 +1456,9 @@ pub(super) fn handle_session_notification_with_origin(
         XaiSessionUpdate::InteractionResolved { tool_call_id } => {
             agent.dismiss_resolved_interaction(&tool_call_id)
         }
+        XaiSessionUpdate::ToolCallDeltaChunk {
+            name, tool_index, ..
+        } => apply_tool_call_delta_chunk(&mut agent.session.tracker, name.as_deref(), tool_index),
         _ => {
             tracing::trace!(
                 "Ignoring {}: {:?}",
@@ -1613,6 +1616,19 @@ pub(super) fn handle_child_session_notification(
             }
             changed
         }
+        XaiSessionUpdate::ToolCallDeltaChunk {
+            name, tool_index, ..
+        } => {
+            if let Some(child_view) = agent.subagent_views.get_mut(child_sid) {
+                apply_tool_call_delta_chunk(
+                    &mut child_view.session.tracker,
+                    name.as_deref(),
+                    tool_index,
+                )
+            } else {
+                false
+            }
+        }
         ref update @ (XaiSessionUpdate::MemoryFlushCompleted { .. }
         | XaiSessionUpdate::MemoryDreamCompleted { .. }
         | XaiSessionUpdate::MemorySessionSaved { .. }) => {
@@ -1645,6 +1661,17 @@ pub(crate) fn apply_session_event_for_test(
 ) -> bool {
     apply_session_event(update, session, scrollback, false)
 }
+fn apply_tool_call_delta_chunk(
+    tracker: &mut crate::acp::tracker::AcpUpdateTracker,
+    name: Option<&str>,
+    tool_index: u32,
+) -> bool {
+    if !crate::appearance::cache::load_stream_tool_calls() {
+        return false;
+    }
+    tracker.note_tool_call_arguments_delta(name, tool_index)
+}
+
 pub(super) fn apply_session_event(
     update: &XaiSessionUpdate,
     session: &mut AgentSession,

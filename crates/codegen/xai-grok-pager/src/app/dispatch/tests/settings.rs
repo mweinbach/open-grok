@@ -1941,6 +1941,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "show_thinking_blocks" => {
             let _ = dispatch(Action::SetShowThinkingBlocks(true), app);
         }
+        "stream_tool_calls" => {
+            let _ = dispatch(Action::SetStreamToolCalls(false), app);
+        }
         "group_tool_verbs" => {
             let _ = dispatch(Action::SetGroupToolVerbs(false), app);
         }
@@ -2599,6 +2602,35 @@ fn set_vim_mode_rollback_restores_state() {
     assert!(
         !app.agents[&AgentId(0)].vim_mode,
         "rollback must restore agent field",
+    );
+}
+#[test]
+fn set_stream_tool_calls_applies_persists_and_rolls_back() {
+    crate::appearance::cache::set_stream_tool_calls(true);
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::SetStreamToolCalls(false), &mut app);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::PersistSetting {
+                key: "stream_tool_calls",
+                value: crate::settings::SettingValue::Bool(false),
+                rollback_value: crate::settings::SettingValue::Bool(true),
+            }]
+        ),
+        "expected exactly one PersistSetting effect, got {effects:?}",
+    );
+    assert!(!crate::appearance::cache::load_stream_tool_calls());
+    let effects = dispatch(Action::SetStreamToolCalls(false), &mut app);
+    assert!(effects.is_empty(), "redundant set must be a no-op");
+    let _ = apply_setting_rollback(
+        &mut app,
+        "stream_tool_calls",
+        &crate::settings::SettingValue::Bool(true),
+    );
+    assert!(
+        crate::appearance::cache::load_stream_tool_calls(),
+        "rollback must restore cache",
     );
 }
 #[test]

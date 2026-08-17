@@ -592,6 +592,73 @@ pub async fn set_show_thinking_blocks(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.show_thinking_blocks = Some(value)).await
 }
 
+const STREAM_TOOL_CALLS_UNSET: u8 = 2;
+const STREAM_TOOL_CALLS_OFF: u8 = 0;
+const STREAM_TOOL_CALLS_ON: u8 = 1;
+
+static STREAM_TOOL_CALLS_PREFERENCE: AtomicU8 = AtomicU8::new(STREAM_TOOL_CALLS_UNSET);
+
+/// Live user preference for requesting incremental tool-call argument
+/// streaming. Defaults ON. `[ui].stream_tool_calls` wins; `[models].stream_tool_calls`
+/// is a fallback when the UI field is unset.
+pub fn stream_tool_calls_preference() -> bool {
+    match STREAM_TOOL_CALLS_PREFERENCE.load(Ordering::Relaxed) {
+        STREAM_TOOL_CALLS_ON => true,
+        STREAM_TOOL_CALLS_OFF => false,
+        _ => {
+            let value = load_stream_tool_calls_preference_from_disk();
+            set_stream_tool_calls_preference(value);
+            value
+        }
+    }
+}
+
+/// Replace the live streamed-tool-call preference (settings persist + tests).
+pub fn set_stream_tool_calls_preference(value: bool) {
+    STREAM_TOOL_CALLS_PREFERENCE.store(
+        if value {
+            STREAM_TOOL_CALLS_ON
+        } else {
+            STREAM_TOOL_CALLS_OFF
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn load_stream_tool_calls_preference_from_disk() -> bool {
+    if let Some(value) = parse_env_bool(super::resolve::ENV_STREAM_TOOL_CALLS) {
+        return value;
+    }
+    let root = super::load_effective_config().ok();
+    let ui = root
+        .as_ref()
+        .and_then(|root| root.get("ui"))
+        .and_then(|ui| ui.get("stream_tool_calls"))
+        .and_then(TomlValue::as_bool);
+    let models = root
+        .as_ref()
+        .and_then(|root| root.get("models"))
+        .and_then(|models| models.get("stream_tool_calls"))
+        .and_then(TomlValue::as_bool);
+    ui.or(models)
+        .unwrap_or(crate::agent::config::UiConfig::STREAM_TOOL_CALLS_DEFAULT)
+}
+
+fn parse_env_bool(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Persist `[ui].stream_tool_calls` and update the live preference.
+pub async fn set_stream_tool_calls(value: bool) -> Result<()> {
+    set_stream_tool_calls_preference(value);
+    update_config(|cfg| cfg.ui.stream_tool_calls = Some(value)).await
+}
+
 /// Persist `[ui].prompt_suggestions` via `update_config`.
 pub async fn set_prompt_suggestions(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.prompt_suggestions = Some(value)).await

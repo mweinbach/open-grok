@@ -380,6 +380,12 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
                 "SetShowThinkingBlocks value differs from expected"
             )
         }
+        ("stream_tool_calls", Action::SetStreamToolCalls(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetStreamToolCalls value differs from expected"
+            )
+        }
         ("prompt_suggestions", Action::SetPromptSuggestions(b)) => {
             assert_eq!(
                 b, expected,
@@ -3153,6 +3159,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetAutoUpdate(_))
             | SettingsKeyOutcome::Action(Action::SetRespectManualFolds(_))
             | SettingsKeyOutcome::Action(Action::SetShowThinkingBlocks(_))
+            | SettingsKeyOutcome::Action(Action::SetStreamToolCalls(_))
             | SettingsKeyOutcome::Action(Action::SetPromptSuggestions(_))
             | SettingsKeyOutcome::Action(Action::SetGroupToolVerbs(_))
             | SettingsKeyOutcome::Action(Action::SetCollapsedEditBlocks(_))

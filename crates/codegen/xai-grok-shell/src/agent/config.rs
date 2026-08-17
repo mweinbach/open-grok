@@ -4190,9 +4190,10 @@ fn apply_global_scalar_defaults(
         if let Some(v) = models.inference_idle_timeout_secs {
             info.inference_idle_timeout_secs.get_or_insert(v);
         }
-        if let Some(v) = models.stream_tool_calls {
-            info.stream_tool_calls.get_or_insert(v);
-        }
+        // `[models].stream_tool_calls` is a live preference fallback (see
+        // `stream_tool_calls_preference`), not a per-model fill. Filling
+        // every ModelInfo here would pin the value and block the Settings
+        // toggle from applying to existing catalog entries.
     }
 }
 /// Built-in default models. Prefer `resolve_model_list()`.
@@ -4570,13 +4571,10 @@ pub struct ModelEntryConfig {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_model_fingerprint: bool,
-    /// Inject `stream_tool_calls: true` into the request body
-    /// so the upstream emits per-chunk `function_call_arguments.delta`
-    /// Without this set, xAI API models send args as one delta
-    /// event, defeating the purpose of streaming.
-    ///
-    /// Per-model opt-in -- BYOK endpoints that don't understand the
-    /// flag should leave this unset to avoid request errors.
+    /// Per-model override for requesting incremental tool-call argument
+    /// deltas. `None` inherits the live Advanced Settings / `[ui]`
+    /// preference. `Some(false)` is the BYOK escape hatch for endpoints
+    /// that reject the xAI `stream_tool_calls` request field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to
@@ -4955,7 +4953,7 @@ pub struct ModelInfo {
     /// Per-model config for the `x-compaction-at` header; `None` disables it.
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: bool,
-    /// When `Some(true)`, the sampler injects `stream_tool_calls: true`
+    /// Explicit per-model override. `None` inherits the live UI preference.
     pub stream_tool_calls: Option<bool>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to
     /// the all-disabled state — the feature is per-model opt-in with a
@@ -6231,6 +6229,21 @@ pub fn resolve_chat_state_auth_type_for_sampling_config(
         }
     }
 }
+/// Resolve whether this request should include the xAI `stream_tool_calls`
+/// field. Per-model overrides win; otherwise the live Settings preference
+/// applies. Non-xAI Responses hosts never receive the field.
+pub fn resolve_stream_tool_calls_inject(
+    model_override: Option<bool>,
+    provider: xai_grok_sampling_types::ModelProvider,
+    backend: ApiBackend,
+) -> bool {
+    xai_grok_sampling_types::should_inject_stream_tool_calls(
+        model_override.unwrap_or_else(crate::util::config::stream_tool_calls_preference),
+        provider,
+        backend,
+    )
+}
+
 pub fn sampling_config_for_model(
     model: &ModelEntry,
     credentials: ResolvedCredentials,
@@ -6305,7 +6318,11 @@ pub fn sampling_config_for_model(
         reasoning_summary: model_reasoning_summary(info),
         force_http1: false,
         max_retries: info.max_retries,
-        stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
+        stream_tool_calls: resolve_stream_tool_calls_inject(
+            info.stream_tool_calls,
+            info.provider,
+            api_backend,
+        ),
         idle_timeout_secs: None,
         client_identifier: None,
         deployment_id: info
@@ -14267,7 +14284,10 @@ default = "grok-4.5"
         assert_eq!(info.max_completion_tokens, Some(4096));
         assert_eq!(info.max_retries, Some(9));
         assert_eq!(info.inference_idle_timeout_secs, Some(600));
-        assert_eq!(info.stream_tool_calls, Some(true));
+        assert_eq!(
+            info.stream_tool_calls, None,
+            "[models].stream_tool_calls is a live preference fallback, not a per-model fill"
+        );
     }
     #[test]
     fn per_model_value_overrides_global_model_default() {
@@ -14298,6 +14318,36 @@ default = "grok-4.5"
             Some(8192),
             "a global-only default must still be inherited"
         );
+    }
+    #[test]
+    fn stream_tool_calls_inject_is_xai_responses_only() {
+        crate::util::config::set_stream_tool_calls_preference(true);
+        assert!(resolve_stream_tool_calls_inject(
+            None,
+            ModelProvider::Xai,
+            ApiBackend::Responses,
+        ));
+        assert!(!resolve_stream_tool_calls_inject(
+            None,
+            ModelProvider::Codex,
+            ApiBackend::Responses,
+        ));
+        assert!(!resolve_stream_tool_calls_inject(
+            Some(true),
+            ModelProvider::Codex,
+            ApiBackend::Responses,
+        ));
+        crate::util::config::set_stream_tool_calls_preference(false);
+        assert!(!resolve_stream_tool_calls_inject(
+            None,
+            ModelProvider::Xai,
+            ApiBackend::Responses,
+        ));
+        assert!(
+            resolve_stream_tool_calls_inject(Some(true), ModelProvider::Xai, ApiBackend::Responses,),
+            "explicit per-model true must beat a live preference of false"
+        );
+        crate::util::config::set_stream_tool_calls_preference(true);
     }
     #[test]
     fn global_model_defaults_do_not_override_prefetched_value() {

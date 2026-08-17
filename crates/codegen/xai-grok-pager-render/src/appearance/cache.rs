@@ -40,6 +40,7 @@ const SIMPLE_MODE_DEFAULT: bool = true;
 /// Vim-mode scrollback default — matches the previous on-disk default.
 const VIM_MODE_DEFAULT: bool = false;
 const SHOW_THINKING_BLOCKS_DEFAULT: bool = true;
+const STREAM_TOOL_CALLS_DEFAULT: bool = UiConfig::STREAM_TOOL_CALLS_DEFAULT;
 const GROUP_TOOL_VERBS_DEFAULT: bool = true;
 /// Collapsed-Edit-blocks rollout flag defaults OFF (legacy expanded diffs).
 const COLLAPSED_EDIT_BLOCKS_DEFAULT: bool = false;
@@ -375,6 +376,49 @@ pub fn load_show_thinking_blocks() -> bool {
 pub fn set_show_thinking_blocks(enabled: bool) {
     SHOW_THINKING_BLOCKS_CURRENT.with(|c| c.set(enabled));
     SHOW_THINKING_BLOCKS_LOADED.with(|l| l.set(true));
+}
+
+// -- Stream tool calls -------------------------------------------------------
+
+thread_local! {
+    static STREAM_TOOL_CALLS_CURRENT: Cell<bool> =
+        const { Cell::new(STREAM_TOOL_CALLS_DEFAULT) };
+    static STREAM_TOOL_CALLS_LOADED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Read cached `stream_tool_calls`, seeding from `[ui]` then `[models]`.
+/// Default ON when unset.
+pub fn load_stream_tool_calls() -> bool {
+    STREAM_TOOL_CALLS_LOADED.with(|loaded| {
+        if !loaded.get() {
+            STREAM_TOOL_CALLS_CURRENT
+                .with(|c| c.set(load_stream_tool_calls_from_effective_config()));
+            loaded.set(true);
+        }
+    });
+    STREAM_TOOL_CALLS_CURRENT.with(|c| c.get())
+}
+
+fn load_stream_tool_calls_from_effective_config() -> bool {
+    let root = match xai_grok_config::load_effective_config_disk_only() {
+        Ok(root) => root,
+        Err(_) => return STREAM_TOOL_CALLS_DEFAULT,
+    };
+    let ui = root
+        .get("ui")
+        .and_then(|ui| ui.get("stream_tool_calls"))
+        .and_then(|value| value.as_bool());
+    let models = root
+        .get("models")
+        .and_then(|models| models.get("stream_tool_calls"))
+        .and_then(|value| value.as_bool());
+    ui.or(models).unwrap_or(STREAM_TOOL_CALLS_DEFAULT)
+}
+
+/// Replace cached `stream_tool_calls`.
+pub fn set_stream_tool_calls(enabled: bool) {
+    STREAM_TOOL_CALLS_CURRENT.with(|c| c.set(enabled));
+    STREAM_TOOL_CALLS_LOADED.with(|l| l.set(true));
 }
 
 // -- Group tool verbs ---------------------------------------------------------
@@ -739,6 +783,10 @@ pub fn prime(ui: &UiConfig) {
     let _ = load_scroll_lines();
     let _ = load_render_mermaid();
     let _ = load_show_thinking_blocks();
+    set_stream_tool_calls(
+        ui.stream_tool_calls
+            .unwrap_or_else(load_stream_tool_calls_from_effective_config),
+    );
     let _ = load_group_tool_verbs();
     let _ = load_collapsed_edit_blocks();
     let _ = load_prompt_suggestions();
@@ -863,6 +911,7 @@ mod tests {
             ui.show_thinking_blocks
                 .unwrap_or(SHOW_THINKING_BLOCKS_DEFAULT)
         );
+        assert_eq!(STREAM_TOOL_CALLS_DEFAULT, ui.stream_tool_calls_enabled());
         assert_eq!(
             GROUP_TOOL_VERBS_DEFAULT,
             ui.group_tool_verbs.unwrap_or(GROUP_TOOL_VERBS_DEFAULT)
@@ -993,6 +1042,18 @@ mod tests {
             assert!(!load_show_thinking_blocks());
             set_show_thinking_blocks(true);
             assert!(load_show_thinking_blocks());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn set_then_load_round_trips_stream_tool_calls() {
+        std::thread::spawn(|| {
+            set_stream_tool_calls(false);
+            assert!(!load_stream_tool_calls());
+            set_stream_tool_calls(true);
+            assert!(load_stream_tool_calls());
         })
         .join()
         .unwrap();

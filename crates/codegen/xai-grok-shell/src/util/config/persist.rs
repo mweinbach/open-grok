@@ -1523,6 +1523,10 @@ auto_update = true
         assert_eq!(cfg.ui.auto_light_theme, Some("grokday".to_string()));
         let cfg = apply(|cfg| cfg.ui.hunk_tracker_mode = Some("off".to_string()));
         assert_eq!(cfg.ui.hunk_tracker_mode, Some("off".to_string()));
+        let cfg = apply(|cfg| cfg.ui.stream_tool_calls = Some(true));
+        assert_eq!(cfg.ui.stream_tool_calls, Some(true));
+        let cfg = apply(|cfg| cfg.ui.stream_tool_calls = Some(false));
+        assert_eq!(cfg.ui.stream_tool_calls, Some(false));
 
         // set_screen_mode wraps `cfg.ui.screen_mode = Some(value)` (the sticky
         // minimal/fullscreen preference written on explicit CLI flags).

@@ -770,6 +770,17 @@ async fn persist_setting_type_mismatch_errors_compact_mode() {
 }
 /// Type-mismatch for `show_timestamps`.
 #[tokio::test]
+async fn persist_setting_type_mismatch_errors_stream_tool_calls() {
+    use crate::settings::SettingValue;
+    let r = persist_setting("stream_tool_calls", SettingValue::String("nope".into())).await;
+    let err = r.expect_err("stream_tool_calls with String payload must return Err");
+    assert!(
+        err.contains("persist_setting(stream_tool_calls) expected Bool"),
+        "error message must mention key + expected kind, got: {err}",
+    );
+}
+/// Type-mismatch for `show_timestamps`.
+#[tokio::test]
 async fn persist_setting_type_mismatch_errors_show_timestamps() {
     use crate::settings::SettingValue;
     let r = persist_setting("show_timestamps", SettingValue::String("nope".into()))

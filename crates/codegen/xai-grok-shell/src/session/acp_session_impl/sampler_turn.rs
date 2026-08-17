@@ -831,6 +831,13 @@ impl SessionActor {
             self.rebuild_spec.multi_agent_policy_enabled,
         );
         let reasoning_summary = self.models_manager.model_reasoning_summary(&cfg.model);
+        let stream_tool_calls = crate::agent::config::resolve_stream_tool_calls_inject(
+            self.models_manager
+                .model_stream_tool_calls_override(&cfg.model)
+                .or(cfg.stream_tool_calls),
+            provider,
+            cfg.api_backend,
+        );
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
@@ -851,7 +858,7 @@ impl SessionActor {
             reasoning_summary,
             force_http1: false,
             max_retries: Some(self.max_retries),
-            stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
+            stream_tool_calls,
             idle_timeout_secs: None,
             client_identifier: profile
                 .request_metadata

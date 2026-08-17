@@ -190,7 +190,7 @@ stream_tool_calls           = true
 
 This is a small, fixed set of environment-wide knobs. Settings that identify a specific model (`model`, `base_url`, `api_key`, `context_window`, ...) cannot be defaulted this way, and a few settings with their own dedicated configuration -- auto-compaction (`[session]`), the system-prompt label (`[agent]`), and reasoning effort (`[models].default_reasoning_effort`) -- keep their existing homes.
 
-> **Note on `stream_tool_calls`:** this one affects request *shape*, not just sampling. A few endpoints (some BYOK providers) expect it left unset; if a global `stream_tool_calls = true` causes problems for such a model, opt that model out with `stream_tool_calls = false` in its `[model.<id>]` block.
+> **Note on `stream_tool_calls`:** this one affects request *shape*, not just sampling. Open Grok only sends the `stream_tool_calls` field to xAI Responses. Codex, DeepSeek, Meta, Chat Completions, and Messages already stream argument fragments without a flag. The user-facing switch is Settings → Advanced → Stream tool calls (`[ui].stream_tool_calls`, default on). A global `[models] stream_tool_calls` value is a fallback when the UI field is unset. If a BYOK Responses endpoint rejects the field, opt that model out with `stream_tool_calls = false` in its `[model.<id>]` block.
 
 ### Request Query Parameters
 

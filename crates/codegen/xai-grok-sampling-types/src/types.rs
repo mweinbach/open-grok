@@ -1615,6 +1615,17 @@ impl ModelProvider {
         matches!(self, Self::Xai)
     }
 
+    /// Whether this provider's Responses dialect accepts the xAI-only
+    /// `stream_tool_calls: true` request field.
+    ///
+    /// Codex, DeepSeek, and Meta already stream
+    /// `function_call_arguments.delta` without a flag. Chat Completions and
+    /// Messages stream argument fragments as part of their native protocols.
+    /// Injecting the xAI field on those hosts can 400.
+    pub const fn supports_stream_tool_calls_request(self, backend: ApiBackend) -> bool {
+        matches!(self, Self::Xai) && matches!(backend, ApiBackend::Responses)
+    }
+
     pub const fn is_codex(self) -> bool {
         matches!(self, Self::Codex)
     }
@@ -1742,10 +1753,21 @@ pub struct SamplingConfig {
     /// `None` omits the field (standard routing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
-    /// When true, inject `stream_tool_calls: true` into the Responses
-    /// API request body so the upstream emits per-chunk argument deltas.
+    /// When `Some`, an explicit per-model override for requesting incremental
+    /// tool-call argument deltas. `None` inherits the live UI preference.
+    /// The sampler still injects the xAI-only `stream_tool_calls` request
+    /// field only for providers that advertise support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+}
+
+/// Whether a Responses request should include `stream_tool_calls: true`.
+pub fn should_inject_stream_tool_calls(
+    requested: bool,
+    provider: ModelProvider,
+    backend: ApiBackend,
+) -> bool {
+    requested && provider.supports_stream_tool_calls_request(backend)
 }
 
 // ============ Responses API wrapper ============
@@ -2122,6 +2144,35 @@ mod tests {
             let round_trip: ProviderProfile = serde_json::from_value(serialized).unwrap();
             assert_eq!(round_trip, profile);
         }
+    }
+
+    #[test]
+    fn stream_tool_calls_request_flag_is_xai_responses_only() {
+        assert!(ModelProvider::Xai.supports_stream_tool_calls_request(ApiBackend::Responses));
+        assert!(
+            !ModelProvider::Xai.supports_stream_tool_calls_request(ApiBackend::ChatCompletions)
+        );
+        assert!(!ModelProvider::Codex.supports_stream_tool_calls_request(ApiBackend::Responses));
+        assert!(!ModelProvider::DeepSeek.supports_stream_tool_calls_request(ApiBackend::Responses));
+        assert!(!ModelProvider::Meta.supports_stream_tool_calls_request(ApiBackend::Responses));
+        assert!(
+            !ModelProvider::Kimi.supports_stream_tool_calls_request(ApiBackend::ChatCompletions)
+        );
+        assert!(should_inject_stream_tool_calls(
+            true,
+            ModelProvider::Xai,
+            ApiBackend::Responses
+        ));
+        assert!(!should_inject_stream_tool_calls(
+            false,
+            ModelProvider::Xai,
+            ApiBackend::Responses
+        ));
+        assert!(!should_inject_stream_tool_calls(
+            true,
+            ModelProvider::Codex,
+            ApiBackend::Responses
+        ));
     }
 
     #[test]

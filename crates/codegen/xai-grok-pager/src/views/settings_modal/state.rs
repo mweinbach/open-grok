@@ -1086,6 +1086,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "toolset.perplexity_web_search.enabled" => Some(Action::SetPerplexityWebSearch(new)),
         "toolset.x_search.enabled" => Some(Action::SetXSearchEnabled(new)),
         "show_thinking_blocks" => Some(Action::SetShowThinkingBlocks(new)),
+        "stream_tool_calls" => Some(Action::SetStreamToolCalls(new)),
         "group_tool_verbs" => Some(Action::SetGroupToolVerbs(new)),
         "collapsed_edit_blocks" => Some(Action::SetCollapsedEditBlocks(new)),
         "prompt_suggestions" => Some(Action::SetPromptSuggestions(new)),

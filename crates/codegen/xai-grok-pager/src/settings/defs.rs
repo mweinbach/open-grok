@@ -2316,6 +2316,36 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: true,
             hidden_in_minimal: false,
         },
+        // SHELL-owned, persisted to `[ui].stream_tool_calls`. Default ON.
+        // Requests incremental tool-call argument deltas on hosts that have
+        // a request switch (xAI Responses). Codex / Chat / Messages already
+        // stream natively; the toggle also gates the TUI "Writing…" activity.
+        SettingMeta {
+            key: "stream_tool_calls",
+            category: SettingCategory::Advanced,
+            owner: SettingOwner::Shell,
+            label: "Stream tool calls",
+            description: "Show tool-call arguments as they stream, and ask hosts \
+                          that support it (Grok Responses) for incremental deltas. \
+                          Codex and other streaming hosts already send fragments \
+                          without a flag. Turn off if a custom endpoint rejects \
+                          the request field.",
+            keywords: &[
+                "stream",
+                "streaming",
+                "tool",
+                "tools",
+                "tool call",
+                "arguments",
+                "delta",
+                "writing",
+            ],
+            kind: SettingKind::Bool {
+                default: ui_default.stream_tool_calls_enabled(),
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned, persisted to `[ui].voice_keybind_enabled`. Default ON —
         // `None` (inherit) reads as `true`. Disables only the Ctrl+Space / F8
         // chord; `/voice` (and Esc / the recording-row `[stop]`) keep working.

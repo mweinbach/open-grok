@@ -2724,7 +2724,13 @@ impl SamplingClient {
             SamplingError::Serialization(e)
         })?;
         // Inject xAI-specific fields not in async-openai's CreateResponse type.
-        if self.defaults.stream_tool_calls {
+        // Codex / DeepSeek / Meta already stream argument deltas natively;
+        // the `stream_tool_calls` field is xAI Responses-only.
+        if xai_grok_sampling_types::should_inject_stream_tool_calls(
+            self.defaults.stream_tool_calls,
+            self.defaults.provider,
+            self.defaults.api_backend,
+        ) {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);

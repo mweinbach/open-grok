@@ -881,7 +881,13 @@ async fn read_parent_sampling_config(
                     .model_reasoning_summary(ctx.model_id.0.as_ref()),
                 force_http1: false,
                 max_retries: None,
-                stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
+                stream_tool_calls: crate::agent::config::resolve_stream_tool_calls_inject(
+                    ctx.models_manager
+                        .model_stream_tool_calls_override(&cfg.model)
+                        .or(cfg.stream_tool_calls),
+                    provider,
+                    cfg.api_backend,
+                ),
                 idle_timeout_secs: None,
                 client_identifier: profile
                     .request_metadata

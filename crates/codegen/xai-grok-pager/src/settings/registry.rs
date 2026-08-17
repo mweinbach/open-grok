@@ -937,6 +937,9 @@ pub fn current_value_for(
         "show_thinking_blocks" => Some(SettingValue::Bool(
             crate::appearance::cache::load_show_thinking_blocks(),
         )),
+        "stream_tool_calls" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_stream_tool_calls(),
+        )),
         // Live cache (like `show_thinking_blocks`).
         "group_tool_verbs" => Some(SettingValue::Bool(
             crate::appearance::cache::load_group_tool_verbs(),
@@ -1579,6 +1582,13 @@ mod tests {
                         *default,
                         ui.show_thinking_blocks.unwrap_or(true),
                         "show_thinking_blocks default drifts from UiConfig::default()"
+                    );
+                }
+                ("stream_tool_calls", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.stream_tool_calls_enabled(),
+                        "stream_tool_calls default drifts from UiConfig::default()"
                     );
                 }
                 // group_tool_verbs: Option<bool>; None → true (client default).

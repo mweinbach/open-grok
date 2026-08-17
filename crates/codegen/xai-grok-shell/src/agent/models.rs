@@ -1829,6 +1829,13 @@ impl ModelsManager {
             .is_some_and(|entry| config::supports_codex_multi_agent_v2(entry.info()))
     }
 
+    /// Explicit per-model `stream_tool_calls` override, if any.
+    pub fn model_stream_tool_calls_override(&self, model_id: &str) -> Option<bool> {
+        let cat = self.inner.catalog.read();
+        config::find_model_by_id(&cat.models, model_id)
+            .and_then(|entry| entry.info().stream_tool_calls)
+    }
+
     /// Resolve the effective Codex reasoning-summary mode by catalog key or
     /// routing slug. The authenticated models.json snapshot remains
     /// authoritative across client rebuilds and subagent inheritance.

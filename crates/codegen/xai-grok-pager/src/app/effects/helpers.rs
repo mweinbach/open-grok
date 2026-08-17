@@ -1423,6 +1423,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "stream_tool_calls" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("stream_tool_calls", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_stream_tool_calls(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "group_tool_verbs" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("group_tool_verbs", "Bool", &value));

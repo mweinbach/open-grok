@@ -99,9 +99,9 @@ use super::settings::setters::{
     set_prompt_suggestions, set_recap_model, set_remember_tool_approvals, set_render_mermaid,
     set_respect_manual_folds, set_runinfra_api_key, set_screen_mode, set_scroll_lines,
     set_scroll_mode, set_scroll_speed, set_show_thinking_blocks, set_show_tips, set_simple_mode,
-    set_theme, set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode,
-    set_voice_keybind_enabled, set_voice_stt_language, set_wafer_api_key, set_web_search_source,
-    set_x_search_enabled, set_zai_api_key,
+    set_stream_tool_calls, set_theme, set_timeline, set_timestamps, set_vim_mode,
+    set_voice_capture_mode, set_voice_keybind_enabled, set_voice_stt_language, set_wafer_api_key,
+    set_web_search_source, set_x_search_enabled, set_zai_api_key,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette,
@@ -1136,6 +1136,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetInvertScroll(v) => set_invert_scroll(app, v),
         Action::SetScrollLines(v) => set_scroll_lines(app, v),
         Action::SetShowThinkingBlocks(v) => set_show_thinking_blocks(app, v),
+        Action::SetStreamToolCalls(v) => set_stream_tool_calls(app, v),
         Action::SetGroupToolVerbs(v) => set_group_tool_verbs(app, v),
         Action::SetCollapsedEditBlocks(v) => set_collapsed_edit_blocks(app, v),
         Action::SetPromptSuggestions(v) => set_prompt_suggestions(app, v),

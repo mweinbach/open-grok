@@ -1,6 +1,34 @@
 use crate::util::config::RemoteSettings;
 use toml::Value as TomlValue;
 
+/// Env override for requesting incremental tool-call argument streaming.
+pub const ENV_STREAM_TOOL_CALLS: &str = "GROK_STREAM_TOOL_CALLS";
+
+#[cfg(test)]
+static STREAM_TOOL_CALLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Resolve whether to request incremental tool-call argument streaming.
+///
+/// Precedence: requirements > env (`GROK_STREAM_TOOL_CALLS`) >
+/// `[ui] stream_tool_calls` > managed > remote settings > default `true`.
+pub fn resolve_stream_tool_calls(
+    requirements: Option<&TomlValue>,
+    user: Option<&TomlValue>,
+    managed: Option<&TomlValue>,
+    remote: Option<&RemoteSettings>,
+) -> crate::agent::config::Resolved<bool> {
+    let _ = remote;
+    resolve_ui_bool(
+        ENV_STREAM_TOOL_CALLS,
+        "stream_tool_calls",
+        crate::agent::config::UiConfig::STREAM_TOOL_CALLS_DEFAULT,
+        requirements,
+        user,
+        managed,
+        None,
+    )
+}
+
 /// Env override for showing agent thinking blocks in the TUI.
 pub const ENV_SHOW_THINKING_BLOCKS: &str = "GROK_SHOW_THINKING_BLOCKS";
 
@@ -168,6 +196,52 @@ mod tests {
         // No effective config → the parsed struct field is the fallback layer.
         let resolved = resolve_mouse_reporting_toggle(None, &ui);
         assert!(resolved.value);
+    }
+}
+
+#[cfg(test)]
+mod stream_tool_calls_tests {
+    use super::*;
+    use crate::agent::config::ConfigSource;
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = super::STREAM_TOOL_CALLS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(ENV_STREAM_TOOL_CALLS) };
+        g
+    }
+
+    fn toml_ui(v: bool) -> TomlValue {
+        toml::from_str(&format!("[ui]\nstream_tool_calls = {v}\n")).unwrap()
+    }
+
+    #[test]
+    fn defaults_on_when_nothing_set() {
+        let _g = guard();
+        let r = resolve_stream_tool_calls(None, None, None, None);
+        assert!(r.value, "streamed tool calls must default ON");
+        assert_eq!(r.source, ConfigSource::Default);
+    }
+
+    #[test]
+    fn config_can_turn_it_off() {
+        let _g = guard();
+        let off = toml_ui(false);
+        let r = resolve_stream_tool_calls(None, Some(&off), None, None);
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn env_overrides_config() {
+        let _g = guard();
+        unsafe { std::env::set_var(ENV_STREAM_TOOL_CALLS, "0") };
+        let on = toml_ui(true);
+        let r = resolve_stream_tool_calls(None, Some(&on), None, None);
+        assert!(!r.value, "env must override config");
+        assert_eq!(r.source, ConfigSource::Env);
+        unsafe { std::env::remove_var(ENV_STREAM_TOOL_CALLS) };
     }
 }
 

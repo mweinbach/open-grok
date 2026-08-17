@@ -268,6 +268,11 @@ pub struct UiConfig {
     /// `None` inherits remote/default; skipped when untouched.
     #[serde(default, skip_serializing_if = "DisplayRefreshSettings::is_default")]
     pub display_refresh: DisplayRefreshSettings,
+    /// Request incremental tool-call argument streaming where the host has a
+    /// switch (xAI Responses `stream_tool_calls`). `None` = on (client default).
+    /// Written by the pager's Advanced Settings toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_tool_calls: Option<bool>,
 }
 
 /// User-config opt-outs for the per-tip contextual hints, serialized as
@@ -387,6 +392,7 @@ impl Default for UiConfig {
             follow_up_behavior: None,
             enter_steers: None,
             display_refresh: DisplayRefreshSettings::default(),
+            stream_tool_calls: None,
         }
     }
 }
@@ -437,6 +443,15 @@ impl UiConfig {
 
     /// Canonical default for `[ui].follow_up_behavior`.
     pub const FOLLOW_UP_BEHAVIOR_DEFAULT: &'static str = "queue";
+
+    /// Default for [`Self::stream_tool_calls`] when unset.
+    pub const STREAM_TOOL_CALLS_DEFAULT: bool = true;
+
+    /// Resolved streamed-tool-call request preference.
+    pub fn stream_tool_calls_enabled(&self) -> bool {
+        self.stream_tool_calls
+            .unwrap_or(Self::STREAM_TOOL_CALLS_DEFAULT)
+    }
 
     /// Resolved follow-up behavior: `"queue"` or `"steer"`.
     /// Unknown values fall back to queue.

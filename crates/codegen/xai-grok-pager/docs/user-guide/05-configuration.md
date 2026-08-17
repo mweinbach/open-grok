@@ -45,6 +45,8 @@ top_p = 0.95
 max_completion_tokens = 8192
 max_retries = 8
 inference_idle_timeout_secs = 600
+# Fallback when [ui].stream_tool_calls is unset. Prefer Settings → Advanced
+# → Stream tool calls, which writes [ui].stream_tool_calls.
 stream_tool_calls = true
 
 [ui]
@@ -56,6 +58,9 @@ remember_tool_approvals = false        # show per-command "Always allow" options
                                        # grants are remembered per project (default: false); see 22-permissions-and-safety.md
 code_mode = "direct"                   # "direct", "code_mode" (mixed), or "code_mode_only";
                                        # restart Open Grok after changing this setting
+stream_tool_calls = true               # request incremental tool-call argument deltas on
+                                       # hosts that support a request flag (Grok Responses).
+                                       # Default on. Settings → Advanced → Stream tool calls.
 image_generation_provider = "grok"     # "grok" (Imagine) or "openai" (gpt-image-2 via Codex OAuth);
                                        # restart Open Grok after changing this setting
 show_thinking_blocks = true            # show agent thinking blocks in the TUI (default: true)

@@ -1073,6 +1073,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "auto_update",
             // SHELL-owned hunk_tracker_mode (Advanced; `off` disables it).
             "hunk_tracker_mode",
+            "stream_tool_calls",
             "memory.enabled",
             "memory.dream.enabled",
             // Advanced opt-in feature flags (config/env-only until exposed
