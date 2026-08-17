@@ -354,11 +354,12 @@ impl MvpAgent {
             return Vec::new();
         }
 
-        let live_lines = crate::session::storage::filter_delta_replay_lines_with_prior_and_transport_ids(
-            contents,
-            prior_contents,
-            code_mode_transport_ids,
-        );
+        let live_lines =
+            crate::session::storage::filter_delta_replay_lines_with_prior_and_transport_ids(
+                contents,
+                prior_contents,
+                code_mode_transport_ids,
+            );
         let delta_count = live_lines.len();
 
         let mut completions = Vec::with_capacity(live_lines.len());

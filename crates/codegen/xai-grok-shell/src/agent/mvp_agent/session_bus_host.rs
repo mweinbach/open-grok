@@ -30,9 +30,8 @@ impl MvpAgent {
             return;
         }
         let agent_ref = super::LocalRef::new(self);
-        let router: PeerRouter = Rc::new(move |msg: &PeerSessionMessage| {
-            route_peer_message(agent_ref.get(), msg)
-        });
+        let router: PeerRouter =
+            Rc::new(move |msg: &PeerSessionMessage| route_peer_message(agent_ref.get(), msg));
         let probe = {
             let activity = self.activity.clone();
             Rc::new(move || activity.live_session_states())
