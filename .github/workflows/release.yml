@@ -188,9 +188,11 @@ jobs:
           set -euo pipefail
           smoke_root="$(mktemp -d)"
           trap 'rm -rf "$smoke_root"' EXIT
+          export HOME="$smoke_root/profile-home"
           export OPENGROK_HOME="$smoke_root/home"
           export OPEN_GROK_BIN_DIR="$smoke_root/bin"
           export OPEN_GROK_RELEASE_BASE_URL="file://$PWD/dist"
+          mkdir -p "$HOME"
           bash dist/install.sh '${{ needs.resolve.outputs.tag }}'
           "$smoke_root/bin/open-grok" --version | grep -F "$(cat OPEN_GROK_VERSION)"
           "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
