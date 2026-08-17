@@ -1167,6 +1167,12 @@ pub(super) async fn run_session(
                                 "Permission state reset via notification"
                             );
                         }
+                        SessionCommand::AddWorkingDirectory { path, respond_to } => {
+                            session.handle_add_working_directory(&path, respond_to);
+                        }
+                        SessionCommand::RemoveWorkingDirectory { path, respond_to } => {
+                            session.handle_remove_working_directory(&path, respond_to);
+                        }
                         SessionCommand::Rewind { request, respond_to } => {
                             let result = session.handle_rewind(request).await;
                             let _ = respond_to.send(result);

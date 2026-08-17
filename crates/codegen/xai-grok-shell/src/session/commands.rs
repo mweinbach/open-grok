@@ -8,7 +8,16 @@ use super::plan_mode::PromptMode;
 use crate::extensions::notification::SessionNotification;
 use crate::session::signals::TurnDeltaSnapshot;
 use agent_client_protocol as acp;
+use std::path::PathBuf;
 use tokio::sync::oneshot;
+
+/// Result of an add/remove working-directory mutation: whether the set
+/// changed and the full canonical list afterwards (newest last).
+#[derive(Debug, Clone)]
+pub struct WorkingDirectoryChange {
+    pub changed: bool,
+    pub directories: Vec<PathBuf>,
+}
 /// Structured context for a cancelled turn, replacing stringly-typed JSON.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct CancellationContext {
@@ -428,6 +437,21 @@ pub enum SessionCommand {
         trigger: crate::session::swarm_mode::SwarmModeTrigger,
     },
     ResetPermissionState,
+    /// Add a working directory to this session's scope (`/add-dir`): widens
+    /// file Read/Edit permissions to the canonicalized directory, records it
+    /// in session state (persisted for resume), and discloses the new working
+    /// set to the model via an environment-update reminder.
+    AddWorkingDirectory {
+        path: PathBuf,
+        respond_to: oneshot::Sender<Result<WorkingDirectoryChange, String>>,
+    },
+    /// Remove a previously added working directory (canonical or as-given
+    /// path). Permission rules for it are dropped by rebuilding the session
+    /// rule set from the remaining directories.
+    RemoveWorkingDirectory {
+        path: PathBuf,
+        respond_to: oneshot::Sender<Result<WorkingDirectoryChange, String>>,
+    },
     Rewind {
         request: RewindRequest,
         respond_to: oneshot::Sender<anyhow::Result<RewindResponse>>,

@@ -291,6 +291,7 @@ async fn create_test_actor_with_memory(
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
         last_announced_user_info_hash: std::cell::Cell::new(None),
         last_announced_rules_hash: std::cell::Cell::new(None),
+        additional_working_dirs: std::cell::RefCell::new(Vec::new()),
         prefix_carries_fallback_date: std::cell::Cell::new(false),
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),

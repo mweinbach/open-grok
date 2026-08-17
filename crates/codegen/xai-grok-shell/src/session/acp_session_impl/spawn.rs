@@ -399,6 +399,11 @@ pub(crate) async fn spawn_session_actor(
         session_info.id.0,
         mcp_servers.len()
     );
+    // `/add-dir` working directories persisted for this session (empty for
+    // new sessions: no working_dirs.json exists yet).
+    let persisted_working_dirs = super::working_dirs::read_working_dirs_file(
+        &crate::session::persistence::session_dir(&session_info),
+    );
     let _ = support_permission;
     let owns_permission_manager = inherited_permission_handle.is_none();
     let (permissions, permission_events_rx, deny_read_globs) = if let Some(handle) =
@@ -1960,7 +1965,14 @@ pub(crate) async fn spawn_session_actor(
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: workspace_ops.clone(),
         trace_config_template: std::cell::RefCell::new(None),
+        additional_working_dirs: std::cell::RefCell::new(Vec::new()),
     });
+    // Restore `/add-dir` working directories persisted for this session:
+    // re-grant the file Read/Edit scope (no model disclosure — the persisted
+    // conversation already carries the history).
+    if !persisted_working_dirs.is_empty() {
+        session.restore_working_dirs(persisted_working_dirs);
+    }
     if owns_permission_manager {
         session.wire_permission_prompt_notification();
     }

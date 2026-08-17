@@ -167,6 +167,8 @@ mod environment_update;
 use environment_update::*;
 #[path = "acp_session_impl/laziness_classifier.rs"]
 mod laziness_classifier;
+#[path = "acp_session_impl/working_dirs.rs"]
+mod working_dirs;
 pub(crate) use laziness_classifier::*;
 #[path = "acp_session_impl/notification_drain.rs"]
 mod notification_drain;
@@ -976,6 +978,11 @@ pub(crate) struct SessionActor {
     pub(crate) last_announced_user_info_hash: std::cell::Cell<Option<u64>>,
     /// Hash of the last AGENTS.md / rules snapshot announced to the model.
     pub(crate) last_announced_rules_hash: std::cell::Cell<Option<u64>>,
+    /// Additional working directories added mid-session via `/add-dir`
+    /// (canonicalized). Empty for sessions that never added one. Drives
+    /// permission scope, the model-facing working-set disclosure, and
+    /// `working_dirs.json` persistence; restored on resume.
+    pub(crate) additional_working_dirs: std::cell::RefCell<Vec<std::path::PathBuf>>,
     /// True when the render-failure fallback stamped a date into a date-free template's prefix, so
     /// [`SessionActor::maybe_inject_date_rollover_reminder`] still rolls it over.
     pub(crate) prefix_carries_fallback_date: std::cell::Cell<bool>,

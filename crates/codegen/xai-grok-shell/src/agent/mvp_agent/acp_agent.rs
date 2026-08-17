@@ -2959,6 +2959,12 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::session_admin::handle(self, &args).await
             }
             "x.ai/session/repair" => crate::extensions::repair::handle(self, &args).await,
+            "x.ai/session/add_working_directory" => {
+                crate::extensions::working_dirs::handle_add(self, &args).await
+            }
+            "x.ai/session/remove_working_directory" => {
+                crate::extensions::working_dirs::handle_remove(self, &args).await
+            }
             "x.ai/session/usage" => crate::extensions::usage::handle(self, &args).await,
             "x.ai/session/cache" => crate::extensions::cache::handle(self, &args).await,
             "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
