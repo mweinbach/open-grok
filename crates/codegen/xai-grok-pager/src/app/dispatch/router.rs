@@ -133,6 +133,7 @@ use super::turn::{
     dispatch_demote_to_background, dispatch_kill_bg_task, dispatch_kill_subagent,
 };
 use super::voice::{dispatch_enable_voice_mode, dispatch_voice_stop, dispatch_voice_toggle};
+use super::working_dirs::dispatch_working_directory_mutation;
 use crate::app::actions::{Action, Effect};
 use crate::app::agent_view::ActivePane;
 use crate::app::app_view::{ActiveView, AppView, AuthState};
@@ -1047,6 +1048,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::OpenTutorial => dispatch_open_tutorial(app),
         Action::RenameSession { title } => dispatch_rename_session(app, title),
+        Action::AddSessionWorkingDirectory { input } => {
+            dispatch_working_directory_mutation(app, input, false)
+        }
+        Action::RemoveSessionWorkingDirectory { input } => {
+            dispatch_working_directory_mutation(app, input, true)
+        }
         Action::ResetSessionTitleToAuto => dispatch_reset_session_title(app),
         Action::ShowContextInfo => dispatch_show_context_info(app),
         Action::ShowUsage => dispatch_show_usage(app),

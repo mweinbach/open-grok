@@ -18,6 +18,7 @@ mod task_result;
 mod transcript;
 mod turn;
 mod voice;
+mod working_dirs;
 use super::billing::{
     CreditLimitUpsellMode, credit_limit_upsell_mode, is_max_tier, open_credit_limit_upsell,
     open_free_usage_upsell,

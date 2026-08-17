@@ -6460,6 +6460,78 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::SendWorkingDirectoryMutation {
+            agent_id,
+            session_id,
+            path,
+            remove,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let method = if remove {
+                    "x.ai/session/remove_working_directory"
+                } else {
+                    "x.ai/session/add_working_directory"
+                };
+                let params = serde_json::json!({
+                    "sessionId": session_id.0.to_string(),
+                    "path": path,
+                });
+                let request = acp::ExtRequest::new(
+                    method,
+                    serde_json::value::to_raw_value(&params)
+                        .expect("serialize working-directory params")
+                        .into(),
+                );
+                let outcome = match acp_send(request, &tx).await {
+                    Ok(resp) => {
+                        let wrapper: serde_json::Value =
+                            serde_json::from_str(resp.0.get()).unwrap_or_default();
+                        if let Some(err) = wrapper.get("error").filter(|v| !v.is_null()) {
+                            let msg = err
+                                .as_str()
+                                .map(String::from)
+                                .unwrap_or_else(|| err.to_string());
+                            Err(msg)
+                        } else {
+                            let result = wrapper.get("result").unwrap_or(&wrapper);
+                            let changed = result
+                                .get("changed")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(true);
+                            let directories = result
+                                .get("directories")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|v| v.as_str().map(str::to_owned))
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            Ok((changed, directories))
+                        }
+                    }
+                    Err(e) => Err(sanitize_user_error(&e.to_string())),
+                };
+                match outcome {
+                    Ok((changed, directories)) => TaskResult::WorkingDirectoryMutated {
+                        agent_id,
+                        remove,
+                        changed,
+                        directories,
+                        error: None,
+                    },
+                    Err(error) => TaskResult::WorkingDirectoryMutated {
+                        agent_id,
+                        remove,
+                        changed: false,
+                        directories: Vec::new(),
+                        error: Some(error),
+                    },
+                }
+            });
+        }
         Effect::FetchCatalogEntry { kind, name } => {
             let tx = acp_tx.clone();
             tasks

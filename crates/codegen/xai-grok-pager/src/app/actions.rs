@@ -1131,6 +1131,19 @@ pub enum Action {
     DashboardChangeLocation {
         input: String,
     },
+    /// Add a working directory to the active session's scope (`/add-dir`).
+    /// `input` is the raw path text; the shell canonicalizes, appends
+    /// session Read/Edit allow rules, persists the set, and discloses it
+    /// to the model. Distinct from `DashboardChangeLocation`, which only
+    /// moves where NEW dashboard sessions spawn.
+    AddSessionWorkingDirectory {
+        input: String,
+    },
+    /// Remove a working directory from the active session's scope
+    /// (`/remove-dir`).
+    RemoveSessionWorkingDirectory {
+        input: String,
+    },
     /// Confirm the dashboard worktree-label dialog: create the next
     /// dashboard agent in a fresh git worktree (rooted at `app.cwd`) using
     /// `label` (`None` → auto-generated). Any prompt stashed when the dialog
@@ -2404,6 +2417,15 @@ pub enum Effect {
         /// interjections — the wire shape stays byte-identical to legacy.
         blocks: Option<Vec<acp::ContentBlock>>,
     },
+    /// Add/remove a session working directory via the
+    /// `x.ai/session/{add,remove}_working_directory` ext methods.
+    SendWorkingDirectoryMutation {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        /// Raw path text (the shell canonicalizes `~` / relative forms).
+        path: String,
+        remove: bool,
+    },
     /// Log out via `x.ai/auth/logout` with provider ownership snapshotted
     /// before shell model updates can rewrite the live catalogs.
     Logout {
@@ -3523,6 +3545,18 @@ pub enum TaskResult {
     /// Interjection queued acknowledgement.
     InterjectQueued {
         agent_id: AgentId,
+    },
+    /// A `/add-dir` / `/remove-dir` mutation completed. `error` is `None`
+    /// on success, carrying the shell's validation message otherwise.
+    /// `remove` records which slash verb produced this so the completion
+    /// toast can phrase the outcome; `directories` is the resulting set of
+    /// additional working directories (the session cwd is implicit).
+    WorkingDirectoryMutated {
+        agent_id: AgentId,
+        remove: bool,
+        changed: bool,
+        directories: Vec<String>,
+        error: Option<String>,
     },
     /// Interjection send failed. Carries the payload so the dispatcher can
     /// requeue it (mirrors the batch path's `failed_local` requeue) — the

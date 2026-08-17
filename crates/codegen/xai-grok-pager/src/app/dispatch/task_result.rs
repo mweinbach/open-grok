@@ -4876,6 +4876,38 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             minimal_request_id,
         } => handle_btw_response(app, agent_id, result, minimal_request_id),
         TaskResult::InterjectQueued { .. } => vec![],
+        TaskResult::WorkingDirectoryMutated {
+            agent_id,
+            remove,
+            changed,
+            directories,
+            error,
+        } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if let Some(error) = error {
+                    agent.show_toast(&format!(
+                        "Couldn't {} working directory: {error}",
+                        if remove { "remove" } else { "add" }
+                    ));
+                } else if !changed {
+                    agent.show_toast(if remove {
+                        "Directory was not in the working set"
+                    } else {
+                        "Directory already in the working set"
+                    });
+                } else if directories.is_empty() {
+                    agent.show_toast("Working set is back to the session directory only");
+                } else {
+                    let noun = if directories.len() == 1 {
+                        "directory"
+                    } else {
+                        "directories"
+                    };
+                    agent.show_toast(&format!("Working {noun}: {}", directories.join(", ")));
+                }
+            }
+            vec![]
+        }
         TaskResult::RecapRequested {
             session_id,
             auto,

@@ -73,6 +73,7 @@ pub mod view_plan;
 pub mod vim_mode;
 pub mod voice;
 pub mod workflows;
+pub mod working_dirs;
 use super::command::SlashCommand;
 use std::sync::Arc;
 /// All pager-local builtin commands, in display order.
@@ -118,6 +119,8 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(rename::RenameCommand),
         Arc::new(dashboard::DashboardCommand),
         Arc::new(cd::CdCommand),
+        Arc::new(working_dirs::AddDirCommand),
+        Arc::new(working_dirs::RemoveDirCommand),
         Arc::new(theme::ThemeCommand),
         Arc::new(feedback::FeedbackCommand),
         Arc::new(announcements::AnnouncementsCommand),
