@@ -444,6 +444,16 @@ mod tests {
         );
         assert!(entries["glm-5.2-fast"].info.service_tiers[0].is_fast());
         assert!(entries["fireworks:kimi-k3-fast"].info.service_tiers[0].is_fast());
+        for key in ["glm-5.2", "glm-5.2-fast"] {
+            assert!(
+                !crate::model_image_input::acp_accepts_images(key, &entries[key].info.model),
+                "{key} must be text-only"
+            );
+        }
+        assert!(crate::model_image_input::acp_accepts_images(
+            "fireworks:kimi-k3",
+            &entries["fireworks:kimi-k3"].info.model
+        ));
     }
 
     #[test]

@@ -68,10 +68,13 @@ private metadata, or xAI-only exports.
 
 Live `/models` objects are `{id, object, created, owned_by}` only — there is
 no `context_window`, `context_length`, or `max_model_len`. Open Grok assigns
-curated windows by case-insensitive prefix (most-specific first): `glm-5.2`
-→ 1_000_000 (max completion 131072); `glm-4-32b` or any id containing `128k`
+curated windows by case-insensitive prefix (most-specific first): `glm-5.3`
+and `glm-5.2` → 1_000_000 (max completion 131072); `glm-4-32b` or any id containing `128k`
 → 128_000; other `glm-5`, `glm-4.7`, `glm-4.6`, `glm-4.5`, and `glm-4` ids
-→ 200_000; unknown ids → 200_000. A positive wire context field, if the
+→ 200_000; unknown ids → 200_000. `glm-5`, `glm-5.1`, `glm-5.2`, and
+`glm-5.3` (including Fireworks `glm-5p2` slugs) are text-only: they do not
+accept image input, and a `read_file` / `view_image` of an image returns a
+model-facing error. Vision variants such as `glm-5v` stay multimodal. A positive wire context field, if the
 endpoint ever sends one, wins over the curated value. After a live Z AI (or
 Wafer) catalog replace, user `[model.*]` / `cfg.config_models` are re-applied
 so custom entries and field overrides survive.

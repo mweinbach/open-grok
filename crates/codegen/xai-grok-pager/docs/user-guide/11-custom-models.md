@@ -361,10 +361,13 @@ GLM Coding Plan endpoint (`https://api.z.ai/api/coding/paas/v4` by default;
 override with `OPENGROK_ZAI_API_BASE_URL`) rather than relying on a static
 model list. That `/models` response lists ids only — it does not include
 `context_window`, `context_length`, or `max_model_len`. Open Grok therefore
-assigns context windows from published GLM sizes: **glm-5.2** is
-**1,000,000** tokens (max output 131,072); other listed GLM text models are
-**200,000**. Override either value with `context_window` in `[model.*]` or
+assigns context windows from published GLM sizes: **glm-5.3** and
+**glm-5.2** are **1,000,000** tokens (max output 131,072); other listed GLM
+text models are **200,000**. Override either value with `context_window` in `[model.*]` or
 the Context window field under **Settings → Models → Custom models**.
+**glm-5**, **glm-5.1**, **glm-5.2**, and **glm-5.3** are text-only models:
+they cannot accept image input, and reading an image file returns an error
+to the model.
 
 Set `ZAI_API_KEY` (or connect it with `/login zai`) and pick one of the
 returned GLM model IDs. To add a GLM id that is not in the live list, use

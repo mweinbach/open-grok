@@ -781,6 +781,7 @@ impl SessionActor {
             .await
             .map(|c| c.model)
             .unwrap_or_default();
+        let accepts_images = crate::model_image_input::model_accepts_images(&model_id);
         if self.telemetry_enabled || xai_grok_telemetry::external::is_active() {
             let effective_client_identifier =
                 prompt_client_identifier.or_else(|| self.client_identifier.clone());
@@ -811,11 +812,18 @@ impl SessionActor {
         }
         self.drain_between_turn_completions().await;
         self.inject_workflow_status_reminder().await;
-        let user_message = if user_images.is_empty() {
+        let user_message = if user_images.is_empty() && extra_images.is_empty() {
             user_message
         } else if self.is_cursor_harness() {
             self.transcribe_user_images(user_message, &user_images)
                 .await?
+        } else if !accepts_images {
+            let mut message = user_message;
+            if !message.is_empty() {
+                message.push_str("\n\n");
+            }
+            message.push_str(crate::model_image_input::TEXT_ONLY_MODEL_IMAGE_ERROR);
+            message
         } else {
             let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
                 &crate::session::info::Info {
@@ -836,7 +844,7 @@ impl SessionActor {
                     .data(format!("failed to save user images to assets dir: {e}"))
             })?
         };
-        let attached_image_refs = if self.is_cursor_harness() {
+        let attached_image_refs = if self.is_cursor_harness() || !accepts_images {
             Vec::new()
         } else {
             crate::session::placeholder_images::attached_image_references(&user_images)
@@ -898,7 +906,7 @@ impl SessionActor {
                 }
             };
             user_chat.set_prompt_index(current_prompt_index);
-            if !self.is_cursor_harness() {
+            if !self.is_cursor_harness() && accepts_images {
                 for image in &user_images {
                     user_chat.add_image(pick_user_image_url(image));
                 }
@@ -2557,6 +2565,19 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
+            if !crate::model_image_input::model_accepts_images(
+                request.model.as_deref().unwrap_or(""),
+            ) {
+                let stripped = request.strip_images();
+                if !stripped.is_empty() {
+                    tracing::info!(
+                        session_id = %self.session_info.id,
+                        count = stripped.len(),
+                        model = request.model.as_deref().unwrap_or(""),
+                        "stripped image input for text-only model"
+                    );
+                }
+            }
             request.x_grok_session_id = Some(self.session_info.id.to_string());
             request.x_grok_cache_affinity_id = self.startup_hints.cache_affinity_id.clone();
             request.x_grok_turn_idx =

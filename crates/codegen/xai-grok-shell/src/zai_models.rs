@@ -37,6 +37,7 @@ const KNOWN_REASONING_MODEL_PREFIXES: &[&str] =
 /// Kept current with Z AI's published GLM text model lineup; the dynamic
 /// catalog overrides this once a query succeeds.
 const FALLBACK_MODEL_IDS: &[&str] = &[
+    "glm-5.3",
     "glm-5.2",
     "glm-5-turbo",
     "glm-5.1",
@@ -112,7 +113,7 @@ fn is_known_reasoning_model(model_id: &str) -> bool {
 /// return a window; these values come from Z.AI's published GLM docs.
 fn curated_limits(model_id: &str) -> (u64, Option<u32>) {
     let lower = model_id.to_ascii_lowercase();
-    if lower.starts_with("glm-5.2") {
+    if lower.starts_with("glm-5.3") || lower.starts_with("glm-5.2") {
         return (1_000_000, Some(131_072));
     }
     if lower.starts_with("glm-4-32b") || lower.contains("128k") {
@@ -566,6 +567,24 @@ mod tests {
     }
 
     #[test]
+    fn glm5_text_models_are_text_only() {
+        for id in ["glm-5", "glm-5.1", "glm-5.2", "glm-5.3", "glm-5-turbo"] {
+            assert!(
+                crate::model_image_input::is_text_only_glm5_model(id),
+                "{id}"
+            );
+        }
+        let catalog = ZaiModelsCatalog::fallback(ZAI_API_BASE_URL);
+        for key in ["zai:glm-5", "zai:glm-5.1", "zai:glm-5.2", "zai:glm-5.3"] {
+            let entry = &catalog.entries()[key];
+            assert!(
+                !crate::model_image_input::acp_accepts_images(key, &entry.info.model),
+                "{key} must advertise text-only image input"
+            );
+        }
+    }
+
+    #[test]
     fn fallback_catalog_marks_known_reasoning_models() {
         let catalog = ZaiModelsCatalog::fallback(ZAI_API_BASE_URL);
         assert!(!catalog.is_authoritative());
@@ -669,6 +688,9 @@ mod tests {
         assert!(glm_5_2.info.supports_reasoning_effort);
         assert_eq!(glm_5_2.info.reasoning_efforts.len(), 4);
         assert_eq!(glm_5_2.info.reasoning_effort, Some(ReasoningEffort::High));
+        let glm_5_3 = &entries["zai:glm-5.3"];
+        assert_eq!(glm_5_3.info.context_window.get(), 1_000_000);
+        assert_eq!(glm_5_3.info.max_completion_tokens, Some(131_072));
         assert_eq!(entries["zai:glm-5.1"].info.context_window.get(), 200_000);
         assert_eq!(entries["zai:glm-4.6"].info.context_window.get(), 200_000);
         assert_eq!(
@@ -784,6 +806,7 @@ mod tests {
             curated_limits("GLM-5.2-preview"),
             (1_000_000, Some(131_072))
         );
+        assert_eq!(curated_limits("GLM-5.3"), (1_000_000, Some(131_072)));
         assert_eq!(curated_limits("GLM-4-32B-0414-128K"), (128_000, None));
         assert_eq!(curated_limits("custom-128k-local"), (128_000, None));
         assert_eq!(curated_limits("glm-5.1"), (200_000, None));

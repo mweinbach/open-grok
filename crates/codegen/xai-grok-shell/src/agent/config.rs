@@ -6578,6 +6578,19 @@ pub fn to_acp_model_info(
                         xai_grok_sampling_types::service_tiers_meta_value(&info.service_tiers),
                     );
                 }
+                let accepts_images = crate::model_image_input::acp_accepts_images(key, &info.model);
+                map.insert(
+                    "acceptsImages".to_string(),
+                    serde_json::Value::Bool(accepts_images),
+                );
+                map.insert(
+                    "inputModalities".to_string(),
+                    if accepts_images {
+                        serde_json::json!(["text", "image"])
+                    } else {
+                        serde_json::json!(["text"])
+                    },
+                );
                 if map.is_empty() { None } else { Some(map) }
             };
             (
@@ -9756,6 +9769,44 @@ reasoning_effort = "low"
         let acp_models = to_acp_model_info(&models);
         let meta = acp_models.values().next().unwrap().meta.as_ref().unwrap();
         assert_eq!(meta["totalContextTokens"], 200_000);
+    }
+    #[test]
+    fn acp_model_meta_marks_glm5_family_text_only() {
+        let mut models = IndexMap::new();
+        for (key, wire) in [
+            ("zai:glm-5", "glm-5"),
+            ("zai:glm-5.1", "glm-5.1"),
+            ("zai:glm-5.2", "glm-5.2"),
+            ("zai:glm-5.3", "glm-5.3"),
+            ("glm-5.2", "accounts/fireworks/models/glm-5p2"),
+        ] {
+            let mut entry = test_model_entry(wire, "https://api.z.ai/v1", None, None, None);
+            entry.info.id = Some(key.to_string());
+            models.insert(key.to_string(), entry);
+        }
+        let acp_models = to_acp_model_info(&models);
+        for (key, info) in acp_models {
+            let meta = info.meta.as_ref().expect("meta");
+            assert_eq!(meta["acceptsImages"], false, "{key} must be text-only");
+            assert_eq!(meta["inputModalities"], serde_json::json!(["text"]));
+        }
+        let mut vision = IndexMap::new();
+        vision.insert(
+            "grok-4.6".to_string(),
+            test_model_entry("grok-4.6", "https://api.x.ai/v1", None, None, None),
+        );
+        let meta = to_acp_model_info(&vision)
+            .values()
+            .next()
+            .unwrap()
+            .meta
+            .clone()
+            .unwrap();
+        assert_eq!(meta["acceptsImages"], true);
+        assert_eq!(
+            meta["inputModalities"],
+            serde_json::json!(["text", "image"])
+        );
     }
     #[test]
     fn hidden_model_excluded_from_acp_but_kept_in_catalog() {

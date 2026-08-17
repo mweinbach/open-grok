@@ -129,6 +129,13 @@ impl SessionActor {
         if images.is_empty() {
             return images;
         }
+        if !self.current_model_accepts_images().await {
+            if !wrapped.is_empty() {
+                wrapped.push_str("\n\n");
+            }
+            wrapped.push_str(crate::model_image_input::TEXT_ONLY_MODEL_IMAGE_ERROR);
+            return Vec::new();
+        }
         let is_cursor = self.is_cursor_harness();
         let images = self
             .normalize_images_with_notices(wrapped, images, is_cursor)

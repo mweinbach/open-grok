@@ -1202,6 +1202,10 @@ impl SessionActor {
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| "unknown".to_string())
     }
+    /// Whether the active sampling model accepts vision / image input.
+    async fn current_model_accepts_images(&self) -> bool {
+        crate::model_image_input::model_accepts_images(&self.current_model_id().await)
+    }
     /// Build a hook run context for dispatching hook events.
     fn session_id_string(&self) -> String {
         self.session_info.id.0.to_string()

@@ -160,6 +160,11 @@ impl AgentView {
         );
         let attachment = match image {
             ProbedAttachment::Image(pasted) => {
+                if self.reject_text_only_model_image() {
+                    return ClipboardPasteCompletion::Failed(
+                        ClipboardPasteFailure::AlreadyReported,
+                    );
+                }
                 if self.reject_shared_queue_image_edit(&pasted) {
                     return ClipboardPasteCompletion::Failed(
                         ClipboardPasteFailure::AlreadyReported,
@@ -407,10 +412,20 @@ impl AgentView {
     /// insert. Callers that wrap an undo group around a batch of
     /// inserts use this to defer opening the group until at least one
     /// mutation lands (avoids an empty undo step on Ctrl-Z).
+    fn reject_text_only_model_image(&mut self) -> bool {
+        if self.session.models.current_model_accepts_images() {
+            return false;
+        }
+        self.show_toast("This model is text-only and cannot accept image input");
+        true
+    }
     fn handle_image_paste_from_data(
         &mut self,
         mut pasted: crate::prompt_images::PastedImage,
     ) -> bool {
+        if self.reject_text_only_model_image() {
+            return false;
+        }
         if self.reject_shared_queue_image_edit(&pasted) {
             return false;
         }
@@ -447,6 +462,7 @@ pub(super) mod paste_key_tests {
     use crate::clipboard::ImageData;
     use crate::scrollback::state::ScrollbackState;
     use crate::views::prompt_widget::KIND_PASTE;
+    use agent_client_protocol as acp;
     fn make_agent() -> AgentView {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         AgentView::new(
@@ -566,6 +582,40 @@ pub(super) mod paste_key_tests {
         agent.set_active_pane(ActivePane::Prompt, true);
         paste_cmd_v_image(&mut agent, Some(""));
         assert_eq!(agent.prompt.images.len(), 1);
+    }
+    #[test]
+    fn text_only_model_rejects_image_paste() {
+        let mut agent = make_agent();
+        let id = acp::ModelId::new(std::sync::Arc::from("zai:glm-5.2"));
+        let mut models = ModelState::default();
+        models.available.insert(
+            id.clone(),
+            acp::ModelInfo::new(id.clone(), "GLM 5.2".to_string()).meta(Some(
+                serde_json::json!({
+                    "acceptsImages": false,
+                    "inputModalities": ["text"],
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            )),
+        );
+        models.current = Some(id);
+        agent.session.models = models;
+        assert!(!agent.handle_image_paste_from_data(test_image_paste()));
+        assert!(
+            agent.prompt.images.is_empty(),
+            "text-only models must not attach image chips"
+        );
+        let toast = agent
+            .toast
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(
+            toast.contains("text-only"),
+            "expected text-only toast, got {toast:?}"
+        );
     }
     #[test]
     fn paste_key_image_when_text_is_whitespace() {

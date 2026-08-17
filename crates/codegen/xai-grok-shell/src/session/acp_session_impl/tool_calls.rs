@@ -2836,6 +2836,8 @@ impl SessionActor {
             result.prompt_text
         };
         let mut inline_images: Vec<ContentPart> = Vec::new();
+        let accepts_images = self.current_model_accepts_images().await;
+        let text_only_vision = self.is_cursor_harness() || !accepts_images;
         let extraction = if !self.is_cursor_harness()
             && !matches!(
                 result.output,
@@ -2850,12 +2852,15 @@ impl SessionActor {
             }
         };
         let mut extracted_images = extraction.images;
-        split_tool_layer_for_harness(
-            self.is_cursor_harness(),
-            &mut extracted_images,
-            tool_layer_images,
-        );
+        split_tool_layer_for_harness(text_only_vision, &mut extracted_images, tool_layer_images);
         let mut prompt_text = maybe_rewrite(path_rewriter.as_ref(), extraction.text);
+        if !accepts_images && !extracted_images.is_empty() {
+            extracted_images.clear();
+            if !prompt_text.contains(crate::model_image_input::TEXT_ONLY_MODEL_IMAGE_ERROR) {
+                prompt_text.push_str("\n\n");
+                prompt_text.push_str(crate::model_image_input::TEXT_ONLY_MODEL_IMAGE_ERROR);
+            }
+        }
         if !self.is_cursor_harness()
             && let ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(ref image_content)) =
                 result.output
@@ -2865,49 +2870,57 @@ impl SessionActor {
                 .or_else(|| tool_parsed_args.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            use crate::session::image_normalize::{InlineAttachVerdict, inline_attach_verdict};
-            match inline_attach_verdict(&image_content.data) {
-                InlineAttachVerdict::TooSmall => {
-                    prompt_text = format!(
-                        "[Image from {path} was not attached: too small for vision models]"
-                    );
-                }
-                InlineAttachVerdict::Unreadable => {
-                    prompt_text = format!(
-                        "[Image from {path} was not attached: invalid or unreadable image data]"
-                    );
-                }
-                InlineAttachVerdict::Attach => {
-                    let url = format!(
-                        "data:{};base64,{}",
-                        image_content.mime_type, image_content.data
-                    );
-                    inline_images.push(ContentPart::Image {
-                        url: std::sync::Arc::<str>::from(url),
-                    });
-                    prompt_text = format!("Read image file: {path}");
+            if !accepts_images {
+                prompt_text = crate::model_image_input::text_only_image_read_error(path);
+            } else {
+                use crate::session::image_normalize::{InlineAttachVerdict, inline_attach_verdict};
+                match inline_attach_verdict(&image_content.data) {
+                    InlineAttachVerdict::TooSmall => {
+                        prompt_text = format!(
+                            "[Image from {path} was not attached: too small for vision models]"
+                        );
+                    }
+                    InlineAttachVerdict::Unreadable => {
+                        prompt_text = format!(
+                            "[Image from {path} was not attached: invalid or unreadable image data]"
+                        );
+                    }
+                    InlineAttachVerdict::Attach => {
+                        let url = format!(
+                            "data:{};base64,{}",
+                            image_content.mime_type, image_content.data
+                        );
+                        inline_images.push(ContentPart::Image {
+                            url: std::sync::Arc::<str>::from(url),
+                        });
+                        prompt_text = format!("Read image file: {path}");
+                    }
                 }
             }
         }
         if !self.is_cursor_harness()
             && let ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(ref pdf)) = result.output
         {
-            for page in &pdf.pages {
-                let url = format!("data:{};base64,{}", page.mime_type, page.data);
-                inline_images.push(ContentPart::Image {
-                    url: std::sync::Arc::<str>::from(url),
-                });
-            }
             let path = tool_parsed_args
                 .get("target_file")
                 .or_else(|| tool_parsed_args.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            prompt_text = format!(
-                "Read PDF file: {path} ({} pages rendered, {} total)",
-                pdf.pages.len(),
-                pdf.total_pages,
-            );
+            if !accepts_images {
+                prompt_text = crate::model_image_input::text_only_image_read_error(path);
+            } else {
+                for page in &pdf.pages {
+                    let url = format!("data:{};base64,{}", page.mime_type, page.data);
+                    inline_images.push(ContentPart::Image {
+                        url: std::sync::Arc::<str>::from(url),
+                    });
+                }
+                prompt_text = format!(
+                    "Read PDF file: {path} ({} pages rendered, {} total)",
+                    pdf.pages.len(),
+                    pdf.total_pages,
+                );
+            }
         }
         let tool_chat = if inline_images.is_empty() {
             ConversationItem::tool_result(call_id.to_string(), prompt_text)

@@ -104,11 +104,9 @@ impl ModelState {
     /// `meta` (the ACP extension point — same source as `totalContextTokens`).
     ///
     /// Honors an explicit `acceptsImages` bool, else an `inputModalities` array
-    /// containing `"image"`. DEFAULTS TO `true` when neither key is present:
-    /// correct today (all current Grok models accept images, so nothing is
-    /// suppressed) and forward-compatible (suppresses non-vision models once the
-    /// ACP server populates the key). Populating that key server-side is a
-    /// separate change.
+    /// containing `"image"`. DEFAULTS TO `true` when neither key is present so
+    /// unknown/legacy catalogs stay permissive. The shell now populates these
+    /// keys: GLM-5 / 5.1 / 5.2 / 5.3 are advertised as text-only.
     pub fn current_model_accepts_images(&self) -> bool {
         let Some(meta) = self
             .current
