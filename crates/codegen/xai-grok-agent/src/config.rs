@@ -183,6 +183,16 @@ pub(crate) fn collaboration_tool_configs() -> [ToolConfig; 4] {
         ToolConfig::from(&grok_build::WaitAgentTool),
     ]
 }
+/// Machine-local session bus tools: list/read/message other live Open Grok
+/// sessions across processes. Registered unconditionally — a bus-less
+/// process still gets informative errors from the injected backend.
+pub(crate) fn session_collaboration_tool_configs() -> [ToolConfig; 3] {
+    [
+        ToolConfig::from(&grok_build::ListSessionsTool),
+        ToolConfig::from(&grok_build::ReadSessionTool),
+        ToolConfig::from(&grok_build::MessageSessionTool),
+    ]
+}
 /// Complete workspace-executable toolset for hub registration.
 ///
 /// Extends `default_grok_build_toolset()` with tools that are dynamically
@@ -301,6 +311,7 @@ fn default_grok_build_toolset() -> ToolServerConfig {
         (&grok_build::WorkflowTool).into(),
     ];
     tools.extend(collaboration_tool_configs());
+    tools.extend(session_collaboration_tool_configs());
     ToolServerConfig {
         tools,
         behavior_preset: None,

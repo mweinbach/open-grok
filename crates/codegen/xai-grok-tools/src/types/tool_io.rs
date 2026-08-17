@@ -28,6 +28,9 @@ use crate::implementations::grok_build::image_gen::ImageGenInput;
 use crate::implementations::grok_build::list_dir::ListDirInput;
 use crate::implementations::grok_build::read_file::ReadFileInput;
 use crate::implementations::grok_build::search_replace::SearchReplaceInput;
+use crate::implementations::grok_build::session_collaboration::{
+    ListSessionsInput, MessageSessionInput, ReadSessionInput,
+};
 use crate::implementations::grok_build::todo::TodoWriteInput;
 use crate::implementations::grok_build::update_goal::UpdateGoalInput;
 use crate::implementations::grok_build::video_gen::{ImageToVideoInput, ReferenceToVideoInput};
@@ -85,6 +88,9 @@ pub enum ToolInput {
     /// distinguishes the two, and the wake semantics live in the message kind.
     AgentMessageSend(SendAgentMessageInput),
     WaitAgent(WaitAgentInput),
+    ListSessions(ListSessionsInput),
+    ReadSession(ReadSessionInput),
+    MessageSession(MessageSessionInput),
     WebSearch(WebSearchInput),
     WebRun(SearchCommands),
     ImageGen(ImageGenInput),

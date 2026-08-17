@@ -26,6 +26,7 @@ pub mod monitor;
 pub mod read_file;
 pub mod scheduler;
 pub mod search_replace;
+pub mod session_collaboration;
 pub(crate) mod storage;
 pub mod task;
 pub mod task_output;
@@ -65,6 +66,10 @@ pub use scheduler::create::{
 pub use scheduler::delete::{SCHEDULER_DELETE_TOOL_NAME, SchedulerDeleteTool};
 pub use scheduler::list::SchedulerListTool;
 pub use search_replace::SearchReplaceTool;
+pub use session_collaboration::{
+    ListSessionsTool, MessageSessionTool, ReadSessionTool, SessionBusResource,
+    SessionCollaborationBackend,
+};
 pub use task::{TaskTool, is_task_tool_id};
 pub use task_output::{GetTerminalCommandOutputTool, TaskOutputTool, WaitTasksTool};
 pub use todo::TodoWriteTool;

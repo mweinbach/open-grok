@@ -650,6 +650,9 @@ pub enum ToolOutput {
     ListAgents(ListAgentsOutput),
     AgentMessageSend(AgentMessageSendOutput),
     WaitAgentMessages(WaitAgentMessagesOutput),
+    ListSessions(crate::implementations::grok_build::session_collaboration::ListSessionsOutput),
+    ReadSession(crate::implementations::grok_build::session_collaboration::ReadSessionOutput),
+    MessageSession(crate::implementations::grok_build::session_collaboration::MessageSessionOutput),
     EnterPlanMode(EnterPlanModeOutput),
     ExitPlanMode(ExitPlanModeOutput),
     AskUserQuestion(AskUserQuestionOutput),
@@ -1072,6 +1075,9 @@ impl ToolOutput {
             ToolOutput::Workflow(o) => o.message.clone(),
             ToolOutput::ListAgents(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
             ToolOutput::AgentMessageSend(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
+            ToolOutput::ListSessions(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
+            ToolOutput::ReadSession(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
+            ToolOutput::MessageSession(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
             ToolOutput::WaitAgentMessages(o) => {
                 if o.messages.is_empty() {
                     if o.timed_out {
@@ -1388,6 +1394,18 @@ impl xai_tool_runtime::ToolOutput for MCPOutput {}
 impl xai_tool_runtime::ToolOutput for ListAgentsOutput {}
 impl xai_tool_runtime::ToolOutput for AgentMessageSendOutput {}
 impl xai_tool_runtime::ToolOutput for WaitAgentMessagesOutput {}
+impl xai_tool_runtime::ToolOutput
+    for crate::implementations::grok_build::session_collaboration::ListSessionsOutput
+{
+}
+impl xai_tool_runtime::ToolOutput
+    for crate::implementations::grok_build::session_collaboration::ReadSessionOutput
+{
+}
+impl xai_tool_runtime::ToolOutput
+    for crate::implementations::grok_build::session_collaboration::MessageSessionOutput
+{
+}
 #[cfg(test)]
 mod tests {
     use super::*;
