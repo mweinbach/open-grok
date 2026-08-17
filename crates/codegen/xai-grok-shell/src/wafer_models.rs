@@ -8,6 +8,7 @@ use crate::agent::config::{EnvKeys, ModelEntry, ModelInfo};
 use anyhow::{Context, anyhow};
 use indexmap::IndexMap;
 use serde::Deserialize;
+use std::num::NonZeroU64;
 use std::time::Duration;
 use url::Url;
 use xai_grok_sampling_types::{ApiBackend, ModelProvider, ToolMode};
@@ -67,6 +68,26 @@ fn credential_fingerprint(api_key: &str) -> String {
     blake3::hash(api_key.as_bytes()).to_hex().to_string()
 }
 
+/// Wafer `/models` returns ids only. Assign published windows by normalized
+/// id (case and punctuation ignored), most-specific families first.
+fn curated_context_window(model_id: &str) -> Option<u64> {
+    let id: String = model_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+    if id.contains("kimik3") || id.contains("deepseekv4flash") || id.contains("glm52") {
+        return Some(1_000_000);
+    }
+    if id.contains("kimik26") {
+        return Some(262_144);
+    }
+    if id.contains("glm51") {
+        return Some(203_000);
+    }
+    None
+}
+
 fn model_entry(model_id: &str, base_url: &str) -> ModelEntry {
     let key = format!("wafer:{model_id}");
     let mut info = ModelInfo::fallback(&key);
@@ -83,6 +104,9 @@ fn model_entry(model_id: &str, base_url: &str) -> ModelEntry {
     info.supports_backend_search = false;
     info.supports_standalone_web_search = Some(false);
     info.supported_in_api = true;
+    if let Some(window) = curated_context_window(model_id) {
+        info.context_window = NonZeroU64::new(window).expect("non-zero Wafer context window");
+    }
     ModelEntry {
         info,
         api_key: None,
@@ -271,11 +295,76 @@ mod tests {
             assert_eq!(entry.info.tool_mode, Some(ToolMode::Direct));
             assert!(!entry.info.supports_backend_search);
             assert_eq!(entry.info.supports_standalone_web_search, Some(false));
+            assert_eq!(entry.info.context_window.get(), 200_000);
             assert_eq!(
                 entry.env_key.as_ref().and_then(EnvKeys::primary),
                 Some(WAFER_API_KEY_ENV)
             );
         }
+    }
+
+    #[test]
+    fn curated_windows_match_published_wafer_lineup() {
+        let cases = [
+            ("Kimi-K3", 1_000_000),
+            ("kimi-k3-fast", 1_000_000),
+            ("Kimi-K3-Fast", 1_000_000),
+            ("DeepSeek-V4-Flash-0731-Fast", 1_000_000),
+            ("deepseek-v4-flash", 1_000_000),
+            ("GLM-5.2", 1_000_000),
+            ("glm-5.2-flash", 1_000_000),
+            ("glm5.2-fast", 1_000_000),
+            ("GLM5.2-Fast", 1_000_000),
+            ("Kimi-K2.6", 262_144),
+            ("kimi-k2.6", 262_144),
+            ("GLM-5.1", 203_000),
+            ("glm-5.1", 203_000),
+            ("MiniMax-M3", 200_000),
+            ("future-model", 200_000),
+        ];
+        for (id, window) in cases {
+            assert_eq!(
+                model_entry(id, WAFER_API_BASE_URL)
+                    .info
+                    .context_window
+                    .get(),
+                window,
+                "{id}"
+            );
+        }
+        assert_eq!(curated_context_window("kimi-k2.6"), Some(262_144));
+        assert_ne!(curated_context_window("kimi-k2.6"), Some(1_000_000));
+    }
+
+    #[test]
+    fn wire_catalog_applies_curated_windows() {
+        let client = WaferModelsClient::with_base_url(WAFER_API_BASE_URL);
+        let catalog = client.catalog_from_wire(
+            WaferModelsResponse {
+                data: vec![
+                    WaferWireModel {
+                        id: "Kimi-K3".to_owned(),
+                    },
+                    WaferWireModel {
+                        id: "Kimi-K2.6".to_owned(),
+                    },
+                    WaferWireModel {
+                        id: "GLM-5.1".to_owned(),
+                    },
+                ],
+            },
+            "catalog-key",
+        );
+        let entries = catalog.entries();
+        assert_eq!(
+            entries["wafer:Kimi-K3"].info.context_window.get(),
+            1_000_000
+        );
+        assert_eq!(
+            entries["wafer:Kimi-K2.6"].info.context_window.get(),
+            262_144
+        );
+        assert_eq!(entries["wafer:GLM-5.1"].info.context_window.get(), 203_000);
     }
 
     #[test]

@@ -336,8 +336,13 @@ reasoning_effort = "high"
 
 Wafer AI provides an OpenAI-compatible Chat Completions endpoint. Its provider
 catalog is dynamic: Open Grok queries `GET /v1/models` at
-`https://pass.wafer.ai/v1` rather than relying on a static model list. Set
-`WAFER_API_KEY` and select one of the model IDs returned by that endpoint:
+`https://pass.wafer.ai/v1` rather than relying on a static model list. That
+response lists ids only, so Open Grok assigns published context windows:
+**Kimi K3 / K3 Fast**, **DeepSeek V4 Flash**, and **GLM 5.2 / 5.2 Flash** are
+**1,000,000** tokens; **Kimi K2.6** is **262,144**; **GLM 5.1** is
+**203,000**. Other Wafer ids stay at the 200,000 fallback. Override any value
+with `context_window` in `[model.*]`. Set `WAFER_API_KEY` and select one of
+the model IDs returned by that endpoint:
 
 ```toml
 [model.wafer-model]

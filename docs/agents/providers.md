@@ -49,7 +49,11 @@ Wafer AI is an isolated, API-key-only OpenAI-compatible provider. Its base URL
 is `https://pass.wafer.ai/v1`; use Chat Completions for inference and
 `GET /v1/models` for dynamic model discovery. Wafer accepts standard client
 function tools, does not provide native hosted web search, and must not receive
-xAI credentials, private metadata, or xAI-only exports.
+xAI credentials, private metadata, or xAI-only exports. Live `/models` objects
+are ids only, so Open Grok assigns published windows by normalized id:
+`kimi-k3` / `kimi-k3-fast`, `deepseek-v4-flash`, and `glm-5.2` / `glm-5.2-flash`
+→ 1_000_000; `kimi-k2.6` → 262_144; `glm-5.1` → 203_000; unknown ids stay at
+the 200_000 fallback. User `[model.*]` `context_window` overrides still win.
 
 ### Z AI ([z.ai](https://z.ai/))
 
