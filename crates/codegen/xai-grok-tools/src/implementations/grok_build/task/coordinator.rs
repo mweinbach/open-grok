@@ -584,7 +584,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             target.to_string()
         };
         if target == identity.agent_id {
-            return Err("Cannot send an agent message to the calling agent itself".to_string());
+            return Err("Cannot send an agent message to the calling agent itself. \
+                 Use list_agents to see teammates, or target \"root\" for the team root."
+                .to_string());
         }
         if target == identity.team_scope_id {
             return Ok(target);

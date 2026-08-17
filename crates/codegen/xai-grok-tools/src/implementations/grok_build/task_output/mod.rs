@@ -270,7 +270,7 @@ impl TaskOutputTool {
                 let known = terminal.list_tasks().await;
                 if known.is_empty() {
                     format!(
-                        "Task {task_id} not found. No background tasks or subagents exist in this session.",
+                        "Task {task_id} not found. No background bash tasks are known in this session.",
                     )
                 } else {
                     let ids: Vec<&str> = known.iter().map(|t| t.task_id.as_str()).collect();
@@ -1441,7 +1441,7 @@ mod tests {
             TaskOutputOutput::TaskNotFound(msg) => {
                 assert!(msg.contains("not found"), "msg: {msg}");
                 assert!(
-                    msg.contains("No background tasks or subagents exist"),
+                    msg.contains("No background bash tasks are known"),
                     "msg: {msg}"
                 );
             }
@@ -2037,7 +2037,7 @@ mod tests {
         match result {
             TaskOutputOutput::TaskNotFound(msg) => {
                 assert!(
-                    msg.contains("No background tasks or subagents exist"),
+                    msg.contains("No background bash tasks are known"),
                     "Current path must include discoverability text, got: {msg}"
                 );
             }

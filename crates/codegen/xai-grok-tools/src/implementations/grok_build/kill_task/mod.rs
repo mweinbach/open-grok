@@ -54,7 +54,7 @@ async fn not_found_response(
     let known = terminal.list_tasks().await;
     let msg = if known.is_empty() {
         format!(
-            "Task or subagent {task_id} not found. No background tasks or subagents exist in this session.",
+            "Task or subagent {task_id} not found. No background bash tasks are known in this session.",
         )
     } else {
         let ids: Vec<&str> = known.iter().map(|t| t.task_id.as_str()).collect();
@@ -624,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn current_kill_task_not_found_includes_discoverability() {
         // Current (non-legacy) path must still include known task IDs
-        // or "No background tasks or subagents exist" text.
+        // or "No background bash tasks are known" text.
         let resources = resources_with_terminal(KO::NotFound);
         let tool = KillTaskTool;
 
@@ -641,7 +641,7 @@ mod tests {
         match result {
             KillTaskOutput::TaskNotFound(msg) => {
                 assert!(
-                    msg.contains("No background tasks or subagents exist"),
+                    msg.contains("No background bash tasks are known"),
                     "Current path must include discoverability text, got: {msg}"
                 );
             }

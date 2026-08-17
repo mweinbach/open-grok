@@ -931,9 +931,12 @@ impl LocalTerminalActor {
                 self.handle_run_background(request, reply).await;
             }
             TerminalCommand::GetTask { task_id, reply } => {
-                let snapshot = match self.processes.get(&task_id) {
-                    Some(p) => Some(p.to_task_snapshot(&task_id).await),
-                    None => self.completed_task_snapshots.get(&task_id).cloned(),
+                let snapshot = match self.resolve_task_key(&task_id) {
+                    Some(key) => match self.processes.get(&key) {
+                        Some(p) => Some(p.to_task_snapshot(&key).await),
+                        None => self.completed_task_snapshots.get(&key).cloned(),
+                    },
+                    None => None,
                 };
                 let _ = reply.send(snapshot);
             }
@@ -1145,10 +1148,35 @@ impl LocalTerminalActor {
         self.processes.insert(internal_id, process_state);
     }
 
-    async fn handle_kill(&mut self, terminal_id: &str, source: KillSource) -> KillOutcome {
-        let Some(process) = self.processes.get_mut(terminal_id) else {
+    /// Map a model-supplied id onto the actor's process or tombstone key.
+    ///
+    /// Native `run_background` keys by a generated UUID and stores the
+    /// originating `tool_call_id` on the process. Auto-background / Ctrl+G
+    /// re-keys onto that `tool_call_id`. Accept both so kill/get/wait agree
+    /// with the id on the tool card and with `list_tasks`.
+    fn resolve_task_key(&self, id: &str) -> Option<String> {
+        if self.processes.contains_key(id) || self.completed_task_snapshots.contains_key(id) {
+            return Some(id.to_owned());
+        }
+        self.processes
+            .iter()
+            .find(|(_, process)| process.tool_call_id == id)
+            .map(|(key, _)| key.clone())
+    }
+
+    async fn handle_kill(&mut self, requested_id: &str, source: KillSource) -> KillOutcome {
+        let Some(terminal_id) = self.resolve_task_key(requested_id) else {
             return KillOutcome::NotFound;
         };
+        // Evicted completed tombstones still appear in `list_tasks`. Killing
+        // one must not report "not found" while listing that same id.
+        if !self.processes.contains_key(&terminal_id) {
+            return KillOutcome::AlreadyExited;
+        }
+        let Some(process) = self.processes.get_mut(&terminal_id) else {
+            return KillOutcome::NotFound;
+        };
+        let terminal_id = terminal_id.as_str();
 
         if process.lifecycle.has_exited() {
             return KillOutcome::AlreadyExited;
@@ -1305,6 +1333,10 @@ impl LocalTerminalActor {
         timeout: Option<Duration>,
         reply: oneshot::Sender<Option<TaskSnapshot>>,
     ) {
+        let Some(task_id) = self.resolve_task_key(&task_id) else {
+            let _ = reply.send(None);
+            return;
+        };
         let Some(process) = self.processes.get_mut(&task_id) else {
             // Check completed snapshots (task already evicted from processes).
             // Mark `block_waited=true` in-place so any downstream consumer
@@ -5118,6 +5150,39 @@ mod tests {
             .await
             .expect("wait_for_completion should return evicted task");
         assert!(snap_wait.completed);
+
+        // 7. kill must not report NotFound for a tombstone still listed
+        //    by list_tasks — that contradiction is what the model saw.
+        assert_eq!(
+            backend.kill_task(&bg.task_id).await,
+            KillOutcome::AlreadyExited
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_and_get_accept_originating_tool_call_id() {
+        let backend = LocalTerminalBackend::new();
+        let mut req = make_request("sleep 60");
+        req.tool_call_id = "alias-call-id".to_string();
+        let bg = backend
+            .run_background(req)
+            .await
+            .expect("background spawn should succeed");
+        assert_ne!(
+            bg.task_id, "alias-call-id",
+            "native background tasks are keyed by a generated id"
+        );
+
+        let snap = backend
+            .get_task("alias-call-id")
+            .await
+            .expect("get_task should resolve the originating tool_call_id");
+        assert_eq!(snap.task_id, bg.task_id);
+
+        assert_eq!(
+            backend.kill_task("alias-call-id").await,
+            KillOutcome::Killed
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -19,6 +19,28 @@ use crate::types::resources::{
 };
 use crate::types::tool::{ToolKind, ToolNamespace};
 
+fn unsupported_image_error(path: &std::path::Path, file_bytes: &[u8]) -> String {
+    match bytes_to_metadata(file_bytes) {
+        Ok(metadata) => format!(
+            "Error: {} is not a supported image file (PNG, JPEG, GIF, WEBP, HEIC). \
+             Detected type: {} ({} bytes). Use read_file for text and other file types.",
+            path.display(),
+            metadata.mime_type,
+            metadata.size
+        ),
+        Err(_) if file_bytes.is_empty() => format!(
+            "Error: {} is empty (0 bytes), not a supported image file (PNG, JPEG, GIF, WEBP, HEIC).",
+            path.display()
+        ),
+        Err(_) => format!(
+            "Error: {} is not a supported image file (PNG, JPEG, GIF, WEBP, HEIC). \
+             Unrecognized file contents ({} bytes). Use read_file for text and other file types.",
+            path.display(),
+            file_bytes.len()
+        ),
+    }
+}
+
 pub(crate) const DESCRIPTION: &str = r#"View an image file.
 
 Usage:
@@ -150,10 +172,9 @@ impl xai_tool_runtime::Tool for ViewImageTool {
                 )
                 .await)
             }
-            _ => Ok(ReadFileOutput::FileReadError(format!(
-                "Error: {} is not a supported image file (PNG, JPEG, GIF, WEBP, HEIC). \
-                 Use read_file for text and other file types.",
-                path.display()
+            _ => Ok(ReadFileOutput::FileReadError(unsupported_image_error(
+                &path,
+                &file_bytes,
             ))),
         }
     }
@@ -179,5 +200,29 @@ mod tests {
         // `path` (or `target_file`) argument; renaming this field silently
         // breaks vision attachment.
         assert!(schema["properties"]["path"].is_object(), "{schema}");
+    }
+
+    #[test]
+    fn unsupported_image_error_reports_empty_file() {
+        let msg = unsupported_image_error(std::path::Path::new("/tmp/ob_list.png"), b"");
+        assert!(msg.contains("empty (0 bytes)"), "{msg}");
+        assert!(msg.contains("/tmp/ob_list.png"), "{msg}");
+    }
+
+    #[test]
+    fn unsupported_image_error_reports_detected_type() {
+        let pdf = b"%PDF-1.7 some bytes";
+        let msg = unsupported_image_error(std::path::Path::new("/tmp/doc.pdf"), pdf);
+        assert!(msg.contains("Detected type: application/pdf"), "{msg}");
+        assert!(msg.contains(&format!("{} bytes", pdf.len())), "{msg}");
+    }
+
+    #[test]
+    fn unsupported_image_error_reports_unrecognized_contents() {
+        let msg = unsupported_image_error(std::path::Path::new("/tmp/note.txt"), b"hello world");
+        assert!(
+            msg.contains("Unrecognized file contents (11 bytes)"),
+            "{msg}"
+        );
     }
 }
