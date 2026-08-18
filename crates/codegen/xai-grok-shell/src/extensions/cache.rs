@@ -1,4 +1,4 @@
-//! `x.ai/session/cache` — prompt cache telemetry, hit rate, and break diagnostics.
+//! `x.ai/session/cache` — provider-aware prompt cache rates and reset diagnostics.
 
 use agent_client_protocol as acp;
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,9 @@ mod tests {
                 preserved_items: 2,
                 new_items: 1,
             },
+            provider: Some(xai_grok_sampling_types::ModelProvider::Xai),
+            model_id: Some("grok-4.6".into()),
+            request_gap_ms: Some(1_000),
             diagnostic: "Cache hit: 80.0%".into(),
             timestamp_rfc3339: "2026-08-14T00:00:00Z".into(),
         };
@@ -86,11 +89,15 @@ mod tests {
             total_cached_tokens: 1200,
             steady_input_tokens: 1500,
             steady_cached_tokens: 1200,
+            supported_input_tokens: 1500,
+            supported_cached_tokens: 1200,
             overall_hit_rate_pct: 80.0,
+            supported_hit_rate_pct: 80.0,
             total_turns: 1,
             hits: 1,
             partial_hits: 0,
             breaks: 0,
+            no_cache_support_turns: 0,
             last_break_diagnostic: None,
         };
 
@@ -104,7 +111,12 @@ mod tests {
         assert_eq!(json["summary"]["totalCachedTokens"], 1200);
         assert_eq!(json["summary"]["steadyInputTokens"], 1500);
         assert_eq!(json["summary"]["steadyCachedTokens"], 1200);
+        assert_eq!(json["summary"]["supportedInputTokens"], 1500);
+        assert_eq!(json["summary"]["supportedHitRatePct"], 80.0);
         assert_eq!(json["recentTurns"][0]["cacheHitRatePct"], 80.0);
         assert_eq!(json["recentTurns"][0]["status"], "hit");
+        assert_eq!(json["recentTurns"][0]["provider"], "xai");
+        assert_eq!(json["recentTurns"][0]["modelId"], "grok-4.6");
+        assert_eq!(json["recentTurns"][0]["requestGapMs"], 1000);
     }
 }

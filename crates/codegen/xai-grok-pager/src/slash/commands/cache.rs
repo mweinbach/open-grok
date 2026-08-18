@@ -1,4 +1,4 @@
-//! `/cache` — view prompt cache hit rates, break diagnostics, and turn records.
+//! `/cache` — compare all-provider and cache-reporting hit rates with diagnostics.
 
 use crate::app::actions::Action;
 use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand};
@@ -15,7 +15,7 @@ impl SlashCommand for CacheCommand {
     }
 
     fn description(&self) -> &str {
-        "View prompt cache hit rates, prefix divergence, and break diagnostics"
+        "Compare all-provider and supported cache hit rates with reset diagnostics"
     }
 
     fn usage(&self) -> &str {

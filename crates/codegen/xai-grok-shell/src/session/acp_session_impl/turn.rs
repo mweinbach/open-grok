@@ -2908,7 +2908,10 @@ impl SessionActor {
                 prompt_tokens.unwrap_or(0),
                 cached_prompt_tokens.unwrap_or(0),
                 completion_tokens.unwrap_or(0),
+                model_timer,
                 request_summary,
+                Some(model_provider),
+                Some(turn_sampling_config.model.as_str()),
             );
             if let Some(usage) = response.usage.as_ref() {
                 self.chat_state_handle

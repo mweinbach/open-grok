@@ -250,7 +250,7 @@ pub(crate) fn session_usage_block_text(
     )
 }
 
-/// `/cache` body — prompt cache hit rates, break diagnostics, and recent turn history.
+/// `/cache` body — all-provider and cache-reporting hit rates with recent diagnostics.
 pub(crate) fn session_cache_block_text(
     cache: &xai_grok_shell::extensions::cache::SessionCacheResponse,
 ) -> String {
@@ -262,17 +262,33 @@ pub(crate) fn session_cache_block_text(
     let mut rows = Vec::new();
     if s.steady_input_tokens > 0 {
         rows.push(format!(
-            "  Cache hit rate: {:.1}% ({} of {} steady-state input tokens cached; cold start excluded)",
+            "  All-provider hit rate: {:.1}% ({} of {} steady-state input tokens cached; cold start excluded)",
             s.overall_hit_rate_pct,
             group_thousands(s.steady_cached_tokens),
             group_thousands(s.steady_input_tokens),
         ));
+        if s.supported_input_tokens > 0 {
+            rows.push(format!(
+                "  Supported hit rate:    {:.1}% ({} of {} cache-reporting input tokens cached; {} no-cache request{} excluded)",
+                s.supported_hit_rate_pct,
+                group_thousands(s.supported_cached_tokens),
+                group_thousands(s.supported_input_tokens),
+                s.no_cache_support_turns,
+                if s.no_cache_support_turns == 1 { "" } else { "s" },
+            ));
+        } else {
+            rows.push(format!(
+                "  Supported hit rate:    n/a (no cache-reporting steady-state requests; {} no-cache request{} excluded)",
+                s.no_cache_support_turns,
+                if s.no_cache_support_turns == 1 { "" } else { "s" },
+            ));
+        }
     } else {
-        rows.push("  Cache hit rate: n/a (cold-start request only so far)".to_string());
+        rows.push("  All-provider hit rate: n/a (cold-start request only so far)".to_string());
     }
     rows.push(format!(
-        "  Turns tracked:  {} ({} hits · {} partial · {} breaks)",
-        s.total_turns, s.hits, s.partial_hits, s.breaks,
+        "  Turns tracked:  {} ({} hits · {} partial · {} breaks · {} no-cache)",
+        s.total_turns, s.hits, s.partial_hits, s.breaks, s.no_cache_support_turns,
     ));
 
     if let Some(ref last_break) = s.last_break_diagnostic {
@@ -287,6 +303,14 @@ pub(crate) fn session_cache_block_text(
                 // hit the cache, so a percentage here reads like a failure.
                 rows.push(format!(
                     "    Turn #{} (loop {}) — cold start ({} in) · {}",
+                    rec.turn_idx,
+                    rec.loop_index,
+                    group_thousands(rec.prompt_tokens as u64),
+                    rec.diagnostic,
+                ));
+            } else if rec.status == xai_grok_shell::session::CacheStatus::NoCacheSupport {
+                rows.push(format!(
+                    "    Turn #{} (loop {}) — no cache reported ({} in) · {}",
                     rec.turn_idx,
                     rec.loop_index,
                     group_thousands(rec.prompt_tokens as u64),
@@ -502,11 +526,15 @@ mod tests {
                 total_cached_tokens: 6_575,
                 steady_input_tokens: 7_500,
                 steady_cached_tokens: 6_375,
+                supported_input_tokens: 6_500,
+                supported_cached_tokens: 6_375,
                 overall_hit_rate_pct: 85.0,
+                supported_hit_rate_pct: 98.076_923_076_923_08,
                 total_turns: 4,
                 hits: 3,
                 partial_hits: 0,
                 breaks: 1,
+                no_cache_support_turns: 1,
                 last_break_diagnostic: Some(
                     "Cache break: 0% hit rate. Item #2 was pruned/trimmed".into(),
                 ),
@@ -521,6 +549,9 @@ mod tests {
                     cache_hit_rate_pct: 8.0,
                     status: xai_grok_shell::session::CacheStatus::FirstTurn,
                     divergence: xai_grok_shell::session::PrefixDivergence::FirstTurn,
+                    provider: None,
+                    model_id: None,
+                    request_gap_ms: None,
                     diagnostic: "First turn in session (cold cache).".into(),
                     timestamp_rfc3339: "2026-08-14T00:00:00Z".into(),
                 },
@@ -536,15 +567,37 @@ mod tests {
                         preserved_items: 4,
                         new_items: 1,
                     },
+                    provider: None,
+                    model_id: None,
+                    request_gap_ms: Some(60_000),
                     diagnostic: "Cache hit: 80.0%".into(),
                     timestamp_rfc3339: "2026-08-14T00:01:00Z".into(),
+                },
+                xai_grok_shell::session::CacheTurnRecord {
+                    turn_idx: "3".into(),
+                    loop_index: 0,
+                    prompt_tokens: 1000,
+                    cached_prompt_tokens: 0,
+                    completion_tokens: 100,
+                    cache_hit_rate_pct: 0.0,
+                    status: xai_grok_shell::session::CacheStatus::NoCacheSupport,
+                    divergence: xai_grok_shell::session::PrefixDivergence::PrefixIntact {
+                        preserved_items: 5,
+                        new_items: 1,
+                    },
+                    provider: None,
+                    model_id: None,
+                    request_gap_ms: Some(60_000),
+                    diagnostic: "No cached tokens reported by provider/model.".into(),
+                    timestamp_rfc3339: "2026-08-14T00:02:00Z".into(),
                 },
             ],
         };
         let text = session_cache_block_text(&resp);
-        assert!(text.contains("Cache hit rate: 85.0% (6,375 of 7,500 steady-state input tokens cached; cold start excluded)"), "{text}");
+        assert!(text.contains("All-provider hit rate: 85.0% (6,375 of 7,500 steady-state input tokens cached; cold start excluded)"), "{text}");
+        assert!(text.contains("Supported hit rate:    98.1% (6,375 of 6,500 cache-reporting input tokens cached; 1 no-cache request excluded)"), "{text}");
         assert!(
-            text.contains("Turns tracked:  4 (3 hits · 0 partial · 1 breaks)"),
+            text.contains("Turns tracked:  4 (3 hits · 0 partial · 1 breaks · 1 no-cache)"),
             "{text}"
         );
         assert!(
@@ -563,6 +616,13 @@ mod tests {
             ),
             "{text}"
         );
+        assert!(
+            text.contains(
+                "Turn #3 (loop 0) — no cache reported (1,000 in) · No cached tokens reported by provider/model."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Turn #3 (loop 0) — 0.0% hit"), "{text}");
     }
 
     #[test]
@@ -573,11 +633,15 @@ mod tests {
                 total_cached_tokens: 200,
                 steady_input_tokens: 0,
                 steady_cached_tokens: 0,
+                supported_input_tokens: 0,
+                supported_cached_tokens: 0,
                 overall_hit_rate_pct: 0.0,
+                supported_hit_rate_pct: 0.0,
                 total_turns: 1,
                 hits: 0,
                 partial_hits: 0,
                 breaks: 0,
+                no_cache_support_turns: 0,
                 last_break_diagnostic: None,
             },
             recent_turns: vec![xai_grok_shell::session::CacheTurnRecord {
@@ -589,13 +653,16 @@ mod tests {
                 cache_hit_rate_pct: 8.0,
                 status: xai_grok_shell::session::CacheStatus::FirstTurn,
                 divergence: xai_grok_shell::session::PrefixDivergence::FirstTurn,
+                provider: None,
+                model_id: None,
+                request_gap_ms: None,
                 diagnostic: "First turn in session (cold cache).".into(),
                 timestamp_rfc3339: "2026-08-14T00:00:00Z".into(),
             }],
         };
         let text = session_cache_block_text(&resp);
         assert!(
-            text.contains("Cache hit rate: n/a (cold-start request only so far)"),
+            text.contains("All-provider hit rate: n/a (cold-start request only so far)"),
             "{text}"
         );
         assert!(
@@ -605,6 +672,34 @@ mod tests {
         assert!(
             !text.contains("% hit ("),
             "must not render a hit-rate percentage: {text}"
+        );
+    }
+
+    #[test]
+    fn session_cache_block_only_no_cache_support() {
+        let resp = xai_grok_shell::extensions::cache::SessionCacheResponse {
+            summary: xai_grok_shell::session::CacheSummary {
+                total_input_tokens: 4_000,
+                total_cached_tokens: 0,
+                steady_input_tokens: 1_500,
+                steady_cached_tokens: 0,
+                supported_input_tokens: 0,
+                supported_cached_tokens: 0,
+                overall_hit_rate_pct: 0.0,
+                supported_hit_rate_pct: 0.0,
+                total_turns: 2,
+                hits: 0,
+                partial_hits: 0,
+                breaks: 0,
+                no_cache_support_turns: 1,
+                last_break_diagnostic: None,
+            },
+            recent_turns: vec![],
+        };
+        let text = session_cache_block_text(&resp);
+        assert!(
+            text.contains("Supported hit rate:    n/a (no cache-reporting steady-state requests; 1 no-cache request excluded)"),
+            "{text}"
         );
     }
 }

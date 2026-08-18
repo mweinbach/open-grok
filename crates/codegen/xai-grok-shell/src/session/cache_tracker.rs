@@ -14,11 +14,13 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::Instant;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{
-    ContentPart, ConversationItem, ConversationRequest, CustomToolOutputContent, ToolSpec,
+    ContentPart, ConversationItem, ConversationRequest, CustomToolOutputContent, ModelProvider,
+    ToolSpec,
 };
 
 /// Placeholder inserted when a tool result is hard-cleared (from `xai_chat_state`).
@@ -75,7 +77,7 @@ pub enum CacheStatus {
     PartialHit,
     /// Cache broke (0 cached tokens on turn > 1, or complete miss).
     Break,
-    /// No prompt caching reported by provider.
+    /// No cached tokens reported despite an intact request prefix.
     NoCacheSupport,
 }
 
@@ -209,6 +211,12 @@ pub struct CacheTurnRecord {
     pub cache_hit_rate_pct: f64,
     pub status: CacheStatus,
     pub divergence: PrefixDivergence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ModelProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_gap_ms: Option<u64>,
     pub diagnostic: String,
     pub timestamp_rfc3339: String,
 }
@@ -227,11 +235,23 @@ pub struct CacheSummary {
     pub steady_input_tokens: u64,
     /// Cached tokens from steady-state turns only (excludes the cold first turn).
     pub steady_cached_tokens: u64,
+    /// Steady-state input tokens from requests where the provider reported cache support.
+    #[serde(default)]
+    pub supported_input_tokens: u64,
+    /// Cached tokens from cache-reporting steady-state requests.
+    #[serde(default)]
+    pub supported_cached_tokens: u64,
+    /// Steady-state hit rate across all requests, including providers reporting no cache.
     pub overall_hit_rate_pct: f64,
+    /// Steady-state hit rate limited to requests where the provider reported cache support.
+    #[serde(default)]
+    pub supported_hit_rate_pct: f64,
     pub total_turns: usize,
     pub hits: usize,
     pub partial_hits: usize,
     pub breaks: usize,
+    #[serde(default)]
+    pub no_cache_support_turns: usize,
     pub last_break_diagnostic: Option<String>,
 }
 
@@ -239,6 +259,7 @@ pub struct CacheSummary {
 #[derive(Debug, Default)]
 pub struct CacheTracker {
     previous_request_summary: Option<RequestSummary>,
+    previous_recorded_at: Option<Instant>,
     turn_records: Vec<CacheTurnRecord>,
     summary: CacheSummary,
 }
@@ -409,8 +430,20 @@ impl CacheTracker {
         prompt_tokens: u32,
         cached_prompt_tokens: u32,
         completion_tokens: u32,
+        request_started_at: Instant,
         current_request_summary: RequestSummary,
+        provider: Option<ModelProvider>,
+        model_id: Option<&str>,
     ) -> CacheTurnRecord {
+        let recorded_at = Instant::now();
+        let request_gap_ms = self.previous_recorded_at.map(|previous| {
+            u64::try_from(
+                request_started_at
+                    .saturating_duration_since(previous)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX)
+        });
         let divergence = Self::analyze_prefix_divergence(
             self.previous_request_summary.as_ref(),
             &current_request_summary,
@@ -438,6 +471,12 @@ impl CacheTracker {
             CacheStatus::Break
         };
 
+        let route = match (provider, model_id) {
+            (Some(provider), Some(model_id)) => format!("{}/{}", provider.as_str(), model_id),
+            (Some(provider), None) => provider.as_str().to_string(),
+            (None, Some(model_id)) => model_id.to_string(),
+            (None, None) => "unknown route".to_string(),
+        };
         let diagnostic = match status {
             CacheStatus::FirstTurn => "First turn in session (cold cache).".to_string(),
             CacheStatus::Hit => {
@@ -453,12 +492,42 @@ impl CacheTracker {
                 }
                 d
             }
-            CacheStatus::PartialHit => format!(
-                "Partial cache hit: {hit_rate_pct:.1}% ({cached_prompt_tokens}/{prompt_tokens} tokens cached). {}",
+            CacheStatus::PartialHit => {
+                let mut diagnostic = format!(
+                    "Partial cache hit on {route}: {hit_rate_pct:.1}% ({cached_prompt_tokens}/{prompt_tokens} tokens cached). {}",
+                    divergence.summary_diagnostic()
+                );
+                if divergence.is_intact()
+                    && let Some(gap_ms) = request_gap_ms
+                {
+                    if gap_ms > 5 * 60 * 1000 {
+                        diagnostic.push_str(&format!(
+                            " The request followed a {} inter-request gap; provider cache expiry or eviction is likely, though a large appended segment can also lower the percentage.",
+                            format_request_gap(gap_ms)
+                        ));
+                    } else {
+                        diagnostic.push_str(&format!(
+                            " The request followed a {} inter-request gap with an intact prefix; this can reflect a large appended segment or provider-side cache routing or eviction.",
+                            format_request_gap(gap_ms)
+                        ));
+                    }
+                }
+                diagnostic
+            }
+            CacheStatus::Break => format!(
+                "Cache break: 0% hit rate. {}",
                 divergence.summary_diagnostic()
             ),
-            CacheStatus::Break => format!("Cache break: 0% hit rate. {}", divergence.summary_diagnostic()),
-            CacheStatus::NoCacheSupport => "0 cached tokens reported (provider may not support prompt caching or cache expired).".to_string(),
+            CacheStatus::NoCacheSupport => {
+                let gap = request_gap_ms
+                    .map(|gap_ms| {
+                        format!(" after a {} inter-request gap", format_request_gap(gap_ms))
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "0 cached tokens reported by {route}{gap} (prompt caching may be unsupported, expired, evicted, or unreported)."
+                )
+            }
         };
 
         // Update running totals
@@ -469,11 +538,20 @@ impl CacheTracker {
             self.summary.steady_input_tokens += prompt_tokens as u64;
             self.summary.steady_cached_tokens += cached_prompt_tokens as u64;
         }
+        if !matches!(status, CacheStatus::FirstTurn | CacheStatus::NoCacheSupport) {
+            self.summary.supported_input_tokens += prompt_tokens as u64;
+            self.summary.supported_cached_tokens += cached_prompt_tokens as u64;
+        }
         // Overall hit rate covers steady-state turns only: the cold first turn
         // cannot hit by definition and would permanently dilute the rate.
         if self.summary.steady_input_tokens > 0 {
             self.summary.overall_hit_rate_pct = (self.summary.steady_cached_tokens as f64
                 / self.summary.steady_input_tokens as f64)
+                * 100.0;
+        }
+        if self.summary.supported_input_tokens > 0 {
+            self.summary.supported_hit_rate_pct = (self.summary.supported_cached_tokens as f64
+                / self.summary.supported_input_tokens as f64)
                 * 100.0;
         }
 
@@ -484,6 +562,7 @@ impl CacheTracker {
                 self.summary.breaks += 1;
                 self.summary.last_break_diagnostic = Some(diagnostic.clone());
             }
+            CacheStatus::NoCacheSupport => self.summary.no_cache_support_turns += 1,
             _ => {}
         }
 
@@ -500,6 +579,9 @@ impl CacheTracker {
                 "hit_rate_pct": (hit_rate_pct * 10.0).round() / 10.0,
                 "status": status,
                 "divergence": divergence,
+                "provider": provider.map(ModelProvider::as_str),
+                "model_id": model_id,
+                "request_gap_ms": request_gap_ms,
                 "diagnostic": diagnostic,
             })),
         );
@@ -543,6 +625,9 @@ impl CacheTracker {
             cache_hit_rate_pct: (hit_rate_pct * 10.0).round() / 10.0,
             status,
             divergence,
+            provider,
+            model_id: model_id.map(str::to_owned),
+            request_gap_ms,
             diagnostic,
             timestamp_rfc3339: Utc::now().to_rfc3339(),
         };
@@ -554,8 +639,17 @@ impl CacheTracker {
 
         // Update previous summary
         self.previous_request_summary = Some(current_request_summary);
+        self.previous_recorded_at = Some(recorded_at);
 
         record
+    }
+}
+
+fn format_request_gap(gap_ms: u64) -> String {
+    if gap_ms >= 60_000 {
+        format!("{:.1} minutes", gap_ms as f64 / 60_000.0)
+    } else {
+        format!("{:.1} seconds", gap_ms as f64 / 1_000.0)
     }
 }
 
@@ -1006,7 +1100,18 @@ mod tests {
             ..Default::default()
         };
         let sum1 = CacheTracker::summarize_request(&req1);
-        let rec1 = tracker.record_turn_outcome(None, "1", 0, 1000, 0, 100, sum1);
+        let rec1 = tracker.record_turn_outcome(
+            None,
+            "1",
+            0,
+            1000,
+            0,
+            100,
+            Instant::now(),
+            sum1,
+            Some(ModelProvider::Xai),
+            Some("grok-4.6"),
+        );
         assert_eq!(rec1.status, CacheStatus::FirstTurn);
         assert_eq!(rec1.cache_hit_rate_pct, 0.0);
 
@@ -1019,7 +1124,18 @@ mod tests {
             ..Default::default()
         };
         let sum2 = CacheTracker::summarize_request(&req2);
-        let rec2 = tracker.record_turn_outcome(None, "2", 1, 1500, 1000, 150, sum2);
+        let rec2 = tracker.record_turn_outcome(
+            None,
+            "2",
+            1,
+            1500,
+            1000,
+            150,
+            Instant::now(),
+            sum2,
+            Some(ModelProvider::Xai),
+            Some("grok-4.6"),
+        );
         assert_eq!(rec2.status, CacheStatus::Hit);
         assert!((rec2.cache_hit_rate_pct - 66.66).abs() < 0.1);
 
@@ -1031,9 +1147,12 @@ mod tests {
         // Steady-state excludes the cold first turn.
         assert_eq!(summary.steady_input_tokens, 1500);
         assert_eq!(summary.steady_cached_tokens, 1000);
+        assert_eq!(summary.supported_input_tokens, 1500);
+        assert_eq!(summary.supported_cached_tokens, 1000);
         assert_eq!(summary.hits, 1);
         assert_eq!(summary.breaks, 0);
         assert!((summary.overall_hit_rate_pct - 66.7).abs() < 0.1);
+        assert!((summary.supported_hit_rate_pct - 66.7).abs() < 0.1);
     }
 
     #[test]
@@ -1044,7 +1163,18 @@ mod tests {
             ..Default::default()
         };
         let sum = CacheTracker::summarize_request(&req);
-        let rec = tracker.record_turn_outcome(None, "1", 0, 1000, 0, 100, sum);
+        let rec = tracker.record_turn_outcome(
+            None,
+            "1",
+            0,
+            1000,
+            0,
+            100,
+            Instant::now(),
+            sum,
+            Some(ModelProvider::Xai),
+            Some("grok-4.6"),
+        );
         assert_eq!(rec.status, CacheStatus::FirstTurn);
 
         let summary = tracker.summary();
@@ -1052,7 +1182,10 @@ mod tests {
         assert_eq!(summary.total_input_tokens, 1000);
         assert_eq!(summary.steady_input_tokens, 0);
         assert_eq!(summary.steady_cached_tokens, 0);
+        assert_eq!(summary.supported_input_tokens, 0);
+        assert_eq!(summary.supported_cached_tokens, 0);
         assert_eq!(summary.overall_hit_rate_pct, 0.0);
+        assert_eq!(summary.supported_hit_rate_pct, 0.0);
     }
 
     #[test]
@@ -1070,7 +1203,10 @@ mod tests {
             1000,
             0,
             100,
+            Instant::now(),
             CacheTracker::summarize_request(&req1),
+            Some(ModelProvider::Xai),
+            Some("grok-4.6"),
         );
 
         // Turn 2: large new append, half cached — Hit status at 50%.
@@ -1088,7 +1224,10 @@ mod tests {
             2000,
             1000,
             100,
+            Instant::now(),
             CacheTracker::summarize_request(&req2),
+            Some(ModelProvider::Xai),
+            Some("grok-4.6"),
         );
         assert_eq!(rec2.status, CacheStatus::Hit);
         assert!(
@@ -1096,5 +1235,134 @@ mod tests {
             "got: {}",
             rec2.diagnostic
         );
+    }
+
+    #[test]
+    fn supported_rate_excludes_no_cache_support_turns() {
+        let mut tracker = CacheTracker::new();
+        let req1 = ConversationRequest {
+            items: vec![ConversationItem::user("turn 1")],
+            ..Default::default()
+        };
+        tracker.record_turn_outcome(
+            None,
+            "1",
+            0,
+            1000,
+            0,
+            100,
+            Instant::now(),
+            CacheTracker::summarize_request(&req1),
+            Some(ModelProvider::Wafer),
+            Some("DeepSeek-V4-Flash-0731-Fast"),
+        );
+
+        let req2 = ConversationRequest {
+            items: vec![
+                ConversationItem::user("turn 1"),
+                ConversationItem::user("turn 2"),
+            ],
+            ..Default::default()
+        };
+        let unsupported = tracker.record_turn_outcome(
+            None,
+            "2",
+            1,
+            1500,
+            0,
+            100,
+            Instant::now(),
+            CacheTracker::summarize_request(&req2),
+            Some(ModelProvider::Wafer),
+            Some("DeepSeek-V4-Flash-0731-Fast"),
+        );
+        assert_eq!(unsupported.status, CacheStatus::NoCacheSupport);
+        assert_eq!(unsupported.provider, Some(ModelProvider::Wafer));
+        assert_eq!(
+            unsupported.model_id.as_deref(),
+            Some("DeepSeek-V4-Flash-0731-Fast")
+        );
+        assert!(unsupported.diagnostic.contains("wafer/DeepSeek"));
+
+        let req3 = ConversationRequest {
+            items: vec![
+                ConversationItem::user("turn 1"),
+                ConversationItem::user("turn 2"),
+                ConversationItem::user("turn 3"),
+            ],
+            ..Default::default()
+        };
+        tracker.record_turn_outcome(
+            None,
+            "3",
+            1,
+            2000,
+            1500,
+            100,
+            Instant::now(),
+            CacheTracker::summarize_request(&req3),
+            Some(ModelProvider::Xai),
+            Some("grok-4.6"),
+        );
+
+        let summary = tracker.summary();
+        assert_eq!(summary.steady_input_tokens, 3500);
+        assert_eq!(summary.steady_cached_tokens, 1500);
+        assert_eq!(summary.supported_input_tokens, 2000);
+        assert_eq!(summary.supported_cached_tokens, 1500);
+        assert_eq!(summary.no_cache_support_turns, 1);
+        assert!((summary.overall_hit_rate_pct - 42.9).abs() < 0.1);
+        assert!((summary.supported_hit_rate_pct - 75.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn intact_partial_after_long_gap_identifies_provider_expiry() {
+        let mut tracker = CacheTracker::new();
+        let req1 = ConversationRequest {
+            items: vec![ConversationItem::user("turn 1")],
+            ..Default::default()
+        };
+        tracker.record_turn_outcome(
+            None,
+            "1",
+            0,
+            1000,
+            0,
+            100,
+            Instant::now(),
+            CacheTracker::summarize_request(&req1),
+            Some(ModelProvider::Xai),
+            Some("grok-4.6"),
+        );
+        let now = Instant::now();
+        tracker.previous_recorded_at = Some(now - std::time::Duration::from_secs(600));
+
+        let req2 = ConversationRequest {
+            items: vec![
+                ConversationItem::user("turn 1"),
+                ConversationItem::user("turn 2"),
+            ],
+            ..Default::default()
+        };
+        let partial = tracker.record_turn_outcome(
+            None,
+            "2",
+            1,
+            2000,
+            128,
+            100,
+            now - std::time::Duration::from_secs(240),
+            CacheTracker::summarize_request(&req2),
+            Some(ModelProvider::Xai),
+            Some("grok-4.6"),
+        );
+        assert_eq!(partial.status, CacheStatus::PartialHit);
+        assert_eq!(partial.request_gap_ms, Some(360_000));
+        assert!(
+            partial
+                .diagnostic
+                .contains("provider cache expiry or eviction")
+        );
+        assert!(partial.diagnostic.contains("xai/grok-4.6"));
     }
 }
