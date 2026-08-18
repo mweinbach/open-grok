@@ -82,11 +82,11 @@ and config, providers, and development workflow).
 
 ## Install
 
-Prebuilt releases support **Apple Silicon macOS** (`arm64` / `aarch64`) and
-**64-bit Windows** (`x86_64`). Linux, Intel macOS, and Windows on Arm users
-should build from source for now.
+Prebuilt releases support **Apple Silicon macOS** (`arm64` / `aarch64`),
+**Linux x86_64**, and **64-bit Windows** (`x86_64`). Intel macOS, Linux on
+Arm, and Windows on Arm users should build from source for now.
 
-Apple Silicon macOS:
+Apple Silicon macOS or Linux x86_64:
 
 ```sh
 curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
@@ -103,8 +103,9 @@ open-grok --version
 Each installer downloads the platform artifact and its `.sha256` file, verifies
 SHA-256, and activates only `open-grok` (`open-grok.exe` on Windows). The
 managed command lives under `${OPENGROK_HOME:-$HOME/.opengrok}/bin/` on macOS
-or `%OPENGROK_HOME%\bin\` on Windows, which keeps manual installs and in-app
-updates on the same path. It does not create `grok` or `agent` aliases.
+and Linux or `%OPENGROK_HOME%\bin\` on Windows, which keeps manual installs
+and in-app updates on the same path. It does not create `grok` or `agent`
+aliases.
 
 By default, that managed `bin` directory is also added to `PATH`. Set
 `OPEN_GROK_BIN_DIR` to expose a symlink from another absolute directory while
@@ -270,6 +271,23 @@ The required version is ripgrep 15.0.0, matching the embedded-tool metadata.
 ```text
 dist/open-grok-macos-aarch64
 dist/open-grok-macos-aarch64.sha256
+dist/install.sh
+dist/LICENSE
+dist/THIRD-PARTY-NOTICES
+```
+
+On Linux x86_64, build the verified release asset set with:
+
+```sh
+./scripts/build-linux-release.sh
+```
+
+The Linux builder embeds a trusted local x86_64 ripgrep 15.0.0 the same way,
+strips the ELF binary, and writes:
+
+```text
+dist/open-grok-linux-x86_64
+dist/open-grok-linux-x86_64.sha256
 dist/install.sh
 dist/LICENSE
 dist/THIRD-PARTY-NOTICES

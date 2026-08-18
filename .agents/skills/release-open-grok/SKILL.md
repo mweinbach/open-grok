@@ -1,6 +1,6 @@
 ---
 name: release-open-grok
-description: Build, publish, and verify an Open Grok macOS arm64 and Windows x86_64 release end to end. Use when the user says push the build, publish the release, update an existing release, bump `OPEN_GROK_VERSION`, upload release assets, verify latest, or smoke-test an installer or managed installation.
+description: Build, publish, and verify an Open Grok macOS arm64, Linux x86_64, and Windows x86_64 release end to end. Use when the user says push the build, publish the release, update an existing release, bump `OPEN_GROK_VERSION`, upload release assets, verify latest, or smoke-test an installer or managed installation.
 ---
 
 # Release Open Grok
@@ -27,6 +27,17 @@ On Apple Silicon macOS, run `./scripts/build-macos-release.sh`. It must produce:
 
 Independently verify arm64 Mach-O type, strict ad-hoc signature, embedded version and commit, SHA-256, and the bundled `rg`. Exercise `dist/install.sh` against `OPEN_GROK_RELEASE_BASE_URL=file://<absolute-dist-dir>` with explicit temporary `OPENGROK_HOME` and `OPEN_GROK_BIN_DIR` paths.
 
+On Linux x86_64, run `./scripts/build-linux-release.sh`. It must produce:
+
+- `dist/open-grok-linux-x86_64`
+- `dist/open-grok-linux-x86_64.sha256`
+- `dist/install.sh`
+- `dist/LICENSE`
+- `dist/THIRD-PARTY-NOTICES`
+
+Independently verify x86_64 ELF type, embedded version and commit, SHA-256, and
+the bundled `rg`. Exercise `dist/install.sh` the same isolated way.
+
 On Windows x86_64, run `.\scripts\build-windows-release.ps1`. It must produce:
 
 - `dist/open-grok-windows-x86_64.exe`
@@ -45,9 +56,9 @@ unchanged.
 1. Push the exact source commit and tag.
 2. Check GitHub CLI auth without inherited overrides: `env -u GH_TOKEN -u GITHUB_TOKEN gh auth status`.
 3. Dispatch `.github/workflows/release.yml` with the existing version tag. The
-   workflow checks out the tag, builds both supported platforms, smokes the
-   macOS installer, publishes all eight unique assets, re-downloads them, and
-   verifies that the release is Latest.
+   workflow checks out the tag, builds all three supported platforms, smokes the
+   macOS and Linux installers, publishes all ten unique assets, re-downloads
+   them, and verifies that the release is Latest.
 4. Do not use browser upload as the primary path when local file access is blocked.
 
 If another publisher races this release, compare tag peel, asset size, and digest before replacing anything. Never assume an existing same-version asset was built from the current head.

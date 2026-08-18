@@ -209,9 +209,111 @@ jobs:
             dist/LICENSE
             dist/THIRD-PARTY-NOTICES
 
+  linux:
+    name: Linux x86_64
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_RELEASE_DIST_CODEGEN_UNITS: 4
+      CARGO_PROFILE_RELEASE_DIST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify tag and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < OPEN_GROK_VERSION)"
+          test "v${version}" = '${{ needs.resolve.outputs.tag }}'
+          git tag --points-at HEAD | grep -Fx '${{ needs.resolve.outputs.tag }}'
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-fast-v1-${{ runner.os }}-${{ runner.arch }}
+          cache-on-failure: true
+          cache-workspace-crates: true
+
+      - name: Install pinned ripgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ripgrep-15.0.0-x86_64-unknown-linux-musl.tar.gz"
+          curl -fL \
+            https://github.com/BurntSushi/ripgrep/releases/download/15.0.0/ripgrep-15.0.0-x86_64-unknown-linux-musl.tar.gz \
+            -o "$archive"
+          printf '%s  %s\n' \
+            253ad0fd5fef0d64cba56c70dccdacc1916d4ed70ad057cc525fcdb0c3bbd2a7 \
+            "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "GROK_TOOLS_BUNDLE_RG_PATH=$RUNNER_TEMP/ripgrep-15.0.0-x86_64-unknown-linux-musl/rg" \
+            >> "$GITHUB_ENV"
+
+      - name: Install pinned protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/protoc-29.3-linux-x86_64.zip"
+          protoc_root="$RUNNER_TEMP/protoc-29.3"
+          curl -fL \
+            https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip \
+            -o "$archive"
+          printf '%s  %s\n' \
+            3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a \
+            "$archive" | sha256sum -c -
+          mkdir -p "$protoc_root"
+          unzip -q "$archive" -d "$protoc_root"
+          protoc="$protoc_root/bin/protoc"
+          printf '%s  %s\n' \
+            5ae94ad986e83f0b52bd8139e036cbf94ddbba3ad348be8e4baf44447d7e19a4 \
+            "$protoc" | sha256sum -c -
+          test "$("$protoc" --version)" = "libprotoc 29.3"
+          echo "PROTOC=$protoc" >> "$GITHUB_ENV"
+
+      - name: Build and verify Linux release
+        shell: bash
+        run: ./scripts/build-linux-release.sh
+
+      - name: Upload Linux Cargo timings on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-cargo-timings
+          if-no-files-found: ignore
+          path: target/cargo-timings/
+
+      - name: Smoke Linux installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$smoke_root"' EXIT
+          export HOME="$smoke_root/profile-home"
+          export OPENGROK_HOME="$smoke_root/home"
+          export OPEN_GROK_BIN_DIR="$smoke_root/bin"
+          export OPEN_GROK_RELEASE_BASE_URL="file://$PWD/dist"
+          mkdir -p "$HOME"
+          bash dist/install.sh '${{ needs.resolve.outputs.tag }}'
+          "$smoke_root/bin/open-grok" --version | grep -F "$(cat OPEN_GROK_VERSION)"
+          "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
+
+      - name: Upload Linux assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-release
+          if-no-files-found: error
+          path: |
+            dist/open-grok-linux-x86_64
+            dist/open-grok-linux-x86_64.sha256
+            dist/install.sh
+
   publish:
     name: Publish and verify GitHub release
-    needs: [resolve, windows, macos]
+    needs: [resolve, windows, macos, linux]
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}

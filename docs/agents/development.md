@@ -162,6 +162,20 @@ Produces under `dist/`:
 
 Binaries are stripped and ad-hoc signed, **not** notarized.
 
+### Linux release build (x86_64)
+
+```sh
+# Clean worktree required; ripgrep 15.0.0 x86_64 on PATH or GROK_TOOLS_BUNDLE_RG_PATH
+./scripts/build-linux-release.sh
+```
+
+Produces under `dist/`:
+
+- `open-grok-linux-x86_64` + `.sha256`
+- `install.sh`, `LICENSE`, `THIRD-PARTY-NOTICES`
+
+Binaries are stripped ELF executables, **not** signed.
+
 ### Windows release build (x86_64)
 
 ```powershell
@@ -183,9 +197,9 @@ archive, verifies the archive digest, and caches it under
 After tests pass, commit the version/release note and create the matching tag
 on that exact commit. Dispatch [`.github/workflows/release.yml`](../../.github/workflows/release.yml)
 with the existing tag. It checks out the tagged source independently on
-Windows x86_64 and Apple Silicon macOS, builds and verifies both asset sets,
-publishes one full GitHub Release, re-downloads the public bytes, and verifies
-the tag is Latest.
+Windows x86_64, Apple Silicon macOS, and Linux x86_64, builds and verifies
+all three asset sets, publishes one full GitHub Release, re-downloads the
+public bytes, and verifies the tag is Latest.
 
 ## Contribution hygiene
 

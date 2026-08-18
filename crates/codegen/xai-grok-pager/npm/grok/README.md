@@ -43,9 +43,9 @@ Re-run the GitHub release installer to update.
 
 ## Supported Platforms
 
-The GitHub release currently provides an Apple Silicon macOS binary. The source
-npm package metadata supports macOS, Linux, and Windows for a future npm
-release.
+The GitHub release currently provides Apple Silicon macOS, Linux x86_64, and
+Windows x86_64 binaries. The source npm package metadata supports macOS, Linux,
+and Windows for a future npm release.
 
 ## Feedback
 

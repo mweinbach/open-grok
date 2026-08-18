@@ -42,6 +42,15 @@ fn host_platform() -> String {
     format!("{os}-{arch}")
 }
 
+fn host_has_prebuilt_release() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        || cfg!(all(target_os = "linux", target_arch = "x86_64"))
+}
+
+fn host_artifact() -> String {
+    format!("open-grok-{}", host_platform())
+}
+
 fn write_fake_curl(dir: &Path) {
     let body = format!(
         r#"#!/bin/bash
@@ -73,9 +82,9 @@ if [ -n "$out" ]; then
   case "$url" in
     *.sha256)
       if [ "$mode" = wrong_version ]; then
-        printf '%s  open-grok-macos-aarch64\n' '{wrong_sha256}' > "$out"
+        printf '%s  {artifact}\n' '{wrong_sha256}' > "$out"
       else
-        printf '%s  open-grok-macos-aarch64\n' '{sha256}' > "$out"
+        printf '%s  {artifact}\n' '{sha256}' > "$out"
       fi
       ;;
     *)
@@ -97,6 +106,7 @@ printf '%s' '{version}'
         wrong_version = WRONG_VERSION_SCRIPT,
         wrong_sha256 = WRONG_VERSION_SHA256,
         version = VERSION,
+        artifact = host_artifact(),
     );
     let path = dir.join("curl");
     std::fs::write(&path, body).unwrap();
@@ -201,8 +211,10 @@ fn run_enterprise_installer(script: &Path, home: &Path, fake_bin: &Path, shell: 
 
 #[test]
 fn release_installer_preserves_previous_binary_when_checksum_fails() {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        eprintln!("skipping: prebuilt release installer currently targets Apple Silicon macOS");
+    if !host_has_prebuilt_release() {
+        eprintln!(
+            "skipping: prebuilt release installer targets Apple Silicon macOS or Linux x86_64"
+        );
         return;
     }
     let Some(script) = script_path("install.sh") else {
@@ -234,8 +246,10 @@ fn release_installer_preserves_previous_binary_when_checksum_fails() {
 
 #[test]
 fn release_installer_keeps_override_linked_to_canonical_managed_command() {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        eprintln!("skipping: prebuilt release installer currently targets Apple Silicon macOS");
+    if !host_has_prebuilt_release() {
+        eprintln!(
+            "skipping: prebuilt release installer targets Apple Silicon macOS or Linux x86_64"
+        );
         return;
     }
     let Some(script) = script_path("install.sh") else {
@@ -282,8 +296,10 @@ fn release_installer_keeps_override_linked_to_canonical_managed_command() {
 
 #[test]
 fn release_installer_treats_a_trailing_slash_canonical_override_as_the_same_directory() {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        eprintln!("skipping: prebuilt release installer currently targets Apple Silicon macOS");
+    if !host_has_prebuilt_release() {
+        eprintln!(
+            "skipping: prebuilt release installer targets Apple Silicon macOS or Linux x86_64"
+        );
         return;
     }
     let Some(script) = script_path("install.sh") else {

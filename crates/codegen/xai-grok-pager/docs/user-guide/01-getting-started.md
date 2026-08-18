@@ -11,7 +11,7 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 
 ## Installation
 
-Install the latest Apple Silicon macOS release:
+Install the latest Apple Silicon macOS or Linux x86_64 release:
 
 ```bash
 curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
