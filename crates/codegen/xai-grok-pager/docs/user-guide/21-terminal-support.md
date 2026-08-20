@@ -74,6 +74,13 @@ Detection has these limitations:
 - tmux's global environment reflects the first client attached to the server,
   not necessarily the current terminal.
 
+### Links in the transcript
+
+Open Grok makes recognized URLs, existing file paths, and email addresses in
+the transcript clickable. Email addresses open as `mailto:` links. Git remotes
+in SCP form, such as `git@github.com:owner/repo.git`, are not treated as email
+addresses.
+
 ---
 
 ## Common Problems and Fixes

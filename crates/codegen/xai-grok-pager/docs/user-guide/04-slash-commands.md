@@ -280,6 +280,12 @@ Generate a video from a text (or image) description. It plans shots, generates s
 /imagine-video a cat playing piano in a jazz club
 ```
 
+For an xAI organization using zero data retention (ZDR), video generation may
+require a user-hosted output bucket. If Open Grok reports that output storage is
+required, follow xAI's [ZDR video storage
+setup](https://docs.x.ai/build/settings/zdr-video-storage), or disable privacy
+mode if your organization permits that.
+
 ---
 
 ## Scheduling
@@ -312,6 +318,12 @@ Set, manage, or check an autonomous goal. Grok works across rounds and only mark
 ```
 
 Arguments are `<objective> [--budget <tokens>]`, or one of `status`, `pause`, `resume`, `clear`. The `--budget` here is a **token** budget for the goal run, separate from the agent-count budgets that workflows use. `/goal` appears when goal mode is enabled for the session. Which driver runs it depends on background workflows: with them on, the host evaluates each model round and runs adversarial verification on completion candidates; with them off, the legacy model-facing `update_goal` path reports progress and triggers verification.
+
+If the objective names an external result as its success condition—such as a
+CI check, remote pipeline, or deployment—goal verification requires a fresh
+verdict from that system. A local rerun can support the result but does not
+replace it; when the external result cannot be inspected, the goal reports that
+it is unverifiable instead of lowering the bar.
 
 ### `/deep-research <query>`
 

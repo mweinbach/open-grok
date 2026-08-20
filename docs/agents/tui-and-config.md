@@ -99,6 +99,14 @@ From `xai-grok-config`:
 
 User-facing effective precedence also includes CLI flags and environment variables (see user-guide `05-configuration.md`).
 
+`[[version_overrides]]` and `[[campaigns]]` are flattened config patches, but
+they are not allowed to introduce local command execution. Patch application
+strips nested override arrays plus top-level `auth_provider`,
+`model_providers`, and `mcp_servers`, as well as `ui.status_line` and
+`ui.notifications.hooks`. Keep this boundary in
+`xai-grok-config/src/config_override.rs`; executable configuration must come
+from ordinary trusted config tables, not a campaign or version-override patch.
+
 ### Two TOML surfaces
 
 | File | Purpose |

@@ -273,6 +273,11 @@ Also isolated:
 | Legacy | — | unary `/responses/compact` if feature flag off |
 | Cross-provider switch | — | compacted Codex → xAI uses **plaintext fallback only**; never replay opaque Codex items |
 
+Before a conversation is sent to an auxiliary summarizer, preparation removes
+reasoning, tool outputs, and provider-native `BackendToolCall` items. Do not
+forward opaque provider tool-call payloads to a summary route, including one
+that happens to use the same model family.
+
 ## Code Mode and tools
 
 When Code Mode is effective (a Codex Code Mode Only requirement beats Settings):

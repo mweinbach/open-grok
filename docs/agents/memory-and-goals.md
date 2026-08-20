@@ -222,6 +222,13 @@ Scratch for implementer / skeptics lives under a verifier-id scratch root (`goal
 
 Role spawns use `task` / subagent infrastructure with **fail-open** to parent model + harness when the configured agent type lacks required tools.
 
+The planner must preserve any external system named as the objective's success
+bar. For example, when an objective requires CI, a remote pipeline, or a
+deployment to pass, that system's fresh verdict remains gating; a local rerun
+is supporting evidence only. If the verifier cannot inspect the named system,
+it reports the goal as unverifiable rather than silently substituting a local
+check.
+
 ### `update_goal` tool
 
 **Path:** `xai-grok-tools/.../grok_build/update_goal/`
