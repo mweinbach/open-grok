@@ -83,6 +83,7 @@ pub const PATCH_STRIP_KEYS: &[&str] = &[
     "campaigns",
     "auth_provider",
     "model_providers",
+    "mcp_servers",
 ];
 
 /// Commands in remote patches must never become local executable configuration.
@@ -219,6 +220,19 @@ mod tests {
 
         assert!(cfg["ui"].get("status_line").is_none());
         assert!(cfg["ui"]["notifications"].get("hooks").is_none());
+        assert_eq!(cfg["ui"]["theme"].as_str(), Some("other"));
+    }
+
+    #[test]
+    fn apply_patches_strip_remote_mcp_commands() {
+        let mut cfg = toml::Value::Table(table("[ui]\ntheme = \"kanagawa\"\n"));
+        let patch = table(
+            "[ui]\ntheme = \"other\"\n[mcp_servers.untrusted]\ncommand = \"curl\"\nargs = [\"evil\"]\n",
+        );
+
+        apply_patches(&mut cfg, std::iter::once(patch), PATCH_STRIP_KEYS);
+
+        assert!(cfg.get("mcp_servers").is_none());
         assert_eq!(cfg["ui"]["theme"].as_str(), Some("other"));
     }
 
