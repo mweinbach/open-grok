@@ -158,14 +158,35 @@ fn link_finder() -> &'static LinkFinder {
     static FINDER: OnceLock<LinkFinder> = OnceLock::new();
     FINDER.get_or_init(|| {
         let mut f = LinkFinder::new();
-        f.kinds(&[LinkKind::Url]);
+        f.kinds(&[LinkKind::Url, LinkKind::Email]);
         f
     })
 }
 
-/// One path segment without spaces (`main.rs`, `.grok`, `@scope`). Leading `.`
-/// matches dot-directories and `%` matches percent-encoded segments — grok
-/// session media lives under `~/.grok/sessions/%2F…/images/1.jpg`.
+fn linkify_href(text: &str, link: &linkify::Link<'_>) -> Option<String> {
+    let start = link.start();
+    let end = link.end();
+    if start > end
+        || end > text.len()
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+    {
+        return None;
+    }
+    match link.kind() {
+        LinkKind::Email => {
+            if matches!(text.as_bytes().get(end), Some(b':' | b'/')) {
+                return None;
+            }
+            Some(format!("mailto:{}", link.as_str()))
+        }
+        _ => Some(link.as_str().to_string()),
+    }
+}
+
+/// One path segment without spaces (`main.rs`, `.opengrok`, `@scope`). Leading `.`
+/// matches dot-directories and `%` matches percent-encoded segments. Open Grok
+/// session media lives under `~/.opengrok/sessions/%2F…/images/1.jpg`.
 const PATH_SEGMENT: &str = r"[a-zA-Z0-9_@.%][a-zA-Z0-9._+@%\-]*";
 
 /// Final path segment may contain *internal* spaces for macOS app bundles and
@@ -174,7 +195,7 @@ const PATH_SEGMENT: &str = r"[a-zA-Z0-9_@.%][a-zA-Z0-9._+@%\-]*";
 const PATH_SEGMENT_SPACED: &str =
     r"[a-zA-Z0-9_@.%][a-zA-Z0-9._+@%\-]*(?: [a-zA-Z0-9._+@%\-]+)+\.[a-zA-Z0-9][a-zA-Z0-9._+@%\-]*";
 
-/// Relative file path (`images/1.png`, `.grok/x.txt`) — one or more `/`-joined
+/// Relative file path (`images/1.png`, `.opengrok/x.txt`) — one or more `/`-joined
 /// directory segments plus a filename that has an extension. No leading `/`
 /// or `~` (those are the absolute forms). The required extension keeps
 /// slashed prose ("and/or", "TCP/IP") out; the caller still gates on the file
@@ -533,15 +554,17 @@ fn scan_logical_line(
     let mut path_byte_ranges: Vec<std::ops::Range<usize>> = Vec::new();
 
     for link in finder.links(text) {
-        let url = link.as_str();
-        if !crate::link_opener::is_safe_to_open(url, scheme_filter) {
+        let Some(url) = linkify_href(text, &link) else {
+            continue;
+        };
+        if !crate::link_opener::is_safe_to_open(&url, scheme_filter) {
             continue;
         }
         url_byte_ranges
             .get_or_insert_with(Vec::new)
             .push(link.start()..link.end());
 
-        let target = LinkTarget::Url(Arc::from(url));
+        let target = LinkTarget::Url(Arc::from(url.as_str()));
         push_link_segments(
             text,
             rows,
@@ -1207,6 +1230,49 @@ mod tests {
             overlay.is_empty(),
             "javascript:// scheme should be filtered"
         );
+    }
+
+    #[test]
+    fn scan_email_produces_mailto_overlay() {
+        let line = make_line("Email foo@bar.com please.");
+        let mut overlay = LinkOverlay::new();
+        scan_unjoined(std::iter::once((0, &line)), 0, &[], &mut overlay);
+
+        assert_eq!(overlay.links().len(), 1);
+        assert_eq!(
+            &*resolve_link_target(&overlay.links()[0].target)
+                .and_then(|resolved| resolved.osc8_url)
+                .expect("url"),
+            "mailto:foo@bar.com"
+        );
+    }
+
+    #[test]
+    fn scan_email_after_multibyte_prefix_is_mailto() {
+        let line = make_line("連絡先: foo@bar.com です");
+        let mut overlay = LinkOverlay::new();
+        scan_unjoined(std::iter::once((0, &line)), 0, &[], &mut overlay);
+
+        assert_eq!(overlay.links().len(), 1);
+        assert_eq!(
+            &*resolve_link_target(&overlay.links()[0].target)
+                .and_then(|resolved| resolved.osc8_url)
+                .expect("url"),
+            "mailto:foo@bar.com"
+        );
+    }
+
+    #[test]
+    fn scan_scp_git_remote_is_not_mailto() {
+        let line = make_line("clone git@github.com:org/repo.git please");
+        let mut overlay = LinkOverlay::new();
+        scan_unjoined(std::iter::once((0, &line)), 0, &[], &mut overlay);
+
+        assert!(overlay.links().iter().all(|link| {
+            resolve_link_target(&link.target)
+                .and_then(|resolved| resolved.osc8_url)
+                .is_none_or(|url| !url.starts_with("mailto:"))
+        }));
     }
 
     #[test]

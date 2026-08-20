@@ -174,8 +174,10 @@ criterion must be atomic and independently checkable from near its own start
 state: never write a single holistic end-to-end gate ("drive the whole thing
 through to the end"), which an automated check rarely completes — decompose into
 separate checks. Preserve OBJECTIVE's must-have terms verbatim: never swap a
-named technique, technology, or artifact for an easier one; if a must-have seems
-wrong or infeasible, keep it AND record the conflict under `## Risks /
+named technique, technology, or artifact for an easier one, and never swap the
+ENVIRONMENT a result must hold in (CI, a remote pipeline, a deployment) for an
+easier local stand-in; if a must-have seems wrong or infeasible, keep it AND
+record the conflict under `## Risks /
 Contradictions`.
 
 **Verification plan** — the shared procedure the implementer and the verifiers
@@ -196,6 +198,13 @@ exercise the entry point, read the artifact) and the
   unit-level functions are exercised directly against the real path. Never set a
   bar that can only be met by building a policy/oracle the verifier will then
   rightly call theater.
+- External oracle — when OBJECTIVE names an external system as its bar (CI, a
+  pipeline, remote job, or deployment), that system's fresh verdict remains a
+  `gating` step. A local rerun is supporting `evidence`, never a substitute for
+  the named outcome. If this environment cannot reach or trigger the oracle,
+  keep the gate and record the limit under `## Risks / Contradictions` so
+  verification ends `blocking: "unverifiable"` rather than silently lowering
+  the bar.
 - Fit every check to what is capturable in the CURRENT environment; if it cannot
   run here, specify a capturable substitute OR record the limit under `## Risks /
   Contradictions`. Never accept generated/mocked artifacts as proof.

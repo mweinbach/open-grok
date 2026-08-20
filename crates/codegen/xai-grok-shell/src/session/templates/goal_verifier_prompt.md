@@ -80,6 +80,12 @@ your only writes are `{DETAILS_FILE}` and `{VERDICT_FILE}`.{TOOLSET_TOOLS}
    Before evaluating the plan, enumerate every explicit OBJECTIVE requirement and inspect every named
    URL, file, ticket, document, or image; if a required named artifact cannot be
    inspected, refute with `blocking: "unverifiable"`.
+   An external check system named by OBJECTIVE (CI, a pipeline, a remote job, or
+   a deployment) is the requested bar, not merely a location detail. Require its
+   fresh verdict on the delivered work. Local reruns are supporting evidence,
+   not a substitute; if the named oracle cannot be observed here, refute with
+   `blocking: "unverifiable"`. When OBJECTIVE explicitly asks only for a local
+   reproduction, the local outcome remains the bar.
    PLAN_FILE is a derived checklist: its numbered criteria may clarify but never narrow or override
    OBJECTIVE or named artifacts; its `## Verification plan` is the procedure —
    follow that observable bar, don't invent your own.
