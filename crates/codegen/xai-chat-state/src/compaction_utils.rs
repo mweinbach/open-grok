@@ -45,8 +45,8 @@ fn placeholder_tool_output(item: &ConversationItem) -> Option<ConversationItem> 
         _ => None,
     }
 }
-/// Drops tool results and flattens assistant `tool_calls` into
-/// `[Called tools: ...]` text annotations.
+/// Drops tool results and provider-native tool calls, and flattens assistant
+/// `tool_calls` into `[Called tools: ...]` text annotations.
 ///
 /// Mutates assistant text in place; do NOT use this directly when sending
 /// to a provider that validates signed `reasoning` blocks against the
@@ -59,6 +59,7 @@ pub(crate) fn strip_tool_messages_for_conversation_item(
         .into_iter()
         .filter_map(|item| match item {
             item if is_tool_output(&item) => None,
+            ConversationItem::BackendToolCall(_) => None,
             ConversationItem::Assistant(mut a) => {
                 if !a.tool_calls.is_empty() {
                     let tool_names: Vec<String> =
@@ -3585,6 +3586,23 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             !result
                 .iter()
                 .any(|m| matches!(m, ConversationItem::ToolResult(_)))
+        );
+    }
+
+    #[test]
+    fn summarization_prep_drops_backend_tool_calls() {
+        let result = prepare_conversation_for_summarization(vec![
+            ConversationItem::user("hello"),
+            raw_compaction_item("provider-native"),
+            ConversationItem::assistant("done"),
+        ]);
+
+        assert_eq!(result.len(), 2);
+        assert!(
+            !result
+                .iter()
+                .any(|item| matches!(item, ConversationItem::BackendToolCall(_))),
+            "provider-native items must not reach an auxiliary summarizer"
         );
     }
     /// Load-bearing: documents the intentional contract that

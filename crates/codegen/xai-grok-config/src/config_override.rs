@@ -85,6 +85,10 @@ pub const PATCH_STRIP_KEYS: &[&str] = &[
     "model_providers",
 ];
 
+/// Commands in remote patches must never become local executable configuration.
+pub const PATCH_STRIP_PATHS: &[PatchPath] =
+    &[&["ui", "status_line"], &["ui", "notifications", "hooks"]];
+
 /// Deep-merge each patch in iteration order (later wins on a leaf), stripping
 /// `strip_keys` (top level) first.
 ///
@@ -101,9 +105,30 @@ pub fn apply_patches(
         for key in strip_keys {
             patch.remove(*key);
         }
+        for path in PATCH_STRIP_PATHS {
+            strip_path(&mut patch, path);
+        }
         let mut patch = toml::Value::Table(patch);
         crate::loader::normalize_config_layer(&mut patch);
         deep_merge_toml(config, &patch);
+    }
+}
+
+fn strip_path(patch: &mut toml::Table, path: PatchPath) {
+    let Some((key, rest)) = path.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        patch.remove(*key);
+        return;
+    }
+    match patch.get_mut(*key) {
+        Some(toml::Value::Table(nested)) => strip_path(nested, rest),
+        Some(_) => {
+            // A scalar ancestor would replace the protected subtree wholesale.
+            patch.remove(*key);
+        }
+        None => {}
     }
 }
 
@@ -178,5 +203,33 @@ mod tests {
             cfg3["model"]["x"]["model_provider"].as_str(),
             Some("local-provider")
         );
+    }
+
+    #[test]
+    fn apply_patches_strip_remote_executable_paths() {
+        let mut cfg = toml::Value::Table(table(
+            "[ui]\ntheme = \"kanagawa\"\n[ui.notifications]\nenabled = true\n",
+        ));
+        let patch = table(
+            "[ui]\ntheme = \"other\"\n[ui.status_line]\ncommand = \"curl evil\"\n\
+             [[ui.notifications.hooks]]\ncommand = \"curl worse\"\n",
+        );
+
+        apply_patches(&mut cfg, std::iter::once(patch), PATCH_STRIP_KEYS);
+
+        assert!(cfg["ui"].get("status_line").is_none());
+        assert!(cfg["ui"]["notifications"].get("hooks").is_none());
+        assert_eq!(cfg["ui"]["theme"].as_str(), Some("other"));
+    }
+
+    #[test]
+    fn non_table_protected_ancestor_is_stripped() {
+        let mut cfg = toml::Value::Table(table("[ui]\ntheme = \"kanagawa\"\n"));
+        let mut patch = toml::Table::new();
+        patch.insert("ui".into(), toml::Value::String("oops".into()));
+
+        apply_patches(&mut cfg, std::iter::once(patch), PATCH_STRIP_KEYS);
+
+        assert_eq!(cfg["ui"]["theme"].as_str(), Some("kanagawa"));
     }
 }

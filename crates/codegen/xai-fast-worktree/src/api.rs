@@ -690,16 +690,27 @@ fn remove_worktree_from_disk(
         Err(_) => {} // nothing at the path
     }
 
-    // Deregister: remove the `.git/worktrees/<name>/` directory.
-    // This is what `git worktree remove` does after deleting the working tree.
     if let Some(reg_dir) = registration_dir
         && reg_dir.exists()
     {
-        tracing::debug!(
-            registration_dir = %reg_dir.display(),
-            "removing worktree registration from .git/worktrees/"
-        );
-        let _ = std::fs::remove_dir_all(&reg_dir);
+        // The `.git` pointer is untrusted. Require both the expected directory
+        // shape and a backlink to the worktree being removed.
+        let is_registration_dir =
+            reg_dir.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("worktrees"));
+        let backlinks_here = crate::git::registration_worktree_path(&reg_dir)
+            == Some(crate::git::normalized_for_match(worktree_path));
+        if is_registration_dir && backlinks_here {
+            tracing::debug!(
+                registration_dir = %reg_dir.display(),
+                "removing worktree registration from .git/worktrees/"
+            );
+            let _ = std::fs::remove_dir_all(&reg_dir);
+        } else {
+            tracing::warn!(
+                registration_dir = %reg_dir.display(),
+                "skipping registration cleanup: not a worktrees entry backlinking to this worktree"
+            );
+        }
     }
 
     Ok(RemoveReport {
@@ -2623,6 +2634,65 @@ mod tests {
             0,
             "delegate is a fallback only; a plain worktree removal must not call it"
         );
+    }
+
+    #[test]
+    fn sibling_registration_not_removed() {
+        xai_test_utils::require_git!();
+        use xai_test_utils::git::{git_commit_all, init_git_repo};
+        #[cfg(feature = "metadata")]
+        let _fx = crate::db::GrokHomeFixture::new();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("file.txt"), "content").unwrap();
+        git_commit_all(&repo, "initial");
+
+        let victim_wt = tmp.path().join("worktrees").join("victim");
+        let attacker_wt = tmp.path().join("worktrees").join("attacker");
+        WorktreeBuilder::new(&repo, &victim_wt).create().unwrap();
+        WorktreeBuilder::new(&repo, &attacker_wt).create().unwrap();
+
+        let victim_reg = read_worktree_gitdir(&victim_wt).expect("victim has a registration");
+        std::fs::write(
+            attacker_wt.join(".git"),
+            format!("gitdir: {}\n", victim_reg.display()),
+        )
+        .unwrap();
+
+        remove_worktree(&attacker_wt).unwrap();
+
+        assert!(!attacker_wt.exists());
+        assert!(
+            victim_reg.join("gitdir").exists(),
+            "a sibling registration and its refs must survive"
+        );
+    }
+
+    #[test]
+    fn non_registration_directory_not_removed() {
+        #[cfg(feature = "metadata")]
+        let _fx = crate::db::GrokHomeFixture::new();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let decoy = tmp.path().join("decoy");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(
+            decoy.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(decoy.join("keep.txt"), b"do not delete").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", decoy.display())).unwrap();
+
+        remove_worktree(&wt).unwrap();
+
+        assert!(!wt.exists());
+        assert!(decoy.join("keep.txt").exists());
     }
 
     /// When the direct `btrfs delete` fails (e.g. EPERM on a rootless host),

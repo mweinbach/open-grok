@@ -17,8 +17,10 @@ pub(crate) use checkout::{has_staged_changes, worktree_at_ref, worktree_has_trac
 pub(crate) use discovery::{find_worktree_root, get_head_commit};
 pub(crate) use index::{copy_git_index, update_index_stats};
 pub(crate) use status::get_modified_files;
-pub(crate) use worktree::worktree_add_no_checkout;
 pub use worktree::{
     StaleWorktreeMatch, remove_stale_worktree_registration, remove_stale_worktree_registrations,
     remove_stale_worktree_registrations_under,
+};
+pub(crate) use worktree::{
+    normalized_for_match, registration_worktree_path, worktree_add_no_checkout,
 };
