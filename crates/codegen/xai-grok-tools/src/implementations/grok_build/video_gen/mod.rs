@@ -53,6 +53,7 @@ const MAX_R2V_REFERENCE_IMAGES: usize = 7;
 const VALID_IMAGINE_VIDEO_ASPECT_RATIOS: &[&str] = &["1:1", "16:9", "9:16", "3:2", "2:3"];
 const VALID_VIDEO_RESOLUTIONS: &[&str] = &["480p", "720p"];
 const IMAGINE_VIDEO_DURATIONS_SECS: &[u32] = &[6, 10];
+const ZDR_RESTRICTED_MESSAGE: &str = "Video generation requires user-hosted output storage under zero data retention (ZDR). Configure a video output bucket (see https://docs.x.ai/build/settings/zdr-video-storage) or disable privacy mode.";
 
 pub use xai_grok_tools_api::slash_commands::{
     IMAGE_TO_VIDEO_TOOL_NAME, IMAGINE_VIDEO_COMMAND_NAME, imagine_video_instruction,
@@ -319,11 +320,7 @@ impl VideoGenClient {
             let body = response.text().await.unwrap_or_default();
             let truncated: String = body.chars().take(200).collect();
             tracing::warn!(http_status = %status, "Video generation API error: {truncated}");
-            return Err(xai_tool_runtime::ToolError::new(
-                xai_tool_runtime::ToolErrorKind::Custom,
-                format!("Video generation failed with HTTP {status}: {truncated}"),
-            )
-            .with_details(serde_json::json!({"code": "http_failure", "status": status.as_u16()})));
+            return Err(video_http_error(status, &body));
         }
 
         let body = response.text().await.map_err(|e| {
@@ -390,6 +387,9 @@ impl VideoGenClient {
             }
             if !poll_status.is_success() && poll_status.as_u16() != 202 {
                 let body = poll_response.text().await.unwrap_or_default();
+                if is_zdr_upload_url_error(&body) {
+                    return Err(zdr_restricted_error());
+                }
                 let truncated: String = body.chars().take(200).collect();
                 return Err(xai_tool_runtime::ToolError::new(
                     xai_tool_runtime::ToolErrorKind::Custom,
@@ -635,6 +635,31 @@ impl VideoGenClient {
 
 fn zdr_presign_expires_secs(configured: u64) -> u64 {
     configured.max(MIN_ZDR_VIDEO_PRESIGN_EXPIRES_SECS)
+}
+
+fn is_zdr_upload_url_error(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains("must provide output.upload_url")
+}
+
+fn zdr_restricted_error() -> xai_tool_runtime::ToolError {
+    xai_tool_runtime::ToolError::new(
+        xai_tool_runtime::ToolErrorKind::Custom,
+        ZDR_RESTRICTED_MESSAGE,
+    )
+    .with_details(serde_json::json!({"code": "zdr_output_storage_required"}))
+}
+
+fn video_http_error(status: reqwest::StatusCode, body: &str) -> xai_tool_runtime::ToolError {
+    if is_zdr_upload_url_error(body) {
+        return zdr_restricted_error();
+    }
+    let truncated: String = body.chars().take(500).collect();
+    xai_tool_runtime::ToolError::new(
+        xai_tool_runtime::ToolErrorKind::Custom,
+        format!("Video generation failed with HTTP {status}: {truncated}"),
+    )
+    .with_details(serde_json::json!({"code": "http_failure", "status": status.as_u16()}))
 }
 
 fn zdr_get_credentials(config: &ZdrVideoOutputS3Config) -> (&S3AccessCredentials, &'static str) {
@@ -1197,6 +1222,21 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_http_error_rewrites_zdr_storage_400() {
+        let zdr = video_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"Zero Data Retention teams must provide output.upload_url for video generation."}"#,
+        );
+        assert_eq!(zdr.to_string(), ZDR_RESTRICTED_MESSAGE);
+
+        let invalid_url = video_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"The output.upload_url field is invalid."}"#,
+        );
+        assert_ne!(invalid_url.to_string(), ZDR_RESTRICTED_MESSAGE);
+    }
     use crate::types::tool_metadata::test_ctx_with_call_id;
 
     #[test]
