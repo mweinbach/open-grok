@@ -838,6 +838,8 @@ impl SessionActor {
             provider,
             cfg.api_backend,
         );
+        let codex_permissions = (provider == xai_grok_sampling_types::ModelProvider::Codex)
+            .then(|| self.codex_permissions());
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
@@ -908,10 +910,61 @@ impl SessionActor {
                 .active_sampling_config()
                 .supports_standalone_web_search,
             codex_multi_agent_v2,
+            codex_permissions,
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+        }
+    }
+
+    fn codex_permissions(&self) -> xai_grok_sampler::CodexPermissions {
+        let active_profile = xai_grok_sandbox::profile_name();
+        let sandbox_mode = match active_profile {
+            None => "danger-full-access",
+            Some("read-only" | "readonly") => "read-only",
+            Some(_) => "workspace-write",
+        };
+        let sandbox = if active_profile.is_none() {
+            "none"
+        } else if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else if cfg!(target_os = "linux") {
+            "landlock"
+        } else if cfg!(target_os = "windows") {
+            "windows_sandbox"
+        } else {
+            "external"
+        };
+        let cwd = std::path::Path::new(self.session_info.cwd.as_str());
+        let writable_roots = active_profile
+            .and_then(|profile| profile.parse::<xai_grok_sandbox::ProfileName>().ok())
+            .and_then(|profile| {
+                let config = xai_grok_sandbox::load_sandbox_config(cwd);
+                profile.resolve_profile(cwd, &config).ok()
+            })
+            .map(|profile| {
+                profile
+                    .read_write
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let auto_review_enabled = self.permissions.is_auto_mode();
+        let approval_policy = if self.permissions.is_yolo_mode() {
+            xai_grok_sampler::CodexApprovalPolicy::Never
+        } else {
+            xai_grok_sampler::CodexApprovalPolicy::OnRequest
+        };
+        xai_grok_sampler::CodexPermissions {
+            sandbox: sandbox.to_owned(),
+            sandbox_mode: sandbox_mode.to_owned(),
+            sandbox_profile: active_profile.map(str::to_owned),
+            network_access: !xai_grok_sandbox::should_restrict_child_network(),
+            writable_roots,
+            approval_policy,
+            auto_review_enabled,
         }
     }
     /// Install auto-mode permission classifier with a live LLM side-query

@@ -6363,6 +6363,7 @@ pub fn sampling_config_for_model(
         supports_standalone_web_search: supports_standalone_web_search(info, uses_codex_oauth),
         // Preserve the live Codex `multi_agent_version` contract through the sampler.
         codex_multi_agent_v2: supports_codex_multi_agent_v2(info),
+        codex_permissions: None,
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
         doom_loop_recovery: None,

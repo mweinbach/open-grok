@@ -24,6 +24,28 @@ pub enum AuthScheme {
     XApiKey,
 }
 
+/// Truthful, session-scoped execution policy exposed to the Codex provider.
+///
+/// Construct this from successfully applied sandbox state, never from a
+/// requested profile or a UI mode alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexPermissions {
+    pub sandbox: String,
+    pub sandbox_mode: String,
+    pub sandbox_profile: Option<String>,
+    pub network_access: bool,
+    pub writable_roots: Vec<String>,
+    pub approval_policy: CodexApprovalPolicy,
+    pub auto_review_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexApprovalPolicy {
+    OnRequest,
+    Never,
+}
+
 /// All knobs that control a single sampling request.
 ///
 /// The session typically owns one `SamplerConfig` per active model
@@ -137,6 +159,10 @@ pub struct SamplerConfig {
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
 
+    /// Effective, applied execution policy. Only the Codex adapter may expose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_permissions: Option<CodexPermissions>,
+
     /// Per-model config for the `x-compactions-remaining` header; `None` disables it.
     #[serde(default)]
     pub compactions_remaining: Option<CompactionsRemaining>,
@@ -194,6 +220,7 @@ impl Default for SamplerConfig {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            codex_permissions: None,
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,

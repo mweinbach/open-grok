@@ -497,6 +497,7 @@ fn patch_codex_request_compat(
             multi_agent_v2,
             local_effort,
             reasoning_summary,
+            ..Default::default()
         },
     );
 }
@@ -683,6 +684,7 @@ fn retain_codex_compact_request_fields(request_body: &mut serde_json::Value) -> 
                 | "service_tier"
                 | "prompt_cache_key"
                 | "text"
+                | "client_metadata"
         )
     });
     body.retain(|key, value| {
@@ -715,6 +717,7 @@ fn retain_codex_remote_compaction_v2_request_fields(
                 | "include"
                 | "store"
                 | "stream"
+                | "client_metadata"
         )
     });
     body.retain(|key, value| {
@@ -1165,6 +1168,7 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     idle_timeout_secs: Option<u64>,
     codex_multi_agent_v2: bool,
+    codex_permissions: Option<crate::config::CodexPermissions>,
     reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     service_tier: Option<String>,
     reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
@@ -1477,6 +1481,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             idle_timeout_secs: config.idle_timeout_secs,
             codex_multi_agent_v2: config.codex_multi_agent_v2,
+            codex_permissions: config.codex_permissions,
             reasoning_effort: config.reasoning_effort,
             service_tier: config.service_tier,
             reasoning_summary: config.reasoning_summary,
@@ -2194,6 +2199,9 @@ impl SamplingClient {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
                 local_effort: local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
+                codex_permissions: self.defaults.codex_permissions.clone(),
+                session_id: request.x_grok_session_id.clone(),
+                turn_id: request.x_grok_turn_idx.clone(),
             },
         );
         if remote_v2 {
@@ -2294,6 +2302,7 @@ impl SamplingClient {
                 .as_deref()
                 .or(request.x_grok_session_id.as_deref()),
         );
+        let builder = self.apply_codex_turn_metadata_header(builder, &request_body);
         let response = builder
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&request_body)
@@ -2400,6 +2409,7 @@ impl SamplingClient {
                 .as_deref()
                 .or(request.x_grok_session_id.as_deref()),
         );
+        let builder = self.apply_codex_turn_metadata_header(builder, &request_body);
         let response = builder
             .headers(beta_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
@@ -2520,6 +2530,29 @@ impl SamplingClient {
         Ok(())
     }
 
+    fn apply_codex_turn_metadata_header(
+        &self,
+        builder: reqwest::RequestBuilder,
+        request_body: &serde_json::Value,
+    ) -> reqwest::RequestBuilder {
+        if self.defaults.provider != ModelProvider::Codex {
+            return builder;
+        }
+        match request_body
+            .pointer("/client_metadata/x-codex-turn-metadata")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(metadata) => match HeaderValue::from_str(metadata) {
+                Ok(value) => builder.header(crate::provider::X_CODEX_TURN_METADATA_HEADER, value),
+                Err(error) => {
+                    tracing::warn!(%error, "Skipping invalid Codex turn metadata header");
+                    builder
+                }
+            },
+            None => builder,
+        }
+    }
+
     /// Create a response using the Responses API (non-streaming).
     ///
     /// This uses the Responses API format which provides a simpler interface
@@ -2577,6 +2610,9 @@ impl SamplingClient {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
+                codex_permissions: self.defaults.codex_permissions.clone(),
+                session_id: request.x_grok_session_id.clone(),
+                turn_id: request.x_grok_turn_idx.clone(),
             },
         );
         validate_responses_wire_body_for_provider(&request_body, self.defaults.provider)?;
@@ -2586,7 +2622,9 @@ impl SamplingClient {
         } = self.post(self.endpoint("responses"));
         let http_request = self
             .provider_adapter
-            .apply_request_headers(builder, grok_headers)
+            .apply_request_headers(builder, grok_headers);
+        let http_request = self
+            .apply_codex_turn_metadata_header(http_request, &request_body)
             .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
@@ -2748,6 +2786,9 @@ impl SamplingClient {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
+                codex_permissions: self.defaults.codex_permissions.clone(),
+                session_id: request.x_grok_session_id.clone(),
+                turn_id: request.x_grok_turn_idx.clone(),
             },
         );
         validate_responses_wire_body_for_provider(&request_body, self.defaults.provider)?;
@@ -2771,7 +2812,9 @@ impl SamplingClient {
             http_request =
                 http_request.header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string());
         }
-        let http_request = http_request.json(&request_body);
+        let http_request = self
+            .apply_codex_turn_metadata_header(http_request, &request_body)
+            .json(&request_body);
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -3864,11 +3907,67 @@ mod tests {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            codex_permissions: None,
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
         }
+    }
+
+    #[test]
+    fn codex_turn_metadata_header_matches_canonical_client_metadata() {
+        let config = SamplerConfig {
+            provider: ModelProvider::Codex,
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(config).expect("Codex client should build");
+        let metadata =
+            r#"{"sandbox":"seatbelt","sandbox_mode":"workspace-write","auto_review_enabled":true}"#;
+        let body = serde_json::json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": metadata,
+            }
+        });
+        let request = client
+            .apply_codex_turn_metadata_header(
+                reqwest::Client::new().post("https://example.test/responses"),
+                &body,
+            )
+            .build()
+            .expect("Codex request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(crate::provider::X_CODEX_TURN_METADATA_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(metadata)
+        );
+    }
+
+    #[test]
+    fn codex_turn_metadata_header_never_crosses_provider_boundaries() {
+        let client = SamplingClient::new(minimal_config()).expect("xAI client should build");
+        let body = serde_json::json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": r#"{"sandbox":"seatbelt"}"#,
+            }
+        });
+        let request = client
+            .apply_codex_turn_metadata_header(
+                reqwest::Client::new().post("https://example.test/responses"),
+                &body,
+            )
+            .build()
+            .expect("xAI request should build");
+
+        assert!(
+            !request
+                .headers()
+                .contains_key(crate::provider::X_CODEX_TURN_METADATA_HEADER)
+        );
     }
 
     #[test]

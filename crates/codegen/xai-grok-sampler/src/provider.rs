@@ -14,7 +14,7 @@ use xai_grok_sampling_types::{
     ReasoningEffort, ReasoningSummary, RequestMetadataPolicy, ResponsesDialect, SamplingError,
 };
 
-use crate::config::SamplerConfig;
+use crate::config::{CodexApprovalPolicy, CodexPermissions, SamplerConfig};
 
 /// Process-level fallback for the `x-grok-client-identifier` header.
 const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
@@ -30,6 +30,7 @@ pub(crate) const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub(crate) const CODEX_SESSION_ID_HEADER: &str = "session-id";
 pub(crate) const CODEX_THREAD_ID_HEADER: &str = "thread-id";
 pub(crate) const CODEX_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
+pub(crate) const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 
 pub(crate) const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
 pub(crate) const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
@@ -37,11 +38,14 @@ pub(crate) const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Any earlie
 pub(crate) const PROACTIVE_MULTI_AGENT_MODE_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
 
 /// Provider-neutral input to the Responses request patching seam.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResponsesRequestPolicy {
     pub multi_agent_v2: bool,
     pub local_effort: Option<ReasoningEffort>,
     pub reasoning_summary: Option<ReasoningSummary>,
+    pub codex_permissions: Option<CodexPermissions>,
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
 }
 
 /// Request metadata available to providers that use the xAI proxy contract.
@@ -789,6 +793,10 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
 fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequestPolicy) {
     patch_codex_instruction_roles(request_body);
 
+    if let Some(permissions) = policy.codex_permissions.as_ref() {
+        patch_codex_permissions(request_body, permissions, &policy);
+    }
+
     // Codex sandboxes `web_search` unless the request opts into live access.
     // async-openai's native tool serializes the bare `{"type":"web_search"}`
     // shape, so grant live sources here — the fork's long-standing Codex
@@ -854,6 +862,104 @@ fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequ
         .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
         .map_or(input.len(), |_| input.len() - 1);
     input.insert(insert_at, mode_item);
+}
+
+fn patch_codex_permissions(
+    request_body: &mut Value,
+    permissions: &CodexPermissions,
+    policy: &ResponsesRequestPolicy,
+) {
+    let mut metadata = serde_json::json!({
+        "sandbox": permissions.sandbox,
+        "sandbox_mode": permissions.sandbox_mode,
+        "auto_review_enabled": permissions.auto_review_enabled,
+    });
+    if let Some(session_id) = policy.session_id.as_ref() {
+        metadata["session_id"] = Value::String(session_id.clone());
+        metadata["thread_id"] = Value::String(session_id.clone());
+    }
+    if let Some(turn_id) = policy.turn_id.as_ref() {
+        metadata["turn_id"] = Value::String(turn_id.clone());
+    }
+    if let Some(profile) = permissions.sandbox_profile.as_ref() {
+        metadata["open_grok_sandbox_profile"] = Value::String(profile.clone());
+    }
+    let client_metadata = request_body
+        .as_object_mut()
+        .expect("Responses request must be an object")
+        .entry("client_metadata")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(client_metadata) = client_metadata.as_object_mut() {
+        client_metadata.insert(
+            X_CODEX_TURN_METADATA_HEADER.to_owned(),
+            Value::String(metadata.to_string()),
+        );
+    }
+
+    let network = if permissions.network_access {
+        "enabled"
+    } else {
+        "restricted"
+    };
+    let sandbox = match permissions.sandbox_mode.as_str() {
+        "read-only" => {
+            "The filesystem sandbox permits reading files; workspace files cannot be modified."
+        }
+        "workspace-write" => {
+            "The filesystem sandbox permits reading files and writing only within its allowed roots."
+        }
+        _ => {
+            "No filesystem sandbox is active; commands have unrestricted filesystem access subject to local permission rules."
+        }
+    };
+    let approval = match permissions.approval_policy {
+        CodexApprovalPolicy::Never => {
+            "Approval policy is `never`: Open Grok automatically permits tool executions unless a hard deny rule or plan-mode restriction applies. Do not claim that approval is required."
+        }
+        CodexApprovalPolicy::OnRequest if permissions.auto_review_enabled => {
+            "Approval policy is `on-request` and `approvals_reviewer` is `auto_review`: Open Grok's permission classifier reviews tool actions automatically; hard deny rules and the actual sandbox remain enforced."
+        }
+        CodexApprovalPolicy::OnRequest => {
+            "Approval policy is `on-request`: Open Grok requests user approval when its local permission policy requires it. Permission prompts are managed by the tool runtime."
+        }
+    };
+    let roots = if permissions.writable_roots.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nThe writable roots are {}.",
+            permissions
+                .writable_roots
+                .iter()
+                .map(|root| format!("`{root}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let rendered = format!(
+        "<permissions instructions>\nFilesystem sandboxing: `sandbox_mode` is `{}`. {sandbox} Network access is {network}.\n{approval}{roots}\n</permissions instructions>",
+        permissions.sandbox_mode,
+    );
+    let Some(input) = request_body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    input.retain(|item| {
+        !(item.get("role").and_then(Value::as_str) == Some("developer")
+            && responses_message_text(item)
+                .is_some_and(|text| text.contains("<permissions instructions>")))
+    });
+    let insert_at = input
+        .iter()
+        .position(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(input.len());
+    input.insert(
+        insert_at,
+        serde_json::json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{ "type": "input_text", "text": rendered }],
+        }),
+    );
 }
 
 fn patch_deepseek_responses_request(request_body: &mut Value, policy: ResponsesRequestPolicy) {
@@ -1062,6 +1168,137 @@ mod tests {
         })
     }
 
+    fn sandboxed_permissions(auto_review_enabled: bool) -> CodexPermissions {
+        CodexPermissions {
+            sandbox: "seatbelt".to_owned(),
+            sandbox_mode: "workspace-write".to_owned(),
+            sandbox_profile: Some("workspace".to_owned()),
+            network_access: true,
+            writable_roots: vec!["/tmp/project".to_owned()],
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            auto_review_enabled,
+        }
+    }
+
+    #[test]
+    fn codex_permissions_report_applied_sandbox_and_auto_review() {
+        let mut request = base_request();
+        let policy = ResponsesRequestPolicy {
+            codex_permissions: Some(sandboxed_permissions(true)),
+            session_id: Some("session-123".to_owned()),
+            turn_id: Some("7".to_owned()),
+            ..Default::default()
+        };
+        provider_adapter(ModelProvider::Codex)
+            .patch_responses_request(&mut request, policy.clone());
+        provider_adapter(ModelProvider::Codex).patch_responses_request(&mut request, policy);
+
+        let metadata: Value = serde_json::from_str(
+            request["client_metadata"][X_CODEX_TURN_METADATA_HEADER]
+                .as_str()
+                .expect("Codex metadata must be JSON-encoded"),
+        )
+        .unwrap();
+        assert_eq!(metadata["sandbox"], "seatbelt");
+        assert_eq!(metadata["sandbox_mode"], "workspace-write");
+        assert_eq!(metadata["auto_review_enabled"], true);
+        assert_eq!(metadata["session_id"], "session-123");
+        assert_eq!(metadata["turn_id"], "7");
+        let permission_items = request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| {
+                item["role"] == "developer"
+                    && responses_message_text(item)
+                        .is_some_and(|text| text.contains("<permissions instructions>"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(permission_items.len(), 1);
+        let text = responses_message_text(permission_items[0]).unwrap();
+        assert!(text.contains("`workspace-write`"));
+        assert!(text.contains("`auto_review`"));
+        assert!(text.contains("`/tmp/project`"));
+    }
+
+    #[test]
+    fn codex_permissions_never_claim_an_unsandboxed_yolo_session_is_confined() {
+        let mut request = base_request();
+        provider_adapter(ModelProvider::Codex).patch_responses_request(
+            &mut request,
+            ResponsesRequestPolicy {
+                codex_permissions: Some(CodexPermissions {
+                    sandbox: "none".to_owned(),
+                    sandbox_mode: "danger-full-access".to_owned(),
+                    sandbox_profile: None,
+                    network_access: true,
+                    writable_roots: vec![],
+                    approval_policy: CodexApprovalPolicy::Never,
+                    auto_review_enabled: false,
+                }),
+                ..Default::default()
+            },
+        );
+        let metadata: Value = serde_json::from_str(
+            request["client_metadata"][X_CODEX_TURN_METADATA_HEADER]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["sandbox"], "none");
+        assert_eq!(metadata["sandbox_mode"], "danger-full-access");
+        let text = responses_message_text(&request["input"][0]).unwrap();
+        assert!(text.contains("No filesystem sandbox is active"));
+        assert!(text.contains("Approval policy is `never`"));
+    }
+
+    #[test]
+    fn codex_permissions_report_read_only_network_restricted_manual_approval() {
+        let mut request = base_request();
+        provider_adapter(ModelProvider::Codex).patch_responses_request(
+            &mut request,
+            ResponsesRequestPolicy {
+                codex_permissions: Some(CodexPermissions {
+                    sandbox: "seatbelt".to_owned(),
+                    sandbox_mode: "read-only".to_owned(),
+                    sandbox_profile: Some("read-only".to_owned()),
+                    network_access: false,
+                    writable_roots: vec![],
+                    approval_policy: CodexApprovalPolicy::OnRequest,
+                    auto_review_enabled: false,
+                }),
+                ..Default::default()
+            },
+        );
+        let metadata: Value = serde_json::from_str(
+            request["client_metadata"][X_CODEX_TURN_METADATA_HEADER]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["sandbox_mode"], "read-only");
+        assert_eq!(metadata["auto_review_enabled"], false);
+        let text = responses_message_text(&request["input"][0]).unwrap();
+        assert!(text.contains("workspace files cannot be modified"));
+        assert!(text.contains("Network access is restricted"));
+        assert!(text.contains("Approval policy is `on-request`"));
+        assert!(!text.contains("`auto_review`"));
+    }
+
+    #[test]
+    fn execution_permissions_never_cross_to_non_codex_providers() {
+        let mut request = base_request();
+        let original = request.clone();
+        provider_adapter(ModelProvider::Xai).patch_responses_request(
+            &mut request,
+            ResponsesRequestPolicy {
+                codex_permissions: Some(sandboxed_permissions(true)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(request, original);
+    }
+
     #[test]
     fn registry_is_complete_and_profiles_match_keys() {
         let expected = [
@@ -1116,6 +1353,7 @@ mod tests {
                     multi_agent_v2: false,
                     local_effort: Some(ReasoningEffort::Max),
                     reasoning_summary: None,
+                    ..Default::default()
                 },
             );
 
@@ -1631,6 +1869,7 @@ mod tests {
                 supports_backend_search: false,
                 supports_standalone_web_search: false,
                 codex_multi_agent_v2: false,
+                codex_permissions: None,
                 compactions_remaining: None,
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
