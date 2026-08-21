@@ -43,7 +43,7 @@ ACP clients can set `"_meta": { "yoloMode": true }` on `session/new`. See [Agent
 
 ### How to set the mode
 
-**Interactive TUI:** `Shift+Tab` / `Ctrl+O`, `/always-approve` or `/auto`, or `/settings` ([shortcuts](03-keyboard-shortcuts.md), [commands](04-slash-commands.md)).
+**Interactive TUI:** `Shift+Tab` / `Ctrl+O`, `/always-approve`, `/yolo-2`, or `/auto`, or `/settings` ([shortcuts](03-keyboard-shortcuts.md), [commands](04-slash-commands.md)). `/yolo-2` requires an active OS-level sandbox.
 
 **CLI:**
 
@@ -72,6 +72,16 @@ Skips ordinary permission prompts so tools run without waiting for a click. `den
 | Config | `[ui] permission_mode = "always-approve"` |
 | Interactive | `/always-approve`, `Ctrl+O` |
 | ACP | `_meta.yoloMode: true` on `session/new` |
+
+#### Sandboxed always-approve: YOLO-2
+
+Start Open Grok with an OS-level sandbox, then run `/yolo-2` to toggle always-approve while retaining the sandbox's filesystem restrictions:
+
+```bash
+open-grok --sandbox workspace
+```
+
+`/yolo-2` refuses to activate unless the sandbox was successfully applied. Codex receives the actual sandbox profile, network restrictions, writable roots, approval policy, and Open Grok auto-review status; an unsandboxed session is always reported as unsandboxed.
 
 #### Always-approve with hard limits
 
@@ -555,4 +565,3 @@ Recommended combination for untrusted code:
 - [Agent mode](15-agent-mode.md) — ACP, stdio, and agent servers
 - [Sandbox](18-sandbox.md) — OS-level isolation profiles
 - [Configuration](05-configuration.md) — Native `config.toml` structure
-

@@ -138,16 +138,17 @@ Set reasoning effort on the **current** model without reselecting it. Levels are
 /effort high
 ```
 
-### `/always-approve` and `/auto`
+### `/always-approve`, `/yolo-2`, and `/auto`
 
-Both are real toggles for the permission mode: they stay in the menu, and running the mode you're already in turns it back off.
+These are real toggles for the permission mode: they stay in the menu, and running the mode you're already in turns it back off.
 
 | Command | When off | When already on |
 |---|---|---|
 | `/always-approve` | Skip all permission prompts | Back to ask |
+| `/yolo-2` | Skip permission prompts only when an OS sandbox is active | Back to ask |
 | `/auto` | Classifier approves safe tools (dangerous ones may still prompt) | Back to ask |
 
-Running one while the other is active switches modes — for example, `/auto` while always-approve is on switches to auto. `/auto` only appears when the auto permission-mode feature is enabled. You can also change mode with `Shift+Tab` (cycles Normal / Plan / Always-approve), `Ctrl+O`, or `/settings`.
+Running one while another is active switches modes — for example, `/auto` while always-approve is on switches to auto. `/yolo-2` refuses to run without a successfully applied sandbox; start with `open-grok --sandbox workspace` first. `/auto` only appears when the auto permission-mode feature is enabled. You can also change mode with `Shift+Tab` (cycles Normal / Plan / Always-approve), `Ctrl+O`, or `/settings`.
 
 ### `/multiline`
 
