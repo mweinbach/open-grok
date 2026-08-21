@@ -250,13 +250,14 @@ cargo build --locked -p xai-grok-pager-bin --bin open-grok
 
 Release (Apple Silicon, clean tree): `./scripts/build-macos-release.sh` reads `OPEN_GROK_VERSION`. The builder requires the pinned arm64 `ripgrep 15.0.0` through `GROK_TOOLS_BUNDLE_RG_PATH`; do not substitute a newer Homebrew binary. Use [`release-open-grok`](.agents/skills/release-open-grok/SKILL.md) for the publication and installer-verification sequence.
 
-Release (Linux x86_64, clean tree): `./scripts/build-linux-release.sh` reads
-`OPEN_GROK_VERSION` and embeds pinned x86_64 `ripgrep` 15.0.0 the same way.
+Release (Linux x86_64 / arm64, clean tree): `./scripts/build-linux-release.sh`
+reads `OPEN_GROK_VERSION` and embeds pinned `ripgrep` 15.0.0 for the host
+architecture the same way.
 
 Release (Windows x86_64, clean tree):
 `.\scripts\build-windows-release.ps1` reads `OPEN_GROK_VERSION`, verifies or
 bootstraps pinned `protoc` 29.3, and packages the `.exe`, checksum, and
-`install.ps1`. The full GitHub release workflow builds all three supported
+`install.ps1`. The full GitHub release workflow builds all four supported
 platforms from the existing version tag.
 
 ---

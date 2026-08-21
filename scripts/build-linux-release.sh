@@ -6,8 +6,22 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 version_file="${repo_root}/OPEN_GROK_VERSION"
 dist_dir="${repo_root}/dist"
-artifact_name="open-grok-linux-x86_64"
-target_triple="x86_64-unknown-linux-gnu"
+arch="$(uname -m)"
+case "$arch" in
+    x86_64 | amd64)
+        arch="x86_64"
+        target_triple="x86_64-unknown-linux-gnu"
+        ;;
+    aarch64 | arm64)
+        arch="aarch64"
+        target_triple="aarch64-unknown-linux-gnu"
+        ;;
+    *)
+        echo "Error: unsupported Linux architecture '$arch' (expected x86_64 or aarch64)." >&2
+        exit 1
+        ;;
+esac
+artifact_name="open-grok-linux-${arch}"
 expected_rg_version="ripgrep 15.0.0"
 artifact_path="${dist_dir}/${artifact_name}"
 checksum_path="${artifact_path}.sha256"
@@ -26,9 +40,8 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?
     exit 1
 fi
 
-if [[ "$(uname -s)" != "Linux" ]] ||
-    [[ "$(uname -m)" != "x86_64" && "$(uname -m)" != "amd64" ]]; then
-    echo "Error: this release builder requires Linux x86_64." >&2
+if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "Error: this release builder requires Linux." >&2
     exit 1
 fi
 
@@ -52,12 +65,22 @@ if [[ -z "$rg_path" ]]; then
 fi
 if [[ -z "$rg_path" || ! -f "$rg_path" || ! -x "$rg_path" ]]; then
     echo "Error: a trusted local ripgrep executable is required." >&2
-    echo "Install rg or set GROK_TOOLS_BUNDLE_RG_PATH to a verified x86_64 binary." >&2
+    echo "Install rg or set GROK_TOOLS_BUNDLE_RG_PATH to a verified ${arch} binary." >&2
     exit 1
 fi
 rg_path="$(cd "$(dirname "$rg_path")" && pwd)/$(basename "$rg_path")"
-if ! file "$rg_path" | grep -Eq 'x86-64|x86_64'; then
-    echo "Error: the bundled ripgrep executable is not x86_64: $rg_path" >&2
+case "$arch" in
+    x86_64)
+        rg_arch_pattern='x86-64|x86_64'
+        elf_arch_pattern='ELF 64-bit LSB.*x86-64'
+        ;;
+    aarch64)
+        rg_arch_pattern='aarch64|ARM aarch64'
+        elf_arch_pattern='ELF 64-bit LSB.*ARM aarch64'
+        ;;
+esac
+if ! file "$rg_path" | grep -Eq "$rg_arch_pattern"; then
+    echo "Error: the bundled ripgrep executable is not ${arch}: $rg_path" >&2
     exit 1
 fi
 rg_version_line="$("$rg_path" --version | sed -n '1p')"
@@ -65,7 +88,7 @@ rg_version="$(printf '%s\n' "$rg_version_line" | awk '{ print $1 " " $2 }')"
 if [[ "$rg_version" != "$expected_rg_version" ]]; then
     echo "Error: release builds require ${expected_rg_version}." >&2
     echo "Found '${rg_version_line}' at $rg_path" >&2
-    echo "Set GROK_TOOLS_BUNDLE_RG_PATH to a verified ripgrep 15.0.0 x86_64 binary." >&2
+    echo "Set GROK_TOOLS_BUNDLE_RG_PATH to a verified ripgrep 15.0.0 ${arch} binary." >&2
     exit 1
 fi
 rg_checksum="$(sha256sum "$rg_path" | awk '{ print $1 }')"
@@ -111,8 +134,8 @@ cp "$source_binary" "$staged_artifact"
 chmod 0755 "$staged_artifact"
 strip --strip-unneeded "$staged_artifact"
 
-if ! file "$staged_artifact" | grep -Eq 'ELF 64-bit LSB.*x86-64'; then
-    echo "Error: release artifact is not an x86_64 ELF binary." >&2
+if ! file "$staged_artifact" | grep -Eq "$elf_arch_pattern"; then
+    echo "Error: release artifact is not an ${arch} ELF binary." >&2
     exit 1
 fi
 

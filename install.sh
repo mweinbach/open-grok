@@ -44,8 +44,13 @@ case "${os}:${arch}" in
         versioned_platform="linux-x86_64"
         platform_label="Linux x86_64"
         ;;
+    Linux:aarch64 | Linux:arm64)
+        artifact_name="open-grok-linux-aarch64"
+        versioned_platform="linux-aarch64"
+        platform_label="Linux arm64"
+        ;;
     *)
-        echo "Error: prebuilt Open Grok releases currently require Apple Silicon macOS or Linux x86_64." >&2
+        echo "Error: prebuilt Open Grok releases currently require Apple Silicon macOS, Linux x86_64, or Linux arm64." >&2
         echo "Detected: ${os} ${arch}. Build from source on unsupported platforms." >&2
         exit 1
         ;;

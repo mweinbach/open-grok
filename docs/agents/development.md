@@ -162,16 +162,18 @@ Produces under `dist/`:
 
 Binaries are stripped and ad-hoc signed, **not** notarized.
 
-### Linux release build (x86_64)
+### Linux release build (x86_64 / arm64)
 
 ```sh
-# Clean worktree required; ripgrep 15.0.0 x86_64 on PATH or GROK_TOOLS_BUNDLE_RG_PATH
+# Clean worktree required; ripgrep 15.0.0 for the host arch on PATH or
+# GROK_TOOLS_BUNDLE_RG_PATH
 ./scripts/build-linux-release.sh
 ```
 
 Produces under `dist/`:
 
-- `open-grok-linux-x86_64` + `.sha256`
+- `open-grok-linux-x86_64` + `.sha256` (on x86_64 hosts)
+- `open-grok-linux-aarch64` + `.sha256` (on arm64 hosts)
 - `install.sh`, `LICENSE`, `THIRD-PARTY-NOTICES`
 
 Binaries are stripped ELF executables, **not** signed.
