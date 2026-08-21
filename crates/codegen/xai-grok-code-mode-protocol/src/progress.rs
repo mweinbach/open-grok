@@ -92,9 +92,7 @@ impl NestedToolProgressSink {
         if let Ok(mut queue) = self.shared.queue.lock() {
             if queue.len() >= NESTED_TOOL_PROGRESS_CAPACITY {
                 queue.pop_front();
-                self.shared
-                    .dropped_chunks
-                    .fetch_add(1, Ordering::Relaxed);
+                self.shared.dropped_chunks.fetch_add(1, Ordering::Relaxed);
             }
             queue.push_back(progress);
         }
@@ -223,7 +221,10 @@ mod tests {
             sink.push(NestedToolProgress::text(format!("chunk-{index}")));
         }
         // The oldest chunk (`chunk-0`) made room for the newest one.
-        assert_eq!(receiver.try_recv(), Some(NestedToolProgress::text("chunk-1")));
+        assert_eq!(
+            receiver.try_recv(),
+            Some(NestedToolProgress::text("chunk-1"))
+        );
         assert_eq!(sink.dropped_chunks(), 1);
         for index in 2..=NESTED_TOOL_PROGRESS_CAPACITY {
             assert_eq!(
@@ -260,7 +261,10 @@ mod tests {
         receiver.close();
         assert!(sink.is_closed());
         // Already-queued chunks stay readable after close.
-        assert_eq!(receiver.recv().await, Some(NestedToolProgress::text("queued")));
+        assert_eq!(
+            receiver.recv().await,
+            Some(NestedToolProgress::text("queued"))
+        );
         assert_eq!(receiver.recv().await, None);
         sink.push(NestedToolProgress::text("late"));
         assert_eq!(receiver.try_recv(), None);

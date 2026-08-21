@@ -27,10 +27,21 @@ const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
 
 #[derive(Debug)]
 pub(crate) enum RuntimeCommand {
-    ToolResponse { id: String, result: JsonValue },
-    ToolError { id: String, error_text: String },
-    ToolProgress { id: String, progress: NestedToolProgress },
-    TimeoutFired { id: u64 },
+    ToolResponse {
+        id: String,
+        result: JsonValue,
+    },
+    ToolError {
+        id: String,
+        error_text: String,
+    },
+    ToolProgress {
+        id: String,
+        progress: NestedToolProgress,
+    },
+    TimeoutFired {
+        id: u64,
+    },
     ObservePendingFrontier,
     Terminate,
 }
@@ -346,6 +357,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::ExecuteRequest;
+    use super::NestedToolProgress;
     use super::PendingRuntimeMode;
     use super::RuntimeCommand;
     use super::RuntimeControlCommand;
@@ -438,6 +450,64 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_progress_commands_fail_closed_without_events() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (runtime_tx, runtime_control_tx, _runtime_terminate_handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request("await new Promise(() => {})"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RuntimeEvent::Started
+        ));
+        // The command loop announces its wait with a Pending event.
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RuntimeEvent::Pending
+        ));
+
+        // Progress for an unknown (already resolved or never issued) call id
+        // must be dropped silently: no error event, no completion.
+        runtime_tx
+            .send(RuntimeCommand::ToolProgress {
+                id: "tool-404".to_string(),
+                progress: NestedToolProgress::text("stale"),
+            })
+            .unwrap();
+        // Processing the dropped chunk re-arms the command loop, which
+        // announces its next wait with a Pending event.
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RuntimeEvent::Pending
+        ));
+        // No error or completion event may follow the dropped chunk.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+                .await
+                .is_err(),
+            "stale progress must not produce runtime events"
+        );
+
+        runtime_control_tx
+            .send(RuntimeControlCommand::Terminate)
+            .unwrap();
     }
 
     #[tokio::test]

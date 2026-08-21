@@ -106,7 +106,10 @@ fn spawn_progress_forwarder(
                 },
             };
             if runtime_tx
-                .send(RuntimeCommand::ToolProgress { id: id.clone(), progress })
+                .send(RuntimeCommand::ToolProgress {
+                    id: id.clone(),
+                    progress,
+                })
                 .is_err()
             {
                 break;
