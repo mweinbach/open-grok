@@ -246,6 +246,20 @@ pub struct SettingsModalState {
     /// returning to Browse. Set by deep-link open (`OpenSettingsFocus`
     /// / `/privacy`); cleared on leave from the picker.
     pub close_on_picker_exit: bool,
+    /// Sub-sheet (`PickingGroup`) search query. Filters dynamic
+    /// multi-select choices (OpenRouter / OpenCode Go / custom model
+    /// catalogs) case-insensitively; empty = unfiltered.
+    pub(super) group_filter: LineEditor,
+    /// Whether typed characters currently edit `group_filter` (set by
+    /// `/`, cleared by Enter/Esc-clear).
+    pub(super) group_filter_focused: bool,
+    /// Viewport scroll offset (first visible item) for the group
+    /// sub-sheet list. Mouse-wheel scrolling moves this freely;
+    /// keyboard navigation keeps the focused row visible.
+    pub group_scroll: usize,
+    /// Hit-rect for the sub-sheet search bar (dynamic groups only).
+    /// Clicking it focuses the query editor. Zero-sized elsewhere.
+    pub group_search_rect: Rect,
 }
 
 impl SettingsModalState {
@@ -286,6 +300,10 @@ impl SettingsModalState {
             expanded_keys: std::collections::HashSet::new(),
             hover_row: None,
             close_on_picker_exit: false,
+            group_filter: LineEditor::default(),
+            group_filter_focused: false,
+            group_scroll: 0,
+            group_search_rect: Rect::default(),
         }
     }
 
@@ -645,6 +663,7 @@ impl SettingsModalState {
         self.picker_choice_rects.clear();
         self.settings_breadcrumb_rect = None;
         self.breadcrumb_hovered = false;
+        self.group_search_rect = Rect::default();
     }
 
     /// Transition to Browse, clearing sub-pane hover/breadcrumb state
@@ -655,6 +674,15 @@ impl SettingsModalState {
         self.settings_breadcrumb_rect = None;
         self.breadcrumb_hovered = false;
         self.close_on_picker_exit = false;
+        self.reset_group_sheet_state();
+    }
+
+    /// Clear sub-sheet search + scroll state so reopening a group
+    /// (or opening a different one) starts unfiltered and at the top.
+    pub(super) fn reset_group_sheet_state(&mut self) {
+        self.group_filter.reset();
+        self.group_filter_focused = false;
+        self.group_scroll = 0;
     }
 
     pub fn focus_filter(&mut self) {
@@ -677,7 +705,16 @@ impl SettingsModalState {
     }
 
     pub(super) fn transition_to_picking_group(&mut self, key: SettingKey, child_idx: usize) {
+        // Only reset search/scroll when switching to a *different* sheet —
+        // this is also the in-sheet focus-move path.
+        let same_sheet = matches!(
+            &self.state.mode,
+            SettingsMode::PickingGroup { key: cur, .. } if *cur == key
+        );
         self.state.mode = SettingsMode::PickingGroup { key, child_idx };
+        if !same_sheet {
+            self.reset_group_sheet_state();
+        }
     }
 
     pub(super) fn transition_to_editing_string(
@@ -1349,6 +1386,29 @@ pub(super) fn dynamic_group_choices(
         }
         _ => Vec::new(),
     }
+}
+
+/// The group's dynamic choices filtered by the sub-sheet search query,
+/// as `(original_index, choice)` pairs so toggles can map a filtered
+/// row back to its catalog entry. Empty query = all choices, indexes
+/// identity. Matches on both display label and canonical id
+/// (case-insensitive substring), so `gpt` finds `openai/gpt-4o`.
+pub(super) fn filtered_group_choices(
+    state: &SettingsModalState,
+    key: SettingKey,
+) -> Vec<(usize, crate::settings::OwnedMultiSelectChoice)> {
+    let query = state.group_filter.text().trim().to_lowercase();
+    let all = dynamic_group_choices(state, key);
+    if query.is_empty() {
+        return all.into_iter().enumerate().collect();
+    }
+    all.into_iter()
+        .enumerate()
+        .filter(|(_, choice)| {
+            choice.display.to_lowercase().contains(&query)
+                || choice.canonical.to_lowercase().contains(&query)
+        })
+        .collect()
 }
 
 /// Whether `(key, canonical)` is gated off and must not be offered as a choice:

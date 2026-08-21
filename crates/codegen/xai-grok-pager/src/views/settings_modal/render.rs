@@ -9,8 +9,8 @@ use unicode_width::UnicodeWidthStr;
 use super::state::{
     CONTENT_MIN_WIDTH, MAX_THOUGHTS_WIDTH_WIDENED_MARGIN, MODAL_TITLE, RowEntry,
     STANDARD_MAX_WIDTH, SettingsModalState, SettingsMode, SettingsModeKind,
-    TITLE_LEADING_DECORATION_W, dynamic_group_choices, effective_enum_choices, group_children,
-    mode_is_consent_chooser,
+    TITLE_LEADING_DECORATION_W, dynamic_group_choices, effective_enum_choices,
+    filtered_group_choices, group_children, mode_is_consent_chooser,
 };
 use crate::render::line_utils::truncate_str;
 use crate::settings::{
@@ -1298,10 +1298,17 @@ pub(super) fn take_picker_choice_rects() -> Vec<Rect> {
 /// toggle (`<marker> <Label> … <on/off>`). Returns the per-child hit-rects
 /// (parallel to the group's children) for mouse routing. Mirrors the enum
 /// chooser's title/description/list shape but for independent toggles.
+///
+/// Dynamic multi-select sheets (OpenRouter / OpenCode Go / custom model
+/// catalogs) additionally render a `/` search bar under the header, list the
+/// *filtered* choices, and support free viewport scrolling via
+/// `state.group_scroll` (mouse wheel); keyboard navigation keeps the focused
+/// row visible. Hit-rects are indexed by display position so mouse clicks map
+/// through the active filter.
 fn render_picking_group(
     buf: &mut Buffer,
     area: Rect,
-    state: &SettingsModalState,
+    state: &mut SettingsModalState,
     theme: &Theme,
 ) -> Vec<Rect> {
     let (group_key, child_idx) = match &state.state.mode {
@@ -1313,10 +1320,16 @@ fn render_picking_group(
     };
     let children = group_children(state, group_key);
     let dynamic_choices = dynamic_group_choices(state, group_key);
-    let item_count = if dynamic_choices.is_empty() {
-        children.len()
+    let has_dynamic = !dynamic_choices.is_empty();
+    let filtered = if has_dynamic {
+        filtered_group_choices(state, group_key)
     } else {
-        dynamic_choices.len()
+        Vec::new()
+    };
+    let item_count = if has_dynamic {
+        filtered.len()
+    } else {
+        children.len()
     };
     if area.width == 0 || area.height == 0 {
         return Vec::new();
@@ -1337,15 +1350,79 @@ fn render_picking_group(
     let mut y = area.y + header_rows;
     let area_end = area.y + area.height;
 
+    // ── Search bar (dynamic catalogs only). ───────────────────────
+    if has_dynamic && y < area_end {
+        state.group_search_rect = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        crate::views::picker::render_line_editor_search_bar_with_label(
+            buf,
+            area.x,
+            y,
+            area.width,
+            theme,
+            " search: ",
+            &state.group_filter,
+            state.group_filter_focused,
+            true,
+            Some(theme.bg_base),
+        );
+        // Match count while filtering (`12/340`, right-aligned).
+        let query = state.group_filter.text().trim();
+        if !query.is_empty() {
+            let count = format!("{}/{}", filtered.len(), dynamic_choices.len());
+            let count_x = (area.x + area.width).saturating_sub(count.width() as u16 + 1);
+            if count_x > area.x + 24.min(area.width) {
+                buf.set_span(
+                    count_x,
+                    y,
+                    &Span::styled(count, Style::default().fg(theme.gray).bg(theme.bg_base)),
+                    (area.x + area.width).saturating_sub(count_x),
+                );
+            }
+        }
+        y = y.saturating_add(1);
+    } else {
+        state.group_search_rect = Rect::default();
+    }
+
     // ── Child toggle rows. ────────────────────────────────────────
     let mut rects: Vec<Rect> = vec![Rect::default(); item_count];
     let visible_rows = usize::from(area_end.saturating_sub(y));
-    let start_idx = child_idx.saturating_add(1).saturating_sub(visible_rows);
+
+    // Free-scroll offset (mouse wheel), clamped to the list, then nudged so
+    // the focused row stays visible after keyboard navigation or filtering.
+    let max_start = item_count.saturating_sub(visible_rows);
+    let mut start_idx = state.group_scroll.min(max_start);
+    if child_idx < start_idx {
+        start_idx = child_idx;
+    } else if visible_rows > 0 && child_idx >= start_idx + visible_rows {
+        start_idx = child_idx + 1 - visible_rows;
+    }
+    state.group_scroll = start_idx;
+
+    // Empty result set: explain why nothing is listed.
+    if item_count == 0 {
+        let query = state.group_filter.text().trim();
+        let msg = if query.is_empty() {
+            "No models discovered yet".to_string()
+        } else {
+            format!("No matches for \"{query}\"")
+        };
+        let style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
+        buf.set_span(area.x, y, &Span::styled(msg.as_str(), style), area.width);
+        return rects;
+    }
+
     for i in start_idx..item_count {
         if y >= area_end {
             break;
         }
-        let (label, on) = if let Some(choice) = dynamic_choices.get(i) {
+        let (label, on) = if has_dynamic {
+            let (_, choice) = &filtered[i];
             (choice.display.as_str(), choice.selected)
         } else {
             let Some(child_key) = children.get(i) else {
@@ -3084,23 +3161,35 @@ pub(super) fn build_shortcuts(state: &SettingsModalState) -> Vec<Shortcut<'stati
                 id: 0,
             },
         ],
-        SettingsMode::PickingGroup { .. } => vec![
-            Shortcut {
-                label: "\u{2191}/\u{2193}/j/k nav",
-                clickable: false,
-                id: 0,
-            },
-            Shortcut {
-                label: "Space/Enter toggle",
-                clickable: false,
-                id: 0,
-            },
-            Shortcut {
+        SettingsMode::PickingGroup { key, .. } => {
+            let mut shortcuts = vec![
+                Shortcut {
+                    label: "\u{2191}/\u{2193}/j/k nav",
+                    clickable: false,
+                    id: 0,
+                },
+                Shortcut {
+                    label: "Space/Enter toggle",
+                    clickable: false,
+                    id: 0,
+                },
+            ];
+            // Dynamic catalogs (OpenRouter / OpenCode Go / custom models)
+            // can be hundreds of rows — advertise the sub-sheet search.
+            if !dynamic_group_choices(state, *key).is_empty() {
+                shortcuts.push(Shortcut {
+                    label: "/ search",
+                    clickable: false,
+                    id: 0,
+                });
+            }
+            shortcuts.push(Shortcut {
                 label: "Esc back",
                 clickable: false,
                 id: 0,
-            },
-        ],
+            });
+            shortcuts
+        }
     }
 }
 
