@@ -918,6 +918,11 @@ async fn read_parent_sampling_config(
                 codex_multi_agent_v2: ctx
                     .models_manager
                     .model_supports_codex_multi_agent_v2(ctx.model_id.0.as_ref()),
+                codex_permissions: ctx
+                    .sampling_config
+                    .codex_permissions
+                    .clone()
+                    .filter(|_| provider == xai_grok_sampling_types::ModelProvider::Codex),
                 compactions_remaining: ctx
                     .models_manager
                     .model_compactions_remaining(ctx.model_id.0.as_ref()),

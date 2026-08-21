@@ -3162,6 +3162,11 @@ impl SessionActor {
                 })
                 .await;
             }
+            SamplingEvent::ToolCallArgumentsComplete { .. } => {
+                // The canonical finalized tool call is still dispatched by
+                // `Completed`; this optional streaming hint has no separate
+                // ACP representation until an early-execution consumer is wired.
+            }
             SamplingEvent::ResponseStarted {
                 message_id,
                 model,
