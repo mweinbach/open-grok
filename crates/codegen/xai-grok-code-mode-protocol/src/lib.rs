@@ -2,6 +2,7 @@
 // 2be648ba4a6c159a3d80b1c07e7323cbd5efef8f (Apache-2.0).
 
 mod description;
+mod progress;
 mod response;
 mod runtime;
 mod session;
@@ -22,6 +23,11 @@ pub use description::normalize_code_mode_identifier;
 pub use description::parse_exec_source;
 pub use description::render_code_mode_sample;
 pub use description::render_json_schema_to_typescript;
+pub use progress::NESTED_TOOL_PROGRESS_CAPACITY;
+pub use progress::NestedToolProgress;
+pub use progress::NestedToolProgressReceiver;
+pub use progress::NestedToolProgressSink;
+pub use progress::nested_tool_progress_channel;
 pub use response::DEFAULT_IMAGE_DETAIL;
 pub use response::FunctionCallOutputContentItem;
 pub use response::ImageDetail;
