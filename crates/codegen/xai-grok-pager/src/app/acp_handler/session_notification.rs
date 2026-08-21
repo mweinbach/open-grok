@@ -1459,8 +1459,18 @@ pub(super) fn handle_session_notification_with_origin(
             agent.dismiss_resolved_interaction(&tool_call_id)
         }
         XaiSessionUpdate::ToolCallDeltaChunk {
-            name, tool_index, ..
-        } => apply_tool_call_delta_chunk(&mut agent.session.tracker, name.as_deref(), tool_index),
+            name,
+            tool_index,
+            arguments_delta,
+            ..
+        } => apply_tool_call_delta_chunk(
+            &mut agent.session.tracker,
+            &mut agent.scrollback,
+            name.as_deref(),
+            arguments_delta.as_deref(),
+            tool_index,
+            meta.is_replay,
+        ),
         _ => {
             tracing::trace!(
                 "Ignoring {}: {:?}",
@@ -1622,13 +1632,21 @@ pub(super) fn handle_child_session_notification(
             changed
         }
         XaiSessionUpdate::ToolCallDeltaChunk {
-            name, tool_index, ..
+            name,
+            tool_index,
+            arguments_delta,
+            ..
         } => {
             if let Some(child_view) = agent.subagent_views.get_mut(child_sid) {
+                // Child deltas are never replayed (the shell does not persist
+                // them), so no replay guard is needed here.
                 apply_tool_call_delta_chunk(
                     &mut child_view.session.tracker,
+                    &mut child_view.scrollback,
                     name.as_deref(),
+                    arguments_delta.as_deref(),
                     tool_index,
+                    false,
                 )
             } else {
                 false
@@ -1666,15 +1684,41 @@ pub(crate) fn apply_session_event_for_test(
 ) -> bool {
     apply_session_event(update, session, scrollback, false)
 }
+/// Test-only shim mirroring [`apply_session_event_for_test`]: lets dispatch
+/// tests drive the delta path (including its replay guard) without a full
+/// AppView fixture.
+#[cfg(test)]
+pub(crate) fn apply_tool_call_delta_chunk_for_test(
+    tracker: &mut crate::acp::tracker::AcpUpdateTracker,
+    scrollback: &mut crate::scrollback::state::ScrollbackState,
+    name: Option<&str>,
+    arguments_delta: Option<&str>,
+    tool_index: u32,
+    is_replay: bool,
+) -> bool {
+    apply_tool_call_delta_chunk(
+        tracker,
+        scrollback,
+        name,
+        arguments_delta,
+        tool_index,
+        is_replay,
+    )
+}
 fn apply_tool_call_delta_chunk(
     tracker: &mut crate::acp::tracker::AcpUpdateTracker,
+    scrollback: &mut crate::scrollback::state::ScrollbackState,
     name: Option<&str>,
+    arguments_delta: Option<&str>,
     tool_index: u32,
+    is_replay: bool,
 ) -> bool {
-    if !crate::appearance::cache::load_stream_tool_calls() {
+    // Deltas are streaming-only — replay never carries them, and a live
+    // Code Mode block must never be reconstructed from history.
+    if is_replay || !crate::appearance::cache::load_stream_tool_calls() {
         return false;
     }
-    tracker.note_tool_call_arguments_delta(name, tool_index)
+    tracker.handle_tool_call_delta(scrollback, name, arguments_delta, tool_index)
 }
 
 pub(super) fn apply_session_event(

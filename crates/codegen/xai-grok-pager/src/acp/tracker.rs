@@ -16,6 +16,7 @@ use crate::scrollback::blocks::tool::{
     ReadMediaKind, ReadToolCallBlock, ToolCallBlock, UseToolCallBlock, WebFetchToolCallBlock,
     WebSearchToolCallBlock,
 };
+use crate::scrollback::blocks::{CodeModeStreamBlock, CodeModeStreamTool};
 use crate::scrollback::entry::{EntryId, ScrollbackEntry};
 use crate::scrollback::state::ScrollbackState;
 use crate::scrollback::state::verb_group::verb_group_kind_changed;
@@ -224,6 +225,47 @@ impl WritingToolCall {
 }
 /// Cap on remembered per-index tool names per sample (model-driven input).
 const MAX_WRITING_TOOL_NAMES: usize = 64;
+/// Code Mode transport tool names — `xai-grok-code-mode-protocol`
+/// `PUBLIC_TOOL_NAME` / `WAIT_TOOL_NAME`. Display-only match for the live
+/// streaming view; it never gates cards, persistence, or replay, so a plugin
+/// tool coincidentally named `exec`/`wait` only gets the same cosmetic view.
+const CODE_MODE_EXEC_TOOL: &str = "exec";
+const CODE_MODE_WAIT_TOOL: &str = "wait";
+/// Max concurrent remembered Code Mode transport streams per sample
+/// (model-driven indices; bounded like [`MAX_WRITING_TOOL_NAMES`]).
+const MAX_CODE_MODE_STREAMS: usize = 8;
+/// Live transport payload trim threshold (chars). Past this, the retained
+/// buffer shrinks to [`CODE_MODE_STREAM_TRIM_TO_CHARS`] keeping the tail.
+pub(crate) const CODE_MODE_STREAM_TRIM_AT_CHARS: usize = 6_000;
+/// Retained tail size after a live transport payload trim.
+pub(crate) const CODE_MODE_STREAM_TRIM_TO_CHARS: usize = 4_000;
+/// Which transport tool a live stream belongs to, plus its capped payload and
+/// scrollback entry. Keyed by `tool_index` within the current sample.
+#[derive(Debug)]
+struct CodeModeStreamState {
+    tool: CodeModeStreamTool,
+    payload: String,
+    dropped_chars: u64,
+    entry_id: Option<EntryId>,
+}
+impl CodeModeStreamState {
+    fn new(tool: CodeModeStreamTool) -> Self {
+        Self {
+            tool,
+            payload: String::new(),
+            dropped_chars: 0,
+            entry_id: None,
+        }
+    }
+}
+/// Transport-tool match for a delta chunk's `name`, if any.
+fn code_mode_transport_kind(name: &str) -> Option<CodeModeStreamTool> {
+    match name {
+        CODE_MODE_EXEC_TOOL => Some(CodeModeStreamTool::Exec),
+        CODE_MODE_WAIT_TOOL => Some(CodeModeStreamTool::Wait),
+        _ => None,
+    }
+}
 /// `strings`-greppable marker proving a binary carries this fix (kept by `#[used]`).
 #[used]
 static PAGER_IMPL_WAIT_STATUS_MIDTURN: &str = "PAGER_IMPL_wait_status_midturn";
@@ -411,6 +453,16 @@ pub struct AcpUpdateTracker {
     /// switch-back; `None` marks an index observed before its name arrived
     /// (it still ranks for ordinals). Cleared together with `writing_tool_call`.
     writing_tool_names: HashMap<u32, Option<String>>,
+    /// Live Code Mode transport streams keyed by `tool_index` (per current
+    /// sample). Transport tools (`exec` / `wait`) never produce tool cards,
+    /// so their accumulating payload renders in an ephemeral scrollback
+    /// block instead of the writing-tool spinner. Entry removal and map
+    /// clearing are deliberately separate: agent output retires the visible
+    /// entries, while the per-index state survives until a turn/sample
+    /// boundary so interleaved text or thought chunks don't lose the stream
+    /// identity of nameless continuation deltas. Never persisted — deltas
+    /// are streaming-only and replay never carries them.
+    code_mode_streams: HashMap<u32, CodeModeStreamState>,
     /// Pending ACP commands from the most recent `AvailableCommandsUpdate`.
     /// Consumed by the caller via `take_pending_acp_commands()`. The caller
     /// is responsible for copying to `AgentSession.available_commands` and
@@ -737,6 +789,149 @@ impl AcpUpdateTracker {
             *at = std::time::Instant::now() - age;
         }
     }
+    /// Handle one `ToolCallDeltaChunk` for display: Code Mode transport tools
+    /// (`exec` / `wait`) accumulate into an ephemeral live scrollback block,
+    /// everything else keeps today's [`WritingToolCall`] spinner path.
+    ///
+    /// The chunk's `name` is present only on its first fragment per tool per
+    /// sample; later fragments carry only `arguments_delta` and are matched
+    /// by `tool_index`.
+    ///
+    /// Returns `true` when visible state changed (redraw warranted).
+    pub fn handle_tool_call_delta(
+        &mut self,
+        scrollback: &mut ScrollbackState,
+        name: Option<&str>,
+        arguments_delta: Option<&str>,
+        tool_index: u32,
+    ) -> bool {
+        // Same retry-override release as the spinner path: streaming data
+        // proves sampling resumed.
+        let retry_cleared = self.retry_activity.take().is_some();
+        let transport = match name {
+            Some(name) => match code_mode_transport_kind(name) {
+                // First fragment of this index this sample — reset stale
+                // payload but reuse a still-visible entry so an index reused
+                // across samples updates in place instead of stacking blocks.
+                Some(tool) => {
+                    let state = self
+                        .code_mode_streams
+                        .entry(tool_index)
+                        .or_insert_with(|| CodeModeStreamState::new(tool));
+                    state.tool = tool;
+                    state.payload.clear();
+                    state.dropped_chars = 0;
+                    Some(tool)
+                }
+                None => {
+                    // An ordinary tool claimed this index: any live block
+                    // here belongs to a previous sample — retire it.
+                    self.retire_code_mode_stream(scrollback, tool_index);
+                    None
+                }
+            },
+            None => self.code_mode_streams.get(&tool_index).map(|s| s.tool),
+        };
+        let changed = match transport {
+            Some(tool) => self.append_code_mode_stream_delta(
+                scrollback,
+                tool_index,
+                tool,
+                arguments_delta.unwrap_or(""),
+            ),
+            None => self.note_tool_call_arguments_delta(name, tool_index),
+        };
+        retry_cleared | changed
+    }
+    /// Append one payload fragment to a transport stream's capped buffer and
+    /// create or update its ephemeral scrollback entry.
+    fn append_code_mode_stream_delta(
+        &mut self,
+        scrollback: &mut ScrollbackState,
+        tool_index: u32,
+        tool: CodeModeStreamTool,
+        delta: &str,
+    ) -> bool {
+        if !self.code_mode_streams.contains_key(&tool_index)
+            && self.code_mode_streams.len() >= MAX_CODE_MODE_STREAMS
+        {
+            // Deterministic eviction: drop the lowest tracked index.
+            if let Some(oldest) = self.code_mode_streams.keys().copied().min() {
+                self.retire_code_mode_stream(scrollback, oldest);
+            }
+        }
+        let state = self
+            .code_mode_streams
+            .entry(tool_index)
+            .or_insert_with(|| CodeModeStreamState::new(tool));
+        if !delta.is_empty() {
+            state.payload.push_str(delta);
+            let len = state.payload.chars().count();
+            if len > CODE_MODE_STREAM_TRIM_AT_CHARS {
+                let drop = len - CODE_MODE_STREAM_TRIM_TO_CHARS;
+                state.payload = state.payload.chars().skip(drop).collect();
+                state.dropped_chars += drop as u64;
+            }
+        }
+        match state.entry_id {
+            Some(entry_id) => {
+                if delta.is_empty() {
+                    // No new content — don't force a redraw.
+                    return false;
+                }
+                scrollback.set_code_mode_stream_payload(
+                    entry_id,
+                    &state.payload,
+                    state.dropped_chars,
+                )
+            }
+            None => {
+                let entry_id = scrollback.push_block(RenderBlock::CodeModeStream(
+                    CodeModeStreamBlock::new(tool, state.payload.clone(), state.dropped_chars),
+                ));
+                state.entry_id = Some(entry_id);
+                true
+            }
+        }
+    }
+    /// Remove one transport stream's block and forget its state.
+    /// Returns `true` when a visible entry was removed.
+    fn retire_code_mode_stream(
+        &mut self,
+        scrollback: &mut ScrollbackState,
+        tool_index: u32,
+    ) -> bool {
+        match self.code_mode_streams.remove(&tool_index) {
+            Some(state) => match state.entry_id {
+                Some(entry_id) => scrollback.remove_entry(entry_id),
+                None => false,
+            },
+            None => false,
+        }
+    }
+    /// Remove every visible transport block without forgetting per-index
+    /// state, so nameless continuation deltas can resurrect their stream
+    /// (interleaved text/thought chunks must not strand a half-written call).
+    /// Returns `true` when any entry was removed.
+    fn retire_code_mode_stream_entries(&mut self, scrollback: &mut ScrollbackState) -> bool {
+        let ids: Vec<EntryId> = self
+            .code_mode_streams
+            .values_mut()
+            .filter_map(|s| s.entry_id.take())
+            .collect();
+        let mut changed = false;
+        for entry_id in ids {
+            changed |= scrollback.remove_entry(entry_id);
+        }
+        changed
+    }
+    /// Forget all transport streams and remove their blocks (turn or sample
+    /// boundary). Returns `true` when any visible entry was removed.
+    pub fn finish_code_mode_streams(&mut self, scrollback: &mut ScrollbackState) -> bool {
+        let changed = self.retire_code_mode_stream_entries(scrollback);
+        self.code_mode_streams.clear();
+        changed
+    }
     /// Take pending ACP commands, if any. Returns `None` if no update arrived
     /// since the last drain.
     ///
@@ -970,6 +1165,9 @@ impl AcpUpdateTracker {
                 if let Some(agent_id) = self.current_agent_msg.take() {
                     scrollback.finish_running(agent_id);
                 }
+                // New LLM response: transport streams of the previous sample
+                // finished writing (their cells already ran or were dropped).
+                self.finish_code_mode_streams(scrollback);
                 if !meta.is_replay
                     && self.current_thinking.is_none()
                     && self.activity_known_blocking_wait().is_none()
@@ -986,9 +1184,15 @@ impl AcpUpdateTracker {
                 | acp::SessionUpdate::ToolCall(_)
                 | acp::SessionUpdate::ToolCallUpdate(_)
         );
+        let mut code_mode_retired = false;
         if is_agent_output && !matches!(&update, acp::SessionUpdate::ToolCallUpdate(_)) {
             self.writing_tool_call = None;
             self.writing_tool_names.clear();
+            // Canonical output (text, thought, or a tool card) means any
+            // transport call stopped streaming — retire its live view.
+            // Per-index state survives so a continuation delta can still
+            // resurrect an interleaved stream.
+            code_mode_retired = self.retire_code_mode_stream_entries(scrollback);
         }
         let changed = match update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
@@ -1018,6 +1222,7 @@ impl AcpUpdateTracker {
             acp::SessionUpdate::Plan(_) | acp::SessionUpdate::CurrentModeUpdate(_) => false,
             _ => false,
         };
+        let changed = changed || code_mode_retired;
         if is_agent_output && changed && !meta.is_replay {
             self.bump_agent_output_epoch();
         }
@@ -1050,6 +1255,7 @@ impl AcpUpdateTracker {
         self.retry_activity = None;
         self.writing_tool_call = None;
         self.writing_tool_names.clear();
+        self.finish_code_mode_streams(scrollback);
         self.suppressed_tools.clear();
         self.blocking_waits.clear();
         self.orphan_updates.clear();

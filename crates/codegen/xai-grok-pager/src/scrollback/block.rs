@@ -14,11 +14,11 @@ use crate::prompt_images::{InlineMediaInfo, ScrollbackImageRef, ScrollbackVideoR
 
 use super::blocks::mermaid_content::DiagramAffordance;
 use super::blocks::{
-    AgentMessageBlock, BgTaskBlock, BtwBlock, ContextInfoBlock, CreditLimitBlock,
-    EditToolCallBlock, ExecuteToolCallBlock, LineRange, ListDirToolCallBlock, OtherToolCallBlock,
-    ReadToolCallBlock, SearchFileMatch, SearchToolCallBlock, SessionEvent, SessionEventBlock,
-    SubagentBlock, SubagentBlockKind, SystemMessageBlock, ThinkingBlock, ToolCallBlock,
-    UserPromptBlock, WorkflowBlock,
+    AgentMessageBlock, BgTaskBlock, BtwBlock, CodeModeStreamBlock, ContextInfoBlock,
+    CreditLimitBlock, EditToolCallBlock, ExecuteToolCallBlock, LineRange, ListDirToolCallBlock,
+    OtherToolCallBlock, ReadToolCallBlock, SearchFileMatch, SearchToolCallBlock, SessionEvent,
+    SessionEventBlock, SubagentBlock, SubagentBlockKind, SystemMessageBlock, ThinkingBlock,
+    ToolCallBlock, UserPromptBlock, WorkflowBlock,
 };
 use super::types::{
     AccentStyle, BlockBackground, BlockContext, BlockOutput, DisplayMode, RenderedBlockOutput,
@@ -397,6 +397,10 @@ pub enum RenderBlock {
     ContextInfo(ContextInfoBlock),
     /// Credit-limit card for max-tier users (red accent, single action).
     CreditLimit(CreditLimitBlock),
+    /// Ephemeral live payload of a streaming Code Mode transport call
+    /// (`exec` / `wait`). Never persisted and removed once the call lands —
+    /// transport tools produce no tool card by contract.
+    CodeModeStream(CodeModeStreamBlock),
 }
 
 /// Delegate a method call to the inner block variant.
@@ -417,6 +421,7 @@ macro_rules! delegate_block {
             RenderBlock::Btw(b) => b.$method($($arg),*),
             RenderBlock::ContextInfo(b) => b.$method($($arg),*),
             RenderBlock::CreditLimit(b) => b.$method($($arg),*),
+            RenderBlock::CodeModeStream(b) => b.$method($($arg),*),
         }
     };
 }
@@ -973,7 +978,8 @@ impl RenderBlock {
             RenderBlock::System(_)
             | RenderBlock::SessionEvent(_)
             | RenderBlock::ContextInfo(_)
-            | RenderBlock::CreditLimit(_) => None,
+            | RenderBlock::CreditLimit(_)
+            | RenderBlock::CodeModeStream(_) => None,
             RenderBlock::Btw(_) => Some(theme.accent_plan),
             RenderBlock::Stub(block) => Some(block.accent_color),
         }
@@ -1133,6 +1139,9 @@ impl RenderBlock {
             RenderBlock::CreditLimit(b) => {
                 join_searchable([Some(b.heading.clone()), Some(b.url.clone())])
             }
+            // Ephemeral streaming view: excluded so a mid-flight block never
+            // leaves a dangling search hit after the tracker removes it.
+            RenderBlock::CodeModeStream(_) => None,
             RenderBlock::ToolCall(tc) => tc.searchable_text(),
         }
     }

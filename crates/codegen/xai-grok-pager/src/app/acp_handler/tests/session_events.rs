@@ -878,7 +878,115 @@
             ),
             "disabled setting must not surface writing-tool activity"
         );
+        assert!(
+            child_code_mode_stream_payloads(&mut agent, child_sid).is_empty(),
+            "disabled setting must not create live Code Mode blocks"
+        );
         crate::appearance::cache::set_stream_tool_calls(true);
+    }
+
+    /// Transport-tool (`exec` / `wait`) deltas on a child session render an
+    /// ephemeral live payload block instead of the writing-tool spinner.
+    #[test]
+    fn child_code_mode_delta_renders_live_block_instead_of_spinner() {
+        crate::appearance::cache::set_stream_tool_calls(true);
+        let mut agent = make_agent(Some("root-sess"));
+        let child_sid = "child-sess-cm-delta";
+        agent
+            .subagent_sessions
+            .insert(child_sid.into(), make_subagent_info(child_sid));
+        let child_view = make_agent(Some(child_sid));
+        agent
+            .subagent_views
+            .insert(child_sid.into(), Box::new(child_view));
+
+        for (name, delta) in [
+            (Some("exec"), Some("const cells")),
+            (None, Some(" = [];")),
+        ] {
+            let update = XaiSessionUpdate::ToolCallDeltaChunk {
+                tool_call_id: Some("call_cm".into()),
+                tool_index: 0,
+                name: name.map(str::to_string),
+                arguments_delta: delta.map(str::to_string),
+            };
+            assert!(handle_child_session_notification(
+                update, child_sid, &mut agent, false
+            ));
+        }
+        let payloads = child_code_mode_stream_payloads(&mut agent, child_sid);
+        assert_eq!(payloads, vec!["const cells = [];".to_string()]);
+        let child = agent.subagent_views.get(child_sid).expect("child view");
+        assert!(
+            !matches!(
+                child.session.tracker.activity(),
+                Some(crate::acp::tracker::TurnActivity::WritingToolCall(_))
+            ),
+            "transport deltas must not raise the generic spinner"
+        );
+    }
+
+    /// Collect live Code Mode stream payloads from a child view's scrollback.
+    fn child_code_mode_stream_payloads(
+        agent: &mut crate::app::agent_view::AgentView,
+        child_sid: &str,
+    ) -> Vec<String> {
+        use crate::scrollback::block::RenderBlock;
+        let child = agent.subagent_views.get_mut(child_sid).expect("child view");
+        (0..child.scrollback.len())
+            .filter_map(|i| child.scrollback.get(i))
+            .filter_map(|e| match &e.block {
+                RenderBlock::CodeModeStream(b) => Some(b.payload().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // ── root-path delta shim (replay guard + live block) ───────────────
+
+    fn root_scrollback_code_mode_payloads(
+        scrollback: &ScrollbackState,
+    ) -> Vec<String> {
+        use crate::scrollback::block::RenderBlock;
+        (0..scrollback.len())
+            .filter_map(|i| scrollback.get(i))
+            .filter_map(|e| match &e.block {
+                RenderBlock::CodeModeStream(b) => Some(b.payload().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Deltas are streaming-only — the shell never persists them to
+    /// `updates.jsonl`, so a replay-stamped delta must never rebuild a live
+    /// Code Mode block. The guard is defense in depth for the restore path.
+    #[test]
+    fn root_replay_stamped_code_mode_delta_is_ignored() {
+        crate::appearance::cache::set_stream_tool_calls(true);
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        assert!(!super::apply_tool_call_delta_chunk_for_test(
+            &mut session.tracker,
+            &mut scrollback,
+            Some("exec"),
+            Some("let x = 1;"),
+            0,
+            true,
+        ));
+        assert!(root_scrollback_code_mode_payloads(&scrollback).is_empty());
+        // The same chunk live (not replayed) does render the block.
+        assert!(super::apply_tool_call_delta_chunk_for_test(
+            &mut session.tracker,
+            &mut scrollback,
+            Some("exec"),
+            Some("let x = 1;"),
+            0,
+            false,
+        ));
+        assert_eq!(
+            root_scrollback_code_mode_payloads(&scrollback),
+            vec!["let x = 1;".to_string()]
+        );
     }
 
     // ── handle_child_session_notification ──────────────────────────────

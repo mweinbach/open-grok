@@ -1010,6 +1010,32 @@ impl ScrollbackState {
         false
     }
 
+    /// Replace the live payload of a Code Mode transport stream entry.
+    ///
+    /// The tracker sends the full capped buffer (cap + tail), not a delta.
+    /// Same cache/height invalidation contract as the other streaming pushes.
+    ///
+    /// Returns true if successful, false if the entry doesn't exist or isn't
+    /// a Code Mode stream block.
+    pub fn set_code_mode_stream_payload(
+        &mut self,
+        id: EntryId,
+        payload: &str,
+        dropped_chars: u64,
+    ) -> bool {
+        if let Some(entry) = self.entries.get_mut(&id)
+            && let RenderBlock::CodeModeStream(ref mut block) = entry.block
+        {
+            block.set_payload(payload, dropped_chars);
+            entry.invalidate_cache();
+            // Always dirty — line count can change on any append.
+            self.dirty_heights.insert(id);
+            self.bump_content_generation();
+            return true;
+        }
+        false
+    }
+
     /// Append incremental output delta to an execute tool call entry.
     ///
     /// Used when the shell sends incremental `output_delta` instead of full buffers.

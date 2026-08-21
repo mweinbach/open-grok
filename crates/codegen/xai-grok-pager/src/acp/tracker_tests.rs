@@ -2678,6 +2678,180 @@ fn writing_tool_call_survives_bg_deferred_stdout_update() {
         "a deferred bg stdout update must not strip the writing label"
     );
 }
+// ── Code Mode transport live streams (`handle_tool_call_delta`) ─────────
+
+/// Count live Code Mode stream entries in the scrollback.
+fn code_mode_stream_payloads(sb: &ScrollbackState) -> Vec<String> {
+    (0..sb.len())
+        .filter_map(|i| sb.get(i))
+        .filter_map(|e| match &e.block {
+            RenderBlock::CodeModeStream(b) => Some(b.payload().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn code_mode_exec_delta_renders_live_block_instead_of_spinner() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    assert!(tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("const x"), 0));
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["const x".to_string()],
+        "first fragment must create the live block"
+    );
+    assert!(
+        tracker.handle_tool_call_delta(&mut sb, None, Some(" = 1;"), 0),
+        "content-changing continuation must request a redraw"
+    );
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["const x = 1;".to_string()]
+    );
+    // The spinner is REPLACED for transport tools — no WritingToolCall.
+    assert_eq!(
+        tracker.activity(),
+        None,
+        "transport deltas must not raise writing-tool activity"
+    );
+}
+
+#[test]
+fn code_mode_wait_delta_accumulates_json_args() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_tool_call_delta(&mut sb, Some("wait"), Some("{\"cell_id\":"), 0);
+    tracker.handle_tool_call_delta(&mut sb, None, Some("\"c1\"}"), 0);
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec![r#"{"cell_id":"c1"}"#.to_string()]
+    );
+}
+
+#[test]
+fn code_mode_stream_retires_on_agent_output_and_resurrects_on_continuation() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("let a"), 0);
+    // Interleaved reasoning: entry hides but per-index state survives.
+    tracker.handle_update(thought_chunk("thinking"), &meta(), &mut sb);
+    assert!(
+        code_mode_stream_payloads(&sb).is_empty(),
+        "agent output must retire the visible block"
+    );
+    // Nameless continuation resurrects the same stream with its payload.
+    assert!(tracker.handle_tool_call_delta(&mut sb, None, Some(" = 1;"), 0));
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["let a = 1;".to_string()]
+    );
+}
+
+#[test]
+fn code_mode_stream_cleared_at_sample_boundary_and_finish_turn() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    let first_sample = NotificationMeta {
+        stream_start_ms: Some(1_000),
+        ..NotificationMeta::default()
+    };
+    let next_sample = NotificationMeta {
+        stream_start_ms: Some(6_000),
+        ..NotificationMeta::default()
+    };
+    tracker.handle_update(agent_chunk("hi"), &first_sample, &mut sb);
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("old()"), 0);
+    assert!(!code_mode_stream_payloads(&sb).is_empty());
+
+    // New LLM sample (different stream_start_ms) retires previous-sample streams.
+    tracker.handle_update(agent_chunk("next"), &next_sample, &mut sb);
+    assert!(
+        code_mode_stream_payloads(&sb).is_empty(),
+        "sample boundary must retire previous-sample blocks"
+    );
+
+    // finish_turn also clears everything.
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("x()"), 1);
+    tracker.finish_turn(&mut sb);
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert!(tracker.code_mode_streams.is_empty());
+}
+
+#[test]
+fn code_mode_index_reuse_resets_payload_and_keeps_single_block() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("first();"), 0);
+    // Same sample reuses index 0 for an ordinary tool: block retires,
+    // spinner takes over.
+    tracker.handle_tool_call_delta(&mut sb, Some("write"), Some("{\"path\""), 0);
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert!(matches!(
+        tracker.activity(),
+        Some(TurnActivity::WritingToolCall(_))
+    ));
+    // A later exec on the same index starts fresh.
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("second();"), 0);
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["second();".to_string()]
+    );
+}
+
+#[test]
+fn code_mode_streams_support_concurrent_indexes() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("a()"), 0);
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("b()"), 1);
+    tracker.handle_tool_call_delta(&mut sb, None, Some(";"), 0);
+    tracker.handle_tool_call_delta(&mut sb, None, Some(";"), 1);
+    let payloads = code_mode_stream_payloads(&sb);
+    assert_eq!(payloads.len(), 2, "two concurrent streams: {payloads:?}");
+    assert!(payloads.contains(&"a();".to_string()));
+    assert!(payloads.contains(&"b();".to_string()));
+}
+
+#[test]
+fn code_mode_large_payload_is_trimmed_to_tail_with_marker() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    let big = "x".repeat(CODE_MODE_STREAM_TRIM_AT_CHARS + 2_000);
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some(&big), 0);
+    tracker.handle_tool_call_delta(&mut sb, None, Some("tail_end"), 0);
+    let payloads = code_mode_stream_payloads(&sb);
+    assert_eq!(payloads.len(), 1);
+    let retained = &payloads[0];
+    assert!(
+        retained.chars().count() <= CODE_MODE_STREAM_TRIM_TO_CHARS + "tail_end".len(),
+        "retained buffer must stay near the tail cap, got {}",
+        retained.chars().count()
+    );
+    assert!(retained.ends_with("tail_end"));
+    let dropped = (0..sb.len())
+        .filter_map(|i| sb.get(i))
+        .filter_map(|e| match &e.block {
+            RenderBlock::CodeModeStream(b) => Some(b.dropped_chars()),
+            _ => None,
+        })
+        .sum::<u64>();
+    assert!(dropped > 0, "trim must record the dropped head size");
+}
+
+#[test]
+fn code_mode_ordinary_names_keep_today_spinner_exactly() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    assert!(tracker.handle_tool_call_delta(&mut sb, Some("read_file"), Some("{}"), 3));
+    assert!(matches!(
+        tracker.activity(),
+        Some(TurnActivity::WritingToolCall(_))
+    ));
+    // Continuation without any prior transport state stays on the spinner path.
+    assert!(!tracker.handle_tool_call_delta(&mut sb, None, Some(",{}"), 3));
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+}
 /// The blocking bg-plumbing tools are kept out of scrollback but the turn
 /// IS blocked on them — `activity()` must name the wait instead of the old
 /// generic `None` (→ "Waiting…"). Task-output tools only advertise once

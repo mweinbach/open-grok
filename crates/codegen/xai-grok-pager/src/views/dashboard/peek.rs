@@ -1029,7 +1029,12 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
             // no agent response after it yet.
             RenderBlock::UserPrompt(_) => break,
             // Structural blocks carry no response type — keep scanning.
-            RenderBlock::System(_) | RenderBlock::SessionEvent(_) | RenderBlock::Stub(_) => {}
+            RenderBlock::System(_)
+            | RenderBlock::SessionEvent(_)
+            | RenderBlock::Stub(_)
+            // Ephemeral streaming view — keep scanning (falls back to
+            // Working/Idle when nothing else answers).
+            | RenderBlock::CodeModeStream(_) => {}
         }
     }
     if running {
@@ -1155,6 +1160,7 @@ fn block_short_text(block: &crate::scrollback::block::RenderBlock) -> Option<Str
         RenderBlock::Btw(_) => Some("(btw)".to_string()),
         RenderBlock::ContextInfo(_) => Some("(context info)".to_string()),
         RenderBlock::CreditLimit(_) => Some("(credit limit)".to_string()),
+        RenderBlock::CodeModeStream(_) => None,
         RenderBlock::Stub(_) => None,
     }
 }
