@@ -1140,6 +1140,7 @@ fn refresh_kimi_sampling_config_for_spawn(
             | ModelProvider::Zai
             | ModelProvider::Runinfra
             | ModelProvider::Gemini
+            | ModelProvider::OpenRouter
     ) {
         return Ok(());
     }

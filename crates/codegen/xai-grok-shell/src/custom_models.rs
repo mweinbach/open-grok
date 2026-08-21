@@ -235,6 +235,12 @@ fn apply_provider_endpoint_defaults(record: &mut CustomModelRecord) {
                 record.env_key = Some(crate::gemini_models::GEMINI_API_KEY_ENV.to_owned());
             }
         }
+        Some("openrouter" | "open_router" | "open-router") if record.base_url.is_none() => {
+            record.base_url = Some(crate::openrouter_models::api_base_url());
+            if record.env_key.is_none() {
+                record.env_key = Some(crate::openrouter_models::OPENROUTER_API_KEY_ENV.to_owned());
+            }
+        }
         _ => {}
     }
 }
@@ -254,9 +260,10 @@ fn parse_provider(raw: &str) -> Result<ModelProvider> {
         "gemini" | "google" | "google_gemini" | "ai_studio" | "aistudio" | "gemini_api" => {
             Ok(ModelProvider::Gemini)
         }
+        "openrouter" | "open_router" | "open-router" => Ok(ModelProvider::OpenRouter),
         other => bail!(
             "invalid provider `{other}`; expected xai, codex, kimi, fireworks, \
-             deepseek, meta, wafer, zai, runinfra, gemini, or opencode_go"
+             deepseek, meta, wafer, zai, runinfra, gemini, opencode_go, or openrouter"
         ),
     }
 }

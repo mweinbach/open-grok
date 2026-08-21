@@ -363,6 +363,7 @@ pub enum WebSearchSourceTarget {
     Runinfra,
     Gemini,
     OpenCodeGo,
+    OpenRouter,
 }
 
 impl WebSearchSourceTarget {
@@ -387,6 +388,7 @@ impl WebSearchSourceTarget {
             ModelProvider::Runinfra => Self::Runinfra,
             ModelProvider::Gemini => Self::Gemini,
             ModelProvider::OpenCodeGo => Self::OpenCodeGo,
+            ModelProvider::OpenRouter => Self::OpenRouter,
         }
     }
 }
@@ -409,6 +411,7 @@ pub struct WebSearchSourceConfig {
     pub runinfra: Option<WebSearchSource>,
     pub gemini: Option<WebSearchSource>,
     pub opencode_go: Option<WebSearchSource>,
+    pub openrouter: Option<WebSearchSource>,
 }
 
 impl WebSearchSourceConfig {
@@ -427,6 +430,7 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::Runinfra => self.runinfra,
             WebSearchSourceTarget::Gemini => self.gemini,
             WebSearchSourceTarget::OpenCodeGo => self.opencode_go,
+            WebSearchSourceTarget::OpenRouter => self.openrouter,
         }
     }
 
@@ -444,7 +448,8 @@ impl WebSearchSourceConfig {
             | WebSearchSourceTarget::Zai
             | WebSearchSourceTarget::Runinfra
             | WebSearchSourceTarget::Gemini
-            | WebSearchSourceTarget::OpenCodeGo => WebSearchSource::Xai,
+            | WebSearchSourceTarget::OpenCodeGo
+            | WebSearchSourceTarget::OpenRouter => WebSearchSource::Xai,
         }
     }
 
@@ -469,6 +474,7 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::Runinfra => self.runinfra = source,
             WebSearchSourceTarget::Gemini => self.gemini = source,
             WebSearchSourceTarget::OpenCodeGo => self.opencode_go = source,
+            WebSearchSourceTarget::OpenRouter => self.openrouter = source,
         }
     }
 }
@@ -565,7 +571,8 @@ impl WebSearchCandidates {
             | WebSearchSourceTarget::Zai
             | WebSearchSourceTarget::Runinfra
             | WebSearchSourceTarget::Gemini
-            | WebSearchSourceTarget::OpenCodeGo => WebSearchSource::Xai,
+            | WebSearchSourceTarget::OpenCodeGo
+            | WebSearchSourceTarget::OpenRouter => WebSearchSource::Xai,
         }
     }
 
@@ -599,7 +606,8 @@ impl WebSearchCandidates {
                 | ModelProvider::Zai
                 | ModelProvider::Runinfra
                 | ModelProvider::Gemini
-                | ModelProvider::OpenCodeGo => WebSearchConfig::Disabled,
+                | ModelProvider::OpenCodeGo
+                | ModelProvider::OpenRouter => WebSearchConfig::Disabled,
                 // For xAI, "native" and the xAI client tool are the same
                 // service — keep the client declaration as today.
                 ModelProvider::Xai => self.xai.clone(),

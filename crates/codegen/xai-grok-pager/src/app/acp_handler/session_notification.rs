@@ -174,6 +174,8 @@ pub(super) fn handle_session_notification_with_origin(
         Some(crate::app::app_view::PrimaryProvider::Runinfra)
     } else if app.pending_gemini_rebind_agents.contains(&parent_id) {
         Some(crate::app::app_view::PrimaryProvider::Gemini)
+    } else if app.pending_openrouter_rebind_agents.contains(&parent_id) {
+        Some(crate::app::app_view::PrimaryProvider::OpenRouter)
     } else {
         Some(crate::app::app_view::PrimaryProvider::Kimi)
     };
@@ -1512,6 +1514,9 @@ pub(super) fn handle_session_notification_with_origin(
         }
         Some(crate::app::app_view::PrimaryProvider::Gemini) => {
             app.cancel_pending_gemini_rebind(parent_id);
+        }
+        Some(crate::app::app_view::PrimaryProvider::OpenRouter) => {
+            app.cancel_pending_openrouter_rebind(parent_id);
         }
         Some(
             crate::app::app_view::PrimaryProvider::Xai

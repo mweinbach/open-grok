@@ -315,6 +315,23 @@ fn toggle_dynamic_multi_select(
             key: choice.canonical.clone(),
         });
     }
+    if group_key == "openrouter_models" {
+        let mut enabled = state.pager_snapshot.openrouter_enabled_models.clone();
+        enabled.retain(|value| {
+            value != &choice.canonical
+                && !state
+                    .pager_snapshot
+                    .openrouter_models
+                    .iter()
+                    .any(|model| model.id == choice.canonical && &model.key == value)
+        });
+        if !choice.selected {
+            enabled.push(choice.canonical.clone());
+        }
+        enabled.sort();
+        enabled.dedup();
+        return SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { models: enabled });
+    }
     if group_key != "opencode_go_models" {
         return SettingsKeyOutcome::Unchanged;
     }
@@ -619,6 +636,15 @@ fn handle_editing_secret(state: &mut SettingsModalState, key: &KeyEvent) -> Sett
             }
             if setting_key == "opencode_go_api_key" {
                 let action = Action::SetOpenCodeGoApiKey { key: secret };
+                return if state.entry_point == SettingsEntryPoint::ProviderLogin {
+                    SettingsKeyOutcome::ActionAndClose(action)
+                } else {
+                    state.transition_to_browse();
+                    SettingsKeyOutcome::Action(action)
+                };
+            }
+            if setting_key == "openrouter_api_key" {
+                let action = Action::SetOpenRouterApiKey { key: secret };
                 return if state.entry_point == SettingsEntryPoint::ProviderLogin {
                     SettingsKeyOutcome::ActionAndClose(action)
                 } else {

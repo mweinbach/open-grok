@@ -63,7 +63,9 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "zai_api_key",
     "runinfra_api_key",
     "gemini_api_key",
+    "openrouter_api_key",
     "opencode_go_models",
+    "openrouter_models",
     "custom_models",
     "custom_models.list",
     "custom_model_id",
@@ -84,6 +86,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "toolset.web_search_source.fireworks",
     "toolset.web_search_source.deepseek",
     "toolset.web_search_source.opencode_go",
+    "toolset.web_search_source.openrouter",
     "toolset.x_search.enabled",
     "recap_model",
     "memory_model",
@@ -787,6 +790,7 @@ fn enter_on_each_provider_api_key_opens_matching_empty_secret_editor() {
         "zai_api_key",
         "runinfra_api_key",
         "gemini_api_key",
+        "openrouter_api_key",
         "perplexity_api_key",
     ] {
         let mut s = make_state();
@@ -1341,6 +1345,7 @@ fn mouse_click_on_each_provider_key_value_opens_matching_secret_editor() {
         "zai_api_key",
         "runinfra_api_key",
         "gemini_api_key",
+        "openrouter_api_key",
         "perplexity_api_key",
     ] {
         let mut s = make_state();
@@ -1392,6 +1397,59 @@ fn enter_on_opencode_go_web_search_source_opens_picker_and_commits() {
         handle_settings_key(&mut s, &press(KeyCode::Enter)),
         SettingsKeyOutcome::Action(Action::SetWebSearchSource {
             key: "toolset.web_search_source.opencode_go",
+            choice: "perplexity",
+        })
+    ));
+}
+
+#[test]
+fn mouse_click_on_openrouter_web_search_source_indicator_opens_picker() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "toolset.web_search_source.openrouter") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert!(matches!(outcome, SettingsKeyOutcome::Changed));
+    assert!(matches!(
+        s.mode(),
+        SettingsModalMode::PickingEnum {
+            key: "toolset.web_search_source.openrouter",
+            choices_idx: 0,
+            supports_preview: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn enter_on_openrouter_web_search_source_opens_picker_and_commits() {
+    let mut s = make_state();
+    navigate_to(&mut s, "toolset.web_search_source.openrouter");
+    assert!(matches!(
+        handle_settings_key(&mut s, &press(KeyCode::Enter)),
+        SettingsKeyOutcome::Changed
+    ));
+    assert!(matches!(
+        s.mode(),
+        SettingsModalMode::PickingEnum {
+            key: "toolset.web_search_source.openrouter",
+            choices_idx: 0,
+            supports_preview: false,
+            original_value: SettingValue::Enum("xai"),
+        }
+    ));
+    assert!(matches!(
+        handle_settings_key(&mut s, &press(KeyCode::Down)),
+        SettingsKeyOutcome::Changed
+    ));
+    assert!(matches!(
+        handle_settings_key(&mut s, &press(KeyCode::Enter)),
+        SettingsKeyOutcome::Action(Action::SetWebSearchSource {
+            key: "toolset.web_search_source.openrouter",
             choice: "perplexity",
         })
     ));
@@ -1499,6 +1557,88 @@ fn mouse_click_on_opencode_go_models_opens_sub_sheet_and_toggles_enabled() {
                 if models == &["opencode-go/model".to_string()]
         ),
         "click on a discovered OpenCode Go model must enable it, got {out:?}",
+    );
+}
+
+fn seed_openrouter_model_catalog(state: &mut SettingsModalState) {
+    state.pager_snapshot.openrouter_models = vec![
+        xai_grok_shell::openrouter_models::OpenRouterModelDescriptor {
+            key: "openrouter:openai/gpt-4o".to_string(),
+            id: "openai/gpt-4o".to_string(),
+            name: "OpenAI: GPT-4o".to_string(),
+            api_backend: xai_grok_shell::sampling::ApiBackend::ChatCompletions,
+        },
+    ];
+    state.pager_snapshot.openrouter_enabled_models.clear();
+}
+
+#[test]
+fn enter_on_openrouter_models_opens_sub_sheet_and_toggles_enabled() {
+    let mut s = make_state();
+    seed_openrouter_model_catalog(&mut s);
+    navigate_to(&mut s, "openrouter_models");
+
+    let out = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(matches!(
+        s.mode(),
+        SettingsModalMode::PickingGroup { child_idx: 0, .. }
+    ));
+
+    let out = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert!(
+        matches!(
+            out,
+            SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
+                if models == &["openai/gpt-4o".to_string()]
+        ),
+        "Space on a discovered OpenRouter model must enable it, got {out:?}",
+    );
+
+    let out = handle_settings_key(&mut s, &press(KeyCode::Esc));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
+}
+
+#[test]
+fn mouse_click_on_openrouter_models_opens_sub_sheet_and_toggles_enabled() {
+    let mut s = make_state();
+    seed_openrouter_model_catalog(&mut s);
+    synth_rects(&mut s);
+    let group_row = row_idx_for(&s, "openrouter_models") as u16;
+
+    let out = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        group_row,
+    );
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(
+        matches!(s.mode(), SettingsModalMode::PickingGroup { .. }),
+        "click on OpenRouter models value column must open the sub-sheet, got {:?}",
+        s.mode(),
+    );
+
+    s.picker_choice_rects = vec![Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 1,
+    }];
+    let out = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        1,
+        0,
+    );
+    assert!(
+        matches!(
+            out,
+            SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
+                if models == &["openai/gpt-4o".to_string()]
+        ),
+        "click on a discovered OpenRouter model must enable it, got {out:?}",
     );
 }
 
@@ -2793,6 +2933,7 @@ fn registry_kind_membership_through_pr_14() {
             "toolset.web_search_source.kimi_code",
             "toolset.web_search_source.kimi_platform",
             "toolset.web_search_source.opencode_go",
+            "toolset.web_search_source.openrouter",
             "toolset.web_search_source.xai",
             "voice_capture_mode",
             "voice_stt_language",
@@ -2828,7 +2969,11 @@ fn registry_kind_membership_through_pr_14() {
     let dynamic_multi_select_keys = by_kind.remove("DynamicMultiSelect").unwrap_or_default();
     assert_eq!(
         dynamic_multi_select_keys,
-        vec!["custom_models.list", "opencode_go_models"],
+        vec![
+            "custom_models.list",
+            "opencode_go_models",
+            "openrouter_models"
+        ],
         "DynamicMultiSelect kind membership drift",
     );
 
@@ -2864,6 +3009,7 @@ fn registry_kind_membership_through_pr_14() {
             "kimi_code_api_key",
             "meta_api_key",
             "opencode_go_api_key",
+            "openrouter_api_key",
             "perplexity_api_key",
             "runinfra_api_key",
             "wafer_api_key",
@@ -2917,6 +3063,7 @@ fn enum_settings_membership_through_pr_14() {
             "toolset.web_search_source.kimi_code",
             "toolset.web_search_source.kimi_platform",
             "toolset.web_search_source.opencode_go",
+            "toolset.web_search_source.openrouter",
             "toolset.web_search_source.xai",
             "voice_capture_mode",
             "voice_stt_language",
@@ -3012,6 +3159,9 @@ fn defaults_round_trip_through_registry() {
             "gemini_api_key" => {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
             }
+            "openrouter_api_key" => {
+                SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)
+            }
             "custom_model_id" => SettingValue::String(String::new()),
             "custom_model_slug" => SettingValue::String(String::new()),
             "custom_model_name" => SettingValue::String(String::new()),
@@ -3029,6 +3179,7 @@ fn defaults_round_trip_through_registry() {
             "toolset.web_search_source.fireworks" => SettingValue::Enum("xai"),
             "toolset.web_search_source.deepseek" => SettingValue::Enum("xai"),
             "toolset.web_search_source.opencode_go" => SettingValue::Enum("xai"),
+            "toolset.web_search_source.openrouter" => SettingValue::Enum("xai"),
             "toolset.x_search.enabled" => SettingValue::Bool(true),
             "perplexity_api_key" => {
                 SettingValue::SecretStatus(xai_grok_pager::settings::SecretStatus::Missing)

@@ -162,6 +162,32 @@ pub(super) fn custom_models_mutation_payload(
     payload
 }
 
+pub(super) fn openrouter_models_payload(
+    refreshed: Result<bool, String>,
+    models: acp::SessionModelState,
+    catalog: Vec<crate::openrouter_models::OpenRouterModelDescriptor>,
+    enabled_models: Vec<String>,
+) -> serde_json::Value {
+    match refreshed {
+        Ok(refreshed) => serde_json::json!({
+            "refreshed": refreshed,
+            "models": models,
+            "catalog": catalog,
+            "enabled_models": enabled_models,
+        }),
+        Err(warning) => {
+            tracing::warn!(%warning, "OpenRouter model query failed; returning current models");
+            serde_json::json!({
+                "refreshed": false,
+                "warning": warning,
+                "models": models,
+                "catalog": catalog,
+                "enabled_models": enabled_models,
+            })
+        }
+    }
+}
+
 pub(super) fn opencode_go_models_payload(
     refreshed: Result<bool, String>,
     models: acp::SessionModelState,
@@ -195,6 +221,12 @@ struct KimiEndpointApplyParams {
 
 #[derive(serde::Deserialize)]
 struct OpenCodeGoEnabledModelsParams {
+    #[serde(default)]
+    enabled_models: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenRouterEnabledModelsParams {
     #[serde(default)]
     enabled_models: Vec<String>,
 }
@@ -2790,6 +2822,83 @@ impl acp::Agent for MvpAgent {
                     models,
                     self.models_manager.opencode_go_models(),
                     self.models_manager.opencode_go_enabled_models(),
+                )))
+            }
+            "open-grok/openrouter/models/get" => {
+                let refreshed = if self.models_manager.openrouter_models().is_empty() {
+                    self.models_manager.refresh_openrouter_models().await.map_err(|error| error.to_string())
+                } else {
+                    Ok(false)
+                };
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(openrouter_models_payload(
+                    refreshed,
+                    models,
+                    self.models_manager.openrouter_models(),
+                    self.models_manager.openrouter_enabled_models(),
+                )))
+            }
+            "open-grok/openrouter/models/apply" => {
+                let params = crate::extensions::parse_params::<OpenRouterEnabledModelsParams>(&args)?;
+                let cancelled_subagents = crate::agent::subagent::cancel_for_provider_runtime_change(
+                    &self.subagent_provider_registry,
+                    xai_grok_sampling_types::ModelProvider::OpenRouter,
+                );
+                if cancelled_subagents > 0 {
+                    tracing::warn!(
+                        cancelled_subagents,
+                        "cancelled subagents before OpenRouter model allowlist change"
+                    );
+                }
+                self.models_manager
+                    .apply_openrouter_enabled_models(params.enabled_models);
+                let refreshed = if self.models_manager.openrouter_models().is_empty() {
+                    self.models_manager.refresh_openrouter_models().await.map_err(|error| error.to_string())
+                } else {
+                    Ok(false)
+                };
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(openrouter_models_payload(
+                    refreshed,
+                    models,
+                    self.models_manager.openrouter_models(),
+                    self.models_manager.openrouter_enabled_models(),
+                )))
+            }
+            "open-grok/openrouter/models/credential-apply" => {
+                let cancelled_subagents = crate::agent::subagent::cancel_for_provider_runtime_change(
+                    &self.subagent_provider_registry,
+                    xai_grok_sampling_types::ModelProvider::OpenRouter,
+                );
+                if cancelled_subagents > 0 {
+                    tracing::warn!(
+                        cancelled_subagents,
+                        "cancelled subagents before OpenRouter credential change"
+                    );
+                }
+                let refreshed = self
+                    .models_manager
+                    .apply_openrouter_credential_change()
+                    .await
+                    .map_err(|error| error.to_string());
+                let available = self.models_manager.available();
+                let models = acp::SessionModelState::new(
+                    self.models_manager.current_model_id(),
+                    available.values().cloned().collect(),
+                );
+                crate::extensions::to_ext_response(Ok(openrouter_models_payload(
+                    refreshed,
+                    models,
+                    self.models_manager.openrouter_models(),
+                    self.models_manager.openrouter_enabled_models(),
                 )))
             }
             "open-grok/opencode-go/models/credential-apply" => {

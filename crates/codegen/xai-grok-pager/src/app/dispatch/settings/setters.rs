@@ -106,6 +106,26 @@ fn next_opencode_go_operation_generation(app: &mut AppView) -> u64 {
     app.opencode_go_operation_generation
 }
 
+fn remember_loaded_openrouter_sessions(app: &mut AppView) {
+    let mut targets = Vec::new();
+    for (&agent_id, agent) in &mut app.agents {
+        if PrimaryProvider::for_current_model(&agent.session.models)
+            == Some(PrimaryProvider::OpenRouter)
+        {
+            agent.session.provider_rebind_pending = true;
+            targets.push(agent_id);
+        }
+    }
+    app.pending_openrouter_rebind_agents.extend(targets);
+}
+
+fn next_openrouter_operation_generation(app: &mut AppView) -> u64 {
+    app.openrouter_operation_generation =
+        app.openrouter_operation_generation.wrapping_add(1).max(1);
+    app.openrouter_runtime_update_pending = true;
+    app.openrouter_operation_generation
+}
+
 fn remember_loaded_wafer_sessions(app: &mut AppView) {
     let mut targets = Vec::new();
     for (&agent_id, agent) in &mut app.agents {
@@ -525,6 +545,52 @@ pub(in crate::app::dispatch) fn set_opencode_go_enabled_models(
 pub(in crate::app::dispatch) fn refresh_opencode_go_models(app: &mut AppView) -> Vec<Effect> {
     vec![Effect::QueryOpenCodeGoModels {
         generation: app.opencode_go_operation_generation,
+    }]
+}
+
+pub(in crate::app::dispatch) fn set_openrouter_api_key(
+    app: &mut AppView,
+    key: SecretInput,
+) -> Vec<Effect> {
+    remember_loaded_openrouter_sessions(app);
+    let generation = next_openrouter_operation_generation(app);
+    app.show_toast("Saving OpenRouter API key and querying models…");
+    vec![Effect::UpdateOpenRouterApiKey {
+        generation,
+        key: Some(key),
+    }]
+}
+
+pub(in crate::app::dispatch) fn clear_openrouter_api_key(app: &mut AppView) -> Vec<Effect> {
+    remember_loaded_openrouter_sessions(app);
+    let generation = next_openrouter_operation_generation(app);
+    app.show_toast("Removing OpenRouter API key…");
+    vec![Effect::UpdateOpenRouterApiKey {
+        generation,
+        key: None,
+    }]
+}
+
+pub(in crate::app::dispatch) fn set_openrouter_enabled_models(
+    app: &mut AppView,
+    mut models: Vec<String>,
+) -> Vec<Effect> {
+    models.sort();
+    models.dedup();
+    if models == app.openrouter_enabled_models && !app.openrouter_runtime_update_pending {
+        return vec![];
+    }
+    remember_loaded_openrouter_sessions(app);
+    let generation = next_openrouter_operation_generation(app);
+    app.openrouter_enabled_models = models.clone();
+    refresh_open_settings_modals(app);
+    app.show_toast("Updating enabled OpenRouter models…");
+    vec![Effect::UpdateOpenRouterEnabledModels { generation, models }]
+}
+
+pub(in crate::app::dispatch) fn refresh_openrouter_models(app: &mut AppView) -> Vec<Effect> {
+    vec![Effect::QueryOpenRouterModels {
+        generation: app.openrouter_operation_generation,
     }]
 }
 
@@ -1115,6 +1181,7 @@ pub(in crate::app::dispatch) fn set_web_search_source(
             "toolset.web_search_source.kimi_platform" => WebSearchSourceTarget::KimiPlatform,
             "toolset.web_search_source.fireworks" => WebSearchSourceTarget::Fireworks,
             "toolset.web_search_source.opencode_go" => WebSearchSourceTarget::OpenCodeGo,
+            "toolset.web_search_source.openrouter" => WebSearchSourceTarget::OpenRouter,
             _ => WebSearchSourceTarget::KimiCode,
         };
         xai_grok_shell::util::config::load_web_search_source_sync()
@@ -2804,6 +2871,8 @@ pub(in crate::app::dispatch) fn set_default_model(
         Some(PrimaryProvider::Runinfra)
     } else if app.pending_gemini_rebind_agents.contains(&aid) {
         Some(PrimaryProvider::Gemini)
+    } else if app.pending_openrouter_rebind_agents.contains(&aid) {
+        Some(PrimaryProvider::OpenRouter)
     } else {
         Some(PrimaryProvider::Kimi)
     };
@@ -2843,6 +2912,9 @@ pub(in crate::app::dispatch) fn set_default_model(
                 }
                 Some(PrimaryProvider::Gemini) => {
                     app.cancel_pending_gemini_rebind(aid);
+                }
+                Some(PrimaryProvider::OpenRouter) => {
+                    app.cancel_pending_openrouter_rebind(aid);
                 }
                 Some(PrimaryProvider::Xai | PrimaryProvider::Codex) | None => {}
             }

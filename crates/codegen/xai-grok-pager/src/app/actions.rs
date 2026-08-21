@@ -680,6 +680,10 @@ pub enum Action {
         key: crate::settings::SecretInput,
     },
     ClearOpenCodeGoApiKey,
+    SetOpenRouterApiKey {
+        key: crate::settings::SecretInput,
+    },
+    ClearOpenRouterApiKey,
     /// Save the Wafer AI API key from the dedicated masked editor.
     SetWaferApiKey {
         key: crate::settings::SecretInput,
@@ -708,6 +712,10 @@ pub enum Action {
         models: Vec<String>,
     },
     RefreshOpenCodeGoModels,
+    SetOpenRouterEnabledModels {
+        models: Vec<String>,
+    },
+    RefreshOpenRouterModels,
     SetCustomModelId(String),
     SetCustomModelSlug(String),
     SetCustomModelName(String),
@@ -834,6 +842,7 @@ pub enum Action {
     /// Open Settings directly in the secure Meta API-key editor.
     OpenMetaApiKeyEditor,
     OpenOpenCodeGoApiKeyEditor,
+    OpenOpenRouterApiKeyEditor,
     /// Open Settings directly in the secure Wafer AI API-key editor.
     OpenWaferApiKeyEditor,
     /// Open Settings directly in the secure Z AI API-key editor.
@@ -1686,6 +1695,10 @@ pub enum Effect {
         generation: u64,
         key: Option<crate::settings::SecretInput>,
     },
+    UpdateOpenRouterApiKey {
+        generation: u64,
+        key: Option<crate::settings::SecretInput>,
+    },
     /// Update the Wafer AI credential, then refresh its dynamic model catalog.
     UpdateWaferApiKey {
         generation: u64,
@@ -1711,6 +1724,13 @@ pub enum Effect {
         models: Vec<String>,
     },
     QueryOpenCodeGoModels {
+        generation: u64,
+    },
+    UpdateOpenRouterEnabledModels {
+        generation: u64,
+        models: Vec<String>,
+    },
+    QueryOpenRouterModels {
         generation: u64,
     },
     QueryCustomModels {
@@ -1775,6 +1795,13 @@ pub enum Effect {
         generation: u64,
     },
     RebindOpenCodeGoModel {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+    },
+    RebindOpenRouterModel {
         agent_id: AgentId,
         session_id: acp::SessionId,
         model_id: acp::ModelId,
@@ -2848,6 +2875,17 @@ pub enum TaskResult {
         catalog: Vec<xai_grok_shell::opencode_go_models::OpenCodeGoModelDescriptor>,
         enabled_models: Vec<String>,
     },
+    OpenRouterModelsUpdated {
+        configured: Option<bool>,
+        mutation: bool,
+        generation: u64,
+        stale: bool,
+        warning: Option<String>,
+        error: Option<String>,
+        models: Option<acp::SessionModelState>,
+        catalog: Vec<xai_grok_shell::openrouter_models::OpenRouterModelDescriptor>,
+        enabled_models: Vec<String>,
+    },
     CustomModelsUpdated {
         generation: u64,
         stale: bool,
@@ -2920,6 +2958,14 @@ pub enum TaskResult {
         result: Result<(), SwitchModelError>,
     },
     OpenCodeGoModelRebindComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        model_id: acp::ModelId,
+        effort: Option<ReasoningEffort>,
+        generation: u64,
+        result: Result<(), SwitchModelError>,
+    },
+    OpenRouterModelRebindComplete {
         agent_id: AgentId,
         session_id: acp::SessionId,
         model_id: acp::ModelId,

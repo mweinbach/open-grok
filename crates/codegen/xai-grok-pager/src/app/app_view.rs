@@ -425,6 +425,7 @@ pub enum PrimaryProvider {
     Zai,
     Runinfra,
     Gemini,
+    OpenRouter,
 }
 
 pub const CODEX_STARTUP_MODEL_ID: &str = "gpt-5.6-sol";
@@ -483,6 +484,11 @@ impl PrimaryProvider {
             || provider.eq_ignore_ascii_case("gemini_api")
         {
             Some(Self::Gemini)
+        } else if provider.eq_ignore_ascii_case("openrouter")
+            || provider.eq_ignore_ascii_case("open_router")
+            || provider.eq_ignore_ascii_case("open-router")
+        {
+            Some(Self::OpenRouter)
         } else {
             None
         }
@@ -803,9 +809,14 @@ pub struct AppView {
     pub(crate) gemini_operation_generation: u64,
     pub(crate) gemini_runtime_update_pending: bool,
     pub(crate) pending_gemini_rebind_agents: std::collections::HashSet<AgentId>,
+    pub(crate) openrouter_operation_generation: u64,
+    pub(crate) openrouter_runtime_update_pending: bool,
+    pub(crate) pending_openrouter_rebind_agents: std::collections::HashSet<AgentId>,
     pub(crate) opencode_go_models:
         Vec<xai_grok_shell::opencode_go_models::OpenCodeGoModelDescriptor>,
     pub(crate) opencode_go_enabled_models: Vec<String>,
+    pub(crate) openrouter_models: Vec<xai_grok_shell::openrouter_models::OpenRouterModelDescriptor>,
+    pub(crate) openrouter_enabled_models: Vec<String>,
     /// Optimistic mirror of `[toolset.perplexity_web_search].enabled`.
     pub perplexity_web_search_enabled: bool,
     pub(crate) perplexity_web_search_generation: u64,
@@ -1555,6 +1566,17 @@ impl AppView {
         }
     }
 
+    pub(crate) fn cancel_pending_openrouter_rebind(&mut self, agent_id: AgentId) -> bool {
+        let removed = self.pending_openrouter_rebind_agents.remove(&agent_id);
+        if let Some(agent) = self.agents.get_mut(&agent_id) {
+            let was_pending = agent.session.provider_rebind_pending;
+            agent.session.provider_rebind_pending = false;
+            removed || was_pending
+        } else {
+            removed
+        }
+    }
+
     pub(crate) fn cancel_pending_wafer_rebind(&mut self, agent_id: AgentId) -> bool {
         let removed = self.pending_wafer_rebind_agents.remove(&agent_id);
         if let Some(agent) = self.agents.get_mut(&agent_id) {
@@ -1640,7 +1662,8 @@ impl AppView {
             | PrimaryProvider::Wafer
             | PrimaryProvider::Zai
             | PrimaryProvider::Runinfra
-            | PrimaryProvider::Gemini => {
+            | PrimaryProvider::Gemini
+            | PrimaryProvider::OpenRouter => {
                 // Preserve the xAI snapshot only when crossing out of xAI.
                 // A non-xAI <-> non-xAI transition sees already-cleared
                 // controls and must not overwrite the saved xAI state with
@@ -1986,8 +2009,13 @@ impl AppView {
             gemini_operation_generation: 0,
             gemini_runtime_update_pending: false,
             pending_gemini_rebind_agents: Default::default(),
+            openrouter_operation_generation: 0,
+            openrouter_runtime_update_pending: false,
+            pending_openrouter_rebind_agents: Default::default(),
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
+            openrouter_models: Vec::new(),
+            openrouter_enabled_models: Vec::new(),
             perplexity_web_search_enabled: false,
             perplexity_web_search_generation: 0,
             perplexity_web_search_update_pending: false,
@@ -6643,8 +6671,13 @@ pub(crate) mod tests {
             gemini_operation_generation: 0,
             gemini_runtime_update_pending: false,
             pending_gemini_rebind_agents: Default::default(),
+            openrouter_operation_generation: 0,
+            openrouter_runtime_update_pending: false,
+            pending_openrouter_rebind_agents: Default::default(),
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
+            openrouter_models: Vec::new(),
+            openrouter_enabled_models: Vec::new(),
             perplexity_web_search_enabled: false,
             perplexity_web_search_generation: 0,
             perplexity_web_search_update_pending: false,

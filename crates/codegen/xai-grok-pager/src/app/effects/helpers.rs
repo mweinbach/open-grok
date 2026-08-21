@@ -1058,7 +1058,8 @@ pub(crate) async fn persist_setting(
         | "toolset.web_search_source.kimi_platform"
         | "toolset.web_search_source.kimi_code"
         | "toolset.web_search_source.fireworks"
-        | "toolset.web_search_source.opencode_go" => {
+        | "toolset.web_search_source.opencode_go"
+        | "toolset.web_search_source.openrouter" => {
             use xai_grok_shell::tools::config::{WebSearchSource, WebSearchSourceTarget};
             let SettingValue::Enum(choice) = value else {
                 return Err(kind_mismatch(key, "Enum", &value));
@@ -1072,6 +1073,7 @@ pub(crate) async fn persist_setting(
                 "toolset.web_search_source.kimi_platform" => WebSearchSourceTarget::KimiPlatform,
                 "toolset.web_search_source.fireworks" => WebSearchSourceTarget::Fireworks,
                 "toolset.web_search_source.opencode_go" => WebSearchSourceTarget::OpenCodeGo,
+                "toolset.web_search_source.openrouter" => WebSearchSourceTarget::OpenRouter,
                 _ => WebSearchSourceTarget::KimiCode,
             };
             xai_grok_shell::util::config::set_web_search_source(target, source)

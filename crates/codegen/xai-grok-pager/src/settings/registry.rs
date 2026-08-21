@@ -105,6 +105,7 @@ pub struct OwnedMultiSelectChoice {
 #[non_exhaustive]
 pub enum DynamicMultiSelectSource {
     OpenCodeGoModels,
+    OpenRouterModels,
     CustomModels,
 }
 
@@ -179,6 +180,19 @@ pub fn dynamic_multi_select_choices(
                 description: format!("{} · {:?}", model.id, model.api_backend),
                 selected: snapshot
                     .opencode_go_enabled_models
+                    .iter()
+                    .any(|enabled| enabled == &model.id || enabled == &model.key),
+            })
+            .collect(),
+        DynamicMultiSelectSource::OpenRouterModels => snapshot
+            .openrouter_models
+            .iter()
+            .map(|model| OwnedMultiSelectChoice {
+                canonical: model.id.clone(),
+                display: model.name.clone(),
+                description: model.id.clone(),
+                selected: snapshot
+                    .openrouter_enabled_models
                     .iter()
                     .any(|enabled| enabled == &model.id || enabled == &model.key),
             })
@@ -442,8 +456,11 @@ pub struct PagerLocalSnapshot {
     pub runinfra_api_key_status: SecretStatus,
     /// Status-only mirror for the Google Gemini API-key source.
     pub gemini_api_key_status: SecretStatus,
+    pub openrouter_api_key_status: SecretStatus,
     pub opencode_go_models: Vec<xai_grok_shell::opencode_go_models::OpenCodeGoModelDescriptor>,
     pub opencode_go_enabled_models: Vec<String>,
+    pub openrouter_models: Vec<xai_grok_shell::openrouter_models::OpenRouterModelDescriptor>,
+    pub openrouter_enabled_models: Vec<String>,
     /// User `[model.*]` entries from `open-grok/custom-models/list`.
     pub custom_models: Vec<CustomModelRecord>,
     /// Draft catalog key for the add-model form (not written until Save).
@@ -537,8 +554,11 @@ impl Default for PagerLocalSnapshot {
             zai_api_key_status: SecretStatus::Missing,
             runinfra_api_key_status: SecretStatus::Missing,
             gemini_api_key_status: SecretStatus::Missing,
+            openrouter_api_key_status: SecretStatus::Missing,
             opencode_go_models: Vec::new(),
             opencode_go_enabled_models: Vec::new(),
+            openrouter_models: Vec::new(),
+            openrouter_enabled_models: Vec::new(),
             custom_models: Vec::new(),
             custom_model_id: String::new(),
             custom_model_slug: String::new(),
@@ -611,6 +631,7 @@ pub fn canonical_custom_model_provider(value: &str) -> &'static str {
         "meta" => "meta",
         "xai" => "xai",
         "opencode_go" | "opencode-go" => "opencode_go",
+        "openrouter" | "open_router" | "open-router" => "openrouter",
         _ => "",
     }
 }
@@ -1078,6 +1099,7 @@ pub fn current_value_for(
         "zai_api_key" => Some(SettingValue::SecretStatus(pager.zai_api_key_status)),
         "runinfra_api_key" => Some(SettingValue::SecretStatus(pager.runinfra_api_key_status)),
         "gemini_api_key" => Some(SettingValue::SecretStatus(pager.gemini_api_key_status)),
+        "openrouter_api_key" => Some(SettingValue::SecretStatus(pager.openrouter_api_key_status)),
         "custom_model_id" => Some(SettingValue::String(pager.custom_model_id.clone())),
         "custom_model_slug" => Some(SettingValue::String(pager.custom_model_slug.clone())),
         "custom_model_name" => Some(SettingValue::String(pager.custom_model_name.clone())),
@@ -1100,7 +1122,8 @@ pub fn current_value_for(
         | "toolset.web_search_source.kimi_code"
         | "toolset.web_search_source.fireworks"
         | "toolset.web_search_source.deepseek"
-        | "toolset.web_search_source.opencode_go" => {
+        | "toolset.web_search_source.opencode_go"
+        | "toolset.web_search_source.openrouter" => {
             use xai_grok_shell::tools::config::WebSearchSourceTarget;
             let target = match key {
                 "toolset.web_search_source.xai" => WebSearchSourceTarget::Xai,
@@ -1109,6 +1132,7 @@ pub fn current_value_for(
                 "toolset.web_search_source.fireworks" => WebSearchSourceTarget::Fireworks,
                 "toolset.web_search_source.deepseek" => WebSearchSourceTarget::DeepSeek,
                 "toolset.web_search_source.opencode_go" => WebSearchSourceTarget::OpenCodeGo,
+                "toolset.web_search_source.openrouter" => WebSearchSourceTarget::OpenRouter,
                 _ => WebSearchSourceTarget::KimiCode,
             };
             Some(SettingValue::Enum(
@@ -1458,13 +1482,17 @@ mod tests {
                     | "zai_api_key"
                     | "runinfra_api_key"
                     | "gemini_api_key"
+                    | "openrouter_api_key"
                     | "perplexity_api_key",
                     SettingKind::Secret,
                 ) => {
                     // Credential presence is pager-local runtime state rather than UiConfig.
                     // `every_setting_has_dispatch_arm` pins the SecretStatus mapping.
                 }
-                ("opencode_go_models", SettingKind::DynamicMultiSelect { .. }) => {
+                (
+                    "opencode_go_models" | "openrouter_models",
+                    SettingKind::DynamicMultiSelect { .. },
+                ) => {
                     // Dynamic multi-select has no scalar registry default; the
                     // empty enabled list is pinned by PagerLocalSnapshot::default
                     // and the shell config default.
@@ -1839,6 +1867,9 @@ mod tests {
                         *default, "xai",
                         "OpenCode Go sessions default to xAI search"
                     );
+                }
+                ("toolset.web_search_source.openrouter", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(*default, "xai", "OpenRouter sessions default to xAI search");
                 }
                 (key, SettingKind::Bool { default }) if is_local_feature_flag(key) => {
                     assert_eq!(

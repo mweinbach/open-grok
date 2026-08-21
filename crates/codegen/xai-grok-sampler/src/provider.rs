@@ -548,6 +548,12 @@ fn normalize_runinfra_deepseek_v4_flash_effort(effort: ReasoningEffort) -> Reaso
 #[derive(Debug)]
 pub struct GeminiProvider;
 
+/// OpenRouter is an OpenAI-compatible Chat Completions gateway. It keeps
+/// `reasoning_effort` for models that advertise reasoning, and drops
+/// Grok-internal `service_tier` plus per-message `model_id`.
+#[derive(Debug)]
+pub struct OpenRouterProvider;
+
 impl ProviderAdapter for GeminiProvider {
     fn provider(&self) -> ModelProvider {
         ModelProvider::Gemini
@@ -562,6 +568,20 @@ impl ProviderAdapter for GeminiProvider {
         request.reasoning_effort = request
             .reasoning_effort
             .and_then(|effort| normalize_gemini_reasoning_effort(request.model.as_deref(), effort));
+    }
+}
+
+impl ProviderAdapter for OpenRouterProvider {
+    fn provider(&self) -> ModelProvider {
+        ModelProvider::OpenRouter
+    }
+
+    fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
+        request.service_tier = None;
+        request.thinking = None;
+        for message in &mut request.messages {
+            message.model_id = None;
+        }
     }
 }
 
@@ -692,9 +712,10 @@ static WAFER_PROVIDER: WaferProvider = WaferProvider;
 static ZAI_PROVIDER: ZaiProvider = ZaiProvider;
 static RUNINFRA_PROVIDER: RuninfraProvider = RuninfraProvider;
 static GEMINI_PROVIDER: GeminiProvider = GeminiProvider;
+static OPENROUTER_PROVIDER: OpenRouterProvider = OpenRouterProvider;
 
 /// Complete registry for the built-in providers.
-pub static PROVIDER_REGISTRY: [ProviderRegistration; 11] = [
+pub static PROVIDER_REGISTRY: [ProviderRegistration; 12] = [
     ProviderRegistration {
         provider: ModelProvider::Xai,
         adapter: &XAI_PROVIDER,
@@ -739,6 +760,10 @@ pub static PROVIDER_REGISTRY: [ProviderRegistration; 11] = [
         provider: ModelProvider::Gemini,
         adapter: &GEMINI_PROVIDER,
     },
+    ProviderRegistration {
+        provider: ModelProvider::OpenRouter,
+        adapter: &OPENROUTER_PROVIDER,
+    },
 ];
 
 /// Look up the stateless transport adapter for a built-in provider.
@@ -757,6 +782,7 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
         ModelProvider::Zai => PROVIDER_REGISTRY[8].adapter,
         ModelProvider::Runinfra => PROVIDER_REGISTRY[9].adapter,
         ModelProvider::Gemini => PROVIDER_REGISTRY[10].adapter,
+        ModelProvider::OpenRouter => PROVIDER_REGISTRY[11].adapter,
     }
 }
 
@@ -1050,6 +1076,7 @@ mod tests {
             ModelProvider::Zai,
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
+            ModelProvider::OpenRouter,
         ];
         assert_eq!(PROVIDER_REGISTRY.len(), expected.len());
         for provider in expected {
@@ -1079,6 +1106,7 @@ mod tests {
             ModelProvider::Zai,
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
+            ModelProvider::OpenRouter,
         ] {
             let mut request = base_request();
             let original = request.clone();

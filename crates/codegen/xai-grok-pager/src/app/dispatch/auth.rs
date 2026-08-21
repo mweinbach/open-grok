@@ -33,6 +33,7 @@ pub(super) fn dispatch_open_login_provider_picker(app: &mut AppView) -> Vec<Effe
     let zai_status = super::settings::ui::zai_api_key_status();
     let runinfra_status = super::settings::ui::runinfra_api_key_status();
     let gemini_status = super::settings::ui::gemini_api_key_status();
+    let openrouter_status = super::settings::ui::openrouter_api_key_status();
     let items = crate::slash::commands::login::provider_items(
         Some(kimi_status),
         Some(fireworks_status),
@@ -43,6 +44,7 @@ pub(super) fn dispatch_open_login_provider_picker(app: &mut AppView) -> Vec<Effe
         Some(zai_status),
         Some(runinfra_status),
         Some(gemini_status),
+        Some(openrouter_status),
     );
     if let Some(agent) = get_visible_agent_mut(app) {
         agent.active_modal = Some(crate::views::modal::ActiveModal::ArgPicker {
@@ -165,6 +167,7 @@ fn select_startup_model(
             PrimaryProvider::Zai => "Z AI",
             PrimaryProvider::Runinfra => "RunInfra",
             PrimaryProvider::Gemini => "Google Gemini",
+            PrimaryProvider::OpenRouter => "OpenRouter",
         };
         return Err(if allow_provider_fallback {
             format!("No visible {provider_name} model is available. Check model filters and retry.")

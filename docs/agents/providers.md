@@ -1,6 +1,6 @@
 # Multi-provider architecture
 
-How Open Grok treats **xAI**, **OpenAI Codex**, **Kimi** (Platform vs Code), **Fireworks AI**, **DeepSeek API direct**, **Meta API**, **Wafer AI**, **Z AI**, **RunInfra**, **Google Gemini**, and **OpenCode Go** without leaking credentials, tools, or opaque history.
+How Open Grok treats **xAI**, **OpenAI Codex**, **Kimi** (Platform vs Code), **Fireworks AI**, **DeepSeek API direct**, **Meta API**, **Wafer AI**, **Z AI**, **RunInfra**, **Google Gemini**, **OpenCode Go**, and **OpenRouter** without leaking credentials, tools, or opaque history.
 
 **Canonical contracts:**
 
@@ -42,6 +42,7 @@ Adapters (credential-free): `xai-grok-sampler/src/provider.rs`.
 | RunInfra | Chat | none | client function tools | API key only | **denied** |
 | Google Gemini | Chat | none | client function tools | API key only | **denied** |
 | OpenCode Go | Chat, Messages (per model) | none | client function tools | API key only | **denied** |
+| OpenRouter | Chat | none | client function tools | API key only | **denied** |
 
 ### Wafer AI ([wafer.ai](https://www.wafer.ai/))
 
@@ -119,6 +120,21 @@ Defaults: 3.7-flash Medium, 3.6-flash Medium, 3.5-flash-lite Minimal,
 Responses dialect, hosted tools, or native search, and must not receive xAI
 credentials or xAI-only exports.
 
+### OpenRouter ([openrouter.ai](https://openrouter.ai/))
+
+OpenRouter is an isolated, API-key-only OpenAI-compatible Chat Completions
+gateway. Its base URL is `https://openrouter.ai/api/v1` (overridable via
+`OPENGROK_OPENROUTER_API_BASE_URL`). Auth is Bearer (`OPENROUTER_API_KEY`).
+Stored keys are sent only to `https://openrouter.ai`. Open Grok queries
+`GET /models` and shows a checklist of discovered text/tool-capable models;
+none are enabled by default. Only selected models appear in normal model
+settings and are eligible for subagents. Requests include the optional
+`HTTP-Referer` and `X-Title` attribution headers. Models that advertise
+`reasoning` expose none/low/medium/high/xhigh (Medium default). OpenRouter
+accepts standard client function tools, has no Responses dialect, hosted
+tools, or native search, and must not receive xAI credentials or xAI-only
+exports.
+
 ## Layer map (paths)
 
 ```text
@@ -175,6 +191,10 @@ OpenCode Go
   xai-grok-shell/src/opencode_go_models.rs      # live availability + models.dev protocol mapping
   auth/storage.rs                               # opencode_go::api_key (generic provider scope)
 
+OpenRouter
+  xai-grok-shell/src/openrouter_models.rs       # live /models catalog + opt-in enable list
+  auth/storage.rs                               # openrouter::api_key (generic provider scope)
+
 Session routing / tools / compaction
   xai-grok-shell/src/session/
   xai-grok-shell/src/session/compaction.rs
@@ -205,6 +225,7 @@ Home root: `$OPENGROK_HOME` or `~/.opengrok` via `xai_grok_config::grok_home()`.
 | RunInfra | `auth.json` scope `runinfra::api_key` or `RUNINFRA_GATEWAY_KEY` / `RUNINFRA_API_KEY` | Settings / `/login runinfra` / environment |
 | Google Gemini | `auth.json` scope `gemini::api_key` or `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Settings / `/login gemini` / environment |
 | OpenCode Go | `auth.json` scope `opencode_go::api_key` | Settings / `/login opencode-go` |
+| OpenRouter | `auth.json` scope `openrouter::api_key` or `OPENROUTER_API_KEY` | Settings / `/login openrouter` / environment |
 | Perplexity Search fallback | `auth.json` scope `perplexity::api_key` | Settings |
 | Both providers | — | `logout --all` |
 
@@ -244,6 +265,11 @@ Also isolated:
     custom Responses routes must opt in with
     `supports_standalone_web_search = true`; when unavailable, hosted search
     remains declared.
+18. **OpenRouter is opt-in per model.** Live `/models` is authoritative for
+    availability and limits. Image/embedding-only and non-tool models are
+    omitted. The enabled list defaults empty, and only enabled entries reach
+    normal model settings or subagent selection. Stored keys are sent only to
+    `https://openrouter.ai`.
 
 ## Sampling, routing, compaction
 
@@ -255,15 +281,15 @@ Also isolated:
 
 ### Adapter differences (summary)
 
-| Behavior | xAI | Codex | Kimi | Fireworks | DeepSeek | Meta | Wafer | OpenCode Go |
+| Behavior | xAI | Codex | Kimi | Fireworks | DeepSeek | Meta | Wafer | OpenCode Go | OpenRouter |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Private headers | `x-grok-*` | stripped | stripped | stripped | stripped | stripped | stripped | stripped |
-| Doom-loop opt-in | yes | no | no | no | no | no | no | no |
-| Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A | N/A | stateless fields; effort normalized to none/low/high/max | stateless fields; preserves low/medium/high/xhigh | N/A | N/A |
-| Prompt cache key | no | session id | no | no | no | no | no | no |
-| Sticky turn state | no | `x-codex-turn-state` | no | no | no | no | no | no |
-| Unknown `response.*` events | strict | ignore unknown side-channels when opted | N/A | N/A | strict | strict | N/A | N/A |
-| Chat sanitization | — | — | clears temp/top_p/penalties | schema normalization | strips internal message model IDs | N/A | standard | per backend |
+| Private headers | `x-grok-*` | stripped | stripped | stripped | stripped | stripped | stripped | stripped | stripped |
+| Doom-loop opt-in | yes | no | no | no | no | no | no | no | no |
+| Responses extras | minimal | Max/Ultra mapping, multi-agent mode, reasoning summary | N/A | N/A | stateless fields; effort normalized to none/low/high/max | stateless fields; preserves low/medium/high/xhigh | N/A | N/A | N/A |
+| Prompt cache key | no | session id | no | no | no | no | no | no | no |
+| Sticky turn state | no | `x-codex-turn-state` | no | no | no | no | no | no | no |
+| Unknown `response.*` events | strict | ignore unknown side-channels when opted | N/A | N/A | strict | strict | N/A | N/A | N/A |
+| Chat sanitization | — | — | clears temp/top_p/penalties | schema normalization | strips internal message model IDs | N/A | standard | per backend | strips service tier / message model IDs |
 
 ### Compaction
 

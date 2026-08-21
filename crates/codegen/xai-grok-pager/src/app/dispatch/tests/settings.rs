@@ -2010,7 +2010,8 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         | "toolset.web_search_source.kimi_code"
         | "toolset.web_search_source.fireworks"
         | "toolset.web_search_source.deepseek"
-        | "toolset.web_search_source.opencode_go" => {
+        | "toolset.web_search_source.opencode_go"
+        | "toolset.web_search_source.openrouter" => {
             // "perplexity" is a valid non-default choice for every target.
             let _ = dispatch(
                 Action::SetWebSearchSource {
@@ -2029,6 +2030,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
                         "toolset.web_search_source.opencode_go" => {
                             "toolset.web_search_source.opencode_go"
                         }
+                        "toolset.web_search_source.openrouter" => {
+                            "toolset.web_search_source.openrouter"
+                        }
                         _ => "toolset.web_search_source.kimi_code",
                     },
                     choice: "perplexity",
@@ -2040,6 +2044,14 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
             let _ = dispatch(
                 Action::SetOpenCodeGoEnabledModels {
                     models: vec!["test/model".to_owned()],
+                },
+                app,
+            );
+        }
+        "openrouter_models" => {
+            let _ = dispatch(
+                Action::SetOpenRouterEnabledModels {
+                    models: vec!["openai/gpt-4o".to_owned()],
                 },
                 app,
             );

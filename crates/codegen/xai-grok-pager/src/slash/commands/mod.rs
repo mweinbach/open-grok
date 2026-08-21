@@ -700,6 +700,15 @@ mod tests {
         }
     }
     #[test]
+    fn login_openrouter_selects_secure_api_key_editor() {
+        for provider in [" openrouter ", "open-router", "open_router"] {
+            assert!(matches!(
+                run_login(provider),
+                CommandResult::Action(Action::OpenOpenRouterApiKeyEditor)
+            ));
+        }
+    }
+    #[test]
     fn login_wafer_selects_secure_api_key_editor() {
         for provider in [" wafer ", "wafer-ai", "wafer_ai"] {
             assert!(matches!(
@@ -744,6 +753,7 @@ mod tests {
             Some(crate::settings::SecretStatus::Stored),
             Some(crate::settings::SecretStatus::Missing),
             Some(crate::settings::SecretStatus::Stored),
+            Some(crate::settings::SecretStatus::Missing),
         );
         assert_eq!(
             items
@@ -761,7 +771,8 @@ mod tests {
                 "wafer",
                 "zai",
                 "runinfra",
-                "gemini"
+                "gemini",
+                "openrouter"
             ]
         );
         assert_eq!(items[2].description, "API key · saved");
@@ -773,6 +784,7 @@ mod tests {
         assert_eq!(items[8].description, "API key · saved");
         assert_eq!(items[9].description, "API key · not configured");
         assert_eq!(items[10].description, "API key · saved");
+        assert_eq!(items[11].description, "API key · not configured");
     }
     #[test]
     fn logout_bare_preserves_xai_flow() {

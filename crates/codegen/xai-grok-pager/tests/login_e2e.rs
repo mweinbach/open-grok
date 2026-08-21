@@ -35,6 +35,9 @@ fn login_argument_completion_lists_all_providers() {
             ("OpenCode Go", "opencode-go"),
             ("Wafer AI", "wafer"),
             ("Z AI", "zai"),
+            ("RunInfra", "runinfra"),
+            ("Google Gemini", "gemini"),
+            ("OpenRouter", "openrouter"),
         ]
     );
     for row in &snapshot.matches[2..] {
@@ -63,11 +66,11 @@ fn login_provider_completion_filters_by_provider_aliases() {
         ("grok", "xai"),
         ("deepseek", "deepseek"),
         ("meta", "meta"),
-        ("go", "opencode-go"),
         ("opencode", "opencode-go"),
         ("wafer", "wafer"),
         ("zai", "zai"),
         ("fireworks", "fireworks"),
+        ("openrouter", "openrouter"),
     ] {
         let text = format!("/login {query}");
         controller.refresh(&state, &text, text.len(), &models);

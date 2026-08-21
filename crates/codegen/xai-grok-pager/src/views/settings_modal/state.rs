@@ -591,6 +591,10 @@ impl SettingsModalState {
         self.try_open_provider_login_secret("opencode_go_api_key")
     }
 
+    pub fn try_open_openrouter_provider_login(&mut self) -> bool {
+        self.try_open_provider_login_secret("openrouter_api_key")
+    }
+
     pub fn try_open_wafer_provider_login(&mut self) -> bool {
         self.try_open_provider_login_secret("wafer_api_key")
     }
@@ -1186,7 +1190,8 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
         | "toolset.web_search_source.kimi_code"
         | "toolset.web_search_source.fireworks"
         | "toolset.web_search_source.deepseek"
-        | "toolset.web_search_source.opencode_go" => {
+        | "toolset.web_search_source.opencode_go"
+        | "toolset.web_search_source.openrouter" => {
             Some(Action::SetWebSearchSource { key, choice })
         }
         "voice_capture_mode" => Some(Action::SetVoiceCaptureMode(choice.to_string())),

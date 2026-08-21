@@ -1165,6 +1165,10 @@ pub struct ModelsConfig {
     /// remote catalog is available only to the provider management UI.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub opencode_go_enabled_models: Vec<String>,
+    /// OpenRouter models explicitly enabled by the user. Empty means the
+    /// remote catalog is available only to the provider management UI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub openrouter_enabled_models: Vec<String>,
     /// Fallback `agent_type` for models without a per-model override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
@@ -4359,6 +4363,12 @@ fn default_models(
                 m.base_url = Some(crate::gemini_models::api_base_url());
                 m.env_key = Some(crate::gemini_models::env_keys());
             }
+            if m.provider == ModelProvider::OpenRouter {
+                m.base_url = Some(crate::openrouter_models::api_base_url());
+                m.env_key = Some(EnvKeys::single(
+                    crate::openrouter_models::OPENROUTER_API_KEY_ENV,
+                ));
+            }
             let key = m.id.clone().unwrap_or_else(|| m.model.clone());
             let context_window = m
                 .context_window
@@ -4711,7 +4721,8 @@ impl ConfigModelOverride {
                 | ModelProvider::Zai
                 | ModelProvider::Runinfra
                 | ModelProvider::Gemini
-                | ModelProvider::OpenCodeGo => ApiBackend::ChatCompletions,
+                | ModelProvider::OpenCodeGo
+                | ModelProvider::OpenRouter => ApiBackend::ChatCompletions,
             };
             if self.base_url.is_none() {
                 entry.info.base_url.clear();
@@ -5643,6 +5654,8 @@ fn trusted_built_in_session_endpoint(provider: ModelProvider, base_url: &str) ->
                 || (provider.is_runinfra()
                     && crate::runinfra_models::is_trusted_api_base_url(base_url))
                 || (provider.is_gemini() && crate::gemini_models::is_trusted_api_base_url(base_url))
+                || (provider.is_open_router()
+                    && crate::openrouter_models::is_trusted_api_base_url(base_url))
         }
         xai_grok_sampling_types::BuiltInSessionAuthKind::XaiSession => {
             crate::util::is_xai_api_bearer_url(base_url)

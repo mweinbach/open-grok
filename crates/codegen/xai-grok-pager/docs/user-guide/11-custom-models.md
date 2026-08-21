@@ -97,8 +97,8 @@ Fill the draft fields, then turn on **Save custom model**:
 | Catalog key | Table name / catalog key (`[model.<key>]`), for example `zai:glm-special` or `my-ollama`. Letters, digits, `:`, `.`, `-`, and `_` only; no spaces or newlines. |
 | Model id | Wire model id sent to the API. |
 | Name | Optional display name in the picker. |
-| Provider | `(inherit)` (empty) or `zai`, `runinfra`, `gemini`, `wafer`, `kimi`, `fireworks`, `deepseek`, `meta`, `xai`, `opencode_go`. |
-| Base URL | Optional OpenAI-compatible endpoint. Leave blank for Z AI, RunInfra, Google Gemini, or Wafer to use that provider's default endpoint. |
+| Provider | `(inherit)` (empty) or `zai`, `runinfra`, `gemini`, `wafer`, `kimi`, `fireworks`, `deepseek`, `meta`, `xai`, `opencode_go`, `openrouter`. |
+| Base URL | Optional OpenAI-compatible endpoint. Leave blank for Z AI, RunInfra, Google Gemini, Wafer, or OpenRouter to use that provider's default endpoint. |
 | Context window | Token window used for auto-compaction (`1000`–`4000000`; default `200000`). |
 | API backend | `chat_completions` (default), `responses`, or `messages`. |
 | Env key | Environment variable that holds the API key. Prefer this over putting a key in the file. |

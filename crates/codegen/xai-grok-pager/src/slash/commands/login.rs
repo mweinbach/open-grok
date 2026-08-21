@@ -19,6 +19,7 @@ pub(crate) fn provider_items(
     zai_status: Option<crate::settings::SecretStatus>,
     runinfra_status: Option<crate::settings::SecretStatus>,
     gemini_status: Option<crate::settings::SecretStatus>,
+    openrouter_status: Option<crate::settings::SecretStatus>,
 ) -> Vec<ArgItem> {
     let api_key_description = |status: Option<crate::settings::SecretStatus>| match status {
         Some(status) => format!("API key · {}", status.display()),
@@ -33,6 +34,7 @@ pub(crate) fn provider_items(
     let zai_description = api_key_description(zai_status);
     let runinfra_description = api_key_description(runinfra_status);
     let gemini_description = api_key_description(gemini_status);
+    let openrouter_description = api_key_description(openrouter_status);
     vec![
         ArgItem {
             display: "xAI Grok".to_owned(),
@@ -104,6 +106,12 @@ pub(crate) fn provider_items(
             insert_text: "gemini".to_owned(),
             description: gemini_description,
         },
+        ArgItem {
+            display: "OpenRouter".to_owned(),
+            match_text: "openrouter open router api key dynamic models catalog".to_owned(),
+            insert_text: "openrouter".to_owned(),
+            description: openrouter_description,
+        },
     ]
 }
 
@@ -126,8 +134,9 @@ pub(crate) fn provider_action(args: &str) -> Result<Action, String> {
         "gemini" | "google" | "ai-studio" | "aistudio" | "google-gemini" => {
             Ok(Action::OpenGeminiApiKeyEditor)
         }
+        "openrouter" | "open-router" | "open_router" => Ok(Action::OpenOpenRouterApiKeyEditor),
         _ => Err(format!(
-            "Unknown provider: {}. Use /login xai, /login codex, /login kimi, /login fireworks, /login deepseek, /login meta, /login wafer, /login zai, /login runinfra, /login gemini, or /login opencode-go",
+            "Unknown provider: {}. Use /login xai, /login codex, /login kimi, /login fireworks, /login deepseek, /login meta, /login wafer, /login zai, /login runinfra, /login gemini, /login opencode-go, or /login openrouter",
             args.trim()
         )),
     }
@@ -139,11 +148,11 @@ impl SlashCommand for LoginCommand {
     }
 
     fn description(&self) -> &str {
-        "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, RunInfra, Google Gemini, or OpenCode Go"
+        "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, RunInfra, Google Gemini, OpenCode Go, or OpenRouter"
     }
 
     fn usage(&self) -> &str {
-        "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|zai|runinfra|gemini|opencode-go]"
+        "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|zai|runinfra|gemini|opencode-go|openrouter]"
     }
 
     fn takes_args(&self) -> bool {
@@ -156,7 +165,7 @@ impl SlashCommand for LoginCommand {
 
     fn suggest_args(&self, _ctx: &AppCtx, _args_query: &str) -> Option<Vec<ArgItem>> {
         Some(provider_items(
-            None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
         ))
     }
 

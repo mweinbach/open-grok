@@ -36,6 +36,7 @@ Codex provider does not override an explicit model API key.
 | RunInfra | Chat | none | client function tools | no | standard only | provider API key | denied |
 | Google Gemini | Chat | none | client function tools | no | standard only | provider API key | denied |
 | OpenCode Go | Chat, Messages | none | client function tools | no | standard only | provider API key | denied |
+| OpenRouter | Chat | none | client function tools | no | standard only | provider API key | denied |
 
 The sampler's built-in `ProviderAdapter` registry applies the transport policy
 for each profile. The xAI adapter owns xAI request metadata and doom-loop
@@ -65,6 +66,11 @@ OpenAI storage and prompt-cache fields, and intersects Meta's live `/models`
 response with the three curated Muse Spark entries.
 OpenCode Go selects Chat Completions or Messages per model from canonical
 metadata rather than from provider identity alone.
+OpenRouter is a plain OpenAI-compatible Chat Completions gateway at
+`https://openrouter.ai/api/v1`: it uses provider-local API-key auth, discovers
+models from `GET /models`, and exposes only explicitly enabled entries in the
+normal model picker. It has no native hosted web-search capability and never
+inherits xAI request metadata, credentials, or exports.
 Wafer AI is a plain OpenAI-compatible Chat Completions provider at
 `https://pass.wafer.ai/v1`: it uses provider-local API-key auth, discovers
 models from `GET /v1/models`, and exposes only standard client function tools.

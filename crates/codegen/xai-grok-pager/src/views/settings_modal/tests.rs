@@ -1042,7 +1042,9 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "runinfra_api_key",
             // Google Gemini isolated credential.
             "gemini_api_key",
+            "openrouter_api_key",
             "opencode_go_models",
+            "openrouter_models",
             "custom_models",
             "toolset.perplexity_web_search.enabled",
             "perplexity_api_key",
@@ -1053,6 +1055,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "toolset.web_search_source.fireworks",
             "toolset.web_search_source.deepseek",
             "toolset.web_search_source.opencode_go",
+            "toolset.web_search_source.openrouter",
             "toolset.x_search.enabled",
             // Auxiliary model selectors persist IDs while rendering names.
             "recap_model",

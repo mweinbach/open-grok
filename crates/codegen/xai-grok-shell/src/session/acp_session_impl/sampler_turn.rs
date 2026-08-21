@@ -1634,6 +1634,13 @@ impl SessionActor {
                     );
                     false
                 }
+                xai_grok_sampling_types::ModelProvider::OpenRouter => {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        "OpenRouter API-key authentication cannot be refreshed; surfacing 401",
+                    );
+                    false
+                }
             };
         debug_assert!(
             !(auth_recovery_eligible && auth_provider.is_some()),

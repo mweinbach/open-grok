@@ -326,6 +326,7 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -342,6 +343,7 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs_and_wafer(
     zai_catalog: Option<&crate::zai_models::ZaiModelsCatalog>,
     runinfra_catalog: Option<&crate::runinfra_models::RuninfraModelsCatalog>,
     gemini_catalog: Option<&crate::gemini_models::GeminiModelsCatalog>,
+    openrouter_catalog: Option<&crate::openrouter_models::OpenRouterModelsCatalog>,
 ) -> IndexMap<String, ModelEntry> {
     resolve_model_catalog_with_live_provider_entries(
         cfg,
@@ -356,6 +358,7 @@ pub(crate) fn resolve_model_catalog_with_provider_catalogs_and_wafer(
         zai_catalog.map(crate::zai_models::ZaiModelsCatalog::entries),
         runinfra_catalog.map(crate::runinfra_models::RuninfraModelsCatalog::entries),
         gemini_catalog.map(crate::gemini_models::GeminiModelsCatalog::entries),
+        openrouter_catalog,
     )
 }
 
@@ -375,6 +378,7 @@ fn resolve_model_catalog_with_live_provider_entries(
     zai_entries: Option<IndexMap<String, ModelEntry>>,
     runinfra_entries: Option<IndexMap<String, ModelEntry>>,
     gemini_entries: Option<IndexMap<String, ModelEntry>>,
+    openrouter_catalog: Option<&crate::openrouter_models::OpenRouterModelsCatalog>,
 ) -> IndexMap<String, ModelEntry> {
     let codex_entries = codex_catalog.map(CodexModelsCatalog::entries);
     let codex_authoritative = codex_catalog.is_some_and(CodexModelsCatalog::is_authoritative);
@@ -436,9 +440,16 @@ fn resolve_model_catalog_with_live_provider_entries(
         catalog.extend(gemini_entries);
     }
 
-    // Live Wafer/Z AI/RunInfra/Gemini catalogs replace that provider's partition.
-    // Re-apply `[model.*]` so user custom/override entries win after the
-    // replace.
+    if let Some(openrouter_catalog) = openrouter_catalog {
+        catalog.retain(|_, entry| {
+            entry.info.provider != xai_grok_sampling_types::ModelProvider::OpenRouter
+        });
+        catalog.extend(openrouter_catalog.entries());
+    }
+
+    // Live Wafer/Z AI/RunInfra/Gemini/OpenRouter catalogs replace that
+    // provider's partition. Re-apply `[model.*]` so user custom/override
+    // entries win after the replace.
     apply_config_model_overrides(cfg, &mut catalog);
 
     let enabled_open_code_go = cfg
@@ -451,6 +462,18 @@ fn resolve_model_catalog_with_live_provider_entries(
         entry.info.provider != xai_grok_sampling_types::ModelProvider::OpenCodeGo
             || enabled_open_code_go.contains(key.as_str())
             || enabled_open_code_go.contains(entry.info.model.as_str())
+    });
+
+    let enabled_openrouter = cfg
+        .models
+        .openrouter_enabled_models
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    catalog.retain(|key, entry| {
+        entry.info.provider != xai_grok_sampling_types::ModelProvider::OpenRouter
+            || enabled_openrouter.contains(key.as_str())
+            || enabled_openrouter.contains(entry.info.model.as_str())
     });
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {
@@ -609,6 +632,7 @@ pub(crate) fn resolve_model_catalog_with_live_wafer_and_zai_entries(
         zai_entries,
         None,
         None,
+        None,
     )
 }
 
@@ -630,6 +654,7 @@ pub(crate) fn resolve_model_catalog_with_live_runinfra_entries(
         None,
         None,
         runinfra_entries,
+        None,
         None,
     )
 }
@@ -653,6 +678,7 @@ pub(crate) fn resolve_model_catalog_with_live_gemini_entries(
         None,
         None,
         gemini_entries,
+        None,
     )
 }
 

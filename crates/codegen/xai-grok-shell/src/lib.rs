@@ -29,6 +29,7 @@ pub mod kimi_models;
 pub mod meta_models;
 pub(crate) mod model_image_input;
 pub mod opencode_go_models;
+pub mod openrouter_models;
 pub mod runinfra_models;
 pub mod wafer_models;
 pub mod zai_models;

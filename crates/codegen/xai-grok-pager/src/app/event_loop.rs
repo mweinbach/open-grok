@@ -245,7 +245,8 @@ fn startup_codex_freshness_required(
             | PrimaryProvider::Wafer
             | PrimaryProvider::Zai
             | PrimaryProvider::Runinfra
-            | PrimaryProvider::Gemini => false,
+            | PrimaryProvider::Gemini
+            | PrimaryProvider::OpenRouter => false,
         },
     }
 }
@@ -274,7 +275,8 @@ fn plan_startup_auth(
             | PrimaryProvider::Wafer
             | PrimaryProvider::Zai
             | PrimaryProvider::Runinfra
-            | PrimaryProvider::Gemini => StartupAuthPlan::Ready,
+            | PrimaryProvider::Gemini
+            | PrimaryProvider::OpenRouter => StartupAuthPlan::Ready,
         };
     }
     match selected_provider {
@@ -290,7 +292,8 @@ fn plan_startup_auth(
         | PrimaryProvider::Wafer
         | PrimaryProvider::Zai
         | PrimaryProvider::Runinfra
-        | PrimaryProvider::Gemini => StartupAuthPlan::Ready,
+        | PrimaryProvider::Gemini
+        | PrimaryProvider::OpenRouter => StartupAuthPlan::Ready,
     }
 }
 

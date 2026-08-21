@@ -2546,6 +2546,9 @@ fn live_provider_entry(
         xai_grok_sampling_types::ModelProvider::Wafer => crate::wafer_models::api_base_url(),
         xai_grok_sampling_types::ModelProvider::Runinfra => crate::runinfra_models::api_base_url(),
         xai_grok_sampling_types::ModelProvider::Gemini => crate::gemini_models::api_base_url(),
+        xai_grok_sampling_types::ModelProvider::OpenRouter => {
+            crate::openrouter_models::api_base_url()
+        }
         _ => entry.info.base_url,
     };
     (key.to_owned(), entry)

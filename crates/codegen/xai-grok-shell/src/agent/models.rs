@@ -22,6 +22,9 @@ use crate::meta_models::{MetaModelsCatalog, MetaModelsClient};
 use crate::opencode_go_models::{
     OpenCodeGoModelDescriptor, OpenCodeGoModelsCatalog, OpenCodeGoModelsClient,
 };
+use crate::openrouter_models::{
+    OpenRouterModelDescriptor, OpenRouterModelsCatalog, OpenRouterModelsClient,
+};
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::runinfra_models::{RuninfraModelsCatalog, RuninfraModelsClient};
 use crate::sampling::SamplerConfig as SamplingConfig;
@@ -135,6 +138,7 @@ fn task_model_credential_error(requested: &str, entry: &ModelEntry) -> Option<St
             | ModelProvider::DeepSeek
             | ModelProvider::Meta
             | ModelProvider::OpenCodeGo
+            | ModelProvider::OpenRouter
             | ModelProvider::Wafer
             | ModelProvider::Zai
             | ModelProvider::Runinfra
@@ -205,6 +209,7 @@ struct Inner {
     /// Provider-isolated Meta catalog queried only with the Meta credential.
     meta_catalog: RwLock<Option<MetaModelsCatalog>>,
     opencode_go_catalog: RwLock<Option<OpenCodeGoModelsCatalog>>,
+    openrouter_catalog: RwLock<Option<OpenRouterModelsCatalog>>,
     wafer_catalog: RwLock<Option<WaferModelsCatalog>>,
     /// Provider-isolated direct Z AI catalog queried only with the Z AI
     /// credential. Populated from `/models` when available, else a curated
@@ -232,6 +237,7 @@ struct Inner {
     deepseek_client: DeepSeekModelsClient,
     meta_client: MetaModelsClient,
     opencode_go_client: OpenCodeGoModelsClient,
+    openrouter_client: OpenRouterModelsClient,
     wafer_client: WaferModelsClient,
     zai_client: ZaiModelsClient,
     runinfra_client: RuninfraModelsClient,
@@ -245,6 +251,7 @@ struct Inner {
     deepseek_refresh_lock: tokio::sync::Mutex<()>,
     meta_refresh_lock: tokio::sync::Mutex<()>,
     opencode_go_refresh_lock: tokio::sync::Mutex<()>,
+    openrouter_refresh_lock: tokio::sync::Mutex<()>,
     wafer_refresh_lock: tokio::sync::Mutex<()>,
     zai_refresh_lock: tokio::sync::Mutex<()>,
     runinfra_refresh_lock: tokio::sync::Mutex<()>,
@@ -261,6 +268,7 @@ struct Inner {
     deepseek_catalog_generation: AtomicU64,
     meta_catalog_generation: AtomicU64,
     opencode_go_catalog_generation: AtomicU64,
+    openrouter_catalog_generation: AtomicU64,
     wafer_catalog_generation: AtomicU64,
     zai_catalog_generation: AtomicU64,
     runinfra_catalog_generation: AtomicU64,
@@ -466,6 +474,7 @@ impl ModelsManager {
                 deepseek_catalog: RwLock::new(None),
                 meta_catalog: RwLock::new(None),
                 opencode_go_catalog: RwLock::new(None),
+                openrouter_catalog: RwLock::new(None),
                 wafer_catalog: RwLock::new(None),
                 zai_catalog: RwLock::new(None),
                 runinfra_catalog: RwLock::new(None),
@@ -484,6 +493,7 @@ impl ModelsManager {
                 deepseek_client: DeepSeekModelsClient::new(),
                 meta_client: MetaModelsClient::new(),
                 opencode_go_client: OpenCodeGoModelsClient::new(),
+                openrouter_client: OpenRouterModelsClient::new(),
                 wafer_client: WaferModelsClient::new(),
                 zai_client: ZaiModelsClient::new(),
                 runinfra_client: RuninfraModelsClient::new(),
@@ -494,6 +504,7 @@ impl ModelsManager {
                 deepseek_refresh_lock: tokio::sync::Mutex::new(()),
                 meta_refresh_lock: tokio::sync::Mutex::new(()),
                 opencode_go_refresh_lock: tokio::sync::Mutex::new(()),
+                openrouter_refresh_lock: tokio::sync::Mutex::new(()),
                 wafer_refresh_lock: tokio::sync::Mutex::new(()),
                 zai_refresh_lock: tokio::sync::Mutex::new(()),
                 runinfra_refresh_lock: tokio::sync::Mutex::new(()),
@@ -504,6 +515,7 @@ impl ModelsManager {
                 deepseek_catalog_generation: AtomicU64::new(0),
                 meta_catalog_generation: AtomicU64::new(0),
                 opencode_go_catalog_generation: AtomicU64::new(0),
+                openrouter_catalog_generation: AtomicU64::new(0),
                 wafer_catalog_generation: AtomicU64::new(0),
                 zai_catalog_generation: AtomicU64::new(0),
                 runinfra_catalog_generation: AtomicU64::new(0),
@@ -582,6 +594,7 @@ impl ModelsManager {
             None,
             None,
             None,
+            None,
         );
 
         // Validate only against a real catalog; a bundled-only first run defers
@@ -637,6 +650,7 @@ impl ModelsManager {
         self.start_deepseek_models_query();
         self.start_meta_models_query();
         self.start_opencode_go_models_query();
+        self.start_openrouter_models_query();
         self.start_wafer_models_query();
         self.start_zai_models_query();
         self.start_runinfra_models_query();
@@ -1093,6 +1107,83 @@ impl ModelsManager {
         }
     }
 
+    fn start_openrouter_models_query(&self) {
+        if !self.inner.openrouter_client.has_usable_api_key() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("OpenRouter model query deferred: no Tokio runtime");
+            return;
+        };
+        let manager = self.clone();
+        runtime.spawn(async move {
+            if let Err(error) = manager.refresh_openrouter_models().await {
+                tracing::warn!(%error, "OpenRouter model query failed; keeping current models");
+            }
+        });
+    }
+
+    /// Query OpenRouter's catalog and publish only the explicitly enabled
+    /// models. The unfiltered descriptors remain available to Settings.
+    pub(crate) async fn refresh_openrouter_models(&self) -> anyhow::Result<bool> {
+        let _refresh_guard = self.inner.openrouter_refresh_lock.lock().await;
+        let generation = self
+            .inner
+            .openrouter_catalog_generation
+            .load(Ordering::Acquire);
+        let client = self.inner.openrouter_client.clone();
+        let Some(refreshed) = client.query().await? else {
+            tracing::debug!("OpenRouter model query skipped: no API key");
+            return Ok(false);
+        };
+        if generation
+            != self
+                .inner
+                .openrouter_catalog_generation
+                .load(Ordering::Acquire)
+            || !client.catalog_matches_current_credential(&refreshed)
+        {
+            tracing::debug!(
+                "discarded OpenRouter model query completed after catalog clear or credential change"
+            );
+            return Ok(false);
+        }
+        for warning in refreshed.warnings() {
+            tracing::warn!(warning, "OpenRouter model omitted from catalog");
+        }
+        let count = refreshed.entries().len();
+        *self.inner.openrouter_catalog.write() = Some(refreshed);
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.catalog.read().prefetched.clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        tracing::info!(count, "OpenRouter model catalog refreshed");
+        Ok(true)
+    }
+
+    pub(crate) fn clear_openrouter_models(&self) -> bool {
+        self.inner
+            .openrouter_catalog_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let had_catalog = self.inner.openrouter_catalog.write().take().is_some();
+        let cfg = self.inner.cfg.read().clone();
+        let prefetched = self.inner.catalog.read().prefetched.clone();
+        self.rebuild(&cfg, prefetched);
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        had_catalog
+    }
+
+    pub(crate) async fn apply_openrouter_credential_change(&self) -> anyhow::Result<bool> {
+        if self.inner.openrouter_client.has_usable_api_key() {
+            self.refresh_openrouter_models().await
+        } else {
+            self.clear_openrouter_models();
+            Ok(false)
+        }
+    }
+
     fn start_wafer_models_query(&self) {
         if !self.inner.wafer_client.has_usable_api_key() {
             return;
@@ -1431,6 +1522,32 @@ impl ModelsManager {
         self.apply_config(cfg);
     }
 
+    pub fn openrouter_models(&self) -> Vec<OpenRouterModelDescriptor> {
+        self.inner
+            .openrouter_catalog
+            .read()
+            .as_ref()
+            .map(OpenRouterModelsCatalog::descriptors)
+            .unwrap_or_default()
+    }
+
+    pub fn openrouter_enabled_models(&self) -> Vec<String> {
+        self.inner
+            .cfg
+            .read()
+            .models
+            .openrouter_enabled_models
+            .clone()
+    }
+
+    pub fn apply_openrouter_enabled_models(&self, mut enabled_models: Vec<String>) {
+        enabled_models.sort();
+        enabled_models.dedup();
+        let mut cfg = self.inner.cfg.read().clone();
+        cfg.models.openrouter_enabled_models = enabled_models;
+        self.apply_config(cfg);
+    }
+
     /// Apply a Kimi service selection to the resident model manager. The
     /// embedded partition is rebuilt synchronously, then both Platform and
     /// Code attempt a live `/models` refresh when a usable key is present.
@@ -1476,6 +1593,7 @@ impl ModelsManager {
             let runinfra_catalog = self.inner.runinfra_catalog.read();
             let gemini_catalog = self.inner.gemini_catalog.read();
             let opencode_go_catalog = self.inner.opencode_go_catalog.read();
+            let openrouter_catalog = self.inner.openrouter_catalog.read();
             resolve_model_catalog_with_provider_catalogs_and_wafer(
                 &new_config,
                 prefetched,
@@ -1493,6 +1611,7 @@ impl ModelsManager {
                 zai_catalog.as_ref(),
                 runinfra_catalog.as_ref(),
                 gemini_catalog.as_ref(),
+                openrouter_catalog.as_ref(),
             )
         };
         let has_real_catalog = self.inner.catalog.read().has_fetched_real_catalog;
@@ -1989,6 +2108,7 @@ impl ModelsManager {
             let runinfra_catalog = self.inner.runinfra_catalog.read();
             let gemini_catalog = self.inner.gemini_catalog.read();
             let opencode_go_catalog = self.inner.opencode_go_catalog.read();
+            let openrouter_catalog = self.inner.openrouter_catalog.read();
             resolve_model_catalog_with_provider_catalogs_and_wafer(
                 cfg,
                 prefetched,
@@ -2002,6 +2122,7 @@ impl ModelsManager {
                 zai_catalog.as_ref(),
                 runinfra_catalog.as_ref(),
                 gemini_catalog.as_ref(),
+                openrouter_catalog.as_ref(),
             )
         };
         self.inner.catalog.write().models = catalog;
@@ -2342,6 +2463,7 @@ impl ModelsManager {
         self.start_deepseek_models_query();
         self.start_meta_models_query();
         self.start_opencode_go_models_query();
+        self.start_openrouter_models_query();
         self.start_wafer_models_query();
         self.start_zai_models_query();
         self.start_runinfra_models_query();

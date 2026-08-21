@@ -905,6 +905,7 @@ mod tests {
         assert!(s.allowed_for_provider(ModelProvider::Runinfra));
         assert!(s.allowed_for_provider(ModelProvider::Gemini));
         assert!(s.allowed_for_provider(ModelProvider::OpenCodeGo));
+        assert!(s.allowed_for_provider(ModelProvider::OpenRouter));
         assert!(!s.native_hosted_web_search_suppressed(ModelProvider::Codex));
         assert!(s.native_hosted_web_search_suppressed(ModelProvider::DeepSeek));
     }
@@ -931,6 +932,7 @@ mod tests {
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
             ModelProvider::OpenCodeGo,
+            ModelProvider::OpenRouter,
         ] {
             assert!(!s.allowed_for_provider(provider), "{provider:?}");
         }

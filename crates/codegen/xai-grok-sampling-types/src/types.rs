@@ -1149,6 +1149,11 @@ pub enum ModelProvider {
         alias = "gemini_api"
     )]
     Gemini,
+    /// OpenRouter's OpenAI-compatible Chat Completions gateway
+    /// (`https://openrouter.ai/api/v1`). Models are opt-in from the live
+    /// catalog, matching OpenCode Go.
+    #[serde(alias = "open_router", alias = "open-router")]
+    OpenRouter,
 }
 
 /// Provider-specific wire contract used by the Responses API.
@@ -1507,6 +1512,25 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
+    /// OpenRouter's OpenAI-compatible Chat Completions gateway. Models are
+    /// discovered live and enabled explicitly; the transport is Chat-only
+    /// with client function tools. No hosted tools, native web search, or
+    /// OAuth.
+    pub const OPENROUTER: Self = Self {
+        provider: ModelProvider::OpenRouter,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: None,
+            messages: false,
+        },
+        code_mode_transport: CodeModeTransport::Unsupported,
+        hosted_tool_dialect: None,
+        native_web_search: false,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
     pub const fn id(self) -> &'static str {
         self.provider.as_str()
     }
@@ -1559,6 +1583,10 @@ impl ProviderProfile {
         self.provider.is_gemini()
     }
 
+    pub const fn is_open_router(self) -> bool {
+        self.provider.is_open_router()
+    }
+
     pub const fn allows_xai_services(self) -> bool {
         self.xai_services.allows()
     }
@@ -1591,6 +1619,7 @@ impl ModelProvider {
             Self::Zai => "zai",
             Self::Runinfra => "runinfra",
             Self::Gemini => "gemini",
+            Self::OpenRouter => "openrouter",
         }
     }
 
@@ -1608,6 +1637,7 @@ impl ModelProvider {
             Self::Zai => "Z AI",
             Self::Runinfra => "RunInfra",
             Self::Gemini => "Google Gemini",
+            Self::OpenRouter => "OpenRouter",
         }
     }
 
@@ -1666,6 +1696,10 @@ impl ModelProvider {
         matches!(self, Self::Gemini)
     }
 
+    pub const fn is_open_router(self) -> bool {
+        matches!(self, Self::OpenRouter)
+    }
+
     /// Return the built-in provider's complete behavior policy.
     pub const fn profile(self) -> ProviderProfile {
         match self {
@@ -1680,6 +1714,7 @@ impl ModelProvider {
             Self::Zai => ProviderProfile::ZAI,
             Self::Runinfra => ProviderProfile::RUNINFRA,
             Self::Gemini => ProviderProfile::GEMINI,
+            Self::OpenRouter => ProviderProfile::OPENROUTER,
         }
     }
 }
@@ -2102,6 +2137,22 @@ mod tests {
                 session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
                 xai_services: XaiServicePolicy::Denied,
             },
+            Case {
+                provider: ModelProvider::OpenRouter,
+                id: "openrouter",
+                name: "OpenRouter",
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: None,
+                    messages: false,
+                },
+                code_mode_transport: CodeModeTransport::Unsupported,
+                hosted_tools: None,
+                native_web_search: false,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+                xai_services: XaiServicePolicy::Denied,
+            },
         ];
 
         for case in cases {
@@ -2127,6 +2178,7 @@ mod tests {
             assert_eq!(profile.is_zai(), case.provider.is_zai());
             assert_eq!(profile.is_runinfra(), case.provider.is_runinfra());
             assert_eq!(profile.is_gemini(), case.provider.is_gemini());
+            assert_eq!(profile.is_open_router(), case.provider.is_open_router());
             assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
             for backend in [
                 ApiBackend::ChatCompletions,

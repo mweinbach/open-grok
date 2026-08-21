@@ -46,8 +46,8 @@ fn bare_login_opens_provider_picker_without_starting_auth() {
         panic!("bare /login should open the provider ArgPicker");
     };
     assert_eq!(command, "login");
-    assert_eq!(items.len(), 9);
-    assert_eq!(original_items.len(), 9);
+    assert_eq!(items.len(), 12);
+    assert_eq!(original_items.len(), 12);
     assert_eq!(
         items
             .iter()
@@ -63,6 +63,9 @@ fn bare_login_opens_provider_picker_without_starting_auth() {
             "opencode-go",
             "wafer",
             "zai",
+            "runinfra",
+            "gemini",
+            "openrouter",
         ]
     );
 }
@@ -99,6 +102,9 @@ fn dashboard_bare_login_opens_inline_provider_picker_without_starting_auth() {
             "opencode-go",
             "wafer",
             "zai",
+            "runinfra",
+            "gemini",
+            "openrouter",
         ]
     );
 }
