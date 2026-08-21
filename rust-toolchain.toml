@@ -10,9 +10,10 @@
 # ```
 channel = "1.94.0"
 components = ["rustfmt", "clippy"]
-profile = "default" # this will override global preferred profile if such is set
-targets = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-] # host target will be added automatically
-# force CI
+# minimal = rustc + std + cargo. rustfmt/clippy still come from `components`.
+# `default` also pulls rust-docs, which CI release jobs never use.
+# Do not list extra rustup targets here: GitHub release jobs are native, and
+# extra targets force every CI rustup (including macOS/Windows) to download
+# unused Linux stds. Host std is added automatically. Cross-compile with
+# `rustup target add`.
+profile = "minimal"

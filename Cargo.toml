@@ -368,22 +368,29 @@ zstd = "0.13"
 [profile.release]
 incremental = true
 panic = "abort"
+# Skip even thin-local LTO. Local `cargo build --release` is for iteration;
+# shipped binaries use release-dist.
+lto = "off"
 
 # Hardened release profile for shipping to end users (alpha + stable).
 # Use `cargo build --profile release-dist` for distribution builds.
 # Not used by default `--release` to avoid slowing down local dev builds (~2.2x).
 #
-# Hardening: thin LTO for cross-crate optimization with reasonable link times,
-# codegen-units=1 maximizes optimization (whole-program analysis, no CGU boundaries).
-# debug=1 emits line-tables DWARF; strip=false keeps symbols so CI can extract
-# .debug sidecars (Linux) or .dSYM bundles (macOS) before stripping post-build.
+# Hardening: thin LTO for cross-crate inlining without fat-LTO's single-module
+# link. codegen-units=16 is Cargo's default release split so ThinLTO can use
+# all cores on GitHub's 4-vCPU runners (codegen-units=1 serialized the macOS
+# link). debug=0: CI already overrides this, and the release scripts strip the
+# staged binary, so embedding DWARF only inflates link time. incremental=false:
+# incremental + LTO fights itself on cold dist links. strip=false leaves
+# post-build strip + macOS codesign in the release scripts.
 # Linker flags (RELRO, NX stack) are set per-target in .cargo/config.toml.
 [profile.release-dist]
 inherits = "release"
 lto = "thin"
-codegen-units = 1
+codegen-units = 16
+incremental = false
 strip = false
-debug = 1
+debug = 0
 split-debuginfo = "off"
 
 # Production profile for latency-sensitive x-product services (VF, home-mixer).
