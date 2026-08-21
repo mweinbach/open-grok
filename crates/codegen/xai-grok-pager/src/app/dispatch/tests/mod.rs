@@ -586,10 +586,7 @@ impl Drop for PlantedBuildSession {
 
 /// Plant a Build session under the process `grok_home()`. Caller must keep the
 /// returned [`PlantedBuildSession`] alive for the duration of the assertions.
-fn plant_local_build_session(
-    cwd: &std::path::Path,
-    session_id: &str,
-) -> PlantedBuildSession {
+fn plant_local_build_session(cwd: &std::path::Path, session_id: &str) -> PlantedBuildSession {
     let home = xai_grok_shell::util::grok_home::grok_home();
     let encoded = xai_grok_shell::util::grok_home::encode_cwd_dirname(&cwd.to_string_lossy());
     let cwd_dir = home.join("sessions").join(encoded);

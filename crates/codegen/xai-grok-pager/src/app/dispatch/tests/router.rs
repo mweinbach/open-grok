@@ -1698,10 +1698,7 @@ fn chat_mode_allows_conversation_entry_even_if_local_path() {
 fn planted_session_guard_cleans_leaf_and_empty_parent_only() {
     use xai_grok_shell::util::grok_home::{encode_cwd_dirname, grok_home};
 
-    let cwd = PathBuf::from(format!(
-        "/tmp/planted-guard-sweep-{}",
-        std::process::id()
-    ));
+    let cwd = PathBuf::from(format!("/tmp/planted-guard-sweep-{}", std::process::id()));
     let sessions_root = grok_home().join("sessions");
     let cwd_dir = sessions_root.join(encode_cwd_dirname(&cwd.to_string_lossy()));
 

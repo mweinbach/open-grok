@@ -181,13 +181,9 @@ pub(super) fn sweep_stale_leases(grok_home: &Path) -> usize {
         if !stale_long_enough {
             continue;
         }
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            else {
-                continue;
-            };
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+            continue;
+        };
         match file.try_lock_exclusive() {
             // Unlink while still holding the lease: a racing `acquire` that
             // opened the same inode fails closed with `LeaseBusy` instead of
