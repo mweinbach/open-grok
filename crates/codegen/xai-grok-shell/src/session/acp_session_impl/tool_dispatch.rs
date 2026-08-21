@@ -33,6 +33,59 @@ pub(super) async fn dispatch_tool(
         .await
 }
 
+/// Nested-Code-Mode variant of [`dispatch_tool`] that also forwards the
+/// dispatch stream's progress items into `progress` as observation-only
+/// chunks. The terminal result is identical to [`dispatch_tool`]; progress
+/// never touches model history or ACP updates.
+pub(super) async fn dispatch_code_mode_nested_tool_streaming(
+    workspace_ops: &xai_grok_workspace::WorkspaceOps,
+    prepared: &PreparedToolCall,
+    session_id: &str,
+    progress: &xai_grok_code_mode_protocol::NestedToolProgressSink,
+) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+    let streaming = match workspace_ops {
+        xai_grok_workspace::WorkspaceOps::Local { handle } => {
+            handle.session(session_id).map(|session| session.toolset())
+        }
+        xai_grok_workspace::WorkspaceOps::Proxy { .. } => None,
+    };
+    let Some(toolset) = streaming else {
+        // Proxy workspaces have no client-side progress stream to observe.
+        return dispatch_tool(workspace_ops, prepared, session_id).await;
+    };
+    tracing::debug!(
+        tool = %prepared.tool_name,
+        call_id = %prepared.tool_call_id.0,
+        session = %session_id,
+        mode = "local_streaming",
+        "dispatch_code_mode_nested_tool_streaming"
+    );
+    use futures::StreamExt;
+    let mut stream = toolset.call_streaming_with_cancellation(
+        &prepared.tool_name,
+        prepared.parsed_args.clone(),
+        &prepared.tool_call_id.0,
+        /*cwd_override*/ None,
+        /*cancellation*/ None,
+    );
+    while let Some(item) = stream.next().await {
+        match item {
+            xai_tool_runtime::ToolStreamItem::Progress(progress_item) => {
+                progress.push(
+                    crate::session::code_mode::nested_tool_progress_from_tool_progress(
+                        progress_item,
+                    ),
+                );
+            }
+            xai_tool_runtime::ToolStreamItem::Terminal(result) => return result,
+        }
+    }
+    Err(xai_tool_runtime::ToolError::custom(
+        "stream_no_terminal",
+        "dispatch stream ended without a terminal item",
+    ))
+}
+
 /// First string-valued argument among `keys`, in priority order.
 fn str_arg<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|k| args.get(*k)?.as_str())
@@ -439,6 +492,43 @@ pub(super) fn build_tool_parse_error_message(
 mod tests {
     use super::*;
     use xai_grok_sampling_types::rs;
+
+    fn nested_prepared_call() -> PreparedToolCall {
+        PreparedToolCall {
+            call_id: "model-call-1".to_string(),
+            tool_call_id: acp::ToolCallId::from("acp-call-1"),
+            tool_name: "read_file".to_string(),
+            raw_arguments: "{}".to_string(),
+            parsed_args: serde_json::json!({}),
+            model_id: String::new(),
+            concatenated_json_count: 0,
+            dispatch_target_name: None,
+            is_read_only: true,
+        }
+    }
+
+    /// A local workspace without a bound session has no stream to observe:
+    /// the streaming wrapper must fall back to plain `dispatch_tool` and
+    /// surface its error instead of inventing progress or panicking.
+    #[tokio::test]
+    async fn nested_streaming_dispatch_falls_back_without_a_bound_session() {
+        let workspace_ops = xai_grok_workspace::WorkspaceOps::for_test();
+        let (progress_sink, _progress_rx) =
+            xai_grok_code_mode_protocol::nested_tool_progress_channel();
+        let error = dispatch_code_mode_nested_tool_streaming(
+            &workspace_ops,
+            &nested_prepared_call(),
+            "no-such-session",
+            &progress_sink,
+        )
+        .await
+        .expect_err("unbound session must fail dispatch");
+        assert!(
+            error.to_string().contains("session not found"),
+            "fallback must surface the underlying dispatch error: {error}"
+        );
+        assert!(!progress_sink.is_closed());
+    }
 
     fn web_search_payload(status: rs::WebSearchToolCallStatus) -> serde_json::Value {
         // The exact serialized `web_search_call` payload the sampler forwards on

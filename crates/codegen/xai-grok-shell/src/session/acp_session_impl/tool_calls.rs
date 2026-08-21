@@ -972,15 +972,17 @@ impl SessionActor {
     /// same parsing, plan-mode, hook, permission, auth-retry, and workspace
     /// path as a model-emitted function call. The result is returned to the
     /// JavaScript runtime and is deliberately not appended as a top-level
-    /// function-call output in the model conversation.
+    /// function-call output in the model conversation. Tool stream progress
+    /// items are forwarded through `progress` as observation-only chunks.
     pub(crate) async fn dispatch_code_mode_nested_tool(
         &self,
         invocation: xai_grok_code_mode_protocol::CodeModeNestedToolCall,
         cancellation_token: tokio_util::sync::CancellationToken,
+        progress: xai_grok_code_mode_protocol::NestedToolProgressSink,
     ) -> Result<serde_json::Value, String> {
         MODEL_TOOL_RESULT_SINK
             .scope(ModelToolResultSink::CodeMode, async move {
-                self.dispatch_code_mode_nested_tool_inner(invocation, cancellation_token)
+                self.dispatch_code_mode_nested_tool_inner(invocation, cancellation_token, progress)
                     .await
             })
             .await
@@ -1000,6 +1002,7 @@ impl SessionActor {
         &self,
         invocation: xai_grok_code_mode_protocol::CodeModeNestedToolCall,
         cancellation_token: tokio_util::sync::CancellationToken,
+        progress: xai_grok_code_mode_protocol::NestedToolProgressSink,
     ) -> Result<serde_json::Value, String> {
         use xai_grok_code_mode_protocol::{CodeModeToolKind, PUBLIC_TOOL_NAME, WAIT_TOOL_NAME};
 
@@ -1097,10 +1100,11 @@ impl SessionActor {
         self.signals_handle().record_tool_call(&prepared.tool_name);
         let tool_started_at = std::time::Instant::now();
         let dispatch = || {
-            dispatch_tool(
+            dispatch_code_mode_nested_tool_streaming(
                 &self.workspace_ops,
                 &prepared,
                 self.session_info.id.0.as_ref(),
+                &progress,
             )
         };
         let (result, was_cancelled) = tokio::select! {

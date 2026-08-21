@@ -19,11 +19,13 @@ use xai_grok_code_mode::InProcessCodeModeSessionProvider;
 use xai_grok_code_mode_protocol::{
     CellId, CodeModeNestedToolCall, CodeModeSession, CodeModeSessionDelegate,
     CodeModeSessionProvider, CodeModeToolKind, ExecuteRequest, FunctionCallOutputContentItem,
-    ImageDetail, NotificationFuture, RuntimeResponse, ToolDefinition as CodeModeToolDefinition,
-    ToolInvocationFuture, ToolName, WaitOutcome, WaitRequest,
+    ImageDetail, NestedToolProgress, NestedToolProgressSink, NotificationFuture, RuntimeResponse,
+    ToolDefinition as CodeModeToolDefinition, ToolInvocationFuture, ToolName, WaitOutcome,
+    WaitRequest,
 };
 use xai_grok_tools::types::definition::ToolDefinition as GrokToolDefinition;
 use xai_grok_tools::util::{ceil_char_boundary, truncate_str};
+use xai_tool_runtime::ToolProgress;
 
 use super::acp_session::SessionActor;
 use crate::sampling::rs::{CustomGrammarFormatParam, CustomToolParamFormat, GrammarSyntax};
@@ -150,6 +152,7 @@ enum DispatchMessage {
     InvokeTool {
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
         response_tx: oneshot::Sender<Result<serde_json::Value, String>>,
     },
     Notify {
@@ -424,14 +427,20 @@ impl CodeModeSessionDelegate for CodeModeRuntimeDelegate {
         &'a self,
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             let runtime = self
                 .runtime
                 .upgrade()
                 .ok_or_else(|| "code mode runtime owner is unavailable".to_string())?;
-            CodeModeSessionDelegate::invoke_tool(runtime.as_ref(), invocation, cancellation_token)
-                .await
+            CodeModeSessionDelegate::invoke_tool(
+                runtime.as_ref(),
+                invocation,
+                cancellation_token,
+                progress,
+            )
+            .await
         })
     }
 
@@ -636,6 +645,7 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
         &'a self,
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             if cancellation_token.is_cancelled() {
@@ -646,6 +656,7 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
                 .send(DispatchMessage::InvokeTool {
                     invocation,
                     cancellation_token: cancellation_token.clone(),
+                    progress,
                     response_tx,
                 })
                 .map_err(|_| "code mode nested tool dispatcher is unavailable".to_string())?;
@@ -719,6 +730,7 @@ async fn dispatch_message(
         DispatchMessage::InvokeTool {
             invocation,
             cancellation_token,
+            progress,
             response_tx,
         } => {
             let response = match wait_for_active_code_mode_turn(
@@ -733,6 +745,7 @@ async fn dispatch_message(
                     response = session_actor.dispatch_code_mode_nested_tool(
                         invocation,
                         cancellation_token.clone(),
+                        progress,
                     ) => response,
                     _ = cancellation_token.cancelled() => {
                         Err("code mode nested tool call cancelled".to_string())
@@ -899,6 +912,28 @@ pub(crate) fn collect_code_mode_tool_definitions(
     definitions.sort_by(|left, right| left.name.cmp(&right.name));
     definitions.dedup_by(|left, right| left.name == right.name);
     definitions
+}
+
+/// Projects a tool-layer progress item onto the nested-tool progress wire
+/// shape. Text keeps its natural form; content blocks and tool-defined custom
+/// payloads travel as the structured payload. Observation-only either way.
+pub(crate) fn nested_tool_progress_from_tool_progress(
+    progress: ToolProgress,
+) -> NestedToolProgress {
+    match progress {
+        ToolProgress::Text { text } => NestedToolProgress::text(text),
+        ToolProgress::Content { blocks } => match serde_json::to_value(blocks) {
+            Ok(blocks) => NestedToolProgress::with_payload(
+                String::new(),
+                serde_json::json!({"blocks": blocks}),
+            ),
+            Err(_) => NestedToolProgress::text(String::new()),
+        },
+        ToolProgress::Custom { subkind, payload } => NestedToolProgress::with_payload(
+            String::new(),
+            serde_json::json!({ "subkind": subkind, "payload": payload }),
+        ),
+    }
 }
 
 /// Creates the native Responses custom `exec` declaration.
@@ -1334,6 +1369,47 @@ mod tests {
         assert!(
             !runtime.known_cells.lock().contains(&cell_id),
             "a runtime close callback must make later wait calls fail locally"
+        );
+    }
+
+    #[test]
+    fn nested_tool_progress_mapping_preserves_text_chunks_verbatim() {
+        let mapped = nested_tool_progress_from_tool_progress(ToolProgress::Text {
+            text: "partial output".to_string(),
+        });
+        assert_eq!(mapped.text, "partial output");
+        assert_eq!(mapped.payload, None);
+    }
+
+    #[test]
+    fn nested_tool_progress_mapping_wraps_content_blocks_as_payload() {
+        let mapped = nested_tool_progress_from_tool_progress(ToolProgress::Content {
+            blocks: vec![xai_tool_runtime::ContentBlock::Text {
+                text: "block".to_string(),
+            }],
+        });
+        assert_eq!(mapped.text, String::new());
+        assert_eq!(
+            mapped.payload,
+            Some(serde_json::json!({
+                "blocks": [{ "type": "text", "text": "block" }]
+            }))
+        );
+    }
+
+    #[test]
+    fn nested_tool_progress_mapping_keeps_custom_subkind_and_payload() {
+        let mapped = nested_tool_progress_from_tool_progress(ToolProgress::Custom {
+            subkind: "bash_output_chunk".to_string(),
+            payload: serde_json::json!({ "delta": "out" }),
+        });
+        assert_eq!(mapped.text, String::new());
+        assert_eq!(
+            mapped.payload,
+            Some(serde_json::json!({
+                "subkind": "bash_output_chunk",
+                "payload": { "delta": "out" }
+            }))
         );
     }
 
