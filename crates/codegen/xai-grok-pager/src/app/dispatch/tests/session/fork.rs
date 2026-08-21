@@ -1275,7 +1275,7 @@ fn fork_session_ready_refuses_local_build_under_chat_mode() {
     app.chat_mode = true;
     let cwd = app.cwd.clone();
     let session_id = format!("fork-build-{}", std::process::id());
-    let sess_dir = plant_local_build_session(&cwd, &session_id);
+    let _planted = plant_local_build_session(&cwd, &session_id);
 
     let effects = dispatch(
         Action::TaskComplete(TaskResult::ForkSessionReady {
@@ -1286,7 +1286,6 @@ fn fork_session_ready_refuses_local_build_under_chat_mode() {
         }),
         &mut app,
     );
-    let _ = std::fs::remove_dir_all(&sess_dir);
     assert!(
         effects.is_empty(),
         "ForkSessionReady under --chat must refuse local Build, got {effects:?}"

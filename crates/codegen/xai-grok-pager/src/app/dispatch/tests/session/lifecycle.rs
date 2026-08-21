@@ -3273,7 +3273,7 @@ mod welcome_workspace_mode {
         app.active_view = ActiveView::Welcome;
         app.cwd = tmp.path().to_path_buf();
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
-        let sess_dir = super::super::super::plant_local_build_session(tmp.path(), "build-1");
+        let _planted = super::super::super::plant_local_build_session(tmp.path(), "build-1");
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
             id: "build-1".into(),
             summary: "local work".into(),
@@ -3320,7 +3320,6 @@ mod welcome_workspace_mode {
             WelcomeWorkspaceMode::LocalWorkspace,
             "Local UX is the workspace_mode indicator"
         );
-        let _ = std::fs::remove_dir_all(sess_dir);
         set_active_local_workspace(None).unwrap();
     }
     #[test]
@@ -3457,7 +3456,7 @@ mod welcome_workspace_mode {
         app.cwd = tmp.path().to_path_buf();
         app.local_workspace_startup_locked = true;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
-        let sess_dir = super::super::super::plant_local_build_session(tmp.path(), "build-lock");
+        let _planted = super::super::super::plant_local_build_session(tmp.path(), "build-lock");
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
             id: "build-lock".into(),
             summary: "local work".into(),
@@ -3494,7 +3493,6 @@ mod welcome_workspace_mode {
             )),
             "locked local-disk pick must still load: {effects:?}"
         );
-        let _ = std::fs::remove_dir_all(sess_dir);
         set_active_local_workspace(None).unwrap();
     }
     #[test]

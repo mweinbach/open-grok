@@ -141,6 +141,69 @@ pub(super) fn acquire(grok_home: &Path, session_id: &str) -> Result<RelocationLe
     })
 }
 
+/// Lease files younger than this are never swept. Holding a lease never
+/// touches the file mtime, so long-held leases are still rejected by
+/// `try_lock`; the age guard only narrows the create-before-flock window in
+/// [`acquire`].
+const LEASE_SWEEP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Best-effort removal of lease files left behind by completed relocations.
+///
+/// [`acquire`] creates `<session_id>.lock` and releases its `flock` on drop
+/// but intentionally never deletes the file, so every completed relocation
+/// leaves an empty lease file in the relocations directory forever. A lease
+/// file is removed only when it is older than [`LEASE_SWEEP_MIN_AGE`] **and**
+/// can be exclusively locked, which proves no relocation is active for that
+/// session. Journals are never touched; errors are swallowed because sweeping
+/// is hygiene, never a correctness step. Returns how many files were removed.
+pub(super) fn sweep_stale_leases(grok_home: &Path) -> usize {
+    let entries = match fs::read_dir(relocation_dir(grok_home)) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "lock") {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let stale_long_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= LEASE_SWEEP_MIN_AGE);
+        if !stale_long_enough {
+            continue;
+        }
+        let Ok(file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            else {
+                continue;
+            };
+        match file.try_lock_exclusive() {
+            // Unlink while still holding the lease: a racing `acquire` that
+            // opened the same inode fails closed with `LeaseBusy` instead of
+            // splitting the session's lease across two files.
+            Ok(()) => {
+                if fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+                let _ = FileExt::unlock(&file);
+            }
+            Err(_) => {} // actively held by a live relocation
+        }
+    }
+    removed
+}
+
 pub(super) fn read(grok_home: &Path, session_id: &str) -> Result<RelocationJournal> {
     validate_component("session id", session_id)?;
     let path = journal_path(grok_home, session_id);

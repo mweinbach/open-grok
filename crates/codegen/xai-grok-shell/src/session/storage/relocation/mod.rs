@@ -342,6 +342,10 @@ impl RelocationStorage {
             let (_, terminal) = self.recover(&lease)?;
             self.finalize_terminal(&lease, &terminal)?;
         }
+        let swept_leases = journal::sweep_stale_leases(&self.grok_home);
+        if swept_leases > 0 {
+            tracing::debug!(swept_leases, "swept stale relocation lease files");
+        }
         Ok(())
     }
 

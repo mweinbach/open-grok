@@ -1659,12 +1659,11 @@ fn chat_mode_refuses_local_build_disk_load() {
         std::process::id()
     ));
     let session_id = format!("build-disk-{}", std::process::id());
-    let sess_dir = plant_local_build_session(&cwd, &session_id);
+    let _planted = plant_local_build_session(&cwd, &session_id);
     let mut app = test_app();
     app.cwd = cwd;
     app.chat_mode = true;
     let effects = dispatch(Action::LoadSession(session_id, None, false), &mut app);
-    let _ = std::fs::remove_dir_all(&sess_dir);
     assert!(
         effects.is_empty(),
         "local Build under --chat must refuse, got {effects:?}"
@@ -1679,12 +1678,11 @@ fn chat_mode_refuses_local_build_disk_load() {
 fn chat_mode_allows_conversation_entry_even_if_local_path() {
     let cwd = PathBuf::from(format!("/tmp/chat-mode-conv-ok-{}", std::process::id()));
     let session_id = format!("conv-also-local-{}", std::process::id());
-    let sess_dir = plant_local_build_session(&cwd, &session_id);
+    let _planted = plant_local_build_session(&cwd, &session_id);
     let mut app = test_app();
     app.cwd = cwd;
     app.chat_mode = true;
     let effects = dispatch(Action::LoadSession(session_id, None, true), &mut app);
-    let _ = std::fs::remove_dir_all(&sess_dir);
     assert!(matches!(
         &effects[..],
         [Effect::LoadSession {
@@ -1692,6 +1690,39 @@ fn chat_mode_allows_conversation_entry_even_if_local_path() {
             ..
         }]
     ));
+}
+/// Dropping the planted-session guard removes the leaf dir and the
+/// cwd-encoded parent when empty — but never a parent holding sibling
+/// sessions (the real-`~/.opengrok` case).
+#[test]
+fn planted_session_guard_cleans_leaf_and_empty_parent_only() {
+    use xai_grok_shell::util::grok_home::{encode_cwd_dirname, grok_home};
+
+    let cwd = PathBuf::from(format!(
+        "/tmp/planted-guard-sweep-{}",
+        std::process::id()
+    ));
+    let sessions_root = grok_home().join("sessions");
+    let cwd_dir = sessions_root.join(encode_cwd_dirname(&cwd.to_string_lossy()));
+
+    // Empty-parent case: guard removes both leaf and parent.
+    {
+        let planted = plant_local_build_session(&cwd, "guard-gone");
+        assert!(planted.dir().join("summary.json").is_file());
+        assert!(cwd_dir.is_dir());
+    }
+    assert!(!cwd_dir.exists());
+
+    // Sibling case: guard removes only its own leaf.
+    let sibling = cwd_dir.join("sibling-build");
+    std::fs::create_dir_all(&sibling).unwrap();
+    {
+        let _planted = plant_local_build_session(&cwd, "guard-with-sibling");
+        assert!(cwd_dir.is_dir());
+    }
+    assert!(sibling.is_dir(), "sibling sessions must survive the guard");
+    assert!(!cwd_dir.join("guard-with-sibling").exists());
+    let _ = std::fs::remove_dir_all(&cwd_dir);
 }
 #[test]
 fn view_catalog_entry_emits_fetch_effect() {

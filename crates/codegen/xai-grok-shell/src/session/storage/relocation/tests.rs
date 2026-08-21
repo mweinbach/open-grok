@@ -35,6 +35,70 @@ fn journal_is_validated_commit_aware_and_externally_leased() {
 }
 
 #[test]
+fn lease_sweep_removes_only_stale_uncontended_lock_files() {
+    use std::fs::OpenOptions;
+    use std::time::{Duration, SystemTime};
+
+    use fs2::FileExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let relocations = super::journal::relocation_dir(temp.path());
+    fs::create_dir_all(&relocations).unwrap();
+    let old = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(120));
+
+    // Stale + uncontended → swept.
+    let stale = relocations.join("stale-session.lock");
+    fs::write(&stale, b"").unwrap();
+    filetime::set_file_mtime(&stale, old).unwrap();
+
+    // Freshly created → kept (age guard narrows the create-before-flock window).
+    let fresh = relocations.join("fresh-session.lock");
+    fs::write(&fresh, b"").unwrap();
+
+    // Stale but held → kept (contention guard proves an active relocation).
+    let held_path = relocations.join("held-session.lock");
+    fs::write(&held_path, b"").unwrap();
+    filetime::set_file_mtime(&held_path, old).unwrap();
+    let held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&held_path)
+        .unwrap();
+    held.try_lock_exclusive().unwrap();
+
+    // Journals are never touched by the sweep.
+    let journal = relocations.join("journalled-session.json");
+    fs::write(&journal, b"{}").unwrap();
+
+    assert_eq!(super::journal::sweep_stale_leases(temp.path()), 1);
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+    assert!(held_path.exists());
+    assert!(journal.exists());
+    drop(held);
+}
+
+#[test]
+fn recover_all_sweeps_stale_leases_but_keeps_fresh_ones() {
+    let temp = tempfile::tempdir().unwrap();
+    let relocations = super::journal::relocation_dir(temp.path());
+    fs::create_dir_all(&relocations).unwrap();
+    let stale = relocations.join("done-session.lock");
+    fs::write(&stale, b"").unwrap();
+    filetime::set_file_mtime(
+        &stale,
+        filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(120),
+        ),
+    )
+    .unwrap();
+    RelocationStorage::new(temp.path().into())
+        .recover_all()
+        .unwrap();
+    assert!(!stale.exists());
+}
+
+#[test]
 fn atomic_journal_write_distinguishes_rename_commit() {
     for (fault, is_committed) in [
         (AtomicWriteFault::BeforeRename, false),
