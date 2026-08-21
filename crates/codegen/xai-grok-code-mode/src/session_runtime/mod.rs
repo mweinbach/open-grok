@@ -11,6 +11,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use xai_grok_code_mode_protocol::NestedToolProgressSink;
 
 pub(crate) use self::types::CellEvent;
 pub(crate) use self::types::CellId;
@@ -242,6 +243,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         &self,
         invocation: CellToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
     ) -> Result<JsonValue, String> {
         self.inner
             .delegate
@@ -254,6 +256,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                     input: invocation.input,
                 },
                 cancellation_token,
+                progress,
             )
             .await
     }

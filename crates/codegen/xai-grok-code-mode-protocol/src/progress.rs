@@ -54,12 +54,21 @@ struct Shared {
     notify: Notify,
     closed: AtomicBool,
     dropped_chunks: AtomicU64,
+    /// Live [`NestedToolProgressSink`] handles. Reaching zero closes the
+    /// channel, so the consumer always terminates once the invocation ends.
+    sink_handles: AtomicU64,
 }
 
-/// Producer half of the channel. Cloneable; pushing never blocks.
-#[derive(Clone)]
+/// Producer half of the channel. Cloneable; pushing never blocks. Dropping
+/// every clone closes the channel.
 pub struct NestedToolProgressSink {
     shared: Arc<Shared>,
+}
+
+impl Clone for NestedToolProgressSink {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.shared))
+    }
 }
 
 /// Consumer half of the channel. Dropping or closing it makes every future
@@ -69,8 +78,13 @@ pub struct NestedToolProgressReceiver {
 }
 
 impl NestedToolProgressSink {
+    fn new(shared: Arc<Shared>) -> Self {
+        shared.sink_handles.fetch_add(1, Ordering::Relaxed);
+        Self { shared }
+    }
+
     /// Enqueues one chunk, dropping the oldest queued chunk when the buffer
-    /// is at capacity. No-op after the receiver was dropped or closed.
+    /// is at capacity. No-op after the channel is closed.
     pub fn push(&self, progress: NestedToolProgress) {
         if self.shared.closed.load(Ordering::Acquire) {
             return;
@@ -98,6 +112,15 @@ impl NestedToolProgressSink {
     }
 }
 
+impl Drop for NestedToolProgressSink {
+    fn drop(&mut self) {
+        if self.shared.sink_handles.fetch_sub(1, Ordering::Release) == 1 {
+            self.shared.closed.store(true, Ordering::Release);
+            self.shared.notify.notify_waiters();
+        }
+    }
+}
+
 impl NestedToolProgressReceiver {
     /// Next queued chunk in FIFO order, waiting for new pushes. Returns
     /// `None` once the channel is closed and fully drained.
@@ -120,6 +143,12 @@ impl NestedToolProgressReceiver {
     pub fn close(&self) {
         self.shared.closed.store(true, Ordering::Release);
         self.shared.notify.notify_waiters();
+    }
+
+    /// Whether the channel was closed by receiver close/drop or by all
+    /// producer handles being dropped.
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
     }
 
     /// Next queued chunk without waiting.
@@ -145,11 +174,10 @@ pub fn nested_tool_progress_channel() -> (NestedToolProgressSink, NestedToolProg
         notify: Notify::new(),
         closed: AtomicBool::new(false),
         dropped_chunks: AtomicU64::new(0),
+        sink_handles: AtomicU64::new(0),
     });
     (
-        NestedToolProgressSink {
-            shared: Arc::clone(&shared),
-        },
+        NestedToolProgressSink::new(Arc::clone(&shared)),
         NestedToolProgressReceiver { shared },
     )
 }
@@ -245,5 +273,21 @@ mod tests {
         assert!(sink.is_closed());
         sink.push(NestedToolProgress::text("ignored"));
         assert_eq!(sink.dropped_chunks(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_every_sink_clone_closes_the_channel() {
+        let (sink, receiver) = nested_tool_progress_channel();
+        let sink_clone = sink.clone();
+        assert!(!receiver.is_closed());
+        drop(sink);
+        assert!(
+            !sink_clone.is_closed(),
+            "a live clone keeps the channel open"
+        );
+        drop(sink_clone);
+        assert!(receiver.is_closed());
+        // After the last producer handle is gone, recv must end.
+        assert_eq!(receiver.recv().await, None);
     }
 }

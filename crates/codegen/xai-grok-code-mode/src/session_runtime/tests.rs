@@ -9,6 +9,7 @@ use std::time::Duration;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
+use xai_grok_code_mode_protocol::NestedToolProgressSink;
 
 use super::*;
 use crate::cell_actor::CompletionCommit;
@@ -22,6 +23,7 @@ impl SessionRuntimeDelegate for RecordingDelegate {
         &self,
         _invocation: NestedToolCall,
         _cancellation_token: CancellationToken,
+        _progress: NestedToolProgressSink,
     ) -> Result<JsonValue, String> {
         Ok(JsonValue::Null)
     }
@@ -44,6 +46,7 @@ impl SessionRuntimeDelegate for PanickingClosedDelegate {
         &self,
         _invocation: NestedToolCall,
         _cancellation_token: CancellationToken,
+        _progress: NestedToolProgressSink,
     ) -> Result<JsonValue, String> {
         Ok(JsonValue::Null)
     }

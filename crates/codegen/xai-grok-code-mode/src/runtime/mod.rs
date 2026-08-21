@@ -16,6 +16,7 @@ use xai_grok_code_mode_protocol::CodeModeToolKind;
 use xai_grok_code_mode_protocol::EnabledToolMetadata;
 use xai_grok_code_mode_protocol::ExecuteRequest;
 use xai_grok_code_mode_protocol::FunctionCallOutputContentItem;
+use xai_grok_code_mode_protocol::NestedToolProgress;
 use xai_grok_code_mode_protocol::ToolName;
 use xai_grok_code_mode_protocol::enabled_tool_metadata;
 
@@ -28,6 +29,7 @@ const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
 pub(crate) enum RuntimeCommand {
     ToolResponse { id: String, result: JsonValue },
     ToolError { id: String, error_text: String },
+    ToolProgress { id: String, progress: NestedToolProgress },
     TimeoutFired { id: u64 },
     ObservePendingFrontier,
     Terminate,
@@ -146,6 +148,9 @@ struct RuntimeConfig {
 pub(super) struct RuntimeState {
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     pending_tool_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
+    /// Progress handlers registered via `promise.onProgress(fn)`, keyed by
+    /// nested tool call id. Entries are removed when the call resolves.
+    pending_progress_callbacks: HashMap<String, v8::Global<v8::Function>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     stored_values: HashMap<String, JsonValue>,
     stored_value_writes: HashMap<String, JsonValue>,
@@ -188,6 +193,7 @@ fn run_runtime(
     scope.set_slot(RuntimeState {
         event_tx: event_tx.clone(),
         pending_tool_calls: HashMap::new(),
+        pending_progress_callbacks: HashMap::new(),
         pending_timeouts: HashMap::new(),
         stored_values: config.stored_values,
         stored_value_writes: HashMap::new(),
@@ -246,6 +252,10 @@ fn run_runtime(
                     capture_scope_send_error(scope, &event_tx, Some(runtime_error));
                     return;
                 }
+            }
+            RuntimeCommand::ToolProgress { id, progress } => {
+                // Observation-only: delivery failures never fail the runtime.
+                callbacks::deliver_tool_progress(scope, &id, progress);
             }
             RuntimeCommand::TimeoutFired { id } => {
                 if let Err(runtime_error) = timers::invoke_timeout_callback(scope, id) {

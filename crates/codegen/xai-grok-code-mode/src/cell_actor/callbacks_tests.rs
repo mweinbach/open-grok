@@ -8,6 +8,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use xai_grok_code_mode_protocol::NestedToolProgressSink;
 
 use super::*;
 use crate::cell_actor::CellState;
@@ -24,6 +25,7 @@ impl CellHost for PanickingCallbackHost {
         &self,
         _invocation: CellToolCall,
         _cancellation_token: CancellationToken,
+        _progress: NestedToolProgressSink,
     ) -> Result<JsonValue, String> {
         panic!("tool callback panic probe");
     }

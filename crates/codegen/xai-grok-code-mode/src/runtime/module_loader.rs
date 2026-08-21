@@ -72,6 +72,7 @@ pub(super) fn resolve_tool_response(
         let state = scope
             .get_slot_mut::<RuntimeState>()
             .ok_or_else(|| "runtime state unavailable".to_string())?;
+        state.pending_progress_callbacks.remove(id);
         state.pending_tool_calls.remove(id)
     }
     .ok_or_else(|| format!("unknown tool call `{id}`"))?;

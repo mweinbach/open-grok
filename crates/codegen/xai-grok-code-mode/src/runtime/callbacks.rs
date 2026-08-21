@@ -1,4 +1,5 @@
 use xai_grok_code_mode_protocol::FunctionCallOutputContentItem;
+use xai_grok_code_mode_protocol::NestedToolProgress;
 
 use super::EXIT_SENTINEL;
 use super::RuntimeEvent;
@@ -41,9 +42,8 @@ pub(super) fn tool_callback(
     };
     let promise = resolver.get_promise(scope);
 
-    let resolver = v8::Global::new(scope, resolver);
-    let (tool_name, tool_kind) = {
-        let Some(state) = scope.get_slot::<RuntimeState>() else {
+    let (tool_name, tool_kind, call_id) = {
+        let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
             throw_type_error(scope, "runtime state unavailable");
             return;
         };
@@ -51,24 +51,110 @@ pub(super) fn tool_callback(
             throw_type_error(scope, "tool callback data is out of range");
             return;
         };
-        (tool.tool_name.clone(), tool.kind)
+        let id = format!("tool-{}", state.next_tool_call_id);
+        state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
+        (tool.tool_name.clone(), tool.kind, id)
     };
+    if attach_progress_subscription(scope, &promise, &call_id).is_err() {
+        throw_type_error(scope, "failed to attach onProgress to the tool promise");
+        return;
+    }
 
+    let resolver = v8::Global::new(scope, resolver);
     let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
         throw_type_error(scope, "runtime state unavailable");
         return;
     };
-    let id = format!("tool-{}", state.next_tool_call_id);
-    state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
     let event_tx = state.event_tx.clone();
-    state.pending_tool_calls.insert(id.clone(), resolver);
+    state.pending_tool_calls.insert(call_id.clone(), resolver);
     let _ = event_tx.send(RuntimeEvent::ToolCall {
-        id,
+        id: call_id,
         name: tool_name,
         kind: tool_kind,
         input,
     });
     retval.set(promise.into());
+}
+
+/// Exposes `promise.onProgress(handler)` for one pending nested call.
+fn attach_progress_subscription(
+    scope: &mut v8::PinScope<'_, '_>,
+    promise: &v8::Local<'_, v8::Promise>,
+    call_id: &str,
+) -> Result<(), ()> {
+    let data = v8::String::new(scope, call_id).ok_or(())?;
+    let template = v8::FunctionTemplate::builder(tool_progress_callback)
+        .data(data.into())
+        .build(scope);
+    let function = template.get_function(scope).ok_or(())?;
+    let key = v8::String::new(scope, "onProgress").ok_or(())?;
+    if promise.set(scope, key.into(), function.into()) == Some(true) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// JS entry point for `promise.onProgress(handler)`: registers (replacing any
+/// previous handler) the function invoked with each `{ text, payload? }`
+/// progress chunk while the nested tool runs.
+pub(super) fn tool_progress_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let call_id = args.data().to_rust_string_lossy(scope);
+    let handler = args.get(0);
+    if !handler.is_function() {
+        throw_type_error(scope, "onProgress expects a handler function");
+        return;
+    }
+    let Ok(handler) = v8::Local::<v8::Function>::try_from(handler) else {
+        throw_type_error(scope, "onProgress expects a handler function");
+        return;
+    };
+    let handler = v8::Global::new(scope, handler);
+    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+        state.pending_progress_callbacks.insert(call_id, handler);
+    }
+    retval.set(v8::undefined(scope).into());
+}
+
+/// Delivers one progress chunk to the registered handler on the V8 thread.
+///
+/// Observation-only by contract: unknown/resolved calls and missing handlers
+/// fail closed silently, and a throwing handler never affects the cell.
+pub(super) fn deliver_tool_progress(
+    scope: &mut v8::PinScope<'_, '_>,
+    call_id: &str,
+    progress: NestedToolProgress,
+) {
+    let handler = {
+        let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
+            return;
+        };
+        // The call must still be pending; resolved or stale ids are dropped.
+        if !state.pending_tool_calls.contains_key(call_id) {
+            state.pending_progress_callbacks.remove(call_id);
+            return;
+        }
+        state.pending_progress_callbacks.get(call_id).cloned()
+    };
+    let Some(handler) = handler else {
+        return;
+    };
+    let Ok(progress_json) = serde_json::to_value(&progress) else {
+        return;
+    };
+
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let Some(argument) = json_to_v8(&mut tc, &progress_json) else {
+        return;
+    };
+    let this = v8::undefined(&tc);
+    let handler = v8::Local::new(&tc, &handler);
+    let _ = handler.call(&mut tc, this.into(), &[argument]);
 }
 
 pub(super) fn text_callback(
