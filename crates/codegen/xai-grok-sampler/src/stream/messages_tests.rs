@@ -723,3 +723,105 @@ async fn pure_cache_hit_with_zero_uncached_still_emits_usage() {
     assert_eq!(usage.cached_prompt_tokens, 2500);
     assert_eq!(usage.total_tokens, 2501);
 }
+
+#[tokio::test]
+async fn tool_use_block_stop_emits_arguments_complete_once() {
+    let tool_start = MessageStreamEvent::ContentBlockStart {
+        index: 0,
+        content_block: ContentBlock::ToolUse {
+            id: "call_c".into(),
+            name: "exec".into(),
+            input: serde_json::json!({}),
+            cache_control: None,
+        },
+    };
+    let arg_delta = MessageStreamEvent::ContentBlockDelta {
+        index: 0,
+        delta: StreamDelta::InputJsonDelta {
+            partial_json: "{\"source\":\"return 1\"}".into(),
+        },
+    };
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(tool_start),
+        Ok(arg_delta),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::ToolUse)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    let completes: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SamplingEvent::ToolCallArgumentsComplete {
+                tool_index,
+                id,
+                name,
+                ..
+            } => Some((*tool_index, id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(completes.len(), 1, "exactly one completion per block");
+    assert_eq!(completes[0].0, 0);
+    assert_eq!(completes[0].1.as_deref(), Some("call_c"));
+    assert_eq!(completes[0].2.as_deref(), Some("exec"));
+
+    // The completion lands after the last fragment and before Completed.
+    let complete_pos = evs
+        .iter()
+        .position(|e| matches!(e, SamplingEvent::ToolCallArgumentsComplete { .. }))
+        .unwrap();
+    let last_delta_pos = evs
+        .iter()
+        .rposition(|e| matches!(e, SamplingEvent::ToolCallDelta { .. }))
+        .unwrap();
+    let completed_pos = evs
+        .iter()
+        .position(|e| matches!(e, SamplingEvent::Completed { .. }))
+        .unwrap();
+    assert!(last_delta_pos < complete_pos && complete_pos < completed_pos);
+}
+
+#[tokio::test]
+async fn two_tool_use_blocks_emit_two_completions() {
+    let tool_start = |index: u32, id: &str| MessageStreamEvent::ContentBlockStart {
+        index,
+        content_block: ContentBlock::ToolUse {
+            id: id.into(),
+            name: "do_thing".into(),
+            input: serde_json::json!({}),
+            cache_control: None,
+        },
+    };
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(tool_start(1, "call_a")),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index: 1,
+            delta: StreamDelta::InputJsonDelta {
+                partial_json: "{}".into(),
+            },
+        }),
+        Ok(block_stop(1)),
+        Ok(tool_start(3, "call_b")),
+        Ok(block_stop(3)),
+        Ok(message_delta_with_stop(messages::StopReason::ToolUse)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    let mut indexes: Vec<u32> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SamplingEvent::ToolCallArgumentsComplete { tool_index, .. } => Some(*tool_index),
+            _ => None,
+        })
+        .collect();
+    indexes.sort_unstable();
+    assert_eq!(indexes, vec![0, 1], "one completion per tool call");
+}

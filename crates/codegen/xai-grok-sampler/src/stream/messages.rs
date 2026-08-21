@@ -402,6 +402,19 @@ pub fn stream_messages<'a>(
                                 }
                             }
                             BlockType::ToolUse => {
+                                // The block's arguments are final. Emit before
+                                // assembling the canonical call so consumers
+                                // accumulating fragments can act mid-stream;
+                                // exactly once per block because the state is
+                                // removed above.
+                                if let Some(&tool_index) = block_to_tool_index.get(&index) {
+                                    yield SamplingEvent::ToolCallArgumentsComplete {
+                                        request_id: request_id.clone(),
+                                        tool_index,
+                                        id: Some(state.tool_id.clone()),
+                                        name: Some(state.tool_name.clone()),
+                                    };
+                                }
                                 assistant_tool_calls.push(ToolCall {
                                     id: std::sync::Arc::<str>::from(state.tool_id),
                                     name: state.tool_name,

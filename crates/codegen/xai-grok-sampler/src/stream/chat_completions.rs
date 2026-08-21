@@ -3,7 +3,7 @@
 //! Consumes a raw `ChatCompletionChunk` stream and produces
 //! [`SamplingEvent`]s. Pure: no I/O, no shell coupling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -74,6 +74,19 @@ pub fn stream_chat_completions<'a>(
         // carries id+name and starts the arguments buffer, subsequent
         // chunks append to arguments only.
         let mut tool_call_acc: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+        // Exactly-once guard for ToolCallArgumentsComplete.
+        //
+        // Chat Completions has no per-call "arguments done" signal, so
+        // completion is inferred conservatively — never before a call's
+        // arguments could still grow:
+        // 1. when a strictly later-indexed call starts streaming (providers
+        //    stream tool calls sequentially by index), and
+        // 2. for every started call, when the chunk carrying `finish_reason`
+        //    has been processed or the stream ends.
+        // A call whose fragments interleave with an equal-or-lower index is
+        // deliberately not completed early; consumers fall back to the
+        // canonical calls on `Completed`.
+        let mut arguments_complete_emitted: BTreeSet<u32> = BTreeSet::new();
 
         // Index counter spanning text + reasoning chunks (matches the
         // shell's chunk_index used for notification correlation).
@@ -142,12 +155,14 @@ pub fn stream_chat_completions<'a>(
             // Track whether this chunk carried meaningful content.
             // Set inside the choices loop and checked at the end.
             let mut chunk_has_content = false;
+            let mut finish_seen = false;
 
             for choice in chunk.choices.into_iter() {
                 first_choice_seen = true;
                 if let Some(fr) = choice.finish_reason {
                     finish_reason = Some(fr.into());
                     chunk_has_content = true;
+                    finish_seen = true;
                 }
 
                 let delta = choice.delta;
@@ -198,6 +213,22 @@ pub fn stream_chat_completions<'a>(
                 for tc_delta in delta.tool_calls.into_iter() {
                     chunk_has_content = true;
 
+                    // A later-indexed call starting implies every
+                    // lower-indexed started call finished streaming.
+                    for earlier in tool_call_acc.keys().copied().collect::<Vec<_>>() {
+                        if earlier < tc_delta.index
+                            && arguments_complete_emitted.insert(earlier)
+                        {
+                            let (id, name, _) = &tool_call_acc[&earlier];
+                            yield SamplingEvent::ToolCallArgumentsComplete {
+                                request_id: request_id.clone(),
+                                tool_index: earlier,
+                                id: Some(id.clone()),
+                                name: Some(name.clone()),
+                            };
+                        }
+                    }
+
                     let entry = tool_call_acc
                         .entry(tc_delta.index)
                         .or_insert_with(|| (String::new(), String::new(), String::new()));
@@ -231,6 +262,20 @@ pub fn stream_chat_completions<'a>(
                 }
             }
 
+            // Terminal chunk: every started call's arguments are final.
+            if finish_seen {
+                for (index, (id, name, _)) in tool_call_acc.iter() {
+                    if arguments_complete_emitted.insert(*index) {
+                        yield SamplingEvent::ToolCallArgumentsComplete {
+                            request_id: request_id.clone(),
+                            tool_index: *index,
+                            id: Some(id.clone()),
+                            name: Some(name.clone()),
+                        };
+                    }
+                }
+            }
+
             if chunk_has_content {
                 last_content_chunk_at = Instant::now();
             } else if last_content_chunk_at.elapsed() > idle_timeout {
@@ -242,6 +287,19 @@ pub fn stream_chat_completions<'a>(
                     error: SamplingErrorInfo::from(&err),
                 };
                 return;
+            }
+        }
+
+        // Streams that end without a `finish_reason` chunk still finalize
+        // every started call before the response is assembled.
+        for (index, (id, name, _)) in tool_call_acc.iter() {
+            if arguments_complete_emitted.insert(*index) {
+                yield SamplingEvent::ToolCallArgumentsComplete {
+                    request_id: request_id.clone(),
+                    tool_index: *index,
+                    id: Some(id.clone()),
+                    name: Some(name.clone()),
+                };
             }
         }
 
@@ -1024,5 +1082,79 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    fn tool_delta_chunk(index: u32, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> ChatCompletionChunk {
+        make_chunk(vec![ChatChunkDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: Vec::new(),
+            tool_calls: vec![ChunkToolCallDelta {
+                index,
+                id: id.map(Into::into),
+                kind: None,
+                function: Some(ToolCallFunctionDelta {
+                    name: name.map(Into::into),
+                    arguments: args.map(Into::into),
+                }),
+            }],
+            tool_call_id: None,
+        }])
+    }
+
+    fn completes(evs: &[SamplingEvent]) -> Vec<u32> {
+        evs.iter()
+            .filter_map(|e| match e {
+                SamplingEvent::ToolCallArgumentsComplete { tool_index, .. } => Some(*tool_index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Conservative completion: a later-indexed call starting completes the
+    /// earlier one exactly once; the terminal chunk completes everything
+    /// still open.
+    #[tokio::test]
+    async fn tool_call_completions_are_conservative_and_exactly_once() {
+        let raw = stream::iter(vec![
+            Ok(tool_delta_chunk(0, Some("call_a"), Some("first"), Some("{\"a\":"))),
+            Ok(tool_delta_chunk(1, Some("call_b"), Some("second"), Some("{}"))),
+            Ok(tool_delta_chunk(0, None, None, Some("1}"))),
+            Ok(final_chunk(FinishReason::ToolCalls)),
+        ])
+        .boxed();
+        let events = collect(stream_chat_completions(raw, None, rid(), Duration::from_secs(60))).await;
+
+        // Index 0 completes exactly once when index 1 starts (the guard does
+        // not re-fire even though a stray fragment for index 0 follows);
+        // index 1 completes at the finish_reason chunk.
+        assert_eq!(completes(&events), vec![0, 1]);
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let calls = response.tool_calls();
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].arguments.as_ref(), "{\"a\":1}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Streams that end without a finish_reason chunk still finalize every
+    /// started call before Completed.
+    #[tokio::test]
+    async fn tool_call_completion_flushes_at_stream_end_without_finish_reason() {
+        let raw = stream::iter(vec![Ok(tool_delta_chunk(
+            0,
+            Some("call_z"),
+            Some("solo"),
+            Some("{}"),
+        ))])
+        .boxed();
+        let events = collect(stream_chat_completions(raw, None, rid(), Duration::from_secs(60))).await;
+        assert_eq!(completes(&events), vec![0]);
+        assert!(matches!(events.last().unwrap(), SamplingEvent::Completed { .. }));
     }
 }

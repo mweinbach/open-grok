@@ -217,6 +217,14 @@ pub(crate) fn stream_responses_tracked<'a>(
         // look up `output_index` here to find the matching `tool_index`.
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
         let mut custom_input_started: BTreeSet<u32> = BTreeSet::new();
+        // Output indexes whose function-call arguments have already streamed
+        // at least one delta. `function_call_arguments.done` re-sends the full
+        // arguments; a synthetic catch-up delta is only needed when no delta
+        // ever streamed.
+        let mut function_delta_started: BTreeSet<u32> = BTreeSet::new();
+        // Exactly-once guard for `ToolCallArgumentsComplete`, keyed by
+        // Responses `output_index`.
+        let mut arguments_complete_emitted: BTreeSet<u32> = BTreeSet::new();
         let mut backend_output_started: BTreeSet<u32> = BTreeSet::new();
         let mut backend_tool_started: BTreeSet<String> = BTreeSet::new();
         let mut next_tool_index: u32 = 0;
@@ -495,6 +503,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                         && let Some(&tool_index) =
                             output_to_tool_index.get(&args_event.output_index)
                     {
+                        function_delta_started.insert(args_event.output_index);
                         yield SamplingEvent::ToolCallDelta {
                             request_id: request_id.clone(),
                             tool_index,
@@ -502,6 +511,38 @@ pub(crate) fn stream_responses_tracked<'a>(
                             name: None,
                             arguments_delta: Some(delta),
                         };
+                    }
+                }
+
+                // Function-call arguments are final mid-stream. The done event
+                // carries the authoritative full `arguments`; when no delta
+                // ever streamed for this output index, deliver them as one
+                // catch-up delta first so consumers that accumulate fragments
+                // hold the complete payload before the completion signal.
+                ResponseStreamEvent::ResponseFunctionCallArgumentsDone(done_event) => {
+                    if let Some(&tool_index) = output_to_tool_index.get(&done_event.output_index)
+                    {
+                        if function_delta_started.insert(done_event.output_index)
+                            && !done_event.arguments.is_empty()
+                        {
+                            yield SamplingEvent::ToolCallDelta {
+                                request_id: request_id.clone(),
+                                tool_index,
+                                id: None,
+                                name: None,
+                                arguments_delta: Some(done_event.arguments.clone()),
+                            };
+                        }
+                        if arguments_complete_emitted.insert(done_event.output_index) {
+                            yield SamplingEvent::ToolCallArgumentsComplete {
+                                request_id: request_id.clone(),
+                                tool_index,
+                                // The done event carries the item id and
+                                // model-facing name, not the provider call id.
+                                id: None,
+                                name: done_event.name.clone(),
+                            };
+                        }
                     }
                 }
 
@@ -632,6 +673,64 @@ pub(crate) fn stream_responses_tracked<'a>(
                     completed_output_items
                         .insert(done_event.output_index, done_event.item.clone());
                     match &done_event.item {
+                        // Client-executable function calls finishing without a
+                        // `function_call_arguments.done` event (non-streaming
+                        // deployments): deliver the full arguments as a
+                        // catch-up delta when nothing streamed, then the
+                        // exactly-once completion signal.
+                        rs::OutputItem::FunctionCall(fc) => {
+                            if let Some(&tool_index) =
+                                output_to_tool_index.get(&done_event.output_index)
+                                && arguments_complete_emitted.insert(done_event.output_index)
+                            {
+                                if function_delta_started.insert(done_event.output_index)
+                                    && !fc.arguments.is_empty()
+                                {
+                                    yield SamplingEvent::ToolCallDelta {
+                                        request_id: request_id.clone(),
+                                        tool_index,
+                                        id: None,
+                                        name: None,
+                                        arguments_delta: Some(fc.arguments.clone()),
+                                    };
+                                }
+                                yield SamplingEvent::ToolCallArgumentsComplete {
+                                    request_id: request_id.clone(),
+                                    tool_index,
+                                    id: None,
+                                    name: Some(fc.name.clone()),
+                                };
+                            }
+                        }
+                        // Client-executable custom calls finishing without an
+                        // input done event: same catch-up + completion
+                        // contract as function calls above.
+                        rs::OutputItem::CustomToolCall(ct)
+                            if client_custom_tool_names.iter().any(|name| name == &ct.name) =>
+                        {
+                            if let Some(&tool_index) =
+                                output_to_tool_index.get(&done_event.output_index)
+                                && arguments_complete_emitted.insert(done_event.output_index)
+                            {
+                                if custom_input_started.insert(done_event.output_index)
+                                    && !ct.input.is_empty()
+                                {
+                                    yield SamplingEvent::ToolCallDelta {
+                                        request_id: request_id.clone(),
+                                        tool_index,
+                                        id: None,
+                                        name: None,
+                                        arguments_delta: Some(ct.input.clone()),
+                                    };
+                                }
+                                yield SamplingEvent::ToolCallArgumentsComplete {
+                                    request_id: request_id.clone(),
+                                    tool_index,
+                                    id: Some(ct.call_id.clone()),
+                                    name: Some(ct.name.clone()),
+                                };
+                            }
+                        }
                         rs::OutputItem::WebSearchCall(ws) => {
                             let was_started = backend_output_started.contains(&done_event.output_index)
                                 || backend_tool_started.contains(&ws.id);
@@ -710,6 +809,16 @@ pub(crate) fn stream_responses_tracked<'a>(
                                 id: None,
                                 name: None,
                                 arguments_delta: Some(ev.input),
+                            };
+                        }
+                        if arguments_complete_emitted.insert(ev.output_index) {
+                            yield SamplingEvent::ToolCallArgumentsComplete {
+                                request_id: request_id.clone(),
+                                tool_index,
+                                id: None,
+                                // Input-done events carry no name; consumers
+                                // already hold it from OutputItemAdded.
+                                name: None,
                             };
                         }
                     } else {
@@ -2391,5 +2500,254 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    type Complete = (u32, Option<String>, Option<String>);
+
+    /// Extract ToolCallArgumentsComplete events as
+    /// (tool_index, id, name) with their stream position.
+    fn tool_call_completes(evs: &[SamplingEvent]) -> Vec<Complete> {
+        evs.iter()
+            .filter_map(|e| match e {
+                SamplingEvent::ToolCallArgumentsComplete {
+                    tool_index,
+                    id,
+                    name,
+                    ..
+                } => Some((*tool_index, id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn function_call_arguments_complete_emitted_once_after_deltas() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(function_call_added_event(0, "call_1", "do_thing")),
+            Ok(function_call_args_delta_event(0, "{\"x\":")),
+            Ok(function_call_args_delta_event(0, "1}")),
+            Ok(rs::ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+                rs_types::ResponseFunctionCallArgumentsDoneEvent {
+                    sequence_number: 0,
+                    item_id: "item-0".into(),
+                    output_index: 0,
+                    name: Some("do_thing".into()),
+                    arguments: "{\"x\":1}".into(),
+                },
+            )),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let completes = tool_call_completes(&evs);
+        assert_eq!(completes.len(), 1, "exactly one completion per call");
+        assert_eq!(completes[0].0, 0);
+        assert_eq!(completes[0].2.as_deref(), Some("do_thing"));
+        // The completion lands after the last delta and before Completed.
+        let last_delta = evs
+            .iter()
+            .position(|e| matches!(e, SamplingEvent::ToolCallDelta { .. }))
+            .expect("deltas present");
+        let complete_pos = evs
+            .iter()
+            .position(|e| matches!(e, SamplingEvent::ToolCallArgumentsComplete { .. }))
+            .unwrap();
+        let completed_pos = evs
+            .iter()
+            .position(|e| matches!(e, SamplingEvent::Completed { .. }))
+            .unwrap();
+        assert!(last_delta < complete_pos && complete_pos < completed_pos);
+    }
+
+    #[tokio::test]
+    async fn custom_tool_input_complete_emitted_once_at_input_done() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(custom_call_added_event(0, "call_c1", "ctc_0", "exec")),
+            Ok(custom_call_input_delta_event(0, "console.log(")),
+            Ok(custom_call_input_delta_event(0, "\"hi\")")),
+            Ok(custom_call_input_done_event(0, "console.log(\"hi\")")),
+            Ok(output_item_done_event(
+                0,
+                rs_types::OutputItem::CustomToolCall(custom_tool_call(
+                    "call_c1",
+                    "ctc_0",
+                    "exec",
+                    "console.log(\"hi\")",
+                )),
+            )),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["exec".into()],
+        ))
+        .await;
+
+        // Item-done arrives after input-done but must not duplicate the
+        // completion signal.
+        let completes = tool_call_completes(&evs);
+        assert_eq!(completes.len(), 1);
+        assert_eq!(completes[0].0, 0);
+    }
+
+    #[tokio::test]
+    async fn custom_call_added_with_full_input_completes_at_item_done() {
+        // Non-streaming deployment: the full input rides OutputItemAdded and
+        // no input delta/done events follow. The item-done backstop must
+        // deliver exactly one completion without re-sending the bytes.
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(custom_call_added_event_with_input(
+                0, "call_c2", "ctc_0", "exec", "return store.k",
+            )),
+            Ok(output_item_done_event(
+                0,
+                rs_types::OutputItem::CustomToolCall(custom_tool_call(
+                    "call_c2", "ctc_0", "exec", "return store.k",
+                )),
+            )),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["exec".into()],
+        ))
+        .await;
+
+        let deltas = tool_call_deltas(&evs);
+        // Only the initial added-time delta carries the input.
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].3.as_deref(), Some("return store.k"));
+
+        let completes = tool_call_completes(&evs);
+        assert_eq!(completes.len(), 1);
+        assert_eq!(completes[0].1.as_deref(), Some("call_c2"));
+        assert_eq!(completes[0].2.as_deref(), Some("exec"));
+    }
+
+    #[tokio::test]
+    async fn function_call_done_without_deltas_sends_full_arguments_first() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(function_call_added_event(0, "call_ns", "do_thing")),
+            Ok(rs::ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+                rs_types::ResponseFunctionCallArgumentsDoneEvent {
+                    sequence_number: 0,
+                    item_id: "item-0".into(),
+                    output_index: 0,
+                    name: None,
+                    arguments: "{\"a\":2}".into(),
+                },
+            )),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        // Catch-up delta precedes the completion so fragment accumulators are
+        // complete when it fires.
+        let deltas = tool_call_deltas(&evs);
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[1].3.as_deref(), Some("{\"a\":2}"));
+        assert_eq!(tool_call_completes(&evs).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_function_call_done_events_emit_single_completion() {
+        let done = || {
+            rs::ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+                rs_types::ResponseFunctionCallArgumentsDoneEvent {
+                    sequence_number: 0,
+                    item_id: "item-0".into(),
+                    output_index: 0,
+                    name: Some("do_thing".into()),
+                    arguments: "{}".into(),
+                },
+            )
+        };
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(function_call_added_event(0, "call_dup", "do_thing")),
+            Ok(done()),
+            Ok(done()),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+        assert_eq!(tool_call_completes(&evs).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_function_calls_complete_independently() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(function_call_added_event(0, "call_a", "first")),
+            Ok(function_call_args_delta_event(0, "{}")),
+            Ok(function_call_added_event(1, "call_b", "second")),
+            Ok(function_call_args_delta_event(1, "{}")),
+            Ok(rs::ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+                rs_types::ResponseFunctionCallArgumentsDoneEvent {
+                    sequence_number: 0,
+                    item_id: "item-1".into(),
+                    output_index: 1,
+                    name: Some("second".into()),
+                    arguments: "{}".into(),
+                },
+            )),
+            Ok(rs::ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+                rs_types::ResponseFunctionCallArgumentsDoneEvent {
+                    sequence_number: 1,
+                    item_id: "item-0".into(),
+                    output_index: 0,
+                    name: Some("first".into()),
+                    arguments: "{}".into(),
+                },
+            )),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let mut indexes: Vec<u32> = tool_call_completes(&evs)
+            .into_iter()
+            .map(|(index, _, _)| index)
+            .collect();
+        indexes.sort_unstable();
+        assert_eq!(indexes, vec![0, 1]);
     }
 }
