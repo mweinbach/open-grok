@@ -176,7 +176,6 @@ pub fn stream_chat_completions<'a>(
                 }
 
                 let thought = delta.reasoning_text();
-                let thought = thought.trim().to_owned();
                 if !thought.is_empty() {
                     if !first_token_emitted {
                         first_token_emitted = true;
@@ -186,6 +185,7 @@ pub fn stream_chat_completions<'a>(
                     }
                     chunk_has_content = true;
                     chunk_index += 1;
+                    let thought = thought.into_owned();
                     reasoning_acc.push_str(&thought);
                     yield SamplingEvent::ChannelToken {
                         request_id: request_id.clone(),
@@ -569,6 +569,67 @@ mod tests {
                     .expect("reasoning sibling preserved from delta.reasoning");
                 let rs::SummaryPart::SummaryText(t) = &r.summary[0];
                 assert_eq!(t.text, "openrouter thinking");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// OpenRouter (and other Chat Completions gateways) stream reasoning as
+    /// token-sized deltas whose leading space is the word separator. Trimming
+    /// each chunk concatenates words (`"Now" + " I"` → `"NowI"`).
+    #[tokio::test]
+    async fn reasoning_deltas_preserve_leading_spaces() {
+        fn reasoning_chunk(text: &str) -> ChatCompletionChunk {
+            let mut chunk = make_chunk(vec![ChatChunkDelta {
+                role: Some(Role::Assistant),
+                content: None,
+                reasoning_content: None,
+                reasoning: Some(text.to_string()),
+                reasoning_details: Vec::new(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            }]);
+            chunk.choices[0].finish_reason = None;
+            chunk
+        }
+
+        let chunks: Vec<Result<ChatCompletionChunk, SamplingError>> = vec![
+            Ok(reasoning_chunk("Now")),
+            Ok(reasoning_chunk(" I")),
+            Ok(reasoning_chunk(" have")),
+            Ok(text_chunk("done")),
+            Ok(final_chunk(FinishReason::Stop)),
+        ];
+        let raw = stream::iter(chunks).boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let reasoning: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Reasoning,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, ["Now", " I", " have"]);
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let r = response
+                    .reasoning_items()
+                    .next()
+                    .expect("reasoning sibling preserved");
+                let rs::SummaryPart::SummaryText(t) = &r.summary[0];
+                assert_eq!(t.text, "Now I have");
             }
             other => panic!("expected Completed, got {other:?}"),
         }
