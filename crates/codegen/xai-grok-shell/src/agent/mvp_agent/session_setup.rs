@@ -423,12 +423,33 @@ impl MvpAgent {
                 origin_client.clone(),
             )
         });
+        // A carried-over (global or previous-model) effort is only applied when
+        // this model's menu actually offers it; otherwise fall back to the
+        // model's own default so an out-of-menu value like `xhigh` never
+        // reaches a model that only accepts low/medium/high/max.
         if let Some(effort) = self.models_manager.current_reasoning_effort()
             && self
                 .models_manager
                 .model_supports_reasoning_effort(&session_sampling.model)
         {
-            session_sampling.reasoning_effort = Some(effort);
+            if self
+                .models_manager
+                .model_accepts_reasoning_effort(&session_sampling.model, effort)
+            {
+                session_sampling.reasoning_effort = Some(effort);
+            } else {
+                let model_default = self
+                    .models_manager
+                    .model_default_reasoning_effort(&session_sampling.model);
+                tracing::info!(
+                    model = %session_sampling.model,
+                    requested_effort = %effort,
+                    fallback_effort = ?model_default,
+                    "session_setup: carried-over reasoning effort not in model menu, \
+                     using model default"
+                );
+                session_sampling.reasoning_effort = model_default;
+            }
         }
         let (summary_client, summary_model) = self.build_summary_client(&session_sampling)?;
         let relay_sync = if session_sampling.provider

@@ -152,7 +152,7 @@ pub fn stream_chat_completions<'a>(
 
                 let delta = choice.delta;
 
-                if let Some(text) = delta.content
+                if let Some(text) = delta.content.as_ref()
                     && !text.is_empty()
                 {
                     if !first_token_emitted {
@@ -165,6 +165,7 @@ pub fn stream_chat_completions<'a>(
                     chunk_timestamps.push(Instant::now());
                     chunk_index += 1;
                     message_chunk_count += 1;
+                    let text = text.clone();
                     content_acc.push_str(&text);
                     yield SamplingEvent::ChannelToken {
                         request_id: request_id.clone(),
@@ -174,9 +175,9 @@ pub fn stream_chat_completions<'a>(
                     };
                 }
 
-                if let Some(thought) = delta.reasoning_content
-                    && !thought.is_empty()
-                {
+                let thought = delta.reasoning_text();
+                let thought = thought.trim().to_owned();
+                if !thought.is_empty() {
                     if !first_token_emitted {
                         first_token_emitted = true;
                         yield SamplingEvent::FirstToken {
@@ -264,6 +265,15 @@ pub fn stream_chat_completions<'a>(
         let mut items: Vec<ConversationItem> = Vec::new();
         if first_choice_seen {
             if !reasoning_acc.is_empty() {
+                // Some gateways (e.g. OpenRouter) omit
+                // `completion_tokens_details.reasoning_tokens` from the usage
+                // chunk. Fall back to a character-based estimate from the
+                // streamed reasoning text so token accounting stays non-zero.
+                if let Some(u) = usage.as_mut()
+                    && u.reasoning_tokens == 0
+                {
+                    u.reasoning_tokens = estimate_reasoning_tokens(&reasoning_acc);
+                }
                 items.push(ConversationItem::Reasoning(
                     xai_grok_sampling_types::synthesized_reasoning_item(reasoning_acc),
                 ));
@@ -305,14 +315,21 @@ pub fn stream_chat_completions<'a>(
     }
 }
 
+/// Rough token estimate for streamed reasoning text, used when the provider's
+/// usage chunk omits `completion_tokens_details.reasoning_tokens`. ~4 chars
+/// per token matches the heuristic used elsewhere for English/code text.
+fn estimate_reasoning_tokens(reasoning_text: &str) -> u32 {
+    (reasoning_text.chars().count() as u32).div_ceil(4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::stream;
     use std::pin::pin;
     use xai_grok_sampling_types::{
-        ChatChunkChoice, ChatChunkDelta, FinishReason, Role, ToolCallDelta as ChunkToolCallDelta,
-        ToolCallFunctionDelta, Usage, rs,
+        ChatChunkChoice, ChatChunkDelta, FinishReason, OpenRouterReasoningDetail, Role,
+        ToolCallDelta as ChunkToolCallDelta, ToolCallFunctionDelta, Usage, rs,
     };
 
     fn rid() -> RequestId {
@@ -344,6 +361,8 @@ mod tests {
             role: Some(Role::Assistant),
             content: Some(text.to_string()),
             reasoning_content: None,
+            reasoning: None,
+            reasoning_details: Vec::new(),
             tool_calls: vec![],
             tool_call_id: None,
         }])
@@ -436,6 +455,8 @@ mod tests {
             role: Some(Role::Assistant),
             content: None,
             reasoning_content: Some("thinking...".into()),
+            reasoning: None,
+            reasoning_details: Vec::new(),
             tool_calls: vec![],
             tool_call_id: None,
         }]);
@@ -493,6 +514,171 @@ mod tests {
         }
     }
 
+    /// OpenRouter streams reasoning as `delta.reasoning` (not the DeepSeek-style
+    /// `reasoning_content`). The parser must fall back to it so thought chunks
+    /// render and the reasoning sibling is preserved.
+    #[tokio::test]
+    async fn openrouter_reasoning_field_emits_reasoning_channel() {
+        let mut reasoning_chunk = make_chunk(vec![ChatChunkDelta {
+            role: Some(Role::Assistant),
+            content: None,
+            reasoning_content: None,
+            reasoning: Some("openrouter thinking".into()),
+            reasoning_details: Vec::new(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }]);
+        reasoning_chunk.choices[0].finish_reason = None;
+
+        let chunks: Vec<Result<ChatCompletionChunk, SamplingError>> = vec![
+            Ok(reasoning_chunk),
+            Ok(text_chunk("done")),
+            Ok(final_chunk(FinishReason::Stop)),
+        ];
+        let raw = stream::iter(chunks).boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let mut saw_reasoning = false;
+        for e in &events {
+            if let SamplingEvent::ChannelToken {
+                channel: SamplingChannel::Reasoning,
+                text,
+                ..
+            } = e
+            {
+                assert_eq!(text, "openrouter thinking");
+                saw_reasoning = true;
+            }
+        }
+        assert!(
+            saw_reasoning,
+            "delta.reasoning must reach the Reasoning channel"
+        );
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let r = response
+                    .reasoning_items()
+                    .next()
+                    .expect("reasoning sibling preserved from delta.reasoning");
+                let rs::SummaryPart::SummaryText(t) = &r.summary[0];
+                assert_eq!(t.text, "openrouter thinking");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// OpenRouter structured `reasoning_details` entries with text variants
+    /// must also feed the Reasoning channel.
+    #[tokio::test]
+    async fn openrouter_reasoning_details_emit_reasoning_channel() {
+        let mut reasoning_chunk = make_chunk(vec![ChatChunkDelta {
+            role: Some(Role::Assistant),
+            content: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: vec![OpenRouterReasoningDetail {
+                r#type: "reasoning.text".into(),
+                text: Some("details thinking".into()),
+                summary: None,
+                extra: Default::default(),
+            }],
+            tool_calls: vec![],
+            tool_call_id: None,
+        }]);
+        reasoning_chunk.choices[0].finish_reason = None;
+
+        let chunks: Vec<Result<ChatCompletionChunk, SamplingError>> = vec![
+            Ok(reasoning_chunk),
+            Ok(text_chunk("done")),
+            Ok(final_chunk(FinishReason::Stop)),
+        ];
+        let raw = stream::iter(chunks).boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let mut saw_reasoning = false;
+        for e in &events {
+            if let SamplingEvent::ChannelToken {
+                channel: SamplingChannel::Reasoning,
+                text,
+                ..
+            } = e
+            {
+                assert_eq!(text, "details thinking");
+                saw_reasoning = true;
+            }
+        }
+        assert!(
+            saw_reasoning,
+            "delta.reasoning_details text must reach the Reasoning channel"
+        );
+    }
+
+    /// When the usage chunk omits `completion_tokens_details.reasoning_tokens`
+    /// (OpenRouter does this), the streamed reasoning text backs into a
+    /// non-zero estimate instead of reporting 0.
+    #[tokio::test]
+    async fn reasoning_tokens_fall_back_to_stream_estimate_when_usage_omits_detail() {
+        let mut reasoning_chunk = make_chunk(vec![ChatChunkDelta {
+            role: Some(Role::Assistant),
+            content: None,
+            reasoning_content: None,
+            reasoning: Some("x".repeat(400)),
+            reasoning_details: Vec::new(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }]);
+        reasoning_chunk.choices[0].finish_reason = None;
+
+        let mut chunk_with_usage = make_chunk(vec![ChatChunkDelta::default()]);
+        chunk_with_usage.usage = Some(Usage {
+            prompt_tokens: 100,
+            completion_tokens: 150,
+            total_tokens: 250,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+            cost_in_usd_ticks: None,
+        });
+
+        let chunks: Vec<Result<ChatCompletionChunk, SamplingError>> = vec![
+            Ok(reasoning_chunk),
+            Ok(text_chunk("done")),
+            Ok(chunk_with_usage),
+            Ok(final_chunk(FinishReason::Stop)),
+        ];
+        let raw = stream::iter(chunks).boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let u = response.usage.as_ref().expect("usage extracted");
+                assert_eq!(
+                    u.reasoning_tokens, 100,
+                    "400 chars / 4 = 100 estimated reasoning tokens"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn tool_call_stream_emits_deltas_and_assembles_final_call() {
         // First chunk has id + name + part of arguments.
@@ -500,6 +686,8 @@ mod tests {
             role: None,
             content: None,
             reasoning_content: None,
+            reasoning: None,
+            reasoning_details: Vec::new(),
             tool_calls: vec![ChunkToolCallDelta {
                 index: 0,
                 id: Some("call_abc".into()),
@@ -516,6 +704,8 @@ mod tests {
             role: None,
             content: None,
             reasoning_content: None,
+            reasoning: None,
+            reasoning_details: Vec::new(),
             tool_calls: vec![ChunkToolCallDelta {
                 index: 0,
                 id: None,

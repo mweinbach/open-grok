@@ -1,4 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize};
+use std::borrow::Cow;
 use std::num::NonZeroU64;
 
 // ============================================================================
@@ -535,6 +536,18 @@ pub struct ChatChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
+    /// OpenRouter's normalized reasoning delta field. OpenRouter streams
+    /// thinking text as `delta.reasoning` (a plain string); `reasoning_content`
+    /// is the DeepSeek-style alias some endpoints emit instead. Both are kept
+    /// so either wire shape deserializes; consumers should prefer
+    /// `reasoning_content` and fall back to `reasoning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// OpenRouter structured reasoning details (`delta.reasoning_details`).
+    /// The text variants carry incremental reasoning text; encrypted/summary
+    /// variants are accepted but ignored by the stream parser.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_details: Vec<OpenRouterReasoningDetail>,
     /// Tool call deltas. Handles `null` in JSON as empty vec.
     #[serde(
         default,
@@ -544,6 +557,58 @@ pub struct ChatChunkDelta {
     pub tool_calls: Vec<ToolCallDelta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+impl ChatChunkDelta {
+    /// Reasoning text carried by this delta. Prefers the DeepSeek-style
+    /// `reasoning_content` field, then OpenRouter's `reasoning`, then any
+    /// text-bearing `reasoning_details` entries joined together.
+    pub fn reasoning_text(&self) -> Cow<'_, str> {
+        if let Some(text) = self
+            .reasoning_content
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.reasoning.as_deref().filter(|s| !s.is_empty()))
+        {
+            return Cow::Borrowed(text);
+        }
+        let mut joined = String::new();
+        for detail in &self.reasoning_details {
+            if let Some(text) = detail.text() {
+                joined.push_str(text);
+            }
+        }
+        Cow::Owned(joined)
+    }
+}
+
+/// One entry of OpenRouter's structured `reasoning_details` array. Only the
+/// text-bearing variants contribute displayable reasoning; other shapes
+/// (`reasoning.encrypted`, `reasoning.summary`, unknown types) deserialize
+/// with their extra fields collapsed into `extra` and are ignored.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct OpenRouterReasoningDetail {
+    #[serde(default)]
+    pub r#type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Preserve unknown/variant-specific fields without failing deserialization.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl OpenRouterReasoningDetail {
+    /// Displayable incremental text for this detail, if any.
+    pub fn text(&self) -> Option<&str> {
+        match self.r#type.as_str() {
+            "reasoning.text" => self.text.as_deref(),
+            // `reasoning.summary` entries stream their text in `summary`.
+            "reasoning.summary" => self.summary.as_deref().or(self.text.as_deref()),
+            _ => None,
+        }
+    }
 }
 
 /// Parameters to control realtime data.
