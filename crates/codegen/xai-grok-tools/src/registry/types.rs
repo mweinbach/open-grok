@@ -1617,6 +1617,25 @@ impl FinalizedToolset {
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> xai_tool_runtime::ToolStream<ToolRunResult> {
+        self.call_streaming_with_cancellation_and_viewer_context(
+            tool_name,
+            tool_args,
+            tool_call_id,
+            cwd_override,
+            cancellation,
+            None,
+        )
+    }
+    /// Streaming dispatch with an optional call-scoped viewer-context override.
+    pub fn call_streaming_with_cancellation_and_viewer_context(
+        self: &Arc<Self>,
+        tool_name: &str,
+        tool_args: serde_json::Value,
+        tool_call_id: &str,
+        cwd_override: Option<std::path::PathBuf>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+        viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
+    ) -> xai_tool_runtime::ToolStream<ToolRunResult> {
         use futures::StreamExt;
         let this = Arc::clone(self);
         let tool_name = tool_name.to_owned();
@@ -1637,11 +1656,14 @@ impl FinalizedToolset {
             };
             let DispatchParts {
                 lr_handle,
-                ctx,
+                mut ctx,
                 canonical_params,
                 output_converter,
                 effective_tool_name,
             } = parts;
+            if let Some(viewer_ctx) = viewer_ctx {
+                ctx.extensions.insert(viewer_ctx);
+            }
 
             let mut inner = lr_handle.execute(ctx, canonical_params).await;
             while let Some(item) = inner.next().await {
@@ -4917,6 +4939,43 @@ mod tests {
                 .is_none(),
             "no extension must be stamped when workspace_viewer_ctx is None",
         );
+    }
+    #[tokio::test]
+    async fn streaming_dispatch_override_enables_progress_without_workspace_viewer_context() {
+        use futures::StreamExt;
+
+        let (toolset, temp_dir) = toolset_with_viewer_ctx(None);
+        let file_path = temp_dir.path().join("streaming.txt");
+        std::fs::write(&file_path, "first line\nsecond line\n").expect("write streamed file");
+
+        let mut stream = toolset.call_streaming_with_cancellation_and_viewer_context(
+            "read_file",
+            serde_json::json!({ "target_file": file_path }),
+            "stream-override",
+            None,
+            None,
+            Some(xai_tool_runtime::WorkspaceViewerContext {
+                stream_tool_progress: true,
+            }),
+        );
+        let mut progress_count = 0;
+        let mut observed_terminal = false;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                xai_tool_runtime::ToolStreamItem::Progress(_) => progress_count += 1,
+                xai_tool_runtime::ToolStreamItem::Terminal(result) => {
+                    result.expect("streamed read succeeds");
+                    observed_terminal = true;
+                }
+            }
+        }
+
+        assert!(
+            progress_count > 0,
+            "call override must enable tool progress"
+        );
+        assert!(observed_terminal, "stream must retain its terminal result");
     }
     /// End-to-end: `FinalizedToolset` with `stream_tool_progress: true`
     /// produces `bash_output_chunk` Progress frames via `call_streaming`.
