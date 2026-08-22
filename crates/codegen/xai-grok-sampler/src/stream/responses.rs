@@ -105,6 +105,16 @@ pub(crate) fn responses_event_may_have_output(event: &rs::ResponseStreamEvent) -
         && responses_event_has_meaningful_content(event)
 }
 
+fn missing_tool_input_suffix(streamed: &mut String, complete: &str) -> Option<String> {
+    let suffix = complete.strip_prefix(streamed.as_str())?;
+    if suffix.is_empty() {
+        return None;
+    }
+    let suffix = suffix.to_owned();
+    streamed.push_str(&suffix);
+    Some(suffix)
+}
+
 /// Transform a raw Responses API event stream into a stream of
 /// [`SamplingEvent`]s.
 ///
@@ -216,12 +226,8 @@ pub(crate) fn stream_responses_tracked<'a>(
         // later `ResponseFunctionCallArgumentsDelta` events
         // look up `output_index` here to find the matching `tool_index`.
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
-        let mut custom_input_started: BTreeSet<u32> = BTreeSet::new();
-        // Output indexes whose function-call arguments have already streamed
-        // at least one delta. `function_call_arguments.done` re-sends the full
-        // arguments; a synthetic catch-up delta is only needed when no delta
-        // ever streamed.
-        let mut function_delta_started: BTreeSet<u32> = BTreeSet::new();
+        let mut custom_input_streamed: BTreeMap<u32, String> = BTreeMap::new();
+        let mut function_arguments_streamed: BTreeMap<u32, String> = BTreeMap::new();
         // Exactly-once guard for `ToolCallArgumentsComplete`, keyed by
         // Responses `output_index`.
         let mut arguments_complete_emitted: BTreeSet<u32> = BTreeSet::new();
@@ -434,13 +440,17 @@ pub(crate) fn stream_responses_tracked<'a>(
                             let tool_index = next_tool_index;
                             next_tool_index += 1;
                             output_to_tool_index.insert(added_event.output_index, tool_index);
+                            let initial_arguments = (!fc.arguments.is_empty())
+                                .then_some(fc.arguments.clone());
+                            function_arguments_streamed
+                                .insert(added_event.output_index, fc.arguments);
 
                             yield SamplingEvent::ToolCallDelta {
                                 request_id: request_id.clone(),
                                 tool_index,
                                 id: Some(fc.call_id),
                                 name: Some(fc.name),
-                                arguments_delta: None,
+                                arguments_delta: initial_arguments,
                             };
                         }
                         rs::OutputItem::CustomToolCall(ct)
@@ -450,9 +460,8 @@ pub(crate) fn stream_responses_tracked<'a>(
                             next_tool_index += 1;
                             output_to_tool_index.insert(added_event.output_index, tool_index);
                             let has_initial_input = !ct.input.is_empty();
-                            if has_initial_input {
-                                custom_input_started.insert(added_event.output_index);
-                            }
+                            custom_input_streamed
+                                .insert(added_event.output_index, ct.input.clone());
                             let call = xai_grok_sampling_types::ToolCall::custom(
                                 &ct.call_id,
                                 &ct.id,
@@ -500,10 +509,14 @@ pub(crate) fn stream_responses_tracked<'a>(
                 ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(args_event) => {
                     let delta = args_event.delta;
                     if !delta.is_empty()
+                        && !arguments_complete_emitted.contains(&args_event.output_index)
                         && let Some(&tool_index) =
                             output_to_tool_index.get(&args_event.output_index)
                     {
-                        function_delta_started.insert(args_event.output_index);
+                        function_arguments_streamed
+                            .entry(args_event.output_index)
+                            .or_default()
+                            .push_str(&delta);
                         yield SamplingEvent::ToolCallDelta {
                             request_id: request_id.clone(),
                             tool_index,
@@ -521,16 +534,21 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // hold the complete payload before the completion signal.
                 ResponseStreamEvent::ResponseFunctionCallArgumentsDone(done_event) => {
                     if let Some(&tool_index) = output_to_tool_index.get(&done_event.output_index)
+                        && !arguments_complete_emitted.contains(&done_event.output_index)
                     {
-                        if function_delta_started.insert(done_event.output_index)
-                            && !done_event.arguments.is_empty()
-                        {
+                        let streamed = function_arguments_streamed
+                            .entry(done_event.output_index)
+                            .or_default();
+                        if let Some(arguments_delta) = missing_tool_input_suffix(
+                            streamed,
+                            &done_event.arguments,
+                        ) {
                             yield SamplingEvent::ToolCallDelta {
                                 request_id: request_id.clone(),
                                 tool_index,
                                 id: None,
                                 name: None,
-                                arguments_delta: Some(done_event.arguments.clone()),
+                                arguments_delta: Some(arguments_delta),
                             };
                         }
                         if arguments_complete_emitted.insert(done_event.output_index) {
@@ -550,10 +568,14 @@ pub(crate) fn stream_responses_tracked<'a>(
                 ResponseStreamEvent::ResponseCustomToolCallInputDelta(input_event) => {
                     let delta = input_event.delta;
                     if !delta.is_empty()
+                        && !arguments_complete_emitted.contains(&input_event.output_index)
                         && let Some(&tool_index) =
                             output_to_tool_index.get(&input_event.output_index)
                     {
-                        custom_input_started.insert(input_event.output_index);
+                        custom_input_streamed
+                            .entry(input_event.output_index)
+                            .or_default()
+                            .push_str(&delta);
                         yield SamplingEvent::ToolCallDelta {
                             request_id: request_id.clone(),
                             tool_index,
@@ -683,15 +705,18 @@ pub(crate) fn stream_responses_tracked<'a>(
                                 output_to_tool_index.get(&done_event.output_index)
                                 && arguments_complete_emitted.insert(done_event.output_index)
                             {
-                                if function_delta_started.insert(done_event.output_index)
-                                    && !fc.arguments.is_empty()
+                                let streamed = function_arguments_streamed
+                                    .entry(done_event.output_index)
+                                    .or_default();
+                                if let Some(arguments_delta) =
+                                    missing_tool_input_suffix(streamed, &fc.arguments)
                                 {
                                     yield SamplingEvent::ToolCallDelta {
                                         request_id: request_id.clone(),
                                         tool_index,
                                         id: None,
                                         name: None,
-                                        arguments_delta: Some(fc.arguments.clone()),
+                                        arguments_delta: Some(arguments_delta),
                                     };
                                 }
                                 yield SamplingEvent::ToolCallArgumentsComplete {
@@ -712,15 +737,18 @@ pub(crate) fn stream_responses_tracked<'a>(
                                 output_to_tool_index.get(&done_event.output_index)
                                 && arguments_complete_emitted.insert(done_event.output_index)
                             {
-                                if custom_input_started.insert(done_event.output_index)
-                                    && !ct.input.is_empty()
+                                let streamed = custom_input_streamed
+                                    .entry(done_event.output_index)
+                                    .or_default();
+                                if let Some(arguments_delta) =
+                                    missing_tool_input_suffix(streamed, &ct.input)
                                 {
                                     yield SamplingEvent::ToolCallDelta {
                                         request_id: request_id.clone(),
                                         tool_index,
                                         id: None,
                                         name: None,
-                                        arguments_delta: Some(ct.input.clone()),
+                                        arguments_delta: Some(arguments_delta),
                                     };
                                 }
                                 yield SamplingEvent::ToolCallArgumentsComplete {
@@ -802,16 +830,22 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // the x_search lifecycle start signal.
                 ResponseStreamEvent::ResponseCustomToolCallInputDone(ev) => {
                     if let Some(&tool_index) = output_to_tool_index.get(&ev.output_index) {
-                        if !custom_input_started.contains(&ev.output_index) && !ev.input.is_empty() {
-                            yield SamplingEvent::ToolCallDelta {
-                                request_id: request_id.clone(),
-                                tool_index,
-                                id: None,
-                                name: None,
-                                arguments_delta: Some(ev.input),
-                            };
-                        }
-                        if arguments_complete_emitted.insert(ev.output_index) {
+                        if !arguments_complete_emitted.contains(&ev.output_index) {
+                            let streamed = custom_input_streamed
+                                .entry(ev.output_index)
+                                .or_default();
+                            if let Some(arguments_delta) =
+                                missing_tool_input_suffix(streamed, &ev.input)
+                            {
+                                yield SamplingEvent::ToolCallDelta {
+                                    request_id: request_id.clone(),
+                                    tool_index,
+                                    id: None,
+                                    name: None,
+                                    arguments_delta: Some(arguments_delta),
+                                };
+                            }
+                            arguments_complete_emitted.insert(ev.output_index);
                             yield SamplingEvent::ToolCallArgumentsComplete {
                                 request_id: request_id.clone(),
                                 tool_index,
@@ -889,6 +923,56 @@ pub(crate) fn stream_responses_tracked<'a>(
         // tool calls.
         if response.output.is_empty() && !completed_output_items.is_empty() {
             response.output = completed_output_items.into_values().collect();
+        }
+
+        for (output_index, item) in response.output.iter().enumerate() {
+            let Ok(output_index) = u32::try_from(output_index) else {
+                continue;
+            };
+            let Some(&tool_index) = output_to_tool_index.get(&output_index) else {
+                continue;
+            };
+            if !arguments_complete_emitted.insert(output_index) {
+                continue;
+            }
+
+            let (streamed, complete, id, name) = match item {
+                rs::OutputItem::FunctionCall(call) => (
+                    function_arguments_streamed.entry(output_index).or_default(),
+                    call.arguments.as_str(),
+                    call.call_id.clone(),
+                    call.name.clone(),
+                ),
+                rs::OutputItem::CustomToolCall(call)
+                    if client_custom_tool_names
+                        .iter()
+                        .any(|registered| registered == &call.name) =>
+                {
+                    (
+                        custom_input_streamed.entry(output_index).or_default(),
+                        call.input.as_str(),
+                        call.call_id.clone(),
+                        call.name.clone(),
+                    )
+                }
+                _ => continue,
+            };
+
+            if let Some(arguments_delta) = missing_tool_input_suffix(streamed, complete) {
+                yield SamplingEvent::ToolCallDelta {
+                    request_id: request_id.clone(),
+                    tool_index,
+                    id: None,
+                    name: None,
+                    arguments_delta: Some(arguments_delta),
+                };
+            }
+            yield SamplingEvent::ToolCallArgumentsComplete {
+                request_id: request_id.clone(),
+                tool_index,
+                id: Some(id),
+                name: Some(name),
+            };
         }
 
         // Billing fields (`prompt_tokens`, `completion_tokens`,
@@ -2610,12 +2694,19 @@ mod tests {
         // deliver exactly one completion without re-sending the bytes.
         let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
             Ok(custom_call_added_event_with_input(
-                0, "call_c2", "ctc_0", "exec", "return store.k",
+                0,
+                "call_c2",
+                "ctc_0",
+                "exec",
+                "return store.k",
             )),
             Ok(output_item_done_event(
                 0,
                 rs_types::OutputItem::CustomToolCall(custom_tool_call(
-                    "call_c2", "ctc_0", "exec", "return store.k",
+                    "call_c2",
+                    "ctc_0",
+                    "exec",
+                    "return store.k",
                 )),
             )),
             Ok(completed_event()),
@@ -2749,5 +2840,259 @@ mod tests {
             .collect();
         indexes.sort_unstable();
         assert_eq!(indexes, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn function_done_appends_only_missing_authoritative_suffix() {
+        let raw = stream::iter(vec![
+            Ok(function_call_added_event(0, "call_exec", "exec")),
+            Ok(function_call_args_delta_event(0, "{\"source\":")),
+            Ok(rs::ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+                rs_types::ResponseFunctionCallArgumentsDoneEvent {
+                    sequence_number: 0,
+                    item_id: "item-0".into(),
+                    output_index: 0,
+                    name: Some("exec".into()),
+                    arguments: "{\"source\":\"return 1\"}".into(),
+                },
+            )),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let fragments: Vec<_> = tool_call_deltas(&events)
+            .into_iter()
+            .filter_map(|(_, _, _, arguments)| arguments)
+            .collect();
+        assert_eq!(fragments, ["{\"source\":", "\"return 1\"}"]);
+        assert_eq!(tool_call_completes(&events).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn function_initial_arguments_are_streamed_before_remaining_fragments() {
+        let added = rs::ResponseStreamEvent::ResponseOutputItemAdded(
+            rs_types::ResponseOutputItemAddedEvent {
+                sequence_number: 0,
+                output_index: 0,
+                item: rs_types::OutputItem::FunctionCall(rs_types::FunctionToolCall {
+                    arguments: "{\"source\":".into(),
+                    call_id: "call_exec".into(),
+                    name: "exec".into(),
+                    id: None,
+                    status: None,
+                }),
+            },
+        );
+        let raw = stream::iter(vec![
+            Ok(added),
+            Ok(function_call_args_delta_event(0, "\"return 1\"}")),
+            Ok(rs::ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+                rs_types::ResponseFunctionCallArgumentsDoneEvent {
+                    sequence_number: 0,
+                    item_id: "item-0".into(),
+                    output_index: 0,
+                    name: Some("exec".into()),
+                    arguments: "{\"source\":\"return 1\"}".into(),
+                },
+            )),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let deltas = tool_call_deltas(&events);
+        assert_eq!(deltas[0].1.as_deref(), Some("call_exec"));
+        assert_eq!(deltas[0].3.as_deref(), Some("{\"source\":"));
+        assert_eq!(deltas[1].3.as_deref(), Some("\"return 1\"}"));
+        assert_eq!(deltas.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_custom_done_and_late_delta_never_follow_completion() {
+        let raw = stream::iter(vec![
+            Ok(custom_call_added_event(0, "call_exec", "ctc_0", "exec")),
+            Ok(custom_call_input_done_event(0, "return 1")),
+            Ok(custom_call_input_done_event(0, "return 1")),
+            Ok(custom_call_input_delta_event(0, ";late()")),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["exec".into()],
+        ))
+        .await;
+
+        let fragments: Vec<_> = tool_call_deltas(&events)
+            .into_iter()
+            .filter_map(|(_, _, _, arguments)| arguments)
+            .collect();
+        assert_eq!(fragments, ["return 1"]);
+        assert_eq!(tool_call_completes(&events).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_done_appends_missing_authoritative_suffix() {
+        let raw = stream::iter(vec![
+            Ok(custom_call_added_event(0, "call_exec", "ctc_0", "exec")),
+            Ok(custom_call_input_delta_event(0, "return ")),
+            Ok(custom_call_input_done_event(0, "return 42")),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["exec".into()],
+        ))
+        .await;
+
+        let fragments: Vec<_> = tool_call_deltas(&events)
+            .into_iter()
+            .filter_map(|(_, _, _, arguments)| arguments)
+            .collect();
+        assert_eq!(fragments, ["return ", "42"]);
+        assert_eq!(tool_call_completes(&events).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_response_finalizes_function_without_item_done() {
+        let output = rs_types::OutputItem::FunctionCall(rs_types::FunctionToolCall {
+            arguments: "{\"source\":\"return 1\"}".into(),
+            call_id: "call_exec".into(),
+            name: "exec".into(),
+            id: None,
+            status: None,
+        });
+        let raw = stream::iter(vec![
+            Ok(function_call_added_event(0, "call_exec", "exec")),
+            Ok(function_call_args_delta_event(0, "{\"source\":")),
+            Ok(completed_event_with_output(vec![output])),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let fragments: Vec<_> = tool_call_deltas(&events)
+            .into_iter()
+            .filter_map(|(_, _, _, arguments)| arguments)
+            .collect();
+        assert_eq!(fragments, ["{\"source\":", "\"return 1\"}"]);
+        assert_eq!(
+            tool_call_completes(&events),
+            [(0, Some("call_exec".into()), Some("exec".into()))]
+        );
+        assert!(matches!(
+            events.last(),
+            Some(SamplingEvent::Completed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_response_finalizes_custom_exec_without_item_done() {
+        let output = rs_types::OutputItem::CustomToolCall(custom_tool_call(
+            "call_exec",
+            "ctc_0",
+            "exec",
+            "return 42",
+        ));
+        let raw = stream::iter(vec![
+            Ok(custom_call_added_event(0, "call_exec", "ctc_0", "exec")),
+            Ok(custom_call_input_delta_event(0, "return ")),
+            Ok(completed_event_with_output(vec![output])),
+        ])
+        .boxed();
+        let events = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["exec".into()],
+        ))
+        .await;
+
+        let fragments: Vec<_> = tool_call_deltas(&events)
+            .into_iter()
+            .filter_map(|(_, _, _, arguments)| arguments)
+            .collect();
+        assert_eq!(fragments, ["return ", "42"]);
+        assert_eq!(
+            tool_call_completes(&events),
+            [(0, Some("call_exec".into()), Some("exec".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_custom_exec_input_completes_once_without_synthetic_delta() {
+        let raw = stream::iter(vec![
+            Ok(custom_call_added_event(0, "call_exec", "ctc_0", "exec")),
+            Ok(custom_call_input_done_event(0, "")),
+            Ok(custom_call_input_done_event(0, "")),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["exec".into()],
+        ))
+        .await;
+
+        assert_eq!(tool_call_deltas(&events).len(), 1);
+        assert_eq!(tool_call_completes(&events).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interrupted_custom_exec_never_emits_arguments_completion() {
+        let raw = stream::iter(vec![
+            Ok(custom_call_added_event(0, "call_exec", "ctc_0", "exec")),
+            Ok(custom_call_input_delta_event(0, "await tools.run(")),
+            Err(SamplingError::EventStreamError("connection closed".into())),
+        ])
+        .boxed();
+        let events = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["exec".into()],
+        ))
+        .await;
+
+        assert!(tool_call_completes(&events).is_empty());
+        assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
     }
 }
