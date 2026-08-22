@@ -1463,14 +1463,24 @@ pub(super) fn handle_session_notification_with_origin(
             tool_index,
             arguments_delta,
             ..
-        } => apply_tool_call_delta_chunk(
-            &mut agent.session.tracker,
-            &mut agent.scrollback,
-            name.as_deref(),
-            arguments_delta.as_deref(),
-            tool_index,
-            meta.is_replay,
-        ),
+        } => {
+            let registered_ordinary_tool = name.as_deref().is_some_and(|name| {
+                agent
+                    .session
+                    .available_tools
+                    .as_ref()
+                    .is_some_and(|tools| tools.contains(name))
+            });
+            apply_tool_call_delta_chunk(
+                &mut agent.session.tracker,
+                &mut agent.scrollback,
+                name.as_deref(),
+                arguments_delta.as_deref(),
+                tool_index,
+                meta.is_replay,
+                registered_ordinary_tool,
+            )
+        }
         _ => {
             tracing::trace!(
                 "Ignoring {}: {:?}",
@@ -1640,6 +1650,13 @@ pub(super) fn handle_child_session_notification(
             if let Some(child_view) = agent.subagent_views.get_mut(child_sid) {
                 // Child deltas are never replayed (the shell does not persist
                 // them), so no replay guard is needed here.
+                let registered_ordinary_tool = name.as_deref().is_some_and(|name| {
+                    child_view
+                        .session
+                        .available_tools
+                        .as_ref()
+                        .is_some_and(|tools| tools.contains(name))
+                });
                 apply_tool_call_delta_chunk(
                     &mut child_view.session.tracker,
                     &mut child_view.scrollback,
@@ -1647,6 +1664,7 @@ pub(super) fn handle_child_session_notification(
                     arguments_delta.as_deref(),
                     tool_index,
                     false,
+                    registered_ordinary_tool,
                 )
             } else {
                 false
@@ -1695,6 +1713,7 @@ pub(crate) fn apply_tool_call_delta_chunk_for_test(
     arguments_delta: Option<&str>,
     tool_index: u32,
     is_replay: bool,
+    registered_ordinary_tool: bool,
 ) -> bool {
     apply_tool_call_delta_chunk(
         tracker,
@@ -1703,6 +1722,7 @@ pub(crate) fn apply_tool_call_delta_chunk_for_test(
         arguments_delta,
         tool_index,
         is_replay,
+        registered_ordinary_tool,
     )
 }
 fn apply_tool_call_delta_chunk(
@@ -1712,11 +1732,15 @@ fn apply_tool_call_delta_chunk(
     arguments_delta: Option<&str>,
     tool_index: u32,
     is_replay: bool,
+    registered_ordinary_tool: bool,
 ) -> bool {
     // Deltas are streaming-only — replay never carries them, and a live
     // Code Mode block must never be reconstructed from history.
     if is_replay || !crate::appearance::cache::load_stream_tool_calls() {
         return false;
+    }
+    if registered_ordinary_tool {
+        return tracker.note_registered_tool_call_arguments_delta(scrollback, name, tool_index);
     }
     tracker.handle_tool_call_delta(scrollback, name, arguments_delta, tool_index)
 }
