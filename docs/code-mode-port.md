@@ -58,15 +58,24 @@ When Code Mode Only is effective:
 5. Tool results and errors cross the JavaScript boundary without losing their
    structured content. Successful nested `apply_patch` may resolve to `{}`;
    failed patches must reject the JS promise with the patcher's diagnostic.
+   A pending nested-tool promise supports `p.onProgress(handler)` for actual
+   incremental `{ text, payload? }` chunks; an absent structured payload is
+   omitted. Register before awaiting; registering again replaces the handler.
+   Delivery is observation-only, FIFO, and bounded to 64 queued chunks per
+   invocation; overflow drops the oldest chunk. Missing or throwing handlers,
+   closed calls, and stale runtime generations never change the terminal tool
+   result.
 6. The JavaScript runtime is persistent for a compatible agent timeline,
    replaced on rewind or incompatible provider/transport changes, and disposed
    when that session ends. Stale callbacks and yielded cell IDs fail closed.
 7. Direct-only collaboration controls remain top-level and are excluded from the
    generated `tools.*` namespace, matching Sol's multi-agent-v2 policy.
 8. `exec` and `wait` remain in model history but are transport details, not TUI
-   tool cards. The UI shows only the decoded nested tools and their ordinary
-   structured results; raw JavaScript, wait arguments, and cell transport output
-   stay hidden during live streaming and session replay.
+   activity. The UI streams the actual nested tools, their genuine progress,
+   and their ordinary structured results, whether or not JavaScript registers
+   `onProgress`. Raw JavaScript, wait arguments, source/payload fragments, cell
+   transport output, wrapper titles/spinners, and ephemeral transport blocks
+   stay hidden during live streaming, continuation chunks, and session replay.
 9. On a supported native Codex Responses route, `web__run` replaces the hosted
    web-search declaration and is callable inside JavaScript as
    `tools.web__run(...)`. Unsupported routes keep hosted search.
@@ -149,8 +158,11 @@ the advertised deadline to return without another model turn.
 The user-visible event behavior was rechecked against Codex commit
 `cbc83d961e8132bfff4d340ab8342d181b79e95e`. That revision records outer custom
 calls as raw response history but does not map them to typed TUI turn items;
-nested Code Mode invocations re-enter the normal tool dispatcher. Open Grok
-mirrors that split and also removes transport wrappers from legacy replay data.
+nested Code Mode invocations re-enter the normal tool dispatcher. The required
+Open Grok split keeps genuine nested tool cards/progress visible, suppresses all
+outer transport fragments rather than rendering transient wrappers, and removes
+transport wrappers from legacy replay data. JavaScript progress observation
+through `p.onProgress` is additive and must not replace visible ACP progress.
 
 ## Provenance and maintenance
 

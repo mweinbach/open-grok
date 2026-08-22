@@ -108,6 +108,7 @@ Ported from OpenAI Codex at the pin in [`../code-mode-port.md`](../code-mode-por
 | --- | --- |
 | `tool_name.rs` | Normalized JS identifiers vs registry keys |
 | `description.rs` | `build_exec_tool_description`, `build_wait_tool_description`, `parse_exec_source`, nested-tool filters |
+| `progress.rs` | Per-invocation bounded, non-blocking nested-tool progress channel |
 | `runtime.rs` | `ExecuteRequest`, `WaitRequest`, `RuntimeResponse`, nested call types |
 | `response.rs` | Content items / image detail |
 | `session.rs` | `CodeModeSession`, `CodeModeSessionDelegate`, `CodeModeSessionProvider`, `CellId`, `StartedCell` |
@@ -116,6 +117,7 @@ Constants:
 
 - `PUBLIC_TOOL_NAME` = `"exec"`
 - `WAIT_TOOL_NAME` = `"wait"`
+- `NESTED_TOOL_PROGRESS_CAPACITY` = `64` chunks per nested invocation; overflow drops the oldest queued chunk.
 - Pragma prefix: `// @exec:` (optional first line JSON: `yield_time_ms`, `max_output_tokens`)
 
 ### 3.2 `xai-grok-code-mode` (runtime)
@@ -245,10 +247,10 @@ JS calls `await tools.search_replace(...)` etc. The exec tool description enumer
 1. Reject nested `exec` / `wait` (no re-entrancy of transport tools).
 2. Build a synthetic `ToolCallResponse` with a fresh `exec-…` call id.
 3. **`prepare_tool_call`** — same as model tools: parse, **plan-mode edit gate**, PreToolUse hooks, permissions, path locks, auth-retry eligibility.
-4. Dispatch via workspace / tool bridge (`call_with_auth_retry`).
+4. Dispatch via workspace / tool bridge (`call_with_auth_retry`); consume actual nested-tool progress without changing its terminal result.
 5. Encode structured result for V8 (`code_mode_result()`); fire PostToolUse when configured.
 6. Failed `apply_patch` **rejects** the JS promise (`code_mode_rejection()`) after the ACP card is emitted. Successful patches still resolve to `{}`. Do not resolve failures as `{}` — the model will treat the edit as a no-op and never see the closest-match diagnostic.
-7. Nested tools **emit ordinary ACP tool cards** (user-visible).
+7. Nested tools **emit ordinary ACP tool cards** and their actual incremental progress (user-visible).
 
 Plan mode, hooks, and permission YOLO therefore apply equally to nested edits — see [editing.md](editing.md) and [agent-runtime.md](agent-runtime.md).
 
@@ -258,11 +260,37 @@ V8 threads cannot call SessionActor directly. Flow:
 
 ```text
 CodeModeSessionDelegate::invoke_tool
-  → mpsc DispatchMessage::InvokeTool
+  → mpsc DispatchMessage::InvokeTool + NestedToolProgressSink
   → LocalSet dispatch_loop / spawn_local
   → SessionActor::dispatch_code_mode_nested_tool
   → oneshot result → V8
 ```
+
+### 5.4 Nested progress (`p.onProgress`)
+
+Each `tools.*` invocation returns a promise with an observation-only
+`onProgress(handler)` method. Register before awaiting:
+
+```js
+const chunks = [];
+const pending = tools.run_terminal_command({ command: "make", description: "Build project" });
+pending.onProgress((chunk) => chunks.push(chunk));
+const result = await pending;
+```
+
+- Chunks have the shape `{ text, payload? }`: `text` is a string and `payload`
+  contains optional structured content and is omitted when absent. Shell text,
+  content blocks, and custom tool payloads preserve their respective shapes.
+- Each invocation owns a non-blocking, 64-chunk FIFO; overflow drops the oldest
+  queued chunk rather than blocking the producer or growing without bound.
+- Registering another handler replaces the previous one. Handler exceptions,
+  missing handlers, resolved calls, stale runtime generations, and closed
+  receivers cannot alter the tool's result or restart a replaced runtime.
+- User-visible ACP progress belongs to the **actual nested tool card** and is
+  independent of whether JavaScript registers `onProgress`. The JavaScript
+  observer and ACP updates are separate consumers of genuine nested-tool
+  activity. During streamed control arguments, sanitized previews may infer
+  nested tool names, but wrapper source, arguments, and payloads never render.
 
 ---
 
@@ -286,11 +314,20 @@ coalesces it with the terminal xAI function output.
 
 ## 7. UI transport hiding
 
-Contract: `exec` / `wait` are **transport**, not user tool cards. Users see **nested** tool cards only.
+Contract: `exec` / `wait` are **transport**, never user-visible activity. Users
+see the **actual nested tools**, their incremental progress, and their ordinary
+results only.
 
 ### 7.1 Live turns
 
-`execute_code_mode_control_call` sets `show_transport = !is_code_mode_transport_tool(name)`. For `exec`/`wait`, no `SessionUpdate::ToolCall` / update is sent for the wrapper. Nested dispatch still uses normal tool UI notifications.
+`execute_code_mode_control_call` sets
+`show_transport = !is_code_mode_transport_tool(name)`. For `exec`/`wait`, no
+`SessionUpdate::ToolCall` / update is sent for the wrapper. Streaming
+argument/source deltas for a confirmed transport call must also be swallowed,
+including continuation chunks after the tool name disappears. Never create a
+transient scrollback block, writing-tool spinner, dashboard preview, or other
+rendered wrapper while those fragments arrive. Nested dispatch still emits its
+own ordinary tool card and incremental ACP progress updates.
 
 ### 7.2 Explicit meta (replay / identity)
 
@@ -318,7 +355,9 @@ Constant: `CODE_MODE_TRANSPORT_META_KEY` in `session/code_mode.rs`.
 
 | Do | Don’t |
 | --- | --- |
-| Render nested `tools.*` like normal tools | Show raw JS / wait args as tool cards |
+| Render real nested `tools.*` cards and their progress | Show raw JS / wait args, wrapper payloads, or `Writing exec cell…` |
+| Suppress confirmed transport fragments before UI state/rendering | Replace transport source with a transient spinner, block, or preview |
+| Fan actual nested progress out to ACP and optional JS observers | Require `p.onProgress` before users can see nested activity |
 | Filter by meta + id sets on replay | Hide every tool titled `exec`/`wait` |
 | Keep transport items in model history | Drop custom_tool outputs from the sample transcript |
 
@@ -386,12 +425,13 @@ Deliberate Open Grok notes in the port doc: in-process V8 only; UI mirrors Codex
 
 | Layer | Where | What |
 | --- | --- | --- |
-| Protocol | `xai-grok-code-mode-protocol` (e.g. `description`, `session_tests`) | Pragma parse, names, descriptions |
-| Runtime | `xai-grok-code-mode` `service_tests`, `cell_actor/*_tests`, `session_runtime/tests`, `tests/jit.rs` | Cells, yield/wait, tools, store, shutdown |
-| Shell adapter | `session/code_mode.rs` module tests | Transport helpers, exec/wait tool shape, hosted-search policy, direct-only list |
+| Protocol | `xai-grok-code-mode-protocol` (e.g. `description`, `progress`, `session_tests`) | Pragma parse, names, descriptions, bounded FIFO/drop-oldest/close semantics |
+| Runtime | `xai-grok-code-mode` `service_tests`, `cell_actor/*_tests`, `session_runtime/tests`, `tests/jit.rs` | Cells, yield/wait, tools, store, shutdown, ordered `onProgress`, ignored handler exceptions, stale-progress rejection |
+| Shell adapter | `session/code_mode.rs` module tests | Transport helpers, exec/wait tool shape, hosted-search policy, direct-only list, text/content/custom progress mapping |
 | Standalone search | sampler `standalone_web_search`, tools `web_run`, shell `agent_rebuild` | Wire/auth, schema, permissions, native/hosted fallback |
 | Tool mode | `agent/config.rs` mixed-fallback/model-first test; `agent/models.rs` resolve tests | Precedence |
-| Turn / nested | Shell session tests + `tool_calls` behavior | Sink, prepare path |
+| Turn / nested | Shell session tests + `tool_calls` behavior | Sink, prepare path, nested-card ACP progress independent of JS observation |
+| Pager streaming | pager ACP tracker / session-notification tests | Nested tool activity stays visible; transport labels, source/payload fragments, continuation chunks, and previews never render |
 | Replay | `session/storage/mod.rs` `replay_hides_code_mode_transport_*` | Nested cards kept; wrappers dropped |
 | Settings | pager settings registry / modal tests for `code_mode` | Three enum choices, legacy bool migration, full-restart messaging |
 | Sampling types / sampler | Projection unit tests + captured Responses request tests | Codex native wire retained; xAI/DeepSeek contain no unsupported custom type; invalid custom history fails pre-network |
@@ -418,7 +458,9 @@ Also exercise plan-mode nested edits and permission deny paths when changing the
 | Nested tools append top-level function results | Duplicate history; model confuses sinks |
 | Skip plan gate / hooks / permissions on nested path | Security / plan-mode bypass |
 | Hide UI by tool **name** only | Legitimate MCP `exec`/`wait` disappear |
-| Show transport cards live or on replay | Noise; violates parity |
+| Show transport labels, raw source, payloads, or cards live/on replay | `Writing exec cell…` / JavaScript leak; violates nested-only UX |
+| Forward nested progress only to `p.onProgress`, not ACP | User never sees actual nested-tool activity while the tool runs |
+| Let progress handlers block, throw, or cross runtime generations | Slow/stale observer changes execution or leaks into another timeline |
 | Expect active Code Mode on Chat Completions / Messages | User preference falls back to Direct; an incompatible Codex hard requirement is rejected before the turn |
 | Settings overrides Codex-required `code_mode_only` | Breaks Sol and precedence tests |
 | Forget `shutdown` on session end | V8 / task leaks |
