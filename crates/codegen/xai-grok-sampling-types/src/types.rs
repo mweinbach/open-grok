@@ -2265,31 +2265,39 @@ mod tests {
 
     #[test]
     fn stream_tool_calls_request_flag_is_xai_responses_only() {
-        assert!(ModelProvider::Xai.supports_stream_tool_calls_request(ApiBackend::Responses));
-        assert!(
-            !ModelProvider::Xai.supports_stream_tool_calls_request(ApiBackend::ChatCompletions)
-        );
-        assert!(!ModelProvider::Codex.supports_stream_tool_calls_request(ApiBackend::Responses));
-        assert!(!ModelProvider::DeepSeek.supports_stream_tool_calls_request(ApiBackend::Responses));
-        assert!(!ModelProvider::Meta.supports_stream_tool_calls_request(ApiBackend::Responses));
-        assert!(
-            !ModelProvider::Kimi.supports_stream_tool_calls_request(ApiBackend::ChatCompletions)
-        );
-        assert!(should_inject_stream_tool_calls(
-            true,
+        for provider in [
             ModelProvider::Xai,
-            ApiBackend::Responses
-        ));
-        assert!(!should_inject_stream_tool_calls(
-            false,
-            ModelProvider::Xai,
-            ApiBackend::Responses
-        ));
-        assert!(!should_inject_stream_tool_calls(
-            true,
             ModelProvider::Codex,
-            ApiBackend::Responses
-        ));
+            ModelProvider::Kimi,
+            ModelProvider::Fireworks,
+            ModelProvider::DeepSeek,
+            ModelProvider::Meta,
+            ModelProvider::OpenCodeGo,
+            ModelProvider::Wafer,
+            ModelProvider::Zai,
+            ModelProvider::Runinfra,
+            ModelProvider::Gemini,
+            ModelProvider::OpenRouter,
+        ] {
+            for backend in [
+                ApiBackend::ChatCompletions,
+                ApiBackend::Responses,
+                ApiBackend::Messages,
+            ] {
+                let supported = provider == ModelProvider::Xai && backend == ApiBackend::Responses;
+                assert_eq!(
+                    provider.supports_stream_tool_calls_request(backend),
+                    supported,
+                    "provider {provider:?}, backend {backend:?}"
+                );
+                assert_eq!(
+                    should_inject_stream_tool_calls(true, provider, backend),
+                    supported,
+                    "provider {provider:?}, backend {backend:?}"
+                );
+                assert!(!should_inject_stream_tool_calls(false, provider, backend));
+            }
+        }
     }
 
     #[test]
