@@ -90,11 +90,11 @@ pub enum SamplingEvent {
     /// canonical call carried by `SamplingEvent::Completed`.
     ///
     /// Responses: fired on `function_call_arguments.done` /
-    /// `custom_tool_call_input.done`, with an `output_item.done` backstop for
-    /// providers that end the item without a done event. Messages: fired on
+    /// `custom_tool_call_input.done`, with `output_item.done` and terminal
+    /// response backstops when per-call done events are absent. Messages: fired on
     /// `content_block_stop` for `tool_use` blocks. Chat Completions has no
-    /// per-call completion signal, so it is conservative: a call completes
-    /// when a later-indexed call starts, at `finish_reason`, or at stream end.
+    /// per-call completion signal and calls may interleave, so it completes
+    /// calls only at `finish_reason` or stream end.
     ///
     /// Never emitted after `Completed`/`Failed` for that call. `id`/`name`
     /// repeat the identity only when this event is the first to carry it;

@@ -77,15 +77,9 @@ pub fn stream_chat_completions<'a>(
         // Exactly-once guard for ToolCallArgumentsComplete.
         //
         // Chat Completions has no per-call "arguments done" signal, so
-        // completion is inferred conservatively — never before a call's
-        // arguments could still grow:
-        // 1. when a strictly later-indexed call starts streaming (providers
-        //    stream tool calls sequentially by index), and
-        // 2. for every started call, when the chunk carrying `finish_reason`
-        //    has been processed or the stream ends.
-        // A call whose fragments interleave with an equal-or-lower index is
-        // deliberately not completed early; consumers fall back to the
-        // canonical calls on `Completed`.
+        // completion is inferred only once the chunk carrying `finish_reason`
+        // has been processed or the stream ends. Parallel calls may interleave
+        // arbitrarily, so a later index never proves an earlier call is done.
         let mut arguments_complete_emitted: BTreeSet<u32> = BTreeSet::new();
 
         // Index counter spanning text + reasoning chunks (matches the
@@ -212,22 +206,6 @@ pub fn stream_chat_completions<'a>(
 
                 for tc_delta in delta.tool_calls.into_iter() {
                     chunk_has_content = true;
-
-                    // A later-indexed call starting implies every
-                    // lower-indexed started call finished streaming.
-                    for earlier in tool_call_acc.keys().copied().collect::<Vec<_>>() {
-                        if earlier < tc_delta.index
-                            && arguments_complete_emitted.insert(earlier)
-                        {
-                            let (id, name, _) = &tool_call_acc[&earlier];
-                            yield SamplingEvent::ToolCallArgumentsComplete {
-                                request_id: request_id.clone(),
-                                tool_index: earlier,
-                                id: Some(id.clone()),
-                                name: Some(name.clone()),
-                            };
-                        }
-                    }
 
                     let entry = tool_call_acc
                         .entry(tc_delta.index)
@@ -1084,7 +1062,12 @@ mod tests {
         }
     }
 
-    fn tool_delta_chunk(index: u32, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> ChatCompletionChunk {
+    fn tool_delta_chunk(
+        index: u32,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+    ) -> ChatCompletionChunk {
         make_chunk(vec![ChatChunkDelta {
             role: None,
             content: None,
@@ -1113,24 +1096,57 @@ mod tests {
             .collect()
     }
 
-    /// Conservative completion: a later-indexed call starting completes the
-    /// earlier one exactly once; the terminal chunk completes everything
-    /// still open.
     #[tokio::test]
-    async fn tool_call_completions_are_conservative_and_exactly_once() {
+    async fn interleaved_tool_calls_complete_only_after_their_last_fragments() {
         let raw = stream::iter(vec![
-            Ok(tool_delta_chunk(0, Some("call_a"), Some("first"), Some("{\"a\":"))),
-            Ok(tool_delta_chunk(1, Some("call_b"), Some("second"), Some("{}"))),
+            Ok(tool_delta_chunk(
+                0,
+                Some("call_a"),
+                Some("first"),
+                Some("{\"a\":"),
+            )),
+            Ok(tool_delta_chunk(
+                1,
+                Some("call_b"),
+                Some("second"),
+                Some("{}"),
+            )),
             Ok(tool_delta_chunk(0, None, None, Some("1}"))),
             Ok(final_chunk(FinishReason::ToolCalls)),
         ])
         .boxed();
-        let events = collect(stream_chat_completions(raw, None, rid(), Duration::from_secs(60))).await;
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
 
-        // Index 0 completes exactly once when index 1 starts (the guard does
-        // not re-fire even though a stray fragment for index 0 follows);
-        // index 1 completes at the finish_reason chunk.
         assert_eq!(completes(&events), vec![0, 1]);
+        let final_first_call_delta = events
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    event,
+                    SamplingEvent::ToolCallDelta {
+                        tool_index: 0,
+                        arguments_delta: Some(arguments),
+                        ..
+                    } if arguments == "1}"
+                )
+            })
+            .unwrap();
+        let first_call_completion = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SamplingEvent::ToolCallArgumentsComplete { tool_index: 0, .. }
+                )
+            })
+            .unwrap();
+        assert!(final_first_call_delta < first_call_completion);
 
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
@@ -1153,8 +1169,47 @@ mod tests {
             Some("{}"),
         ))])
         .boxed();
-        let events = collect(stream_chat_completions(raw, None, rid(), Duration::from_secs(60))).await;
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
         assert_eq!(completes(&events), vec![0]);
-        assert!(matches!(events.last().unwrap(), SamplingEvent::Completed { .. }));
+        assert!(matches!(
+            events.last().unwrap(),
+            SamplingEvent::Completed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn interrupted_parallel_tool_calls_never_emit_completion() {
+        let raw = stream::iter(vec![
+            Ok(tool_delta_chunk(
+                0,
+                Some("call_a"),
+                Some("first"),
+                Some("{"),
+            )),
+            Ok(tool_delta_chunk(
+                1,
+                Some("call_b"),
+                Some("second"),
+                Some("{"),
+            )),
+            Err(SamplingError::EventStreamError("connection closed".into())),
+        ])
+        .boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        assert!(completes(&events).is_empty());
+        assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
     }
 }

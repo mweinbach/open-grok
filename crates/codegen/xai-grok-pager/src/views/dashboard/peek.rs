@@ -1025,16 +1025,12 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
             RenderBlock::Btw(_) => return "Btw".to_string(),
             RenderBlock::ContextInfo(_) => return "Context".to_string(),
             RenderBlock::CreditLimit(_) => return "Credit limit".to_string(),
+            RenderBlock::CodeModeStream(block) => return block.activity_label(),
             // The user's latest input marks the turn boundary — there's
             // no agent response after it yet.
             RenderBlock::UserPrompt(_) => break,
             // Structural blocks carry no response type — keep scanning.
-            RenderBlock::System(_)
-            | RenderBlock::SessionEvent(_)
-            | RenderBlock::Stub(_)
-            // Ephemeral streaming view — keep scanning (falls back to
-            // Working/Idle when nothing else answers).
-            | RenderBlock::CodeModeStream(_) => {}
+            RenderBlock::System(_) | RenderBlock::SessionEvent(_) | RenderBlock::Stub(_) => {}
         }
     }
     if running {
