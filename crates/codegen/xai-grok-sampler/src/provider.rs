@@ -10,8 +10,9 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 use xai_grok_sampling_types::{
-    ApiBackend, ChatCompletionRequest, ChatThinkingMode, ModelProvider, ProviderProfile,
-    ReasoningEffort, ReasoningSummary, RequestMetadataPolicy, ResponsesDialect, SamplingError,
+    ApiBackend, ChatCompletionRequest, ChatReasoningConfig, ChatThinkingMode, ModelProvider,
+    ProviderProfile, ReasoningEffort, ReasoningSummary, RequestMetadataPolicy, ResponsesDialect,
+    SamplingError,
 };
 
 use crate::config::SamplerConfig;
@@ -548,9 +549,10 @@ fn normalize_runinfra_deepseek_v4_flash_effort(effort: ReasoningEffort) -> Reaso
 #[derive(Debug)]
 pub struct GeminiProvider;
 
-/// OpenRouter is an OpenAI-compatible Chat Completions gateway. It keeps
-/// `reasoning_effort` for models that advertise reasoning, and drops
-/// Grok-internal `service_tier` plus per-message `model_id`.
+/// OpenRouter is an OpenAI-compatible Chat Completions gateway. It maps
+/// `reasoning_effort` onto the nested `reasoning` object OpenRouter
+/// documents, copies replayed thinking onto `messages[].reasoning`, and
+/// drops Grok-internal `service_tier` plus per-message `model_id`.
 #[derive(Debug)]
 pub struct OpenRouterProvider;
 
@@ -579,9 +581,26 @@ impl ProviderAdapter for OpenRouterProvider {
     fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
         request.service_tier = None;
         request.thinking = None;
+        if let Some(effort) = request.reasoning_effort.take() {
+            request.reasoning = Some(ChatReasoningConfig::effort(
+                normalize_openrouter_reasoning_effort(effort),
+            ));
+        }
         for message in &mut request.messages {
             message.model_id = None;
+            if message.reasoning.is_none() {
+                message.reasoning = message.reasoning_content.take();
+            } else {
+                message.reasoning_content = None;
+            }
         }
+    }
+}
+
+fn normalize_openrouter_reasoning_effort(effort: ReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ReasoningEffort::Ultra => ReasoningEffort::Max,
+        other => other,
     }
 }
 
@@ -1559,6 +1578,88 @@ mod tests {
         assert_eq!(
             normalize_gemini_reasoning_effort(Some("gemini-3.6-flash"), ReasoningEffort::Minimal),
             Some(ReasoningEffort::Minimal)
+        );
+    }
+
+    #[test]
+    fn openrouter_uses_nested_reasoning_and_message_field() {
+        use xai_grok_sampling_types::types::{ChatRequestMessage, ToolDefinition};
+
+        let assistant = ChatRequestMessage::assistant(
+            "previous turn",
+            "anthropic/claude-sonnet-4",
+            Some("prior thoughts".to_owned()),
+        );
+        let mut request = ChatCompletionRequest::new("anthropic/claude-sonnet-4", vec![assistant]);
+        request.temperature = Some(0.2);
+        request.reasoning_effort = Some(ReasoningEffort::Ultra);
+        request.service_tier = Some("priority".to_owned());
+        request.thinking = Some(ChatThinkingMode::enabled());
+        request.tools = Some(vec![ToolDefinition::function(
+            "lookup",
+            Some("Look up a value"),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"]
+            }),
+        )]);
+
+        provider_adapter(ModelProvider::OpenRouter).sanitize_chat_request(&mut request);
+
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| message.model_id.is_none())
+        );
+        assert_eq!(request.service_tier, None);
+        assert!(request.thinking.is_none());
+        assert_eq!(request.reasoning_effort, None);
+        assert_eq!(
+            request.reasoning,
+            Some(ChatReasoningConfig::effort(ReasoningEffort::Max))
+        );
+        assert_eq!(
+            request.messages[0].reasoning.as_deref(),
+            Some("prior thoughts")
+        );
+        assert!(request.messages[0].reasoning_content.is_none());
+        assert_eq!(request.temperature, Some(0.2));
+
+        let wire = serde_json::to_value(&request).expect("serializes");
+        assert!(wire.get("reasoning_effort").is_none());
+        assert_eq!(wire["reasoning"]["effort"], "max");
+        assert!(wire.get("thinking").is_none());
+        assert_eq!(wire["messages"][0]["reasoning"], "prior thoughts");
+        assert!(wire["messages"][0].get("reasoning_content").is_none());
+        assert_eq!(wire["tools"][0]["function"]["name"], "lookup");
+
+        let mut none_off = ChatCompletionRequest::new(
+            "anthropic/claude-sonnet-4",
+            vec![ChatRequestMessage::user("hi")],
+        );
+        none_off.reasoning_effort = Some(ReasoningEffort::None);
+        provider_adapter(ModelProvider::OpenRouter).sanitize_chat_request(&mut none_off);
+        assert_eq!(none_off.reasoning_effort, None);
+        assert_eq!(
+            none_off.reasoning,
+            Some(ChatReasoningConfig::effort(ReasoningEffort::None))
+        );
+
+        let mut unset =
+            ChatCompletionRequest::new("openai/gpt-4o", vec![ChatRequestMessage::user("hi")]);
+        provider_adapter(ModelProvider::OpenRouter).sanitize_chat_request(&mut unset);
+        assert!(unset.reasoning.is_none());
+        assert!(unset.reasoning_effort.is_none());
+
+        assert_eq!(
+            normalize_openrouter_reasoning_effort(ReasoningEffort::Ultra),
+            ReasoningEffort::Max
+        );
+        assert_eq!(
+            normalize_openrouter_reasoning_effort(ReasoningEffort::Xhigh),
+            ReasoningEffort::Xhigh
         );
     }
 
