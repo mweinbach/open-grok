@@ -5,7 +5,7 @@
 //! and are dispatched by the single local task started with
 //! [`CodeModeRuntime::start_dispatch_loop`].
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -330,7 +330,7 @@ impl CodeModeRuntime {
 
     /// Best-effort termination of one live cell. Unknown / already-terminal
     /// cells are a no-op, so callers never need to pre-check liveness.
-    pub(crate) async fn terminate_cell(&self, cell_id: &str) -> Result<(), String> {
+    pub(crate) async fn terminate_cell(self: &Arc<Self>, cell_id: &str) -> Result<(), String> {
         let cell_id = CellId::new(cell_id.to_string());
         if !self.known_cells.lock().contains(&cell_id) {
             return Ok(());
@@ -505,11 +505,6 @@ impl RuntimeGeneration {
     }
 }
 
-/// Replaceable owner for the session's persistent JavaScript runtime.
-///
-/// A model/provider transition or conversation rewind can invalidate the old
-/// timeline without making future Code Mode calls permanently unusable. Each
-/// dispatcher carries the generation it was created for, so callbacks that
 /// Per-sample turn context for streaming early-start of `exec` cells.
 ///
 /// Captured from `process_conversation_turn` right before sampling begins so
@@ -536,7 +531,9 @@ impl EarlyExecTurnContext {
                     .get("source")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
-                    .ok_or_else(|| "exec arguments must contain a string `source` field".to_string())
+                    .ok_or_else(|| {
+                        "exec arguments must contain a string `source` field".to_string()
+                    })
             }
             Some(active @ CodeModeTransport::Unsupported) => Err(format!(
                 "Code Mode received an incompatible `exec` call for the active {active:?} transport"
@@ -596,7 +593,9 @@ impl CodeModeEarlyExecState {
     }
 
     fn accepts_early_exec(&self) -> bool {
-        self.context.as_ref().is_some_and(|c| c.accepts_early_exec())
+        self.context
+            .as_ref()
+            .is_some_and(|c| c.accepts_early_exec())
     }
 
     fn note_delta(&mut self, tool_index: u32, id: Option<&str>, arguments_delta: Option<&str>) {
@@ -687,6 +686,14 @@ impl CodeModeEarlyExecState {
     }
 }
 
+/// Replaceable owner for the session's persistent JavaScript runtime.
+///
+/// A model/provider transition or conversation rewind can invalidate the old
+/// timeline without making future Code Mode calls permanently unusable. Each
+/// dispatcher carries the generation it was created for, so callbacks that
+/// race shutdown fail closed instead of attaching to the replacement runtime's
+/// conversation.
+pub(crate) struct CodeModeRuntimeSlot {
     current: Mutex<Arc<CodeModeRuntime>>,
     generation: Arc<AtomicU64>,
     bind_tx: Mutex<Option<mpsc::UnboundedSender<BindRuntimeRequest>>>,
@@ -928,16 +935,15 @@ async fn dispatch_message(
             )
             .await
             {
-                Ok(session_actor) => tokio::select! {
-                    response = session_actor.dispatch_code_mode_nested_tool(
-                        invocation,
-                        cancellation_token.clone(),
-                        progress,
-                    ) => response,
-                    _ = cancellation_token.cancelled() => {
-                        Err("code mode nested tool call cancelled".to_string())
-                    }
-                },
+                Ok(session_actor) => {
+                    session_actor
+                        .dispatch_code_mode_nested_tool(
+                            invocation,
+                            cancellation_token.clone(),
+                            progress,
+                        )
+                        .await
+                }
                 Err(error) => Err(error),
             };
             let _ = response_tx.send(response);

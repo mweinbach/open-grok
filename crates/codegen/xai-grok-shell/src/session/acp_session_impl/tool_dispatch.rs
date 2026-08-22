@@ -34,15 +34,26 @@ pub(super) async fn dispatch_tool(
 }
 
 /// Nested-Code-Mode variant of [`dispatch_tool`] that also forwards the
-/// dispatch stream's progress items into `progress` as observation-only
-/// chunks. The terminal result is identical to [`dispatch_tool`]; progress
-/// never touches model history or ACP updates.
-pub(super) async fn dispatch_code_mode_nested_tool_streaming(
+/// dispatch stream's progress items into both the embedded cell and the
+/// nested tool's existing ACP card without adding model conversation items.
+pub(super) async fn dispatch_code_mode_nested_tool_streaming<F, Fut>(
     workspace_ops: &xai_grok_workspace::WorkspaceOps,
     prepared: &PreparedToolCall,
     session_id: &str,
+    cancellation_token: &tokio_util::sync::CancellationToken,
     progress: &xai_grok_code_mode_protocol::NestedToolProgressSink,
-) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+    on_progress: F,
+) -> Result<ToolRunResult, xai_tool_runtime::ToolError>
+where
+    F: FnMut(acp::ToolCallUpdate) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if cancellation_token.is_cancelled() {
+        return Err(xai_tool_runtime::ToolError::new(
+            xai_tool_runtime::ToolErrorKind::Cancelled,
+            format!("Code Mode tool `{}` was cancelled", prepared.tool_name),
+        ));
+    }
     let streaming = match workspace_ops {
         xai_grok_workspace::WorkspaceOps::Local { handle } => {
             handle.session(session_id).map(|session| session.toolset())
@@ -60,22 +71,42 @@ pub(super) async fn dispatch_code_mode_nested_tool_streaming(
         mode = "local_streaming",
         "dispatch_code_mode_nested_tool_streaming"
     );
-    use futures::StreamExt;
-    let mut stream = toolset.call_streaming_with_cancellation(
+    let stream = toolset.call_streaming_with_cancellation_and_viewer_context(
         &prepared.tool_name,
         prepared.parsed_args.clone(),
         &prepared.tool_call_id.0,
-        /*cwd_override*/ None,
-        /*cancellation*/ None,
+        None,
+        Some(cancellation_token.clone()),
+        Some(xai_tool_runtime::WorkspaceViewerContext {
+            stream_tool_progress: true,
+        }),
     );
+    drain_code_mode_nested_tool_stream(stream, prepared, progress, on_progress).await
+}
+
+async fn drain_code_mode_nested_tool_stream<F, Fut>(
+    mut stream: xai_tool_runtime::ToolStream<ToolRunResult>,
+    prepared: &PreparedToolCall,
+    progress: &xai_grok_code_mode_protocol::NestedToolProgressSink,
+    mut on_progress: F,
+) -> Result<ToolRunResult, xai_tool_runtime::ToolError>
+where
+    F: FnMut(acp::ToolCallUpdate) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use futures::StreamExt;
     while let Some(item) = stream.next().await {
         match item {
             xai_tool_runtime::ToolStreamItem::Progress(progress_item) => {
+                let update = nested_tool_progress_update(prepared, &progress_item);
                 progress.push(
                     crate::session::code_mode::nested_tool_progress_from_tool_progress(
                         progress_item,
                     ),
                 );
+                if let Some(update) = update {
+                    on_progress(update).await;
+                }
             }
             xai_tool_runtime::ToolStreamItem::Terminal(result) => return result,
         }
@@ -83,6 +114,51 @@ pub(super) async fn dispatch_code_mode_nested_tool_streaming(
     Err(xai_tool_runtime::ToolError::custom(
         "stream_no_terminal",
         "dispatch stream ended without a terminal item",
+    ))
+}
+
+fn nested_tool_progress_update(
+    prepared: &PreparedToolCall,
+    progress: &xai_tool_runtime::ToolProgress,
+) -> Option<acp::ToolCallUpdate> {
+    let mut fields = acp::ToolCallUpdateFields::new().status(Some(acp::ToolCallStatus::InProgress));
+
+    match progress {
+        xai_tool_runtime::ToolProgress::Text { text } => {
+            fields = fields.content(Some(vec![acp::ToolCallContent::from(
+                acp::ContentBlock::Text(acp::TextContent::new(text.clone())),
+            )]));
+        }
+        xai_tool_runtime::ToolProgress::Content { blocks } => {
+            let content = blocks
+                .iter()
+                .filter_map(|block| serde_json::to_value(block).ok())
+                .filter_map(|block| serde_json::from_value::<acp::ContentBlock>(block).ok())
+                .map(acp::ToolCallContent::from)
+                .collect::<Vec<_>>();
+            if !content.is_empty() {
+                fields = fields.content(Some(content));
+            }
+        }
+        xai_tool_runtime::ToolProgress::Custom { subkind, payload } => {
+            if subkind == "bash_output_chunk" {
+                return None;
+            }
+            let text = payload
+                .get("delta")
+                .or_else(|| payload.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| payload.to_string());
+            fields = fields.content(Some(vec![acp::ToolCallContent::from(
+                acp::ContentBlock::Text(acp::TextContent::new(text.clone())),
+            )]));
+        }
+    }
+
+    Some(acp::ToolCallUpdate::new(
+        prepared.tool_call_id.clone(),
+        fields,
     ))
 }
 
@@ -519,7 +595,9 @@ mod tests {
             &workspace_ops,
             &nested_prepared_call(),
             "no-such-session",
+            &tokio_util::sync::CancellationToken::new(),
             &progress_sink,
+            |_| async {},
         )
         .await
         .expect_err("unbound session must fail dispatch");
@@ -528,6 +606,217 @@ mod tests {
             "fallback must surface the underlying dispatch error: {error}"
         );
         assert!(!progress_sink.is_closed());
+    }
+
+    #[tokio::test]
+    async fn nested_streaming_dispatch_rejects_cancelled_calls_before_workspace_dispatch() {
+        let workspace_ops = xai_grok_workspace::WorkspaceOps::for_test();
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        cancellation_token.cancel();
+        let (progress_sink, progress_rx) =
+            xai_grok_code_mode_protocol::nested_tool_progress_channel();
+
+        let error = dispatch_code_mode_nested_tool_streaming(
+            &workspace_ops,
+            &nested_prepared_call(),
+            "no-such-session",
+            &cancellation_token,
+            &progress_sink,
+            |_| async {},
+        )
+        .await
+        .expect_err("cancelled nested calls must not reach workspace dispatch");
+
+        assert!(error.to_string().contains("was cancelled"));
+        assert!(progress_rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn nested_text_progress_updates_the_existing_acp_card() {
+        let prepared = nested_prepared_call();
+        let update = nested_tool_progress_update(
+            &prepared,
+            &xai_tool_runtime::ToolProgress::Text {
+                text: "partial output".to_string(),
+            },
+        )
+        .expect("text progress must update its ACP card");
+
+        assert_eq!(update.tool_call_id, prepared.tool_call_id);
+        assert_eq!(update.fields.status, Some(acp::ToolCallStatus::InProgress));
+        let serialized = serde_json::to_value(update).expect("serialize ACP progress update");
+        assert_eq!(
+            serialized["content"][0]["content"]["text"],
+            "partial output"
+        );
+    }
+
+    #[test]
+    fn nested_content_progress_preserves_acp_content_blocks() {
+        let update = nested_tool_progress_update(
+            &nested_prepared_call(),
+            &xai_tool_runtime::ToolProgress::Content {
+                blocks: vec![xai_tool_runtime::ContentBlock::Text {
+                    text: "content chunk".to_string(),
+                }],
+            },
+        )
+        .expect("content progress must update its ACP card");
+
+        let serialized = serde_json::to_value(update).expect("serialize ACP progress update");
+        assert_eq!(serialized["content"][0]["content"]["text"], "content chunk");
+    }
+
+    #[test]
+    fn nested_custom_progress_surfaces_the_projected_text_delta() {
+        let update = nested_tool_progress_update(
+            &nested_prepared_call(),
+            &xai_tool_runtime::ToolProgress::Custom {
+                subkind: "grep_match_chunk".to_string(),
+                payload: serde_json::json!({ "delta": "src/main.rs:42:match\n" }),
+            },
+        )
+        .expect("grep progress must update its ACP card");
+
+        let serialized = serde_json::to_value(update).expect("serialize ACP progress update");
+        assert_eq!(
+            serialized["content"][0]["content"]["text"],
+            "src/main.rs:42:match\n"
+        );
+        assert!(serialized.get("rawOutput").is_none());
+    }
+
+    #[test]
+    fn nested_bash_progress_does_not_duplicate_notification_bridge_updates() {
+        let update = nested_tool_progress_update(
+            &nested_prepared_call(),
+            &xai_tool_runtime::ToolProgress::Custom {
+                subkind: "bash_output_chunk".to_string(),
+                payload: serde_json::json!({
+                    "delta": "hello",
+                    "total_bytes": 11,
+                    "truncated": true
+                }),
+            },
+        );
+
+        assert!(
+            update.is_none(),
+            "the notification bridge already sends canonical bash ACP progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_bash_progress_still_reaches_javascript_without_duplicate_acp_updates() {
+        let prepared = nested_prepared_call();
+        let (progress_sink, progress_rx) =
+            xai_grok_code_mode_protocol::nested_tool_progress_channel();
+        let acp_updates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stream = Box::pin(futures::stream::iter(vec![
+            xai_tool_runtime::ToolStreamItem::Progress(xai_tool_runtime::ToolProgress::Custom {
+                subkind: "bash_output_chunk".to_string(),
+                payload: serde_json::json!({ "delta": "hello" }),
+            }),
+            xai_tool_runtime::ToolStreamItem::Terminal(Err(xai_tool_runtime::ToolError::custom(
+                "stream_failed",
+                "terminal failure",
+            ))),
+        ]));
+
+        let _ = drain_code_mode_nested_tool_stream(stream, &prepared, &progress_sink, |_| {
+            let acp_updates = std::sync::Arc::clone(&acp_updates);
+            async move {
+                acp_updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .await;
+
+        assert_eq!(
+            progress_rx
+                .try_recv()
+                .expect("bash JavaScript progress")
+                .payload,
+            Some(serde_json::json!({
+                "subkind": "bash_output_chunk",
+                "payload": { "delta": "hello" }
+            }))
+        );
+        assert_eq!(acp_updates.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn nested_stream_progress_reaches_javascript_and_acp_in_order_before_terminal_error() {
+        let prepared = nested_prepared_call();
+        let (progress_sink, progress_rx) =
+            xai_grok_code_mode_protocol::nested_tool_progress_channel();
+        let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream = Box::pin(futures::stream::iter(vec![
+            xai_tool_runtime::ToolStreamItem::Progress(xai_tool_runtime::ToolProgress::Text {
+                text: "first".to_string(),
+            }),
+            xai_tool_runtime::ToolStreamItem::Progress(xai_tool_runtime::ToolProgress::Text {
+                text: "second".to_string(),
+            }),
+            xai_tool_runtime::ToolStreamItem::Terminal(Err(xai_tool_runtime::ToolError::custom(
+                "stream_failed",
+                "terminal failure",
+            ))),
+        ]));
+
+        let error =
+            drain_code_mode_nested_tool_stream(stream, &prepared, &progress_sink, |update| {
+                let updates = std::sync::Arc::clone(&updates);
+                async move {
+                    updates.lock().expect("progress update lock").push(update);
+                }
+            })
+            .await
+            .expect_err("terminal failures must propagate unchanged");
+
+        assert!(error.to_string().contains("terminal failure"));
+        assert_eq!(
+            progress_rx.try_recv().expect("first JS chunk").text,
+            "first"
+        );
+        assert_eq!(
+            progress_rx.try_recv().expect("second JS chunk").text,
+            "second"
+        );
+        assert!(progress_rx.try_recv().is_none());
+        let updates = updates.lock().expect("progress update lock");
+        assert_eq!(updates.len(), 2);
+        let serialized = updates
+            .iter()
+            .map(|update| serde_json::to_value(update).expect("serialize ACP progress update"))
+            .collect::<Vec<_>>();
+        assert_eq!(serialized[0]["content"][0]["content"]["text"], "first");
+        assert_eq!(serialized[1]["content"][0]["content"]["text"], "second");
+    }
+
+    #[tokio::test]
+    async fn nested_stream_without_terminal_fails_after_delivering_progress() {
+        let prepared = nested_prepared_call();
+        let (progress_sink, progress_rx) =
+            xai_grok_code_mode_protocol::nested_tool_progress_channel();
+        let stream = Box::pin(futures::stream::iter(vec![
+            xai_tool_runtime::ToolStreamItem::Progress(xai_tool_runtime::ToolProgress::Text {
+                text: "before disconnect".to_string(),
+            }),
+        ]));
+
+        let error =
+            drain_code_mode_nested_tool_stream(stream, &prepared, &progress_sink, |_| async {})
+                .await
+                .expect_err("streams without a terminal item must fail closed");
+
+        assert!(error.to_string().contains("without a terminal item"));
+        assert_eq!(
+            progress_rx
+                .try_recv()
+                .expect("progress before disconnect")
+                .text,
+            "before disconnect"
+        );
     }
 
     fn web_search_payload(status: rs::WebSearchToolCallStatus) -> serde_json::Value {
