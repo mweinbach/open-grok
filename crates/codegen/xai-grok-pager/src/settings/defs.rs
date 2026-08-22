@@ -1446,7 +1446,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Models,
             owner: SettingOwner::Shell,
             label: "OpenRouter API key",
-            description: "API key for OpenRouter. Saving queries its live model catalog; no models are enabled automatically.",
+            description: "API key for OpenRouter. Saving queries its live model catalog and enables every discovered text model.",
             keywords: &[
                 "openrouter",
                 "open",
@@ -1478,7 +1478,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Models,
             owner: SettingOwner::Shell,
             label: "OpenRouter models",
-            description: "Choose which discovered OpenRouter models appear in model settings and are available to subagents.",
+            description: "Discovered OpenRouter models populate the picker automatically. Leave all selected to keep the full live catalog, or narrow the list to a subset.",
             keywords: &[
                 "openrouter",
                 "open",

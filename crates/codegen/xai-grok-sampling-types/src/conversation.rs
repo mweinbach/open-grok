@@ -3350,6 +3350,7 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
                 tool_call_id: None,
                 model_id: None,
                 reasoning_content: None,
+                reasoning: None,
             }
         }
         ConversationItem::Assistant(a) => {
@@ -3376,6 +3377,7 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
                 tool_call_id: None,
                 model_id: a.model_id,
                 reasoning_content: None,
+                reasoning: None,
             }
         }
         ConversationItem::ToolResult(t) => {
@@ -3402,6 +3404,7 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
                     tool_call_id: Some(t.tool_call_id),
                     model_id: None,
                     reasoning_content: None,
+                    reasoning: None,
                 }
             } else if t.images.is_empty() {
                 ChatRequestMessage::tool(t.tool_call_id, t.content.as_ref().to_owned())
@@ -3426,6 +3429,7 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
                     tool_call_id: Some(t.tool_call_id),
                     model_id: None,
                     reasoning_content: None,
+                    reasoning: None,
                 }
             }
         }
@@ -3469,6 +3473,7 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
                 tool_call_id: Some(output.call_id),
                 model_id: None,
                 reasoning_content: None,
+                reasoning: None,
             }
         }
         // Backend tool calls have no Chat Completions equivalent.
@@ -3485,6 +3490,7 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
             tool_call_id: None,
             model_id: None,
             reasoning_content: None,
+            reasoning: None,
         },
         // Unreachable: `conversation_to_chat_messages` (the only caller)
         // folds `Reasoning` siblings into the following assistant and
@@ -3881,6 +3887,7 @@ impl From<ConversationRequest> for ChatCompletionRequest {
             search_parameters: None,
             response_format,
             reasoning_effort: req.reasoning_effort,
+            reasoning: None,
             thinking: None,
             service_tier: req.service_tier,
             x_grok_conv_id: req.x_grok_conv_id,

@@ -1165,8 +1165,8 @@ pub struct ModelsConfig {
     /// remote catalog is available only to the provider management UI.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub opencode_go_enabled_models: Vec<String>,
-    /// OpenRouter models explicitly enabled by the user. Empty means the
-    /// remote catalog is available only to the provider management UI.
+    /// OpenRouter models explicitly enabled by the user. Empty means every
+    /// discovered text model from the live catalog is available.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub openrouter_enabled_models: Vec<String>,
     /// Fallback `agent_type` for models without a per-model override.
@@ -7684,6 +7684,12 @@ reasoning_effort = "low"
         .expect("store RunInfra key");
         store_provider_api_key(home.path(), ModelProvider::Gemini, "gemini-stored-secret")
             .expect("store Gemini key");
+        store_provider_api_key(
+            home.path(),
+            ModelProvider::OpenRouter,
+            "openrouter-stored-secret",
+        )
+        .expect("store OpenRouter key");
 
         let mut meta = test_model_entry(
             "meta:muse-spark-1.2",
@@ -7779,6 +7785,33 @@ reasoning_effort = "low"
                 .is_none()
         );
         assert!(!gemini_proxy.has_usable_provider_credentials_at(home.path()));
+
+        let mut openrouter = test_model_entry(
+            "openrouter:openai/gpt-4o",
+            crate::openrouter_models::OPENROUTER_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        openrouter.info.provider = ModelProvider::OpenRouter;
+        openrouter.env_key = Some(EnvKeys::single(
+            crate::openrouter_models::OPENROUTER_API_KEY_ENV,
+        ));
+        let openrouter_creds = resolve_credentials_at_home(&openrouter, None, home.path());
+        assert_eq!(
+            openrouter_creds.api_key.as_deref(),
+            Some("openrouter-stored-secret")
+        );
+        assert!(openrouter.has_usable_provider_credentials_at(home.path()));
+
+        let mut openrouter_proxy = openrouter.clone();
+        openrouter_proxy.info.base_url = "https://proxy.example/v1".to_owned();
+        assert!(
+            resolve_credentials_at_home(&openrouter_proxy, None, home.path())
+                .api_key
+                .is_none()
+        );
+        assert!(!openrouter_proxy.has_usable_provider_credentials_at(home.path()));
     }
 
     #[test]

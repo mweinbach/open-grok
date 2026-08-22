@@ -115,8 +115,10 @@ does the same with `https://api.runinfra.ai/v1` and `RUNINFRA_GATEWAY_KEY`.
 Google Gemini defaults to
 `https://generativelanguage.googleapis.com/v1beta/openai/` and
 `env_key = "GEMINI_API_KEY"`.
-Wafer does the same with `https://pass.wafer.ai/v1` and `WAFER_API_KEY`. That
-keeps API-key-only providers from inheriting an empty or xAI endpoint.
+Wafer does the same with `https://pass.wafer.ai/v1` and `WAFER_API_KEY`.
+OpenRouter does the same with `https://openrouter.ai/api/v1` and
+`OPENROUTER_API_KEY`. That keeps API-key-only providers from inheriting an
+empty or xAI endpoint.
 
 ---
 
@@ -244,10 +246,10 @@ When you override a built-in model, Grok starts with the default configuration (
 ### Priority Order
 
 1. Your config (`[model.*]`, including tables written from Settings) -- highest priority
-2. Live provider catalogs (Z AI, RunInfra, Google Gemini, and Wafer `/models`, plus other prefetched `/v1/models` lists)
+2. Live provider catalogs (Z AI, RunInfra, Google Gemini, Wafer, and OpenRouter `/models`, plus other prefetched `/v1/models` lists)
 3. Hardcoded defaults -- lowest priority
 
-A live Z AI, RunInfra, Google Gemini, or Wafer catalog replace rebuilds that provider's picker
+A live Z AI, RunInfra, Google Gemini, Wafer, or OpenRouter catalog replace rebuilds that provider's picker
 entries, then Open Grok re-applies `[model.*]`. Custom models that the
 remote list does not return stay in the catalog, and field overrides on a
 live id (for example a larger `context_window`) win.
@@ -470,6 +472,37 @@ Defaults: 3.7-flash Medium, 3.6-flash Medium, 3.5-flash-lite Minimal,
 It has no native hosted web search, Responses API, OAuth flow, or xAI-only
 export path. Keep the Gemini API key provider-local; do not use `XAI_API_KEY`
 or an xAI session as a substitute.
+
+### OpenRouter
+
+OpenRouter is an isolated Chat Completions gateway at
+`https://openrouter.ai/api/v1`. Open Grok queries
+`GET /models?output_modalities=all` and adds every text-output model to the
+picker. Image and embedding-only models are omitted. An empty
+`openrouter_enabled_models` list keeps that full catalog; a non-empty list is
+an optional allowlist (Settings → Models → OpenRouter models).
+
+Set `OPENROUTER_API_KEY` (or connect it with `/login openrouter`) and pick a
+returned id. Reasoning menus use only that model's live `supported_efforts`
+array. Models that omit the field have no effort selector. To add an id that
+is not in the live list, use Settings or a `[model.*]` table with
+`provider = "openrouter"`:
+
+```toml
+[model.openrouter-model]
+model = "your-openrouter-model-id"
+name = "OpenRouter model"
+provider = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_backend = "chat_completions"
+env_key = "OPENROUTER_API_KEY"
+```
+
+OpenRouter accepts standard client function tools. Chat Completions
+inference sends nested `reasoning: { effort }` and reads thinking tokens from
+stream `delta.reasoning`. It has no native hosted web search, Responses API,
+OAuth flow, or xAI-only export path. Keep the OpenRouter API key
+provider-local; do not use `XAI_API_KEY` or an xAI session as a substitute.
 
 ### Anthropic (Claude)
 

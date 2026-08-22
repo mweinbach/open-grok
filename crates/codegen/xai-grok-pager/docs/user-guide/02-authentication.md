@@ -166,6 +166,30 @@ native hosted web search, Responses API, or OAuth. Its key and model catalog
 remain isolated from other providers and Gemini sessions cannot export data to
 xAI-only services.
 
+### OpenRouter
+
+OpenRouter uses an isolated API key with the OpenAI-compatible Chat
+Completions API. It does not use Open Grok's xAI or Codex login flows. Set
+the key before starting Open Grok, or connect it in a session with
+`/login openrouter` (Settings → Models → OpenRouter API key):
+
+```bash
+export OPENROUTER_API_KEY="sk-or-..."
+open-grok
+```
+
+The default base URL is `https://openrouter.ai/api/v1`; override it with
+`OPENGROK_OPENROUTER_API_BASE_URL`. Stored keys are sent only to
+`https://openrouter.ai`. Open Grok queries `GET /models?output_modalities=all`
+and adds every text-output model to the picker. Image and embedding-only
+models are omitted. An empty Settings allowlist keeps the full live catalog;
+narrow it from **Settings → Models → OpenRouter models**. Reasoning menus use
+each model's live `supported_efforts` list; models that omit that field have
+no effort selector. OpenRouter supports standard client function tools but no
+native hosted web search, Responses API, or OAuth. Its key and model catalog
+remain isolated from other providers and OpenRouter sessions cannot export
+data to xAI-only services.
+
 ---
 
 ## OIDC (Customer SSO)
