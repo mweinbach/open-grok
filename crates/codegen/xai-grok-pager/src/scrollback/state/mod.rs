@@ -1010,10 +1010,8 @@ impl ScrollbackState {
         false
     }
 
-    /// Replace the live payload of a Code Mode transport stream entry.
-    ///
-    /// The tracker sends the full capped buffer (cap + tail), not a delta.
-    /// Same cache/height invalidation contract as the other streaming pushes.
+    /// Refresh sanitized inferred nested-tool activity from a bounded private
+    /// transport buffer; the block never retains or renders that buffer.
     ///
     /// Returns true if successful, false if the entry doesn't exist or isn't
     /// a Code Mode stream block.
