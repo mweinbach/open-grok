@@ -1104,7 +1104,9 @@ impl SessionActor {
                 &self.workspace_ops,
                 &prepared,
                 self.session_info.id.0.as_ref(),
+                &cancellation_token,
                 &progress,
+                |update| self.send_update(acp::SessionUpdate::ToolCallUpdate(update), None),
             )
         };
         let (result, was_cancelled) = tokio::select! {
