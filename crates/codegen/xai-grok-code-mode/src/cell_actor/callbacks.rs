@@ -2,6 +2,8 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use futures::FutureExt;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -53,7 +55,8 @@ pub(super) fn spawn_tool<H: CellHost>(
     tasks.spawn(async move {
         let id = invocation.id.clone();
         let (progress_sink, progress_rx) = nested_tool_progress_channel();
-        spawn_progress_forwarder(
+        let progress_close = progress_sink.clone();
+        let progress_forwarder = spawn_progress_forwarder(
             id.clone(),
             progress_rx,
             runtime_tx.clone(),
@@ -65,6 +68,12 @@ pub(super) fn spawn_tool<H: CellHost>(
         })
         .catch_unwind()
         .await;
+        progress_close.close();
+        report_task_result(
+            Some(progress_forwarder.await),
+            "progress",
+            task_failure_handler.as_ref(),
+        );
         let (command, failure_reason) = match callback {
             Ok(Ok(result)) => (RuntimeCommand::ToolResponse { id, result }, None),
             Ok(Err(error_text)) => (RuntimeCommand::ToolError { id, error_text }, None),
@@ -86,15 +95,12 @@ pub(super) fn spawn_tool<H: CellHost>(
     });
 }
 
-/// Forwards queued progress chunks to the V8 runtime until the channel closes
-/// or the cell cancels. The terminal result races trailing chunks: the runtime
-/// drops progress for an already-resolved call, so late delivery fails closed.
 fn spawn_progress_forwarder(
     id: String,
     progress_rx: xai_grok_code_mode_protocol::NestedToolProgressReceiver,
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
     cancellation_token: CancellationToken,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let progress = tokio::select! {
@@ -105,17 +111,27 @@ fn spawn_progress_forwarder(
                     None => break,
                 },
             };
+            let (acknowledgement_tx, acknowledgement_rx) = oneshot::channel();
             if runtime_tx
                 .send(RuntimeCommand::ToolProgress {
                     id: id.clone(),
                     progress,
+                    acknowledgement: acknowledgement_tx,
                 })
                 .is_err()
             {
                 break;
             }
+            let stop = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => true,
+                result = acknowledgement_rx => result.is_err(),
+            };
+            if stop {
+                break;
+            }
         }
-    });
+    })
 }
 
 pub(super) async fn finish_callbacks(

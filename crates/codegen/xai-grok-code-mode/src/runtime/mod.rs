@@ -5,6 +5,7 @@ mod timers;
 mod value;
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::sync::mpsc as std_mpsc;
@@ -12,6 +13,7 @@ use std::thread;
 
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use xai_grok_code_mode_protocol::CodeModeToolKind;
 use xai_grok_code_mode_protocol::EnabledToolMetadata;
 use xai_grok_code_mode_protocol::ExecuteRequest;
@@ -38,6 +40,7 @@ pub(crate) enum RuntimeCommand {
     ToolProgress {
         id: String,
         progress: NestedToolProgress,
+        acknowledgement: oneshot::Sender<()>,
     },
     TimeoutFired {
         id: u64,
@@ -162,6 +165,7 @@ pub(super) struct RuntimeState {
     /// Progress handlers registered via `promise.onProgress(fn)`, keyed by
     /// nested tool call id. Entries are removed when the call resolves.
     pending_progress_callbacks: HashMap<String, v8::Global<v8::Function>>,
+    pending_progress_chunks: HashMap<String, VecDeque<NestedToolProgress>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     stored_values: HashMap<String, JsonValue>,
     stored_value_writes: HashMap<String, JsonValue>,
@@ -205,6 +209,7 @@ fn run_runtime(
         event_tx: event_tx.clone(),
         pending_tool_calls: HashMap::new(),
         pending_progress_callbacks: HashMap::new(),
+        pending_progress_chunks: HashMap::new(),
         pending_timeouts: HashMap::new(),
         stored_values: config.stored_values,
         stored_value_writes: HashMap::new(),
@@ -264,9 +269,14 @@ fn run_runtime(
                     return;
                 }
             }
-            RuntimeCommand::ToolProgress { id, progress } => {
+            RuntimeCommand::ToolProgress {
+                id,
+                progress,
+                acknowledgement,
+            } => {
                 // Observation-only: delivery failures never fail the runtime.
                 callbacks::deliver_tool_progress(scope, &id, progress);
+                let _ = acknowledgement.send(());
             }
             RuntimeCommand::TimeoutFired { id } => {
                 if let Err(runtime_error) = timers::invoke_timeout_callback(scope, id) {
@@ -364,7 +374,11 @@ mod tests {
     use super::RuntimeEvent;
     use super::spawn_runtime;
     use super::spawn_supervised_runtime_thread;
+    use crate::CodeModeToolKind;
     use crate::FunctionCallOutputContentItem;
+    use crate::ToolDefinition;
+    use xai_grok_code_mode_protocol::NESTED_TOOL_PROGRESS_CAPACITY;
+    use xai_grok_code_mode_protocol::ToolName;
 
     fn execute_request(source: &str) -> ExecuteRequest {
         ExecuteRequest {
@@ -482,12 +496,15 @@ mod tests {
 
         // Progress for an unknown (already resolved or never issued) call id
         // must be dropped silently: no error event, no completion.
+        let (acknowledgement_tx, acknowledgement_rx) = tokio::sync::oneshot::channel();
         runtime_tx
             .send(RuntimeCommand::ToolProgress {
                 id: "tool-404".to_string(),
                 progress: NestedToolProgress::text("stale"),
+                acknowledgement: acknowledgement_tx,
             })
             .unwrap();
+        acknowledgement_rx.await.unwrap();
         // Processing the dropped chunk re-arms the command loop, which
         // announces its next wait with a Pending event.
         assert!(matches!(
@@ -508,6 +525,87 @@ mod tests {
         runtime_control_tx
             .send(RuntimeControlCommand::Terminate)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_before_handler_registration_is_buffered_and_replayed() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut request = execute_request(
+            r#"
+const chunks = [];
+const pending = tools.echo({role: "stream"});
+await tools.echo({role: "barrier"});
+pending.onProgress((chunk) => chunks.push(chunk.text));
+await pending;
+text(JSON.stringify(chunks));
+"#,
+        );
+        request.enabled_tools.push(ToolDefinition {
+            name: "echo".to_string(),
+            tool_name: ToolName::plain("echo"),
+            description: String::new(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            output_schema: None,
+        });
+        let (runtime_tx, _runtime_control_tx, _runtime_terminate_handle) = spawn_runtime(
+            HashMap::new(),
+            request,
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let mut call_ids = Vec::new();
+        while call_ids.len() < 2 {
+            if let RuntimeEvent::ToolCall { id, .. } = event_rx.recv().await.unwrap() {
+                call_ids.push(id);
+            }
+        }
+
+        for index in 0..=NESTED_TOOL_PROGRESS_CAPACITY {
+            let (acknowledgement_tx, acknowledgement_rx) = tokio::sync::oneshot::channel();
+            runtime_tx
+                .send(RuntimeCommand::ToolProgress {
+                    id: call_ids[0].clone(),
+                    progress: NestedToolProgress::text(format!("early-{index}")),
+                    acknowledgement: acknowledgement_tx,
+                })
+                .unwrap();
+            acknowledgement_rx.await.unwrap();
+        }
+
+        for id in [call_ids[1].clone(), call_ids[0].clone()] {
+            runtime_tx
+                .send(RuntimeCommand::ToolResponse {
+                    id,
+                    result: serde_json::Value::Null,
+                })
+                .unwrap();
+        }
+
+        let mut output = None;
+        loop {
+            match event_rx.recv().await.unwrap() {
+                RuntimeEvent::ContentItem(FunctionCallOutputContentItem::InputText { text }) => {
+                    output = Some(text);
+                }
+                RuntimeEvent::Result { error_text, .. } => {
+                    assert_eq!(error_text, None);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let expected = serde_json::to_string(
+            &(1..=NESTED_TOOL_PROGRESS_CAPACITY)
+                .map(|index| format!("early-{index}"))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(output.as_deref(), Some(expected.as_str()));
     }
 
     #[tokio::test]

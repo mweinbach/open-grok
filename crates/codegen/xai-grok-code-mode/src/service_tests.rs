@@ -374,6 +374,266 @@ impl CodeModeSessionDelegate for ProgressHandshakeDelegate {
     fn cell_closed(&self, _cell_id: &CellId) {}
 }
 
+#[derive(Default)]
+struct ImmediateProgressDelegate {
+    retained_sinks: Mutex<Vec<NestedToolProgressSink>>,
+}
+
+impl CodeModeSessionDelegate for ImmediateProgressDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        invocation: CodeModeNestedToolCall,
+        _cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async move {
+            let label = invocation
+                .input
+                .as_ref()
+                .and_then(|input| input.get("label"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("tool");
+            progress.push(NestedToolProgress::with_payload(
+                format!("{label}-first"),
+                serde_json::json!({"label": label}),
+            ));
+            progress.push(NestedToolProgress::text(format!("{label}-last")));
+            self.retained_sinks.lock().unwrap().push(progress.clone());
+            Ok(JsonValue::String(format!("{label}-done")))
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+#[tokio::test]
+async fn immediate_nested_tool_progress_precedes_result_and_closes_retained_sinks() {
+    let delegate = Arc::new(ImmediateProgressDelegate::default());
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: vec![echo_tool()],
+            source: r#"
+const chunks = [];
+const pending = tools.echo({});
+pending.onProgress((chunk) => chunks.push({
+  text: chunk.text,
+  hasPayload: Object.hasOwn(chunk, "payload"),
+  payload: chunk.payload ?? null,
+}));
+text(JSON.stringify({chunks, resolved: await pending}));
+"#
+            .to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: r#"{"chunks":[{"text":"tool-first","hasPayload":true,"payload":{"label":"tool"}},{"text":"tool-last","hasPayload":false,"payload":null}],"resolved":"tool-done"}"#
+                    .to_string(),
+            }],
+            error_text: None,
+        }
+    );
+    assert!(
+        delegate
+            .retained_sinks
+            .lock()
+            .unwrap()
+            .iter()
+            .all(NestedToolProgressSink::is_closed)
+    );
+}
+
+#[tokio::test]
+async fn nested_tool_progress_survives_a_yield_and_wait_resume() {
+    let delegate = Arc::new(ReleasableToolDelegate::default());
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+
+    let initial_response = service
+        .execute_to_pending(ExecuteRequest {
+            enabled_tools: vec![echo_tool()],
+            source: r#"
+const pending = tools.echo({});
+pending.onProgress((chunk) => text(chunk.text));
+await pending;
+text("done");
+"#
+            .to_string(),
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        initial_response,
+        ExecuteToPendingOutcome::Pending {
+            cell_id: cell_id("1"),
+            content_items: Vec::new(),
+            pending_tool_call_ids: vec!["tool-1".to_string()],
+        }
+    );
+
+    wait_until_tool_started(&delegate).await;
+    delegate.push_unobserved_progress();
+    delegate.release_tool();
+
+    let response = service
+        .begin_wait(WaitRequest {
+            cell_id: cell_id("1"),
+            yield_time_ms: 10_000,
+        })
+        .await
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        WaitOutcome::LiveCell(RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "unobserved".to_string(),
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: "done".to_string(),
+                },
+            ],
+            error_text: None,
+        })
+    );
+}
+
+#[tokio::test]
+async fn shutdown_cancels_progress_forwarders_in_paused_cells() {
+    let delegate = Arc::new(ReleasableToolDelegate::default());
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+
+    let response = service
+        .execute_to_pending(ExecuteRequest {
+            enabled_tools: vec![echo_tool()],
+            source: r#"
+const pending = tools.echo({});
+pending.onProgress((chunk) => text(chunk.text));
+await pending;
+"#
+            .to_string(),
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+    assert!(matches!(response, ExecuteToPendingOutcome::Pending { .. }));
+    wait_until_tool_started(&delegate).await;
+    delegate.push_unobserved_progress();
+    tokio::task::yield_now().await;
+
+    tokio::time::timeout(Duration::from_secs(1), service.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        delegate
+            .progress_sink
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(NestedToolProgressSink::is_closed)
+    );
+}
+
+#[tokio::test]
+async fn replacing_a_progress_handler_discards_the_previous_registration() {
+    let service =
+        InProcessCodeModeSession::with_delegate(Arc::new(ImmediateProgressDelegate::default()));
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: vec![echo_tool()],
+            source: r#"
+const chunks = [];
+const pending = tools.echo({});
+pending.onProgress((chunk) => chunks.push(`old:${chunk.text}`));
+pending.onProgress((chunk) => chunks.push(`new:${chunk.text}`));
+await pending;
+text(JSON.stringify(chunks));
+"#
+            .to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: r#"["new:tool-first","new:tool-last"]"#.to_string(),
+            }],
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn concurrent_nested_tools_keep_progress_handlers_isolated() {
+    let service =
+        InProcessCodeModeSession::with_delegate(Arc::new(ImmediateProgressDelegate::default()));
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: vec![echo_tool()],
+            source: r#"
+const left = [];
+const right = [];
+const first = tools.echo({label: "left"});
+const second = tools.echo({label: "right"});
+first.onProgress((chunk) => left.push(chunk.text));
+second.onProgress((chunk) => right.push(chunk.text));
+const results = await Promise.all([first, second]);
+text(JSON.stringify({left, right, results}));
+"#
+            .to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: r#"{"left":["left-first","left-last"],"right":["right-first","right-last"],"results":["left-done","right-done"]}"#
+                    .to_string(),
+            }],
+            error_text: None,
+        }
+    );
+}
+
 #[tokio::test]
 async fn nested_tool_progress_reaches_on_progress_handler_in_order() {
     let delegate = Arc::new(ProgressHandshakeDelegate::default());

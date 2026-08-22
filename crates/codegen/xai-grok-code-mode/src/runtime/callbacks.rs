@@ -1,4 +1,5 @@
 use xai_grok_code_mode_protocol::FunctionCallOutputContentItem;
+use xai_grok_code_mode_protocol::NESTED_TOOL_PROGRESS_CAPACITY;
 use xai_grok_code_mode_protocol::NestedToolProgress;
 
 use super::EXIT_SENTINEL;
@@ -114,16 +115,30 @@ pub(super) fn tool_progress_callback(
         return;
     };
     let handler = v8::Global::new(scope, handler);
-    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-        state.pending_progress_callbacks.insert(call_id, handler);
+    let buffered = if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+        if state.pending_tool_calls.contains_key(&call_id) {
+            state
+                .pending_progress_callbacks
+                .insert(call_id.clone(), handler);
+            state.pending_progress_chunks.remove(&call_id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(buffered) = buffered {
+        for progress in buffered {
+            deliver_tool_progress(scope, &call_id, progress);
+        }
     }
     retval.set(v8::undefined(scope).into());
 }
 
 /// Delivers one progress chunk to the registered handler on the V8 thread.
 ///
-/// Observation-only by contract: unknown/resolved calls and missing handlers
-/// fail closed silently, and a throwing handler never affects the cell.
+/// Observation-only by contract: unknown/resolved calls fail closed, chunks
+/// without a handler are bounded and buffered, and handler exceptions are ignored.
 pub(super) fn deliver_tool_progress(
     scope: &mut v8::PinScope<'_, '_>,
     call_id: &str,
@@ -136,12 +151,22 @@ pub(super) fn deliver_tool_progress(
         // The call must still be pending; resolved or stale ids are dropped.
         if !state.pending_tool_calls.contains_key(call_id) {
             state.pending_progress_callbacks.remove(call_id);
+            state.pending_progress_chunks.remove(call_id);
             return;
         }
-        state.pending_progress_callbacks.get(call_id).cloned()
-    };
-    let Some(handler) = handler else {
-        return;
+        if let Some(handler) = state.pending_progress_callbacks.get(call_id).cloned() {
+            handler
+        } else {
+            let buffered = state
+                .pending_progress_chunks
+                .entry(call_id.to_string())
+                .or_default();
+            if buffered.len() >= NESTED_TOOL_PROGRESS_CAPACITY {
+                buffered.pop_front();
+            }
+            buffered.push_back(progress);
+            return;
+        }
     };
     let Ok(progress_json) = serde_json::to_value(&progress) else {
         return;

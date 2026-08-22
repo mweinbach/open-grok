@@ -30,6 +30,7 @@ pub struct NestedToolProgress {
     /// Human-readable text chunk. Empty when the chunk carries only payload.
     pub text: String,
     /// Optional structured payload (e.g. partial-result JSON).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<JsonValue>,
 }
 
@@ -57,6 +58,16 @@ struct Shared {
     /// Live [`NestedToolProgressSink`] handles. Reaching zero closes the
     /// channel, so the consumer always terminates once the invocation ends.
     sink_handles: AtomicU64,
+}
+
+impl Shared {
+    fn close(&self) {
+        {
+            let _queue = self.queue.lock();
+            self.closed.store(true, Ordering::Release);
+        }
+        self.notify.notify_waiters();
+    }
 }
 
 /// Producer half of the channel. Cloneable; pushing never blocks. Dropping
@@ -90,6 +101,9 @@ impl NestedToolProgressSink {
             return;
         }
         if let Ok(mut queue) = self.shared.queue.lock() {
+            if self.shared.closed.load(Ordering::Acquire) {
+                return;
+            }
             if queue.len() >= NESTED_TOOL_PROGRESS_CAPACITY {
                 queue.pop_front();
                 self.shared.dropped_chunks.fetch_add(1, Ordering::Relaxed);
@@ -97,6 +111,11 @@ impl NestedToolProgressSink {
             queue.push_back(progress);
         }
         self.shared.notify.notify_one();
+    }
+
+    /// Closes every producer handle while preserving already-queued chunks.
+    pub fn close(&self) {
+        self.shared.close();
     }
 
     /// Chunks dropped so far because the buffer was full.
@@ -113,8 +132,7 @@ impl NestedToolProgressSink {
 impl Drop for NestedToolProgressSink {
     fn drop(&mut self) {
         if self.shared.sink_handles.fetch_sub(1, Ordering::Release) == 1 {
-            self.shared.closed.store(true, Ordering::Release);
-            self.shared.notify.notify_waiters();
+            self.shared.close();
         }
     }
 }
@@ -126,6 +144,7 @@ impl NestedToolProgressReceiver {
         loop {
             let notified = self.shared.notify.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(progress) = self.try_recv() {
                 return Some(progress);
             }
@@ -139,8 +158,7 @@ impl NestedToolProgressReceiver {
     /// Closes the channel. Queued chunks stay readable via [`Self::try_recv`]
     /// / [`Self::recv`]; later sink pushes are dropped.
     pub fn close(&self) {
-        self.shared.closed.store(true, Ordering::Release);
-        self.shared.notify.notify_waiters();
+        self.shared.close();
     }
 
     /// Whether the channel was closed by receiver close/drop or by all
@@ -201,7 +219,12 @@ mod tests {
 
     #[test]
     fn text_constructor_leaves_payload_absent() {
-        assert_eq!(NestedToolProgress::text("hi").payload, None);
+        let progress = NestedToolProgress::text("hi");
+        assert_eq!(progress.payload, None);
+        assert_eq!(
+            serde_json::to_value(progress).unwrap(),
+            json!({"text": "hi"})
+        );
     }
 
     #[test]
@@ -293,5 +316,33 @@ mod tests {
         assert!(receiver.is_closed());
         // After the last producer handle is gone, recv must end.
         assert_eq!(receiver.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn producer_close_preserves_buffer_and_invalidates_retained_clones() {
+        let (sink, receiver) = nested_tool_progress_channel();
+        let retained_sink = sink.clone();
+        sink.push(NestedToolProgress::text("queued"));
+
+        sink.close();
+        retained_sink.push(NestedToolProgress::text("late"));
+
+        assert!(retained_sink.is_closed());
+        assert_eq!(
+            receiver.recv().await,
+            Some(NestedToolProgress::text("queued"))
+        );
+        assert_eq!(receiver.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn producer_close_wakes_an_already_waiting_receiver() {
+        let (sink, receiver) = nested_tool_progress_channel();
+        let waiter = tokio::spawn(async move { receiver.recv().await });
+        tokio::task::yield_now().await;
+
+        sink.close();
+
+        assert_eq!(waiter.await.unwrap(), None);
     }
 }
