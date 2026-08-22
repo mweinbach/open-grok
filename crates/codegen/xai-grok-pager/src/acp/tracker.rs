@@ -225,10 +225,7 @@ impl WritingToolCall {
 }
 /// Cap on remembered per-index tool names per sample (model-driven input).
 const MAX_WRITING_TOOL_NAMES: usize = 64;
-/// Code Mode transport tool names — `xai-grok-code-mode-protocol`
-/// `PUBLIC_TOOL_NAME` / `WAIT_TOOL_NAME`. Display-only match for the live
-/// streaming view; it never gates cards, persistence, or replay, so a plugin
-/// tool coincidentally named `exec`/`wait` only gets the same cosmetic view.
+/// Candidate transport names; canonical ACP cards always remain authoritative.
 const CODE_MODE_EXEC_TOOL: &str = "exec";
 const CODE_MODE_WAIT_TOOL: &str = "wait";
 /// Max concurrent remembered Code Mode transport streams per sample
@@ -453,15 +450,8 @@ pub struct AcpUpdateTracker {
     /// switch-back; `None` marks an index observed before its name arrived
     /// (it still ranks for ordinals). Cleared together with `writing_tool_call`.
     writing_tool_names: HashMap<u32, Option<String>>,
-    /// Live Code Mode transport streams keyed by `tool_index` (per current
-    /// sample). Transport tools (`exec` / `wait`) never produce tool cards,
-    /// so their accumulating payload renders in an ephemeral scrollback
-    /// block instead of the writing-tool spinner. Entry removal and map
-    /// clearing are deliberately separate: agent output retires the visible
-    /// entries, while the per-index state survives until a turn/sample
-    /// boundary so interleaved text or thought chunks don't lose the stream
-    /// identity of nameless continuation deltas. Never persisted — deltas
-    /// are streaming-only and replay never carries them.
+    /// Bounded private transport fragments used solely to infer nested tools.
+    /// Visible entries contain sanitized tool names, never transport payloads.
     code_mode_streams: HashMap<u32, CodeModeStreamState>,
     /// Pending ACP commands from the most recent `AvailableCommandsUpdate`.
     /// Consumed by the caller via `take_pending_acp_commands()`. The caller
@@ -789,9 +779,8 @@ impl AcpUpdateTracker {
             *at = std::time::Instant::now() - age;
         }
     }
-    /// Handle one `ToolCallDeltaChunk` for display: Code Mode transport tools
-    /// (`exec` / `wait`) accumulate into an ephemeral live scrollback block,
-    /// everything else keeps today's [`WritingToolCall`] spinner path.
+    /// Infer sanitized nested-tool previews from transport fragments without
+    /// exposing transport names, JavaScript, arguments, or wait payloads.
     ///
     /// The chunk's `name` is present only on its first fragment per tool per
     /// sample; later fragments carry only `arguments_delta` and are matched
@@ -814,6 +803,12 @@ impl AcpUpdateTracker {
                 // payload but reuse a still-visible entry so an index reused
                 // across samples updates in place instead of stacking blocks.
                 Some(tool) => {
+                    if !self.code_mode_streams.contains_key(&tool_index)
+                        && self.code_mode_streams.len() >= MAX_CODE_MODE_STREAMS
+                        && let Some(oldest) = self.code_mode_streams.keys().copied().min()
+                    {
+                        self.retire_code_mode_stream(scrollback, oldest);
+                    }
                     let state = self
                         .code_mode_streams
                         .entry(tool_index)
@@ -843,8 +838,17 @@ impl AcpUpdateTracker {
         };
         retry_cleared | changed
     }
-    /// Append one payload fragment to a transport stream's capped buffer and
-    /// create or update its ephemeral scrollback entry.
+
+    pub(crate) fn note_registered_tool_call_arguments_delta(
+        &mut self,
+        scrollback: &mut ScrollbackState,
+        name: Option<&str>,
+        tool_index: u32,
+    ) -> bool {
+        let retired = self.retire_code_mode_stream(scrollback, tool_index);
+        self.note_tool_call_arguments_delta(name, tool_index) || retired
+    }
+
     fn append_code_mode_stream_delta(
         &mut self,
         scrollback: &mut ScrollbackState,
@@ -873,26 +877,42 @@ impl AcpUpdateTracker {
                 state.dropped_chars += drop as u64;
             }
         }
-        match state.entry_id {
+        let nested_tools = CodeModeStreamBlock::nested_tool_names(tool, &state.payload);
+        if nested_tools.is_empty() {
+            return state
+                .entry_id
+                .take()
+                .is_some_and(|entry_id| scrollback.remove_entry(entry_id));
+        }
+
+        let first_nested_tool = nested_tools[0].clone();
+        let visible_payload = nested_tools.join("\n");
+        let entry_changed = match state.entry_id {
             Some(entry_id) => {
-                if delta.is_empty() {
-                    // No new content — don't force a redraw.
-                    return false;
+                let unchanged = scrollback.get_by_id(entry_id).is_some_and(|entry| {
+                    matches!(&entry.block, RenderBlock::CodeModeStream(block) if block.payload() == visible_payload)
+                });
+                if unchanged {
+                    false
+                } else {
+                    scrollback.set_code_mode_stream_payload(
+                        entry_id,
+                        &state.payload,
+                        state.dropped_chars,
+                    )
                 }
-                scrollback.set_code_mode_stream_payload(
-                    entry_id,
-                    &state.payload,
-                    state.dropped_chars,
-                )
             }
             None => {
                 let entry_id = scrollback.push_block(RenderBlock::CodeModeStream(
-                    CodeModeStreamBlock::new(tool, state.payload.clone(), state.dropped_chars),
+                    CodeModeStreamBlock::new(tool, &state.payload, state.dropped_chars),
                 ));
                 state.entry_id = Some(entry_id);
                 true
             }
-        }
+        };
+        let activity_changed =
+            self.note_tool_call_arguments_delta(Some(&first_nested_tool), tool_index);
+        entry_changed || activity_changed
     }
     /// Remove one transport stream's block and forget its state.
     /// Returns `true` when a visible entry was removed.
