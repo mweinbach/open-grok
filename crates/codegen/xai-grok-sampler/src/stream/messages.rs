@@ -127,7 +127,7 @@ pub fn stream_messages<'a>(
         // `rs::ReasoningItem` and emitted as a sibling
         // `ConversationItem::Reasoning` before the trailing Assistant.
         let mut assistant_text = String::new();
-        let mut assistant_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut assistant_tool_calls: BTreeMap<u32, ToolCall> = BTreeMap::new();
         let mut assistant_reasoning: Option<rs::ReasoningItem> = None;
 
         // Index counters
@@ -243,10 +243,14 @@ pub fn stream_messages<'a>(
                             };
                         }
                     }
-                    ContentBlock::ToolUse { id, name, .. } => {
+                    ContentBlock::ToolUse { id, name, input, .. } => {
                         let tool_index = next_tool_index;
                         next_tool_index += 1;
                         block_to_tool_index.insert(index, tool_index);
+                        let initial_arguments = (!input
+                            .as_object()
+                            .is_some_and(serde_json::Map::is_empty))
+                            .then(|| input.to_string());
 
                         blocks.insert(
                             index,
@@ -255,11 +259,7 @@ pub fn stream_messages<'a>(
                                 text_acc: String::new(),
                                 tool_name: name.clone(),
                                 tool_id: id.clone(),
-                                // Anthropic Messages API streams arguments via
-                                // InputJsonDelta events; starting from
-                                // "{}" then appending fragments would
-                                // produce invalid JSON.
-                                args_acc: String::new(),
+                                args_acc: initial_arguments.clone().unwrap_or_default(),
                                 thinking_acc: String::new(),
                                 signature: String::new(),
                             },
@@ -272,7 +272,7 @@ pub fn stream_messages<'a>(
                             tool_index,
                             id: Some(id),
                             name: Some(name),
-                            arguments_delta: None,
+                            arguments_delta: initial_arguments,
                         };
                     }
                     // Encrypted reasoning the model chose to redact. Deliberately
@@ -402,6 +402,19 @@ pub fn stream_messages<'a>(
                                 }
                             }
                             BlockType::ToolUse => {
+                                let mut arguments = state.args_acc;
+                                if arguments.is_empty() {
+                                    arguments.push_str("{}");
+                                    if let Some(&tool_index) = block_to_tool_index.get(&index) {
+                                        yield SamplingEvent::ToolCallDelta {
+                                            request_id: request_id.clone(),
+                                            tool_index,
+                                            id: None,
+                                            name: None,
+                                            arguments_delta: Some(arguments.clone()),
+                                        };
+                                    }
+                                }
                                 // The block's arguments are final. Emit before
                                 // assembling the canonical call so consumers
                                 // accumulating fragments can act mid-stream;
@@ -415,11 +428,13 @@ pub fn stream_messages<'a>(
                                         name: Some(state.tool_name.clone()),
                                     };
                                 }
-                                assistant_tool_calls.push(ToolCall {
-                                    id: std::sync::Arc::<str>::from(state.tool_id),
-                                    name: state.tool_name,
-                                    arguments: std::sync::Arc::<str>::from(state.args_acc),
-                                });
+                                if let Some(&tool_index) = block_to_tool_index.get(&index) {
+                                    assistant_tool_calls.insert(tool_index, ToolCall {
+                                        id: std::sync::Arc::<str>::from(state.tool_id),
+                                        name: state.tool_name,
+                                        arguments: std::sync::Arc::<str>::from(arguments),
+                                    });
+                                }
                             }
                         }
                     }
@@ -568,7 +583,7 @@ pub fn stream_messages<'a>(
 
         let assistant_item = ConversationItem::Assistant(AssistantItem {
             content: std::sync::Arc::<str>::from(assistant_text),
-            tool_calls: assistant_tool_calls,
+            tool_calls: assistant_tool_calls.into_values().collect(),
             model_id: Some(model_id),
             model_fingerprint: None,
             // The Messages API does not echo the applied reasoning effort.

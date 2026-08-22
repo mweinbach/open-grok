@@ -825,3 +825,172 @@ async fn two_tool_use_blocks_emit_two_completions() {
     indexes.sort_unstable();
     assert_eq!(indexes, vec![0, 1], "one completion per tool call");
 }
+
+#[tokio::test]
+async fn empty_tool_use_input_emits_valid_object_before_completion() {
+    let raw = stream::iter(vec![
+        Ok(message_start()),
+        Ok(MessageStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlock::ToolUse {
+                id: "call_empty".into(),
+                name: "empty_tool".into(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            },
+        }),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::ToolUse)),
+        Ok(MessageStreamEvent::MessageStop),
+    ])
+    .boxed();
+    let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    let arguments_position = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                SamplingEvent::ToolCallDelta {
+                    arguments_delta: Some(arguments),
+                    ..
+                } if arguments == "{}"
+            )
+        })
+        .unwrap();
+    let completion_position = events
+        .iter()
+        .position(|event| matches!(event, SamplingEvent::ToolCallArgumentsComplete { .. }))
+        .unwrap();
+    assert!(arguments_position < completion_position);
+
+    match events.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.tool_calls()[0].arguments.as_ref(), "{}");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn populated_tool_use_start_preserves_input_without_deltas() {
+    let raw = stream::iter(vec![
+        Ok(message_start()),
+        Ok(MessageStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlock::ToolUse {
+                id: "call_initial".into(),
+                name: "do_thing".into(),
+                input: serde_json::json!({"value": 7}),
+                cache_control: None,
+            },
+        }),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::ToolUse)),
+        Ok(MessageStreamEvent::MessageStop),
+    ])
+    .boxed();
+    let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    let fragments: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SamplingEvent::ToolCallDelta {
+                arguments_delta: Some(arguments),
+                ..
+            } => Some(arguments.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fragments, ["{\"value\":7}"]);
+    match events.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.tool_calls()[0].arguments.as_ref(), "{\"value\":7}");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn interleaved_tool_blocks_preserve_call_indexes_and_canonical_order() {
+    let tool_start = |index: u32, id: &str| MessageStreamEvent::ContentBlockStart {
+        index,
+        content_block: ContentBlock::ToolUse {
+            id: id.into(),
+            name: "do_thing".into(),
+            input: serde_json::json!({}),
+            cache_control: None,
+        },
+    };
+    let argument_delta = |index: u32, arguments: &str| MessageStreamEvent::ContentBlockDelta {
+        index,
+        delta: StreamDelta::InputJsonDelta {
+            partial_json: arguments.into(),
+        },
+    };
+    let raw = stream::iter(vec![
+        Ok(message_start()),
+        Ok(tool_start(2, "call_first")),
+        Ok(argument_delta(2, "{\"first\":")),
+        Ok(tool_start(5, "call_second")),
+        Ok(argument_delta(5, "{\"second\":2}")),
+        Ok(block_stop(5)),
+        Ok(argument_delta(2, "1}")),
+        Ok(block_stop(2)),
+        Ok(message_delta_with_stop(messages::StopReason::ToolUse)),
+        Ok(MessageStreamEvent::MessageStop),
+    ])
+    .boxed();
+    let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    let completion_indexes: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SamplingEvent::ToolCallArgumentsComplete { tool_index, .. } => Some(*tool_index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completion_indexes, [1, 0]);
+    match events.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            let calls = response.tool_calls();
+            assert_eq!(calls[0].id.as_ref(), "call_first");
+            assert_eq!(calls[0].arguments.as_ref(), "{\"first\":1}");
+            assert_eq!(calls[1].id.as_ref(), "call_second");
+            assert_eq!(calls[1].arguments.as_ref(), "{\"second\":2}");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn interrupted_tool_use_block_never_emits_arguments_completion() {
+    let raw = stream::iter(vec![
+        Ok(message_start()),
+        Ok(MessageStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlock::ToolUse {
+                id: "call_interrupted".into(),
+                name: "do_thing".into(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: StreamDelta::InputJsonDelta {
+                partial_json: "{\"value\":".into(),
+            },
+        }),
+        Err(SamplingError::EventStreamError("connection closed".into())),
+    ])
+    .boxed();
+    let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| { matches!(event, SamplingEvent::ToolCallArgumentsComplete { .. }) })
+    );
+    assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
+}
