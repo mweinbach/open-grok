@@ -53,6 +53,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            codex_permissions: None,
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,
