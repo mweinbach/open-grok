@@ -144,11 +144,19 @@ OpenRouter is an isolated, API-key-only OpenAI-compatible Chat Completions
 gateway. Its base URL is `https://openrouter.ai/api/v1` (overridable via
 `OPENGROK_OPENROUTER_API_BASE_URL`). Auth is Bearer (`OPENROUTER_API_KEY`).
 Stored keys are sent only to `https://openrouter.ai`. Open Grok queries
-`GET /models` and shows a checklist of discovered text/tool-capable models;
-none are enabled by default. Only selected models appear in normal model
-settings and are eligible for subagents. Requests include the optional
-`HTTP-Referer` and `X-Title` attribution headers. Models that advertise
-`reasoning` expose none/low/medium/high/xhigh (Medium default). OpenRouter
+`GET /models?output_modalities=all` and populates every text-output model,
+including per-model `reasoning.supported_efforts`. Image/embedding-only
+models are omitted. An empty enabled list keeps the full live catalog; a
+non-empty list is an optional allowlist. Requests include the optional
+`HTTP-Referer` and `X-Title` attribution headers. Reasoning menus use only
+the live `supported_efforts` array (`default_effort` / `mandatory` apply
+to that list). `null` means the full gateway set
+(max/xhigh/high/medium/low/minimal/none). Omitted `supported_efforts`
+hides the selector — those models reason without an effort control, or
+only via `reasoning.max_tokens`. Chat
+Completions inference sends OpenRouter's nested `reasoning: { effort }`
+object (not top-level `reasoning_effort`) and reads thinking tokens from
+stream `delta.reasoning`. OpenRouter
 accepts standard client function tools, has no Responses dialect, hosted
 tools, or native search, and must not receive xAI credentials or xAI-only
 exports.
@@ -231,7 +239,7 @@ OpenCode Go
   auth/storage.rs                               # opencode_go::api_key (generic provider scope)
 
 OpenRouter
-  xai-grok-shell/src/openrouter_models.rs       # live /models catalog + opt-in enable list
+  xai-grok-shell/src/openrouter_models.rs       # live /models catalog + per-model efforts
   auth/storage.rs                               # openrouter::api_key (generic provider scope)
 
 Custom endpoint (no credential store, no curated catalog)
@@ -309,10 +317,10 @@ Also isolated:
     custom Responses routes must opt in with
     `supports_standalone_web_search = true`; when unavailable, hosted search
     remains declared.
-18. **OpenRouter is opt-in per model.** Live `/models` is authoritative for
-    availability and limits. Image/embedding-only and non-tool models are
-    omitted. The enabled list defaults empty, and only enabled entries reach
-    normal model settings or subagent selection. Stored keys are sent only to
+18. **OpenRouter catalogs every text model.** Live `/models` is authoritative
+    for availability, limits, and reasoning efforts. Image/embedding-only
+    models are omitted. An empty enabled list keeps the full live catalog;
+    a non-empty list is an optional allowlist. Stored keys are sent only to
     `https://openrouter.ai`.
 
 ## Sampling, routing, compaction

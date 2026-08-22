@@ -4544,6 +4544,7 @@ mod tests {
             search_parameters: None,
             response_format: None,
             reasoning_effort: None,
+            reasoning: None,
             thinking: None,
             service_tier: None,
             x_grok_conv_id: None,

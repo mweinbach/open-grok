@@ -1570,6 +1570,12 @@ fn seed_openrouter_model_catalog(state: &mut SettingsModalState) {
             name: "OpenAI: GPT-4o".to_string(),
             api_backend: xai_grok_shell::sampling::ApiBackend::ChatCompletions,
         },
+        xai_grok_shell::openrouter_models::OpenRouterModelDescriptor {
+            key: "openrouter:meta-llama/llama-3.1-8b-instruct".to_string(),
+            id: "meta-llama/llama-3.1-8b-instruct".to_string(),
+            name: "Llama 3.1 8B".to_string(),
+            api_backend: xai_grok_shell::sampling::ApiBackend::ChatCompletions,
+        },
     ];
     state.pager_snapshot.openrouter_enabled_models.clear();
 }
@@ -1592,9 +1598,9 @@ fn enter_on_openrouter_models_opens_sub_sheet_and_toggles_enabled() {
         matches!(
             out,
             SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
-                if models == &["openai/gpt-4o".to_string()]
+                if models == &["meta-llama/llama-3.1-8b-instruct".to_string()]
         ),
-        "Space on a discovered OpenRouter model must enable it, got {out:?}",
+        "Space on a selected OpenRouter model must leave the rest of the live catalog, got {out:?}",
     );
 
     let out = handle_settings_key(&mut s, &press(KeyCode::Esc));
@@ -1638,9 +1644,9 @@ fn mouse_click_on_openrouter_models_opens_sub_sheet_and_toggles_enabled() {
         matches!(
             out,
             SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
-                if models == &["openai/gpt-4o".to_string()]
+                if models == &["meta-llama/llama-3.1-8b-instruct".to_string()]
         ),
-        "click on a discovered OpenRouter model must enable it, got {out:?}",
+        "click on a selected OpenRouter model must leave the rest of the live catalog, got {out:?}",
     );
 }
 

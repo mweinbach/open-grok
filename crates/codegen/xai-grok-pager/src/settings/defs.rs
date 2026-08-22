@@ -1478,7 +1478,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Models,
             owner: SettingOwner::Shell,
             label: "OpenRouter models",
-            description: "Choose which discovered OpenRouter models appear in model settings and are available to subagents.",
+            description: "Discovered OpenRouter models populate the picker automatically. Leave all selected to keep the full live catalog, or narrow the list to a subset.",
             keywords: &[
                 "openrouter",
                 "open",

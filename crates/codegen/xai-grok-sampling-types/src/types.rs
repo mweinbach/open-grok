@@ -87,6 +87,10 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<crate::rs::ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// OpenRouter nested reasoning control. Mutually exclusive with
+    /// top-level `reasoning_effort` on that gateway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ChatReasoningConfig>,
     /// Z AI GLM "thinking mode" switch; unset for every other provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ChatThinkingMode>,
@@ -134,6 +138,7 @@ impl ChatCompletionRequest {
             search_parameters: None,
             response_format: None,
             reasoning_effort: None,
+            reasoning: None,
             thinking: None,
             service_tier: None,
             x_grok_conv_id: None,
@@ -210,6 +215,10 @@ pub struct ChatRequestMessage {
     /// The reasoning/thinking content from the model (for models that support extended thinking)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// OpenRouter's assistant-message thinking field. Unset for other
+    /// Chat Completions providers, which keep `reasoning_content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl ChatRequestMessage {
@@ -222,6 +231,7 @@ impl ChatRequestMessage {
             tool_call_id: None,
             model_id: None,
             reasoning_content: None,
+            reasoning: None,
         }
     }
 
@@ -234,6 +244,7 @@ impl ChatRequestMessage {
             tool_call_id: None,
             model_id: None,
             reasoning_content: None,
+            reasoning: None,
         }
     }
 
@@ -250,6 +261,7 @@ impl ChatRequestMessage {
             tool_call_id: None,
             model_id: Some(model_id.into()),
             reasoning_content,
+            reasoning: None,
         }
     }
 
@@ -262,6 +274,7 @@ impl ChatRequestMessage {
             tool_call_id: Some(tool_call_id.into()),
             model_id: None,
             reasoning_content: None,
+            reasoning: None,
         }
     }
 
@@ -396,7 +409,7 @@ pub struct ChatResponseMessage {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallResponse>,
@@ -538,6 +551,9 @@ pub struct ChatChunkDelta {
     pub role: Option<Role>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// DeepSeek/Kimi thinking tokens. OpenRouter sends the same payload as
+    /// `reasoning`; the alias keeps one accumulator for both wire names.
+    #[serde(default, alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// OpenRouter's normalized reasoning delta field. OpenRouter streams
     /// thinking text as `delta.reasoning` (a plain string); `reasoning_content`
@@ -737,6 +753,25 @@ pub enum ReasoningEffort {
     Xhigh,
     Max,
     Ultra,
+}
+
+/// OpenRouter nested reasoning control (`reasoning.effort` body parameter).
+///
+/// OpenRouter rejects a request that sends both this object and a differing
+/// top-level `reasoning_effort`, so the OpenRouter adapter copies effort
+/// here and clears the shorthand.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChatReasoningConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+}
+
+impl ChatReasoningConfig {
+    pub fn effort(effort: ReasoningEffort) -> Self {
+        Self {
+            effort: Some(effort),
+        }
+    }
 }
 
 /// Z AI GLM "thinking mode" selector (`thinking.type` body parameter).
@@ -1218,8 +1253,8 @@ pub enum ModelProvider {
     )]
     Gemini,
     /// OpenRouter's OpenAI-compatible Chat Completions gateway
-    /// (`https://openrouter.ai/api/v1`). Models are opt-in from the live
-    /// catalog, matching OpenCode Go.
+    /// (`https://openrouter.ai/api/v1`). Models are populated from the live
+    /// catalog; an empty enabled list keeps every discovered text model.
     #[serde(alias = "open_router", alias = "open-router")]
     OpenRouter,
     /// A user-supplied server address speaking one of the three supported wire
@@ -1594,9 +1629,9 @@ impl ProviderProfile {
     };
 
     /// OpenRouter's OpenAI-compatible Chat Completions gateway. Models are
-    /// discovered live and enabled explicitly; the transport is Chat-only
-    /// with client function tools. No hosted tools, native web search, or
-    /// OAuth.
+    /// discovered live from `GET /models`, including per-model reasoning
+    /// efforts. The transport is Chat-only with client function tools. No
+    /// hosted tools, native web search, or OAuth.
     pub const OPENROUTER: Self = Self {
         provider: ModelProvider::OpenRouter,
         backends: ProviderBackends {
@@ -2404,6 +2439,28 @@ mod tests {
             assert_eq!(back, v, "round-trip {v:?}");
         }
         assert!(serde_json::from_str::<ReasoningEffort>("\"BOGUS\"").is_err());
+    }
+
+    #[test]
+    fn openrouter_reasoning_alias_deserializes_into_reasoning_content() {
+        let delta: ChatChunkDelta = serde_json::from_value(json!({
+            "role": "assistant",
+            "reasoning": "gateway thoughts"
+        }))
+        .expect("OpenRouter delta.reasoning deserializes");
+        assert_eq!(delta.reasoning_content.as_deref(), Some("gateway thoughts"));
+
+        let message: ChatResponseMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "non-stream thoughts"
+        }))
+        .expect("OpenRouter message.reasoning deserializes");
+        assert_eq!(message.content.as_deref(), Some("answer"));
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("non-stream thoughts")
+        );
     }
 
     #[test]
