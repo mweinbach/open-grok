@@ -397,9 +397,8 @@ pub enum RenderBlock {
     ContextInfo(ContextInfoBlock),
     /// Credit-limit card for max-tier users (red accent, single action).
     CreditLimit(CreditLimitBlock),
-    /// Ephemeral live payload of a streaming Code Mode transport call
-    /// (`exec` / `wait`). Never persisted and removed once the call lands —
-    /// transport tools produce no tool card by contract.
+    /// Ephemeral sanitized preview of inferred nested tools; transport source
+    /// and arguments never enter this block or persisted scrollback.
     CodeModeStream(CodeModeStreamBlock),
 }
 
