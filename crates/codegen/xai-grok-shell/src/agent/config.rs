@@ -1273,7 +1273,7 @@ impl SandboxSettingsConfig {
             .and_then(|v| v.get("sandbox")?.clone().try_into().ok())
             .unwrap_or_default()
     }
-    /// Resolve sandbox profile: requirement > CLI > env > config > "off".
+    /// Resolve sandbox profile: requirement > CLI > env > config > "workspace".
     pub fn resolve_profile(
         &self,
         cli_arg: Option<&str>,
@@ -1283,7 +1283,7 @@ impl SandboxSettingsConfig {
             return Resolved::new(val.to_owned(), ConfigSource::Requirement);
         }
         resolve_string_flag(cli_arg, "GROK_SANDBOX", self.profile.as_deref(), None)
-            .unwrap_or_else(|| Resolved::new("off".to_owned(), ConfigSource::Default))
+            .unwrap_or_else(|| Resolved::new("workspace".to_owned(), ConfigSource::Default))
     }
     /// Resolve auto_allow_bash: requirement > env > config > default (false).
     pub fn resolve_auto_allow_bash(&self, requirement: Option<bool>) -> Resolved<bool> {
