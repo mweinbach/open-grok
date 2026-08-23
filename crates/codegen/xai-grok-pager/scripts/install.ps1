@@ -1,7 +1,7 @@
 # Open Grok release installer for Windows.
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/mweinbach/open-grok/main/crates/codegen/xai-grok-pager/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/megascan/open-grok/main/crates/codegen/xai-grok-pager/scripts/install.ps1 | iex
 #   $env:OPEN_GROK_VERSION = '1.0.0-open-grok.59'; irm <url> | iex
 #
 # Environment:
@@ -48,7 +48,7 @@ if (-not $arch) {
     exit 1
 }
 
-$repository = 'mweinbach/open-grok'
+$repository = 'megascan/open-grok'
 $artifactName = "open-grok-windows-$arch.exe"
 if ($env:OPEN_GROK_RELEASE_BASE_URL) {
     $releaseUrl = $env:OPEN_GROK_RELEASE_BASE_URL.TrimEnd('/')

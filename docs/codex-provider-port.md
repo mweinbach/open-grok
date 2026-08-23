@@ -96,6 +96,22 @@ distinct in local session state while both encode as Codex `max`; Ultra adds the
 same request-local proactive delegation policy used by codex-rs. Live catalog
 metadata replaces these fallback capabilities when OpenAI changes them.
 
+GPT-5.6 Sol, Terra, and Luna publish a 1,050,000-token raw window. Codex still
+ships a smaller product-tuned default. Open Grok accepts the same top-level
+opt-in as Codex:
+
+```toml
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
+```
+
+The first key is the raw token budget (clamped to the published 1.05M spec or a
+larger live `max_context_window`); the picker and session store the 95%
+effective window. The second key is an absolute auto-compact threshold, clamped
+to 90% of that raw window. `[model.*] context_window` still wins per catalog
+key. xAI and other providers are not affected. A larger window increases usage;
+leave these unset unless the task needs the extra retained history.
+
 ## Response continuity and reasoning summaries
 
 Open Grok sends a stable `prompt_cache_key` derived from the session identity on

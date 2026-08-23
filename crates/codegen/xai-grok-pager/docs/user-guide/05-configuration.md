@@ -93,6 +93,12 @@ remote_fetch = true                    # allow optional online model-catalog fet
 auto_compact_threshold_percent = 85    # auto-compact at this % of context window (default: 85)
 load_envrc = true                      # load .envrc environment variables
 
+# Codex GPT-5.6 opt-in (OpenAI's documented 1M-context settings). Unset keeps
+# the product-tuned catalog default (~353K effective). The first value is the
+# raw window; Open Grok stores the 95% effective picker/session budget.
+# model_context_window = 1000000
+# model_auto_compact_token_limit = 900000
+
 [tools]
 respect_gitignore = false              # default: false; set true to make every tool skip gitignored files
 ```
@@ -321,6 +327,11 @@ tool_mode = "code_mode_only"
 supports_backend_search = true
 context_window = 353000
 ```
+
+To opt into GPT-5.6's published ~1.05M window instead of that catalog default,
+set the Codex-compatible top-level keys (see the `[session]` example above):
+`model_context_window = 1000000` and `model_auto_compact_token_limit = 900000`.
+A per-model `context_window` on `[model.gpt-5-6-sol]` still wins for that key.
 
 `provider = "codex"` reads only `~/.opengrok/codex-auth.json`; it never falls
 back to or modifies the xAI account in `~/.opengrok/auth.json`. Explicit `api_key`

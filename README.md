@@ -89,14 +89,14 @@ Arm, and Windows on Arm users should build from source for now.
 Apple Silicon macOS or Linux x86_64:
 
 ```sh
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/megascan/open-grok/releases/latest/download/install.sh | bash
 open-grok --version
 ```
 
 64-bit Windows PowerShell:
 
 ```powershell
-irm https://github.com/mweinbach/open-grok/releases/latest/download/install.ps1 | iex
+irm https://github.com/megascan/open-grok/releases/latest/download/install.ps1 | iex
 open-grok --version
 ```
 
@@ -114,14 +114,14 @@ installer, export the override first so it is available to `bash`:
 
 ```sh
 export OPEN_GROK_BIN_DIR="$HOME/.local/bin"
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/megascan/open-grok/releases/latest/download/install.sh | bash
 ```
 
 Install a specific version by passing it to the script (with or without a
 leading `v`):
 
 ```sh
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh \
+curl -fsSL https://github.com/megascan/open-grok/releases/latest/download/install.sh \
   | bash -s -- v0.1.220-open-grok.24
 ```
 
@@ -343,7 +343,9 @@ an upstream installation.
 
 ## Upstream provenance and license
 
-Open Grok is maintained at
+This checkout publishes releases from
+[`megascan/open-grok`](https://github.com/megascan/open-grok). The public
+upstream project remains
 [`mweinbach/open-grok`](https://github.com/mweinbach/open-grok). It is derived
 from the Grok Build local source snapshot
 `c1b5909ec707c069f1d21a93917af044e71da0d7` dated 2026-07-15. That exact

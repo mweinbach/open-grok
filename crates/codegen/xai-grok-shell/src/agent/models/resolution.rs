@@ -536,6 +536,10 @@ fn resolve_model_catalog_with_live_provider_entries(
         }
     }
 
+    crate::agent::model_context::apply_codex_style_context_overrides(cfg, &mut catalog, |slug| {
+        codex_catalog.and_then(|catalog| catalog.max_raw_context_window(slug))
+    });
+
     catalog
 }
 

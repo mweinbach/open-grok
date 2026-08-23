@@ -1488,6 +1488,19 @@ pub struct Config {
     /// Session behavior configuration.
     #[serde(default)]
     pub session: SessionConfig,
+    /// Codex-compatible raw context-window override (tokens). When set, Codex
+    /// GPT-5.6 models use this budget instead of the product-tuned catalog
+    /// default (~353K effective). Clamped to the published 1.05M spec or a
+    /// larger live `max_context_window`. Unset keeps catalog defaults.
+    /// `[model.*] context_window` still wins per key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<u64>,
+    /// Codex-compatible automatic compaction threshold (tokens). When set,
+    /// Codex sessions compact at this absolute count, clamped to 90% of the
+    /// resolved raw window. Unset keeps the live catalog limit (or 90% of
+    /// raw when the window itself was overridden).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_auto_compact_token_limit: Option<u64>,
     /// Agent definition selection configuration.
     /// Set in `config.toml` under `[agent]` to choose which agent definition
     /// is used for all sessions (unless overridden by CLI flag or ACP meta).
@@ -1922,6 +1935,8 @@ impl Default for Config {
             endpoints,
             telemetry: TelemetryConfig::default(),
             session: SessionConfig::default(),
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
             agent: AgentSelectionConfig::default(),
             repo_changes_dedup: RepoChangesDedupConfig::default(),
             skills: SkillsConfig::default(),
@@ -4137,6 +4152,7 @@ pub fn resolve_model_list_with_provider_catalogs(
     }
     apply_global_extra_headers(&mut resolved, &cfg.models);
     apply_global_scalar_defaults(&mut resolved, &cfg.models);
+    crate::agent::model_context::apply_codex_style_context_overrides(cfg, &mut resolved, |_| None);
     for entry in resolved.values_mut() {
         entry.info.derive_reasoning_effort_fields();
     }
@@ -8947,6 +8963,47 @@ reasoning_effort = "low"
         let resolved = resolve_model_list(&cfg, None);
         let model = resolved.get("my-custom-model").expect("model should exist");
         assert_eq!(model.info.context_window, NonZeroU64::new(256_000).unwrap());
+    }
+    #[test]
+    fn parses_codex_model_context_window_and_auto_compact_token_limit() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            model_context_window = 1000000
+            model_auto_compact_token_limit = 900000
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        assert_eq!(cfg.model_context_window, Some(1_000_000));
+        assert_eq!(cfg.model_auto_compact_token_limit, Some(900_000));
+        let resolved = resolve_model_list(&cfg, None);
+        let sol = resolved.get("gpt-5.6-sol").expect("sol in default catalog");
+        assert_eq!(sol.info.context_window.get(), 950_000);
+        let terra = resolved
+            .get("gpt-5.6-terra")
+            .expect("terra in default catalog");
+        assert_eq!(terra.info.context_window.get(), 950_000);
+        assert_eq!(
+            crate::agent::model_context::overridden_auto_compact_token_limit(
+                &cfg,
+                sol.info.context_window.get(),
+            ),
+            Some(900_000)
+        );
+    }
+    #[test]
+    fn default_gpt56_catalog_keeps_product_tuned_context_window() {
+        let cfg = Config::default();
+        let resolved = resolve_model_list(&cfg, None);
+        let sol = resolved.get("gpt-5.6-sol").expect("sol in default catalog");
+        assert_eq!(sol.info.context_window.get(), 353_000);
+        assert_eq!(
+            crate::agent::model_context::overridden_auto_compact_token_limit(
+                &cfg,
+                sol.info.context_window.get(),
+            ),
+            None
+        );
     }
     #[test]
     fn parses_codex_provider_for_model_credentials_and_wire_contract() {

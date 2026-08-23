@@ -31,9 +31,9 @@ const MSG_RUN_UPDATE_MANUAL: &str = "Run `open-grok update` to get the latest ve
 /// Manual-install one-liner for this platform's bootstrap installer.
 fn manual_install_cmd() -> &'static str {
     if cfg!(windows) {
-        "irm https://github.com/mweinbach/open-grok/releases/latest/download/install.ps1 | iex"
+        "irm https://github.com/megascan/open-grok/releases/latest/download/install.ps1 | iex"
     } else {
-        "curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash"
+        "curl -fsSL https://github.com/megascan/open-grok/releases/latest/download/install.sh | bash"
     }
 }
 
@@ -1125,7 +1125,7 @@ async fn install_open_grok_release(
 
 /// Install a pinned Open Grok release from a GitHub-Releases-compatible base
 /// URL. Exposed for an isolated updater integration test; production callers
-/// use the fixed mweinbach/open-grok URL from [`UpdateConfig`].
+/// use the fixed megascan/open-grok URL from [`UpdateConfig`].
 #[doc(hidden)]
 pub async fn install_open_grok_release_from_base(
     target: &str,

@@ -2,3 +2,5 @@
 /dist/
 **/*.rs.bk
 .DS_Store
+/target-gpt56
+/target-openrouter-pr

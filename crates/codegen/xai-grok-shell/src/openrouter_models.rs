@@ -30,7 +30,7 @@ const OPENROUTER_GATEWAY_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Minimal,
     ReasoningEffort::None,
 ];
-const OPENROUTER_HTTP_REFERER: &str = "https://github.com/mweinbach/open-grok";
+const OPENROUTER_HTTP_REFERER: &str = "https://github.com/megascan/open-grok";
 const OPENROUTER_APP_TITLE: &str = "Open Grok";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

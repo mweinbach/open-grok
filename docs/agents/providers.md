@@ -304,6 +304,7 @@ Also isolated:
 | | xAI | Codex |
 | --- | --- | --- |
 | Default | Grok Build local/summary compaction | Remote Compaction V2 over streaming `/responses` |
+| Context window | catalog / `[model.*]` | product-tuned ~353K effective; opt into GPT-5.6's published 1.05M raw window with top-level `model_context_window` + `model_auto_compact_token_limit` (Codex-compatible; see `docs/codex-provider-port.md`) |
 | Legacy | — | unary `/responses/compact` if feature flag off |
 | Cross-provider switch | — | compacted Codex → xAI uses **plaintext fallback only**; never replay opaque Codex items |
 
