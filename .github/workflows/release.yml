@@ -102,6 +102,7 @@ jobs:
           rustc -vV
 
       - name: Restore Cargo cache
+        id: cargo-cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -109,10 +110,11 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          # Unique primary key so this run can save. restore-keys prefix-matches
-          # the newest previous release cache (GitHub cache is write-once).
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Keep one reusable cache per dependency/toolchain configuration.
+          # Source fingerprints still make Cargo rebuild changed workspace crates.
+          key: rust-release-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build and verify Windows release
@@ -120,7 +122,7 @@ jobs:
         run: .\scripts\build-windows-release.ps1
 
       - name: Save Cargo cache
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -129,7 +131,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Upload Windows assets
         uses: actions/upload-artifact@v7
@@ -171,6 +173,7 @@ jobs:
           rustc -vV
 
       - name: Restore Cargo cache
+        id: cargo-cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -178,8 +181,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: rust-release-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install pinned ripgrep
@@ -246,7 +250,7 @@ jobs:
           "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
 
       - name: Save Cargo cache
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -255,7 +259,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Upload macOS and common assets
         uses: actions/upload-artifact@v7
@@ -299,6 +303,7 @@ jobs:
           rustc -vV
 
       - name: Restore Cargo cache
+        id: cargo-cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -306,8 +311,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: rust-release-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install pinned ripgrep
@@ -374,7 +380,7 @@ jobs:
           "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
 
       - name: Save Cargo cache
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -383,7 +389,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Upload Linux assets
         uses: actions/upload-artifact@v7
@@ -425,6 +431,7 @@ jobs:
           rustc -vV
 
       - name: Restore Cargo cache
+        id: cargo-cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -432,8 +439,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: rust-release-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install pinned ripgrep
@@ -500,7 +508,7 @@ jobs:
           "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
 
       - name: Save Cargo cache
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -509,7 +517,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Upload Linux arm64 assets
         uses: actions/upload-artifact@v7
