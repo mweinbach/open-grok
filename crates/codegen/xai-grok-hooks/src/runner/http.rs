@@ -134,7 +134,7 @@ fn build_hook_client(timeout_ms: u64) -> reqwest::Client {
 pub async fn run_http_hook(
     spec: &HookSpec,
     envelope: &HookEventEnvelope,
-    _ctx: &RunContext<'_>,
+    ctx: &RunContext<'_>,
     mode: GateKind,
 ) -> HookRunOutput {
     let start = Instant::now();
@@ -151,7 +151,17 @@ pub async fn run_http_hook(
     // vars (e.g. `${CLAUDE_PLUGIN_ROOT}/check`) only land in `extra_env` after
     // the plugin adapter runs. Unset refs are preserved so `validate_hook_url`
     // rejects them rather than smuggling a literal `${VAR}` past validation.
-    let expanded_url = crate::env_expand::expand_env_vars_with_extra(raw_url, &spec.extra_env);
+    let mut url_env = spec.extra_env.clone();
+    for (name, value) in [
+        ("GROK_HOOK_EVENT", envelope.hook_event_name.to_string()),
+        ("GROK_HOOK_NAME", spec.name.clone()),
+        ("GROK_SESSION_ID", ctx.session_id.to_owned()),
+        ("GROK_WORKSPACE_ROOT", ctx.workspace_root.to_owned()),
+        ("CLAUDE_PROJECT_DIR", ctx.workspace_root.to_owned()),
+    ] {
+        url_env.insert(name.to_owned(), value);
+    }
+    let expanded_url = crate::env_expand::expand_env_vars_with_extra(raw_url, &url_env);
     let url: &str = &expanded_url;
     // Prefer the pre-expansion source for logs so resolved `env` secrets don't
     // reach `~/.opengrok/logs`; threaded into the reqwest error format below so
@@ -724,6 +734,60 @@ mod tests {
             info.raw_url.as_deref(),
             Some("https://${INTERNAL_HOST_SSRF}/hook"),
             "HttpInfo.raw_url must mirror HookSpec::url_raw"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_http_hook_uses_authentic_runner_identity_for_url_expansion() {
+        let raw = "https://${GROK_SESSION_ID}/hook";
+        let spec = HookSpec {
+            name: "test-authentic-runner-identity".into(),
+            event: HookEventName::PreToolUse,
+            handler_type: crate::config::HandlerType::Http,
+            configured_matcher: None,
+            matcher: None,
+            enabled: true,
+            command: None,
+            command_raw: None,
+            url: Some(raw.to_owned()),
+            url_raw: Some(raw.to_owned()),
+            timeout_ms: 1000,
+            source_dir: std::env::temp_dir(),
+            extra_env: std::collections::HashMap::from([(
+                "GROK_SESSION_ID".to_owned(),
+                "spoofed.example.com".to_owned(),
+            )]),
+            layer: crate::config::HookProvenance::File,
+        };
+        let envelope = HookEventEnvelope {
+            hook_event_name: HookEventName::PreToolUse,
+            session_id: "10.0.0.1".into(),
+            cwd: "/tmp".into(),
+            workspace_root: "/tmp".into(),
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            transcript_path: None,
+            client_identifier: None,
+            prompt_id: None,
+            permission_mode: None,
+            payload: HookPayload::PreToolUse {
+                tool_name: "test".into(),
+                tool_use_id: "id-1".into(),
+                tool_input: serde_json::json!({}),
+                tool_input_truncated: false,
+                subagent_type: None,
+            },
+        };
+        let context = crate::runner::RunContext {
+            session_id: "10.0.0.1",
+            workspace_root: "/tmp",
+            process_scope: None,
+        };
+
+        let (result, _, info) = run_http_hook(&spec, &envelope, &context, GateKind::Tool).await;
+        assert!(matches!(result, crate::runner::HookRunnerResult::Failed(_)));
+        assert_eq!(
+            info.expect("SSRF rejection records HTTP metadata").url,
+            "https://10.0.0.1/hook",
         );
     }
 

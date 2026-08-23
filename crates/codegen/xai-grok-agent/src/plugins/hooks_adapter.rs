@@ -139,8 +139,10 @@ fn process_hooks_content(
         });
         if let Some(cmd_str) = raw_command {
             let substituted = substitute_env_vars(&cmd_str, plugin_root, plugin_data);
-            let expanded =
-                xai_grok_hooks::expand_env_vars_with_extra(&substituted, &spec.extra_env);
+            let expanded = xai_grok_hooks::config::expand_env_vars_with_extra_skipping_runner_vars(
+                &substituted,
+                &spec.extra_env,
+            );
             spec.command = Some(PathBuf::from(expanded));
         }
     }
