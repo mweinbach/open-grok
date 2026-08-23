@@ -1458,3 +1458,100 @@ fn resolve_normalized_remote_urls_deduplicates_across_transports() {
     // Both should normalize to the same value and dedup.
     assert_eq!(urls, vec!["github.com/xai-org/example"]);
 }
+
+/// A well-formed OID that no fresh repository has an object for.
+const MISSING_OID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+fn init_git2_repo_with_commit(dir: &Path) -> (git2::Repository, git2::Oid) {
+    let repo = git2::Repository::init(dir).expect("init repo");
+    let oid = {
+        let signature = git2::Signature::now("test", "test@test.com").expect("signature");
+        let mut index = repo.index().expect("index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit")
+    };
+    (repo, oid)
+}
+
+fn point_head_at_missing_object(repo: &git2::Repository, oid: &str) {
+    let head_ref = repo.head().expect("head").name().expect("name").to_owned();
+    std::fs::write(repo.commondir().join(&head_ref), format!("{oid}\n")).expect("write ref");
+
+    // Open a fresh handle because libgit2 caches refs.
+    let fresh = git2::Repository::open(repo.path()).expect("reopen repo");
+    assert!(
+        fresh.head().expect("head").peel_to_commit().is_err(),
+        "peeling must fail to exercise refs-only HEAD resolution",
+    );
+}
+
+#[test]
+fn metadata_resolves_head_when_object_missing() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let (repo, _) = init_git2_repo_with_commit(temporary.path());
+    let branch = repo
+        .head()
+        .expect("head")
+        .shorthand()
+        .expect("branch")
+        .to_owned();
+
+    point_head_at_missing_object(&repo, MISSING_OID);
+
+    let metadata = resolve_persisted_session_git_metadata_sync(temporary.path());
+    assert_eq!(metadata.head_commit.as_deref(), Some(MISSING_OID));
+    assert_eq!(metadata.head_branch.as_deref(), Some(branch.as_str()));
+}
+
+#[tokio::test]
+async fn get_current_commit_reads_head_from_refs() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+
+    git2::Repository::init(temporary.path()).expect("init repo");
+    assert!(get_current_commit(temporary.path()).await.is_none());
+
+    let (repo, commit_oid) = init_git2_repo_with_commit(temporary.path());
+    assert_eq!(
+        get_current_commit(temporary.path()).await.as_deref(),
+        Some(commit_oid.to_string().as_str()),
+    );
+
+    point_head_at_missing_object(&repo, MISSING_OID);
+    assert_eq!(
+        get_current_commit(temporary.path()).await.as_deref(),
+        Some(MISSING_OID),
+    );
+}
+
+#[tokio::test]
+async fn status_reports_head_oid_when_object_missing() {
+    xai_test_utils::require_git!();
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let (repo, _) = init_git2_repo_with_commit(temporary.path());
+    point_head_at_missing_object(&repo, MISSING_OID);
+
+    let data = status(
+        temporary.path(),
+        /*include_untracked*/ false,
+        /*include_stats*/ false,
+        /*ignore_submodules*/ true,
+        /*include_patches*/ false,
+    )
+    .await
+    .expect("status");
+    assert_eq!(data.commit.as_deref(), Some(MISSING_OID));
+}
+
+#[tokio::test]
+async fn checkout_commit_with_fetch_repairs_missing_head_object() {
+    xai_test_utils::require_git!();
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let (repo, _) = init_git2_repo_with_commit(temporary.path());
+    point_head_at_missing_object(&repo, MISSING_OID);
+
+    let response =
+        checkout_commit_with_fetch(temporary.path(), MISSING_OID, /*stash_if_dirty*/ false).await;
+    assert!(!response.checked_out);
+}
