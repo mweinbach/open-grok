@@ -28,6 +28,8 @@ env:
   RUSTUP_TOOLCHAIN: "1.94.0"
   CARGO_PROFILE_RELEASE_DIST_CODEGEN_UNITS: "16"
   CARGO_PROFILE_RELEASE_DIST_DEBUG: "0"
+  # Keep optimized thin-local LTO without the 9-19 minute cross-crate link.
+  CARGO_PROFILE_RELEASE_DIST_LTO: "false"
 
 jobs:
   resolve:
@@ -113,8 +115,9 @@ jobs:
             target
           # Keep one reusable cache per dependency/toolchain configuration.
           # Source fingerprints still make Cargo rebuild changed workspace crates.
-          key: rust-release-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-
             rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
 
@@ -198,8 +201,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-
             rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
 
@@ -344,8 +348,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-
             rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
 
@@ -488,8 +493,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-
             rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
 
