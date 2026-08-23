@@ -82,6 +82,8 @@ pub struct McpServerEntry {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub icons: Vec<xai_grok_mcp::servers::McpIcon>,
     pub source: McpServerSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_label: Option<String>,
@@ -171,6 +173,8 @@ pub struct McpToolEntry {
     pub description: Option<String>,
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub icons: Vec<xai_grok_mcp::servers::McpIcon>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -222,6 +226,7 @@ pub struct McpClientStatus {
     pub name: String,
     pub status: McpSessionStatus,
     pub tools: Vec<McpToolEntry>,
+    pub icons: Vec<xai_grok_mcp::servers::McpIcon>,
 }
 
 // ── Notification: mcp/servers_updated ────────────────────────────────
@@ -445,6 +450,7 @@ pub(crate) fn build_mcp_catalog_with_gateway_tools(
             servers.push(McpServerEntry {
                 name,
                 display_name: Some(connector_name.to_owned()),
+                icons: Vec::new(),
                 source: McpServerSource::Managed,
                 config: McpServerConfig::ManagedGateway,
                 source_label: None,
@@ -462,6 +468,7 @@ pub(crate) fn build_mcp_catalog_with_gateway_tools(
                                 display_name: Some(tool.tool_name.clone()),
                                 description: Some(tool.description.clone()),
                                 meta: None,
+                                icons: Vec::new(),
                                 enabled: disabled.is_none_or(|set| !set.contains(&qualified_name)),
                             }
                         })
@@ -505,6 +512,7 @@ pub(crate) fn build_mcp_catalog_with_gateway_tools(
             servers.push(McpServerEntry {
                 name,
                 display_name: None,
+                icons: Vec::new(),
                 source,
                 config,
                 source_label: None,
@@ -549,6 +557,7 @@ fn disabled_server_placeholder_entry(name: &str) -> McpServerEntry {
         display_name: name
             .strip_prefix(MANAGED_GATEWAY_ENTRY_PREFIX)
             .map(str::to_owned),
+        icons: Vec::new(),
         source,
         source_label: None,
         setup: None,
@@ -580,6 +589,7 @@ pub(crate) async fn build_mcp_status(
         _is_initializing,
         initializing_servers,
         mcp_tool_meta,
+        mcp_tool_icons,
         auth_required,
         init_failed,
         disabled_regs,
@@ -594,6 +604,7 @@ pub(crate) async fn build_mcp_status(
             state.is_initializing(),
             state.handshaking_servers_cloned(),
             state.mcp_tool_meta.clone(),
+            state.mcp_tool_icons.clone(),
             state.auth_required.clone(),
             state.init_failed.clone(),
             // Collect (qualified_name, description) for disabled tools so we
@@ -650,6 +661,10 @@ pub(crate) async fn build_mcp_status(
                         display_name: None,
                         description: t.function.description.clone(),
                         meta,
+                        icons: mcp_tool_icons
+                            .get(qualified_name)
+                            .cloned()
+                            .unwrap_or_default(),
                         enabled: true,
                     }
                 })
@@ -667,6 +682,7 @@ pub(crate) async fn build_mcp_status(
                         display_name: None,
                         description: Some(desc.clone()),
                         meta,
+                        icons: mcp_tool_icons.get(qname).cloned().unwrap_or_default(),
                         enabled: false,
                     });
                 }
@@ -681,10 +697,12 @@ pub(crate) async fn build_mcp_status(
             (McpSessionStatus::Unavailable, vec![])
         };
 
+        let icons = client.server_icons().await;
         client_statuses.push(McpClientStatus {
             name,
             status,
             tools,
+            icons,
         });
     }
 
@@ -699,6 +717,7 @@ pub(crate) async fn build_mcp_status(
                 name: cname.to_string(),
                 status: McpSessionStatus::Initializing,
                 tools: vec![],
+                icons: Vec::new(),
             });
         }
     }
@@ -945,6 +964,7 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         servers.push(McpServerEntry {
             name: name.clone(),
             display_name: None,
+            icons: Vec::new(),
             source: McpServerSource::Local,
             source_label: setup_entry
                 .source
@@ -1049,12 +1069,19 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 .configs
                 .iter()
                 .any(|c| crate::session::mcp_servers::mcp_server_name(c) == entry.name);
-            let (status, tools) = snapshot
+            let (status, tools, icons) = snapshot
                 .clients
                 .iter()
                 .find(|c| c.name == entry.name)
-                .map(|c| (Some(c.status.clone()), c.tools.clone()))
-                .unwrap_or((None, vec![]));
+                .map(|client| {
+                    (
+                        Some(client.status.clone()),
+                        client.tools.clone(),
+                        client.icons.clone(),
+                    )
+                })
+                .unwrap_or((None, vec![], Vec::new()));
+            entry.icons = icons;
             entry.session = Some(McpServerSessionState {
                 enabled,
                 status,
@@ -1070,6 +1097,7 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 servers.push(McpServerEntry {
                     name: client_status.name.clone(),
                     display_name: None,
+                    icons: client_status.icons.clone(),
                     source: McpServerSource::Local,
                     source_label: None,
                     setup: None,
@@ -2076,6 +2104,7 @@ mod tests {
                 McpServerEntry {
                     name: "linear".to_string(),
                     display_name: None,
+                    icons: Vec::new(),
                     source: McpServerSource::Local,
                     config: McpServerConfig::Http {
                         url: "https://mcp.linear.app".to_string(),
@@ -2091,6 +2120,7 @@ mod tests {
                 McpServerEntry {
                     name: "filesystem".to_string(),
                     display_name: None,
+                    icons: Vec::new(),
                     source: McpServerSource::Local,
                     source_label: None,
                     setup: None,
@@ -2110,6 +2140,7 @@ mod tests {
                             display_name: None,
                             description: Some("Read a file".to_string()),
                             meta: None,
+                            icons: Vec::new(),
                             enabled: true,
                         }],
                     }),
@@ -2129,6 +2160,7 @@ mod tests {
         let gateway = serde_json::to_value(McpServerEntry {
             name: managed_gateway_entry_name("linear"),
             display_name: Some("linear".to_string()),
+            icons: Vec::new(),
             source: McpServerSource::Managed,
             source_label: None,
             setup: None,
@@ -2163,6 +2195,57 @@ mod tests {
             json["servers"][1]["session"]["tools"][0]["name"],
             "read_file"
         );
+        assert!(json["servers"][0].get("icons").is_none());
+        assert!(
+            json["servers"][1]["session"]["tools"][0]
+                .get("icons")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_mcp_list_serializes_server_and_tool_icons() {
+        let icon = xai_grok_mcp::servers::McpIcon {
+            src: "https://example.com/icon.png".to_owned(),
+            mime_type: Some("image/png".to_owned()),
+            sizes: Some(vec!["48x48".to_owned()]),
+            theme: Some(xai_grok_mcp::servers::McpIconTheme::Dark),
+        };
+        let entry = McpServerEntry {
+            name: "custom".to_owned(),
+            display_name: None,
+            icons: vec![icon.clone()],
+            source: McpServerSource::Local,
+            source_label: None,
+            setup: None,
+            setup_values: None,
+            config: McpServerConfig::Http {
+                url: "https://example.com/mcp".to_owned(),
+                scope: None,
+                scope_id: None,
+                scope_name: None,
+            },
+            session: Some(McpServerSessionState {
+                enabled: true,
+                status: Some(McpSessionStatus::Ready),
+                tools: vec![McpToolEntry {
+                    name: "search".to_owned(),
+                    display_name: None,
+                    description: None,
+                    meta: None,
+                    icons: vec![icon],
+                    enabled: true,
+                }],
+                auth_required: false,
+                setup_required: false,
+            }),
+        };
+
+        let json = serde_json::to_value(entry).expect("serialize MCP entry");
+        assert_eq!(json["icons"][0]["src"], "https://example.com/icon.png");
+        assert_eq!(json["icons"][0]["mimeType"], "image/png");
+        assert_eq!(json["icons"][0]["theme"], "dark");
+        assert_eq!(json["session"]["tools"][0]["icons"][0]["sizes"][0], "48x48");
     }
 
     #[test]
@@ -2358,6 +2441,7 @@ mod tests {
         let entry = McpServerEntry {
             name: "acme".to_string(),
             display_name: None,
+            icons: Vec::new(),
             source: McpServerSource::Local,
             source_label: Some("plugin: acme".to_string()),
             setup: Some(crate::util::config::McpSetupConfig {
@@ -2443,6 +2527,7 @@ mod tests {
         let entry = McpServerEntry {
             name: "slack".to_string(),
             display_name: None,
+            icons: Vec::new(),
             source: McpServerSource::Local,
             source_label: None,
             setup: None,

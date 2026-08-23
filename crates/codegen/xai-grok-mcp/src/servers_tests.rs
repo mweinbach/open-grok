@@ -3277,3 +3277,63 @@ fn apply_stdio_env_session_id_cannot_be_shadowed() {
         .map(|v| v.to_string_lossy().into_owned());
     assert_eq!(value.as_deref(), Some("sess-real"));
 }
+
+#[test]
+fn mcp_icon_rejects_unsafe_sources_and_preserves_protocol_metadata() {
+    for source in ["   ", "http://example.com/icon.png", "javascript:alert(1)"] {
+        assert!(McpIcon::from_rmcp(rmcp::model::Icon::new(source)).is_none());
+    }
+
+    let icon = rmcp::model::Icon::new("  https://example.com/icon.png  ")
+        .with_mime_type("image/png")
+        .with_sizes(vec!["48x48".to_owned()])
+        .with_theme(rmcp::model::IconTheme::Dark);
+    let converted = McpIcon::from_rmcp(icon).expect("valid icon");
+    assert_eq!(converted.src, "https://example.com/icon.png");
+    assert_eq!(converted.mime_type.as_deref(), Some("image/png"));
+    assert_eq!(converted.sizes.as_deref(), Some(&["48x48".to_owned()][..]));
+    assert_eq!(converted.theme, Some(McpIconTheme::Dark));
+    assert!(McpIcon::from_rmcp(rmcp::model::Icon::new("data:image/png;base64,aaa")).is_some());
+}
+
+#[test]
+fn mcp_icon_ingest_caps_entity_count_and_individual_fields() {
+    let icons = (0..20)
+        .map(|index| rmcp::model::Icon::new(format!("https://example.com/{index}.png")))
+        .collect();
+    assert_eq!(
+        McpIcon::from_rmcp_list(Some(icons)).len(),
+        MAX_MCP_ICONS_PER_ENTITY
+    );
+
+    let oversized = format!("https://example.com/{}", "x".repeat(MAX_MCP_ICON_SRC_BYTES));
+    assert!(McpIcon::from_rmcp(rmcp::model::Icon::new(oversized)).is_none());
+
+    let icon = rmcp::model::Icon::new("https://example.com/icon.png")
+        .with_mime_type("x".repeat(MAX_MCP_ICON_MIME_TYPE_BYTES + 1))
+        .with_sizes(vec![
+            "x".repeat(MAX_MCP_ICON_SIZE_TOKEN_BYTES + 1),
+            "48x48".to_owned(),
+        ]);
+    let converted = McpIcon::from_rmcp(icon).expect("icon with invalid optional fields");
+    assert_eq!(converted.mime_type, None);
+    assert_eq!(converted.sizes.as_deref(), Some(&["48x48".to_owned()][..]));
+}
+
+#[test]
+fn mcp_tool_icons_are_removed_when_refresh_omits_them() {
+    let mut state = McpState::new(vec![]);
+    let name = "server__tool".to_owned();
+    state.record_tool_icons(
+        name.clone(),
+        vec![McpIcon {
+            src: "https://example.com/icon.png".to_owned(),
+            mime_type: None,
+            sizes: None,
+            theme: None,
+        }],
+    );
+    assert_eq!(state.mcp_tool_icons.get(&name).map(Vec::len), Some(1));
+    state.record_tool_icons(name.clone(), Vec::new());
+    assert!(!state.mcp_tool_icons.contains_key(&name));
+}
