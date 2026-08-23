@@ -1826,7 +1826,7 @@ impl SessionActor {
         } else {
             format!("{auth_mode:?}")
         };
-        let client_version = xai_grok_version::VERSION;
+        let client_version = xai_grok_version::version();
         if request_provider == xai_grok_sampling_types::ModelProvider::Xai
             && auth_mode == crate::auth::AuthMode::WebLogin
         {

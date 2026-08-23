@@ -1686,7 +1686,7 @@ pub(crate) async fn run_shell_child(
             prompt_verbatim: Some(true),
             cwd: Some(child_handle.info.cwd.clone()),
             agent_type: Some(request.subagent_type.clone()),
-            shell_version: Some(xai_grok_version::VERSION.to_string()),
+            shell_version: Some(xai_grok_version::version().to_string()),
             workspace_type: None,
             sandbox: local_sandbox_telemetry(),
         };

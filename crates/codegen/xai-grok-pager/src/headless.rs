@@ -26,7 +26,7 @@ use xai_grok_telemetry::startup::PendingStartup;
 
 use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::spawn::{AgentShutdownGuard, spawn_grok_shell};
-use crate::client_identity::{HEADLESS_CLIENT_TYPE, PAGER_CLIENT_VERSION};
+use crate::client_identity::{HEADLESS_CLIENT_TYPE, pager_client_version};
 use crate::headless::reducer::{
     Lifecycle, McpServer, Reducer, SessionContext, StreamEvent, TurnEnd, map_session_update,
     reducer_for,
@@ -567,7 +567,7 @@ fn build_headless_init_request(
 ) -> acp::InitializeRequest {
     let mut meta = serde_json::json!({
         "clientType": HEADLESS_CLIENT_TYPE,
-        "clientVersion": PAGER_CLIENT_VERSION,
+        "clientVersion": pager_client_version(),
     });
     if let Some(rules) = rules {
         meta["rules"] = serde_json::json!(rules);

@@ -3645,7 +3645,7 @@ impl McpClient {
             capabilities,
             Implementation::new(
                 format!("grok-shell-{server_name}"),
-                xai_grok_version::VERSION.to_string(),
+                xai_grok_version::version().to_string(),
             ),
         )
         // This pin currently equals rmcp 2.1 LATEST, but the explicit setter

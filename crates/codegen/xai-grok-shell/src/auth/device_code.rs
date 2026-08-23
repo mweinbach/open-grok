@@ -142,7 +142,7 @@ pub(crate) async fn request_device_code(
         client
             .post(&url)
             // Lets oauth2-provider segment device-flow success by client version.
-            .header("x-grok-client-version", xai_grok_version::VERSION)
+            .header("x-grok-client-version", xai_grok_version::version())
             // Lets oauth2-provider separate human-completable logins from
             // headless automation in the device-flow funnel metrics.
             .header("x-grok-client-surface", surface.as_str())
@@ -231,7 +231,7 @@ pub(crate) async fn complete_device_code_login(
         let resp = with_alpha_test_key(
             client
                 .post(&token_url)
-                .header("x-grok-client-version", xai_grok_version::VERSION)
+                .header("x-grok-client-version", xai_grok_version::version())
                 .header("x-grok-client-surface", surface.as_str())
                 .form(&[
                     ("grant_type", DEVICE_GRANT_TYPE),

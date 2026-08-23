@@ -1581,7 +1581,7 @@ fn reload_from_disk_cache_ignores_stale_cache() {
     let auth_method = mgr.inner.fetch_auth.read().cache_auth_method();
     let stale = ModelsCache {
         fetched_at: Utc::now() - ChronoDuration::seconds(3600),
-        grok_version: Some(xai_grok_version::VERSION.to_string()),
+        grok_version: Some(xai_grok_version::version().to_string()),
         auth_method: Some(auth_method),
         origin: Some(mgr.cache_origin()),
         etag: Some("etag-stale".into()),
@@ -1645,7 +1645,7 @@ fn reload_from_disk_cache_ignores_legacy_cache_without_origin() {
     let auth_method = mgr.inner.fetch_auth.read().cache_auth_method();
     let legacy = ModelsCache {
         fetched_at: Utc::now(),
-        grok_version: Some(xai_grok_version::VERSION.to_string()),
+        grok_version: Some(xai_grok_version::version().to_string()),
         auth_method: Some(auth_method),
         origin: None,
         etag: Some("etag-legacy".into()),

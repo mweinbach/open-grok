@@ -43,7 +43,7 @@ fn push_entry(lvl: LogLevel, msg: &str, sid: Option<&str>, ctx: Option<serde_jso
     let entry = ClientLogEntry {
         ts: now_ts(),
         pid: Some(std::process::id()),
-        ver: Some(xai_grok_version::VERSION.to_owned()),
+        ver: Some(xai_grok_version::version().to_owned()),
         lvl,
         sid: sid.map(Into::into),
         msg: msg.into(),

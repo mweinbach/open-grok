@@ -1574,7 +1574,7 @@ impl WorkspaceOps {
     /// first bind or against servers predating the field).
     pub fn server_version(&self) -> Option<String> {
         match self {
-            Self::Local { .. } => Some(xai_grok_version::VERSION.to_owned()),
+            Self::Local { .. } => Some(xai_grok_version::version().to_owned()),
             Self::Proxy { client } => client.server_binary_version(),
         }
     }

@@ -20,11 +20,11 @@ pub(crate) struct FakeVersions {
 }
 impl FakeVersions {
     /// The versions a same-build real leader would report (`run_leader` stamps
-    /// `xai_grok_version::VERSION` into its metadata).
+    /// `xai_grok_version::version()` into its metadata).
     pub(crate) fn current() -> Self {
         Self {
             protocol_version: Some(LEADER_PROTOCOL_VERSION),
-            binary_version: Some(xai_grok_version::VERSION.to_string()),
+            binary_version: Some(xai_grok_version::version().to_string()),
         }
     }
 }

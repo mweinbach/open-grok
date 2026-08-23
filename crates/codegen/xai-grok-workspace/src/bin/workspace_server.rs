@@ -245,6 +245,10 @@ struct Capabilities {
 }
 const CAPABILITIES: Capabilities = Capabilities { diag: true };
 fn main() -> anyhow::Result<()> {
+    xai_grok_version::initialize(xai_grok_version::BuildInfo::from_version_stamp(
+        option_env!("GROK_VERSION"),
+    ))
+    .unwrap_or_else(|conflict| panic!("conflicting Open Grok build identity: {conflict:?}"));
     let mut args = Args::parse();
     if args.capabilities {
         println!("{}", serde_json::to_string(&CAPABILITIES)?);

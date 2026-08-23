@@ -524,7 +524,7 @@ impl FeedbackClient {
 
     fn add_common_headers(&self, builder: RequestBuilder) -> RequestBuilder {
         let builder = builder
-            .header(CLIENT_VERSION_HEADER, xai_grok_version::VERSION)
+            .header(CLIENT_VERSION_HEADER, xai_grok_version::version())
             .header(
                 crate::http::CLIENT_MODE_HEADER,
                 crate::http::process_client_mode(),

@@ -390,7 +390,9 @@ pub struct LeaderArgs {
 fn open_grok_version() -> &'static str {
     use std::sync::OnceLock;
     static V: OnceLock<String> = OnceLock::new();
-    V.get_or_init(|| xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), ""))
+    V.get_or_init(|| {
+        xai_grok_version::display_version_with_commit(xai_grok_version::version_with_commit(), "")
+    })
 }
 #[derive(Debug, Clone, Parser)]
 #[command(

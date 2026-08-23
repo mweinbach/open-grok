@@ -19,7 +19,7 @@ pub(crate) fn channel_name_from_cache() -> Option<&'static str> {
         let content = std::fs::read_to_string(&version_path).ok()?;
         let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
         let stable = parsed.get("stable_version")?.as_str()?;
-        let current = semver::Version::parse(xai_grok_version::VERSION).ok()?;
+        let current = semver::Version::parse(xai_grok_version::version()).ok()?;
         let stable_v = semver::Version::parse(stable).ok()?;
         if current > stable_v {
             Some("alpha")

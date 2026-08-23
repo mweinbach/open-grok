@@ -122,7 +122,7 @@ impl ChangelogManager {
             };
         }
 
-        let version = xai_grok_version::VERSION;
+        let version = xai_grok_version::version();
         let md_url = format!("{}/{}.external.md", base, version);
 
         // Fetch both formats in parallel (3s timeout each → 3s total, not 6s).

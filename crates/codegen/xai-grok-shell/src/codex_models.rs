@@ -345,7 +345,7 @@ impl CodexModelsClient {
             http: reqwest::Client::new(),
             cache_path: crate::util::grok_home::grok_home().join(CODEX_MODELS_CACHE_FILE),
             base_url: codex_auth::inference_base_url(),
-            open_grok_version: xai_grok_version::VERSION.to_owned(),
+            open_grok_version: xai_grok_version::version().to_owned(),
             client_version: codex_client_version(),
             cache_ttl: CODEX_MODELS_CACHE_TTL,
             auth: Arc::new(ProductionCodexModelsAuthSource),

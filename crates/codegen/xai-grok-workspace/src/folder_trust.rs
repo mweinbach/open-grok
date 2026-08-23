@@ -116,7 +116,7 @@ pub fn decide_inputs_with_interactive(
 }
 
 /// Whether the whole folder-trust system is inert (auto-trusts everything) for
-/// this binary — true on a local/dev build (no `GROK_VERSION` release stamp).
+/// this binary — true when the composition root registered a local/dev build.
 ///
 /// THE single security short-circuit: every explicit trust auto-grant site calls
 /// this (greppable via `folder_trust_inert`). When true a self-built grok never
@@ -126,20 +126,18 @@ pub fn folder_trust_inert() -> bool {
     is_local_build()
 }
 
-/// Whether this binary was built without a release version stamp
-/// (`GROK_VERSION` unset at compile time) — i.e. a local/dev build.
-///
-/// Kept local (not in `xai-grok-version`) on purpose: adding a symbol to that
-/// near-universal crate widens the rebuild/test fan-out for unrelated targets.
-/// `option_env!` resolves the same in any crate, so the
-/// location is behavior-neutral. Cross-crate callers use [`folder_trust_inert`].
+/// Whether the composition root registered a local/dev build.
 fn is_local_build() -> bool {
     // Runtime escape hatch: a pinned GROK_TEST_VERSION simulates a release build,
     // so tests/CI (which run unstamped, i.e. local-looking) can exercise the gate.
-    if std::env::var(xai_grok_version::TEST_VERSION_ENV).is_ok() {
-        return false;
-    }
-    option_env!("GROK_VERSION").is_none()
+    is_local_build_for(
+        std::env::var(xai_grok_version::TEST_VERSION_ENV).is_ok(),
+        xai_grok_version::is_release_build(),
+    )
+}
+
+fn is_local_build_for(test_release_override: bool, release_build: bool) -> bool {
+    !test_release_override && !release_build
 }
 
 /// Resolve whether the folder-trust gate is enabled.
@@ -1016,13 +1014,19 @@ mod tests {
             let _sim = EnvVarGuard::set(xai_grok_version::TEST_VERSION_ENV, Path::new("0.0.0-sim"));
             assert!(!is_local_build());
         }
-        // With it unset, an unstamped build (no GROK_VERSION) is a local build.
-        // Guard to the unstamped case so a release-stamped test binary (CI release)
-        // doesn't spuriously fail this arm.
+        // With it unset, the registered/debug fallback build identity decides.
         let _unset = EnvVarGuard::unset(xai_grok_version::TEST_VERSION_ENV);
-        if option_env!("GROK_VERSION").is_none() {
+        if !xai_grok_version::is_release_build() {
             assert!(is_local_build());
         }
+    }
+
+    #[test]
+    fn build_identity_matrix_keeps_release_folder_trust_fail_closed() {
+        assert!(is_local_build_for(false, false));
+        assert!(!is_local_build_for(false, true));
+        assert!(!is_local_build_for(true, false));
+        assert!(!is_local_build_for(true, true));
     }
 
     #[test]
@@ -1036,7 +1040,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _home = EnvVarGuard::set("OPENGROK_HOME", home.path());
         let _unset = EnvVarGuard::unset(xai_grok_version::TEST_VERSION_ENV);
-        if option_env!("GROK_VERSION").is_some() {
+        if xai_grok_version::is_release_build() {
             return; // a release-stamped test binary is not a local build
         }
         let tmp = repo_tmp();

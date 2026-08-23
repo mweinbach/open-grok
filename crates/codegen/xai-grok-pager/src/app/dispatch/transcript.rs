@@ -620,7 +620,7 @@ pub(super) fn dispatch_dump_input_log(app: &mut AppView) -> Vec<Effect> {
     let entry_count = entries.len();
     let terminal = crate::terminal::terminal_context().telemetry_snapshot();
     let session_id = agent.session.session_id.as_ref().map(|s| s.0.to_string());
-    let pager_version = crate::client_identity::PAGER_CLIENT_VERSION;
+    let pager_version = crate::client_identity::pager_client_version();
 
     let now = chrono::Utc::now();
     let dump = crate::input_log::InputDump {

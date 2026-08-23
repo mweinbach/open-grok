@@ -138,7 +138,7 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
         // Every agent mode (stdio/headless/leader and the in-process TUI
         // agent) passes through here, so diagnostic uploads always carry
         // the version stamp and the resource ceilings in effect.
-        xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
+        xai_grok_telemetry::unified_log::set_version(xai_grok_version::version());
         let limits = crate::util::limits::ProcessLimits::read();
         limits.log();
 
@@ -213,7 +213,7 @@ pub fn update_telemetry_config(config: &AgentConfig, auth_manager: &AuthManager)
         team_id,
         config.endpoints.deployment_key.clone(),
         crate::http::origin_client_info_from_env(),
-        xai_grok_version::VERSION.to_owned(),
+        xai_grok_version::version().to_owned(),
         subscription_tier,
         crate::http::shared_client(),
     );

@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::cli_models::{AuthStatus, list_models};
 
-use crate::client_identity::{PAGER_CLIENT_TYPE, PAGER_CLIENT_VERSION};
+use crate::client_identity::{PAGER_CLIENT_TYPE, pager_client_version};
 
 pub async fn list_available_models(agent_config: &AgentConfig) -> Result<()> {
     match AuthStatus::resolve(agent_config) {
@@ -26,7 +26,12 @@ pub async fn list_available_models(agent_config: &AgentConfig) -> Result<()> {
     let _agent_guard =
         crate::acp::spawn::AgentShutdownGuard::new(cancel.clone(), Some(spawned.thread_handle));
 
-    let state = list_models(&spawned.channel.tx, PAGER_CLIENT_TYPE, PAGER_CLIENT_VERSION).await?;
+    let state = list_models(
+        &spawned.channel.tx,
+        PAGER_CLIENT_TYPE,
+        pager_client_version(),
+    )
+    .await?;
 
     println!("Default model: {}", state.current_model_id.0);
     println!();

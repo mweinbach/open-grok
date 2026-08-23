@@ -1368,7 +1368,7 @@ fn inject_proxy_headers(
         .or_insert_with(|| {
             client_version
                 .map(String::from)
-                .unwrap_or_else(|| xai_grok_version::VERSION.to_string())
+                .unwrap_or_else(|| xai_grok_version::version().to_string())
         });
     headers
         .entry("x-grok-client-identifier".to_string())
@@ -2374,7 +2374,7 @@ async fn handle_synthetic_turn_trace(
         prompt_verbatim: Some(true),
         cwd: Some(info.cwd.clone()),
         agent_type: None,
-        shell_version: Some(xai_grok_version::VERSION.to_string()),
+        shell_version: Some(xai_grok_version::version().to_string()),
         workspace_type: None,
         sandbox: local_sandbox_telemetry(),
     };

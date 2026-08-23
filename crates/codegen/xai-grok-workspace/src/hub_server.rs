@@ -420,7 +420,7 @@ impl WorkspaceRpcHandler {
                     os: std::env::consts::OS.to_owned(),
                     shell,
                     cwd: cwd.to_string_lossy().into_owned(),
-                    version: Some(xai_grok_version::VERSION.to_owned()),
+                    version: Some(xai_grok_version::version().to_owned()),
                 };
                 serde_json::to_value(info).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }

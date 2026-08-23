@@ -14,7 +14,7 @@ use tokio::time::{Instant, sleep_until};
 use zeroize::Zeroize;
 
 use crate::appearance::ConfigWatcher;
-use crate::client_identity::{PAGER_CLIENT_TYPE, PAGER_CLIENT_VERSION};
+use crate::client_identity::{PAGER_CLIENT_TYPE, pager_client_version};
 use crate::theme::system_appearance::{self, SystemAppearanceWatcher};
 use crate::theme::{Theme, ThemeKind, cache as theme_cache};
 
@@ -3074,7 +3074,7 @@ pub(crate) async fn run(
                             let ok = tokio::time::timeout(timeout, async {
                                 let init_req = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(acp::ClientCapabilities::new().fs(acp::FileSystemCapabilities::new()).terminal(false)).meta(serde_json::json!({
                                         "clientType": PAGER_CLIENT_TYPE,
-                                        "clientVersion": PAGER_CLIENT_VERSION,
+                                        "clientVersion": pager_client_version(),
                                     }).as_object().cloned());
                                 if let Err(e) = acp_send(init_req, &acp_tx).await {
                                     tracing::error!(error = %e, "reconnect: re-initialize failed");

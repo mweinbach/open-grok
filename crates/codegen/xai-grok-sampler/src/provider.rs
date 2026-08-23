@@ -141,7 +141,7 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
         let client_version = config
             .client_version
             .as_deref()
-            .unwrap_or(xai_grok_version::VERSION);
+            .unwrap_or(xai_grok_version::version());
         let client_version = client_version
             .split(['-', '+'])
             .next()

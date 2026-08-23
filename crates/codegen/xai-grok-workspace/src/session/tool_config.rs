@@ -508,7 +508,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
 /// Mirrors the shell's `inject_proxy_headers` logic.
 fn build_proxy_headers(base_url: &str) -> indexmap::IndexMap<String, String> {
     let mut headers = indexmap::IndexMap::new();
-    let version = xai_grok_version::VERSION;
+    let version = xai_grok_version::version();
     headers.insert(
         "user-agent".to_string(),
         format!("xai-grok-workspace/{version}"),

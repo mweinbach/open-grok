@@ -793,7 +793,7 @@ impl acp::Agent for MvpAgent {
                     // `_meta.pluginDirs`; the SDKs gate `GrokOptions.plugins` on this.
                     (SESSION_PLUGIN_DIRS_CAPABILITY_KEY): true,
                     "currentWorkingDirectory": current_working_directory.to_string_lossy().to_string(),
-                    "agentVersion": xai_grok_version::VERSION,
+                    "agentVersion": xai_grok_version::version(),
                     "agentId": agent_id(),
                     "agentInstanceId": agent_instance_id(),
                     "hostname": hostname.to_string_lossy().to_string(),
@@ -1478,7 +1478,7 @@ impl acp::Agent for MvpAgent {
                 prompt_verbatim: if verbatim { Some(true) } else { None },
                 cwd: Some(ctx.session_info.cwd.clone()),
                 agent_type: Some(ctx.session_handle.agent_name.clone()),
-                shell_version: Some(xai_grok_version::VERSION.to_string()),
+                shell_version: Some(xai_grok_version::version().to_string()),
                 workspace_type: None,
                 sandbox: local_sandbox_telemetry(),
             };

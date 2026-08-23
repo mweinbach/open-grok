@@ -113,7 +113,7 @@ pub async fn run(args: WorktreeArgs, agent_config: &AgentConfig) -> Result<()> {
             .meta(
                 serde_json::json!({
                     "clientType": crate::client_identity::HEADLESS_CLIENT_TYPE,
-                    "clientVersion": crate::client_identity::PAGER_CLIENT_VERSION
+                    "clientVersion": crate::client_identity::pager_client_version()
                 })
                 .as_object()
                 .cloned(),

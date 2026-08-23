@@ -944,7 +944,7 @@ mod tests {
         // when compiled unstamped (mirrors the inert tests elsewhere), with
         // GROK_TEST_VERSION unset so `is_local_build()` is genuinely true.
         let _unset_ver = EnvGuard::unset(xai_grok_version::TEST_VERSION_ENV);
-        if option_env!("GROK_VERSION").is_some() {
+        if xai_grok_version::is_release_build() {
             return; // a release-stamped test binary is not a local build
         }
         let home = tempfile::tempdir().unwrap();
@@ -1545,7 +1545,7 @@ mod tests {
         // unset so `is_local_build()` is genuinely true. OPENGROK_HOME-isolated so the
         // real store is never touched.
         let _sim = EnvGuard::unset(xai_grok_version::TEST_VERSION_ENV);
-        if option_env!("GROK_VERSION").is_some() {
+        if xai_grok_version::is_release_build() {
             return; // a release-stamped test binary is not a local build
         }
         let home = tempfile::tempdir().unwrap();

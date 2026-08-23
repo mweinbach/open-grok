@@ -1275,7 +1275,7 @@ impl PlatformInfo {
 }
 
 fn agent_version() -> String {
-    xai_grok_version::VERSION.to_string()
+    xai_grok_version::version().to_string()
 }
 
 /// Render a User-Agent string for the given origin client.
@@ -4944,7 +4944,7 @@ mod tests {
 
     #[test]
     fn user_agent_collapses_when_origin_matches_agent() {
-        let agent_version = xai_grok_version::VERSION.to_string();
+        let agent_version = xai_grok_version::version().to_string();
         let origin = OriginClientInfo {
             product: AGENT_PRODUCT.to_string(),
             version: Some(agent_version.clone()),

@@ -6547,7 +6547,7 @@ pub(crate) fn execute(
                         context_type: None,
                         turn_number: None,
                         request_id: None,
-                        client_version: Some(xai_grok_version::VERSION.to_string()),
+                        client_version: Some(xai_grok_version::version().to_string()),
                         metadata: None,
                         terminal_info,
                     };

@@ -412,7 +412,7 @@ pub(super) async fn exchange_code(
     let resp = with_alpha_test_key(
         crate::http::shared_client()
             .post(token_endpoint)
-            .header("x-grok-client-version", xai_grok_version::VERSION)
+            .header("x-grok-client-version", xai_grok_version::version())
             .form(&[
                 ("grant_type", "authorization_code"),
                 ("code", code),
