@@ -10,6 +10,7 @@ Without memory, each Grok session starts fresh: the model knows nothing about pr
 
 - Recall project conventions you explained before.
 - Reuse debugging steps that worked.
+- Avoid approaches that previously failed under similar conditions.
 - Carry architectural decisions forward across sessions.
 - Avoid re-asking questions it already has answers to.
 
@@ -81,19 +82,21 @@ You can also toggle from inside the `/memory` modal by pressing `t`.
 
 ## How Memory Is Stored
 
-Memory is stored as Markdown files under `~/.opengrok/memory/`:
+Human-editable memory is stored as Markdown files under `~/.opengrok/memory/`:
 
 | Location | Scope | Description |
 |----------|-------|-------------|
 | `~/.opengrok/memory/MEMORY.md` | Global | Facts that apply across all your projects |
 | `~/.opengrok/memory/<project-slug>-<hash8>/MEMORY.md` | Workspace | Project-specific conventions and context |
 | `~/.opengrok/memory/<project-slug>-<hash8>/sessions/` | Sessions | Per-session summaries and logs |
+| `~/.opengrok/memory/<project-slug>-<hash8>/index.sqlite` | Workspace | Search index and evidence-backed experience records |
 
-Grok suffixes each workspace directory with a short hash of the repository's identity. The identity is the `origin` remote in `org/repo` form when the directory is a Git repository with an `origin` remote, or the directory path otherwise. Because clones and worktrees of the same repository share an `origin` remote, they also share one memory directory.
+Grok suffixes each workspace directory with a short hash of the repository's identity. The identity includes the `origin` remote's normalized host, any non-default port, and `org/repo` path when the directory is a Git repository with an `origin` remote, or the directory path otherwise. Clones and worktrees with the same remote host and repository share one memory directory; repositories with identical names on different Git hosts remain isolated. Older workspace memory is reused only when its existing ownership can be verified safely.
 
 An SQLite index supports hybrid search across all memory files:
 - **FTS5** provides full-text search for keyword matching.
 - **vec0** provides vector search for semantic similarity. Vector search is optional and requires an embedding.
+- **Experience records** retain concise, workspace-scoped lessons backed by observed command, build, test, or failure evidence.
 
 ---
 
@@ -107,7 +110,26 @@ When a session ends, Grok saves a structured metadata summary to that session's 
 
 Grok builds the summary from conversation metadata without an LLM call, without added latency. Grok skips the save for trivial sessions -- those with fewer than three substantive prompts, or fewer than 50 bytes of user text.
 
-The summary does not record tool usage, file paths, or shell commands. The session ID forms part of the log filename. To turn automatic saves off, set `session.save_on_end = false`. For richer capture of decisions, patterns, and reasoning, use `/flush`.
+The Markdown summary does not record tool usage, file paths, or shell commands. Separate experience records can retain bounded, redacted verification commands and failure summaries when objective tool evidence is available. The session ID forms part of the log filename. To turn both automatic summaries and experience collection off, set `session.save_on_end = false`. For richer capture of decisions, patterns, and reasoning, use `/flush`.
+
+---
+
+## Learning from Verified Experience
+
+When memory and automatic session saves are enabled, Open Grok can extract compact lessons from actual command exit codes, compilation results, tests, lint checks, and other observable tool outcomes. It does not treat an assistant's claim that a task succeeded as proof, and it does not save entire execution transcripts as experience.
+
+Only directly attributable execution results count as verification. Programmable Code Mode output can print arbitrary test summaries or exit codes, so it is not accepted as proof unless authenticated nested-tool execution evidence becomes available.
+
+Future tasks and `/goal` plans can receive a short advisory briefing containing:
+
+- **Recommended:** approaches or validation commands supported by successful checks.
+- **Avoid:** previously observed failure modes and repository-specific anti-patterns.
+- **Uncertain:** promising but weakly supported hypotheses.
+- **Contradictions:** situations where prior results disagree and current conditions need inspection.
+
+Experience is advisory: current repository evidence and your instructions take precedence. Matching considers the project, task, Git revision, operating system, architecture, evidence quality, and prior reuse. Repeated successful or unsuccessful reuse adjusts a lesson's confidence; simply showing a lesson does not count as following it.
+
+Experience records live in the workspace's `index.sqlite`, not in the editable Markdown files shown by `/memory`. Run `open-grok memory clear --workspace` to remove both workspace Markdown memory and structured experience. To remove only structured experience, close Open Grok and delete that workspace's `index.sqlite` file; the Markdown memory remains, and its search index is rebuilt when needed. Existing `/forget` operations apply to editable Markdown memory rather than individual structured experience rows.
 
 ---
 
@@ -253,11 +275,13 @@ min_sessions = 3   # Minimum sessions since the last consolidation
 
 On the first turn of each session, Grok automatically searches memory for content relevant to the current project and injects it as context. This means Grok starts with knowledge from previous sessions without a reminder.
 
+When applicable, that context also includes a compact experience briefing before planning. Dedicated `/goal` plans use the same injection policy. After an objectively failed command or check, Grok may consult relevant prior failure patterns and revise its approach without rewriting the original prompt context.
+
 First-turn injection can be configured:
 
 ```toml
 [memory.initial_injection]
-enabled = true     # Enable or disable first-turn injection
+enabled = true     # Enable or disable first-turn and goal-planner experience injection
 min_score = 0.0    # Optional score threshold; unset by default, which applies no filtering
 ```
 
@@ -354,7 +378,7 @@ To edit memory from the shell, open the files in your editor directly -- for exa
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `false` | Enable memory |
-| `session.save_on_end` | `true` | Write metadata summary on session end |
+| `session.save_on_end` | `true` | Write the metadata summary and extract evidence-backed experience on session end |
 | `watcher.enabled` | `true` | Watch `~/.opengrok/memory/` for external edits and reindex |
 
 ### Index Settings (`[memory.index]`)
@@ -385,7 +409,7 @@ To edit memory from the shell, open the files in your editor directly -- for exa
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `true` | Enable first-turn memory injection |
+| `enabled` | `true` | Enable first-turn memory and goal-planner experience injection |
 | `min_score` | unset | Score threshold for first-turn results. When unset, Grok applies no threshold, which is equivalent to `0.0`. |
 
 ### Dream Settings (`[memory.dream]`)

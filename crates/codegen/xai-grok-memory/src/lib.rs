@@ -28,6 +28,7 @@ pub mod chunker;
 pub mod dream;
 pub mod dream_lock;
 pub mod embedding;
+pub mod experience;
 pub mod index;
 pub mod mmr;
 pub mod query_expansion;

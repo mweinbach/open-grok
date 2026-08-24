@@ -2,7 +2,7 @@
 
 Implementation map of cross-session memory (`xai-grok-memory`), memory tools / slash commands, and goal-mode orchestration (`GoalTracker` + `update_goal`). Paths are relative to the repo root under `crates/codegen/` unless noted.
 
-End-user docs: `xai-grok-pager/docs/user-guide/13-memory.md` (memory product UX). Goal slash / dashboard surfaces are covered in agent-mode and dashboard user guides; this page is the developer map.
+End-user docs: `xai-grok-pager/docs/user-guide/13-memory.md` (memory product UX). Goal slash / dashboard surfaces are covered in agent-mode and dashboard user guides; this page is the developer map. The additive, evidence-backed experience architecture and evaluation contract are documented in [experience-memory.md](experience-memory.md).
 
 ## Architecture snapshot
 
@@ -11,7 +11,8 @@ SessionActor
   ├── SessionMemory (memory_state.rs)
   │     ├── MemoryStorage          → $OPENGROK_HOME/memory/…
   │     ├── MemoryBackendParams    → shared search / embed config
-  │     ├── MemoryIndex (sqlite)   → workspace index.sqlite
+  │     ├── MemoryIndex (sqlite)   → workspace index.sqlite (Markdown chunks)
+  │     ├── Experience memory      → additive rows in the same workspace index.sqlite
   │     └── dream / flush config
   ├── Memory tools (ToolBridge Resources)
   │     ├── memory_search
@@ -24,11 +25,15 @@ SessionActor
 | Concern | Path |
 | --- | --- |
 | Core engine | `xai-grok-memory/` |
+| Experience schema / evidence / store / retrieval / evaluation | `xai-grok-memory/src/experience/{types,extraction,store,retrieval,evaluation}.rs` |
 | Shell shim / re-exports | `xai-grok-shell/src/session/memory/` |
 | Session memory state | `…/session/memory_state.rs` |
 | Dream + tool registration | `…/session/acp_session_impl/memory_dream.rs` |
+| Experience lifecycle / evidence extraction | `…/session/memory/hooks.rs`, `…/session/acp_session_impl/memory_dream.rs` |
 | Pre-compact flush pure logic | `…/session/helpers/memory_flush.rs` |
-| Injection formatting | `…/session/helpers/memory_context.rs` |
+| Injection / experience-briefing formatting | `…/session/helpers/memory_context.rs` |
+| First-turn planning briefing / failure replanning | `…/session/acp_session_impl/turn.rs` |
+| Goal-planner experience briefing | `…/session/goal_planner.rs`, `…/session/acp_session_impl/goal_support.rs` |
 | Compaction ↔ memory | `…/session/compaction.rs` |
 | Goal state machine | `…/session/goal_tracker.rs` |
 | Goal notifications | `…/session/goal_orchestrator.rs` |
@@ -52,7 +57,7 @@ Memory is **off by default**. Enable via (priority high → low):
 4. `[memory] enabled` in `$OPENGROK_HOME/config.toml`
 5. Default: disabled
 
-Mid-session: `/memory on|off` (session-scoped; does not rewrite config). `/memory` browse modal remains available when backend params exist even if currently toggled off (`memory_configured` gate).
+Mid-session: `/memory on|off` (session-scoped; does not rewrite config). `/memory` browse modal remains available when backend params exist even if currently toggled off (`memory_configured` gate). Experience memory follows these existing enablement and workspace-storage rules; it is not a separate default-on feature.
 
 ### Storage layout under `$OPENGROK_HOME`
 
@@ -61,7 +66,7 @@ $OPENGROK_HOME/memory/
   ├── MEMORY.md                              # Global curated knowledge
   └── {project-slug}-{hash8}/                # Workspace-scoped (blake3)
         ├── MEMORY.md                        # Project curated knowledge
-        ├── index.sqlite                     # Chunks + FTS5 (+ optional vec0)
+        ├── index.sqlite                     # Chunks + FTS5 (+ optional vec0); additive experience rows
         ├── dream.lock / consolidation meta  # Dream gates (DreamLock)
         └── sessions/
               └── YYYY-MM-DD-{slug}-{sid8}.md  # Session / flush logs
@@ -86,10 +91,11 @@ Scaffold / empty `MEMORY.md` stubs are filtered out of search and injection (`se
 
 | Piece | Path / role |
 | --- | --- |
-| Schema | `schema.rs` — `meta`, `chunks`, `chunks_fts` (FTS5), optional `chunks_vec` (sqlite-vec) |
+| Markdown schema | `schema.rs` — `meta`, `chunks`, `chunks_fts` (FTS5), optional `chunks_vec` (sqlite-vec) |
 | Index API | `index.rs` — `MemoryIndex::open_or_create` |
 | Chunking | `chunker.rs` |
 | Hybrid search | `search.rs` — FTS BM25 + optional vector KNN + temporal decay + source weights + MMR |
+| Experience layer | `experience/{types,extraction,store,retrieval,evaluation}.rs` — evidence-backed lessons, additive SQLite storage, ranked guidance, and comparison metrics |
 | Embeddings | `embedding.rs` + `embed_missing_chunks` in `lib.rs` (batches of 32) |
 | Backend for tools | `backend.rs` — `MemoryBackendImpl` / `MemoryBackendParams` |
 | File watcher | `watcher.rs` — external edit → reindex on search |
@@ -97,6 +103,8 @@ Scaffold / empty `MEMORY.md` stubs are filtered out of search and injection (`se
 | Archive | `archive.rs` |
 
 **Search pipeline (summary):** FTS always → vector KNN when available → merge/normalize → drop content-free → temporal decay (session only) → source weights / min_score → optional MMR → `max_results`. Degrades to FTS-only when embeddings or sqlite-vec are missing.
+
+Markdown chunk access counts measure exposure, not proven usefulness. Structured experience adds scoped positive/negative/uncertain guidance, objective evidence, multidimensional outcomes, contradiction handling, and observed reuse calibration without replacing this legacy search pipeline. See [experience-memory.md](experience-memory.md) for the ranking, migration, planning, extraction, and evaluation contracts.
 
 `MemoryBackendParams.search_source` labels telemetry paths:
 
@@ -159,8 +167,14 @@ Shell-advertised ACP slash commands (`session/slash_commands.rs`):
 ```text
 First turn
   → search (injection params, min_score often 0.0)
-  → format_memory_reminder → <memory-context> in system prefix
+  → retrieve relevant Markdown and applicable structured experience
+  → format compact snippets + recommended / avoid / uncertain guidance
+  → <memory-context> in system prefix before the model plans
   → conversation_has_memory_context prevents re-search (KV cache stability)
+
+Observed execution failure
+  → classify objective diagnostic and retrieve matching anti-patterns
+  → append bounded trailing advisory for replanning (never mutate cached prefix)
 
 Approaching compact
   → should_flush → flush model turn → write session log → reindex
@@ -172,6 +186,7 @@ Compact
 
 Session end
   → optional session summary write
+  → extract evidence-backed experience and update attributable reuse outcomes
   → maybe_run_dream
   → MemorySessionSummary telemetry
 ```
@@ -271,6 +286,7 @@ Subagents inherit parent permission handle but **not** parent plan gate; goal ch
 | Area | Where |
 | --- | --- |
 | Memory schema / search unit | `xai-grok-memory` module tests (`schema`, `search`, …) |
+| Experience extraction / ranking / consolidation / evaluation | `xai-grok-memory/src/experience/{types,extraction,store,retrieval,evaluation}.rs` module tests |
 | Memory tool id constants | `xai-grok-tools/.../memory/mod.rs` tests |
 | Memory config / enablement | `shell/.../acp_session_tests/memory_config_tests.rs` |
 | Memory context helpers | `shell/.../helpers/memory_context.rs` tests |
@@ -305,11 +321,14 @@ cargo test --locked -p xai-grok-shell -- memory
 10. **Unknown goal status → UserPaused** — never invent Active from unknown wire.
 11. **Dream skips subagents** — do not run consolidation on child sessions.
 12. **Tool name constants** gate slash availability — keep `MEMORY_*_TOOL_NAME` in sync with `Tool::id`.
+13. **Experience is advisory and evidence-backed** — never treat retrieval as follow-through, assistant self-reflection as a verdict, or an entire trajectory as planning context.
+14. **Experience uses the existing workspace index and memory gate** — preserve legacy chunks, repository/provider isolation, configured retention, and cache-stable first-turn injection.
 
 ---
 
 ## See also
 
+- [experience-memory.md](experience-memory.md) — evidence-backed lessons, scoped retrieval, reinforcement, migration, and evaluation
 - [agent-runtime.md](agent-runtime.md) — turn loop, permissions, plan mode, session storage
 - [providers.md](providers.md) — auxiliary models (memory flush/dream/recap) and provider isolation
 - [tui-and-config.md](tui-and-config.md) — config layers, env vars, slash registration

@@ -109,6 +109,25 @@ impl SessionActor {
         if !self.startup_hints.is_subagent {
             if let Some(storage) = self.memory.storage() {
                 let conversation = self.chat_state_handle.get_conversation().await;
+                if self.memory.save_on_end && !storage.is_ephemeral() {
+                    match crate::session::memory::hooks::persist_session_experiences(
+                        &storage,
+                        &conversation,
+                        &self.session_info.id.0,
+                    ) {
+                        Ok(count) if count > 0 => tracing::info!(
+                            target: xai_grok_telemetry::memory_log::TARGET,
+                            experience_count = count,
+                            "MEMORY_EXPERIENCE: persisted evidence-backed session lessons"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(
+                            target: xai_grok_telemetry::memory_log::TARGET,
+                            error = %error,
+                            "MEMORY_EXPERIENCE: failed to persist session lessons"
+                        ),
+                    }
+                }
                 let result = crate::session::memory::hooks::on_session_end(
                     &storage,
                     &conversation,

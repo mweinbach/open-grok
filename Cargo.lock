@@ -13872,6 +13872,7 @@ dependencies = [
  "reqwest 0.12.24",
  "reqwest-middleware 0.4.2",
  "rusqlite",
+ "serde",
  "serde_json",
  "sqlite-vec",
  "tar",
