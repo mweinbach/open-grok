@@ -5459,6 +5459,38 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.welcome_prompt_focused = false;
             effects
         }
+        TaskResult::CodexLoginUrlReady {
+            agent_id,
+            purpose,
+            authorization_url,
+        } => {
+            if let Some(authorization_url) = authorization_url {
+                match purpose {
+                    crate::app::actions::CodexLoginPurpose::Independent => {
+                        push_codex_auth_result(
+                            app,
+                            agent_id,
+                            format!(
+                                "Could not open a browser automatically. Open this URL to connect OpenAI Codex:\n{authorization_url}"
+                            ),
+                        );
+                    }
+                    crate::app::actions::CodexLoginPurpose::Startup { request_seq }
+                    | crate::app::actions::CodexLoginPurpose::SessionResume { request_seq } => {
+                        if let AuthState::Authenticating {
+                            request_seq: current_seq,
+                            auth_url,
+                            ..
+                        } = &mut app.auth_state
+                            && *current_seq == request_seq
+                        {
+                            *auth_url = Some(authorization_url);
+                        }
+                    }
+                }
+            }
+            Vec::new()
+        }
         TaskResult::CodexLoginComplete {
             agent_id,
             purpose,

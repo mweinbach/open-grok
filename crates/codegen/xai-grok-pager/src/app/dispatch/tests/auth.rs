@@ -319,6 +319,45 @@ fn codex_login_keeps_xai_session_active_and_emits_independent_effect() {
 }
 
 #[test]
+fn independent_codex_browser_failure_shows_manual_authorization_url() {
+    let mut app = test_app_with_agent();
+    let authorization_url = "https://auth.openai.com/oauth/authorize?state=test-state";
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginUrlReady {
+            agent_id: Some(AgentId(0)),
+            purpose: CodexLoginPurpose::Independent,
+            authorization_url: Some(authorization_url.to_owned()),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    let message = last_system_text(&app, AgentId(0));
+    assert!(message.contains("Could not open a browser automatically"));
+    assert!(message.contains(authorization_url));
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+}
+
+#[test]
+fn successful_codex_browser_launch_does_not_show_manual_url() {
+    let mut app = test_app_with_agent();
+    let scrollback_len = app.agents[&AgentId(0)].scrollback.len();
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginUrlReady {
+            agent_id: Some(AgentId(0)),
+            purpose: CodexLoginPurpose::Independent,
+            authorization_url: None,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert_eq!(app.agents[&AgentId(0)].scrollback.len(), scrollback_len);
+}
+
+#[test]
 fn codex_logout_keeps_xai_session_active_and_emits_independent_effect() {
     let mut app = test_app_with_agent();
     let effects = dispatch(Action::LogoutCodex, &mut app);
@@ -768,6 +807,59 @@ fn startup_codex_choice_uses_separate_oauth_purpose_and_clears_xai_gate() {
     assert!(matches!(
         app.auth_state,
         AuthState::Authenticating { request_seq: 1, .. }
+    ));
+}
+
+#[test]
+fn startup_codex_browser_failure_exposes_manual_authorization_url() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    let _ = dispatch(Action::ChooseStartupCodex, &mut app);
+    let authorization_url = "https://auth.openai.com/oauth/authorize?state=test-state";
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginUrlReady {
+            agent_id: None,
+            purpose: CodexLoginPurpose::Startup { request_seq: 1 },
+            authorization_url: Some(authorization_url.to_owned()),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(matches!(
+        &app.auth_state,
+        AuthState::Authenticating {
+            request_seq: 1,
+            auth_url: Some(url),
+            ..
+        } if url == authorization_url
+    ));
+}
+
+#[test]
+fn stale_codex_browser_failure_does_not_replace_current_authorization_url() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    let _ = dispatch(Action::ChooseStartupCodex, &mut app);
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginUrlReady {
+            agent_id: None,
+            purpose: CodexLoginPurpose::Startup { request_seq: 2 },
+            authorization_url: Some("https://auth.openai.com/stale".to_owned()),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(matches!(
+        app.auth_state,
+        AuthState::Authenticating {
+            request_seq: 1,
+            auth_url: None,
+            ..
+        }
     ));
 }
 

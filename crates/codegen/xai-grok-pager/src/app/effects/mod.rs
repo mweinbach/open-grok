@@ -2491,10 +2491,39 @@ pub(crate) fn execute(
         }
         Effect::LoginCodex { agent_id, purpose } => {
             let tx = acp_tx.clone();
+            let (fallback_tx, fallback_rx) =
+                tokio::sync::oneshot::channel::<xai_grok_shell::codex_auth::CodexBrowserFallback>();
             tasks.spawn(async move {
-                let result = xai_grok_shell::codex_auth::run_tui_login()
+                let authorization_url = match fallback_rx.await {
+                    Ok(fallback) => {
+                        ulog::warn(
+                            "codex.login.browser_open_failed",
+                            None,
+                            Some(serde_json::json!({
+                                "error": sanitize_user_error(&fallback.error),
+                            })),
+                        );
+                        Some(fallback.authorization_url)
+                    }
+                    Err(_) => None,
+                };
+                TaskResult::CodexLoginUrlReady {
+                    agent_id,
+                    purpose,
+                    authorization_url,
+                }
+            });
+            tasks.spawn(async move {
+                let result = xai_grok_shell::codex_auth::run_tui_login(fallback_tx)
                     .await
                     .map_err(|error| sanitize_user_error(&format!("{error:#}")));
+                if let Err(error) = &result {
+                    ulog::error(
+                        "codex.login.failed",
+                        None,
+                        Some(serde_json::json!({ "error": error })),
+                    );
+                }
                 let models = if result.is_ok() {
                     match refresh_codex_models(&tx).await {
                         Ok(models) => Some(models),
