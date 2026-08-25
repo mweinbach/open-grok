@@ -131,6 +131,31 @@ Experience is advisory: current repository evidence and your instructions take p
 
 When you reopen a saved session after its earlier run has ended, experience attribution starts a new run while the session keeps its existing identity and conversation. That resumed work can retrieve, follow, and independently reinforce relevant lessons even when the earlier run has already finished.
 
+### Search What Worked and What Failed
+
+Ask Open Grok to inspect verified experience directly:
+
+```text
+Search prior experience for authentication middleware failures.
+What debugging approach worked the last time the integration tests failed?
+Show the commands, results, and source sessions behind that recommendation.
+Look up experience:abc123 and show the evidence behind that lesson.
+Show every lesson learned during run:019abc.
+Find lessons from session:019def.
+```
+
+The model uses the read-only `experience_search` tool to search ranked lessons from the current workspace. It can return up to 20 results and restrict a query to successful or failed outcomes; the configured memory-search result limit applies when no explicit limit is requested. Matching results show the lesson, what worked or failed, confidence, safe verification commands, compact observed evidence, and stable references when available:
+
+```text
+experience:<experience-id>   Identifies the stored lesson.
+run:<run-id>                 Identifies the activation that observed its evidence.
+session:<session-id>         Identifies the original saved session, when known.
+```
+
+You can search `experience:<experience-id>` to retrieve that exact lesson, `run:<run-id>` to find lessons learned during that activation, or `session:<session-id>` to find lessons from runs verifiably associated with that session. All three use the same workspace, outcome, and redaction safeguards as ordinary experience searches. A session reference can additionally be reopened with `open-grok --resume <session-id>` when that session still exists and is accessible; experience and run IDs are searchable references, not session IDs. A resumed session can contribute several independently tracked run references. Older lessons created before run-to-session mapping remain searchable by run ID, but not by session ID; Open Grok does not guess missing session provenance.
+
+Experience search exposes bounded, redacted details, not complete transcripts, raw terminal dumps, API keys, or provider credentials. It is separate from `memory_search`, which searches editable Markdown memory, and is available only while memory is enabled. Subagents and Code Mode can search the same workspace experience, including through nested `tools.experience_search(...)` in Code Mode Only; the main session alone saves new lessons and session references. It is a model tool rather than a standalone `/experience_search` slash command. An already-installed older Open Grok binary must be updated to a build containing this feature before the tool is available.
+
 Experience records live in the workspace's `index.sqlite`, not in the editable Markdown files shown by `/memory`. Run `open-grok memory clear --workspace` to remove both workspace Markdown memory and structured experience. To remove only structured experience, close Open Grok and delete that workspace's `index.sqlite` file; the Markdown memory remains, and its search index is rebuilt when needed. Existing `/forget` operations apply to editable Markdown memory rather than individual structured experience rows.
 
 ---
@@ -302,9 +327,11 @@ Search memory for "auth middleware patterns"
 Read my workspace MEMORY.md
 ```
 
-The model has access to two memory tools:
-- `memory_search` -- Hybrid search across all memory (vector + full-text)
+The model has access to three memory tools:
+
+- `memory_search` -- Hybrid search across Markdown memory (vector + full-text)
 - `memory_get` -- Read a specific memory file by path
+- `experience_search` -- Search verified workspace lessons, outcomes, commands, evidence, and run/session references
 
 ### Hybrid Scoring
 

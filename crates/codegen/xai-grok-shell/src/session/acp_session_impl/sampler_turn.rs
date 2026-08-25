@@ -467,7 +467,7 @@ impl SessionActor {
             // Memory storage and FTS are local/provider-neutral. Semantic
             // search may independently use the user's connected xAI embedding
             // route while chat runs through Codex.
-            "memory_search" | "memory_get" => self.memory.is_enabled(),
+            "memory_search" | "experience_search" | "memory_get" => self.memory.is_enabled(),
             _ => true,
         }
     }

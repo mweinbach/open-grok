@@ -403,9 +403,9 @@ impl AgentBuilder {
     }
     /// Set the memory backend for cross-session knowledge retrieval.
     ///
-    /// When set, the `memory_search` and `memory_get` tools can access
-    /// the indexed memory store. When `None` (default), those tools
-    /// return "Memory is not enabled".
+    /// When set, the `memory_search`, `experience_search`, and `memory_get`
+    /// tools can access the indexed memory store. When `None` (default),
+    /// those tools return "Memory is not enabled".
     pub fn with_memory_backend(
         mut self,
         backend: Arc<dyn xai_grok_tools::types::memory_backend::MemoryBackend>,
@@ -751,6 +751,9 @@ impl AgentBuilder {
                     .push((&memory::search_tool::MemorySearchImpl).into());
                 tool_config
                     .tools
+                    .push((&memory::ExperienceSearchImpl).into());
+                tool_config
+                    .tools
                     .push((&memory::get_tool::MemoryGetImpl).into());
             }
             if self.web_search_config.is_enabled() {
@@ -810,13 +813,17 @@ impl AgentBuilder {
                 "{grok_build_ns}:{}",
                 xai_grok_tools::implementations::memory::MEMORY_SEARCH_TOOL_NAME
             );
+            let experience_search_id = format!(
+                "{grok_build_ns}:{}",
+                xai_grok_tools::implementations::memory::EXPERIENCE_SEARCH_TOOL_NAME
+            );
             let mem_get_id = format!(
                 "{grok_build_ns}:{}",
                 xai_grok_tools::implementations::memory::MEMORY_GET_TOOL_NAME
             );
-            tool_config
-                .tools
-                .retain(|tc| tc.id != mem_search_id && tc.id != mem_get_id);
+            tool_config.tools.retain(|tc| {
+                tc.id != mem_search_id && tc.id != experience_search_id && tc.id != mem_get_id
+            });
         }
         if !self.ask_user_question_enabled {
             let ask_user_id = format!(
@@ -1706,6 +1713,42 @@ mod tests {
                 names.contains(&"ask_user_question"),
                 "[{label}] stripping plan mode must preserve independently enabled ask-user: {names:?}"
             );
+        }
+    }
+    #[tokio::test]
+    async fn memory_disabled_strips_all_memory_tools_from_primary_and_subagent() {
+        use xai_grok_tools::implementations::{grok_build, memory};
+
+        for audience in [PromptAudience::Primary, PromptAudience::Subagent] {
+            let mut profile = crate::config::AgentDefinition::default_grok_build();
+            profile.inject_default_tools = false;
+            profile.tool_config.tools = vec![
+                (&grok_build::ReadFileTool).into(),
+                (&memory::MemorySearchImpl).into(),
+                (&memory::ExperienceSearchImpl).into(),
+                (&memory::MemoryGetImpl).into(),
+            ];
+            let agent = build_pager_agent(profile, false, false, audience).await;
+            let definitions = agent.tool_definitions().await;
+            let names: Vec<&str> = definitions
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect();
+
+            assert!(
+                names.contains(&"read_file"),
+                "[{audience:?}] non-memory tools must remain available: {names:?}"
+            );
+            for memory_tool in [
+                memory::MEMORY_SEARCH_TOOL_NAME,
+                memory::EXPERIENCE_SEARCH_TOOL_NAME,
+                memory::MEMORY_GET_TOOL_NAME,
+            ] {
+                assert!(
+                    !names.contains(&memory_tool),
+                    "[{audience:?}] {memory_tool} must be absent without a memory backend: {names:?}"
+                );
+            }
         }
     }
     #[tokio::test]

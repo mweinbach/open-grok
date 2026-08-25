@@ -741,6 +741,8 @@ impl ToolRegistryBuilder {
         b.register::<opencode::OpenCodeTodoWriteTool>();
         b.register::<opencode::OpenCodeSkillTool>();
         b.register::<crate::implementations::memory::search_tool::MemorySearchImpl>();
+        b.register::<crate::implementations::memory::experience_search_tool::ExperienceSearchImpl>(
+        );
         b.register::<crate::implementations::memory::get_tool::MemoryGetImpl>();
         b.register::<crate::implementations::search_tool::SearchTool>();
         b.register_with_params::<
@@ -2165,6 +2167,86 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct ExperienceSearchTestBackend {
+        calls: parking_lot::Mutex<Vec<(String, usize, Option<bool>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::types::memory_backend::MemoryBackend for ExperienceSearchTestBackend {
+        async fn search(
+            &self,
+            _query: &str,
+            _max_results: usize,
+            _min_score: f64,
+        ) -> Result<
+            Vec<crate::types::memory_backend::MemorySearchResult>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(Vec::new())
+        }
+
+        fn search_experiences(
+            &self,
+            query: &str,
+            max_results: usize,
+            outcome: Option<bool>,
+        ) -> Result<
+            Vec<crate::types::memory_backend::ExperienceSearchResult>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            self.calls
+                .lock()
+                .push((query.to_owned(), max_results, outcome));
+
+            Ok([true, false]
+                .into_iter()
+                .map(|success| {
+                    let verdict = if success { "success" } else { "failure" };
+                    crate::types::memory_backend::ExperienceSearchResult {
+                        id: verdict.to_owned(),
+                        category: "debugging".to_owned(),
+                        task_summary: "Repair provider authentication".to_owned(),
+                        lesson: format!("Observed {verdict}"),
+                        strategy: "Refresh isolated credentials".to_owned(),
+                        outcome: success,
+                        confidence: 0.9,
+                        score: 0.8,
+                        failure_reason: (!success).then(|| "Expired credential".to_owned()),
+                        what_worked: vec!["Refresh".to_owned()],
+                        what_failed: vec!["Blind retry".to_owned()],
+                        tests_run: vec!["cargo test provider_auth".to_owned()],
+                        source_run_ids: vec!["activation-1".to_owned()],
+                        source_session_ids: vec!["session-1".to_owned()],
+                        evidence: vec![crate::types::memory_backend::ExperienceEvidenceReference {
+                            kind: "command".to_owned(),
+                            verdict: verdict.to_owned(),
+                            command: Some("cargo test provider_auth".to_owned()),
+                            summary: format!("Test {verdict}"),
+                            observed_at: 1_700_000_000,
+                            source_run_id: Some("activation-1".to_owned()),
+                            source_session_id: Some("session-1".to_owned()),
+                        }],
+                    }
+                })
+                .collect())
+        }
+
+        fn get(
+            &self,
+            _path: &str,
+            _from: Option<usize>,
+            _lines: Option<usize>,
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(String::new())
+        }
+
+        fn total_chunks(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(0)
+        }
+    }
+
     /// Build a `SessionContext` for tests using a temp dir and real local
     /// filesystem/terminal backends.
     fn test_session_context(tmp: &TempDir) -> SessionContext {
@@ -2198,6 +2280,92 @@ mod tests {
             system_reminder_tag: crate::reminders::DEFAULT_REMINDER_TAG,
         }
     }
+
+    #[tokio::test]
+    async fn experience_search_dispatch_is_read_only_filtered_and_preserves_legacy_kind() {
+        let tmp = TempDir::new().expect("temporary session directory");
+        let backend = Arc::new(ExperienceSearchTestBackend::default());
+        let mut context = test_session_context(&tmp);
+        context.memory_backend = Some(backend.clone());
+
+        let config = ToolServerConfig {
+            tools: vec![
+                ToolConfig::for_tool::<crate::implementations::memory::MemorySearchImpl>(),
+                ToolConfig::for_tool::<crate::implementations::memory::ExperienceSearchImpl>(),
+                ToolConfig::for_tool::<crate::implementations::memory::MemoryGetImpl>(),
+            ],
+            behavior_preset: None,
+        };
+        let toolset = Arc::new(
+            ToolRegistryBuilder::new()
+                .finalize(config, context)
+                .expect("all memory tools must finalize together"),
+        );
+
+        assert_eq!(
+            toolset
+                .renderer
+                .render("${{ tools.by_kind.memory_search }}")
+                .expect("memory-search kind must render"),
+            "memory_search",
+            "adding experience search must not replace legacy Markdown search by kind"
+        );
+        assert!(
+            toolset
+                .tool_definitions()
+                .iter()
+                .any(|tool| tool.function.name == "experience_search"),
+            "experience_search must have its own independently callable wire name"
+        );
+
+        let result = toolset
+            .call(
+                "experience_search",
+                serde_json::json!({
+                    "query": "expired provider token",
+                    "outcome": "failure",
+                    "max_results": 999
+                }),
+                "experience-search-test",
+                None,
+            )
+            .await
+            .expect("experience search must dispatch successfully");
+
+        assert_eq!(
+            backend.calls.lock().as_slice(),
+            &[("expired provider token".to_owned(), 20, Some(false))],
+            "query, bounded result count, and typed verdict must reach the backend"
+        );
+        assert!(result.prompt_text.contains("experience:failure"));
+        assert!(result.prompt_text.contains("run:activation-1"));
+        assert!(result.prompt_text.contains("session:session-1"));
+        assert!(result.prompt_text.contains("cargo test provider_auth"));
+        assert!(
+            !result.prompt_text.contains("experience:success"),
+            "the tool must enforce filters even when a backend ignores them"
+        );
+
+        let empty = toolset
+            .call(
+                "experience_search",
+                serde_json::json!({
+                    "query": "expired provider token",
+                    "max_results": 0
+                }),
+                "experience-search-empty",
+                None,
+            )
+            .await
+            .expect("zero-result experience search must dispatch successfully");
+        assert!(
+            empty
+                .prompt_text
+                .contains("No evidence-backed experience results found"),
+            "tool must enforce result bounds when a backend ignores them"
+        );
+    }
+
     /// Regression test: `kind_params` must merge input params from ALL tools
     /// that share a `ToolKind`, not just the first one.
     ///

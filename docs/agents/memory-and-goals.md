@@ -16,7 +16,8 @@ SessionActor
   │     └── dream / flush config
   ├── Memory tools (ToolBridge Resources)
   │     ├── memory_search
-  │     └── memory_get
+  │     ├── memory_get
+  │     └── experience_search
   ├── GoalTracker (Mutex, pure state machine)
   │     └── GoalOrchestration snapshot → session_dir/goal/…
   └── update_goal tool channel → drain in goal.rs
@@ -26,6 +27,7 @@ SessionActor
 | --- | --- |
 | Core engine | `xai-grok-memory/` |
 | Experience schema / evidence / store / retrieval / evaluation | `xai-grok-memory/src/experience/{types,extraction,store,retrieval,evaluation}.rs` |
+| Experience tool search / workspace-safe result projection | `xai-grok-memory/src/backend.rs` |
 | Shell shim / re-exports | `xai-grok-shell/src/session/memory/` |
 | Session memory state | `…/session/memory_state.rs` |
 | Dream + tool registration | `…/session/acp_session_impl/memory_dream.rs` |
@@ -95,7 +97,7 @@ Scaffold / empty `MEMORY.md` stubs are filtered out of search and injection (`se
 | Index API | `index.rs` — `MemoryIndex::open_or_create` |
 | Chunking | `chunker.rs` |
 | Hybrid search | `search.rs` — FTS BM25 + optional vector KNN + temporal decay + source weights + MMR |
-| Experience layer | `experience/{types,extraction,store,retrieval,evaluation}.rs` — evidence-backed lessons, additive SQLite storage, ranked guidance, and comparison metrics |
+| Experience layer | `experience/{types,extraction,store,retrieval,evaluation}.rs` — evidence-backed lessons, additive SQLite storage, ranked guidance, run-to-session references, and comparison metrics |
 | Embeddings | `embedding.rs` + `embed_missing_chunks` in `lib.rs` (batches of 32) |
 | Backend for tools | `backend.rs` — `MemoryBackendImpl` / `MemoryBackendParams` |
 | File watcher | `watcher.rs` — external edit → reindex on search |
@@ -155,12 +157,18 @@ Shell-advertised ACP slash commands (`session/slash_commands.rs`):
 
 | Tool | Id | Module |
 | --- | --- | --- |
-| Search | `memory_search` | `implementations/memory/search_tool.rs` |
+| Search Markdown memory | `memory_search` | `implementations/memory/search_tool.rs` |
 | Read file | `memory_get` | `implementations/memory/get_tool.rs` |
+| Search verified experience | `experience_search` | `implementations/memory/experience_search_tool.rs` |
 
 - Read-only; require `Arc<dyn MemoryBackend>` in tool Resources.
 - If backend missing: text reply that memory is disabled (not a hard tool error).
-- Registered at session setup when memory enabled; re-registered on `/memory on` via `register_memory_tools` (dynamic register path).
+- Registered at session setup when memory enabled; re-registered on `/memory on` via `register_memory_tools` and removed on `/memory off`.
+- `experience_search` accepts `query`, optional `max_results` (configured search default; maximum 20), and optional `outcome: "success" | "failure"`. It searches only ranked experience in the current workspace; `memory_search` remains the separate Markdown/vector/FTS path.
+- Direct-reference queries use the same tool and safety rules: `{"query":"experience:abc123"}` loads that exact lesson; `{"query":"run:019abc"}` retrieves lessons from that activation; `{"query":"session:019def"}` retrieves lessons through verified run-to-session mappings. Legacy unmapped runs remain searchable by run reference only.
+- Results provide bounded, redacted lessons, observed successes/failures, verification commands, objective evidence, confidence, and `experience:<id>` / `run:<id>` references. A `session:<id>` reference appears only when a newly recorded run has a verified stable-session mapping; older unmapped rows retain their run reference without fabricated session provenance.
+- Session references can also be followed through existing resume flows, such as `open-grok --resume <id>`. Experience/run identifiers are directly searchable provenance references, not resume targets or unrestricted transcript access.
+- Memory-enabled subagents inherit read-only experience search; lesson persistence and run-to-session mapping remain root-session-only. In Code Mode Only the registered tool is called as nested `tools.experience_search(...)` through the existing memory tool path.
 
 ### Memory ↔ session / compaction
 
@@ -287,6 +295,7 @@ Subagents inherit parent permission handle but **not** parent plan gate; goal ch
 | --- | --- |
 | Memory schema / search unit | `xai-grok-memory` module tests (`schema`, `search`, …) |
 | Experience extraction / ranking / consolidation / evaluation | `xai-grok-memory/src/experience/{types,extraction,store,retrieval,evaluation}.rs` module tests |
+| Experience search / outcome filters / safe evidence references | `xai-grok-memory/src/backend.rs`, `xai-grok-tools/.../memory/experience_search_tool.rs` tests |
 | Memory tool id constants | `xai-grok-tools/.../memory/mod.rs` tests |
 | Memory config / enablement | `shell/.../acp_session_tests/memory_config_tests.rs` |
 | Memory context helpers | `shell/.../helpers/memory_context.rs` tests |

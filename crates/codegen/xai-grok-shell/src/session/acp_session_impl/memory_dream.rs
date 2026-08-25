@@ -34,7 +34,7 @@ pub(super) fn build_initial_injection_backend_params(
 }
 
 impl SessionActor {
-    /// Re-register `memory_search` and `memory_get` tools on the tool bridge.
+    /// Re-register memory and evidence-backed experience tools on the bridge.
     ///
     /// Used when re-enabling memory mid-session (`/memory on`). The tools are
     /// registered via the dynamic `register_mcp_tools` path which puts them in
@@ -45,7 +45,7 @@ impl SessionActor {
         bridge: &xai_grok_tools::bridge::ToolBridge,
     ) -> Result<(), String> {
         use xai_grok_tools::implementations::memory::{
-            MEMORY_GET_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME,
+            EXPERIENCE_SEARCH_TOOL_NAME, MEMORY_GET_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME,
         };
 
         bridge
@@ -56,6 +56,14 @@ impl SessionActor {
             )
             .await
             .map_err(|e| format!("failed to register memory_search: {e}"))?;
+        bridge
+            .register_mcp_tools(
+                EXPERIENCE_SEARCH_TOOL_NAME.to_owned(),
+                xai_grok_tools::implementations::memory::experience_search_tool::ExperienceSearchImpl,
+                None,
+            )
+            .await
+            .map_err(|e| format!("failed to register experience_search: {e}"))?;
         bridge
             .register_mcp_tools(
                 MEMORY_GET_TOOL_NAME.to_owned(),
@@ -119,11 +127,28 @@ impl SessionActor {
                         &trusted_nested_experience,
                         self.memory.experience_prior_tool_result_ids(),
                     ) {
-                        Ok(count) if count > 0 => tracing::info!(
-                            target: xai_grok_telemetry::memory_log::TARGET,
-                            experience_count = count,
-                            "MEMORY_EXPERIENCE: persisted evidence-backed session lessons"
-                        ),
+                        Ok(count) if count > 0 => {
+                            if let Err(error) = xai_grok_memory::experience::store::ExperienceStore::open(
+                                &storage.workspace_dir().join("index.sqlite"),
+                            )
+                            .and_then(|store| {
+                                store.record_source_session(
+                                    self.memory.experience_run_id(),
+                                    &self.session_info.id.0,
+                                )
+                            }) {
+                                tracing::warn!(
+                                    target: xai_grok_telemetry::memory_log::TARGET,
+                                    error = %error,
+                                    "MEMORY_EXPERIENCE: failed to associate experience run with source session"
+                                );
+                            }
+                            tracing::info!(
+                                target: xai_grok_telemetry::memory_log::TARGET,
+                                experience_count = count,
+                                "MEMORY_EXPERIENCE: persisted evidence-backed session lessons"
+                            );
+                        }
                         Ok(_) => {}
                         Err(error) => tracing::warn!(
                             target: xai_grok_telemetry::memory_log::TARGET,

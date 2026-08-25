@@ -76,6 +76,7 @@ ${%- if memory_enabled and tools.by_kind.memory_search and tools.by_kind.memory_
 
 <memory>
 Use `${{ tools.by_kind.memory_search }}` and `${{ tools.by_kind.memory_get }}` to recall past decisions and context. Search memory proactively for prior work or conventions.
+When `experience_search` is available, use it to inspect successful and failed approaches, supporting commands and outcomes, and references to the original evidence.
 </memory>
 ${%- endif %}
 ${%- if role_instructions %}

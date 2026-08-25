@@ -819,6 +819,13 @@ impl SessionActor {
                         tracing::debug!("memory_search tool was not registered during unregister");
                     }
                     if !bridge.unregister_tool_by_name(
+                        xai_grok_tools::implementations::memory::EXPERIENCE_SEARCH_TOOL_NAME,
+                    ) {
+                        tracing::debug!(
+                            "experience_search tool was not registered during unregister"
+                        );
+                    }
+                    if !bridge.unregister_tool_by_name(
                         xai_grok_tools::implementations::memory::MEMORY_GET_TOOL_NAME,
                     ) {
                         tracing::debug!("memory_get tool was not registered during unregister");

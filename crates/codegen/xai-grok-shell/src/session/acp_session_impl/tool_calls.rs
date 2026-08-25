@@ -2388,6 +2388,20 @@ impl SessionActor {
                     vec![],
                 )
             }
+            ToolInput::ExperienceSearch(search) => {
+                let end = search
+                    .query
+                    .char_indices()
+                    .nth(60)
+                    .map_or(search.query.len(), |(i, _)| i);
+                let display = &search.query[..end];
+                (
+                    format!("Experience search: \"{display}\""),
+                    acp::ToolKind::Other,
+                    vec![],
+                    vec![],
+                )
+            }
             ToolInput::MemoryGet(mg) => (
                 format!("Memory read: {}", mg.path),
                 acp::ToolKind::Read,

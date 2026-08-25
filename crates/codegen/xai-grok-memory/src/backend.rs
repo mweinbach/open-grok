@@ -9,14 +9,25 @@
 //! `rusqlite::Connection` is `!Send + !Sync`, so we open a fresh `MemoryIndex`
 //! per query. WAL mode ensures concurrent readers don't block.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use xai_grok_tools::types::memory_backend::{MemoryBackend, MemorySearchResult};
+use xai_grok_tools::types::memory_backend::{
+    ExperienceEvidenceReference, ExperienceSearchResult, MemoryBackend, MemorySearchResult,
+};
 
 use super::embedding::EmbeddingProvider as _;
+use super::experience::extraction::redact_sensitive_text;
+use super::experience::store::{ExperienceStore, source_reference_is_safe};
+use super::experience::types::{EvidenceSignal, EvidenceVerdict, ExperienceQuery};
 use super::storage::MemoryStorage;
 use super::watcher::MemoryFileWatcher;
+
+const MAX_EXPERIENCE_SEARCH_RESULTS: usize = 50;
+const MAX_EXPERIENCE_SEARCH_CANDIDATES: usize = 256;
+const MAX_EXPERIENCE_SEARCH_DETAILS: usize = 16;
+const MAX_EXPERIENCE_SEARCH_FIELD_CHARS: usize = 2_048;
 
 /// Embedding-client credentials scoped to a trusted endpoint. Only
 /// [`Self::for_endpoint`] retains a live credential; the empty default fails closed.
@@ -277,6 +288,186 @@ impl MemoryBackendImpl {
             &self.embed_base_url,
         )
         .await
+    }
+
+    fn search_experience_records(
+        &self,
+        query: &str,
+        max_results: usize,
+        outcome: Option<bool>,
+    ) -> anyhow::Result<Vec<ExperienceSearchResult>> {
+        if query.trim().is_empty() || max_results == 0 || self.storage.is_ephemeral() {
+            return Ok(Vec::new());
+        }
+
+        let max_results = max_results.min(MAX_EXPERIENCE_SEARCH_RESULTS);
+        let store = ExperienceStore::open(&self.db_path)?;
+        let search = ExperienceQuery {
+            text: query.to_owned(),
+            repository_id: Some(self.storage.workspace_dir().to_string_lossy().into_owned()),
+            repository_revision: super::experience::current_repository_revision(
+                self.storage.workspace_path(),
+            ),
+            environment: Some(super::experience::execution_environment()),
+            // SQLite applies outcome and exact-workspace filters before this
+            // bounded candidate scan, preserving minority failures without
+            // sacrificing ordinary evidence-aware ranking.
+            limit: MAX_EXPERIENCE_SEARCH_CANDIDATES,
+            ..Default::default()
+        };
+        let reference = query.trim();
+        let ranked = if ["experience:", "run:", "session:"]
+            .iter()
+            .any(|prefix| reference.starts_with(prefix))
+        {
+            store.retrieve_reference(&search, reference, outcome)?
+        } else {
+            store.retrieve_with_outcome(&search, outcome)?
+        };
+        let mut session_ids_by_run = BTreeMap::<String, Option<String>>::new();
+        let mut results = Vec::with_capacity(max_results.min(ranked.len()));
+
+        for ranked in ranked {
+            let memory = ranked.memory;
+            let Some(successful) = memory.success else {
+                // A hypothesis without an objective outcome is neither a
+                // successful strategy nor an established failed strategy.
+                continue;
+            };
+            if outcome.is_some_and(|requested| requested != successful)
+                || !source_reference_is_safe(&memory.id)
+                || memory.repository_id != self.storage.workspace_dir().to_string_lossy().as_ref()
+            {
+                continue;
+            }
+
+            let mut source_run_ids = Vec::new();
+            let mut source_session_ids = Vec::new();
+            let mut unique_runs = BTreeSet::new();
+            let mut unique_sessions = BTreeSet::new();
+            let evidenced_runs: BTreeSet<&str> = memory
+                .evidence
+                .iter()
+                .chain(&memory.test_results)
+                .filter(|signal| {
+                    signal.is_objective()
+                        && matches!(
+                            signal.verdict,
+                            EvidenceVerdict::Passed | EvidenceVerdict::Failed
+                        )
+                })
+                .filter_map(|signal| signal.source_run_id.as_deref())
+                .filter(|source_run_id| {
+                    source_reference_is_safe(source_run_id)
+                        && memory
+                            .source_run_ids
+                            .iter()
+                            .any(|declared| declared.as_str() == *source_run_id)
+                })
+                .collect();
+            let prioritized_run = if let Some(requested_run) = reference.strip_prefix("run:") {
+                memory.source_run_ids.iter().find(|source_run_id| {
+                    source_run_id.as_str() == requested_run
+                        && evidenced_runs.contains(source_run_id.as_str())
+                })
+            } else if let Some(requested_session) = reference.strip_prefix("session:") {
+                let mut matched_run = None;
+                for source_run_id in &memory.source_run_ids {
+                    if !evidenced_runs.contains(source_run_id.as_str()) {
+                        continue;
+                    }
+                    if source_session_for_run(&store, &mut session_ids_by_run, source_run_id)?
+                        .as_deref()
+                        == Some(requested_session)
+                    {
+                        matched_run = Some(source_run_id);
+                        break;
+                    }
+                }
+                matched_run
+            } else {
+                None
+            };
+
+            for source_run_id in prioritized_run
+                .into_iter()
+                .chain(memory.source_run_ids.iter())
+            {
+                if source_run_ids.len() >= MAX_EXPERIENCE_SEARCH_DETAILS {
+                    break;
+                }
+                if !evidenced_runs.contains(source_run_id.as_str())
+                    || !unique_runs.insert(source_run_id.clone())
+                {
+                    continue;
+                }
+
+                let session_id =
+                    source_session_for_run(&store, &mut session_ids_by_run, source_run_id)?;
+
+                source_run_ids.push(source_run_id.clone());
+                if let Some(session_id) = session_id
+                    && unique_sessions.insert(session_id.clone())
+                {
+                    source_session_ids.push(session_id);
+                }
+            }
+
+            if reference
+                .strip_prefix("run:")
+                .is_some_and(|run_id| !unique_runs.contains(run_id))
+                || reference
+                    .strip_prefix("session:")
+                    .is_some_and(|session_id| !unique_sessions.contains(session_id))
+            {
+                continue;
+            }
+
+            let evidence = experience_evidence_references(
+                &memory.evidence,
+                &memory.test_results,
+                &unique_runs,
+                &session_ids_by_run,
+            );
+            let expected_verdict = if successful { "passed" } else { "failed" };
+            if !evidence
+                .iter()
+                .any(|signal| signal.verdict == expected_verdict)
+            {
+                continue;
+            }
+            let category = serde_json::to_value(memory.category)?
+                .as_str()
+                .unwrap_or("unknown")
+                .to_owned();
+
+            results.push(ExperienceSearchResult {
+                id: memory.id,
+                category,
+                task_summary: bounded_experience_detail(&memory.task_summary),
+                lesson: bounded_experience_detail(&memory.lesson),
+                strategy: bounded_experience_detail(&memory.strategy),
+                outcome: successful,
+                confidence: memory.confidence.clamp(0.0, 1.0),
+                score: ranked.score,
+                failure_reason: memory
+                    .failure_reason
+                    .as_deref()
+                    .map(bounded_experience_detail),
+                what_worked: bounded_experience_details(&memory.what_worked),
+                what_failed: bounded_experience_details(&memory.what_failed),
+                tests_run: bounded_experience_details(&memory.tests_run),
+                source_run_ids,
+                source_session_ids,
+                evidence,
+            });
+
+            if results.len() >= max_results {
+                break;
+            }
+        }
+
+        Ok(results)
     }
 
     /// Build a fully configured backend for a live session.
@@ -565,6 +756,20 @@ impl MemoryBackend for MemoryBackendImpl {
             .collect())
     }
 
+    fn search_experiences(
+        &self,
+        query: &str,
+        max_results: usize,
+        outcome: Option<bool>,
+    ) -> Result<Vec<ExperienceSearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let results = self
+            .search_experience_records(query, max_results, outcome)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.search_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(results)
+    }
+
     fn get(
         &self,
         path: &str,
@@ -593,6 +798,99 @@ impl MemoryBackend for MemoryBackendImpl {
     fn default_search_min_score(&self) -> f64 {
         self.search_config.min_score as f64
     }
+}
+
+fn bounded_experience_detail(text: &str) -> String {
+    redact_sensitive_text(text)
+        .chars()
+        .take(MAX_EXPERIENCE_SEARCH_FIELD_CHARS)
+        .collect()
+}
+
+fn source_session_for_run(
+    store: &ExperienceStore,
+    cached_sessions: &mut BTreeMap<String, Option<String>>,
+    source_run_id: &str,
+) -> anyhow::Result<Option<String>> {
+    match cached_sessions.get(source_run_id) {
+        Some(session_id) => Ok(session_id.clone()),
+        None => {
+            let session_id = store.source_session_id(source_run_id)?;
+            cached_sessions.insert(source_run_id.to_owned(), session_id.clone());
+            Ok(session_id)
+        }
+    }
+}
+
+fn bounded_experience_details(details: &[String]) -> Vec<String> {
+    details
+        .iter()
+        .take(MAX_EXPERIENCE_SEARCH_DETAILS)
+        .map(|detail| bounded_experience_detail(detail))
+        .collect()
+}
+
+fn experience_evidence_references(
+    evidence: &[EvidenceSignal],
+    test_results: &[EvidenceSignal],
+    declared_runs: &BTreeSet<String>,
+    session_ids_by_run: &BTreeMap<String, Option<String>>,
+) -> Vec<ExperienceEvidenceReference> {
+    let mut unique = BTreeSet::new();
+    let mut references = Vec::new();
+
+    for signal in evidence.iter().chain(test_results) {
+        if references.len() >= MAX_EXPERIENCE_SEARCH_DETAILS {
+            break;
+        }
+        if !signal.is_objective()
+            || !matches!(
+                signal.verdict,
+                EvidenceVerdict::Passed | EvidenceVerdict::Failed
+            )
+        {
+            continue;
+        }
+        let Some(source_run_id) = signal
+            .source_run_id
+            .as_ref()
+            .filter(|source_run_id| declared_runs.contains(source_run_id.as_str()))
+        else {
+            continue;
+        };
+
+        let kind = serde_json::to_value(signal.kind)
+            .ok()
+            .and_then(|kind| kind.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let verdict = serde_json::to_value(signal.verdict)
+            .ok()
+            .and_then(|verdict| verdict.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let command = signal.command.as_deref().map(bounded_experience_detail);
+        let summary = bounded_experience_detail(&signal.summary);
+        if !unique.insert((
+            kind.clone(),
+            verdict.clone(),
+            command.clone(),
+            summary.clone(),
+            source_run_id.clone(),
+        )) {
+            continue;
+        }
+
+        references.push(ExperienceEvidenceReference {
+            kind,
+            verdict,
+            command,
+            summary,
+            observed_at: signal.observed_at,
+            source_run_id: Some(source_run_id.clone()),
+            source_session_id: session_ids_by_run.get(source_run_id).cloned().flatten(),
+        });
+    }
+
+    references
 }
 
 #[cfg(test)]
@@ -1255,6 +1553,7 @@ mod factory_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::experience::{EvidenceKind, ExperienceCategory, ExperienceMemory, ExperienceScope};
     use crate::index::{MemoryIndex, init_sqlite_vec};
     use tempfile::TempDir;
     use xai_grok_config_types::MemoryIndexConfig;
@@ -1284,6 +1583,483 @@ mod tests {
         idx.reindex_file(&file_path, "workspace").unwrap();
 
         (db_path, storage)
+    }
+
+    fn setup_experience_backend(tmp: &TempDir) -> (MemoryBackendImpl, ExperienceStore) {
+        let storage = MemoryStorage::new_flat(tmp.path(), &tmp.path().join("workspace-memory"));
+        let database_path = storage.workspace_dir().join("index.sqlite");
+        let store = ExperienceStore::open(&database_path).unwrap();
+        let backend = MemoryBackendImpl::new(database_path, storage);
+        (backend, store)
+    }
+
+    fn experience_fixture(
+        backend: &MemoryBackendImpl,
+        id: &str,
+        source_run_id: &str,
+        successful: bool,
+    ) -> ExperienceMemory {
+        let category = if successful {
+            ExperienceCategory::SuccessfulPattern
+        } else {
+            ExperienceCategory::FailureAntiPattern
+        };
+        let now = chrono::Utc::now().timestamp();
+        let mut experience = ExperienceMemory::new(
+            category,
+            "The parser visitor strategy produced an independently verified result",
+            source_run_id,
+            now,
+        );
+        experience.id = id.to_owned();
+        experience.repository_id = backend
+            .storage
+            .workspace_dir()
+            .to_string_lossy()
+            .into_owned();
+        experience.environment = super::super::experience::execution_environment();
+        experience.scope = ExperienceScope::Repository;
+        experience.task_type = "parser_change".to_owned();
+        experience.task_summary = "Fix the parser visitor regression".to_owned();
+        experience.strategy = "Extend the existing parser visitor".to_owned();
+        experience.success = Some(successful);
+        experience.tests_run = vec!["cargo test parser".to_owned()];
+        experience.what_worked = if successful {
+            vec!["Reused the existing parser visitor".to_owned()]
+        } else {
+            Vec::new()
+        };
+        experience.what_failed = if successful {
+            Vec::new()
+        } else {
+            vec!["The original parser visitor skipped nested expressions".to_owned()]
+        };
+        experience.failure_reason = (!successful)
+            .then(|| "Parser visitor regression still reproduced nested expressions".to_owned());
+        experience.evidence = vec![EvidenceSignal {
+            kind: EvidenceKind::Test,
+            verdict: if successful {
+                EvidenceVerdict::Passed
+            } else {
+                EvidenceVerdict::Failed
+            },
+            command: Some("cargo test parser".to_owned()),
+            summary: if successful {
+                "Parser visitor regression tests passed".to_owned()
+            } else {
+                "Parser visitor regression tests failed".to_owned()
+            },
+            score: Some(if successful { 1.0 } else { 0.0 }),
+            observed_at: now,
+            source_run_id: Some(source_run_id.to_owned()),
+        }];
+        experience.test_results = experience.evidence.clone();
+        experience.refresh_confidence();
+        experience
+    }
+
+    #[test]
+    fn experience_search_returns_outcomes_details_and_resolved_source_sessions() {
+        let temporary = TempDir::new().unwrap();
+        let (backend, store) = setup_experience_backend(&temporary);
+        store
+            .upsert(&experience_fixture(
+                &backend,
+                "success-1",
+                "run-success",
+                true,
+            ))
+            .unwrap();
+        store
+            .upsert(&experience_fixture(
+                &backend,
+                "failure-1",
+                "run-failure",
+                false,
+            ))
+            .unwrap();
+        store
+            .record_source_session("run-success", "session-success")
+            .unwrap();
+        store
+            .record_source_session("run-failure", "session-failure")
+            .unwrap();
+
+        let results = backend
+            .search_experiences("parser visitor regression", 10, None)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+
+        let success = results
+            .iter()
+            .find(|result| result.id == "success-1")
+            .unwrap();
+        assert!(success.outcome);
+        assert_eq!(success.category, "successful_pattern");
+        assert_eq!(
+            success.what_worked,
+            vec!["Reused the existing parser visitor"]
+        );
+        assert_eq!(success.tests_run, vec!["cargo test parser"]);
+        assert_eq!(success.source_run_ids, vec!["run-success"]);
+        assert_eq!(success.source_session_ids, vec!["session-success"]);
+        assert_eq!(success.evidence.len(), 1, "duplicate test signals collapse");
+        assert_eq!(success.evidence[0].kind, "test");
+        assert_eq!(success.evidence[0].verdict, "passed");
+        assert_eq!(
+            success.evidence[0].source_session_id.as_deref(),
+            Some("session-success")
+        );
+
+        let failure = results
+            .iter()
+            .find(|result| result.id == "failure-1")
+            .unwrap();
+        assert!(!failure.outcome);
+        assert_eq!(failure.category, "failure_anti_pattern");
+        assert!(
+            failure
+                .failure_reason
+                .as_deref()
+                .unwrap()
+                .contains("nested")
+        );
+        assert_eq!(failure.what_failed.len(), 1);
+        assert_eq!(failure.evidence[0].verdict, "failed");
+        assert_eq!(failure.source_session_ids, vec!["session-failure"]);
+    }
+
+    #[test]
+    fn experience_search_keeps_legacy_run_references_without_inventing_sessions() {
+        let temporary = TempDir::new().unwrap();
+        let (backend, store) = setup_experience_backend(&temporary);
+        store
+            .upsert(&experience_fixture(
+                &backend,
+                "legacy-1",
+                "legacy-run",
+                true,
+            ))
+            .unwrap();
+
+        let results = backend
+            .search_experiences("parser visitor", 1, Some(true))
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_run_ids, vec!["legacy-run"]);
+        assert!(results[0].source_session_ids.is_empty());
+        assert_eq!(results[0].evidence[0].source_session_id, None);
+        assert_eq!(
+            backend
+                .search_experiences("run:legacy-run", 1, None)
+                .unwrap()[0]
+                .id,
+            "legacy-1",
+            "legacy activation references remain resolvable without a session mapping"
+        );
+    }
+
+    #[test]
+    fn experience_search_resolves_exact_experience_run_and_session_references() {
+        let temporary = TempDir::new().unwrap();
+        let (backend, store) = setup_experience_backend(&temporary);
+        store
+            .upsert(&experience_fixture(
+                &backend,
+                "success-1",
+                "shared-run",
+                true,
+            ))
+            .unwrap();
+        store
+            .upsert(&experience_fixture(
+                &backend,
+                "failure-1",
+                "shared-run",
+                false,
+            ))
+            .unwrap();
+        store
+            .record_source_session("shared-run", "stable-session")
+            .unwrap();
+
+        let exact = backend
+            .search_experiences("experience:success-1", 10, None)
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].id, "success-1");
+        assert!(
+            backend
+                .search_experiences("experience:success-1", 10, Some(false))
+                .unwrap()
+                .is_empty(),
+            "exact reference lookup must still respect the outcome filter"
+        );
+
+        let from_run = backend
+            .search_experiences("run:shared-run", 10, None)
+            .unwrap();
+        assert_eq!(from_run.len(), 2);
+
+        let from_session = backend
+            .search_experiences("session:stable-session", 10, None)
+            .unwrap();
+        assert_eq!(from_session.len(), 2);
+
+        for invalid_reference in [
+            "experience:",
+            "experience:../stolen",
+            "run:.",
+            "run:nested/escape",
+            "session:../stolen",
+            "session:unmapped-session",
+        ] {
+            assert!(
+                backend
+                    .search_experiences(invalid_reference, 10, None)
+                    .unwrap()
+                    .is_empty(),
+                "unknown or unsafe references must not expose experience details"
+            );
+        }
+    }
+
+    #[test]
+    fn experience_search_rejects_declared_run_and_session_without_objective_evidence() {
+        let temporary = TempDir::new().unwrap();
+        let (backend, store) = setup_experience_backend(&temporary);
+        let mut experience = experience_fixture(&backend, "backed-1", "verified-run", true);
+        experience.source_run_ids.push("unsupported-run".to_owned());
+        store.upsert(&experience).unwrap();
+        store
+            .record_source_session("verified-run", "verified-session")
+            .unwrap();
+        store
+            .record_source_session("unsupported-run", "unsupported-session")
+            .unwrap();
+
+        let result = backend
+            .search_experiences("experience:backed-1", 1, None)
+            .unwrap()
+            .remove(0);
+        assert_eq!(result.source_run_ids, vec!["verified-run"]);
+        assert_eq!(result.source_session_ids, vec!["verified-session"]);
+
+        for unsupported_reference in ["run:unsupported-run", "session:unsupported-session"] {
+            assert!(
+                backend
+                    .search_experiences(unsupported_reference, 10, None)
+                    .unwrap()
+                    .is_empty(),
+                "an unsupported provenance declaration must not authorize reference lookup"
+            );
+        }
+        assert_eq!(
+            backend
+                .search_experiences("run:verified-run", 1, None)
+                .unwrap()[0]
+                .id,
+            "backed-1"
+        );
+    }
+
+    #[test]
+    fn experience_search_prioritizes_referenced_sources_beyond_the_visible_reference_limit() {
+        let temporary = TempDir::new().unwrap();
+        let (backend, store) = setup_experience_backend(&temporary);
+        let mut experience = experience_fixture(&backend, "many-sources", "source-00", true);
+
+        for index in 1..20 {
+            let source_run = format!("source-{index:02}");
+            experience.source_run_ids.push(source_run.clone());
+            let mut evidence = experience.evidence[0].clone();
+            evidence.source_run_id = Some(source_run);
+            experience.evidence.push(evidence);
+        }
+        store.upsert(&experience).unwrap();
+
+        for index in 0..20 {
+            store
+                .record_source_session(
+                    &format!("source-{index:02}"),
+                    &format!("session-{index:02}"),
+                )
+                .unwrap();
+        }
+
+        for (query, expected_run, expected_session) in [
+            ("run:source-19", "source-19", "session-19"),
+            ("session:session-18", "source-18", "session-18"),
+        ] {
+            let results = backend.search_experiences(query, 1, None).unwrap();
+            assert_eq!(results.len(), 1, "late valid references must resolve");
+            assert_eq!(
+                results[0].source_run_ids.len(),
+                MAX_EXPERIENCE_SEARCH_DETAILS
+            );
+            assert_eq!(results[0].source_run_ids[0], expected_run);
+            assert_eq!(results[0].source_session_ids[0], expected_session);
+            assert!(
+                results[0]
+                    .evidence
+                    .iter()
+                    .any(|signal| signal.source_run_id.as_deref() == Some(expected_run)),
+                "the prioritized reference must retain supporting objective evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn experience_search_filters_outcomes_unknowns_foreign_records_and_unbacked_claims() {
+        let temporary = TempDir::new().unwrap();
+        let (backend, store) = setup_experience_backend(&temporary);
+        store
+            .upsert(&experience_fixture(
+                &backend,
+                "success-1",
+                "run-success",
+                true,
+            ))
+            .unwrap();
+        store
+            .upsert(&experience_fixture(
+                &backend,
+                "failure-1",
+                "run-failure",
+                false,
+            ))
+            .unwrap();
+
+        let mut unknown = experience_fixture(&backend, "unknown-1", "run-unknown", true);
+        unknown.category = ExperienceCategory::UncertainHypothesis;
+        unknown.success = None;
+        store.upsert(&unknown).unwrap();
+
+        let mut foreign = experience_fixture(&backend, "foreign-1", "run-foreign", true);
+        foreign.repository_id = "foreign-workspace".to_owned();
+        foreign.scope = ExperienceScope::Global;
+        foreign.generalizability = 0.97;
+        for run in ["foreign-run-2", "foreign-run-3"] {
+            foreign.source_run_ids.push(run.to_owned());
+            let mut supporting = foreign.evidence[0].clone();
+            supporting.source_run_id = Some(run.to_owned());
+            foreign.evidence.push(supporting);
+        }
+        store.upsert(&foreign).unwrap();
+        store
+            .record_source_session("run-foreign", "foreign-session")
+            .unwrap();
+
+        let mut unsupported =
+            experience_fixture(&backend, "unsupported-1", "run-unsupported", true);
+        unsupported.task_type = "unsupported_claim".to_owned();
+        unsupported.evidence[0].verdict = EvidenceVerdict::Failed;
+        unsupported.test_results = unsupported.evidence.clone();
+        store.upsert(&unsupported).unwrap();
+
+        let successes = backend
+            .search_experiences("parser visitor regression", 20, Some(true))
+            .unwrap();
+        assert_eq!(successes.len(), 1);
+        assert_eq!(successes[0].id, "success-1");
+
+        let failures = backend
+            .search_experiences("parser visitor regression", 20, Some(false))
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].id, "failure-1");
+
+        for foreign_reference in [
+            "experience:foreign-1",
+            "run:run-foreign",
+            "session:foreign-session",
+        ] {
+            assert!(
+                backend
+                    .search_experiences(foreign_reference, 20, None)
+                    .unwrap()
+                    .is_empty(),
+                "direct references must never bypass workspace isolation"
+            );
+        }
+    }
+
+    #[test]
+    fn experience_search_redacts_compromised_legacy_text_and_rejects_unsafe_references() {
+        let temporary = TempDir::new().unwrap();
+        let (backend, store) = setup_experience_backend(&temporary);
+        let experience = experience_fixture(&backend, "secure-1", "safe-run", true);
+        store.upsert(&experience).unwrap();
+
+        let leaked_credential = "QWxhZGRpbjpPcGVuU2VzYW1l";
+        let mut compromised = serde_json::to_value(&experience).unwrap();
+        compromised["strategy"] =
+            serde_json::Value::String(format!("Authorization: Basic {leaked_credential}"));
+        compromised["tests_run"] = serde_json::json!([format!(
+            "curl --header 'Authorization: Basic {leaked_credential}'"
+        )]);
+        compromised["evidence"][0]["summary"] =
+            serde_json::Value::String(format!("Authorization: Basic {leaked_credential}"));
+        compromised["test_results"] = serde_json::json!([]);
+        compromised["source_run_ids"] = serde_json::json!(["../stolen-session", "safe-run"]);
+
+        let connection = rusqlite::Connection::open(&backend.db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE experiences SET record_json = ?1 WHERE id = ?2",
+                rusqlite::params![serde_json::to_string(&compromised).unwrap(), "secure-1"],
+            )
+            .unwrap();
+
+        let results = backend
+            .search_experiences("parser visitor", 1, Some(true))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert!(!result.strategy.contains(leaked_credential));
+        assert!(!result.tests_run[0].contains(leaked_credential));
+        assert!(!result.evidence[0].summary.contains(leaked_credential));
+        assert_eq!(result.source_run_ids, vec!["safe-run"]);
+        assert!(result.source_session_ids.is_empty());
+    }
+
+    #[test]
+    fn experience_search_bounds_detail_lists_and_redacted_text() {
+        let temporary = TempDir::new().unwrap();
+        let (backend, store) = setup_experience_backend(&temporary);
+        let mut experience = experience_fixture(&backend, "bounded-1", "bounded-run", true);
+        experience.strategy = "s".repeat(MAX_EXPERIENCE_SEARCH_FIELD_CHARS + 100);
+        experience.what_worked = (0..(MAX_EXPERIENCE_SEARCH_DETAILS + 5))
+            .map(|index| format!("Successful parser visitor strategy {index}"))
+            .collect();
+        experience.tests_run = (0..(MAX_EXPERIENCE_SEARCH_DETAILS + 5))
+            .map(|index| format!("cargo test parser_{index}"))
+            .collect();
+        store.upsert(&experience).unwrap();
+
+        let results = backend
+            .search_experiences("parser visitor", usize::MAX, Some(true))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].strategy.chars().count(),
+            MAX_EXPERIENCE_SEARCH_FIELD_CHARS
+        );
+        assert_eq!(results[0].what_worked.len(), MAX_EXPERIENCE_SEARCH_DETAILS);
+        assert_eq!(results[0].tests_run.len(), MAX_EXPERIENCE_SEARCH_DETAILS);
+        assert!(
+            backend
+                .search_experiences("parser visitor", 0, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .search_experiences("  ", 10, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

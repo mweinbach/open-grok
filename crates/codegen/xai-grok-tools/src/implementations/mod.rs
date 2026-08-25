@@ -20,7 +20,7 @@ pub use grok_build::{
     SendAgentMessageTool, SwarmWaitTool, TaskOutputTool, TaskTool, TodoWriteTool, WaitAgentTool,
     WaitTasksTool, WebFetchTool, WebRunTool, WebSearchTool,
 };
-pub use memory::{MemoryGetImpl, MemorySearchImpl};
+pub use memory::{ExperienceSearchImpl, MemoryGetImpl, MemorySearchImpl};
 pub use opencode::{
     OpenCodeBashTool, OpenCodeEditTool, OpenCodeGlobTool, OpenCodeGrepTool, OpenCodeReadTool,
     OpenCodeSkillTool, OpenCodeTodoWriteTool, OpenCodeWriteTool,

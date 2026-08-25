@@ -8,7 +8,7 @@ For existing enablement, storage, flush/dream behavior, and goal orchestration, 
 
 The existing `xai-grok-memory` engine stores global and workspace `MEMORY.md` files plus Markdown session/flush summaries. Workspace `index.sqlite` indexes Markdown chunks using SQLite FTS5/BM25 and, when available, sqlite-vec embeddings. Retrieval merges lexical/vector scores, applies source weighting, session-age decay, an access-frequency boost, and optional maximal marginal relevance. Dream consolidation summarizes prior session files into curated workspace Markdown.
 
-The shell searches this index before the first model sample, formats relevant snippets inside `<memory-context>`, and reuses an already-persisted block to preserve the system-prefix KV cache. `memory_search`/`memory_get` expose the same Markdown-backed memory; compaction can recover relevant snippets.
+The shell searches this index before the first model sample, formats relevant snippets inside `<memory-context>`, and reuses an already-persisted block to preserve the system-prefix KV cache. `memory_search`/`memory_get` expose Markdown-backed memory, while the dedicated `experience_search` tool exposes ranked, evidence-backed experience records; compaction can recover relevant snippets.
 
 Current gaps:
 
@@ -47,6 +47,8 @@ Intended ownership:
 | Objective-signal classification and bounded lesson extraction | `crates/codegen/xai-grok-memory/src/experience/extraction.rs` |
 | Additive SQLite storage, consolidation, provenance, and reinforcement | `crates/codegen/xai-grok-memory/src/experience/store.rs` |
 | Context-aware ranking, contradiction detection, and compact briefing | `crates/codegen/xai-grok-memory/src/experience/retrieval.rs` |
+| Workspace-scoped experience tool queries and safe result projection | `crates/codegen/xai-grok-memory/src/backend.rs` |
+| Read-only experience-search tool, input schema, and result rendering | `crates/codegen/xai-grok-tools/src/implementations/memory/experience_search_tool.rs` |
 | Deterministic comparison metrics and retrieval ablations | `crates/codegen/xai-grok-memory/src/experience/evaluation.rs` |
 | Existing `<memory-context>` formatting and cache guard | `crates/codegen/xai-grok-shell/src/session/helpers/memory_context.rs` |
 | First-turn advisory injection and failure-triggered replanning | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` |
@@ -109,7 +111,7 @@ Lifecycle states are `active`, `low_confidence`, `superseded`, `deprecated`, and
 
 An evidence signal records its kind, observed verdict, bounded/redacted summary, optional command or check identifier, optional numeric score, timestamp, and source-run reference. Relevant kinds include command exit, compilation, tests, lint, type checks, benchmarks, runtime behavior, regression detection, code review/judge verdict, and explicit user feedback. Multiple checks from one source run are supporting detail, not independent replications; confidence and cross-repository generalization depend on distinct source runs.
 
-The experience run ID is scoped to one session-actor activation, not to the stable session ID used for persisted conversation and resume. Retrieval attribution, extracted evidence, followed recommendations, and finalization must all use the same activation-scoped ID. Resuming a persisted session into a newly spawned actor creates a fresh experience run, so its new checks can independently reinforce prior lessons instead of being rejected by the previous activation's finalized-run tombstone; reattaching to an actor that is still running preserves its current run ID.
+The experience run ID is scoped to one session-actor activation, not to the stable session ID used for persisted conversation and resume. Retrieval attribution, extracted evidence, followed recommendations, and finalization must all use the same activation-scoped ID. Resuming a persisted session into a newly spawned actor creates a fresh experience run, so its new checks can independently reinforce prior lessons instead of being rejected by the previous activation's finalized-run tombstone; reattaching to an actor that is still running preserves its current run ID. A bounded workspace-local run-to-session mapping makes newly recorded activation references traceable to the stable persisted session without conflating either identity. Older records without a mapping retain their run references but do not invent session provenance.
 
 Keep outcome dimensions separate:
 
@@ -132,11 +134,11 @@ $OPENGROK_HOME/memory/
         ├── index.sqlite
         │     ├── existing meta/chunks/chunks_fts[/chunks_vec]
         │     └── additive experiences, lexical index, reuse, source provenance,
-        │         and bounded finalized-run tombstones
+        │         bounded run-to-session references, and finalized-run tombstones
         └── sessions/*.md
 ```
 
-Use the **same workspace-scoped `index.sqlite`** and existing filesystem/journal policy. Create experience, lexical-search, reuse-attribution, compact source-provenance, and bounded finalized-run tables additively and idempotently (`CREATE ... IF NOT EXISTS`); do not rebuild or reinterpret legacy chunks, require embeddings, create a second database, migrate Markdown eagerly, or cross repository boundaries. Legacy hostless workspace directories are migrated only when their recorded workspace ownership and current origin prove the same host-qualified repository; ambiguous legacy directories remain untouched rather than risking disclosure. Existing installations with no experience rows retain the legacy retrieval path unchanged. Missing optional fields deserialize with conservative defaults, and unrecognized evidence is never considered objective, so future schema evolution is non-destructive and fails safely.
+Use the **same workspace-scoped `index.sqlite`** and existing filesystem/journal policy. Create experience, lexical-search, reuse-attribution, compact source-provenance, bounded run-to-session references, and bounded finalized-run tables additively and idempotently (`CREATE ... IF NOT EXISTS`); do not rebuild or reinterpret legacy chunks, require embeddings, create a second database, migrate Markdown eagerly, or cross repository boundaries. Legacy hostless workspace directories are migrated only when their recorded workspace ownership and current origin prove the same host-qualified repository; ambiguous legacy directories remain untouched rather than risking disclosure. Existing installations with no experience rows retain the legacy retrieval path unchanged. Missing optional fields deserialize with conservative defaults, and unrecognized evidence is never considered objective, so future schema evolution is non-destructive and fails safely.
 
 Experience collection and retrieval inherit the existing memory enablement/configuration and workspace-storage rules: memory is off by default; `--no-memory`, `--experimental-memory`, `GROK_MEMORY`, `[memory] enabled`, session `/memory on|off`, and ephemeral-workspace protections retain their existing meaning. Respect session retention/save policy; do not introduce a separate default-on subsystem or write under `~/.grok`.
 
@@ -177,6 +179,24 @@ experience_score = base_score × freshness_decay × lifecycle_modifier
 ```
 
 The source implementation and tests are authoritative for exact constants; these weights are the initial design calibration, not a claim of experimentally optimized coefficients. Require meaningful lexical/context overlap before scoring, so an otherwise confident unrelated lesson cannot dominate. Neutral Bayesian priors prevent one reuse from becoming certainty. The outcome component is **polarity-aware**: a well-evidenced failed strategy can rank highly as a warning without being mislabeled a successful solution. Recent contradictory evidence, failed reuse, revision changes, and poor quality reduce influence; stronger independent evidence offsets ordinary age decay.
+
+### Explicit experience search and references
+
+`experience_search` is a dedicated read-only model tool for inspecting structured lessons; it does not change the Markdown-backed `memory_search`/`memory_get` contract. Its required `query` searches ranked experience for the current workspace and repository. Optional `max_results` uses the configured memory-search default when omitted and is capped at 20. An optional `outcome` accepts only `"success"` or `"failure"`; omitting it searches both:
+
+```json
+{
+  "query": "authentication middleware integration test",
+  "max_results": 5,
+  "outcome": "failure"
+}
+```
+
+The same tool also dereferences safe exact references: `{"query":"experience:abc123"}` loads that lesson, `{"query":"run:019abc"}` retrieves lessons supported by that activation, and `{"query":"session:019def"}` retrieves lessons from runs verifiably mapped to that stable session. Older records without run-to-session mappings remain searchable by run reference but cannot be resolved by session reference. Direct lookup preserves workspace/repository isolation, lifecycle and outcome filtering, response bounds, and evidence redaction; malformed references do not become unrestricted queries.
+
+Results expose concise task/lesson/strategy context, outcome and confidence, what worked or failed, verification commands, failure reasons, and bounded objective evidence where available. Each result includes its stable `experience:<id>` reference and source `run:<id>` references; `session:<id>` references appear only when the corresponding activation has a verified workspace-local session mapping. Resumed activations can therefore link to the same stable session while remaining independent experience runs. Historical unmapped runs are not guessed or matched across workspaces. All three references are queryable through `experience_search`; a resolvable session can additionally be reopened through existing session-resume flows, such as `open-grok --resume <id>`. Experience and run references are not standalone resume commands.
+
+Search returns bounded, redacted details rather than complete transcripts, provider history, raw terminal output, or credentials. It inherits the existing memory enablement, permission, and workspace-isolation rules; disabling memory removes the tool. Memory-enabled subagents may search inherited workspace experience, but only root sessions persist lessons and run-to-session mappings. Code Mode Only exposes the same registered tool through nested `tools.experience_search(...)`, not as a special top-level transport or a second memory backend. Availability requires running an Open Grok binary that includes this implementation.
 
 ### Briefings and contradictions
 

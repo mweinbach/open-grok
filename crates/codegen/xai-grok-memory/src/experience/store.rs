@@ -16,6 +16,7 @@ const MAX_ACTIVE_EXPERIENCES: usize = 2_048;
 const MAX_TOTAL_EXPERIENCES: usize = 4_096;
 const MAX_FINALIZED_REUSE_ROWS: usize = 8_192;
 const MAX_FINALIZED_RUN_TOMBSTONES: usize = 16_384;
+const MAX_SOURCE_SESSION_REFERENCES: usize = 16_384;
 const MAX_PENDING_REUSE_ROWS: usize = 4_096;
 const MAX_CANDIDATES: usize = 256;
 const MAX_CONSOLIDATION_CANDIDATES: usize = 64;
@@ -108,6 +109,15 @@ CREATE TABLE IF NOT EXISTS experience_source_provenance (
     observed_count INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS experience_run_sessions (
+    run_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_experience_run_sessions_time
+    ON experience_run_sessions(recorded_at, run_id);
 "#;
 
 pub struct ExperienceStore {
@@ -287,7 +297,200 @@ impl ExperienceStore {
             .collect()
     }
 
+    /// Bind an activation-scoped source run to its stable session identity.
+    ///
+    /// Mappings are workspace-local, immutable, and contain only validated
+    /// opaque identifiers. Replaying the same mapping is harmless; a conflicting
+    /// session never replaces an existing provenance reference.
+    pub fn record_source_session(&self, run_id: &str, session_id: &str) -> Result<()> {
+        require_run_id(run_id)?;
+        if !source_reference_is_safe(run_id) || !source_reference_is_safe(session_id) {
+            bail!("experience source references require safe run and session identifiers");
+        }
+
+        let transaction = self.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT session_id FROM experience_run_sessions WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        match existing {
+            Some(existing) if existing != session_id => {
+                bail!("experience source run is already bound to another session");
+            }
+            Some(_) => {}
+            None => {
+                transaction.execute(
+                    "INSERT INTO experience_run_sessions (run_id, session_id, recorded_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![run_id, session_id, current_timestamp()],
+                )?;
+                enforce_source_session_limit(&transaction, MAX_SOURCE_SESSION_REFERENCES)?;
+            }
+        }
+
+        transaction
+            .commit()
+            .context("failed to commit experience source session reference")
+    }
+
+    /// Resolve one activation run within this workspace without guessing
+    /// identities for records created before session provenance was available.
+    pub fn source_session_id(&self, run_id: &str) -> Result<Option<String>> {
+        require_run_id(run_id)?;
+        if !source_reference_is_safe(run_id) {
+            bail!("experience source references require a safe run identifier");
+        }
+
+        let session_id = self
+            .connection
+            .query_row(
+                "SELECT session_id FROM experience_run_sessions WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        if session_id
+            .as_deref()
+            .is_some_and(|session_id| !source_reference_is_safe(session_id))
+        {
+            bail!("persisted experience source session identifier is unsafe");
+        }
+
+        Ok(session_id)
+    }
+
     pub fn retrieve(&self, query: &ExperienceQuery) -> Result<Vec<RankedExperience>> {
+        self.retrieve_filtered(query, None, false)
+    }
+
+    /// Retrieve objectively classified, workspace-local experience, optionally
+    /// selecting successes or failures before SQLite's bounded candidate scan.
+    ///
+    /// Unlike general planning retrieval, this explicit search never includes
+    /// unknown outcomes or generalized records owned by another repository.
+    pub fn retrieve_with_outcome(
+        &self,
+        query: &ExperienceQuery,
+        outcome: Option<bool>,
+    ) -> Result<Vec<RankedExperience>> {
+        self.retrieve_filtered(query, outcome, true)
+    }
+
+    /// Resolve an exact experience, activation-run, or stable-session reference
+    /// without relying on full-text indexing of opaque provenance identifiers.
+    pub fn retrieve_reference(
+        &self,
+        query: &ExperienceQuery,
+        reference: &str,
+        outcome: Option<bool>,
+    ) -> Result<Vec<RankedExperience>> {
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(repository_id) = query
+            .repository_id
+            .as_deref()
+            .filter(|repository_id| !repository_id.trim().is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let (identifier, predicate) =
+            if let Some(identifier) = reference.strip_prefix("experience:") {
+                (identifier, "e.id = ?1")
+            } else if let Some(identifier) = reference.strip_prefix("run:") {
+                (
+                    identifier,
+                    "EXISTS (
+                    SELECT 1 FROM json_each(e.record_json, '$.source_run_ids') AS source
+                     WHERE source.value = ?1
+                )",
+                )
+            } else if let Some(identifier) = reference.strip_prefix("session:") {
+                (
+                    identifier,
+                    "EXISTS (
+                    SELECT 1 FROM json_each(e.record_json, '$.source_run_ids') AS source
+                    JOIN experience_run_sessions AS session_refs
+                      ON session_refs.run_id = source.value
+                   WHERE session_refs.session_id = ?1
+                )",
+                )
+            } else {
+                return Ok(Vec::new());
+            };
+
+        if !source_reference_is_safe(identifier) {
+            return Ok(Vec::new());
+        }
+
+        let active = status_label(&ExperienceStatus::Active)?;
+        let low_confidence = status_label(&ExperienceStatus::LowConfidence)?;
+        let deprecated = status_label(&ExperienceStatus::Deprecated)?;
+        let outcome = outcome.map(i64::from);
+        let sql = format!(
+            "SELECT e.record_json
+               FROM experiences AS e
+              WHERE {predicate}
+                AND e.repository_id = ?2
+                AND json_type(e.record_json, '$.success') IN ('true', 'false')
+                AND (?3 IS NULL OR json_extract(e.record_json, '$.success') = ?3)
+                AND (e.status = ?4 OR (?5 AND (e.status = ?6 OR e.status = ?7)))
+              ORDER BY e.confidence DESC, e.updated_at DESC, e.id ASC
+              LIMIT ?8"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let records = statement.query_map(
+            params![
+                identifier,
+                repository_id,
+                outcome,
+                active,
+                query.include_low_confidence,
+                low_confidence,
+                deprecated,
+                MAX_CANDIDATES as i64,
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+
+        let mut ranked = Vec::new();
+        for record in records {
+            let memory = deserialize_record_json(&record?)?;
+            // Identifiers are intentionally unindexed. Rank each explicitly
+            // referenced record against its own redacted applicability context
+            // so exact-file/module boundaries and lifecycle rules still apply.
+            let mut reference_query = query.clone();
+            reference_query.text = format!(
+                "{} {} {} {}",
+                memory.task_summary, memory.lesson, memory.strategy, memory.context
+            );
+            reference_query.limit = 1;
+            ranked.extend(rank_experiences(vec![memory], &reference_query));
+        }
+
+        ranked.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| right.memory.updated_at.cmp(&left.memory.updated_at))
+                .then_with(|| left.memory.id.cmp(&right.memory.id))
+        });
+        ranked.truncate(query.limit);
+        Ok(ranked)
+    }
+
+    fn retrieve_filtered(
+        &self,
+        query: &ExperienceQuery,
+        outcome: Option<bool>,
+        require_known_outcome: bool,
+    ) -> Result<Vec<RankedExperience>> {
         if query.limit == 0 {
             return Ok(Vec::new());
         }
@@ -297,6 +500,11 @@ impl ExperienceStore {
         let deprecated = status_label(&ExperienceStatus::Deprecated)?;
         let candidate_limit = query.limit.saturating_mul(16).clamp(32, MAX_CANDIDATES);
         let repository_id = query.repository_id.as_deref().unwrap_or_default();
+        if require_known_outcome && repository_id.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let strict_repository = require_known_outcome && !repository_id.is_empty();
+        let outcome = outcome.map(|successful| i64::from(successful));
         let failure_context = query.failure_context.as_deref().unwrap_or_default();
         let searchable_query = format!("{} {failure_context}", query.text);
         let mut candidates = Vec::with_capacity(candidate_limit);
@@ -305,15 +513,18 @@ impl ExperienceStore {
         if let Some(fts_query) = sanitize_fts_query(&searchable_query) {
             let fts_result = self.connection.prepare(
                 "SELECT e.record_json
-                   FROM experience_fts
+                  FROM experience_fts
                    JOIN experiences e ON e.id = experience_fts.experience_id
                   WHERE experience_fts MATCH ?1
                     AND (e.status = ?2 OR (?3 AND (e.status = ?4 OR e.status = ?5)))
+                    AND (?7 = 0 OR json_type(e.record_json, '$.success') IN ('true', 'false'))
+                    AND (?8 IS NULL OR json_extract(e.record_json, '$.success') = ?8)
+                    AND (?9 = 0 OR e.repository_id = ?6)
                   ORDER BY (e.repository_id = ?6) DESC,
                            bm25(experience_fts),
                            e.confidence DESC,
                            e.updated_at DESC
-                  LIMIT ?7",
+                  LIMIT ?10",
             );
 
             match fts_result {
@@ -326,6 +537,9 @@ impl ExperienceStore {
                             low_confidence,
                             deprecated,
                             repository_id,
+                            require_known_outcome,
+                            outcome,
+                            strict_repository,
                             MAX_CANDIDATES as i64,
                         ],
                         |row| row.get::<_, String>(0),
@@ -360,12 +574,15 @@ impl ExperienceStore {
             let mut statement = self.connection.prepare(
                 "SELECT record_json
                    FROM experiences
-                  WHERE status = ?1 OR (?2 AND (status = ?3 OR status = ?4))
+                  WHERE (status = ?1 OR (?2 AND (status = ?3 OR status = ?4)))
+                    AND (?6 = 0 OR json_type(record_json, '$.success') IN ('true', 'false'))
+                    AND (?7 IS NULL OR json_extract(record_json, '$.success') = ?7)
+                    AND (?8 = 0 OR repository_id = ?5)
                   ORDER BY (repository_id = ?5) DESC,
                            confidence DESC,
                            evidence_count DESC,
                            updated_at DESC
-                  LIMIT ?6",
+                  LIMIT ?9",
             )?;
             let records = statement.query_map(
                 params![
@@ -374,6 +591,9 @@ impl ExperienceStore {
                     low_confidence,
                     deprecated,
                     repository_id,
+                    require_known_outcome,
+                    outcome,
+                    strict_repository,
                     MAX_CANDIDATES as i64,
                 ],
                 |row| row.get::<_, String>(0),
@@ -1083,6 +1303,15 @@ fn identity_is_safe(identity: &str, repository_path: bool) -> bool {
     redact_sensitive_text(identity) == identity
 }
 
+pub(crate) fn source_reference_is_safe(identity: &str) -> bool {
+    identity_is_safe(identity, false)
+        && identity
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && identity.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && !identity.contains("..")
+}
+
 fn load_source_provenance(
     connection: &Connection,
     experience_id: &str,
@@ -1429,6 +1658,28 @@ fn enforce_finalized_run_limit(connection: &Connection, maximum: usize) -> Resul
                   SELECT run_id
                     FROM experience_finalized_runs
                    ORDER BY finalized_at ASC, run_id ASC
+                   LIMIT ?1
+              )",
+            params![overflow as i64],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn enforce_source_session_limit(connection: &Connection, maximum: usize) -> Result<()> {
+    let count =
+        connection.query_row("SELECT COUNT(*) FROM experience_run_sessions", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+    let overflow = (count.max(0) as usize).saturating_sub(maximum);
+    if overflow != 0 {
+        connection.execute(
+            "DELETE FROM experience_run_sessions
+              WHERE run_id IN (
+                  SELECT run_id
+                    FROM experience_run_sessions
+                   ORDER BY recorded_at ASC, run_id ASC
                    LIMIT ?1
               )",
             params![overflow as i64],
@@ -1928,7 +2179,262 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_exists, 1);
+        let source_session_table_exists = second
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name = 'experience_run_sessions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(source_session_table_exists, 1);
         assert!(second.all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_session_reference_is_durable_idempotent_and_immutable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("index.sqlite");
+        let store = ExperienceStore::open(&path).unwrap();
+
+        assert_eq!(store.source_session_id("activation-1").unwrap(), None);
+        store
+            .record_source_session("activation-1", "stable-session-1")
+            .unwrap();
+        store
+            .record_source_session("activation-1", "stable-session-1")
+            .unwrap();
+        assert_eq!(
+            store.source_session_id("activation-1").unwrap(),
+            Some("stable-session-1".to_owned())
+        );
+        assert!(
+            store
+                .record_source_session("activation-1", "different-session")
+                .is_err(),
+            "an existing activation must never be rebound to another session"
+        );
+
+        drop(store);
+        let reopened = ExperienceStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.source_session_id("activation-1").unwrap(),
+            Some("stable-session-1".to_owned())
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row("SELECT COUNT(*) FROM experience_run_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                },)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn source_session_references_reject_unsafe_or_credential_like_identities() {
+        let (_temporary, store) = store();
+        let unsafe_identities = [
+            "",
+            " ",
+            ".",
+            "contains whitespace",
+            "nested/identity",
+            "nested\\identity",
+            "../secret",
+            "/tmp/session",
+            "session..identity",
+            "session@example.com",
+            "key=AIzaSyDUMMYEXAMPLEFORTESTING1234567890A",
+            "Authorization:Basic",
+            "Unicode-\u{1F512}",
+            "line\nbreak",
+        ];
+
+        for unsafe_identity in unsafe_identities {
+            assert!(
+                store
+                    .record_source_session(unsafe_identity, "safe-session")
+                    .is_err(),
+                "unsafe activation identifier must be rejected"
+            );
+            assert!(
+                store
+                    .record_source_session("safe-activation", unsafe_identity)
+                    .is_err(),
+                "unsafe session identifier must be rejected"
+            );
+            assert!(
+                store.source_session_id(unsafe_identity).is_err(),
+                "unsafe lookup identifiers must be rejected"
+            );
+        }
+
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM experience_run_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                },)
+                .unwrap(),
+            0,
+            "rejected credentials and traversal strings must never reach SQLite"
+        );
+    }
+
+    #[test]
+    fn source_session_references_remain_workspace_local_and_fail_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = ExperienceStore::open(&temporary.path().join("first/index.sqlite")).unwrap();
+        let second = ExperienceStore::open(&temporary.path().join("second/index.sqlite")).unwrap();
+
+        first
+            .record_source_session("activation-1", "stable-session-1")
+            .unwrap();
+        assert_eq!(second.source_session_id("activation-1").unwrap(), None);
+
+        second
+            .connection
+            .execute(
+                "INSERT INTO experience_run_sessions (run_id, session_id, recorded_at)
+                 VALUES (?1, ?2, ?3)",
+                params!["activation-1", "../stolen-session", 1],
+            )
+            .unwrap();
+        assert!(
+            second.source_session_id("activation-1").is_err(),
+            "a corrupted session reference must never become a navigable path"
+        );
+    }
+
+    #[test]
+    fn source_session_reference_retention_discards_the_oldest_mappings() {
+        let (_temporary, store) = store();
+        for (run_id, observed_at) in [("run-old", 1), ("run-middle", 2), ("run-new", 3)] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO experience_run_sessions (run_id, session_id, recorded_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![run_id, format!("session-{run_id}"), observed_at],
+                )
+                .unwrap();
+        }
+
+        enforce_source_session_limit(&store.connection, 2).unwrap();
+        assert_eq!(store.source_session_id("run-old").unwrap(), None);
+        assert_eq!(
+            store.source_session_id("run-middle").unwrap(),
+            Some("session-run-middle".to_owned())
+        );
+        assert_eq!(
+            store.source_session_id("run-new").unwrap(),
+            Some("session-run-new".to_owned())
+        );
+    }
+
+    #[test]
+    fn outcome_filtered_retrieval_selects_matching_rows_before_candidate_limit() {
+        let (_temporary, store) = store();
+        let transaction = store.transaction().unwrap();
+
+        for index in 0..(MAX_CANDIDATES + 12) {
+            let mut successful = memory(
+                &format!("success-{index:03}"),
+                "Parser visitor strategy passed its focused regression checks",
+                &format!("successful-run-{index}"),
+                ExperienceCategory::SuccessfulPattern,
+            );
+            successful.confidence = 0.9;
+            successful.updated_at = 1_700_000_100 + index as i64;
+            let record = serde_json::to_value(successful).unwrap();
+            persist_record(&transaction, record.as_object().unwrap()).unwrap();
+        }
+
+        let mut failure = memory(
+            "rare-failure",
+            "Parser visitor strategy failed with the original regression",
+            "failed-run",
+            ExperienceCategory::FailureAntiPattern,
+        );
+        failure.confidence = 0.1;
+        let record = serde_json::to_value(failure).unwrap();
+        persist_record(&transaction, record.as_object().unwrap()).unwrap();
+        transaction.commit().unwrap();
+
+        let mut query = query("parser visitor strategy regression");
+        query.limit = 1;
+        let failures = store.retrieve_with_outcome(&query, Some(false)).unwrap();
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].memory.id, "rare-failure");
+        assert_eq!(failures[0].memory.success, Some(false));
+    }
+
+    #[test]
+    fn outcome_filtered_retrieval_rejects_foreign_generalized_and_unknown_records() {
+        let (_temporary, store) = store();
+
+        let local = memory(
+            "local-success",
+            "Parser visitor strategy passed local verification",
+            "local-run",
+            ExperienceCategory::SuccessfulPattern,
+        );
+        store.upsert(&local).unwrap();
+
+        let mut foreign = memory(
+            "foreign-generalized",
+            "Parser visitor strategy passed verification in another repository",
+            "foreign-run-1",
+            ExperienceCategory::SuccessfulPattern,
+        );
+        foreign.repository_id = "repository-b".to_owned();
+        foreign.scope = ExperienceScope::Global;
+        foreign.generalizability = 0.95;
+        for source in ["foreign-run-2", "foreign-run-3"] {
+            foreign.source_run_ids.push(source.to_owned());
+            let mut supporting_signal = foreign.evidence[0].clone();
+            supporting_signal.source_run_id = Some(source.to_owned());
+            foreign.evidence.push(supporting_signal);
+        }
+        store.upsert(&foreign).unwrap();
+
+        let mut unknown = memory(
+            "unknown-outcome",
+            "Parser visitor strategy has unresolved verification results",
+            "unknown-run",
+            ExperienceCategory::UncertainHypothesis,
+        );
+        unknown.success = None;
+        store.upsert(&unknown).unwrap();
+
+        let query = query("parser visitor strategy verification");
+        let general_planning = store.retrieve(&query).unwrap();
+        assert!(
+            general_planning
+                .iter()
+                .any(|experience| experience.memory.id == "foreign-generalized"),
+            "ordinary planning may use sufficiently generalized cross-repository advice"
+        );
+
+        let explicit_search = store.retrieve_with_outcome(&query, None).unwrap();
+        assert_eq!(explicit_search.len(), 1);
+        assert_eq!(explicit_search[0].memory.id, "local-success");
+
+        for missing_repository in [None, Some(String::new()), Some(" ".to_owned())] {
+            let mut unscoped_query = query.clone();
+            unscoped_query.repository_id = missing_repository;
+            assert!(
+                store
+                    .retrieve_with_outcome(&unscoped_query, None)
+                    .unwrap()
+                    .is_empty(),
+                "explicit search must fail closed without a workspace identity"
+            );
+        }
     }
 
     #[test]
