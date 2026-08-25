@@ -1860,6 +1860,33 @@ mod tests {
         .expect("valid experience fixture")
     }
 
+    fn persisted_text_surfaces(
+        store: &ExperienceStore,
+        experience_id: &str,
+    ) -> (String, String, String) {
+        let (record_json, projected_lesson) = store
+            .connection
+            .query_row(
+                "SELECT record_json, lesson FROM experiences WHERE id = ?1",
+                params![experience_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("persisted experience and projected lesson");
+        let indexed_text = store
+            .connection
+            .query_row(
+                "SELECT lesson || ' ' || task_summary || ' ' || strategy || ' '
+                        || recommendation || ' ' || anti_pattern
+                   FROM experience_fts
+                  WHERE experience_id = ?1",
+                params![experience_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("persisted experience full-text index");
+
+        (record_json, projected_lesson, indexed_text)
+    }
+
     fn query(text: &str) -> ExperienceQuery {
         serde_json::from_value(serde_json::json!({
             "text": text,
@@ -2414,6 +2441,393 @@ mod tests {
             "stable-nested-source-run-id"
         );
         assert_eq!(restored["evaluator_scores"]["judge/api_token"], 0.8);
+    }
+
+    #[test]
+    fn direct_upsert_redacts_basic_authorization_before_json_projection_and_fts() {
+        const LESSON_CREDENTIAL: &str = "dXNlcjpsZXNzb24tZG8tbm90LXBlcnNpc3Q=";
+        const TASK_CREDENTIAL: &str = "cHJveHk6dGFzay1kby1ub3QtcGVyc2lzdA==";
+        const STRATEGY_CREDENTIAL: &str = "dXNlcjpzdHJhdGVneS1kby1ub3QtcGVyc2lzdA==";
+        const RECOMMENDATION_CREDENTIAL: &str = "dXNlcjpyZWNvbW1lbmQtZG8tbm90LXBlcnNpc3Q=";
+        const EVIDENCE_CREDENTIAL: &str = "dXNlcjpldmlkZW5jZS1kby1ub3QtcGVyc2lzdA==";
+
+        let (_temporary, store) = store();
+        let mut hostile = memory(
+            "basic-authorization-experience",
+            &format!("Retry Authorization: Basic {LESSON_CREDENTIAL} safely"),
+            "basic-authorization-source-run",
+            ExperienceCategory::SuccessfulPattern,
+        );
+        hostile.task_summary = format!("proxy-authorization: BASIC {TASK_CREDENTIAL}");
+        hostile.strategy = format!("authorization: bAsIc {STRATEGY_CREDENTIAL}");
+        hostile.recommendation = Some(format!(
+            "Inspect Authorization Basic {RECOMMENDATION_CREDENTIAL}"
+        ));
+        hostile.evidence[0].command = Some(format!(
+            "curl -H 'Authorization: Basic {EVIDENCE_CREDENTIAL}' https://example.invalid"
+        ));
+
+        let identifier = store.upsert(&hostile).unwrap();
+        let (record_json, projected_lesson, indexed_text) =
+            persisted_text_surfaces(&store, &identifier);
+
+        for secret in [
+            LESSON_CREDENTIAL,
+            TASK_CREDENTIAL,
+            STRATEGY_CREDENTIAL,
+            RECOMMENDATION_CREDENTIAL,
+            EVIDENCE_CREDENTIAL,
+        ] {
+            assert!(
+                !record_json.contains(secret),
+                "Basic credential persisted in JSON: {secret}"
+            );
+            assert!(
+                !projected_lesson.contains(secret),
+                "Basic credential persisted in the projected lesson: {secret}"
+            );
+            assert!(
+                !indexed_text.contains(secret),
+                "Basic credential persisted in FTS: {secret}"
+            );
+        }
+
+        let restored = store.get(&identifier).unwrap().unwrap();
+        assert!(restored.lesson.contains("Basic"));
+        assert!(restored.lesson.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn direct_upsert_redacts_extended_authorization_schemes_before_json_projection_and_fts() {
+        for (index, scheme) in [
+            "Bearer",
+            "Basic",
+            "Digest",
+            "dIgEsT",
+            "Negotiate",
+            "nEgOtIaTe",
+            "NTLM",
+            "Signature",
+            "AWS4-HMAC-SHA256",
+            "Custom-Proof-42",
+            "Token",
+            "ApiKey",
+            "API-Key",
+            "OAuth",
+            "DPoP",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_temporary, store) = store();
+            let credential = format!("opaqueauthenticationmaterial{index}donotpersist");
+            let mut hostile = memory(
+                &format!("extended-authorization-experience-{index}"),
+                &format!("Retry Authorization:{scheme} {credential} safely"),
+                &format!("extended-authorization-run-{index}"),
+                ExperienceCategory::SuccessfulPattern,
+            );
+            hostile.task_summary =
+                format!("Proxy-Authorization:{scheme} {credential} retained-context");
+            hostile.strategy = format!("authorization:{scheme} {credential}");
+            hostile.recommendation = Some(format!("Authorization {scheme} {credential}"));
+            hostile.evidence[0].command = Some(format!(
+                "curl -H 'Authorization: {scheme} {credential}' https://example.invalid"
+            ));
+
+            let identifier = store.upsert(&hostile).unwrap();
+            let (record_json, projected_lesson, indexed_text) =
+                persisted_text_surfaces(&store, &identifier);
+
+            for (surface_name, surface) in [
+                ("JSON", record_json),
+                ("projected lesson", projected_lesson),
+                ("FTS", indexed_text),
+            ] {
+                assert!(
+                    !surface.contains(&credential),
+                    "{scheme} credential persisted in {surface_name}: {credential}"
+                );
+            }
+
+            let restored = store.get(&identifier).unwrap().unwrap();
+            assert!(restored.lesson.contains(&format!("{scheme} [REDACTED]")));
+            assert!(restored.task_summary.contains("retained-context"));
+        }
+    }
+
+    #[test]
+    fn direct_upsert_redacts_digest_auth_parameters_before_json_projection_and_fts() {
+        let (_temporary, store) = store();
+        let hostile = memory(
+            "digest-authorization-experience",
+            concat!(
+                "Authorization: Digest ",
+                "username = \"hidden-digest-user hidden-digest-user-continuation\" , ",
+                "realm = \"hidden-digest-realm hidden-digest-realm-continuation\" , ",
+                "nonce = hidden-digest-nonce , ",
+                "custom_proof = hidden-digest-extension , ",
+                "response = hidden-digest-response , ",
+                "cnonce = hidden-digest-cnonce ",
+                "retained-context"
+            ),
+            "digest-authorization-source-run",
+            ExperienceCategory::SuccessfulPattern,
+        );
+
+        let identifier = store.upsert(&hostile).unwrap();
+        let (record_json, projected_lesson, indexed_text) =
+            persisted_text_surfaces(&store, &identifier);
+
+        for secret in [
+            "hidden-digest-user",
+            "hidden-digest-user-continuation",
+            "hidden-digest-realm",
+            "hidden-digest-realm-continuation",
+            "hidden-digest-nonce",
+            "hidden-digest-extension",
+            "hidden-digest-response",
+            "hidden-digest-cnonce",
+        ] {
+            assert!(
+                !record_json.contains(secret),
+                "Digest credential persisted in JSON: {secret}"
+            );
+            assert!(
+                !projected_lesson.contains(secret),
+                "Digest credential persisted in the projected lesson: {secret}"
+            );
+            assert!(
+                !indexed_text.contains(secret),
+                "Digest credential persisted in FTS: {secret}"
+            );
+        }
+
+        let restored = store.get(&identifier).unwrap().unwrap();
+        assert!(restored.lesson.contains("Authorization: Digest [REDACTED]"));
+        assert!(restored.lesson.contains("retained-context"));
+    }
+
+    #[test]
+    fn direct_upsert_redacts_oauth_auth_parameters_before_json_projection_and_fts() {
+        let (_temporary, store) = store();
+        let hostile = memory(
+            "oauth-authorization-experience",
+            concat!(
+                "Authorization: OAuth ",
+                "oauth_consumer_key = \"hidden-oauth-consumer hidden-oauth-continuation\" , ",
+                "oauth_nonce = hidden-oauth-nonce , ",
+                "custom_proof = hidden-oauth-extension , ",
+                "oauth_signature = hidden-oauth-signature , ",
+                "oauth_body_hash = hidden-oauth-body-hash ",
+                "retained-context"
+            ),
+            "oauth-authorization-source-run",
+            ExperienceCategory::SuccessfulPattern,
+        );
+
+        let identifier = store.upsert(&hostile).unwrap();
+        let (record_json, projected_lesson, indexed_text) =
+            persisted_text_surfaces(&store, &identifier);
+
+        for secret in [
+            "hidden-oauth-consumer",
+            "hidden-oauth-continuation",
+            "hidden-oauth-nonce",
+            "hidden-oauth-extension",
+            "hidden-oauth-signature",
+            "hidden-oauth-body-hash",
+        ] {
+            assert!(
+                !record_json.contains(secret),
+                "OAuth credential persisted in JSON: {secret}"
+            );
+            assert!(
+                !projected_lesson.contains(secret),
+                "OAuth credential persisted in the projected lesson: {secret}"
+            );
+            assert!(
+                !indexed_text.contains(secret),
+                "OAuth credential persisted in FTS: {secret}"
+            );
+        }
+
+        let restored = store.get(&identifier).unwrap().unwrap();
+        assert!(restored.lesson.contains("Authorization: OAuth [REDACTED]"));
+        assert!(restored.lesson.contains("retained-context"));
+    }
+
+    #[test]
+    fn direct_upsert_redacts_signature_and_aws_auth_parameters_on_every_surface() {
+        for (index, scheme, parameters) in [
+            (
+                0,
+                "Signature",
+                concat!(
+                    "keyId = \"hidden-signing-key\" , ",
+                    "custom_proof = \"hidden-extension\" , ",
+                    "signature = \"hidden-signature\""
+                ),
+            ),
+            (
+                1,
+                "AWS4-HMAC-SHA256",
+                concat!(
+                    "Credential = \"hidden-signing-key\" , ",
+                    "SignedHeaders = hidden-extension , ",
+                    "Signature = hidden-signature"
+                ),
+            ),
+        ] {
+            let (_temporary, store) = store();
+            let hostile = memory(
+                &format!("parameterized-authorization-experience-{index}"),
+                &format!("Proxy-Authorization:{scheme} {parameters} retained-context"),
+                &format!("parameterized-authorization-run-{index}"),
+                ExperienceCategory::SuccessfulPattern,
+            );
+
+            let identifier = store.upsert(&hostile).unwrap();
+            let surfaces = persisted_text_surfaces(&store, &identifier);
+
+            for secret in ["hidden-signing-key", "hidden-extension", "hidden-signature"] {
+                assert!(
+                    !surfaces.0.contains(secret),
+                    "{scheme} secret persisted in JSON"
+                );
+                assert!(
+                    !surfaces.1.contains(secret),
+                    "{scheme} secret persisted in the projected lesson"
+                );
+                assert!(
+                    !surfaces.2.contains(secret),
+                    "{scheme} secret persisted in FTS"
+                );
+            }
+
+            assert!(
+                store
+                    .get(&identifier)
+                    .unwrap()
+                    .unwrap()
+                    .lesson
+                    .contains("retained-context")
+            );
+        }
+    }
+
+    #[test]
+    fn direct_upsert_redacts_all_cookie_pairs_before_json_projection_and_fts() {
+        for (index, header) in ["Cookie", "Set-Cookie"].into_iter().enumerate() {
+            let (_temporary, store) = store();
+            let hostile = memory(
+                &format!("cookie-authorization-experience-{index}"),
+                &format!(
+                    "{header}: analytics=first-cookie-secret; remember_me=second-cookie-secret; connect.sid=third-cookie-secret retained-context"
+                ),
+                &format!("cookie-authorization-run-{index}"),
+                ExperienceCategory::SuccessfulPattern,
+            );
+
+            let identifier = store.upsert(&hostile).unwrap();
+            let surfaces = persisted_text_surfaces(&store, &identifier);
+
+            for secret in [
+                "first-cookie-secret",
+                "second-cookie-secret",
+                "third-cookie-secret",
+            ] {
+                assert!(
+                    !surfaces.0.contains(secret),
+                    "cookie secret persisted in JSON"
+                );
+                assert!(
+                    !surfaces.1.contains(secret),
+                    "cookie secret persisted in the projected lesson"
+                );
+                assert!(
+                    !surfaces.2.contains(secret),
+                    "cookie secret persisted in FTS"
+                );
+            }
+
+            assert!(
+                store
+                    .get(&identifier)
+                    .unwrap()
+                    .unwrap()
+                    .lesson
+                    .contains("retained-context")
+            );
+        }
+    }
+
+    #[test]
+    fn direct_upsert_redacts_gemini_query_keys_before_json_projection_and_fts() {
+        const LESSON_KEY: &str = "AIzaSyLessonCredentialDoNotPersist11111111";
+        const TASK_KEY: &str = "AIzaSyTaskCredentialDoNotPersist2222222222";
+        const STRATEGY_KEY: &str = "AIzaSyStrategyCredentialDoNotPersist333333";
+        const RECOMMENDATION_KEY: &str = "AIzaSyRecommendationDoNotPersist444444444";
+        const EVIDENCE_KEY: &str = "AIzaSyEvidenceCredentialDoNotPersist55555";
+        const STANDALONE_KEY: &str = "AIzaSyStandaloneCredentialDoNotPersist666";
+        const EMBEDDED_KEY: &str = "AIzaSyEmbeddedCredentialDoNotPersist77777";
+
+        let (_temporary, store) = store();
+        let mut hostile = memory(
+            "gemini-query-key-experience",
+            &format!(
+                "Call https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent?key={LESSON_KEY}&alt=json#safe"
+            ),
+            "gemini-query-key-source-run",
+            ExperienceCategory::SuccessfulPattern,
+        );
+        hostile.task_summary = format!(
+            "Inspect https://example.invalid/generate?alt=json&key={TASK_KEY}&prettyPrint=false"
+        );
+        hostile.strategy =
+            format!("Retry https://example.invalid/generate?alt=json&KEY={STRATEGY_KEY}#fragment");
+        hostile.recommendation = Some(format!(
+            "Use https://example.invalid/generate?safe=true&key={RECOMMENDATION_KEY}"
+        ));
+        hostile.anti_pattern = Some(format!("Avoid pasting {STANDALONE_KEY} into logs"));
+        hostile.context = "Keep ordinary configuration key=parser-cache unchanged".to_owned();
+        hostile.judge_feedback = Some(format!(r#"{{"key":"{EMBEDDED_KEY}","region":"us"}}"#));
+        hostile.evidence[0].command = Some(format!(
+            "curl 'https://example.invalid/generate?format=json&key={EVIDENCE_KEY}'"
+        ));
+
+        let identifier = store.upsert(&hostile).unwrap();
+        let (record_json, projected_lesson, indexed_text) =
+            persisted_text_surfaces(&store, &identifier);
+
+        for secret in [
+            LESSON_KEY,
+            TASK_KEY,
+            STRATEGY_KEY,
+            RECOMMENDATION_KEY,
+            EVIDENCE_KEY,
+            STANDALONE_KEY,
+            EMBEDDED_KEY,
+        ] {
+            assert!(
+                !record_json.contains(secret),
+                "Gemini API key persisted in JSON: {secret}"
+            );
+            assert!(
+                !projected_lesson.contains(secret),
+                "Gemini API key persisted in the projected lesson: {secret}"
+            );
+            assert!(
+                !indexed_text.contains(secret),
+                "Gemini API key persisted in FTS: {secret}"
+            );
+        }
+
+        let restored = store.get(&identifier).unwrap().unwrap();
+        assert!(restored.lesson.contains("key=[REDACTED]"));
+        assert!(restored.lesson.contains("alt=json"));
+        assert!(restored.lesson.contains("#safe"));
+        assert!(restored.context.contains("key=parser-cache"));
     }
 
     #[test]

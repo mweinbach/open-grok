@@ -1203,15 +1203,26 @@ pub(crate) fn is_sensitive_field_name(field: &str) -> bool {
         .any(|suffix| normalized.ends_with(suffix))
 }
 
-pub(crate) fn redact_sensitive_text(input: &str) -> String {
+/// Redacts credentials and other sensitive values before memory evidence is persisted.
+pub fn redact_sensitive_text(input: &str) -> String {
     let without_private_keys = redact_private_key_blocks(input);
     let without_structured_secrets = redact_structured_secret_values(&without_private_keys);
     let without_secret_assignments = redact_secret_assignments(&without_structured_secrets);
     let mut sanitized = Vec::new();
     let mut redact_next = false;
+    let mut authorization_header_pending_scheme = false;
+    let mut cookie_header_pending_value = false;
+    let mut parameterized_auth_scheme = false;
+    let mut redact_auth_parameters = false;
+    let mut auth_parameter_quote_open = false;
+    let mut auth_parameter_assignment_pending = false;
+    let mut auth_parameter_value_pending = false;
+    let mut redact_cookie_pairs = false;
+    let mut tokens = without_secret_assignments.split_whitespace().peekable();
 
-    for raw_token in without_secret_assignments.split_whitespace() {
-        let token = redact_url_credentials(raw_token);
+    while let Some(raw_token) = tokens.next() {
+        let token =
+            redact_google_api_keys(&redact_url_query_keys(&redact_url_credentials(raw_token)));
         let normalized = token
             .trim_matches(|character: char| {
                 matches!(character, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']')
@@ -1219,19 +1230,115 @@ pub(crate) fn redact_sensitive_text(input: &str) -> String {
             .to_ascii_lowercase();
 
         if redact_next {
-            if normalized == "bearer" {
+            if authorization_header_pending_scheme && is_http_auth_token(&normalized) {
                 sanitized.push(token.clone());
+                parameterized_auth_scheme = true;
+                authorization_header_pending_scheme = false;
             } else {
                 sanitized.push("[REDACTED]".to_string());
                 redact_next = false;
+                redact_auth_parameters = parameterized_auth_scheme;
+                redact_cookie_pairs = cookie_header_pending_value;
+                auth_parameter_quote_open = parameterized_auth_scheme
+                    && parameterized_auth_value_has_open_quote(&token, false);
+                auth_parameter_assignment_pending = parameterized_auth_scheme
+                    && !token.contains('=')
+                    && is_http_auth_token(token.trim_start_matches([',', ';']))
+                    && tokens.peek().is_some_and(|next| next.starts_with('='));
+                auth_parameter_value_pending = parameterized_auth_scheme
+                    && !is_padded_auth_token68(&token)
+                    && token
+                        .split_once('=')
+                        .is_some_and(|(_, value)| value.is_empty());
+                parameterized_auth_scheme = false;
+                authorization_header_pending_scheme = false;
+                cookie_header_pending_value = false;
             }
 
             continue;
         }
 
+        if redact_auth_parameters {
+            if token
+                .chars()
+                .all(|character| matches!(character, ',' | ';'))
+            {
+                sanitized.push(token.clone());
+                continue;
+            }
+
+            if auth_parameter_quote_open
+                || auth_parameter_assignment_pending
+                || auth_parameter_value_pending
+                || is_parameterized_auth_parameter(&token)
+                || (is_http_auth_token(token.trim_start_matches([',', ';']))
+                    && tokens.peek().is_some_and(|next| next.starts_with('=')))
+            {
+                let assignment_was_pending = auth_parameter_assignment_pending;
+                let value_was_pending = auth_parameter_value_pending;
+                auth_parameter_quote_open =
+                    parameterized_auth_value_has_open_quote(&token, auth_parameter_quote_open);
+                auth_parameter_assignment_pending = !auth_parameter_quote_open
+                    && !value_was_pending
+                    && !token.contains('=')
+                    && !assignment_was_pending
+                    && tokens.peek().is_some_and(|next| next.starts_with('='));
+                auth_parameter_value_pending = !auth_parameter_quote_open
+                    && ((assignment_was_pending && token == "=")
+                        || (!is_padded_auth_token68(&token)
+                            && token
+                                .split_once('=')
+                                .is_some_and(|(_, value)| value.is_empty())));
+                sanitized.push("[REDACTED]".to_string());
+                continue;
+            }
+
+            redact_auth_parameters = false;
+            auth_parameter_quote_open = false;
+            auth_parameter_assignment_pending = false;
+            auth_parameter_value_pending = false;
+        }
+
+        if redact_cookie_pairs {
+            if token
+                .chars()
+                .all(|character| matches!(character, ',' | ';'))
+                || is_parameterized_auth_parameter(&token)
+                || matches!(normalized.as_str(), "httponly" | "secure" | "partitioned")
+            {
+                sanitized.push("[REDACTED]".to_string());
+                continue;
+            }
+
+            redact_cookie_pairs = false;
+        }
+
+        if let Some((header, value)) = normalized.split_once(':') {
+            if matches!(header, "authorization" | "proxy-authorization")
+                && is_http_auth_token(value)
+            {
+                sanitized.push(token.clone());
+                redact_next = true;
+                parameterized_auth_scheme = true;
+                continue;
+            }
+
+            if matches!(header, "cookie" | "set-cookie") && !value.is_empty() {
+                let separator = token.find(':').expect("normalized header includes a colon");
+                sanitized.push(format!("{}:[REDACTED]", &token[..separator]));
+                redact_cookie_pairs = true;
+                continue;
+            }
+        }
+
         if is_secret_flag(&normalized) {
             sanitized.push(token.clone());
             redact_next = true;
+            authorization_header_pending_scheme = matches!(
+                normalized.as_str(),
+                "authorization" | "authorization:" | "proxy-authorization" | "proxy-authorization:"
+            );
+            cookie_header_pending_value = matches!(normalized.as_str(), "cookie:" | "set-cookie:");
             continue;
         }
 
@@ -1492,6 +1599,160 @@ fn redact_url_credentials(token: &str) -> String {
     )
 }
 
+fn redact_url_query_keys(token: &str) -> String {
+    let Some(scheme_end) = token.find("://") else {
+        return token.to_string();
+    };
+    let url_start = scheme_end + "://".len();
+    let Some(query_offset) = token[url_start..].find('?') else {
+        return token.to_string();
+    };
+    let query_start = url_start + query_offset;
+
+    if token[url_start..query_start].contains('#') {
+        return token.to_string();
+    }
+
+    let query_end = token[query_start + 1..]
+        .find(['#', '"', '\'', ',', ')', ']', '}'])
+        .map_or(token.len(), |offset| query_start + 1 + offset);
+    let mut sanitized = String::with_capacity(token.len());
+    let mut cursor = query_start + 1;
+
+    sanitized.push_str(&token[..cursor]);
+
+    while cursor < query_end {
+        let parameter_end = token[cursor..query_end]
+            .find(['&', ';'])
+            .map_or(query_end, |offset| cursor + offset);
+        let parameter = &token[cursor..parameter_end];
+
+        if let Some((field, _)) = parameter.split_once('=')
+            && field.eq_ignore_ascii_case("key")
+        {
+            sanitized.push_str(field);
+            sanitized.push_str("=[REDACTED]");
+        } else {
+            sanitized.push_str(parameter);
+        }
+
+        if parameter_end < query_end {
+            sanitized.push(token.as_bytes()[parameter_end] as char);
+            cursor = parameter_end + 1;
+        } else {
+            cursor = parameter_end;
+        }
+    }
+
+    sanitized.push_str(&token[query_end..]);
+    sanitized
+}
+
+fn redact_google_api_keys(token: &str) -> String {
+    let bytes = token.as_bytes();
+    let mut sanitized = String::with_capacity(token.len());
+    let mut copied_to = 0;
+    let mut cursor = 0;
+
+    while cursor + 4 <= bytes.len() {
+        let starts_google_key = bytes[cursor..cursor + 4].eq_ignore_ascii_case(b"AIza");
+        let starts_at_token_boundary = cursor == 0
+            || !matches!(bytes[cursor - 1], b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
+
+        if !starts_google_key || !starts_at_token_boundary {
+            cursor += 1;
+            continue;
+        }
+
+        let mut key_end = cursor + 4;
+
+        while matches!(
+            bytes.get(key_end),
+            Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')
+        ) {
+            key_end += 1;
+        }
+
+        if key_end - cursor >= 20 {
+            sanitized.push_str(&token[copied_to..cursor]);
+            sanitized.push_str("[REDACTED]");
+            copied_to = key_end;
+        }
+
+        cursor = key_end;
+    }
+
+    sanitized.push_str(&token[copied_to..]);
+    sanitized
+}
+
+fn is_parameterized_auth_parameter(token: &str) -> bool {
+    let token = token.trim_start_matches(|character: char| matches!(character, ',' | ';'));
+    let Some((field, _)) = token.split_once('=') else {
+        return false;
+    };
+
+    is_http_auth_token(field)
+}
+
+fn is_http_auth_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn is_padded_auth_token68(token: &str) -> bool {
+    let unpadded = token.trim_end_matches('=');
+    let padding = token.len().saturating_sub(unpadded.len());
+
+    unpadded.len() >= 16
+        && matches!(padding, 1 | 2)
+        && token.len().is_multiple_of(4)
+        && unpadded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+}
+
+fn parameterized_auth_value_has_open_quote(token: &str, already_open: bool) -> bool {
+    let value = if already_open {
+        token
+    } else {
+        token.split_once('=').map_or(token, |(_, value)| value)
+    };
+    let mut quote_open = already_open;
+    let mut escaped = false;
+
+    for byte in value.bytes() {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quote_open = !quote_open;
+        }
+    }
+
+    quote_open
+}
+
 fn is_secret_flag(token: &str) -> bool {
     matches!(
         token,
@@ -1581,6 +1842,7 @@ fn looks_like_secret(token: &str) -> bool {
         || token.starts_with("github_pat_")
         || token.starts_with("glpat-")
         || (token.starts_with("akia") && token.len() >= 16)
+        || (token.starts_with("aiza") && token.len() >= 20)
         || (token.len() > 32
             && token.split('.').count() == 3
             && token.split('.').all(|segment| {
@@ -2506,6 +2768,278 @@ mod tests {
 
         assert!(sanitized.contains("example.test"));
         assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn shared_redaction_preserves_authentication_schemes_without_leaking_credentials() {
+        for header in ["Authorization", "Proxy-Authorization", "authorization"] {
+            for scheme in [
+                "Bearer",
+                "Basic",
+                "bAsIc",
+                "Digest",
+                "dIgEsT",
+                "Negotiate",
+                "nEgOtIaTe",
+                "NTLM",
+                "Signature",
+                "AWS4-HMAC-SHA256",
+                "Custom-Proof-42",
+                "Token",
+                "ApiKey",
+                "API-Key",
+                "OAuth",
+                "DPoP",
+            ] {
+                let credential = "dXNlcm5hbWU6cGFzc3dvcmQ=";
+                for whitespace in ["", " "] {
+                    let input =
+                        format!("{header}:{whitespace}{scheme} {credential} retained-context");
+                    let sanitized = redact_sensitive_text(&input);
+
+                    assert!(
+                        !sanitized.contains(credential),
+                        "leaked {header} {scheme} credential: {sanitized}"
+                    );
+                    assert!(
+                        sanitized.contains(&format!("{header}:{whitespace}{scheme} [REDACTED]")),
+                        "lost {header} {scheme} authentication scheme: {sanitized}"
+                    );
+                    assert!(
+                        sanitized.contains("retained-context"),
+                        "lost trailing context for header={header:?}, scheme={scheme:?}, whitespace={whitespace:?}: {sanitized}"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            redact_sensitive_text("Authorization Basic dXNlcm5hbWU6cGFzc3dvcmQ= retained"),
+            "Authorization Basic [REDACTED] retained"
+        );
+    }
+
+    #[test]
+    fn shared_redaction_hides_all_digest_auth_parameters_without_losing_context() {
+        let input = concat!(
+            "Authorization: Digest ",
+            "username=\"hidden-username hidden-user-continuation\", ",
+            "realm=\"hidden-realm hidden-realm-continuation\", ",
+            "nonce=hidden-nonce, ",
+            "uri=/hidden-path, ",
+            "response=hidden-response, ",
+            "cnonce=hidden-client-nonce, ",
+            "opaque=hidden-opaque ",
+            "retained-context region=us-east"
+        );
+        let sanitized = redact_sensitive_text(input);
+
+        for secret in [
+            "hidden-username",
+            "hidden-user-continuation",
+            "hidden-realm",
+            "hidden-realm-continuation",
+            "hidden-nonce",
+            "hidden-path",
+            "hidden-response",
+            "hidden-client-nonce",
+            "hidden-opaque",
+        ] {
+            assert!(!sanitized.contains(secret), "leaked {secret}: {sanitized}");
+        }
+
+        assert!(sanitized.starts_with("Authorization: Digest [REDACTED]"));
+        assert!(sanitized.contains("retained-context region=us-east"));
+    }
+
+    #[test]
+    fn shared_redaction_hides_all_oauth_auth_parameters_without_losing_context() {
+        let input = concat!(
+            "Proxy-Authorization: OAuth ",
+            "oauth_consumer_key=\"hidden-consumer hidden-consumer-continuation\", ",
+            "oauth_signature_method=hidden-method, ",
+            "oauth_timestamp=hidden-timestamp, ",
+            "oauth_nonce=hidden-nonce, ",
+            "oauth_signature=hidden-signature, ",
+            "oauth_body_hash=hidden-body-hash ",
+            "retained-context region=us-east"
+        );
+        let sanitized = redact_sensitive_text(input);
+
+        for secret in [
+            "hidden-consumer",
+            "hidden-consumer-continuation",
+            "hidden-method",
+            "hidden-timestamp",
+            "hidden-nonce",
+            "hidden-signature",
+            "hidden-body-hash",
+        ] {
+            assert!(!sanitized.contains(secret), "leaked {secret}: {sanitized}");
+        }
+
+        assert!(sanitized.starts_with("Proxy-Authorization: OAuth [REDACTED]"));
+        assert!(sanitized.contains("retained-context region=us-east"));
+    }
+
+    #[test]
+    fn shared_redaction_handles_optional_auth_parameter_whitespace_and_extension_fields() {
+        for (scheme, parameters) in [
+            (
+                "Digest",
+                concat!(
+                    "username = \"hidden-user hidden-user-continuation\" , ",
+                    "custom_proof = \"hidden-extension\" , ",
+                    "response= \"hidden-response\""
+                ),
+            ),
+            (
+                "OAuth",
+                concat!(
+                    "oauth_consumer_key = \"hidden-user hidden-user-continuation\" , ",
+                    "custom_proof = \"hidden-extension\" , ",
+                    "oauth_signature= \"hidden-response\""
+                ),
+            ),
+            (
+                "Signature",
+                concat!(
+                    "keyId = \"hidden-user hidden-user-continuation\" , ",
+                    "custom_proof = \"hidden-extension\" , ",
+                    "signature = \"hidden-response\""
+                ),
+            ),
+            (
+                "AWS4-HMAC-SHA256",
+                concat!(
+                    "Credential = \"hidden-user hidden-user-continuation\" , ",
+                    "custom_proof = \"hidden-extension\" , ",
+                    "Signature = \"hidden-response\""
+                ),
+            ),
+        ] {
+            let input = format!(
+                "Proxy-Authorization:{scheme} {parameters} retained-context region=us-east"
+            );
+            let sanitized = redact_sensitive_text(&input);
+
+            for secret in [
+                "hidden-user",
+                "hidden-user-continuation",
+                "hidden-extension",
+                "hidden-response",
+            ] {
+                assert!(
+                    !sanitized.contains(secret),
+                    "leaked {scheme} auth parameter {secret}: {sanitized}"
+                );
+            }
+
+            assert!(sanitized.starts_with(&format!("Proxy-Authorization:{scheme} [REDACTED]")));
+            assert!(sanitized.contains("retained-context region=us-east"));
+        }
+    }
+
+    #[test]
+    fn shared_redaction_hides_all_cookie_header_pairs_without_losing_context() {
+        for header in ["Cookie", "Set-Cookie", "cookie", "set-cookie"] {
+            for whitespace in ["", " "] {
+                let input = format!(
+                    "{header}:{whitespace}analytics=first-secret; remember_me=second-secret; connect.sid=third-secret retained-context region=us-east"
+                );
+                let sanitized = redact_sensitive_text(&input);
+
+                for secret in ["first-secret", "second-secret", "third-secret"] {
+                    assert!(
+                        !sanitized.contains(secret),
+                        "leaked {header} cookie pair {secret}: {sanitized}"
+                    );
+                }
+
+                assert!(sanitized.contains("retained-context region=us-east"));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_redaction_hides_url_query_keys_and_preserves_other_parameters() {
+        for (input, preserved_values) in [
+            (
+                "https://generativelanguage.googleapis.com/v1/models?key=AIzaSyFirstGeminiCredential0123456789&alt=json#safe",
+                ["alt=json", "#safe"],
+            ),
+            (
+                "https://generativelanguage.googleapis.com/v1/models?alt=json&key=AIzaSyMiddleGeminiCredential0123456789&prettyPrint=false",
+                ["alt=json", "prettyPrint=false"],
+            ),
+            (
+                "https://generativelanguage.googleapis.com/v1/models?alt=json&KEY=AIzaSyUppercaseGeminiCredential0123456789#safe",
+                ["alt=json", "#safe"],
+            ),
+            (
+                "https://example.test/models?format=json;key=opaque-query-credential#safe",
+                ["format=json", "#safe"],
+            ),
+        ] {
+            let sanitized = redact_sensitive_text(input);
+
+            assert!(
+                !sanitized.contains("AIza"),
+                "leaked Google key: {sanitized}"
+            );
+            assert!(
+                !sanitized.contains("opaque-query-credential"),
+                "leaked opaque URL query key: {sanitized}"
+            );
+            assert!(sanitized.contains("=[REDACTED]"));
+
+            for preserved_value in preserved_values {
+                assert!(
+                    sanitized.contains(preserved_value),
+                    "lost nonsecret URL value {preserved_value}: {sanitized}"
+                );
+            }
+        }
+
+        let ordinary = concat!(
+            "key=parser-cache ",
+            "https://example.test/path/key=ordinary-path ",
+            "https://example.test/path#key=ordinary-fragment"
+        );
+        let sanitized = redact_sensitive_text(ordinary);
+
+        assert!(sanitized.contains("key=parser-cache"));
+        assert!(sanitized.contains("key=ordinary-path"));
+        assert!(sanitized.contains("key=ordinary-fragment"));
+    }
+
+    #[test]
+    fn shared_redaction_recognizes_standalone_google_api_key_prefixes() {
+        let credential = "AIzaSyStandaloneGeminiCredential0123456789";
+        for input in [
+            format!("google credential {credential} retained"),
+            format!(r#"{{"key":"{credential}","region":"retained"}}"#),
+            format!("gemini={credential} retained"),
+            format!("https://example.test/models/{credential}#retained"),
+        ] {
+            let sanitized = redact_sensitive_text(&input);
+
+            assert!(
+                !sanitized.contains(credential),
+                "leaked {input}: {sanitized}"
+            );
+            assert!(sanitized.contains("[REDACTED]"));
+            assert!(sanitized.contains("retained"));
+        }
+
+        assert_eq!(
+            redact_sensitive_text("aiza-friendly-name"),
+            "aiza-friendly-name"
+        );
+        assert_eq!(
+            redact_sensitive_text(r#"{"key":"parser-cache","region":"us-east"}"#),
+            r#"{"key":"parser-cache","region":"us-east"}"#
+        );
     }
 
     #[test]
