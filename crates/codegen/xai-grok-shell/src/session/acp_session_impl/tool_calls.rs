@@ -1081,6 +1081,33 @@ impl SessionActor {
             }
         };
 
+        // Bind observations to the real task before dispatch yields: an
+        // interjection during execution must not reattribute an older tool
+        // result to a newer user request.
+        let nested_experience_context = if !self.startup_hints.is_subagent
+            && self
+                .memory
+                .storage()
+                .is_some_and(|storage| !storage.is_ephemeral())
+        {
+            let conversation = self.chat_state_handle.get_conversation().await;
+            Some((
+                crate::session::memory::experience_ledger::latest_task_fingerprint(&conversation),
+                self.current_turn_number.get(),
+                conversation.len(),
+            ))
+        } else {
+            None
+        };
+        let nested_experience_tool_identity = nested_experience_context.as_ref().and_then(|_| {
+            self.agent
+                .borrow()
+                .tool_bridge()
+                .toolset()
+                .get_tool_metadata(&prepared.tool_name)
+                .map(|metadata| (metadata.kind(), metadata.tool_namespace()))
+        });
+
         // Start lifecycle tracking only after preflight succeeds. Permission,
         // hook, parsing, and availability failures are already represented by
         // `prepare_tool_call`; opening an execution lifecycle before that point
@@ -1141,6 +1168,30 @@ impl SessionActor {
                         .or_else(|| prepared.dispatch_target_name.clone())
                         .unwrap_or_else(|| prepared.tool_name.clone());
                     let drained = DrainedToolSuccess::new(tool_result);
+                    let trusted_nested_evidence = nested_experience_context
+                        .as_ref()
+                        .zip(nested_experience_tool_identity)
+                        .filter(|(_, (kind, namespace))| {
+                            crate::session::memory::experience_ledger::is_trusted_registered_tool(
+                                &prepared.tool_name,
+                                &effective_tool_name,
+                                *kind,
+                                *namespace,
+                            )
+                        })
+                        .and_then(
+                            |((task_fingerprint, turn_number, conversation_position), _)| {
+                                crate::session::memory::experience_ledger::evidence_from_output(
+                                    &prepared.call_id,
+                                    &effective_tool_name,
+                                    &prepared.parsed_args,
+                                    drained.output(),
+                                    task_fingerprint.clone(),
+                                    *turn_number,
+                                    *conversation_position,
+                                )
+                            },
+                        );
                     // Reject failed apply_patch into JS *after* the ACP card is
                     // emitted. The TUI already shows ApplicationError; without
                     // this reject, Code Mode resolves `{}` and the model treats
@@ -1164,6 +1215,17 @@ impl SessionActor {
                     )
                     .await
                     .map_err(|error| error.to_string())?;
+                    if let Some(evidence) = trusted_nested_evidence
+                        && self
+                            .memory
+                            .storage()
+                            .is_some_and(|storage| !storage.is_ephemeral())
+                    {
+                        crate::session::memory::experience_ledger::record(
+                            self.memory.experience_run_id(),
+                            evidence,
+                        );
+                    }
                     if let Some(tool_result_value) = post_tool_use_result {
                         let raw_input = serde_json::from_str(&prepared.raw_arguments)
                             .unwrap_or(serde_json::Value::Null);

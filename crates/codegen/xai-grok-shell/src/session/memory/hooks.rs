@@ -156,7 +156,26 @@ struct ObservedToolCall {
 pub fn persist_session_experiences(
     storage: &MemoryStorage,
     conversation: &[ConversationItem],
-    session_id: &str,
+    run_id: &str,
+) -> anyhow::Result<usize> {
+    persist_session_experiences_with_trusted_events(
+        storage,
+        conversation,
+        run_id,
+        &[],
+        &HashSet::new(),
+    )
+}
+
+/// Persist lessons from both model-visible direct calls and independently
+/// authenticated nested Code Mode dispatches. Programmable `exec` output is
+/// never used as verification evidence.
+pub(crate) fn persist_session_experiences_with_trusted_events(
+    storage: &MemoryStorage,
+    conversation: &[ConversationItem],
+    run_id: &str,
+    trusted_events: &[super::experience_ledger::NestedToolEvidence],
+    prior_tool_result_ids: &HashSet<String>,
 ) -> anyhow::Result<usize> {
     if storage.is_ephemeral() {
         return Ok(0);
@@ -169,7 +188,27 @@ pub fn persist_session_experiences(
     };
 
     let task_conversation = latest_task_conversation(conversation, task_summary);
-    let (events, changed_paths) = observed_tool_events(task_conversation);
+    let task_start = conversation.len().saturating_sub(task_conversation.len());
+    let task_prompt_index = task_conversation.first().and_then(|item| match item {
+        ConversationItem::User(user) => user.prompt_index.map(|index| index as u64),
+        _ => None,
+    });
+    let (mut positioned_events, mut changed_paths) =
+        observed_tool_events_with_positions(task_conversation, prior_tool_result_ids, task_start);
+    append_trusted_nested_tool_events(
+        trusted_events,
+        task_summary,
+        task_start,
+        task_prompt_index,
+        conversation.len(),
+        &mut positioned_events,
+        &mut changed_paths,
+    );
+    positioned_events.sort_by_key(|(position, _)| *position);
+    let events: Vec<ObservedEvent> = positioned_events
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect();
     if events.is_empty() {
         return Ok(0);
     }
@@ -197,7 +236,7 @@ pub fn persist_session_experiences(
         .join("; ");
 
     let observation = RunObservation {
-        run_id: session_id.to_owned(),
+        run_id: run_id.to_owned(),
         task_type: classify_task_type(task_summary),
         task_summary: redact_and_truncate(task_summary, 400),
         repository_id: storage.workspace_dir().to_string_lossy().into_owned(),
@@ -232,7 +271,7 @@ pub fn persist_session_experiences(
     }
 
     let store = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite"))?;
-    let previously_retrieved = store.retrieved_for_run(session_id)?;
+    let previously_retrieved = store.retrieved_for_run(run_id)?;
 
     for lesson in &lessons {
         store.upsert(lesson)?;
@@ -240,18 +279,76 @@ pub fn persist_session_experiences(
 
     for memory in previously_retrieved {
         if recommendation_was_followed(&memory, &observation) {
-            store.record_followed(session_id, &memory.id)?;
+            store.record_followed(run_id, &memory.id)?;
         }
     }
 
     if let Some(success) = completed {
-        store.finalize_run(session_id, success)?;
+        store.finalize_run(run_id, success)?;
     }
 
     Ok(lessons.len())
 }
 
-fn latest_substantive_task(queries: &[String]) -> Option<&str> {
+fn append_trusted_nested_tool_events(
+    trusted_events: &[super::experience_ledger::NestedToolEvidence],
+    task_summary: &str,
+    task_start: usize,
+    task_prompt_index: Option<u64>,
+    conversation_len: usize,
+    events: &mut Vec<(usize, ObservedEvent)>,
+    changed_paths: &mut Vec<String>,
+) {
+    let task_fingerprint = super::experience_ledger::task_fingerprint(task_summary);
+
+    for event in trusted_events.iter().filter(|event| {
+        event.task_fingerprint.as_deref() == Some(task_fingerprint.as_str())
+            && task_prompt_index
+                .is_none_or(|task_prompt_index| event.turn_number >= task_prompt_index)
+            && (event.conversation_position > conversation_len
+                || event.conversation_position >= task_start)
+    }) {
+        if event.succeeded == Some(true) {
+            changed_paths.extend(
+                event
+                    .changed_paths
+                    .iter()
+                    .map(|path| redact_and_truncate(path, 300)),
+            );
+        }
+
+        if !is_execution_tool(&event.tool_name)
+            || event.command.is_none()
+            || (event.exit_code.is_none() && event.succeeded.is_none())
+        {
+            continue;
+        }
+
+        events.push((
+            if event.conversation_position > conversation_len {
+                0
+            } else {
+                event.conversation_position
+            },
+            ObservedEvent {
+                tool_name: event.tool_name.clone(),
+                command: event
+                    .command
+                    .as_deref()
+                    .map(|command| redact_and_truncate(command, 512)),
+                output: redact_and_truncate(&event.output, 1_200),
+                exit_code: event.exit_code,
+                succeeded: event.succeeded,
+                timestamp: event.timestamp,
+            },
+        ));
+    }
+
+    changed_paths.sort();
+    changed_paths.dedup();
+}
+
+pub(crate) fn latest_substantive_task(queries: &[String]) -> Option<&str> {
     queries
         .iter()
         .rev()
@@ -365,13 +462,27 @@ fn classify_task_type(task: &str) -> String {
     .to_owned()
 }
 
+#[cfg(test)]
 fn observed_tool_events(conversation: &[ConversationItem]) -> (Vec<ObservedEvent>, Vec<String>) {
+    let (events, changed_paths) =
+        observed_tool_events_with_positions(conversation, &HashSet::new(), 0);
+    (
+        events.into_iter().map(|(_, event)| event).collect(),
+        changed_paths,
+    )
+}
+
+fn observed_tool_events_with_positions(
+    conversation: &[ConversationItem],
+    prior_tool_result_ids: &HashSet<String>,
+    conversation_offset: usize,
+) -> (Vec<(usize, ObservedEvent)>, Vec<String>) {
     let mut calls = HashMap::<String, ObservedToolCall>::new();
     let mut events = Vec::new();
     let mut changed_paths = Vec::new();
     let timestamp = chrono::Utc::now().timestamp();
 
-    for item in conversation {
+    for (position, item) in conversation.iter().enumerate() {
         match item {
             ConversationItem::Assistant(assistant) => {
                 for call in &assistant.tool_calls {
@@ -385,17 +496,24 @@ fn observed_tool_events(conversation: &[ConversationItem]) -> (Vec<ObservedEvent
                 }
             }
             ConversationItem::ToolResult(result) => {
+                if prior_tool_result_ids.contains(&result.tool_call_id) {
+                    continue;
+                }
                 if let Some(call) = calls.get(&result.tool_call_id) {
                     observe_tool_result(
                         call,
                         result.content.as_ref(),
                         timestamp,
+                        conversation_offset + position,
                         &mut events,
                         &mut changed_paths,
                     );
                 }
             }
             ConversationItem::CustomToolOutput(output) => {
+                if prior_tool_result_ids.contains(&output.call_id) {
+                    continue;
+                }
                 if let Some(call) = calls.get(&output.call_id) {
                     let content = output.text_content();
                     if !is_execution_tool(&call.name)
@@ -407,7 +525,14 @@ fn observed_tool_events(conversation: &[ConversationItem]) -> (Vec<ObservedEvent
                     {
                         continue;
                     }
-                    observe_tool_result(call, &content, timestamp, &mut events, &mut changed_paths);
+                    observe_tool_result(
+                        call,
+                        &content,
+                        timestamp,
+                        conversation_offset + position,
+                        &mut events,
+                        &mut changed_paths,
+                    );
                 }
             }
             _ => {}
@@ -423,7 +548,8 @@ fn observe_tool_result(
     call: &ObservedToolCall,
     output: &str,
     timestamp: i64,
-    events: &mut Vec<ObservedEvent>,
+    conversation_position: usize,
+    events: &mut Vec<(usize, ObservedEvent)>,
     changed_paths: &mut Vec<String>,
 ) {
     let (exit_code, succeeded) = parse_objective_status(output, call);
@@ -435,17 +561,20 @@ fn observe_tool_result(
         changed_paths.extend(call.changed_paths.iter().cloned());
     }
 
-    events.push(ObservedEvent {
-        tool_name: call.name.clone(),
-        command: call
-            .command
-            .as_deref()
-            .map(|command| redact_and_truncate(command, 512)),
-        output: redact_and_truncate(output, 1_200),
-        exit_code,
-        succeeded,
-        timestamp,
-    });
+    events.push((
+        conversation_position,
+        ObservedEvent {
+            tool_name: call.name.clone(),
+            command: call
+                .command
+                .as_deref()
+                .map(|command| redact_and_truncate(command, 512)),
+            output: redact_and_truncate(output, 1_200),
+            exit_code,
+            succeeded,
+            timestamp,
+        },
+    ));
 }
 
 fn parse_objective_status(output: &str, call: &ObservedToolCall) -> (Option<i32>, Option<bool>) {
@@ -872,6 +1001,16 @@ fn redact_experience_text(value: &str) -> String {
     let without_url_credentials =
         URL_CREDENTIALS.replace_all(&without_private_keys, "${1}[REDACTED]@");
     let sanitized = COOKIE_HEADER.replace_all(&without_url_credentials, "${1}: [REDACTED]");
+    let sanitized = sanitized
+        .split_inclusive('\n')
+        .map(|line| match line.strip_suffix('\n') {
+            Some(content) => format!(
+                "{}\n",
+                xai_grok_memory::experience::extraction::redact_sensitive_text(content)
+            ),
+            None => xai_grok_memory::experience::extraction::redact_sensitive_text(line),
+        })
+        .collect::<String>();
 
     let mut redacted = String::with_capacity(sanitized.len().min(1_200));
     let mut redact_next = false;
@@ -881,7 +1020,21 @@ fn redact_experience_text(value: &str) -> String {
         let lower = token.to_ascii_lowercase();
 
         if redact_next {
-            if lower == "bearer" {
+            if matches!(
+                lower.as_str(),
+                "bearer"
+                    | "basic"
+                    | "digest"
+                    | "negotiate"
+                    | "token"
+                    | "oauth"
+                    | "apikey"
+                    | "api-key"
+                    | "dpop"
+                    | "ntlm"
+                    | "signature"
+                    | "aws4-hmac-sha256"
+            ) {
                 redacted.push_str(token);
             } else {
                 redacted.push_str("[REDACTED]");
@@ -1070,6 +1223,29 @@ mod tests {
             }]),
             ConversationItem::tool_result(call_id, output),
         ]
+    }
+
+    fn nested_execution_evidence(
+        call_id: &str,
+        task: &str,
+        command: &str,
+        output: &str,
+        exit_code: i32,
+        conversation_position: usize,
+    ) -> super::super::experience_ledger::NestedToolEvidence {
+        super::super::experience_ledger::NestedToolEvidence {
+            tool_call_id: call_id.to_owned(),
+            tool_name: "run_terminal_command".to_owned(),
+            command: Some(command.to_owned()),
+            output: output.to_owned(),
+            exit_code: Some(exit_code),
+            succeeded: Some(exit_code == 0),
+            changed_paths: Vec::new(),
+            timestamp: 1,
+            task_fingerprint: Some(super::super::experience_ledger::task_fingerprint(task)),
+            turn_number: 1,
+            conversation_position,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1836,6 +2012,291 @@ mod tests {
     }
 
     #[test]
+    fn test_experience_authenticated_code_mode_execution_persists_and_reinforces() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+        let store = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite")).unwrap();
+
+        let task = "Repair the parser direct execution regression";
+        let command = "cargo test -p parser authenticated_nested_case";
+        let mut recommendation = ExperienceMemory::new(
+            ExperienceCategory::ToolProcessLesson,
+            "Run the focused parser regression",
+            "prior-parser-run",
+            1,
+        );
+        recommendation.repository_id = storage.workspace_dir().to_string_lossy().into_owned();
+        recommendation.recommendation = Some(format!("Run `{command}`"));
+        recommendation.tests_run = vec![command.to_owned()];
+        let recommendation_id = store.upsert(&recommendation).unwrap();
+        let run_id = "authenticated-code-mode-run";
+        store
+            .record_retrieval(run_id, std::slice::from_ref(&recommendation_id))
+            .unwrap();
+        drop(store);
+
+        let conversation = vec![
+            make_user(task),
+            ConversationItem::assistant_tool_calls(vec![ToolCall::custom(
+                "code-mode-wrapper",
+                "provider-item",
+                "exec",
+                "await tools.run_terminal_command({command: 'cargo test'})",
+            )]),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text("code-mode-wrapper", "model-controlled cell output")
+                    .with_name("exec"),
+            ),
+        ];
+        let edit = super::super::experience_ledger::NestedToolEvidence {
+            tool_call_id: "authenticated-edit".to_owned(),
+            tool_name: "apply_patch".to_owned(),
+            command: None,
+            output: "updated src/parser.rs".to_owned(),
+            exit_code: None,
+            succeeded: Some(true),
+            changed_paths: vec!["src/parser.rs".to_owned()],
+            timestamp: 1,
+            task_fingerprint: Some(super::super::experience_ledger::task_fingerprint(task)),
+            turn_number: 1,
+            conversation_position: 2,
+        };
+        let execution = nested_execution_evidence(
+            "authenticated-test",
+            task,
+            command,
+            "test result: ok. 4 passed; 0 failed",
+            0,
+            2,
+        );
+
+        assert!(
+            persist_session_experiences_with_trusted_events(
+                &storage,
+                &conversation,
+                run_id,
+                &[edit, execution],
+                &HashSet::new(),
+            )
+            .unwrap()
+                > 0
+        );
+
+        let store = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite")).unwrap();
+        let experiences = store.all().unwrap();
+        assert!(experiences.iter().any(|experience| {
+            experience
+                .source_run_ids
+                .iter()
+                .any(|source| source == run_id)
+                && experience.context.contains("src/parser.rs")
+                && experience.tests_run.iter().any(|test| test == command)
+        }));
+        let reinforced = store.get(&recommendation_id).unwrap().unwrap();
+        assert_eq!(reinforced.followed_count, 1);
+        assert_eq!(reinforced.successful_reuse_count, 1);
+    }
+
+    #[test]
+    fn test_experience_authenticated_code_mode_rejects_previous_task_evidence() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+
+        let conversation = vec![make_user("Implement the current parser escaping feature")];
+        let previous_task_event = nested_execution_evidence(
+            "previous-task-call",
+            "Repair the old migration locking regression",
+            "cargo test -p migrations lock_contention",
+            "test result: FAILED. 1 failed",
+            101,
+            1,
+        );
+
+        assert_eq!(
+            persist_session_experiences_with_trusted_events(
+                &storage,
+                &conversation,
+                "current-task-run",
+                &[previous_task_event],
+                &HashSet::new(),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!storage.workspace_dir().join("index.sqlite").exists());
+    }
+
+    #[test]
+    fn test_experience_authenticated_code_mode_rejects_previous_same_text_task_evidence() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+
+        let task = "Repair the parser escaping regression";
+        let conversation = vec![
+            make_user(task),
+            make_assistant("First attempt"),
+            make_user(task),
+        ];
+        let previous_attempt = nested_execution_evidence(
+            "previous-attempt-call",
+            task,
+            "cargo test -p parser old_escape_regression",
+            "test result: FAILED. 1 failed",
+            101,
+            1,
+        );
+
+        assert_eq!(
+            persist_session_experiences_with_trusted_events(
+                &storage,
+                &conversation,
+                "repeated-task-run",
+                &[previous_attempt],
+                &HashSet::new(),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!storage.workspace_dir().join("index.sqlite").exists());
+    }
+
+    #[test]
+    fn test_experience_compacted_previous_same_text_task_cannot_replay_old_evidence() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+
+        let task = "Repair the parser escaping regression";
+        let mut latest_task = make_user(task);
+        if let ConversationItem::User(user) = &mut latest_task {
+            user.prompt_index = Some(7);
+        }
+        let conversation = vec![latest_task];
+        let previous_attempt = nested_execution_evidence(
+            "previous-compacted-attempt",
+            task,
+            "cargo test -p parser old_escape_regression",
+            "test result: FAILED. 1 failed",
+            101,
+            usize::MAX,
+        );
+
+        assert_eq!(
+            persist_session_experiences_with_trusted_events(
+                &storage,
+                &conversation,
+                "repeated-compacted-task-run",
+                &[previous_attempt],
+                &HashSet::new(),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!storage.workspace_dir().join("index.sqlite").exists());
+    }
+
+    #[test]
+    fn test_experience_mixed_code_mode_failure_and_direct_retry_preserve_chronology() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+
+        let task = "Repair the parser escaping regression";
+        let command = "cargo test -p parser escape_regression";
+        let mut conversation = vec![
+            make_user(task),
+            make_assistant("The authenticated nested verification initially failed."),
+        ];
+        conversation.extend(execution_items(
+            "successful-direct-retry",
+            command,
+            "exit: 0\ntest result: ok. 3 passed; 0 failed",
+        ));
+        let nested_failure = nested_execution_evidence(
+            "failed-nested-attempt",
+            task,
+            command,
+            "test result: FAILED. 1 failed",
+            101,
+            2,
+        );
+
+        assert!(
+            persist_session_experiences_with_trusted_events(
+                &storage,
+                &conversation,
+                "mixed-code-mode-run",
+                &[nested_failure],
+                &HashSet::new(),
+            )
+            .unwrap()
+                > 0
+        );
+        let experiences = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite"))
+            .unwrap()
+            .all()
+            .unwrap();
+        assert!(experiences.iter().any(|experience| {
+            experience.category == ExperienceCategory::SuccessfulPattern
+                && experience.success == Some(true)
+        }));
+    }
+
+    #[test]
+    fn test_experience_precompaction_nested_failure_stays_ordered_after_history_regrows() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+
+        let task = "Repair the parser escaping regression";
+        let command = "cargo test -p parser escape_regression";
+        let mut conversation = vec![make_user(task)];
+        conversation.extend(execution_items(
+            "successful-after-compaction",
+            command,
+            "exit: 0\ntest result: ok. 3 passed; 0 failed",
+        ));
+        for _ in 0..6 {
+            conversation.push(make_assistant("Additional post-compaction conversation."));
+        }
+        let precompaction_failure = nested_execution_evidence(
+            "failed-before-compaction",
+            task,
+            command,
+            "test result: FAILED. 1 failed",
+            101,
+            5,
+        );
+        let run_id = uuid::Uuid::now_v7().to_string();
+        super::super::experience_ledger::record(&run_id, precompaction_failure);
+        super::super::experience_ledger::mark_history_compacted(&run_id);
+        let compacted_evidence = super::super::experience_ledger::drain(&run_id);
+
+        assert!(
+            persist_session_experiences_with_trusted_events(
+                &storage,
+                &conversation,
+                &run_id,
+                &compacted_evidence,
+                &HashSet::new(),
+            )
+            .unwrap()
+                > 0
+        );
+        let experiences = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite"))
+            .unwrap()
+            .all()
+            .unwrap();
+        assert!(experiences.iter().any(|experience| {
+            experience.category == ExperienceCategory::SuccessfulPattern
+                && experience.success == Some(true)
+        }));
+    }
+
+    #[test]
     fn test_experience_code_mode_fake_text_success_is_not_execution_evidence() {
         let temporary = TempDir::new().unwrap();
         let storage = test_storage(&temporary);
@@ -1980,6 +2441,144 @@ mod tests {
     }
 
     #[test]
+    fn test_experience_resumed_session_activation_reinforces_independently() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+        let store = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite")).unwrap();
+
+        let command = "cargo test -p parser parser_regression";
+        let mut recommendation = ExperienceMemory::new(
+            ExperienceCategory::ToolProcessLesson,
+            "Run the focused parser regression before the full suite",
+            "prior-parser-run",
+            1,
+        );
+        recommendation.repository_id = storage.workspace_dir().to_string_lossy().into_owned();
+        recommendation.recommendation = Some(format!("Run `{command}`"));
+        recommendation.tests_run = vec![command.to_owned()];
+        let recommendation_id = store.upsert(&recommendation).unwrap();
+        drop(store);
+
+        for (activation, outcome) in [
+            ("initial-activation", "exit: 0\ntest result: ok"),
+            (
+                "resumed-activation",
+                "exit: 101\ntest result: FAILED. 1 failed",
+            ),
+        ] {
+            let store =
+                ExperienceStore::open(&storage.workspace_dir().join("index.sqlite")).unwrap();
+            store
+                .record_retrieval(activation, std::slice::from_ref(&recommendation_id))
+                .unwrap();
+            drop(store);
+
+            let mut conversation = vec![make_user("Fix the parser regression and verify it")];
+            conversation.extend(execution_items(activation, command, outcome));
+            persist_session_experiences(&storage, &conversation, activation).unwrap();
+        }
+
+        let reinforced = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite"))
+            .unwrap()
+            .get(&recommendation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reinforced.retrieved_count, 2);
+        assert_eq!(reinforced.followed_count, 2);
+        assert_eq!(reinforced.successful_reuse_count, 1);
+        assert_eq!(reinforced.failed_reuse_count, 1);
+    }
+
+    #[test]
+    fn test_experience_resumed_activation_excludes_completed_historical_results() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+
+        let mut inherited = vec![make_user("Fix the parser regression and verify it")];
+        inherited.extend(execution_items(
+            "historical-test",
+            "cargo test -p parser historical_regression",
+            "exit: 0\ntest result: ok. 3 passed; 0 failed",
+        ));
+        let prior_results =
+            crate::session::memory_state::SessionMemory::collect_prior_tool_result_ids(&inherited);
+
+        assert_eq!(
+            persist_session_experiences_with_trusted_events(
+                &storage,
+                &inherited,
+                "resumed-without-new-results",
+                &[],
+                &prior_results,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!storage.workspace_dir().join("index.sqlite").exists());
+    }
+
+    #[test]
+    fn test_experience_resumed_activation_accepts_new_result_for_inherited_pending_call() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+
+        let old_command = "cargo test -p parser historical_regression";
+        let resumed_command = "cargo test -p parser resumed_regression";
+        let mut conversation = vec![make_user("Fix the parser regression and verify it")];
+        conversation.extend(execution_items(
+            "historical-test",
+            old_command,
+            "exit: 0\ntest result: ok. 3 passed; 0 failed",
+        ));
+        conversation.push(ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "inherited-pending-test".into(),
+            name: "run_terminal_command".to_owned(),
+            arguments: serde_json::json!({ "command": resumed_command })
+                .to_string()
+                .into(),
+        }]));
+        let prior_results =
+            crate::session::memory_state::SessionMemory::collect_prior_tool_result_ids(
+                &conversation,
+            );
+        conversation.push(ConversationItem::tool_result(
+            "inherited-pending-test",
+            "exit: 0\ntest result: ok. 1 passed; 0 failed",
+        ));
+
+        assert!(
+            persist_session_experiences_with_trusted_events(
+                &storage,
+                &conversation,
+                "resumed-new-result",
+                &[],
+                &prior_results,
+            )
+            .unwrap()
+                > 0
+        );
+        let experiences = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite"))
+            .unwrap()
+            .all()
+            .unwrap();
+        assert!(experiences.iter().any(|experience| {
+            experience
+                .tests_run
+                .iter()
+                .any(|command| command == resumed_command)
+        }));
+        assert!(experiences.iter().all(|experience| {
+            experience
+                .evidence
+                .iter()
+                .all(|signal| signal.command.as_deref() != Some(old_command))
+        }));
+    }
+
+    #[test]
     fn test_experience_successful_pattern_is_not_followed_by_shared_validation() {
         let temporary = TempDir::new().unwrap();
         let storage = test_storage(&temporary);
@@ -2082,6 +2681,129 @@ mod tests {
         assert!(!serialized.contains("super-secret"));
         assert!(!serialized.contains("hidden-token"));
         assert!(!serialized.contains("another-secret"));
+    }
+
+    #[test]
+    fn test_experience_redacts_basic_authorization_before_extracting_lessons() {
+        let temporary = TempDir::new().unwrap();
+        let storage = test_storage(&temporary);
+        storage.ensure_initialized().unwrap();
+
+        let credential = "Zm9vOnN1cGVyc2VjcmV0";
+        let mut conversation = vec![make_user("Fix the authenticated parser regression")];
+        conversation.extend(execution_items(
+            "basic-auth-test",
+            "cargo test -p parser authentication",
+            &format!("exit: 0\nAuthorization: Basic {credential}\ntest result: ok"),
+        ));
+
+        persist_session_experiences(&storage, &conversation, "basic-auth-run").unwrap();
+        let experiences = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite"))
+            .unwrap()
+            .all()
+            .unwrap();
+        let serialized = serde_json::to_string(&experiences).unwrap();
+
+        assert!(!serialized.contains(credential));
+        for scheme in [
+            "Bearer",
+            "Basic",
+            "Digest",
+            "Negotiate",
+            "Token",
+            "OAuth",
+            "ApiKey",
+            "API-Key",
+            "DPoP",
+            "NTLM",
+            "Signature",
+            "AWS4-HMAC-SHA256",
+        ] {
+            assert_eq!(
+                redact_experience_text(&format!("Authorization: {scheme} {credential}")),
+                format!("Authorization: {scheme} [REDACTED]"),
+                "shell preliminary sanitizer leaked or malformed {scheme} credentials"
+            );
+            assert_eq!(
+                redact_experience_text(&format!("Proxy-Authorization:{scheme} {credential}")),
+                format!("Proxy-Authorization:{scheme} [REDACTED]"),
+                "shell sanitizer leaked a valid no-whitespace {scheme} authorization header"
+            );
+        }
+    }
+
+    #[test]
+    fn test_experience_redacts_parameterized_authorization_before_extracting_lessons() {
+        for (scheme, authorization, secrets) in [
+            (
+                "Digest",
+                "username=\"hidden-user hidden-continuation\", realm=\"hidden-realm\", response=\"hidden-response\"",
+                [
+                    "hidden-user",
+                    "hidden-continuation",
+                    "hidden-realm",
+                    "hidden-response",
+                ],
+            ),
+            (
+                "OAuth",
+                "oauth_consumer_key=\"hidden-user hidden-continuation\", oauth_nonce=\"hidden-realm\", oauth_signature=\"hidden-response\"",
+                [
+                    "hidden-user",
+                    "hidden-continuation",
+                    "hidden-realm",
+                    "hidden-response",
+                ],
+            ),
+            (
+                "Digest",
+                "username = \"hidden-user hidden-continuation\", realm = \"hidden-realm\", response = \"hidden-response\"",
+                [
+                    "hidden-user",
+                    "hidden-continuation",
+                    "hidden-realm",
+                    "hidden-response",
+                ],
+            ),
+            (
+                "OAuth",
+                "oauth_consumer_key=\"hidden-user hidden-continuation\" , oauth_nonce = \"hidden-realm\" , oauth_signature = \"hidden-response\"",
+                [
+                    "hidden-user",
+                    "hidden-continuation",
+                    "hidden-realm",
+                    "hidden-response",
+                ],
+            ),
+        ] {
+            let temporary = TempDir::new().unwrap();
+            let storage = test_storage(&temporary);
+            storage.ensure_initialized().unwrap();
+
+            let mut conversation = vec![make_user("Fix the authenticated parser regression")];
+            conversation.extend(execution_items(
+                "parameterized-auth-test",
+                "cargo test -p parser authentication",
+                &format!("exit: 0\nAuthorization: {scheme} {authorization}\ntest result: ok"),
+            ));
+
+            assert!(
+                persist_session_experiences(&storage, &conversation, "parameterized-auth-run")
+                    .unwrap()
+                    > 0
+            );
+            let experiences = ExperienceStore::open(&storage.workspace_dir().join("index.sqlite"))
+                .unwrap()
+                .all()
+                .unwrap();
+            let serialized = serde_json::to_string(&experiences).unwrap();
+            for secret in secrets {
+                assert!(
+                    !serialized.contains(secret),
+                    "{scheme} authorization credential persisted after shell preprocessing: {secret}"
+                );
+            }
+        }
     }
 
     #[test]

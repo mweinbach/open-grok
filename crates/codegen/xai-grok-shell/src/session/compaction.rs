@@ -1051,6 +1051,9 @@ impl SessionActor {
         let new_len = replacement.len();
         self.chat_state_handle
             .replace_conversation_for_compaction(replacement);
+        crate::session::memory::experience_ledger::mark_history_compacted(
+            self.memory.experience_run_id(),
+        );
         self.compaction
             .auto_compact_suppressed
             .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
@@ -2367,6 +2370,9 @@ impl SessionActor {
         let new_len = compacted_history.len();
         self.chat_state_handle
             .replace_conversation_for_compaction(compacted_history);
+        crate::session::memory::experience_ledger::mark_history_compacted(
+            self.memory.experience_run_id(),
+        );
         if self.startup_hints.inherited_prefix_len.is_some() {
             let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
             if xai_token_estimation::exceeds_threshold(
@@ -3101,6 +3107,8 @@ mod inline_auto_compact_flow_tests {
                 cancel: Default::default(),
             },
             memory: crate::session::memory_state::SessionMemory {
+                experience_run_id: uuid::Uuid::now_v7().to_string(),
+                experience_prior_tool_result_ids: std::collections::HashSet::new(),
                 embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
                 active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
                 flush_config: crate::config::MemoryFlushConfig::default(),
@@ -4349,6 +4357,8 @@ mod inline_auto_compact_flow_tests {
         )
         .await;
         actor.memory = crate::session::memory_state::SessionMemory {
+            experience_run_id: uuid::Uuid::now_v7().to_string(),
+            experience_prior_tool_result_ids: std::collections::HashSet::new(),
             embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
             active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: memory_config

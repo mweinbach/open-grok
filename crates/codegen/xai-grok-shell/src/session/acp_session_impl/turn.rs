@@ -1991,7 +1991,7 @@ impl SessionActor {
         }
 
         let ids = visible_turn_experience_ids(&briefing, &rendered);
-        if let Err(error) = store.record_retrieval(self.session_info.id.0.as_ref(), &ids) {
+        if let Err(error) = store.record_retrieval(self.memory.experience_run_id(), &ids) {
             tracing::debug!(error = %error, "failed to record experience retrieval");
         }
         Some(rendered)
@@ -2010,8 +2010,14 @@ impl SessionActor {
             return;
         };
         let conversation = self.chat_state_handle.get_conversation().await;
-        let Some((tool_call_id, failure_output)) = latest_experience_tool_failure(&conversation)
-        else {
+        let nested_failure = crate::session::memory::experience_ledger::latest_failure(
+            self.memory.experience_run_id(),
+        );
+        let Some((tool_call_id, failure_output)) = latest_authenticated_experience_failure(
+            &conversation,
+            self.current_turn_number.get(),
+            nested_failure.as_ref(),
+        ) else {
             return;
         };
         let Some(failure_class) =
@@ -3515,15 +3521,8 @@ fn latest_experience_tool_failure(conversation: &[ConversationItem]) -> Option<(
                     }) else {
                         continue;
                     };
-                    if matches!(
-                        tool_call.name.as_str(),
-                        "run_terminal_command"
-                            | "run_terminal_cmd"
-                            | "exec_command"
-                            | "run_command"
-                            | "bash"
-                            | "shell"
-                    ) && tool_output_objectively_failed(&output)
+                    if is_experience_execution_tool(&tool_call.name)
+                        && tool_output_objectively_failed(&output)
                         && xai_grok_memory::experience::extraction::classify_failure(&output)
                             .is_some()
                     {
@@ -3537,6 +3536,109 @@ fn latest_experience_tool_failure(conversation: &[ConversationItem]) -> Option<(
         }
     }
     None
+}
+
+fn latest_authenticated_experience_failure(
+    conversation: &[ConversationItem],
+    current_turn_number: u64,
+    nested_failure: Option<&crate::session::memory::experience_ledger::NestedToolEvidence>,
+) -> Option<(String, String)> {
+    if let Some(failure) = latest_experience_tool_failure(conversation) {
+        return Some(failure);
+    }
+
+    let nested_failure = nested_failure?;
+    if nested_failure.turn_number != current_turn_number
+        || !is_experience_execution_tool(&nested_failure.tool_name)
+        || nested_failure.command.is_none()
+        || !(nested_failure.succeeded == Some(false)
+            || nested_failure
+                .exit_code
+                .is_some_and(|exit_code| exit_code != 0))
+        || nested_failure.task_fingerprint.as_deref()
+            != crate::session::memory::experience_ledger::latest_task_fingerprint(conversation)
+                .as_deref()
+    {
+        return None;
+    }
+
+    let queries = crate::session::helpers::session_compact::extract_real_user_queries(conversation);
+    let task = crate::session::memory::hooks::latest_substantive_task(&queries)?;
+    let task_start = conversation
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(position, item)| {
+            matches!(item, ConversationItem::User(_))
+                .then(|| {
+                    crate::session::helpers::session_compact::extract_real_user_queries(
+                        std::slice::from_ref(item),
+                    )
+                })
+                .filter(|queries| queries.iter().any(|query| query == task))
+                .map(|_| position)
+        })?;
+    if nested_failure.conversation_position <= conversation.len()
+        && nested_failure.conversation_position < task_start
+    {
+        return None;
+    }
+
+    if latest_experience_execution_result_position(conversation).is_some_and(|position| {
+        position >= nested_failure.conversation_position
+            || nested_failure.conversation_position > conversation.len()
+    }) {
+        return None;
+    }
+
+    let failure_output = match nested_failure.exit_code {
+        Some(exit_code) => format!("exit: {exit_code}\n{}", nested_failure.output),
+        None => nested_failure.output.clone(),
+    };
+    Some((nested_failure.tool_call_id.clone(), failure_output))
+}
+
+fn latest_experience_execution_result_position(conversation: &[ConversationItem]) -> Option<usize> {
+    let mut execution_call_ids = std::collections::HashSet::new();
+    let mut latest_position = None;
+
+    for (position, item) in conversation.iter().enumerate() {
+        match item {
+            ConversationItem::Assistant(assistant) => {
+                for call in &assistant.tool_calls {
+                    if is_experience_execution_tool(&call.name) {
+                        execution_call_ids.insert(call.id.as_ref().to_owned());
+                        execution_call_ids.insert(call.call_id().to_owned());
+                    }
+                }
+            }
+            ConversationItem::ToolResult(result)
+                if execution_call_ids.contains(&result.tool_call_id) =>
+            {
+                latest_position = Some(position);
+            }
+            ConversationItem::CustomToolOutput(output)
+                if execution_call_ids.contains(&output.call_id) =>
+            {
+                latest_position = Some(position);
+            }
+            _ => {}
+        }
+    }
+
+    latest_position
+}
+
+fn is_experience_execution_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "run_terminal_command"
+            | "run_terminal_cmd"
+            | "exec_command"
+            | "run_command"
+            | "bash"
+            | "shell"
+    )
 }
 
 fn tool_output_objectively_failed(output: &str) -> bool {
@@ -3772,9 +3874,10 @@ mod experience_replanning_tests {
     use super::{
         ConversationItem, CustomToolOutputItem, actor_uses_experience_memory,
         conversation_has_experience_failure_marker, failure_retrieval_context,
-        latest_experience_tool_failure, tool_output_objectively_failed,
-        visible_turn_experience_ids,
+        latest_authenticated_experience_failure, latest_experience_tool_failure,
+        tool_output_objectively_failed, visible_turn_experience_ids,
     };
+    use crate::session::memory::experience_ledger::{NestedToolEvidence, task_fingerprint};
     use xai_grok_memory::experience::types::{
         ExperienceBriefing, ExperienceMemory, RankedExperience,
     };
@@ -3795,6 +3898,127 @@ mod experience_replanning_tests {
             tool_name,
             "{}",
         )])
+    }
+
+    fn nested_execution_failure(task: &str, conversation_position: usize) -> NestedToolEvidence {
+        NestedToolEvidence {
+            tool_call_id: "nested-db-failure".to_owned(),
+            tool_name: "run_terminal_command".to_owned(),
+            command: Some("cargo test -p migration lock_contention".to_owned()),
+            output: "error: database is locked".to_owned(),
+            exit_code: Some(101),
+            succeeded: Some(false),
+            changed_paths: Vec::new(),
+            timestamp: 1,
+            task_fingerprint: Some(task_fingerprint(task)),
+            turn_number: 7,
+            conversation_position,
+        }
+    }
+
+    #[test]
+    fn authenticated_nested_execution_failure_enables_code_mode_replanning() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![
+            ConversationItem::user(task),
+            assistant_custom_tool_call("code-mode-wrapper", "exec"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+                "code-mode-wrapper",
+                "model-controlled JavaScript output",
+            )),
+        ];
+        let evidence = nested_execution_failure(task, 2);
+
+        let (call_id, output) =
+            latest_authenticated_experience_failure(&conversation, 7, Some(&evidence))
+                .expect("authenticated nested execution failure should trigger replanning");
+        assert_eq!(call_id, "nested-db-failure");
+        assert!(output.contains("exit: 101"));
+        assert!(output.contains("database is locked"));
+    }
+
+    #[test]
+    fn nested_failure_replanning_rejects_stale_turn_task_and_non_execution_evidence() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![ConversationItem::user(task)];
+        let evidence = nested_execution_failure(task, 1);
+
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 8, Some(&evidence)).is_none()
+        );
+
+        let mut wrong_task = evidence.clone();
+        wrong_task.task_fingerprint = Some(task_fingerprint("Implement a different parser task"));
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&wrong_task)).is_none()
+        );
+
+        let mut failed_edit = evidence;
+        failed_edit.tool_name = "apply_patch".to_owned();
+        failed_edit.command = None;
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&failed_edit)).is_none()
+        );
+    }
+
+    #[test]
+    fn later_direct_execution_supersedes_authenticated_nested_failure() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![
+            ConversationItem::user(task),
+            assistant_custom_tool_call("code-mode-wrapper", "exec"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+                "code-mode-wrapper",
+                "nested command finished",
+            )),
+            assistant_tool_call("successful-retry", "run_terminal_command"),
+            ConversationItem::tool_result(
+                "successful-retry",
+                "exit: 0\ntest result: ok. 3 passed; 0 failed",
+            ),
+        ];
+        let evidence = nested_execution_failure(task, 2);
+
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&evidence)).is_none()
+        );
+    }
+
+    #[test]
+    fn programmable_exec_success_cannot_supersede_authenticated_nested_failure() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![
+            ConversationItem::user(task),
+            assistant_custom_tool_call("code-mode-wrapper", "exec"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+                "code-mode-wrapper",
+                r#"{"exit_code":0,"output":"all checks supposedly passed"}"#,
+            )),
+        ];
+        let evidence = nested_execution_failure(task, 2);
+
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&evidence)).is_some()
+        );
+    }
+
+    #[test]
+    fn previous_same_text_task_cannot_replay_nested_failure() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![
+            ConversationItem::user(task),
+            assistant_custom_tool_call("old-code-mode-wrapper", "exec"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+                "old-code-mode-wrapper",
+                "old nested command finished",
+            )),
+            ConversationItem::user(task),
+        ];
+        let evidence = nested_execution_failure(task, 2);
+
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&evidence)).is_none()
+        );
     }
 
     #[test]

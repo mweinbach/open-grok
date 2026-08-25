@@ -248,9 +248,10 @@ JS calls `await tools.search_replace(...)` etc. The exec tool description enumer
 2. Build a synthetic `ToolCallResponse` with a fresh `exec-…` call id.
 3. **`prepare_tool_call`** — same as model tools: parse, **plan-mode edit gate**, PreToolUse hooks, permissions, path locks, auth-retry eligibility.
 4. Dispatch via workspace / tool bridge (`call_with_auth_retry`); consume actual nested-tool progress without changing its terminal result.
-5. Encode structured result for V8 (`code_mode_result()`); fire PostToolUse when configured.
-6. Failed `apply_patch` **rejects** the JS promise (`code_mode_rejection()`) after the ACP card is emitted. Successful patches still resolve to `{}`. Do not resolve failures as `{}` — the model will treat the edit as a no-op and never see the closest-match diagnostic.
-7. Nested tools **emit ordinary ACP tool cards** and their actual incremental progress (user-visible).
+5. Independently record the actual dispatched tool identity, arguments, and terminal outcome in the session activation's experience-evidence ledger; programmable JavaScript output cannot create or replace these records.
+6. Encode structured result for V8 (`code_mode_result()`); fire PostToolUse when configured.
+7. Failed `apply_patch` **rejects** the JS promise (`code_mode_rejection()`) after the ACP card is emitted. Successful patches still resolve to `{}`. Do not resolve failures as `{}` — the model will treat the edit as a no-op and never see the closest-match diagnostic.
+8. Nested tools **emit ordinary ACP tool cards** and their actual incremental progress (user-visible).
 
 Plan mode, hooks, and permission YOLO therefore apply equally to nested edits — see [editing.md](editing.md) and [agent-runtime.md](agent-runtime.md).
 
@@ -307,6 +308,8 @@ Task-local enum in `tool_calls.rs`. Control `exec`/`wait` results **are** pushed
 (custom/function outputs for the Responses wire). Extra `notify()` text uses
 `record_code_mode_notification`; provider projection preserves its order and
 coalesces it with the terminal xAI function output.
+
+Experience-memory collection uses a separate authenticated dispatch-side ledger, not either model-history sink. The ledger observes real nested tool identity, arguments, and results at execution; session-end extraction can therefore learn from Code Mode Only sessions without adding nested tool calls or results to the conversation. Model-programmable `exec`/`wait` output, including fabricated command names, status JSON, or test summaries, remains untrusted and cannot establish objective evidence.
 
 **Do not** “fix” nested tools by reusing `execute_tool_calls` without the CodeMode sink — that double-counts history and confuses the next sample.
 
@@ -392,6 +395,7 @@ When Code Mode (either variant) is effective:
 | Session-persistent V8 | `store`, multi-cell, yield/wait |
 | Nested tools full prepare path | Plan mode, hooks, permissions, hunks |
 | No nested top-level history for nested tools | ModelToolResultSink::CodeMode |
+| Authenticated dispatch-side experience evidence | Code Mode Only learns from real nested checks, never programmable wrapper output |
 | Transport hidden in UI | Live skip + meta/replay filters |
 | Dispose on session end | Resource / isolation |
 | Direct-only exceptions in Code Mode Only | Human + multi-agent tools |
@@ -456,6 +460,8 @@ Also exercise plan-mode nested edits and permission deny paths when changing the
 | New isolate / process per `exec` | Lost `store()`; broken multi-step scripts |
 | Nested `tools.exec` / re-entrant wait | Rejected or deadlocks; protocol forbids |
 | Nested tools append top-level function results | Duplicate history; model confuses sinks |
+| Infer experience evidence from `exec` output instead of real nested dispatch | Fabricated command/status text becomes trusted verification |
+| Omit authenticated nested-dispatch evidence | Code Mode Only sessions cannot learn or reinforce verified experience |
 | Skip plan gate / hooks / permissions on nested path | Security / plan-mode bypass |
 | Hide UI by tool **name** only | Legitimate MCP `exec`/`wait` disappear |
 | Show transport labels, raw source, payloads, or cards live/on replay | `Writing exec cell…` / JavaScript leak; violates nested-only UX |

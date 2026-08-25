@@ -520,6 +520,8 @@ pub(crate) async fn spawn_session_actor(
         .filter(|item| matches!(item, ConversationItem::User(_)))
         .count();
     let initial_conversation_len = conversation.len();
+    let experience_prior_tool_result_ids =
+        super::memory_state::SessionMemory::collect_prior_tool_result_ids(&conversation);
     let initial_last_recap_main_turn = crate::session::helpers::session_recap::load_recap_watermark(
         &crate::session::persistence::session_dir(&session_info),
     );
@@ -1787,6 +1789,8 @@ pub(crate) async fn spawn_session_actor(
             cancel: Default::default(),
         },
         memory: super::memory_state::SessionMemory {
+            experience_run_id: uuid::Uuid::now_v7().to_string(),
+            experience_prior_tool_result_ids,
             embedding_provider: sampling_config.provider,
             active_provider: std::cell::Cell::new(sampling_config.provider),
             flush_config: memory_config.as_ref().map_or_else(

@@ -496,6 +496,13 @@ impl SessionActor {
             self.merge_rewind_tracker_from(target_index).await;
         }
 
+        if wants_file_revert || wants_conversation_rewind {
+            crate::session::memory::experience_ledger::truncate_from_turn(
+                self.memory.experience_run_id(),
+                target_index as u64,
+            );
+        }
+
         self.signals_handle().mark_reverted();
 
         Ok(RewindResponse {

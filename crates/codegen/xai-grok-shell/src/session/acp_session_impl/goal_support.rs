@@ -1359,7 +1359,7 @@ impl SessionActor {
             self.memory.initial_injection_config.enabled,
             &attempt_objective,
             "",
-            &self.session_id_string(),
+            self.memory.experience_run_id(),
         );
 
         let task_tool_name = self.resolve_goal_tool_names().await.task;

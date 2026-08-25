@@ -381,6 +381,8 @@ pub(crate) async fn create_test_actor_with_terminal(
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
+            experience_run_id: uuid::Uuid::now_v7().to_string(),
+            experience_prior_tool_result_ids: std::collections::HashSet::new(),
             embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
             active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: crate::config::MemoryFlushConfig::default(),

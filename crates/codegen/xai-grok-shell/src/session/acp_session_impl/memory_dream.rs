@@ -100,6 +100,8 @@ impl SessionActor {
     /// `log_suffix` is appended to the `MEMORY_SESSION_END:` log line so each
     /// arm keeps a distinct reason string in logs.
     pub(super) async fn run_session_end_memory_pipeline(&self, log_suffix: &str) {
+        let trusted_nested_experience =
+            crate::session::memory::experience_ledger::drain(self.memory.experience_run_id());
         let mut session_end_result = "disabled";
         let mut total_chunks_at_end = 0usize;
         // Dream consolidates *prior* logs. Run after Written/Failed, or when
@@ -110,10 +112,12 @@ impl SessionActor {
             if let Some(storage) = self.memory.storage() {
                 let conversation = self.chat_state_handle.get_conversation().await;
                 if self.memory.save_on_end && !storage.is_ephemeral() {
-                    match crate::session::memory::hooks::persist_session_experiences(
+                    match crate::session::memory::hooks::persist_session_experiences_with_trusted_events(
                         &storage,
                         &conversation,
-                        &self.session_info.id.0,
+                        self.memory.experience_run_id(),
+                        &trusted_nested_experience,
+                        self.memory.experience_prior_tool_result_ids(),
                     ) {
                         Ok(count) if count > 0 => tracing::info!(
                             target: xai_grok_telemetry::memory_log::TARGET,

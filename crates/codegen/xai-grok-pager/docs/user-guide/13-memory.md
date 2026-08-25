@@ -118,7 +118,7 @@ The Markdown summary does not record tool usage, file paths, or shell commands. 
 
 When memory and automatic session saves are enabled, Open Grok can extract compact lessons from actual command exit codes, compilation results, tests, lint checks, and other observable tool outcomes. It does not treat an assistant's claim that a task succeeded as proof, and it does not save entire execution transcripts as experience.
 
-Only directly attributable execution results count as verification. Programmable Code Mode output can print arbitrary test summaries or exit codes, so it is not accepted as proof unless authenticated nested-tool execution evidence becomes available.
+Only directly attributable execution results count as verification. In Code Mode, Open Grok records the identity, arguments, and actual result of tools when they really execute, so Code Mode Only models can learn from verified nested commands and checks. Programmable `exec` output can print arbitrary test summaries or exit codes and is never accepted as proof. These authenticated execution records do not add nested tool results to the model's conversation history.
 
 Future tasks and `/goal` plans can receive a short advisory briefing containing:
 
@@ -128,6 +128,8 @@ Future tasks and `/goal` plans can receive a short advisory briefing containing:
 - **Contradictions:** situations where prior results disagree and current conditions need inspection.
 
 Experience is advisory: current repository evidence and your instructions take precedence. Matching considers the project, task, Git revision, operating system, architecture, evidence quality, and prior reuse. Repeated successful or unsuccessful reuse adjusts a lesson's confidence; simply showing a lesson does not count as following it.
+
+When you reopen a saved session after its earlier run has ended, experience attribution starts a new run while the session keeps its existing identity and conversation. That resumed work can retrieve, follow, and independently reinforce relevant lessons even when the earlier run has already finished.
 
 Experience records live in the workspace's `index.sqlite`, not in the editable Markdown files shown by `/memory`. Run `open-grok memory clear --workspace` to remove both workspace Markdown memory and structured experience. To remove only structured experience, close Open Grok and delete that workspace's `index.sqlite` file; the Markdown memory remains, and its search index is rebuilt when needed. Existing `/forget` operations apply to editable Markdown memory rather than individual structured experience rows.
 

@@ -9,6 +9,7 @@
 //! `crate::sampling` and `crate::session::helpers::session_compact`) and is
 //! not part of the relocatable core engine.
 
+pub(crate) mod experience_ledger;
 pub mod hooks;
 
 pub use xai_grok_memory::{

@@ -50,9 +50,11 @@ Intended ownership:
 | Deterministic comparison metrics and retrieval ablations | `crates/codegen/xai-grok-memory/src/experience/evaluation.rs` |
 | Existing `<memory-context>` formatting and cache guard | `crates/codegen/xai-grok-shell/src/session/helpers/memory_context.rs` |
 | First-turn advisory injection and failure-triggered replanning | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` |
+| Activation-scoped experience identity and authenticated evidence ledger | `crates/codegen/xai-grok-shell/src/session/memory_state.rs` |
+| Authenticated Code Mode nested-tool dispatch evidence | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs` |
 | Dedicated goal-planner guidance and advisory contract | `crates/codegen/xai-grok-shell/src/session/{goal_planner.rs,acp_session_impl/goal_support.rs,templates/goal_planner_prompt.md}` |
 | Session-end orchestration | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/memory_dream.rs` |
-| Conversation evidence extraction and session lifecycle | `crates/codegen/xai-grok-shell/src/session/memory/hooks.rs` |
+| Conversation and authenticated-dispatch evidence extraction | `crates/codegen/xai-grok-shell/src/session/memory/hooks.rs` |
 
 These paths describe the intended implementation boundary; the source itself, rather than this document, determines which pieces have landed.
 
@@ -107,6 +109,8 @@ Lifecycle states are `active`, `low_confidence`, `superseded`, `deprecated`, and
 
 An evidence signal records its kind, observed verdict, bounded/redacted summary, optional command or check identifier, optional numeric score, timestamp, and source-run reference. Relevant kinds include command exit, compilation, tests, lint, type checks, benchmarks, runtime behavior, regression detection, code review/judge verdict, and explicit user feedback. Multiple checks from one source run are supporting detail, not independent replications; confidence and cross-repository generalization depend on distinct source runs.
 
+The experience run ID is scoped to one session-actor activation, not to the stable session ID used for persisted conversation and resume. Retrieval attribution, extracted evidence, followed recommendations, and finalization must all use the same activation-scoped ID. Resuming a persisted session into a newly spawned actor creates a fresh experience run, so its new checks can independently reinforce prior lessons instead of being rejected by the previous activation's finalized-run tombstone; reattaching to an actor that is still running preserves its current run ID.
+
 Keep outcome dimensions separate:
 
 ```text
@@ -148,7 +152,7 @@ Derive lessons from observable tool/conversation evidence and available evaluato
 4. Emit only concise actionable patterns supported by the observed signals; keep weak or conflicting interpretations as hypotheses.
 5. Start at the narrowest defensible scope, link all source runs, and bound both record count and evidence text.
 
-Programmable Code Mode `exec` output is not authenticated nested-tool execution evidence: a model-written JavaScript cell can fabricate arbitrary command names, exit-code JSON, and passing test summaries with `text()`. Until nested dispatch exposes independently recorded tool identity, arguments, and outcomes, exclude `exec` output from persisted verification and reinforcement. Correlated results from directly invoked execution tools remain eligible; successful wrapper transport, ordinary `git diff`, file contents, and assistant prose never prove functional correctness.
+Programmable Code Mode `exec` output is not authenticated nested-tool execution evidence: a model-written JavaScript cell can fabricate arbitrary command names, exit-code JSON, and passing test summaries with `text()`. Nested execution counts only when the real shell dispatch independently records the prepared tool identity, arguments, and terminal result in its activation-scoped evidence ledger. Session-end extraction combines those authenticated dispatch records with correlated, directly invoked execution results; it never trusts programmable `exec` output or appends nested results to the model conversation. This lets Code Mode Only models learn from real nested checks without weakening the history sink or accepting fabricated JavaScript output. Successful wrapper transport, ordinary `git diff`, file contents, and assistant prose still never prove functional correctness.
 
 Store redacted summaries and safe command/check identifiers, never complete transcripts, terminal dumps, authorization headers, bearer tokens, API keys, AWS access/secret/session credentials, cookies, passwords, sensitive environment values, or opaque provider history. Redact before persistence and again before prompt rendering; avoid embedding secrets inside deduplication keys or telemetry. Preserve provider/export isolation and fail open without blocking session shutdown if extraction or persistence fails.
 

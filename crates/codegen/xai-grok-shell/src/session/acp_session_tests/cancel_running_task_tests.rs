@@ -188,6 +188,8 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    experience_run_id: uuid::Uuid::now_v7().to_string(),
+                    experience_prior_tool_result_ids: std::collections::HashSet::new(),
                     embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
                     active_provider: std::cell::Cell::new(
                         xai_grok_sampling_types::ModelProvider::Xai,
@@ -693,6 +695,8 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    experience_run_id: uuid::Uuid::now_v7().to_string(),
+                    experience_prior_tool_result_ids: std::collections::HashSet::new(),
                     embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
                     active_provider: std::cell::Cell::new(
                         xai_grok_sampling_types::ModelProvider::Xai,
@@ -1001,6 +1005,8 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    experience_run_id: uuid::Uuid::now_v7().to_string(),
+                    experience_prior_tool_result_ids: std::collections::HashSet::new(),
                     embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
                     active_provider: std::cell::Cell::new(
                         xai_grok_sampling_types::ModelProvider::Xai,
@@ -2536,6 +2542,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    experience_run_id: uuid::Uuid::now_v7().to_string(),
+                    experience_prior_tool_result_ids: std::collections::HashSet::new(),
                     embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
                     active_provider: std::cell::Cell::new(
                         xai_grok_sampling_types::ModelProvider::Xai,
