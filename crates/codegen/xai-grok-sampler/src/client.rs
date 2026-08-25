@@ -399,6 +399,7 @@ fn normalize_response_output_item(item: &mut serde_json::Value) {
     fill_missing_custom_tool_call_id(item);
     fill_missing_compaction_output_id(item);
     fill_missing_web_search_action(item);
+    normalize_web_search_action(item);
 }
 
 /// async-openai 0.33.1 requires `CompactionBody.id`, while the Responses
@@ -434,6 +435,42 @@ fn fill_missing_web_search_action(item: &mut serde_json::Value) {
             "action".to_owned(),
             xai_grok_sampling_types::sentinel_web_search_action_json(),
         );
+    }
+}
+
+fn normalize_web_search_action(item: &mut serde_json::Value) {
+    let Some(item) = item.as_object_mut() else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("web_search_call") {
+        return;
+    }
+
+    let Some(action) = item
+        .get_mut("action")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    match action.get("type").and_then(serde_json::Value::as_str) {
+        Some("search") => {
+            if let Some(sources) = action
+                .get_mut("sources")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                sources
+                    .retain(|source| source.get("url").is_some_and(serde_json::Value::is_string));
+            }
+        }
+        Some("find" | "find_in_page")
+            if !action.get("url").is_some_and(serde_json::Value::is_string) =>
+        {
+            item.insert(
+                "action".to_owned(),
+                xai_grok_sampling_types::sentinel_web_search_action_json(),
+            );
+        }
+        _ => {}
     }
 }
 
@@ -5851,6 +5888,145 @@ mod tests {
         assert!(xai_grok_sampling_types::is_sentinel_web_search_action(
             &call.action
         ));
+    }
+
+    #[test]
+    fn codex_web_search_item_done_ignores_sources_without_urls() {
+        let event = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 3,
+            "output_index": 0,
+            "item": {
+                "id": "ws_sources",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "agent benchmarks",
+                    "sources": [
+                        { "type": "url", "url": "https://example.com/first" },
+                        { "type": "url" },
+                        { "type": "url", "url": null },
+                        { "type": "url", "url": "https://example.com/second" }
+                    ]
+                }
+            }
+        })
+        .to_string();
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&event).is_err());
+
+        let event =
+            deserialize_response_event_for_adapter(&event, provider_adapter(ModelProvider::Codex))
+                .expect("search sources without URLs should not fail the stream");
+        let rs::ResponseStreamEvent::ResponseOutputItemDone(event) = event else {
+            panic!("expected ResponseOutputItemDone");
+        };
+        let rs::OutputItem::WebSearchCall(call) = event.item else {
+            panic!("expected WebSearchCall");
+        };
+        let rs::WebSearchToolCallAction::Search(action) = call.action else {
+            panic!("expected search action");
+        };
+        assert_eq!(action.query, "agent benchmarks");
+        assert_eq!(
+            action
+                .sources
+                .expect("valid sources are retained")
+                .into_iter()
+                .map(|source| source.url)
+                .collect::<Vec<_>>(),
+            ["https://example.com/first", "https://example.com/second"]
+        );
+    }
+
+    #[test]
+    fn codex_web_search_in_completed_output_ignores_sources_without_urls() {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 9,
+            "response": {
+                "created_at": 0,
+                "id": "resp_sources",
+                "model": "gpt-5.6-sol",
+                "object": "response",
+                "output": [{
+                    "id": "ws_sources",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "agent benchmarks",
+                        "sources": [
+                            { "type": "url" },
+                            { "type": "url", "url": "https://example.com/valid" }
+                        ]
+                    }
+                }],
+                "status": "completed"
+            }
+        })
+        .to_string();
+        assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&event).is_err());
+
+        let event =
+            deserialize_response_event_for_adapter(&event, provider_adapter(ModelProvider::Codex))
+                .expect("terminal output should tolerate search sources without URLs");
+        let rs::ResponseStreamEvent::ResponseCompleted(event) = event else {
+            panic!("expected response.completed");
+        };
+        let [rs::OutputItem::WebSearchCall(call)] = event.response.output.as_slice() else {
+            panic!("expected a single WebSearchCall output item");
+        };
+        let rs::WebSearchToolCallAction::Search(action) = &call.action else {
+            panic!("expected search action");
+        };
+        assert_eq!(
+            action
+                .sources
+                .as_ref()
+                .expect("valid sources are retained")
+                .iter()
+                .map(|source| source.url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://example.com/valid"]
+        );
+    }
+
+    #[test]
+    fn codex_web_search_find_action_without_url_uses_sentinel() {
+        for action_type in ["find", "find_in_page"] {
+            let event = serde_json::json!({
+                "type": "response.output_item.done",
+                "sequence_number": 3,
+                "output_index": 0,
+                "item": {
+                    "id": "ws_find",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {
+                        "type": action_type,
+                        "pattern": "benchmark methodology"
+                    }
+                }
+            })
+            .to_string();
+            assert!(serde_json::from_str::<rs::ResponseStreamEvent>(&event).is_err());
+
+            let event = deserialize_response_event_for_adapter(
+                &event,
+                provider_adapter(ModelProvider::Codex),
+            )
+            .unwrap_or_else(|error| panic!("{action_type} without URL should parse: {error}"));
+            let rs::ResponseStreamEvent::ResponseOutputItemDone(event) = event else {
+                panic!("expected ResponseOutputItemDone");
+            };
+            let rs::OutputItem::WebSearchCall(call) = event.item else {
+                panic!("expected WebSearchCall");
+            };
+            assert!(xai_grok_sampling_types::is_sentinel_web_search_action(
+                &call.action
+            ));
+        }
     }
 
     #[test]
