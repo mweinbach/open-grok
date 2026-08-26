@@ -2,6 +2,48 @@ use super::*;
 use xai_grok_tools::computer::types::TaskKind;
 use xai_grok_tools::types::TaskSnapshot;
 
+#[tokio::test]
+async fn async_user_message_is_persisted_and_forwarded_without_a_blocking_request() {
+    use xai_grok_tools::implementations::codex::send_user_message_async::ASYNC_USER_MESSAGE_META_KEY;
+    let (config, mut gateway_rx, mut persistence_rx, mut command_rx) = make_test_config_full();
+    handle_notification(
+        &config,
+        ToolNotification::AsyncUserMessage(xai_grok_tools::notification::types::AsyncUserMessage {
+            tool_call_id: "async-call".into(),
+            message: "Which option?".into(),
+        }),
+        &mut HashMap::new(),
+    )
+    .await;
+    let xai_acp_lib::AcpClientMessage::SessionNotification(forwarded) =
+        gateway_rx.try_recv().unwrap()
+    else {
+        panic!("expected a session notification, not a blocking client request");
+    };
+    let PersistenceMsg::Update(crate::session::storage::SessionUpdate::Acp(persisted)) =
+        persistence_rx.try_recv().unwrap()
+    else {
+        panic!("expected a persisted ACP update");
+    };
+    assert_eq!(
+        serde_json::to_value(&forwarded.request).unwrap(),
+        serde_json::to_value(&persisted).unwrap()
+    );
+    let acp::SessionUpdate::AgentMessageChunk(chunk) = &persisted.update else {
+        panic!("expected a visible assistant message");
+    };
+    assert_eq!(
+        chunk.meta.as_ref().unwrap()[ASYNC_USER_MESSAGE_META_KEY],
+        true
+    );
+    let acp::ContentBlock::Text(text) = &chunk.content else {
+        panic!("expected text")
+    };
+    assert_eq!(text.text, "Which option?");
+    assert!(command_rx.try_recv().is_err());
+    assert!(gateway_rx.try_recv().is_err());
+}
+
 /// Drive the admission handshake inline so receiver assertions observe the
 /// bridge's command order without racing a detached proxy task.
 async fn handle_notification_with_admission(

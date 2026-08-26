@@ -86,6 +86,41 @@ fn streaming_agent_message() {
     assert_eq!(sb.len(), 1);
     assert!(tracker.current_agent_msg.is_some());
 }
+
+#[test]
+fn async_user_message_is_a_completed_message_without_finishing_the_turn() {
+    use xai_grok_tools::implementations::codex::send_user_message_async::ASYNC_USER_MESSAGE_META_KEY;
+    for is_replay in [false, true] {
+        let mut scrollback = ScrollbackState::new();
+        let mut tracker = AcpUpdateTracker::new();
+        let metadata = NotificationMeta {
+            is_replay,
+            ..Default::default()
+        };
+        tracker.handle_update(agent_chunk("Working"), &metadata, &mut scrollback);
+        let mut message_meta = acp::Meta::new();
+        message_meta.insert(
+            ASYNC_USER_MESSAGE_META_KEY.into(),
+            serde_json::Value::Bool(true),
+        );
+        let message = acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                "Which option?",
+            )))
+            .meta(Some(message_meta)),
+        );
+        assert!(tracker.handle_update(message, &metadata, &mut scrollback));
+        assert_eq!(scrollback.len(), 2);
+        assert!(tracker.current_agent_msg.is_none());
+        assert!(tracker.handle_update(
+            agent_chunk("Continuing other work"),
+            &metadata,
+            &mut scrollback
+        ));
+        assert_eq!(scrollback.len(), 3);
+        assert!(tracker.current_agent_msg.is_some());
+    }
+}
 #[test]
 fn agent_output_epoch_tracks_visible_live_output() {
     crate::appearance::cache::set_show_thinking_blocks(true);

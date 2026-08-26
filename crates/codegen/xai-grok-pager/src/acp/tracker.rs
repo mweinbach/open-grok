@@ -1347,6 +1347,13 @@ impl AcpUpdateTracker {
         if text.is_empty() {
             return false;
         }
+        let async_message = chunk.meta.as_ref().is_some_and(|meta| {
+            meta.get(xai_grok_tools::implementations::codex::send_user_message_async::ASYNC_USER_MESSAGE_META_KEY)
+                .and_then(serde_json::Value::as_bool) == Some(true)
+        });
+        if async_message && let Some(previous) = self.current_agent_msg.take() {
+            scrollback.finish_running(previous);
+        }
         if self.current_agent_msg.is_none() && text.trim().is_empty() {
             tracing::warn!(
                 text = %text.escape_debug(),
@@ -1366,11 +1373,16 @@ impl AcpUpdateTracker {
         {
             entry.created_at = Some(utc_ms_to_local(ts_ms));
         }
-        if meta.is_replay {
+        let changed = if meta.is_replay {
             scrollback.push_chunk_to_agent_deferred(id, &text)
         } else {
             scrollback.push_chunk_to_agent(id, &text)
+        };
+        if async_message {
+            scrollback.finish_running(id);
+            self.current_agent_msg = None;
         }
+        changed
     }
     /// Handle an agent thought chunk (streaming thinking).
     fn handle_thought_chunk(
