@@ -1059,6 +1059,19 @@ fn responses_config(base_url: String, doom_loop: Option<DoomLoopRecoveryPolicy>)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_lite_is_model_gated_for_stream_unary_and_compact_requests() {
     use std::sync::Mutex;
+    let legacy_id = "00000000-0000-7000-8000-000000000001";
+    let legacy_message = json!({
+        "type": "agent_message", "id": legacy_id,
+        "author": "/root", "recipient": "/root/worker",
+        "content": [{"type": "encrypted_content", "encrypted_content": "opaque-test-message"}],
+    });
+    let stored_message: ConversationItem = serde_json::from_value(json!({
+        "type": "backend_tool_call",
+        "kind": {"tool_type": "codex_raw_input", "id": legacy_id, "raw": legacy_message},
+    }))
+    .unwrap();
+    let mut repaired_message = legacy_message.clone();
+    repaired_message["id"] = format!("amsg_{legacy_id}").into();
     let captured = Arc::new(Mutex::new(Vec::<(HeaderMap, serde_json::Value)>::new()));
     let response_capture = Arc::clone(&captured);
     let compact_capture = Arc::clone(&captured);
@@ -1136,6 +1149,7 @@ async fn responses_lite_is_model_gated_for_stream_unary_and_compact_requests() {
             ConversationRequest::from_items(vec![
                 ConversationItem::system("Base instructions"),
                 ConversationItem::user("Hello"),
+                stored_message.clone(),
             ])
         };
         client.conversation_responses(request()).await.unwrap();
@@ -1163,6 +1177,18 @@ async fn responses_lite_is_model_gated_for_stream_unary_and_compact_requests() {
         );
         let opted_in = provider == ModelProvider::Codex && enabled;
         for (headers, body) in requests {
+            let agent_messages: Vec<_> = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "agent_message")
+                .collect();
+            if provider == ModelProvider::Codex {
+                assert_eq!(agent_messages, vec![&repaired_message]);
+            } else {
+                assert!(agent_messages.is_empty());
+                assert!(!body.to_string().contains("opaque-test-message"));
+            }
             assert_eq!(
                 headers.contains_key("x-openai-internal-codex-responses-lite"),
                 opted_in
