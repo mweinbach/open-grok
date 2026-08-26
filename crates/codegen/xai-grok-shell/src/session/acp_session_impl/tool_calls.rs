@@ -1012,7 +1012,7 @@ impl SessionActor {
         }
         if crate::session::code_mode::is_code_mode_direct_only_tool(&tool_name) {
             return Err(format!(
-                "`{tool_name}` pauses the turn for user interaction and cannot run inside a \
+                "`{tool_name}` is a direct-only control tool and cannot run inside a \
                  Code Mode cell; call the `{tool_name}` function tool directly instead"
             ));
         }

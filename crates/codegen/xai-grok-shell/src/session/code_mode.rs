@@ -72,10 +72,13 @@ pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
         name,
         "ask_user_question"
             | "request_user_input"
+            | "send_user_message_async"
             | "enter_plan_mode"
             | "exit_plan_mode"
             | "task"
             | "spawn_subagent"
+            | "spawn_agent"
+            | "interrupt_agent"
             | "agent_swarm"
             | "swarm_wait"
             | "workflow"
@@ -1855,6 +1858,11 @@ mod tests {
                 json!({"type": "object"}),
             ),
             GrokToolDefinition::function(
+                "send_user_message_async",
+                Some("Send a nonblocking user message"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
                 "read_file",
                 Some("Read a file"),
                 json!({"type": "object"}),
@@ -1862,6 +1870,16 @@ mod tests {
             GrokToolDefinition::function(
                 "spawn_subagent",
                 Some("Launch a subagent"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "spawn_agent",
+                Some("Launch a named native agent"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "interrupt_agent",
+                Some("Interrupt a named agent"),
                 json!({"type": "object"}),
             ),
             GrokToolDefinition::function(
@@ -1896,6 +1914,7 @@ mod tests {
         for direct_only in [
             "ask_user_question",
             "request_user_input",
+            "send_user_message_async",
             "enter_plan_mode",
             "exit_plan_mode",
             "task",
