@@ -3844,6 +3844,51 @@ mod plan_mode_edit_gate_tests {
     }
 
     #[test]
+    fn freeform_apply_patch_keeps_the_normal_plan_edit_gate() {
+        let fixture = active_fixture();
+        let surface = crate::session::tool_surface::EffectiveToolSurface::build(
+            vec![xai_grok_sampling_types::ToolSpec {
+                name: "apply_patch".into(),
+                description: None,
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+            &[],
+            &[],
+            xai_grok_sampling_types::ToolMode::Direct,
+            xai_grok_sampling_types::ModelProvider::Codex,
+            &xai_grok_sampling_types::ApiBackend::Responses,
+            false,
+        )
+        .unwrap()
+        .with_freeform_apply_patch(true);
+        for (patch, allowed) in [
+            (
+                "*** Begin Patch\n*** Add File: ../../gate-session/plan.md\n+# Plan\n*** End Patch",
+                true,
+            ),
+            (
+                "*** Begin Patch\n*** Add File: source.rs\n+changed\n*** End Patch",
+                false,
+            ),
+            ("invalid patch", false),
+        ] {
+            let call = xai_grok_sampling_types::ToolCall::custom(
+                "patch-call",
+                "patch-item",
+                "apply_patch",
+                patch,
+            );
+            let dispatch = surface.freeform_apply_patch_call(&call).unwrap();
+            let input: xai_grok_tools::implementations::codex::apply_patch::ApplyPatchInput =
+                serde_json::from_str(&dispatch.function.arguments).unwrap();
+            assert_eq!(
+                gate(&fixture, &ToolInput::ApplyPatch(input)) == PlanEditGate::Allow,
+                allowed
+            );
+        }
+    }
+
+    #[test]
     fn apply_patch_malformed_outside_or_mixed_targets_rejected() {
         let fixture = active_fixture();
         for input in [

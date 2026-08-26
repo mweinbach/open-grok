@@ -2473,7 +2473,11 @@ impl SessionActor {
                 .web_search_state()
                 .native_hosted_web_search_suppressed(model_provider),
         )
-        .map_err(|error| acp::Error::internal_error().data(error))?;
+        .map_err(|error| acp::Error::internal_error().data(error))?
+        .with_freeform_apply_patch(
+            self.models_manager
+                .model_supports_freeform_apply_patch(&turn_sampling_config.model),
+        );
         if !base_tool_surface.reserved_name_collisions.is_empty() {
             tracing::warn!(
                 collisions = ?base_tool_surface.reserved_name_collisions,
@@ -3336,6 +3340,10 @@ impl SessionActor {
                 .await;
             let mut direct_tool_calls = Vec::new();
             for call in tool_calls {
+                if let Some(patch_call) = base_tool_surface.freeform_apply_patch_call(&call) {
+                    direct_tool_calls.push(patch_call);
+                    continue;
+                }
                 let code_mode_exec_call = match code_mode_transport {
                     Some(xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar) => {
                         call.is_custom()

@@ -364,7 +364,10 @@ impl SessionActor {
                 .web_search_state()
                 .native_hosted_web_search_suppressed(sampling_config.provider),
         ) {
-            Ok(surface) => surface,
+            Ok(surface) => surface.with_freeform_apply_patch(
+                self.models_manager
+                    .model_supports_freeform_apply_patch(&sampling_config.model),
+            ),
             Err(error) => {
                 tracing::warn!(%error, "two_pass: incompatible effective tool surface");
                 return None;
@@ -1616,6 +1619,10 @@ impl SessionActor {
                 .native_hosted_web_search_suppressed(sampling_config.provider),
         )
         .map_err(|error| acp::Error::internal_error().data(error))?;
+        let compaction_surface = compaction_surface.with_freeform_apply_patch(
+            self.models_manager
+                .model_supports_freeform_apply_patch(&sampling_config.model),
+        );
         let compaction_tool_tokens = compaction_surface.estimated_definition_tokens();
         let compaction_tools = compaction_surface.function_tools;
         let compaction_hosted_tools = compaction_surface.hosted_tools;

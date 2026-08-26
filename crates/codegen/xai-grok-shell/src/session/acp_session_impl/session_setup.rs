@@ -673,7 +673,12 @@ impl SessionActor {
                     .web_search_state()
                     .native_hosted_web_search_suppressed(sampling_config.provider),
             ) {
-                Ok(surface) => Some(surface),
+                Ok(surface) => Some(
+                    surface.with_freeform_apply_patch(
+                        self.models_manager
+                            .model_supports_freeform_apply_patch(&sampling_config.model),
+                    ),
+                ),
                 Err(error) => {
                     tracing::warn!(%error, "session info: incompatible effective tool surface");
                     None

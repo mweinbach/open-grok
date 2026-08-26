@@ -299,6 +299,53 @@ impl EffectiveToolSurface {
         })
     }
 
+    pub(crate) fn with_freeform_apply_patch(mut self, enabled: bool) -> Self {
+        if enabled
+            && let Some(index) = self
+                .function_tools
+                .iter()
+                .position(|tool| tool.name == "apply_patch")
+        {
+            let tool = self.function_tools.remove(index);
+            self.hosted_tools
+                .push(HostedTool::ClientCustom(CustomToolSpec {
+                name: tool.name,
+                description: tool.description,
+                format: crate::sampling::rs::CustomToolParamFormat::Grammar(
+                    crate::sampling::rs::CustomGrammarFormatParam {
+                        definition:
+                            xai_grok_tools::implementations::codex::apply_patch::FREEFORM_GRAMMAR
+                                .to_owned(),
+                        syntax: crate::sampling::rs::GrammarSyntax::Lark,
+                    },
+                ),
+            }));
+        }
+        self
+    }
+
+    pub(crate) fn freeform_apply_patch_call(
+        &self,
+        call: &xai_grok_sampling_types::ToolCall,
+    ) -> Option<crate::sampling::types::ToolCallResponse> {
+        if !call.is_custom()
+            || call.name != "apply_patch"
+            || !self.hosted_tools.iter().any(
+                |tool| matches!(tool, HostedTool::ClientCustom(tool) if tool.name == "apply_patch"),
+            )
+        {
+            return None;
+        }
+        Some(crate::sampling::types::ToolCallResponse {
+            id: call.id.to_string(),
+            kind: "function".to_owned(),
+            function: crate::sampling::types::ToolCallFunction {
+                name: call.name.clone(),
+                arguments: serde_json::json!({"patch": call.arguments.as_ref()}).to_string(),
+            },
+        })
+    }
+
     /// Tool-prefix estimate including native custom declarations. Hosted
     /// provider tools are intentionally excluded, matching the existing
     /// context accounting, but client custom tools occupy the same prefix as
@@ -366,6 +413,106 @@ mod tests {
 
     fn definitions(tools: &[ToolSpec]) -> Vec<ToolDefinition> {
         tool_specs_as_definitions(tools)
+    }
+
+    #[test]
+    fn freeform_apply_patch_is_opt_in_and_stays_nested_in_code_mode_only() {
+        for mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
+            for enabled in [false, true] {
+                let tools = vec![tool("apply_patch"), tool("read_file")];
+                let surface = EffectiveToolSurface::build(
+                    tools.clone(),
+                    &definitions(&tools),
+                    &[],
+                    mode,
+                    ModelProvider::Codex,
+                    &ApiBackend::Responses,
+                    false,
+                )
+                .unwrap()
+                .with_freeform_apply_patch(enabled);
+                let native = surface.hosted_tools.iter().filter(|tool| {
+                    matches!(tool, HostedTool::ClientCustom(tool) if tool.name == "apply_patch")
+                }).count();
+                assert_eq!(
+                    native,
+                    usize::from(enabled && mode != ToolMode::CodeModeOnly)
+                );
+                assert_eq!(
+                    surface
+                        .function_tools
+                        .iter()
+                        .any(|tool| tool.name == "apply_patch"),
+                    !enabled && mode != ToolMode::CodeModeOnly,
+                );
+                let call = xai_grok_sampling_types::ToolCall::custom(
+                    "call_patch",
+                    "patch_item",
+                    "apply_patch",
+                    "*** Begin Patch\n*** Delete File: old.txt\n*** End Patch\n",
+                );
+                let dispatch = surface.freeform_apply_patch_call(&call);
+                assert_eq!(dispatch.is_some(), native == 1);
+                if let Some(dispatch) = dispatch {
+                    assert_eq!(dispatch.id, call.id.as_ref());
+                    assert_eq!(
+                        xai_grok_sampling_types::conversation::provider_tool_call_id(&dispatch.id),
+                        "call_patch"
+                    );
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&dispatch.function.arguments)
+                            .unwrap()["patch"],
+                        call.arguments.as_ref()
+                    );
+                    for result in [
+                        "Success",
+                        "Permission denied",
+                        "Hook denied",
+                        "Cancelled",
+                        "Invalid patch",
+                    ] {
+                        let request =
+                            xai_grok_sampling_types::ConversationRequest::from_items(vec![
+                                xai_grok_sampling_types::ConversationItem::tool_result(
+                                    dispatch.id.clone(),
+                                    result,
+                                ),
+                            ]);
+                        let wire: crate::sampling::rs::CreateResponse = (&request).into();
+                        let wire = serde_json::to_value(wire).unwrap();
+                        assert_eq!(wire["input"][0]["type"], "custom_tool_call_output");
+                        assert_eq!(wire["input"][0]["call_id"], "call_patch");
+                        assert_eq!(wire["input"][0]["output"], result);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn freeform_apply_patch_does_not_restore_filtered_tools() {
+        let surface = EffectiveToolSurface::build(
+            Vec::new(),
+            &[],
+            &[],
+            ToolMode::Direct,
+            ModelProvider::Codex,
+            &ApiBackend::Responses,
+            false,
+        )
+        .unwrap()
+        .with_freeform_apply_patch(true);
+        assert!(surface.hosted_tools.is_empty());
+        assert!(
+            surface
+                .freeform_apply_patch_call(&xai_grok_sampling_types::ToolCall::custom(
+                    "call_patch",
+                    "patch_item",
+                    "apply_patch",
+                    "unavailable",
+                ))
+                .is_none()
+        );
     }
 
     #[test]
