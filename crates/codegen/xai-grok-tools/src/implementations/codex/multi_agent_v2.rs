@@ -107,7 +107,7 @@ fn message(
         ));
     }
     Ok(AgentMailboxMessage {
-        message_id: uuid::Uuid::now_v7().to_string(),
+        message_id: format!("amsg_{}", uuid::Uuid::now_v7()),
         team_scope_id: identity.team_scope_id.clone(),
         from_agent_id: identity.agent_id.clone(),
         to_agent_id: String::new(),
@@ -423,6 +423,12 @@ mod tests {
             )
             .unwrap();
             assert_eq!(result.body, body);
+            let suffix = result
+                .message_id
+                .strip_prefix("amsg_")
+                .expect("native agent message IDs must use the Responses prefix");
+            assert!(uuid::Uuid::parse_str(suffix).is_ok());
+            assert_eq!(result.native_wire_item().unwrap()["id"], result.message_id);
             assert_eq!(result.native.unwrap().encrypted, encrypted.unwrap_or(true));
         }
     }
