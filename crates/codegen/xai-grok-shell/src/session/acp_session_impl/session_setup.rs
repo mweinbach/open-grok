@@ -345,6 +345,7 @@ impl SessionActor {
         }
     }
     pub(super) async fn flush_pending_skill_reminders(&self) {
+        self.flush_native_agent_messages();
         let activation = self.plan_mode.lock().take_pending_activation();
         if let Some(text) = activation {
             self.chat_state_handle
@@ -361,6 +362,15 @@ impl SessionActor {
             self.chat_state_handle.push_user_message(item);
         }
         self.persist_announcement_state().await;
+    }
+
+    pub(super) fn flush_native_agent_messages(&self) -> bool {
+        let items = std::mem::take(&mut *self.pending_native_agent_messages.lock());
+        let has_items = !items.is_empty();
+        for item in items {
+            self.chat_state_handle.push_tool_result(item);
+        }
+        has_items
     }
     /// Idle threshold for proactive model metadata refresh on session resume.
     /// If the session has been idle longer than this, we fetch fresh model config

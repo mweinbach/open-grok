@@ -310,12 +310,13 @@ impl SessionActor {
     }
 
     pub(super) async fn drain_pending_interjections(&self) -> bool {
+        let native_activity = self.flush_native_agent_messages();
         // Manual drain (not `drain_formatted`): skill parsing needs the raw
         // text — parsed post-wrap, the envelope's closing `</user_query>` tag
         // would pollute the trailing skill's args.
         let entries = self.pending_interjections.drain_all();
         if entries.is_empty() {
-            return false;
+            return native_activity;
         }
 
         for PendingInterjection { text, attachments } in entries {

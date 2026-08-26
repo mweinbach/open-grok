@@ -444,6 +444,24 @@ impl SessionActor {
         provider: xai_grok_sampling_types::ModelProvider,
     ) -> bool {
         let web_search = self.rebuild_spec.web_search_state();
+        if matches!(tool_name, "spawn_agent" | "interrupt_agent") {
+            let sampling = self.rebuild_spec.active_sampling_config.read();
+            return provider == xai_grok_sampling_types::ModelProvider::Codex
+                && sampling.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                && self
+                    .models_manager
+                    .model_supports_codex_multi_agent_v2(&sampling.model);
+        }
+        if tool_name == "send_user_message_async" {
+            let sampling = self.rebuild_spec.active_sampling_config.read();
+            return provider == xai_grok_sampling_types::ModelProvider::Codex
+                && self.rebuild_spec.subagent_depth == 0
+                && self
+                    .models_manager
+                    .model_experimental_supported_tools(&sampling.model)
+                    .iter()
+                    .any(|tool| tool == "send_user_message_async");
+        }
         if tool_name == "web_search" {
             return web_search.allowed_for_provider(provider);
         }

@@ -630,6 +630,11 @@ impl SessionActor {
         let shared_codex_recovery = Arc::new(tokio::sync::OnceCell::<bool>::const_new());
         let workspace_ops = self.workspace_ops.clone();
         let pending_interjections = self.pending_interjections.clone();
+        let native_agents_enabled = {
+            let sampling = self.rebuild_spec.active_sampling_config.read();
+            self.models_manager
+                .model_supports_codex_multi_agent_v2(&sampling.model)
+        };
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
         let dispatch_futures: Vec<_> = approved
             .iter()
@@ -647,7 +652,8 @@ impl SessionActor {
                 let pending_interjections = pending_interjections.clone();
                 let blocking_wait_depth = self.tool_context.blocking_wait_depth.clone();
                 let interruptible =
-                    is_interruptible_wait_tool(&prepared.tool_name, &prepared.parsed_args);
+                    is_interruptible_wait_tool(&prepared.tool_name, &prepared.parsed_args)
+                        || (native_agents_enabled && prepared.tool_name == "wait_agent");
                 let lock = lock_path_for_args(&prepared.parsed_args)
                     .and_then(|fp| file_locks.get(fp).cloned());
                 async move {
@@ -682,7 +688,16 @@ impl SessionActor {
                                     tool = %prepared.tool_name,
                                     "abort wait tool: interjection pending"
                                 );
-                                Ok(interrupted_wait_tool_result(&prepared.parsed_args))
+                                if native_agents_enabled && prepared.tool_name == "wait_agent" {
+                                    let value = serde_json::json!({"updates": [], "interrupted": true, "timed_out": false});
+                                    Ok(ToolRunResult {
+                                        prompt_text: value.to_string(),
+                                        output: ToolsToolOutput::Dynamic(value.into()),
+                                        effective_tool_name: None,
+                                    })
+                                } else {
+                                    Ok(interrupted_wait_tool_result(&prepared.parsed_args))
+                                }
                             }
                         }
                     } else {
@@ -1341,7 +1356,9 @@ impl SessionActor {
         call: crate::sampling::types::ToolCallResponse,
         deferred_followups: &mut Vec<ConversationItem>,
     ) -> Result<Result<PreparedToolCall, ToolLoop>, acp::Error> {
-        let tool_call_id = acp::ToolCallId::new(Arc::from(call.id.clone()));
+        let tool_call_id = acp::ToolCallId::new(Arc::from(
+            xai_grok_sampling_types::conversation::provider_tool_call_id(&call.id),
+        ));
         let model_id_str = self.current_model_id().await;
         tracing::info!(
             "Model requesting tool: name='{}', call_id='{}'",
@@ -1380,6 +1397,60 @@ impl SessionActor {
             .await;
         }
         let mcp_parts = parse_mcp_tool_name(&call.function.name);
+        if matches!(
+            call.function.name.as_str(),
+            "send_message" | "followup_task"
+        ) && xai_grok_sampling_types::conversation::decode_codex_function_call_id(&call.id)
+            .is_some()
+        {
+            let enabled = {
+                let sampling = self.rebuild_spec.active_sampling_config.read();
+                sampling.provider == xai_grok_sampling_types::ModelProvider::Codex
+                    && sampling.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                    && self
+                        .models_manager
+                        .model_supports_codex_multi_agent_v2(&sampling.model)
+            };
+            if !enabled {
+                let error =
+                    anyhow::anyhow!("Native agent messages are no longer enabled on this route");
+                deferred_followups.extend(
+                    self.handle_tool_error(
+                        &tool_call_id,
+                        &call.id,
+                        &call.function.name,
+                        None,
+                        &error,
+                        &model_id_str,
+                    )
+                    .await,
+                );
+                return Ok(Err(ToolLoop::NonExistingTool));
+            }
+        }
+        if matches!(
+            call.function.name.as_str(),
+            "send_user_message_async" | "spawn_agent" | "interrupt_agent"
+        ) {
+            let provider = self.rebuild_spec.active_sampling_config.read().provider;
+            if !self.local_tool_allowed_for_provider(&call.function.name, provider) {
+                let error = anyhow::anyhow!(
+                    "This metadata-gated tool is not enabled for the current model or session"
+                );
+                let followups = self
+                    .handle_tool_error(
+                        &tool_call_id,
+                        &call.id,
+                        &call.function.name,
+                        None,
+                        &error,
+                        &model_id_str,
+                    )
+                    .await;
+                deferred_followups.extend(followups);
+                return Ok(Err(ToolLoop::NonExistingTool));
+            }
+        }
         let is_mcp_tool = mcp_parts.is_some();
         if is_mcp_tool && !self.mcp_state.lock().await.is_initialized() {
             match self.mcp_strategy.get() {

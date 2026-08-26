@@ -27,7 +27,15 @@ pub(super) async fn dispatch_tool(
         .call_tool(
             &prepared.tool_name,
             prepared.parsed_args.clone(),
-            &prepared.tool_call_id.0,
+            if xai_grok_sampling_types::conversation::decode_codex_function_call_id(
+                &prepared.call_id,
+            )
+            .is_some()
+            {
+                &prepared.call_id
+            } else {
+                &prepared.tool_call_id.0
+            },
             Some(session_id),
         )
         .await
