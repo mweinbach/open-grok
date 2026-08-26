@@ -358,6 +358,7 @@ pub fn test_sampler_config(
         codex_multi_agent_v2: false,
         use_responses_lite: false,
         experimental_supported_tools: Vec::new(),
+        codex_permissions: None,
         compactions_remaining: None,
         compaction_at_tokens: None,
         doom_loop_recovery: None,
