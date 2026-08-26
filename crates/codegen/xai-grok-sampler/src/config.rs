@@ -158,6 +158,10 @@ pub struct SamplerConfig {
     /// Ultra behavior without a client release.
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
+    #[serde(default)]
+    pub use_responses_lite: bool,
+    #[serde(default)]
+    pub experimental_supported_tools: Vec<String>,
 
     /// Effective, applied execution policy. Only the Codex adapter may expose it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +187,23 @@ pub struct SamplerConfig {
     /// Per-request header injector (e.g. OTel traceparent). Called in `post()`.
     #[serde(skip)]
     pub header_injector: Option<SharedHeaderInjector>,
+}
+
+impl SamplerConfig {
+    pub fn uses_responses_lite(&self) -> bool {
+        self.provider == ModelProvider::Codex
+            && self.api_backend == ApiBackend::Responses
+            && self.use_responses_lite
+    }
+
+    pub fn supports_async_user_messages(&self) -> bool {
+        self.provider == ModelProvider::Codex
+            && self.api_backend == ApiBackend::Responses
+            && self
+                .experimental_supported_tools
+                .iter()
+                .any(|tool| tool == "send_user_message_async")
+    }
 }
 
 impl Default for SamplerConfig {
@@ -220,6 +241,8 @@ impl Default for SamplerConfig {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            use_responses_lite: false,
+            experimental_supported_tools: Vec::new(),
             codex_permissions: None,
             compactions_remaining: None,
             compaction_at_tokens: None,
@@ -322,6 +345,55 @@ pub struct OriginClientInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_capability_opt_ins_default_off_and_remain_provider_local() {
+        let mut legacy = serde_json::to_value(SamplerConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("use_responses_lite");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("experimental_supported_tools");
+        let legacy: SamplerConfig = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.uses_responses_lite());
+        assert!(!legacy.supports_async_user_messages());
+        for provider in [
+            ModelProvider::Codex,
+            ModelProvider::Xai,
+            ModelProvider::DeepSeek,
+            ModelProvider::Meta,
+        ] {
+            for lite in [false, true] {
+                for async_messages in [false, true] {
+                    let config = SamplerConfig {
+                        provider,
+                        api_backend: ApiBackend::Responses,
+                        use_responses_lite: lite,
+                        experimental_supported_tools: if async_messages {
+                            vec!["send_user_message_async".into()]
+                        } else {
+                            vec!["unknown_tool".into()]
+                        },
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        config.uses_responses_lite(),
+                        provider == ModelProvider::Codex && lite
+                    );
+                    assert_eq!(
+                        config.supports_async_user_messages(),
+                        provider == ModelProvider::Codex && async_messages
+                    );
+                    let incompatible = SamplerConfig {
+                        api_backend: ApiBackend::ChatCompletions,
+                        ..config
+                    };
+                    assert!(!incompatible.uses_responses_lite());
+                    assert!(!incompatible.supports_async_user_messages());
+                }
+            }
+        }
+    }
 
     #[test]
     fn retry_policy_defaults() {

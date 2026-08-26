@@ -356,6 +356,8 @@ pub fn test_sampler_config(
         supports_backend_search: false,
         supports_standalone_web_search: false,
         codex_multi_agent_v2: false,
+        use_responses_lite: false,
+        experimental_supported_tools: Vec::new(),
         compactions_remaining: None,
         compaction_at_tokens: None,
         doom_loop_recovery: None,

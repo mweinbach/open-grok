@@ -918,6 +918,9 @@ pub(crate) fn parse_remote_model_value(
         tool_mode,
         subagent_context_default,
         codex_multi_agent_v2: false,
+        use_responses_lite: false,
+        experimental_supported_tools: Vec::new(),
+        apply_patch_tool_type: None,
         context_window,
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")
             .or_else(|| get_u64(obj, "auto_compact_threshold_percent"))

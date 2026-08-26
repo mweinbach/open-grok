@@ -1948,6 +1948,38 @@ impl ModelsManager {
             .is_some_and(|entry| config::supports_codex_multi_agent_v2(entry.info()))
     }
 
+    pub fn model_supports_freeform_apply_patch(&self, model_id: &str) -> bool {
+        let catalog = self.inner.catalog.read();
+        config::find_model_by_id(&catalog.models, model_id).is_some_and(|entry| {
+            let info = entry.info();
+            info.provider == xai_grok_sampling_types::ModelProvider::Codex
+                && info.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                && info.apply_patch_tool_type.as_deref() == Some("freeform")
+        })
+    }
+
+    pub fn model_uses_responses_lite(&self, model_id: &str) -> bool {
+        let catalog = self.inner.catalog.read();
+        config::find_model_by_id(&catalog.models, model_id).is_some_and(|entry| {
+            let info = entry.info();
+            info.provider == xai_grok_sampling_types::ModelProvider::Codex
+                && info.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                && info.use_responses_lite
+        })
+    }
+
+    pub fn model_experimental_supported_tools(&self, model_id: &str) -> Vec<String> {
+        let catalog = self.inner.catalog.read();
+        config::find_model_by_id(&catalog.models, model_id)
+            .filter(|entry| {
+                let info = entry.info();
+                info.provider == xai_grok_sampling_types::ModelProvider::Codex
+                    && info.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+            })
+            .map(|entry| entry.info().experimental_supported_tools.clone())
+            .unwrap_or_default()
+    }
+
     /// Explicit per-model `stream_tool_calls` override, if any.
     pub fn model_stream_tool_calls_override(&self, model_id: &str) -> Option<bool> {
         let cat = self.inner.catalog.read();

@@ -831,6 +831,10 @@ impl SessionActor {
             self.rebuild_spec.multi_agent_policy_enabled,
         );
         let reasoning_summary = self.models_manager.model_reasoning_summary(&cfg.model);
+        let use_responses_lite = self.models_manager.model_uses_responses_lite(&cfg.model);
+        let experimental_supported_tools = self
+            .models_manager
+            .model_experimental_supported_tools(&cfg.model);
         let stream_tool_calls = crate::agent::config::resolve_stream_tool_calls_inject(
             self.models_manager
                 .model_stream_tool_calls_override(&cfg.model)
@@ -910,6 +914,8 @@ impl SessionActor {
                 .active_sampling_config()
                 .supports_standalone_web_search,
             codex_multi_agent_v2,
+            use_responses_lite,
+            experimental_supported_tools,
             codex_permissions,
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
