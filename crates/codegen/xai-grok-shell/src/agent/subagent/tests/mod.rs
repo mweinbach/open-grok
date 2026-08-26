@@ -1,5 +1,25 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
+
+#[test]
+fn native_fork_turn_limit_keeps_system_head_and_a_clean_recent_tail() {
+    let items = vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("first"),
+        ConversationItem::assistant("first answer"),
+        ConversationItem::user("second"),
+        ConversationItem::assistant("second answer"),
+        ConversationItem::user("third"),
+        ConversationItem::assistant_tool_calls(vec![xai_grok_sampling_types::ToolCall {
+            id: "pending-spawn".into(), name: "spawn_agent".into(), arguments: "{}".into(),
+        }]),
+    ];
+    let selected = select_native_fork_turns(items, Some(2));
+    assert_eq!(selected.len(), 4);
+    assert!(matches!(&selected[0], ConversationItem::System(system) if system.content.as_ref() == "system"));
+    assert!(matches!(&selected[1], ConversationItem::User(user) if user.content.iter().any(|part| matches!(part, xai_grok_sampling_types::ContentPart::Text { text } if text.as_ref() == "second"))));
+    assert!(matches!(selected.last(), Some(ConversationItem::User(_))));
+}
 use super::attempt_runner::{
     canonical_total_tokens, record_subagent_usage, usage_is_incomplete,
 };

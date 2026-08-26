@@ -17,6 +17,51 @@ impl coordinator::ChildRunner for ShellChildRunner {
     type DescribeFuture = coordinator::LocalBoxFuture<
         xai_grok_tools::implementations::grok_build::task::types::SubagentDescribeOutcome,
     >;
+    fn load_native_agents(
+        &self,
+        team: &str,
+    ) -> Result<
+        Vec<xai_grok_tools::implementations::grok_build::task::types::NativeAgentRecord>,
+        String,
+    > {
+        let handle = self
+            .agent_ref
+            .get()
+            .session_registry
+            .resident_handle(&acp::SessionId::new(team))
+            .ok_or_else(|| "Root session is unavailable".to_owned())?;
+        let path =
+            crate::session::persistence::session_dir(&handle.info).join("native_agents.json");
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| format!("Invalid native agent registry: {error}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn save_native_agents(
+        &self,
+        team: &str,
+        records: &[xai_grok_tools::implementations::grok_build::task::types::NativeAgentRecord],
+    ) -> Result<(), String> {
+        let handle = self
+            .agent_ref
+            .get()
+            .session_registry
+            .resident_handle(&acp::SessionId::new(team))
+            .ok_or_else(|| "Root session is unavailable".to_owned())?;
+        let directory = crate::session::persistence::session_dir(&handle.info);
+        let temporary = directory.join(format!(".native-agents-{}.tmp", uuid::Uuid::now_v7()));
+        let bytes = serde_json::to_vec(records).map_err(|error| error.to_string())?;
+        crate::util::secure_file::write_secure_file(&temporary, &bytes)
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = std::fs::rename(&temporary, directory.join("native_agents.json")) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
     fn run(&self, run: coordinator::ChildRunRequest<Self::Control>) -> Self::RunFuture {
         let agent_ref = self.agent_ref.clone();
         Box::pin(async move {
@@ -107,6 +152,28 @@ impl coordinator::ChildRunner for ShellChildRunner {
         root_session_id: &str,
         message: &xai_grok_tools::implementations::grok_build::task::types::AgentMailboxMessage,
     ) -> bool {
+        if message
+            .native
+            .as_ref()
+            .is_some_and(|native| native.encrypted)
+        {
+            let Some(context) = self
+                .agent_ref
+                .get()
+                .try_build_subagent_spawn_context(root_session_id)
+            else {
+                return false;
+            };
+            if context.sampling_config.provider != xai_grok_sampling_types::ModelProvider::Codex
+                || context.sampling_config.api_backend
+                    != xai_grok_sampling_types::ApiBackend::Responses
+                || !context
+                    .models_manager
+                    .model_supports_codex_multi_agent_v2(&context.sampling_config.model)
+            {
+                return false;
+            }
+        }
         let session_id = acp::SessionId::new(root_session_id);
         let command_tx = self
             .agent_ref
@@ -126,9 +193,7 @@ impl coordinator::ChildRunner for ShellChildRunner {
         message: &xai_grok_tools::implementations::grok_build::task::types::AgentMailboxMessage,
         status: xai_grok_tools::implementations::grok_build::task::types::AgentMessageDeliveryStatus,
     ) {
-        use xai_grok_tools::implementations::grok_build::task::types::{
-            AgentMailboxMessageKind, AgentMessageDeliveryStatus,
-        };
+        use xai_grok_tools::implementations::grok_build::task::types::AgentMessageDeliveryStatus;
 
         let this = self.agent_ref.get();
         let parent_cmd_tx = this
@@ -143,15 +208,12 @@ impl coordinator::ChildRunner for ShellChildRunner {
                 team_scope_id: message.team_scope_id.clone(),
                 from_agent_id: message.from_agent_id.clone(),
                 to_agent_id: message.to_agent_id.clone(),
-                kind: match message.kind {
-                    AgentMailboxMessageKind::Message => "message",
-                    AgentMailboxMessageKind::FollowupTask => "followup_task",
-                }
-                .to_string(),
-                body: message.body.clone(),
+                kind: message.kind.as_str().to_owned(),
+                body: message.display_body().to_owned(),
                 status: match status {
                     AgentMessageDeliveryStatus::Queued => "queued",
                     AgentMessageDeliveryStatus::Delivered => "delivered",
+                    AgentMessageDeliveryStatus::Rejected => "rejected",
                 }
                 .to_string(),
                 created_at_ms: message.created_at_ms,
