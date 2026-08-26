@@ -124,10 +124,13 @@ from a model name, reasoning effort, or the Lite flag.
 - **Opaque wire data:** Codex requests that advertise encrypted collaboration
   schemas retain `namespace` and `encrypted_function_args` through the SDK
   boundary. Native `agent_message` items preserve provider-owned encrypted
-  content, including Lite and compaction replay. Encrypted messages require
-  a v2-capable Codex Responses destination; they cannot be forwarded as
-  plaintext to other routes. Cross-provider projections, digests, and
-  plaintext compaction artifacts omit private tool arguments.
+  content, including Lite and compaction replay. Locally created messages use
+  `amsg_<UUID>` item IDs. Codex request preparation adds that prefix to legacy
+  bare UUIDs from saved history or queued mail, without rewriting session
+  files or changing encrypted content; valid provider IDs remain unchanged.
+  Encrypted messages require a v2-capable Codex Responses destination; they
+  cannot be forwarded as plaintext to other routes. Cross-provider projections,
+  digests, and plaintext compaction artifacts omit private tool arguments.
 
 This is an adapter over Open Grok's flat-team coordinator, not a replacement
 with Codex's unrestricted agent hierarchy. Host spawn limits still apply
