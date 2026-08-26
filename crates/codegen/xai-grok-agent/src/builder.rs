@@ -105,6 +105,8 @@ pub struct AgentBuilder {
     subagents_enabled: bool,
     background_workflows_enabled: bool,
     ask_user_question_enabled: bool,
+    async_user_messages_enabled: bool,
+    native_agents_enabled: bool,
     subagent_toggle: HashMap<String, bool>,
     task_model_slugs: Vec<String>,
     skills_config: crate::prompt::skills::SkillsConfig,
@@ -247,6 +249,8 @@ impl AgentBuilder {
             subagents_enabled: false,
             background_workflows_enabled: false,
             ask_user_question_enabled: true,
+            async_user_messages_enabled: false,
+            native_agents_enabled: false,
             subagent_toggle: HashMap::new(),
             task_model_slugs: Vec::new(),
             skills_config: Default::default(),
@@ -601,6 +605,16 @@ impl AgentBuilder {
         self.ask_user_question_enabled = enabled;
         self
     }
+
+    pub fn with_async_user_messages_enabled(mut self, enabled: bool) -> Self {
+        self.async_user_messages_enabled = enabled;
+        self
+    }
+
+    pub fn with_native_agents_enabled(mut self, enabled: bool) -> Self {
+        self.native_agents_enabled = enabled;
+        self
+    }
     /// Set per-subagent enable/disable toggles from `[subagents.toggle]`.
     ///
     /// Keys are agent names, values are booleans. Omitted agents default
@@ -734,6 +748,17 @@ impl AgentBuilder {
         let tool_bridge_builder = ToolBridge::get_builder();
         let state_path = self.state_path.clone().unwrap_or_default();
         let mut tool_config = definition.tool_config.clone();
+        tool_config.tools.retain(|tool| {
+            !matches!(
+                tool.id.as_str(),
+                "Codex:spawn_agent"
+                    | "Codex:send_message"
+                    | "Codex:followup_task"
+                    | "Codex:list_agents"
+                    | "Codex:wait_agent"
+                    | "Codex:interrupt_agent"
+            )
+        });
         if !definition.inject_default_tools && tool_config.tools.is_empty() {
             return Err(AgentBuildError::InvalidConfig(format!(
                 "agent '{}' declares a curated toolset (inject_default_tools = false) \
@@ -742,6 +767,16 @@ impl AgentBuilder {
                  at process startup before any agent is built",
                 definition.name
             )));
+        }
+        let async_user_messages_enabled =
+            self.async_user_messages_enabled && self.prompt_audience == PromptAudience::Primary;
+        tool_config
+            .tools
+            .retain(|tool| tool.id != "Codex:send_user_message_async");
+        if async_user_messages_enabled {
+            tool_config
+                .tools
+                .push((&xai_grok_tools::implementations::codex::SendUserMessageAsyncTool).into());
         }
         if definition.inject_default_tools {
             if self.memory_backend.is_some() {
@@ -1113,6 +1148,33 @@ impl AgentBuilder {
                 }
             }
         }
+        if self.native_agents_enabled {
+            use xai_grok_tools::implementations::codex::multi_agent_v2;
+            let can_spawn = self.subagents_enabled
+                && tool_config.tools.iter().any(|tool| {
+                    xai_grok_tools::implementations::grok_build::task::is_task_tool_id(
+                        short_tool_name(&tool.id),
+                    )
+                });
+            tool_config.tools.retain(|tool| {
+                !matches!(
+                    short_tool_name(&tool.id),
+                    "send_message" | "followup_task" | "list_agents" | "wait_agent"
+                )
+            });
+            if can_spawn {
+                tool_config
+                    .tools
+                    .push((&multi_agent_v2::SpawnAgentTool).into());
+            }
+            tool_config.tools.extend([
+                (&multi_agent_v2::SendMessageTool).into(),
+                (&multi_agent_v2::FollowupTaskTool).into(),
+                (&multi_agent_v2::ListAgentsTool).into(),
+                (&multi_agent_v2::WaitAgentTool).into(),
+                (&multi_agent_v2::InterruptAgentTool).into(),
+            ]);
+        }
         let use_backend_search = self.backend_search;
         let standalone_web_search_backend = self.standalone_web_search_backend.take();
         // Backend-hosted web search uses the primary model provider and does
@@ -1152,6 +1214,20 @@ impl AgentBuilder {
         )
         .await
         .map_err(|e| AgentBuildError::ToolError(e.to_string()))?;
+        tool_bridge
+            .update_resource(
+                xai_grok_tools::implementations::codex::multi_agent_v2::NativeAgentsEnabled(
+                    self.native_agents_enabled,
+                ),
+            )
+            .await;
+        tool_bridge
+            .update_resource(
+                xai_grok_tools::implementations::codex::send_user_message_async::AsyncUserMessagesEnabled(
+                    async_user_messages_enabled,
+                ),
+            )
+            .await;
         if let Some(bytes) = self.mcp_max_output_bytes {
             tool_bridge.toolset().resources.lock().await.insert(
                 xai_grok_tools::types::resources::TruncationCfg(
@@ -1691,6 +1767,62 @@ mod tests {
         .await
         .expect("agent should build for every pager-reachable flag combination")
     }
+    #[tokio::test]
+    async fn native_agents_replace_legacy_tools_but_keep_child_communication() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        for (enabled, can_spawn, audience) in [
+            (false, true, PromptAudience::Primary),
+            (true, true, PromptAudience::Primary),
+            (true, false, PromptAudience::Subagent),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let agent = AgentBuilder::new(
+                directory.path().to_owned(),
+                Arc::new(LocalTerminalBackend::new()),
+                ToolNotificationHandle::noop(),
+            )
+            .from_definition(crate::config::AgentDefinition::codex())
+            .with_subagents_enabled(can_spawn)
+            .with_native_agents_enabled(enabled)
+            .with_prompt_audience(audience)
+            .build()
+            .await
+            .unwrap();
+            let definitions = agent.tool_definitions().await;
+            let names: Vec<_> = definitions
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect();
+            assert_eq!(names.contains(&"spawn_agent"), enabled && can_spawn);
+            assert_eq!(
+                names.iter().any(|name| {
+                    xai_grok_tools::implementations::grok_build::task::is_task_tool_id(name)
+                }),
+                can_spawn
+            );
+            assert_eq!(names.contains(&"interrupt_agent"), enabled);
+            for name in ["send_message", "followup_task", "list_agents", "wait_agent"] {
+                assert_eq!(
+                    names.iter().filter(|candidate| **candidate == name).count(),
+                    1
+                );
+            }
+            let send = definitions
+                .iter()
+                .find(|tool| tool.function.name == "send_message")
+                .unwrap();
+            assert_eq!(
+                send.function
+                    .parameters
+                    .pointer("/properties/message/encrypted")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                enabled
+            );
+        }
+    }
+
     #[tokio::test]
     async fn subagent_audience_strips_plan_mode_after_default_injection() {
         for profile in [
