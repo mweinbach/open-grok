@@ -39,6 +39,15 @@ pub trait ChildControl: 'static {
 
     fn progress(&self) -> Self::ProgressFuture;
     fn cancel(&self);
+    fn interrupt(&self) -> bool {
+        false
+    }
+    fn accepts_native_message(&self, _message: &AgentMailboxMessage) -> bool {
+        false
+    }
+    fn deliver_initial_message(&self, message: &AgentMailboxMessage) -> bool {
+        self.deliver_followup(message)
+    }
     fn deliver_followup(&self, _message: &AgentMailboxMessage) -> bool {
         false
     }
@@ -125,6 +134,21 @@ pub trait ChildRunner: 'static {
     ) -> Self::DescribeFuture;
 
     fn on_completed(&self, completion: ChildCompletion<Self::CompletionData>);
+
+    fn load_native_agents(
+        &self,
+        _team: &str,
+    ) -> Result<Vec<super::types::NativeAgentRecord>, String> {
+        Ok(Vec::new())
+    }
+
+    fn save_native_agents(
+        &self,
+        _team: &str,
+        _records: &[super::types::NativeAgentRecord],
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     fn deliver_root_followup(
         &self,

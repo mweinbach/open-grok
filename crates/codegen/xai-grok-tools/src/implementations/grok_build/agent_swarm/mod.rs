@@ -877,6 +877,7 @@ fn build_member_request(
             completion_output_cap: None,
             spawn_depth: None,
             loop_task_id: None,
+            native_agent: None,
             output_schema: None,
             output_token_budget: None,
         },

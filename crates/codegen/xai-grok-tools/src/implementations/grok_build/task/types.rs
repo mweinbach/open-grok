@@ -263,11 +263,27 @@ register_resource!("grok_build", "AgentMailboxIdentity", AgentMailboxIdentity);
 pub enum AgentMailboxMessageKind {
     Message,
     FollowupTask,
+    NativeMessage,
+    NativeFollowup,
 }
 
 impl AgentMailboxMessageKind {
     pub fn steers_recipient(self) -> bool {
-        matches!(self, Self::Message)
+        matches!(
+            self,
+            Self::Message | Self::NativeMessage | Self::NativeFollowup
+        )
+    }
+
+    pub fn triggers_turn(self) -> bool {
+        matches!(self, Self::Message | Self::NativeFollowup)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Message | Self::NativeMessage => "message",
+            Self::FollowupTask | Self::NativeFollowup => "followup_task",
+        }
     }
 }
 
@@ -284,6 +300,90 @@ pub struct AgentMailboxMessage {
     pub kind: AgentMailboxMessageKind,
     pub body: String,
     pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeAgentMessage>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct NativeAgentMessage {
+    pub author: String,
+    pub recipient: String,
+    pub encrypted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_prompt_id: Option<String>,
+}
+
+impl AgentMailboxMessage {
+    pub fn display_body(&self) -> &str {
+        if self.native.as_ref().is_some_and(|native| native.encrypted) {
+            "[Encrypted agent message]"
+        } else {
+            &self.body
+        }
+    }
+
+    pub fn native_wire_item(&self) -> Option<serde_json::Value> {
+        let native = self.native.as_ref()?;
+        let content = if native.encrypted {
+            serde_json::json!({"type": "encrypted_content", "encrypted_content": self.body})
+        } else {
+            serde_json::json!({"type": "input_text", "text": self.body})
+        };
+        Some(serde_json::json!({
+            "type": "agent_message",
+            "id": self.message_id,
+            "author": native.author,
+            "recipient": native.recipient,
+            "content": [content],
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NativeAgentSpawn {
+    pub task_name: String,
+    pub fork_turns: Option<usize>,
+    pub service_tier: Option<String>,
+    pub message: Option<AgentMailboxMessage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NativeAgentRecord {
+    pub task_name: String,
+    pub agent_id: String,
+    pub agent_type: String,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub mailbox: Vec<AgentMailboxMessage>,
+}
+
+#[derive(Debug)]
+pub enum NativeAgentOperation {
+    List {
+        path_prefix: Option<String>,
+    },
+    Message {
+        target: String,
+        message: AgentMailboxMessage,
+    },
+    Interrupt {
+        target: String,
+    },
+    Wait {
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug)]
+pub struct NativeAgentRequest {
+    pub identity: AgentMailboxIdentity,
+    pub operation: NativeAgentOperation,
+    pub respond_to: oneshot::Sender<Result<serde_json::Value, String>>,
 }
 
 #[derive(
@@ -318,6 +418,7 @@ pub struct ListAgentsOutput {
 pub enum AgentMessageDeliveryStatus {
     Queued,
     Delivered,
+    Rejected,
 }
 
 #[derive(
@@ -383,6 +484,7 @@ pub enum ModelOverrideProvenance {
 
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRuntimeOverrides {
+    pub native_agent: Option<NativeAgentSpawn>,
     /// Override the model (e.g. "test-model").
     pub model: Option<String>,
     /// Whether `model` came from a model-facing Task call or internal harness logic.
@@ -1149,6 +1251,7 @@ pub struct SubagentDescribeRequest {
 /// Coordinator message enum. Kept exhaustive so every actor command is handled.
 pub enum SubagentEvent {
     Spawn(SubagentSpawnRequest),
+    NativeAgent(NativeAgentRequest),
     Query(SubagentQueryRequest),
     ListAgents(AgentListRequest),
     SendAgentMessage(AgentMessageRequest),

@@ -14,6 +14,7 @@
 pub mod apply_patch;
 pub mod grep_files;
 pub mod list_dir;
+pub mod multi_agent_v2;
 pub mod multi_agent_wire;
 pub mod read_file;
 pub mod send_user_message_async;

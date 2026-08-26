@@ -47,6 +47,10 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             ));
             return;
         }
+        if let Err(error) = self.register_native_spawn(&mut request) {
+            let _ = result_tx.send(rejected_spawn_result(&id, &error, false));
+            return;
+        }
         let running = self.session_running_count(&request.parent_session_id);
         match self.admission.admit(&request, running) {
             AdmissionDecision::Start => {

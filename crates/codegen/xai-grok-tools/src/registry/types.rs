@@ -706,6 +706,12 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::SendAgentMessageTool>();
         b.register::<grok_build::FollowupAgentTaskTool>();
         b.register::<grok_build::WaitAgentTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::SpawnAgentTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::SendMessageTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::FollowupTaskTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::ListAgentsTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::WaitAgentTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::InterruptAgentTool>();
         b.register::<grok_build::ListSessionsTool>();
         b.register::<grok_build::ReadSessionTool>();
         b.register::<grok_build::MessageSessionTool>();
@@ -1731,9 +1737,24 @@ impl FinalizedToolset {
             None
         };
         let contract_version = self.get_contract_version(tool_name);
-        let rt_call_id = xai_tool_protocol::ToolCallId::new(tool_call_id)
+        let native_metadata =
+            crate::implementations::codex::multi_agent_wire::decode_function_call_id(tool_call_id);
+        let runtime_call_id = native_metadata
+            .as_ref()
+            .map(|(call_id, _)| *call_id)
+            .unwrap_or(tool_call_id);
+        let rt_call_id = xai_tool_protocol::ToolCallId::new(runtime_call_id)
             .unwrap_or_else(|_| xai_tool_protocol::ToolCallId::new_v7());
         let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
+        if native_metadata.is_some() {
+            ctx.insert(
+                crate::implementations::codex::multi_agent_wire::NativeMessageEncryption(
+                    crate::implementations::codex::multi_agent_wire::codex_message_is_encrypted(
+                        tool_call_id,
+                    ),
+                ),
+            );
+        }
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
         ctx.extensions.insert(
@@ -5066,6 +5087,64 @@ mod tests {
             .expect("finalize succeeds");
         (Arc::new(toolset), tmp)
     }
+    #[tokio::test]
+    async fn native_agent_dispatch_keeps_public_call_id_and_encryption_context() {
+        use crate::implementations::codex::multi_agent_wire::{
+            NativeMessageEncryption, encode_function_call,
+        };
+        let tmp = TempDir::new().unwrap();
+        let config = ToolServerConfig {
+            tools: vec![ToolConfig {
+                id: "Codex:send_message".to_owned(),
+                params: None,
+                name_override: None,
+                params_name_overrides: None,
+                description_override: None,
+                behavior_version: None,
+                kind: None,
+            }],
+            behavior_preset: None,
+        };
+        let toolset = Arc::new(
+            ToolRegistryBuilder::new()
+                .finalize_with_trunc_config(
+                    config,
+                    test_session_context(&tmp),
+                    Default::default(),
+                    None,
+                )
+                .unwrap(),
+        );
+        for encrypted in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!(["message"])),
+        ] {
+            let mut call = serde_json::json!({
+                "type":"function_call", "call_id":"call_native", "name":"send_message",
+                "arguments":"{}", "namespace":"functions",
+            });
+            if let Some(encrypted) = &encrypted {
+                call["encrypted_function_args"] = encrypted.clone();
+            }
+            encode_function_call(&mut call);
+            let parts = toolset
+                .prepare_dispatch(
+                    "send_message",
+                    serde_json::json!({"target":"/root/worker", "message":"test"}),
+                    call["call_id"].as_str().unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(parts.ctx.call_id.as_str(), "call_native");
+            assert_eq!(
+                parts.ctx.get::<NativeMessageEncryption>().unwrap().0,
+                encrypted != Some(serde_json::json!([]))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn prepare_dispatch_stamps_workspace_viewer_ctx_when_present() {
         let (toolset, _tmp) =

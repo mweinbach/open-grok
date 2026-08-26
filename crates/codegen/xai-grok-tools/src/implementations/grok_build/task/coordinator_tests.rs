@@ -3,6 +3,7 @@ use crate::implementations::grok_build::task::admission::{LimitBehavior, Subagen
 use crate::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use crate::implementations::grok_build::task::types::{
     AgentMailboxIdentity, AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDeliveryStatus,
+    NativeAgentMessage, NativeAgentOperation, NativeAgentRecord, NativeAgentSpawn,
     SubagentCancelRequest, SubagentCancelTarget, SubagentClearUsageNotAppliedRequest,
     SubagentCompletionsRequest, SubagentContextRequest, SubagentListActiveRequest,
     SubagentLoopUnitActiveRequest, SubagentMarkUsageNotAppliedRequest, SubagentOutstandingReply,
@@ -11,10 +12,14 @@ use crate::implementations::grok_build::task::types::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "native_tests.rs"]
+mod native_tests;
+
 #[derive(Clone)]
 struct TestControl {
     cancellation: CancellationToken,
     followups: mpsc::UnboundedSender<AgentMailboxMessage>,
+    interruptions: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ChildControl for TestControl {
@@ -36,6 +41,16 @@ impl ChildControl for TestControl {
         self.cancellation.cancel();
     }
 
+    fn interrupt(&self) -> bool {
+        self.interruptions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    fn accepts_native_message(&self, _message: &AgentMailboxMessage) -> bool {
+        true
+    }
+
     fn deliver_followup(&self, message: &AgentMailboxMessage) -> bool {
         self.followups.send(message.clone()).is_ok()
     }
@@ -51,6 +66,8 @@ struct TestRunner {
     started: mpsc::UnboundedSender<String>,
     queue_waits: mpsc::UnboundedSender<(String, Option<std::time::Duration>, usize)>,
     followups: mpsc::UnboundedSender<AgentMailboxMessage>,
+    interruptions: Arc<std::sync::atomic::AtomicUsize>,
+    registry: Arc<std::sync::Mutex<HashMap<String, Vec<NativeAgentRecord>>>>,
 }
 
 impl ChildRunner for TestRunner {
@@ -59,6 +76,28 @@ impl ChildRunner for TestRunner {
     type RunFuture = SendBoxFuture<ChildRunOutput<()>>;
     type ValidateFuture = SendBoxFuture<SubagentValidateTypeOutcome>;
     type DescribeFuture = SendBoxFuture<SubagentDescribeOutcome>;
+
+    fn load_native_agents(&self, team: &str) -> Result<Vec<NativeAgentRecord>, String> {
+        Ok(self
+            .registry
+            .lock()
+            .unwrap()
+            .get(team)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn save_native_agents(&self, team: &str, records: &[NativeAgentRecord]) -> Result<(), String> {
+        self.registry
+            .lock()
+            .unwrap()
+            .insert(team.to_owned(), records.to_vec());
+        Ok(())
+    }
+
+    fn deliver_root_followup(&self, _root: &str, message: &AgentMailboxMessage) -> bool {
+        message.native.is_some() && self.followups.send(message.clone()).is_ok()
+    }
 
     fn run(&self, run: ChildRunRequest<Self::Control>) -> Self::RunFuture {
         let wait_before_start = self.wait_before_start;
@@ -69,6 +108,7 @@ impl ChildRunner for TestRunner {
         let started = self.started.clone();
         let queue_waits = self.queue_waits.clone();
         let followups = self.followups.clone();
+        let interruptions = self.interruptions.clone();
         Box::pin(async move {
             let ChildRunRequest {
                 request,
@@ -107,6 +147,7 @@ impl ChildRunner for TestRunner {
                     control: TestControl {
                         cancellation: cancellation.clone(),
                         followups,
+                        interruptions,
                     },
                 })
                 .await
@@ -207,6 +248,8 @@ struct Harness {
     queue_waits: mpsc::UnboundedReceiver<(String, Option<std::time::Duration>, usize)>,
     followups: mpsc::UnboundedReceiver<AgentMailboxMessage>,
     actor: tokio::task::JoinHandle<()>,
+    interruptions: Arc<std::sync::atomic::AtomicUsize>,
+    registry: Arc<std::sync::Mutex<HashMap<String, Vec<NativeAgentRecord>>>>,
 }
 
 fn harness(wait_before_start: bool, foreground_budget: std::time::Duration) -> Harness {
@@ -236,6 +279,8 @@ fn harness_with_options(
     let (started_tx, started) = mpsc::unbounded_channel();
     let (queue_wait_tx, queue_waits) = mpsc::unbounded_channel();
     let (followup_tx, followups) = mpsc::unbounded_channel();
+    let interruptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let actor = tokio::spawn(
         SubagentCoordinator::new(
             command_rx,
@@ -249,6 +294,8 @@ fn harness_with_options(
                 started: started_tx,
                 queue_waits: queue_wait_tx,
                 followups: followup_tx,
+                interruptions: interruptions.clone(),
+                registry: registry.clone(),
             },
             config,
         )
@@ -267,6 +314,8 @@ fn harness_with_options(
         queue_waits,
         followups,
         actor,
+        interruptions,
+        registry,
     }
 }
 
@@ -1796,6 +1845,7 @@ fn mailbox_message(
         kind: AgentMailboxMessageKind::Message,
         body: body.to_string(),
         created_at_ms: 1,
+        native: None,
     }
 }
 
