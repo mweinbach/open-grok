@@ -16,6 +16,10 @@ at `6d4d9442c7142c08ac5c5098dfd6e82d8cd9f65a`; this includes the
 `x-codex-image-turn-id` correlation added by upstream commit
 `6219b7c40fc9`.
 
+The Responses Lite and asynchronous user-message contracts were refreshed
+against Codex commit `8e93b1a405e02f8797a04d747bb7d1654b839685`. The default
+model-catalog compatibility version is `0.150.0`.
+
 ## Live model catalog
 
 Open Grok embeds the current GPT-5.6 Sol, Terra, and Luna definitions so the
@@ -38,11 +42,97 @@ credentials available, the shell follows codex-rs' live catalog contract:
 - Apply user `[model.*]` entries last, so explicit operator configuration remains
   the highest-priority layer.
 
+### Opt-in transport and user messaging
+
+Both capabilities default off and are selected from model metadata, never
+model names. Use synthetic model IDs in fixtures. Live `/models` responses,
+the isolated Codex cache, and embedded
+model JSON preserve `use_responses_lite` and `experimental_supported_tools`.
+Missing fields in older caches do not enable either feature. Changing
+providers clears the inherited values; there is no global enable switch.
+
+- `use_responses_lite = true` enables the Codex-only Lite wire contract on the
+  existing Responses endpoint and both compaction protocols. Requests carry
+  `x-openai-internal-codex-responses-lite: true`, put client tools in a leading
+  `additional_tools` input item, and put base instructions in a developer input
+  message. Function/custom tools share the `functions` namespace. Top-level
+  `instructions` and `tools` are omitted, `parallel_tool_calls` is false, and
+  `reasoning.context` is `all_turns`. Input-image detail fields are omitted.
+  Hosted tools are not advertised through Lite; the existing standalone search
+  and image tools retain their own provider/auth availability gates.
+- `experimental_supported_tools` must explicitly contain
+  `send_user_message_async` to expose that tool. It is root-session-only and
+  direct-only, including in Code Mode Only. It sends a normal visible assistant
+  message and immediately returns `{"accepted":true}` without ending the turn
+  or waiting for a reply. Replies use the existing user-message/interjection
+  path. The message is persisted as an ACP update with the
+  `x.ai/async_user_message` chunk metadata flag; buffering and replay preserve
+  its separate, completed message boundary.
+
+The two opt-ins are independent. Neither a reasoning effort nor a tool mode
+enables them. Other providers cannot activate these Codex contracts by carrying
+the same flags or supplying the Lite header in extra headers. Model switches
+re-evaluate tool exposure and rebuild the sampling route; subagent routes
+resolve their own model metadata and never expose async user messaging.
+
 The cache is `$OPENGROK_HOME/codex_models_cache.json` and is matched against the
 client version, endpoint, and non-secret Codex account identity. It is separate
 from xAI's `models_cache.json`, just as Codex credentials are separate from xAI
 credentials. A Codex refresh can neither remove xAI models nor read or mutate
 xAI auth state.
+
+### Native patch and v2 collaboration
+
+The Codex Responses catalog independently selects these contracts:
+
+```json
+{
+  "apply_patch_tool_type": "freeform",
+  "multi_agent_version": "v2"
+}
+```
+
+Missing or unknown selectors do not opt in. Neither capability is inferred
+from a model name, reasoning effort, or the Lite flag.
+
+- **Freeform patch:** Direct and mixed Code Mode replace the registered
+  `apply_patch` function declaration with a native custom tool using the
+  upstream Lark grammar. Code Mode Only keeps patches nested under
+  `tools.apply_patch(raw_patch)`. The adapter reuses normal patch parsing,
+  plan-mode gates, hooks, permissions, and write attribution. The original
+  custom call identity produces matching custom outputs, including failures
+  and denials; it does not manufacture an `exec` transport card.
+- **Native collaboration:** Opted-in sessions use `spawn_agent`,
+  `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and
+  `list_agents` with the v2 contract. The shared mailbox names switch
+  implementations only on these routes. Other models retain the existing
+  steering/passive-mail semantics. Ordinary host task, swarm, and workflow
+  tools remain available, including plaintext cross-provider delegation.
+- **Lifecycle:** Named agents use stable `/root/<task_name>` paths. Spawn
+  acknowledges initialization, not task completion. `send_message` delivers
+  promptly without starting an idle turn; `followup_task` starts or resumes
+  a non-root agent through its owning parent. `interrupt_agent` cancels a
+  turn without deleting the task identity or saved history. `wait_agent`
+  returns activity summaries rather than message contents and yields to
+  steered user input. Team, root, and self-target restrictions remain enforced.
+- **Persistence and context:** An owner-only, atomically replaced
+  `native_agents.json` in the root session stores names, resume references,
+  and queued messages. A resumed child can have a new physical session ID;
+  its canonical task name stays stable. `fork_turns` accepts `none`, `all`
+  (the default), or a positive integer string. Existing clean-prefix,
+  context-window, same-model fork, and cross-model digest safeguards remain.
+- **Opaque wire data:** Codex requests that advertise encrypted collaboration
+  schemas retain `namespace` and `encrypted_function_args` through the SDK
+  boundary. Native `agent_message` items preserve provider-owned encrypted
+  content, including Lite and compaction replay. Encrypted messages require
+  a v2-capable Codex Responses destination; they cannot be forwarded as
+  plaintext to other routes. Cross-provider projections, digests, and
+  plaintext compaction artifacts omit private tool arguments.
+
+This is an adapter over Open Grok's flat-team coordinator, not a replacement
+with Codex's unrestricted agent hierarchy. Host spawn limits still apply
+(default depth one), while v2 children keep communication and roster tools
+even when they cannot spawn. Async user messaging remains root-only.
 
 ## Authentication
 
