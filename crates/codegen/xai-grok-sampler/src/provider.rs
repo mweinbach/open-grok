@@ -31,6 +31,7 @@ pub(crate) const CODEX_SESSION_ID_HEADER: &str = "session-id";
 pub(crate) const CODEX_THREAD_ID_HEADER: &str = "thread-id";
 pub(crate) const CODEX_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 pub(crate) const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+pub(crate) const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 
 pub(crate) const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
 pub(crate) const MULTI_AGENT_MODE_CLOSE_TAG: &str = "</multi_agent_mode>";
@@ -41,6 +42,7 @@ pub(crate) const PROACTIVE_MULTI_AGENT_MODE_TEXT: &str = "Proactive multi-agent 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResponsesRequestPolicy {
     pub multi_agent_v2: bool,
+    pub use_responses_lite: bool,
     pub local_effort: Option<ReasoningEffort>,
     pub reasoning_summary: Option<ReasoningSummary>,
     pub codex_permissions: Option<CodexPermissions>,
@@ -173,6 +175,13 @@ pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
             headers.apply_x_grok(builder)
         } else {
             builder
+        }
+    }
+
+    fn apply_responses_lite_header(&self, headers: &mut HeaderMap, enabled: bool) {
+        headers.remove(RESPONSES_LITE_HEADER);
+        if self.provider() == ModelProvider::Codex && enabled {
+            headers.insert(RESPONSES_LITE_HEADER, HeaderValue::from_static("true"));
         }
     }
 
@@ -797,6 +806,10 @@ fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequ
         patch_codex_permissions(request_body, permissions, &policy);
     }
 
+    if policy.use_responses_lite {
+        patch_codex_responses_lite(request_body);
+    }
+
     // Codex sandboxes `web_search` unless the request opts into live access.
     // async-openai's native tool serializes the bare `{"type":"web_search"}`
     // shape, so grant live sources here — the fork's long-standing Codex
@@ -862,6 +875,128 @@ fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequ
         .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
         .map_or(input.len(), |_| input.len() - 1);
     input.insert(insert_at, mode_item);
+}
+
+fn patch_codex_responses_lite(request_body: &mut Value) {
+    let Some(body) = request_body.as_object_mut() else {
+        return;
+    };
+    let already_prepared = !body.contains_key("tools")
+        && !body.contains_key("instructions")
+        && body
+            .get("input")
+            .and_then(Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            == Some("additional_tools");
+    let tools = body
+        .remove("tools")
+        .and_then(|tools| tools.as_array().cloned())
+        .unwrap_or_default();
+    let instructions = body.remove("instructions");
+    body.insert("parallel_tool_calls".into(), Value::Bool(false));
+    let input = body
+        .entry("input")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::String(text) = input {
+        *input = serde_json::json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": std::mem::take(text)}],
+        }]);
+    }
+    let Some(input) = input.as_array_mut() else {
+        return;
+    };
+    for item in input.iter_mut() {
+        let item_type = item.get("type").and_then(Value::as_str);
+        let content_key = match item_type {
+            Some("function_call" | "custom_tool_call") => {
+                if let Some(item) = item.as_object_mut() {
+                    item.entry("namespace")
+                        .or_insert_with(|| Value::String("functions".into()));
+                }
+                continue;
+            }
+            Some("function_call_output" | "custom_tool_call_output") => "output",
+            Some("message") | None => "content",
+            _ => continue,
+        };
+        if let Some(content) = item.get_mut(content_key).and_then(Value::as_array_mut) {
+            for part in content {
+                if part.get("type").and_then(Value::as_str) == Some("input_image")
+                    && let Some(part) = part.as_object_mut()
+                {
+                    part.remove("detail");
+                }
+            }
+        }
+    }
+    let mut prefix = vec![serde_json::json!({
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": responses_lite_tools(tools),
+    })];
+    if let Some(instructions) = instructions.and_then(|value| value.as_str().map(str::to_owned))
+        && !instructions.is_empty()
+    {
+        prefix.push(serde_json::json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": instructions}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["model.base_instructions"],
+            },
+        }));
+    }
+    if !already_prepared {
+        input.splice(0..0, prefix);
+    }
+    ensure_reasoning_object(request_body);
+    request_body["reasoning"]["context"] = Value::String("all_turns".into());
+}
+
+fn responses_lite_tools(tools: Vec<Value>) -> Vec<Value> {
+    let mut functions = Vec::new();
+    let mut namespaces = Vec::new();
+    let mut functions_index = None;
+    let mut description = Value::String(String::new());
+    for mut tool in tools {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("function" | "custom") => functions.push(tool),
+            Some("namespace") if tool.get("name").and_then(Value::as_str) == Some("functions") => {
+                if let Some(value) = tool.get("description")
+                    && value.as_str().is_some_and(|text| !text.trim().is_empty())
+                {
+                    description = value.clone();
+                }
+                if let Some(tools) = tool.get_mut("tools").and_then(Value::as_array_mut) {
+                    functions.append(tools);
+                }
+            }
+            Some("namespace") => {
+                namespaces.push(tool);
+                continue;
+            }
+            _ => continue,
+        }
+        functions_index.get_or_insert(namespaces.len());
+    }
+    if let Some(index) = functions_index
+        && !functions.is_empty()
+    {
+        namespaces.insert(
+            index,
+            serde_json::json!({
+                "type": "namespace",
+                "name": "functions",
+                "description": description,
+                "tools": functions,
+            }),
+        );
+    }
+    namespaces
 }
 
 fn patch_codex_permissions(
@@ -1157,6 +1292,186 @@ fn is_unknown_top_level_response_event(error: &SamplingError, data: &str) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_lite_moves_tools_and_instructions_into_the_input_prefix() {
+        let mut request = base_request();
+        request["tools"] = serde_json::json!([
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "exec", "format": {"type": "text"}},
+            {"type": "web_search"},
+            {"type": "image_generation"},
+        ]);
+        request["parallel_tool_calls"] = Value::Bool(true);
+        let policy = ResponsesRequestPolicy {
+            use_responses_lite: true,
+            reasoning_summary: Some(ReasoningSummary::Detailed),
+            ..Default::default()
+        };
+        provider_adapter(ModelProvider::Codex)
+            .patch_responses_request(&mut request, policy.clone());
+        assert!(request.get("instructions").is_none());
+        assert!(request.get("tools").is_none());
+        assert_eq!(request["parallel_tool_calls"], false);
+        assert_eq!(request["reasoning"]["context"], "all_turns");
+        assert_eq!(request["reasoning"]["summary"], "detailed");
+        assert_eq!(request["input"][0]["type"], "additional_tools");
+        assert_eq!(request["input"][0]["role"], "developer");
+        let tools = &request["input"][0]["tools"];
+        assert_eq!(tools.as_array().unwrap().len(), 1);
+        assert_eq!(tools[0]["type"], "namespace");
+        assert_eq!(tools[0]["name"], "functions");
+        assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(request["input"][1]["role"], "developer");
+        assert_eq!(request["input"][1]["content"][0]["text"], "base prompt");
+        assert_eq!(
+            request["input"][1]["internal_chat_message_metadata_passthrough"]["content_item_kinds"],
+            serde_json::json!(["model.base_instructions"])
+        );
+        assert_eq!(request["input"][2]["role"], "user");
+        let prepared = request.clone();
+        provider_adapter(ModelProvider::Codex).patch_responses_request(&mut request, policy);
+        assert_eq!(request, prepared);
+    }
+
+    #[test]
+    fn responses_lite_preserves_namespaces_and_removes_only_image_detail_fields() {
+        let mut request = serde_json::json!({
+            "tools": [
+                {"type": "namespace", "name": "remote", "tools": []},
+                {"type": "function", "name": "lookup"},
+                {"type": "namespace", "name": "functions", "description": "Local tools", "tools": [{"type": "custom", "name": "exec"}]},
+            ],
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "original"},
+                    {"type": "input_text", "text": "Describe this", "detail": "preserve"},
+                ]},
+                {"type": "function_call_output", "call_id": "lookup-call", "output": [{"type": "input_image", "image_url": "image", "detail": "high"}]},
+                {"type": "custom_tool_call_output", "call_id": "exec-call", "output": [{"type": "input_image", "image_url": "image", "detail": "low"}]},
+                {"type": "reasoning", "encrypted_content": "opaque"},
+                {"type": "function_call", "name": "lookup", "call_id": "lookup-call", "arguments": "{}"},
+                {"type": "custom_tool_call", "name": "exec", "call_id": "exec-call", "input": "text(1)"},
+            ],
+        });
+        provider_adapter(ModelProvider::Codex).patch_responses_request(
+            &mut request,
+            ResponsesRequestPolicy {
+                use_responses_lite: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(request["input"][0]["tools"][0]["name"], "remote");
+        assert_eq!(
+            request["input"][0]["tools"][1]["description"],
+            "Local tools"
+        );
+        assert_eq!(
+            request["input"][0]["tools"][1]["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(request["input"][1]["content"][0].get("detail").is_none());
+        assert_eq!(request["input"][1]["content"][1]["detail"], "preserve");
+        assert!(request["input"][2]["output"][0].get("detail").is_none());
+        assert!(request["input"][3]["output"][0].get("detail").is_none());
+        assert_eq!(request["input"][4]["encrypted_content"], "opaque");
+        assert_eq!(request["input"][5]["namespace"], "functions");
+        assert_eq!(request["input"][6]["namespace"], "functions");
+    }
+
+    #[test]
+    fn responses_lite_body_and_headers_require_codex_model_opt_in() {
+        for (provider, enabled) in [
+            (ModelProvider::Codex, false),
+            (ModelProvider::Codex, true),
+            (ModelProvider::Xai, true),
+            (ModelProvider::DeepSeek, true),
+            (ModelProvider::Meta, true),
+        ] {
+            let opted_in = provider == ModelProvider::Codex && enabled;
+            let mut request = base_request();
+            request["tools"] = serde_json::json!([{"type": "function", "name": "lookup"}]);
+            provider_adapter(provider).patch_responses_request(
+                &mut request,
+                ResponsesRequestPolicy {
+                    use_responses_lite: enabled,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(request["input"][0]["type"] == "additional_tools", opted_in);
+            assert_eq!(request.get("tools").is_none(), opted_in);
+            assert_eq!(request["reasoning"]["context"] == "all_turns", opted_in);
+            let mut headers = HeaderMap::new();
+            headers.insert(RESPONSES_LITE_HEADER, HeaderValue::from_static("forged"));
+            provider_adapter(provider).apply_responses_lite_header(&mut headers, enabled);
+            assert_eq!(headers.contains_key(RESPONSES_LITE_HEADER), opted_in);
+            if opted_in {
+                assert_eq!(headers[RESPONSES_LITE_HEADER], "true");
+            }
+        }
+    }
+
+    #[test]
+    fn native_agent_and_freeform_patch_wire_survive_responses_lite() {
+        let agent_message = serde_json::json!({
+            "type":"agent_message","id":"message-test","author":"/root","recipient":"/root/worker",
+            "content":[{"type":"encrypted_content","encrypted_content":"opaque-test-content"}],
+        });
+        let function_call = serde_json::json!({
+            "type":"function_call","name":"send_message","namespace":"collaboration","call_id":"message-call",
+            "arguments":"{\"message\":\"opaque-test-content\"}","encrypted_function_args":["message"],
+        });
+        let mut request = serde_json::json!({
+            "tools":[
+                {"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"send_message"}]},
+                {"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /patch/"}},
+            ],
+            "input":[agent_message.clone(), function_call.clone(),
+                {"type":"custom_tool_call","name":"apply_patch","call_id":"patch-call","input":"raw patch"},
+                {"type":"custom_tool_call_output","call_id":"patch-call","output":"success"}],
+        });
+        provider_adapter(ModelProvider::Codex).patch_responses_request(
+            &mut request,
+            ResponsesRequestPolicy {
+                use_responses_lite: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(request["input"][1], agent_message);
+        assert_eq!(request["input"][2], function_call);
+        assert_eq!(request["input"][3]["namespace"], "functions");
+        assert_eq!(request["input"][4]["type"], "custom_tool_call_output");
+        assert_eq!(
+            request["input"][0]["tools"][1]["tools"][0]["name"],
+            "apply_patch"
+        );
+        assert_eq!(
+            request["input"][0]["tools"][1]["tools"][0]["format"]["syntax"],
+            "lark"
+        );
+    }
+
+    #[test]
+    fn responses_lite_normalizes_string_input_without_losing_instructions() {
+        let mut request =
+            serde_json::json!({"input": "Hello", "instructions": "Base instructions"});
+        provider_adapter(ModelProvider::Codex).patch_responses_request(
+            &mut request,
+            ResponsesRequestPolicy {
+                use_responses_lite: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(request["input"][0]["type"], "additional_tools");
+        assert_eq!(
+            request["input"][1]["content"][0]["text"],
+            "Base instructions"
+        );
+        assert_eq!(request["input"][2]["content"][0]["text"], "Hello");
+    }
 
     fn base_request() -> Value {
         serde_json::json!({

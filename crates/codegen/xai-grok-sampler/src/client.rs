@@ -1205,6 +1205,7 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     idle_timeout_secs: Option<u64>,
     codex_multi_agent_v2: bool,
+    use_responses_lite: bool,
     codex_permissions: Option<crate::config::CodexPermissions>,
     reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     service_tier: Option<String>,
@@ -1507,6 +1508,7 @@ impl SamplingClient {
         );
 
         let max_retries = crate::retry::resolve_max_retries(config.max_retries);
+        let use_responses_lite = config.uses_responses_lite();
         let defaults = ClientDefaults {
             model: config.model,
             max_completion_tokens: config.max_completion_tokens,
@@ -1518,6 +1520,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             idle_timeout_secs: config.idle_timeout_secs,
             codex_multi_agent_v2: config.codex_multi_agent_v2,
+            use_responses_lite,
             codex_permissions: config.codex_permissions,
             reasoning_effort: config.reasoning_effort,
             service_tier: config.service_tier,
@@ -1646,6 +1649,8 @@ impl SamplingClient {
         }
 
         self.provider_adapter.sanitize_headers(&mut headers);
+        self.provider_adapter
+            .apply_responses_lite_header(&mut headers, self.defaults.use_responses_lite);
 
         self.provider_adapter
             .apply_turn_state_header(&mut headers, self.codex_turn_state.as_ref());
@@ -2234,6 +2239,7 @@ impl SamplingClient {
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
                 codex_permissions: self.defaults.codex_permissions.clone(),
@@ -2645,6 +2651,7 @@ impl SamplingClient {
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
                 codex_permissions: self.defaults.codex_permissions.clone(),
@@ -2821,6 +2828,7 @@ impl SamplingClient {
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
                 codex_permissions: self.defaults.codex_permissions.clone(),
@@ -3951,6 +3959,34 @@ mod tests {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+        }
+    }
+
+    #[test]
+    fn responses_lite_covers_both_compaction_protocols() {
+        let client = SamplingClient::new(SamplerConfig {
+            provider: ModelProvider::Codex,
+            api_backend: ApiBackend::Responses,
+            use_responses_lite: true,
+            ..minimal_config()
+        })
+        .unwrap();
+        for remote_v2 in [false, true] {
+            let request = ConversationRequest::from_items(vec![
+                xai_grok_sampling_types::ConversationItem::user("Preserve this context"),
+            ]);
+            let body = client
+                .codex_compaction_request_body(&request, "Compact instructions", remote_v2)
+                .unwrap();
+            assert!(body.get("instructions").is_none());
+            assert!(body.get("tools").is_none());
+            assert_eq!(body["input"][0]["type"], "additional_tools");
+            assert_eq!(
+                body["input"][1]["content"][0]["text"],
+                "Compact instructions"
+            );
+            assert_eq!(body["reasoning"]["context"], "all_turns");
+            assert_eq!(body["parallel_tool_calls"], false);
         }
     }
 
