@@ -800,6 +800,7 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
 }
 
 fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequestPolicy) {
+    patch_codex_agent_message_ids(request_body);
     patch_codex_instruction_roles(request_body);
 
     if let Some(permissions) = policy.codex_permissions.as_ref() {
@@ -875,6 +876,22 @@ fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequ
         .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
         .map_or(input.len(), |_| input.len() - 1);
     input.insert(insert_at, mode_item);
+}
+
+fn patch_codex_agent_message_ids(request_body: &mut Value) {
+    let Some(input) = request_body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in input {
+        // Older native mailboxes persisted local UUIDs as Responses item IDs.
+        // Repair only that shape so resume works without changing opaque history.
+        if item.get("type").and_then(Value::as_str) == Some("agent_message")
+            && let Some(id) = item.get("id").and_then(Value::as_str)
+            && let Ok(id) = uuid::Uuid::parse_str(id)
+        {
+            item["id"] = Value::String(format!("amsg_{id}"));
+        }
+    }
 }
 
 fn patch_codex_responses_lite(request_body: &mut Value) {
@@ -1415,9 +1432,69 @@ mod tests {
     }
 
     #[test]
+    fn codex_repairs_legacy_agent_message_ids_without_changing_opaque_history() {
+        let legacy_id = "00000000-0000-7000-8000-000000000001";
+        let legacy_message = serde_json::json!({
+            "type": "agent_message", "id": legacy_id,
+            "author": "/root", "recipient": "/root/worker",
+            "content": [{"type": "encrypted_content", "encrypted_content": "opaque-test-content"}],
+            "internal_chat_message_metadata_passthrough": {"test_marker": "retained"},
+        });
+        let mut repaired_message = legacy_message.clone();
+        repaired_message["id"] = format!("amsg_{legacy_id}").into();
+        let mut public_message = legacy_message.clone();
+        public_message["content"] =
+            serde_json::json!([{"type": "input_text", "text": "  task text\n"}]);
+        let mut repaired_public_message = public_message.clone();
+        repaired_public_message["id"] = repaired_message["id"].clone();
+        let mut idless_message = legacy_message.clone();
+        idless_message.as_object_mut().unwrap().remove("id");
+        let mut opaque_id_message = legacy_message.clone();
+        opaque_id_message["id"] = "amsg_provider-owned-id".into();
+        let mut unknown_id_message = legacy_message.clone();
+        unknown_id_message["id"] = "unknown-provider-id".into();
+        let other_item = serde_json::json!({
+            "type": "compaction", "id": legacy_id, "encrypted_content": "opaque-test-summary",
+        });
+        let input = serde_json::json!([
+            legacy_message,
+            public_message,
+            repaired_message,
+            idless_message,
+            opaque_id_message,
+            unknown_id_message,
+            other_item,
+        ]);
+
+        for provider in [ModelProvider::Codex, ModelProvider::Xai] {
+            for use_responses_lite in [false, true] {
+                let mut request = serde_json::json!({"input": input});
+                let policy = ResponsesRequestPolicy {
+                    use_responses_lite,
+                    ..Default::default()
+                };
+                provider_adapter(provider).patch_responses_request(&mut request, policy.clone());
+                let offset = usize::from(provider == ModelProvider::Codex && use_responses_lite);
+                let mut expected = input.as_array().unwrap().clone();
+                if provider == ModelProvider::Codex {
+                    expected[0] = repaired_message.clone();
+                    expected[1] = repaired_public_message.clone();
+                }
+                assert_eq!(&request["input"].as_array().unwrap()[offset..], expected);
+                let prepared = request.clone();
+                provider_adapter(provider).patch_responses_request(&mut request, policy);
+                assert_eq!(
+                    request, prepared,
+                    "retry preparation must preserve stable IDs"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn native_agent_and_freeform_patch_wire_survive_responses_lite() {
         let agent_message = serde_json::json!({
-            "type":"agent_message","id":"message-test","author":"/root","recipient":"/root/worker",
+            "type":"agent_message","id":"amsg_test","author":"/root","recipient":"/root/worker",
             "content":[{"type":"encrypted_content","encrypted_content":"opaque-test-content"}],
         });
         let function_call = serde_json::json!({
