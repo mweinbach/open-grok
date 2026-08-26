@@ -732,6 +732,7 @@ impl ToolRegistryBuilder {
         b.register::<codex::list_dir::CodexListDirTool>();
         b.register::<codex::grep_files::CodexGrepFilesTool>();
         b.register::<codex::read_file::CodexReadFileTool>();
+        b.register::<codex::SendUserMessageAsyncTool>();
         b.register::<opencode::OpenCodeBashTool>();
         b.register::<opencode::OpenCodeReadTool>();
         b.register::<opencode::OpenCodeEditTool>();

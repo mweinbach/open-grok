@@ -56,6 +56,7 @@ pub const KNOWN_NOTIFICATION_KINDS: &[&str] = &[
     "PlanModeEntered",
     "PlanModeExited",
     "UserQuestionAsked",
+    "AsyncUserMessage",
     "LspServerStarting",
     "LspServerReady",
     "LspServerCrashed",

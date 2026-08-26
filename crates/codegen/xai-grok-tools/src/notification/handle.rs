@@ -139,6 +139,7 @@ fn is_critical_notification(notification: &ToolNotification) -> bool {
             | ToolNotification::PlanModeEntered(_)
             | ToolNotification::PlanModeExited(_)
             | ToolNotification::UserQuestionAsked(_)
+            | ToolNotification::AsyncUserMessage(_)
             | ToolNotification::LspServerCrashed(_)
             | ToolNotification::LspServerFailed(_)
             | ToolNotification::ScheduledTaskFired(_)

@@ -256,6 +256,13 @@ pub struct UserQuestionAsked {
     pub questions_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AsyncUserMessage {
+    pub tool_call_id: String,
+    pub message: String,
+}
+
 /// LSP server is being spawned, waiting for initialize handshake.
 #[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -475,6 +482,7 @@ pub enum ToolNotification {
     /// Consumers (gateway, TUI) use this to present the question UI
     /// and collect the user's answers.
     UserQuestionAsked(UserQuestionAsked),
+    AsyncUserMessage(AsyncUserMessage),
 
     LspServerStarting(LspServerStarting),
     LspServerReady(LspServerReady),
@@ -546,6 +554,7 @@ notification_variants! {
     PlanModeEntered => PlanModeEntered,
     PlanModeExited => PlanModeExited,
     UserQuestionAsked => UserQuestionAsked,
+    AsyncUserMessage => AsyncUserMessage,
     LspServerStarting => LspServerStarting,
     LspServerReady => LspServerReady,
     LspServerCrashed => LspServerCrashed,

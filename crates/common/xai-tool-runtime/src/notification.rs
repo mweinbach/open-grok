@@ -186,6 +186,12 @@ pub struct UserQuestionAsked {
     pub questions_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsyncUserMessage {
+    pub tool_call_id: String,
+    pub message: String,
+}
+
 /// LSP server is being spawned and is waiting for the initialise
 /// handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +339,7 @@ pub enum ToolNotification {
     PlanModeEntered(PlanModeEntered),
     PlanModeExited(PlanModeExited),
     UserQuestionAsked(UserQuestionAsked),
+    AsyncUserMessage(AsyncUserMessage),
     LspServerStarting(LspServerStarting),
     LspServerReady(LspServerReady),
     LspServerCrashed(LspServerCrashed),
@@ -359,6 +366,7 @@ impl ToolNotification {
             Self::PlanModeEntered(_) => "PlanModeEntered",
             Self::PlanModeExited(_) => "PlanModeExited",
             Self::UserQuestionAsked(_) => "UserQuestionAsked",
+            Self::AsyncUserMessage(_) => "AsyncUserMessage",
             Self::LspServerStarting(_) => "LspServerStarting",
             Self::LspServerReady(_) => "LspServerReady",
             Self::LspServerCrashed(_) => "LspServerCrashed",

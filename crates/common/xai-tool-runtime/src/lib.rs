@@ -24,10 +24,10 @@ pub use context::{
 pub use dispatch::ToolDispatch;
 pub use error::{ToolError, ToolErrorKind};
 pub use notification::{
-    BashExecutionBackgrounded, BashExecutionComplete, BashExecutionFailed, BashExecutionTimeout,
-    BashNotificationBase, BashOutputChunk, FileRead, FileWritten, LspServerCrashed,
-    LspServerFailed, LspServerReady, LspServerRetrying, LspServerStarting, MonitorEvent,
-    PlanModeEntered, PlanModeExited, ScheduledTaskCreated, ScheduledTaskFired,
+    AsyncUserMessage, BashExecutionBackgrounded, BashExecutionComplete, BashExecutionFailed,
+    BashExecutionTimeout, BashNotificationBase, BashOutputChunk, FileRead, FileWritten,
+    LspServerCrashed, LspServerFailed, LspServerReady, LspServerRetrying, LspServerStarting,
+    MonitorEvent, PlanModeEntered, PlanModeExited, ScheduledTaskCreated, ScheduledTaskFired,
     ScheduledTaskRemoved, TaskKind, TaskSnapshot, ToolNotification, ToolNotificationHandle,
     UserQuestionAsked,
 };
