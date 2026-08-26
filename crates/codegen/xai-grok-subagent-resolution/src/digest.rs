@@ -230,7 +230,14 @@ fn render_item_to_digest(out: &mut String, item: &ConversationItem) {
         ConversationItem::Assistant(a) => {
             push_capped(out, "Assistant", &a.content, ASSISTANT_TEXT_CAP);
             for tc in &a.tool_calls {
-                let args: &str = tc.arguments.as_ref();
+                let args: &str =
+                    if xai_grok_sampling_types::conversation::codex_private_function_arguments(
+                        &tc.id, &tc.name,
+                    ) {
+                        "[provider-private tool arguments omitted]"
+                    } else {
+                        tc.arguments.as_ref()
+                    };
                 if args.len() > TOOL_ARGS_CAP {
                     let _ = writeln!(
                         out,

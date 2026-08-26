@@ -448,7 +448,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                             yield SamplingEvent::ToolCallDelta {
                                 request_id: request_id.clone(),
                                 tool_index,
-                                id: Some(fc.call_id),
+                                id: Some(xai_grok_sampling_types::conversation::provider_tool_call_id(&fc.call_id).to_owned()),
                                 name: Some(fc.name),
                                 arguments_delta: initial_arguments,
                             };
@@ -940,7 +940,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                 rs::OutputItem::FunctionCall(call) => (
                     function_arguments_streamed.entry(output_index).or_default(),
                     call.arguments.as_str(),
-                    call.call_id.clone(),
+                    xai_grok_sampling_types::conversation::provider_tool_call_id(&call.call_id).to_owned(),
                     call.name.clone(),
                 ),
                 rs::OutputItem::CustomToolCall(call)
@@ -2136,6 +2136,68 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn native_agent_stream_uses_stable_public_ids_and_retains_completed_metadata() {
+        for emit_done in [false, true] {
+            let mut added = serde_json::json!({
+                "type":"function_call", "call_id":"call_native", "name":"send_message",
+                "namespace":"functions", "id":"fc_native", "status":"in_progress", "arguments":"",
+            });
+            let mut completed = added.clone();
+            completed["status"] = serde_json::json!("completed");
+            completed["encrypted_function_args"] = serde_json::json!([]);
+            completed["arguments"] =
+                serde_json::json!("{\"target\":\"/root/worker\",\"message\":\"hello\"}");
+            xai_grok_sampling_types::conversation::encode_codex_function_call(&mut added);
+            xai_grok_sampling_types::conversation::encode_codex_function_call(&mut completed);
+            assert_ne!(added["call_id"], completed["call_id"]);
+            let completed_item: rs_types::OutputItem =
+                serde_json::from_value(completed.clone()).unwrap();
+            let mut events = vec![Ok(function_call_added_event(
+                0,
+                added["call_id"].as_str().unwrap(),
+                "send_message",
+            ))];
+            if emit_done {
+                events.push(Ok(output_item_done_event(0, completed_item.clone())));
+            }
+            events.push(Ok(completed_event_with_output(vec![completed_item])));
+            let events = collect(stream_responses(
+                stream::iter(events).boxed(),
+                None,
+                rid(),
+                Duration::from_secs(60),
+                None,
+            ))
+            .await;
+            let mut observed_ids = Vec::new();
+            for event in &events {
+                match event {
+                    SamplingEvent::ToolCallDelta { id: Some(id), .. }
+                    | SamplingEvent::ToolCallArgumentsComplete { id: Some(id), .. } => {
+                        observed_ids.push(id.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            assert!(!observed_ids.is_empty());
+            assert!(observed_ids.iter().all(|id| *id == "call_native"));
+            let SamplingEvent::Completed { response, .. } = events.last().unwrap() else {
+                panic!("expected completion");
+            };
+            let ConversationItem::Assistant(assistant) = response.items.last().unwrap() else {
+                panic!("expected assistant tool call");
+            };
+            let call = &assistant.tool_calls[0];
+            assert_eq!(call.call_id(), "call_native");
+            assert_eq!(call.id.as_ref(), completed["call_id"].as_str().unwrap());
+            assert_eq!(
+                call.arguments.as_ref(),
+                completed["arguments"].as_str().unwrap()
+            );
+        }
     }
 
     #[tokio::test]

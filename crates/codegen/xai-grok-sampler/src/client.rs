@@ -111,10 +111,34 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     deserialize_response_event_for_adapter(data, provider_adapter(ModelProvider::Xai))
 }
 
+#[cfg(test)]
 fn deserialize_response_event_for_adapter(
     data: &str,
     adapter: &dyn ProviderAdapter,
 ) -> Result<rs::ResponseStreamEvent> {
+    deserialize_response_event_for_tools(data, adapter, false)
+}
+
+fn deserialize_response_event_for_tools(
+    data: &str,
+    adapter: &dyn ProviderAdapter,
+    native_multi_agent: bool,
+) -> Result<rs::ResponseStreamEvent> {
+    let codex_data = if adapter.provider() == ModelProvider::Codex {
+        let mut value: serde_json::Value = serde_json::from_str(data)?;
+        if !native_multi_agent && has_encrypted_function_calls(&value) {
+            return Err(SamplingError::InvalidConfiguration(
+                "Encrypted agent arguments require advertised native collaboration tools",
+            ));
+        }
+        if native_multi_agent {
+            preserve_codex_function_metadata(&mut value);
+        }
+        Some(value.to_string())
+    } else {
+        None
+    };
+    let data = codex_data.as_deref().unwrap_or(data);
     let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
         Ok(event) => event,
         Err(first_err) => {
@@ -138,6 +162,62 @@ fn deserialize_response_event_for_adapter(
     };
     apply_terminal_event_overrides(&mut event, data);
     Ok(event)
+}
+
+fn has_native_multi_agent_tools(body: &serde_json::Value) -> bool {
+    fn native(tool: &serde_json::Value) -> bool {
+        (matches!(
+            tool.get("name").and_then(serde_json::Value::as_str),
+            Some("spawn_agent" | "send_message" | "followup_task")
+        ) && tool
+            .pointer("/parameters/properties/message/encrypted")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true))
+            || (tool.get("type").and_then(serde_json::Value::as_str) == Some("namespace")
+                && tool
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|tools| tools.iter().any(native)))
+    }
+    body.get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| tools.iter().any(native))
+}
+
+fn preserve_codex_function_metadata(value: &mut serde_json::Value) {
+    if let Some(item) = value.get_mut("item") {
+        xai_grok_sampling_types::conversation::encode_codex_function_call(item);
+    }
+    let response = if value.get("response").is_some() {
+        value.get_mut("response").expect("response exists")
+    } else {
+        value
+    };
+    if let Some(output) = response
+        .get_mut("output")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in output {
+            xai_grok_sampling_types::conversation::encode_codex_function_call(item);
+        }
+    }
+}
+
+fn has_encrypted_function_calls(value: &serde_json::Value) -> bool {
+    let response = value.get("response").unwrap_or(value);
+    response
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(value.get("item"))
+        .any(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+                && item
+                    .get("encrypted_function_args")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|arguments| !arguments.is_empty())
+        })
 }
 
 /// Absorb Codex's forward-compatible `response.metadata` side channel.
@@ -2635,6 +2715,7 @@ impl SamplingClient {
         })?;
         let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        let native_multi_agent = has_native_multi_agent_tools(&request_body);
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
         // it in post-serialize. This is the last surviving piece of the
@@ -2717,8 +2798,19 @@ impl SamplingClient {
             });
         }
 
+        if self.defaults.provider == ModelProvider::Codex
+            && !native_multi_agent
+            && has_encrypted_function_calls(&serde_json::from_slice::<serde_json::Value>(&bytes)?)
+        {
+            return Err(SamplingError::InvalidConfiguration(
+                "Encrypted agent arguments require advertised native collaboration tools",
+            ));
+        }
         let response_obj = (|| {
             let mut value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+            if self.defaults.provider == ModelProvider::Codex && native_multi_agent {
+                preserve_codex_function_metadata(&mut value);
+            }
             if self.provider_adapter.normalizes_response_events() {
                 normalize_response_compat(&mut value, "completed");
             }
@@ -2816,6 +2908,7 @@ impl SamplingClient {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        let native_multi_agent = has_native_multi_agent_tools(&request_body);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         xai_grok_sampling_types::strip_sentinel_web_search_actions(&mut request_body);
         patch_custom_tool_output_wire_fields(
@@ -2991,9 +3084,10 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            let decoded = deserialize_response_event_for_adapter(
+                            let decoded = deserialize_response_event_for_tools(
                                 data,
                                 provider_adapter_for_stream,
+                                native_multi_agent,
                             );
                             if decoded.as_ref().is_err_and(|error| {
                                 provider_adapter_for_stream
@@ -3751,6 +3845,75 @@ mod tests {
         assert_eq!(
             body["tools"],
             serde_json::json!([{ "type": "function" }, { "type": "web_search" }])
+        );
+    }
+
+    #[test]
+    fn native_agent_decoder_requires_codex_and_an_advertised_encrypted_schema() {
+        let tool = serde_json::json!({"type":"function","name":"send_message","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true}}}});
+        assert!(has_native_multi_agent_tools(
+            &serde_json::json!({"tools":[tool.clone()]})
+        ));
+        assert!(!has_native_multi_agent_tools(
+            &serde_json::json!({"input":[{"role":"user","content":tool}]})
+        ));
+        assert!(!has_native_multi_agent_tools(
+            &serde_json::json!({"tools":[{"type":"function","name":"send_message","parameters":{"properties":{"message":{"type":"string"}}}}]})
+        ));
+        let mut event = serde_json::json!({
+            "type":"response.output_item.done","sequence_number":1,"output_index":0,
+            "item":{"type":"function_call","id":"fc_native","call_id":"call_native","name":"send_message",
+                "namespace":"collaboration","status":"completed","arguments":"{\"target\":\"/root/worker\",\"message\":\"opaque-test-content\"}"}
+        });
+        for provider in [ModelProvider::Codex, ModelProvider::Xai] {
+            for enabled in [false, true] {
+                let decoded = deserialize_response_event_for_tools(
+                    &event.to_string(),
+                    provider_adapter(provider),
+                    enabled,
+                )
+                .unwrap();
+                let rs::ResponseStreamEvent::ResponseOutputItemDone(event) = decoded else {
+                    panic!("output item")
+                };
+                let rs::OutputItem::FunctionCall(call) = event.item else {
+                    panic!("function call")
+                };
+                assert_eq!(
+                    xai_grok_sampling_types::conversation::decode_codex_function_call_id(
+                        &call.call_id
+                    )
+                    .is_some(),
+                    enabled && provider == ModelProvider::Codex
+                );
+            }
+        }
+        event["item"]["encrypted_function_args"] = serde_json::json!(["message"]);
+        assert!(
+            deserialize_response_event_for_tools(
+                &event.to_string(),
+                provider_adapter(ModelProvider::Codex),
+                false
+            )
+            .is_err()
+        );
+        let decoded = deserialize_response_event_for_tools(
+            &event.to_string(),
+            provider_adapter(ModelProvider::Codex),
+            true,
+        )
+        .unwrap();
+        let rs::ResponseStreamEvent::ResponseOutputItemDone(event) = decoded else {
+            panic!("output item")
+        };
+        let rs::OutputItem::FunctionCall(call) = event.item else {
+            panic!("function call")
+        };
+        assert_eq!(
+            xai_grok_sampling_types::conversation::decode_codex_function_call_id(&call.call_id)
+                .unwrap()
+                .1["encrypted_function_args"],
+            serde_json::json!(["message"])
         );
     }
 
