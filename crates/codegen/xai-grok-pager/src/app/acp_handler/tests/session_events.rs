@@ -878,7 +878,211 @@
             ),
             "disabled setting must not surface writing-tool activity"
         );
+        assert!(
+            child_code_mode_stream_payloads(&mut agent, child_sid).is_empty(),
+            "disabled setting must not create live Code Mode blocks"
+        );
         crate::appearance::cache::set_stream_tool_calls(true);
+    }
+
+    #[test]
+    fn child_code_mode_delta_renders_nested_tool_without_transport_source() {
+        crate::appearance::cache::set_stream_tool_calls(true);
+        let mut agent = make_agent(Some("root-sess"));
+        let child_sid = "child-sess-cm-delta";
+        agent
+            .subagent_sessions
+            .insert(child_sid.into(), make_subagent_info(child_sid));
+        let child_view = make_agent(Some(child_sid));
+        agent
+            .subagent_views
+            .insert(child_sid.into(), Box::new(child_view));
+
+        for (name, delta) in [
+            (Some("exec"), Some("await tools.read_file({")),
+            (None, Some("file_path: 'private-child-path'});")),
+        ] {
+            let update = XaiSessionUpdate::ToolCallDeltaChunk {
+                tool_call_id: Some("call_cm".into()),
+                tool_index: 0,
+                name: name.map(str::to_string),
+                arguments_delta: delta.map(str::to_string),
+            };
+            handle_child_session_notification(update, child_sid, &mut agent, false);
+        }
+        let payloads = child_code_mode_stream_payloads(&mut agent, child_sid);
+        assert_eq!(payloads, vec!["read_file".to_string()]);
+        let child = agent.subagent_views.get(child_sid).expect("child view");
+        let Some(crate::acp::tracker::TurnActivity::WritingToolCall(activity)) =
+            child.session.tracker.activity()
+        else {
+            panic!("nested child tool must drive ordinary tool activity");
+        };
+        assert_eq!(activity.tool_name.as_deref(), Some("read_file"));
+    }
+
+    /// Collect live Code Mode stream payloads from a child view's scrollback.
+    fn child_code_mode_stream_payloads(
+        agent: &mut crate::app::agent_view::AgentView,
+        child_sid: &str,
+    ) -> Vec<String> {
+        use crate::scrollback::block::RenderBlock;
+        let child = agent.subagent_views.get_mut(child_sid).expect("child view");
+        (0..child.scrollback.len())
+            .filter_map(|i| child.scrollback.get(i))
+            .filter_map(|e| match &e.block {
+                RenderBlock::CodeModeStream(b) => Some(b.payload().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // ── root-path delta shim (replay guard + sanitized nested activity) ──
+
+    fn root_scrollback_code_mode_payloads(
+        scrollback: &ScrollbackState,
+    ) -> Vec<String> {
+        use crate::scrollback::block::RenderBlock;
+        (0..scrollback.len())
+            .filter_map(|i| scrollback.get(i))
+            .filter_map(|e| match &e.block {
+                RenderBlock::CodeModeStream(b) => Some(b.payload().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Deltas are streaming-only — the shell never persists them to
+    /// `updates.jsonl`, so a replay-stamped delta must never rebuild a live
+    /// Code Mode block. The guard is defense in depth for the restore path.
+    #[test]
+    fn root_replay_stamped_code_mode_delta_is_ignored() {
+        crate::appearance::cache::set_stream_tool_calls(true);
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        assert!(!super::apply_tool_call_delta_chunk_for_test(
+            &mut session.tracker,
+            &mut scrollback,
+            Some("exec"),
+            Some("tools.read_file({file_path: 'private'})"),
+            0,
+            true,
+            false,
+        ));
+        assert!(root_scrollback_code_mode_payloads(&scrollback).is_empty());
+        // The same live chunk renders only the inferred nested tool name.
+        assert!(super::apply_tool_call_delta_chunk_for_test(
+            &mut session.tracker,
+            &mut scrollback,
+            Some("exec"),
+            Some("tools.read_file({file_path: 'private'})"),
+            0,
+            false,
+            false,
+        ));
+        assert_eq!(
+            root_scrollback_code_mode_payloads(&scrollback),
+            vec!["read_file".to_string()]
+        );
+    }
+
+    #[test]
+    fn registered_ordinary_exec_and_wait_tools_keep_writing_activity() {
+        crate::appearance::cache::set_stream_tool_calls(true);
+
+        for name in ["exec", "wait"] {
+            let mut session = make_session(Some("ordinary-tool-session"));
+            let mut scrollback = ScrollbackState::new();
+            assert!(super::apply_tool_call_delta_chunk_for_test(
+                &mut session.tracker,
+                &mut scrollback,
+                Some(name),
+                Some("{\"ordinary\":true}"),
+                0,
+                false,
+                true,
+            ));
+
+            let Some(crate::acp::tracker::TurnActivity::WritingToolCall(activity)) =
+                session.tracker.activity()
+            else {
+                panic!("registered ordinary tool {name} must remain visible");
+            };
+            assert_eq!(activity.tool_name.as_deref(), Some(name));
+            assert!(root_scrollback_code_mode_payloads(&scrollback).is_empty());
+        }
+    }
+
+    #[test]
+    fn child_registered_ordinary_exec_remains_visible() {
+        crate::appearance::cache::set_stream_tool_calls(true);
+        let mut agent = make_agent(Some("root-sess"));
+        let child_sid = "child-ordinary-exec";
+        agent
+            .subagent_sessions
+            .insert(child_sid.into(), make_subagent_info(child_sid));
+        let mut child_view = make_agent(Some(child_sid));
+        child_view.session.available_tools = Some(["exec".to_string()].into_iter().collect());
+        agent
+            .subagent_views
+            .insert(child_sid.into(), Box::new(child_view));
+
+        assert!(handle_child_session_notification(
+            XaiSessionUpdate::ToolCallDeltaChunk {
+                tool_call_id: Some("ordinary_exec".into()),
+                tool_index: 0,
+                name: Some("exec".into()),
+                arguments_delta: Some("{\"command\":\"private\"}".into()),
+            },
+            child_sid,
+            &mut agent,
+            false,
+        ));
+
+        let child = agent.subagent_views.get(child_sid).expect("child view");
+        let Some(crate::acp::tracker::TurnActivity::WritingToolCall(activity)) =
+            child.session.tracker.activity()
+        else {
+            panic!("ordinary child exec tool must remain visible");
+        };
+        assert_eq!(activity.tool_name.as_deref(), Some("exec"));
+    }
+
+    #[test]
+    fn registered_ordinary_exec_retires_stale_transport_on_reused_index() {
+        crate::appearance::cache::set_stream_tool_calls(true);
+        let mut session = make_session(Some("ordinary-tool-session"));
+        let mut scrollback = ScrollbackState::new();
+        assert!(super::apply_tool_call_delta_chunk_for_test(
+            &mut session.tracker,
+            &mut scrollback,
+            Some("exec"),
+            Some("tools.read_file({})"),
+            0,
+            false,
+            false,
+        ));
+        assert_eq!(
+            root_scrollback_code_mode_payloads(&scrollback),
+            vec!["read_file".to_string()]
+        );
+
+        assert!(super::apply_tool_call_delta_chunk_for_test(
+            &mut session.tracker,
+            &mut scrollback,
+            Some("exec"),
+            Some("{\"ordinary\":true}"),
+            0,
+            false,
+            true,
+        ));
+        assert!(root_scrollback_code_mode_payloads(&scrollback).is_empty());
+        let Some(crate::acp::tracker::TurnActivity::WritingToolCall(activity)) =
+            session.tracker.activity()
+        else {
+            panic!("registered ordinary exec must replace stale transport preview");
+        };
+        assert_eq!(activity.tool_name.as_deref(), Some("exec"));
     }
 
     // ── handle_child_session_notification ──────────────────────────────

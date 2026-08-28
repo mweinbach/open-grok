@@ -664,6 +664,45 @@ pub(crate) async fn run_shell_child(
     // Codex v2 treats Ultra as a proactive multi-agent policy, not only an
     // effort tier. A flat child cannot satisfy that instruction.
     let multi_agent_policy_enabled = child_has_spawn_tools(&definition);
+    let native_agent_protocol = ctx
+        .models_manager
+        .model_supports_codex_multi_agent_v2(effective_model_id.0.as_ref());
+    if let Some(native) = &request.runtime_overrides.native_agent {
+        if let Some(message) = &native.message
+            && let Err(error) = crate::session::native_agents::message_item(
+                message,
+                effective_sampling_config.provider,
+                effective_sampling_config.api_backend,
+                native_agent_protocol,
+            )
+        {
+            return child_run_output(failure_result(&request, &error), completion_data, None);
+        }
+        if let Some(tier) = &native.service_tier {
+            let offered = crate::agent::config::find_model_by_id(
+                &ctx.available_models,
+                effective_model_id.0.as_ref(),
+            )
+            .is_some_and(|entry| {
+                entry
+                    .info()
+                    .service_tiers
+                    .iter()
+                    .any(|option| &option.id == tier)
+            });
+            if !offered {
+                return child_run_output(
+                    failure_result(
+                        &request,
+                        "Requested service tier is not advertised by the child model",
+                    ),
+                    completion_data,
+                    None,
+                );
+            }
+            effective_sampling_config.service_tier = Some(tier.clone());
+        }
+    }
     effective_sampling_config.codex_multi_agent_v2 = child_multi_agent_policy_enabled(
         &definition,
         effective_sampling_config.codex_multi_agent_v2,
@@ -778,12 +817,28 @@ pub(crate) async fn run_shell_child(
         return child_run_output(failure_result(&request, &error), completion_data, None);
     }
     let tracker_provider = effective_sampling_config.provider;
+    let tracker_backend = effective_sampling_config.api_backend;
     provider_registry_guard.set_provider(tracker_provider);
     let verbatim_mirror_fork =
         context_source == InitialContextSource::Forked && context_verbatim_fork;
     let task_prompt_text = prompt.clone();
     let (mut forked_conversation, mut inherited_prefix_len) =
         (forked_conversation, inherited_prefix_len.unwrap_or(0));
+    if let Some(message) = request
+        .runtime_overrides
+        .native_agent
+        .as_ref()
+        .and_then(|native| native.message.as_ref())
+    {
+        let item = crate::session::native_agents::message_item(
+            message,
+            effective_sampling_config.provider,
+            effective_sampling_config.api_backend,
+            native_agent_protocol,
+        )
+        .expect("native message route validated");
+        forked_conversation.push(item);
+    }
     if crate::session::is_cursor_user_template(&definition.user_message_template)
         && context_source != InitialContextSource::Resumed
         && !verbatim_mirror_fork
@@ -1509,6 +1564,9 @@ pub(crate) async fn run_shell_child(
             control: ShellChildRuntime {
                 child_handle: child_handle.clone(),
                 _child_thread: child_thread,
+                provider: tracker_provider,
+                api_backend: tracker_backend,
+                native_agent_protocol,
             },
         })
         .await;
@@ -1686,7 +1744,7 @@ pub(crate) async fn run_shell_child(
             prompt_verbatim: Some(true),
             cwd: Some(child_handle.info.cwd.clone()),
             agent_type: Some(request.subagent_type.clone()),
-            shell_version: Some(xai_grok_version::VERSION.to_string()),
+            shell_version: Some(xai_grok_version::version().to_string()),
             workspace_type: None,
             sandbox: local_sandbox_telemetry(),
         };

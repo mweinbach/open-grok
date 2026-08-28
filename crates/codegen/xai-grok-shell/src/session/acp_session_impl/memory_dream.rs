@@ -34,7 +34,7 @@ pub(super) fn build_initial_injection_backend_params(
 }
 
 impl SessionActor {
-    /// Re-register `memory_search` and `memory_get` tools on the tool bridge.
+    /// Re-register memory and evidence-backed experience tools on the bridge.
     ///
     /// Used when re-enabling memory mid-session (`/memory on`). The tools are
     /// registered via the dynamic `register_mcp_tools` path which puts them in
@@ -45,7 +45,7 @@ impl SessionActor {
         bridge: &xai_grok_tools::bridge::ToolBridge,
     ) -> Result<(), String> {
         use xai_grok_tools::implementations::memory::{
-            MEMORY_GET_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME,
+            EXPERIENCE_SEARCH_TOOL_NAME, MEMORY_GET_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME,
         };
 
         bridge
@@ -56,6 +56,14 @@ impl SessionActor {
             )
             .await
             .map_err(|e| format!("failed to register memory_search: {e}"))?;
+        bridge
+            .register_mcp_tools(
+                EXPERIENCE_SEARCH_TOOL_NAME.to_owned(),
+                xai_grok_tools::implementations::memory::experience_search_tool::ExperienceSearchImpl,
+                None,
+            )
+            .await
+            .map_err(|e| format!("failed to register experience_search: {e}"))?;
         bridge
             .register_mcp_tools(
                 MEMORY_GET_TOOL_NAME.to_owned(),
@@ -100,6 +108,8 @@ impl SessionActor {
     /// `log_suffix` is appended to the `MEMORY_SESSION_END:` log line so each
     /// arm keeps a distinct reason string in logs.
     pub(super) async fn run_session_end_memory_pipeline(&self, log_suffix: &str) {
+        let trusted_nested_experience =
+            crate::session::memory::experience_ledger::drain(self.memory.experience_run_id());
         let mut session_end_result = "disabled";
         let mut total_chunks_at_end = 0usize;
         // Dream consolidates *prior* logs. Run after Written/Failed, or when
@@ -109,6 +119,44 @@ impl SessionActor {
         if !self.startup_hints.is_subagent {
             if let Some(storage) = self.memory.storage() {
                 let conversation = self.chat_state_handle.get_conversation().await;
+                if self.memory.save_on_end && !storage.is_ephemeral() {
+                    match crate::session::memory::hooks::persist_session_experiences_with_trusted_events(
+                        &storage,
+                        &conversation,
+                        self.memory.experience_run_id(),
+                        &trusted_nested_experience,
+                        self.memory.experience_prior_tool_result_ids(),
+                    ) {
+                        Ok(count) if count > 0 => {
+                            if let Err(error) = xai_grok_memory::experience::store::ExperienceStore::open(
+                                &storage.workspace_dir().join("index.sqlite"),
+                            )
+                            .and_then(|store| {
+                                store.record_source_session(
+                                    self.memory.experience_run_id(),
+                                    &self.session_info.id.0,
+                                )
+                            }) {
+                                tracing::warn!(
+                                    target: xai_grok_telemetry::memory_log::TARGET,
+                                    error = %error,
+                                    "MEMORY_EXPERIENCE: failed to associate experience run with source session"
+                                );
+                            }
+                            tracing::info!(
+                                target: xai_grok_telemetry::memory_log::TARGET,
+                                experience_count = count,
+                                "MEMORY_EXPERIENCE: persisted evidence-backed session lessons"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(
+                            target: xai_grok_telemetry::memory_log::TARGET,
+                            error = %error,
+                            "MEMORY_EXPERIENCE: failed to persist session lessons"
+                        ),
+                    }
+                }
                 let result = crate::session::memory::hooks::on_session_end(
                     &storage,
                     &conversation,

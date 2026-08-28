@@ -21,6 +21,7 @@ This directory is for **contributors and AI coding agents** working on the Open 
 | [tools.md](tools.md) | Tool packs, registry/finalize, taxonomy, major tools, caps, Computer Hub, add-a-tool checklist |
 | [permissions-and-sandbox.md](permissions-and-sandbox.md) | Permission pipeline, rules, bash policy, folder trust, OS sandbox |
 | [memory-and-goals.md](memory-and-goals.md) | Cross-session memory, flush/dream, memory tools, goal tracker / `update_goal` |
+| [experience-memory.md](experience-memory.md) | Evidence-backed experiences, outcome-aware retrieval, planning, reuse calibration, and evaluation |
 | [hooks-plugins-skills.md](hooks-plugins-skills.md) | Hooks discovery/events, plugins/marketplace, skills/commands session load |
 | [tui-and-config.md](tui-and-config.md) | Pager Action/Effect, config layers, slash commands, hooks, plugins, skills, MCP |
 | [providers.md](providers.md) | xAI / Codex / Kimi isolation, auth stores, compaction, safe extension checklist |

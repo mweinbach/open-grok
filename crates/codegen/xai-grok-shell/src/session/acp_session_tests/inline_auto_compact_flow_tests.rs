@@ -132,6 +132,8 @@ async fn create_test_actor(
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
+            experience_run_id: uuid::Uuid::now_v7().to_string(),
+            experience_prior_tool_result_ids: std::collections::HashSet::new(),
             embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
             active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: crate::config::MemoryFlushConfig::default(),
@@ -160,6 +162,7 @@ async fn create_test_actor(
         max_retries: 3,
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
+        pending_native_agent_messages: Default::default(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: None,
         dream_check_timeout: None,
@@ -594,6 +597,8 @@ async fn create_test_actor_with_memory(
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
+            experience_run_id: uuid::Uuid::now_v7().to_string(),
+            experience_prior_tool_result_ids: std::collections::HashSet::new(),
             embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
             active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: memory_config
@@ -624,6 +629,7 @@ async fn create_test_actor_with_memory(
         max_retries: 3,
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
+        pending_native_agent_messages: Default::default(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: memory_config
             .as_ref()
@@ -1362,6 +1368,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    experience_run_id: uuid::Uuid::now_v7().to_string(),
+                    experience_prior_tool_result_ids: std::collections::HashSet::new(),
                     embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
                     active_provider: std::cell::Cell::new(
                         xai_grok_sampling_types::ModelProvider::Xai,
@@ -1392,6 +1400,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 max_retries: 3,
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
+                pending_native_agent_messages: Default::default(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,

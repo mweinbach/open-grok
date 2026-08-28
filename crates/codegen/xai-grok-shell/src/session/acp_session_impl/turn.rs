@@ -1893,7 +1893,7 @@ impl SessionActor {
         let (injection_params, configured_min_score) =
             build_initial_injection_backend_params(params, &self.memory.initial_injection_config);
         let backend = crate::session::memory::MemoryBackendImpl::from_session_params(
-            storage,
+            storage.clone(),
             &injection_params,
         );
         let raw_query =
@@ -1932,7 +1932,137 @@ impl SessionActor {
                 injection_duration_ms: inject_start.elapsed().as_millis() as u64,
             },
         );
-        crate::session::helpers::memory_context::format_memory_reminder(&inject_results)
+        let experience_briefing = if actor_uses_experience_memory(self.startup_hints.is_subagent) {
+            self.experience_planning_briefing(&storage, &query, None)
+        } else {
+            None
+        };
+        crate::session::helpers::memory_context::format_memory_reminder_with_experience(
+            &inject_results,
+            experience_briefing.as_deref(),
+        )
+    }
+
+    fn experience_planning_briefing(
+        &self,
+        storage: &crate::session::memory::MemoryStorage,
+        query_text: &str,
+        failure_context: Option<String>,
+    ) -> Option<String> {
+        if !actor_uses_experience_memory(self.startup_hints.is_subagent) || storage.is_ephemeral() {
+            return None;
+        }
+        let store = match xai_grok_memory::experience::store::ExperienceStore::open(
+            &storage.workspace_dir().join("index.sqlite"),
+        ) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::debug!(error = %error, "experience store unavailable for planning");
+                return None;
+            }
+        };
+        let query = xai_grok_memory::experience::types::ExperienceQuery {
+            text: query_text.to_owned(),
+            repository_id: Some(storage.workspace_dir().to_string_lossy().into_owned()),
+            repository_revision: xai_grok_memory::experience::current_repository_revision(
+                storage.workspace_path(),
+            ),
+            environment: Some(xai_grok_memory::experience::execution_environment()),
+            failure_context,
+            limit: 8,
+            now: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        };
+        let ranked = match store.retrieve(&query) {
+            Ok(ranked) if !ranked.is_empty() => ranked,
+            Ok(_) => return None,
+            Err(error) => {
+                tracing::debug!(error = %error, "experience retrieval failed during planning");
+                return None;
+            }
+        };
+        let briefing = xai_grok_memory::experience::retrieval::build_briefing(&ranked, query.limit);
+        let rendered = xai_grok_memory::experience::retrieval::render_briefing(
+            &briefing,
+            crate::session::helpers::memory_context::EXPERIENCE_BRIEFING_MAX_CHARS,
+        );
+        if rendered.trim().is_empty() {
+            return None;
+        }
+
+        let ids = visible_turn_experience_ids(&briefing, &rendered);
+        if let Err(error) = store.record_retrieval(self.memory.experience_run_id(), &ids) {
+            tracing::debug!(error = %error, "failed to record experience retrieval");
+        }
+        Some(rendered)
+    }
+
+    async fn maybe_inject_experience_failure_reminder(
+        &self,
+        observed_failures: &mut std::collections::HashSet<u64>,
+    ) {
+        if !actor_uses_experience_memory(self.startup_hints.is_subagent)
+            || !self.memory.initial_injection_config.enabled
+        {
+            return;
+        }
+        let Some(storage) = self.memory.storage() else {
+            return;
+        };
+        let conversation = self.chat_state_handle.get_conversation().await;
+        let nested_failure = crate::session::memory::experience_ledger::latest_failure(
+            self.memory.experience_run_id(),
+        );
+        let Some((tool_call_id, failure_output)) = latest_authenticated_experience_failure(
+            &conversation,
+            self.current_turn_number.get(),
+            nested_failure.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(failure_class) =
+            xai_grok_memory::experience::extraction::classify_failure(&failure_output)
+        else {
+            return;
+        };
+        let failure_name = format!("{failure_class:?}");
+        let failure_context = failure_retrieval_context(&failure_name);
+        let fingerprint = hash_step_signature(&format!("{tool_call_id}\u{1f}{failure_name}"));
+        if observed_failures.contains(&fingerprint)
+            || conversation_has_experience_failure_marker(&conversation, fingerprint)
+        {
+            return;
+        }
+        observed_failures.insert(fingerprint);
+
+        let task_query =
+            crate::session::helpers::session_compact::extract_last_real_user_query(&conversation)
+                .unwrap_or_default();
+        let bounded_failure: String = failure_output.chars().take(1_200).collect();
+        let query_text = format!("{task_query}\nObserved {failure_context}: {bounded_failure}");
+        let Some(briefing) =
+            self.experience_planning_briefing(&storage, &query_text, Some(failure_context.clone()))
+        else {
+            return;
+        };
+        let Some(reminder) =
+            crate::session::helpers::memory_context::format_experience_replanning_reminder(
+                fingerprint,
+                &bounded_failure,
+                &briefing,
+            )
+        else {
+            return;
+        };
+
+        tracing::info!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            session_id = %self.session_info.id,
+            tool_call_id,
+            failure_class = %failure_context,
+            "experience-backed failure guidance injected as trailing reminder"
+        );
+        self.push_system_reminder(&reminder);
     }
 
     pub(super) fn is_first_turn_memory_score_visible(score: f64) -> bool {
@@ -2343,7 +2473,11 @@ impl SessionActor {
                 .web_search_state()
                 .native_hosted_web_search_suppressed(model_provider),
         )
-        .map_err(|error| acp::Error::internal_error().data(error))?;
+        .map_err(|error| acp::Error::internal_error().data(error))?
+        .with_freeform_apply_patch(
+            self.models_manager
+                .model_supports_freeform_apply_patch(&turn_sampling_config.model),
+        );
         if !base_tool_surface.reserved_name_collisions.is_empty() {
             tracing::warn!(
                 collisions = ?base_tool_surface.reserved_name_collisions,
@@ -2387,6 +2521,7 @@ impl SessionActor {
         let mut tool_turn_count: usize = 1;
         let mut loop_index: u32 = 0;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
+        let mut experience_replanning_nudges = std::collections::HashSet::new();
         let mut todo_gate_fires: u32 = 0;
         let mut auth_retry_schedule = AuthRetrySchedule::new();
         let mut codex_auth_retry_attempted = false;
@@ -2497,6 +2632,10 @@ impl SessionActor {
             self.flush_pending_skill_reminders().await;
             self.inject_pending_monitor_events().await;
             self.drain_detached_swarm_completions().await;
+            if loop_index > 1 && actor_uses_experience_memory(self.startup_hints.is_subagent) {
+                self.maybe_inject_experience_failure_reminder(&mut experience_replanning_nudges)
+                    .await;
+            }
             let memory_reminder = self.first_turn_memory_reminder().await;
             if memory_reminder.is_some() {
                 self.memory
@@ -3201,6 +3340,10 @@ impl SessionActor {
                 .await;
             let mut direct_tool_calls = Vec::new();
             for call in tool_calls {
+                if let Some(patch_call) = base_tool_surface.freeform_apply_patch_call(&call) {
+                    direct_tool_calls.push(patch_call);
+                    continue;
+                }
                 let code_mode_exec_call = match code_mode_transport {
                     Some(xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar) => {
                         call.is_custom()
@@ -3310,6 +3453,380 @@ const ACTION_STATIONARITY_NUDGE_TEMPLATE: &str = "You have called the same tool 
      then check once — do not poll in a tight loop. If you cannot make progress, stop and \
      tell the user what you are waiting for. This turn will be halted automatically if the \
      identical call keeps repeating.";
+
+fn actor_uses_experience_memory(is_subagent: bool) -> bool {
+    !is_subagent
+}
+
+fn visible_turn_experience_ids(
+    briefing: &xai_grok_memory::experience::types::ExperienceBriefing,
+    rendered: &str,
+) -> Vec<String> {
+    let mut experience_ids = Vec::new();
+    for (section, experiences, negative) in [
+        ("Recommended:", &briefing.recommended, false),
+        ("Avoid:", &briefing.avoid, true),
+        ("Uncertain:", &briefing.uncertain, false),
+    ] {
+        let mut matching_section = false;
+        let mut rendered_guidance = rendered.lines().filter_map(|line| {
+            if matches!(line, "Recommended:" | "Avoid:" | "Uncertain:") {
+                matching_section = line == section;
+                return None;
+            }
+            if line == "Contradictory evidence; compare applicability:" {
+                matching_section = false;
+                return None;
+            }
+            (matching_section && line.starts_with("- ")).then_some(line)
+        });
+
+        for experience in experiences {
+            let memory = &experience.memory;
+            let guidance = if negative {
+                memory.anti_pattern.as_deref().unwrap_or(&memory.lesson)
+            } else {
+                memory.recommendation.as_deref().unwrap_or(&memory.lesson)
+            };
+            let normalized = guidance.split_whitespace().collect::<Vec<_>>().join(" ");
+            let visible_prefix: String = normalized.chars().take(80).collect();
+            if visible_prefix.is_empty() {
+                continue;
+            }
+
+            let Some(rendered_line) = rendered_guidance.next() else {
+                break;
+            };
+            if rendered_line
+                .strip_prefix("- ")
+                .is_some_and(|guidance| guidance.starts_with(&visible_prefix))
+            {
+                experience_ids.push(memory.id.clone());
+            } else {
+                break;
+            }
+        }
+    }
+
+    experience_ids
+}
+
+fn latest_experience_tool_failure(conversation: &[ConversationItem]) -> Option<(String, String)> {
+    let mut latest_tool_results = Vec::new();
+    for item in conversation.iter().rev() {
+        match item {
+            ConversationItem::ToolResult(result) => {
+                latest_tool_results
+                    .push((result.tool_call_id.as_str(), result.content.to_string()));
+            }
+            ConversationItem::CustomToolOutput(result) => {
+                latest_tool_results.push((result.call_id.as_str(), result.text_content()));
+            }
+            ConversationItem::Assistant(assistant) => {
+                for (tool_call_id, output) in latest_tool_results {
+                    let Some(tool_call) = assistant.tool_calls.iter().find(|tool_call| {
+                        tool_call.call_id() == tool_call_id || tool_call.id.as_ref() == tool_call_id
+                    }) else {
+                        continue;
+                    };
+                    if is_experience_execution_tool(&tool_call.name)
+                        && tool_output_objectively_failed(&output)
+                        && xai_grok_memory::experience::extraction::classify_failure(&output)
+                            .is_some()
+                    {
+                        return Some((tool_call_id.to_owned(), output));
+                    }
+                }
+                break;
+            }
+            ConversationItem::User(user) if user.synthetic_reason.is_some() => {}
+            _ => break,
+        }
+    }
+    None
+}
+
+fn latest_authenticated_experience_failure(
+    conversation: &[ConversationItem],
+    current_turn_number: u64,
+    nested_failure: Option<&crate::session::memory::experience_ledger::NestedToolEvidence>,
+) -> Option<(String, String)> {
+    if let Some(failure) = latest_experience_tool_failure(conversation) {
+        return Some(failure);
+    }
+
+    let nested_failure = nested_failure?;
+    if nested_failure.turn_number != current_turn_number
+        || !is_experience_execution_tool(&nested_failure.tool_name)
+        || nested_failure.command.is_none()
+        || !(nested_failure.succeeded == Some(false)
+            || nested_failure
+                .exit_code
+                .is_some_and(|exit_code| exit_code != 0))
+        || nested_failure.task_fingerprint.as_deref()
+            != crate::session::memory::experience_ledger::latest_task_fingerprint(conversation)
+                .as_deref()
+    {
+        return None;
+    }
+
+    let queries = crate::session::helpers::session_compact::extract_real_user_queries(conversation);
+    let task = crate::session::memory::hooks::latest_substantive_task(&queries)?;
+    let task_start = conversation
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(position, item)| {
+            matches!(item, ConversationItem::User(_))
+                .then(|| {
+                    crate::session::helpers::session_compact::extract_real_user_queries(
+                        std::slice::from_ref(item),
+                    )
+                })
+                .filter(|queries| queries.iter().any(|query| query == task))
+                .map(|_| position)
+        })?;
+    if nested_failure.conversation_position <= conversation.len()
+        && nested_failure.conversation_position < task_start
+    {
+        return None;
+    }
+
+    if latest_experience_execution_result_position(conversation).is_some_and(|position| {
+        position >= nested_failure.conversation_position
+            || nested_failure.conversation_position > conversation.len()
+    }) {
+        return None;
+    }
+
+    let failure_output = match nested_failure.exit_code {
+        Some(exit_code) => format!("exit: {exit_code}\n{}", nested_failure.output),
+        None => nested_failure.output.clone(),
+    };
+    Some((nested_failure.tool_call_id.clone(), failure_output))
+}
+
+fn latest_experience_execution_result_position(conversation: &[ConversationItem]) -> Option<usize> {
+    let mut execution_call_ids = std::collections::HashSet::new();
+    let mut latest_position = None;
+
+    for (position, item) in conversation.iter().enumerate() {
+        match item {
+            ConversationItem::Assistant(assistant) => {
+                for call in &assistant.tool_calls {
+                    if is_experience_execution_tool(&call.name) {
+                        execution_call_ids.insert(call.id.as_ref().to_owned());
+                        execution_call_ids.insert(call.call_id().to_owned());
+                    }
+                }
+            }
+            ConversationItem::ToolResult(result)
+                if execution_call_ids.contains(&result.tool_call_id) =>
+            {
+                latest_position = Some(position);
+            }
+            ConversationItem::CustomToolOutput(output)
+                if execution_call_ids.contains(&output.call_id) =>
+            {
+                latest_position = Some(position);
+            }
+            _ => {}
+        }
+    }
+
+    latest_position
+}
+
+fn is_experience_execution_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "run_terminal_command"
+            | "run_terminal_cmd"
+            | "exec_command"
+            | "run_command"
+            | "bash"
+            | "shell"
+    )
+}
+
+fn tool_output_objectively_failed(output: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
+        && let Some(verdict) = structured_tool_failure_verdict(&value)
+    {
+        return verdict;
+    }
+
+    unstructured_tool_failure_verdict(output).unwrap_or(false)
+}
+
+fn unstructured_tool_failure_verdict(output: &str) -> Option<bool> {
+    let mut exit_verdict = None;
+    let mut successful_test_summary = false;
+    let mut failed_test_summary = false;
+    let mut anchored_failure = false;
+
+    for line in output.lines() {
+        let lowered = line.trim().to_ascii_lowercase();
+        for prefix in [
+            "exit code:",
+            "exit_code:",
+            "exit:",
+            "exit status:",
+            "process exited with code",
+            "process exited with status",
+            "command exited with code",
+            "command exited with status",
+        ] {
+            if let Some(remainder) = lowered.strip_prefix(prefix)
+                && let Some(code) = remainder
+                    .trim_start_matches([' ', ':', '='])
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.trim_end_matches([',', '.', ';']).parse::<i32>().ok())
+            {
+                exit_verdict = Some(code != 0);
+            }
+        }
+
+        if lowered.starts_with("test result:") {
+            if lowered.contains("test result: failed") || has_nonzero_failed_count(&lowered) {
+                failed_test_summary = true;
+            } else if lowered.contains("test result: ok") || lowered.contains("0 failed") {
+                successful_test_summary = true;
+            }
+        } else if lowered.contains(" failed") && lowered.contains(" passed") {
+            if has_nonzero_failed_count(&lowered) {
+                failed_test_summary = true;
+            } else if lowered.contains("0 failed") {
+                successful_test_summary = true;
+            }
+        }
+        if lowered == "failures:"
+            || lowered.starts_with("failed:")
+            || lowered.starts_with("fatal:")
+            || lowered.starts_with("command failed")
+            || lowered.starts_with("timed out")
+            || lowered.starts_with("timeout:")
+            || ((lowered.starts_with("error:") || lowered.starts_with("error["))
+                && !lowered.starts_with("error: 0"))
+            || (lowered.starts_with("thread '") && lowered.contains(" panicked at "))
+        {
+            anchored_failure = true;
+        }
+    }
+
+    if let Some(verdict) = exit_verdict {
+        return Some(verdict);
+    }
+    if failed_test_summary {
+        return Some(true);
+    }
+    if successful_test_summary {
+        return Some(false);
+    }
+    anchored_failure.then_some(true)
+}
+
+fn structured_tool_failure_verdict(value: &serde_json::Value) -> Option<bool> {
+    if let Some(values) = value.as_array() {
+        let mut verdict = None;
+        for value in values {
+            match structured_tool_failure_verdict(value) {
+                Some(true) => return Some(true),
+                Some(false) => verdict = Some(false),
+                None => {}
+            }
+        }
+        return verdict;
+    }
+    if let Some(text) = value.as_str() {
+        if let Ok(nested) = serde_json::from_str::<serde_json::Value>(text) {
+            return structured_tool_failure_verdict(&nested);
+        }
+        return unstructured_tool_failure_verdict(text);
+    }
+
+    let object = value.as_object()?;
+    for key in ["exit_code", "exit_status"] {
+        if let Some(code) = object.get(key).and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+        }) {
+            return Some(code != 0);
+        }
+    }
+    let mut wrapper_verdict = None;
+    if let Some(success) = object.get("success").and_then(serde_json::Value::as_bool) {
+        if !success {
+            return Some(true);
+        }
+        wrapper_verdict = Some(false);
+    }
+    if let Some(is_error) = object.get("is_error").and_then(serde_json::Value::as_bool) {
+        if is_error {
+            return Some(true);
+        }
+        wrapper_verdict = Some(false);
+    }
+    if object.get("timed_out").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Some(true);
+    }
+    if let Some(status) = object.get("status").and_then(serde_json::Value::as_str) {
+        match status.to_ascii_lowercase().as_str() {
+            "failed" | "failure" | "error" | "timed_out" | "timeout" => return Some(true),
+            "ok" | "success" | "succeeded" | "completed" | "running" | "pending" => {
+                wrapper_verdict = Some(false);
+            }
+            _ => {}
+        }
+    }
+    let mut nested_verdict = None;
+    for key in ["result", "data", "output", "text", "content"] {
+        if let Some(verdict) = object.get(key).and_then(structured_tool_failure_verdict) {
+            if verdict {
+                return Some(true);
+            }
+            nested_verdict = Some(false);
+        }
+    }
+    nested_verdict.or(wrapper_verdict)
+}
+
+fn failure_retrieval_context(failure_name: &str) -> String {
+    let mut context = String::with_capacity(failure_name.len() + 4);
+    for (index, character) in failure_name.chars().enumerate() {
+        if index > 0 && character.is_uppercase() {
+            context.push(' ');
+        }
+        context.extend(character.to_lowercase());
+    }
+    context
+}
+
+fn has_nonzero_failed_count(summary: &str) -> bool {
+    summary
+        .split("failed")
+        .next()
+        .and_then(|prefix| prefix.split_whitespace().last())
+        .and_then(|count| count.parse::<u64>().ok())
+        .is_some_and(|count| count > 0)
+}
+
+fn conversation_has_experience_failure_marker(
+    conversation: &[ConversationItem],
+    fingerprint: u64,
+) -> bool {
+    let marker = crate::session::helpers::memory_context::experience_failure_marker(fingerprint);
+    conversation.iter().rev().any(|item| {
+        matches!(
+            item,
+            ConversationItem::User(user)
+                if user.synthetic_reason == Some(SyntheticReason::SystemReminder)
+        ) && item.text_content().contains(&marker)
+    })
+}
+
 fn hash_step_signature(signature: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -3359,6 +3876,457 @@ impl IdenticalToolCallRun {
         }
     }
 }
+
+#[cfg(test)]
+mod experience_replanning_tests {
+    use super::{
+        ConversationItem, CustomToolOutputItem, actor_uses_experience_memory,
+        conversation_has_experience_failure_marker, failure_retrieval_context,
+        latest_authenticated_experience_failure, latest_experience_tool_failure,
+        tool_output_objectively_failed, visible_turn_experience_ids,
+    };
+    use crate::session::memory::experience_ledger::{NestedToolEvidence, task_fingerprint};
+    use xai_grok_memory::experience::types::{
+        ExperienceBriefing, ExperienceMemory, RankedExperience,
+    };
+    use xai_grok_sampling_types::conversation::ToolCall;
+
+    fn assistant_tool_call(tool_call_id: &str, tool_name: &str) -> ConversationItem {
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: tool_call_id.into(),
+            name: tool_name.to_owned(),
+            arguments: "{}".into(),
+        }])
+    }
+
+    fn assistant_custom_tool_call(tool_call_id: &str, tool_name: &str) -> ConversationItem {
+        ConversationItem::assistant_tool_calls(vec![ToolCall::custom(
+            tool_call_id,
+            format!("item-{tool_call_id}"),
+            tool_name,
+            "{}",
+        )])
+    }
+
+    fn nested_execution_failure(task: &str, conversation_position: usize) -> NestedToolEvidence {
+        NestedToolEvidence {
+            tool_call_id: "nested-db-failure".to_owned(),
+            tool_name: "run_terminal_command".to_owned(),
+            command: Some("cargo test -p migration lock_contention".to_owned()),
+            output: "error: database is locked".to_owned(),
+            exit_code: Some(101),
+            succeeded: Some(false),
+            changed_paths: Vec::new(),
+            timestamp: 1,
+            task_fingerprint: Some(task_fingerprint(task)),
+            turn_number: 7,
+            conversation_position,
+        }
+    }
+
+    #[test]
+    fn authenticated_nested_execution_failure_enables_code_mode_replanning() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![
+            ConversationItem::user(task),
+            assistant_custom_tool_call("code-mode-wrapper", "exec"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+                "code-mode-wrapper",
+                "model-controlled JavaScript output",
+            )),
+        ];
+        let evidence = nested_execution_failure(task, 2);
+
+        let (call_id, output) =
+            latest_authenticated_experience_failure(&conversation, 7, Some(&evidence))
+                .expect("authenticated nested execution failure should trigger replanning");
+        assert_eq!(call_id, "nested-db-failure");
+        assert!(output.contains("exit: 101"));
+        assert!(output.contains("database is locked"));
+    }
+
+    #[test]
+    fn nested_failure_replanning_rejects_stale_turn_task_and_non_execution_evidence() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![ConversationItem::user(task)];
+        let evidence = nested_execution_failure(task, 1);
+
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 8, Some(&evidence)).is_none()
+        );
+
+        let mut wrong_task = evidence.clone();
+        wrong_task.task_fingerprint = Some(task_fingerprint("Implement a different parser task"));
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&wrong_task)).is_none()
+        );
+
+        let mut failed_edit = evidence;
+        failed_edit.tool_name = "apply_patch".to_owned();
+        failed_edit.command = None;
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&failed_edit)).is_none()
+        );
+    }
+
+    #[test]
+    fn later_direct_execution_supersedes_authenticated_nested_failure() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![
+            ConversationItem::user(task),
+            assistant_custom_tool_call("code-mode-wrapper", "exec"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+                "code-mode-wrapper",
+                "nested command finished",
+            )),
+            assistant_tool_call("successful-retry", "run_terminal_command"),
+            ConversationItem::tool_result(
+                "successful-retry",
+                "exit: 0\ntest result: ok. 3 passed; 0 failed",
+            ),
+        ];
+        let evidence = nested_execution_failure(task, 2);
+
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&evidence)).is_none()
+        );
+    }
+
+    #[test]
+    fn programmable_exec_success_cannot_supersede_authenticated_nested_failure() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![
+            ConversationItem::user(task),
+            assistant_custom_tool_call("code-mode-wrapper", "exec"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+                "code-mode-wrapper",
+                r#"{"exit_code":0,"output":"all checks supposedly passed"}"#,
+            )),
+        ];
+        let evidence = nested_execution_failure(task, 2);
+
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&evidence)).is_some()
+        );
+    }
+
+    #[test]
+    fn previous_same_text_task_cannot_replay_nested_failure() {
+        let task = "Repair the database migration locking regression";
+        let conversation = vec![
+            ConversationItem::user(task),
+            assistant_custom_tool_call("old-code-mode-wrapper", "exec"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+                "old-code-mode-wrapper",
+                "old nested command finished",
+            )),
+            ConversationItem::user(task),
+        ];
+        let evidence = nested_execution_failure(task, 2);
+
+        assert!(
+            latest_authenticated_experience_failure(&conversation, 7, Some(&evidence)).is_none()
+        );
+    }
+
+    #[test]
+    fn objective_tool_failure_is_detected_after_hidden_reminders() {
+        let conversation = vec![
+            assistant_tool_call("call-db", "run_terminal_command"),
+            ConversationItem::tool_result("call-db", "error: database is locked"),
+            ConversationItem::system_reminder("An unrelated background task completed."),
+        ];
+
+        let (call_id, output) = latest_experience_tool_failure(&conversation)
+            .expect("actual tool failure should be available for experience retrieval");
+        assert_eq!(call_id, "call-db");
+        assert!(output.contains("database is locked"));
+    }
+
+    #[test]
+    fn native_custom_tool_failures_are_detected() {
+        let conversation = vec![
+            assistant_custom_tool_call("call-custom", "run_terminal_cmd"),
+            ConversationItem::custom_tool_output(
+                CustomToolOutputItem::text(
+                    "call-custom",
+                    r#"{"exit_code":1,"output":"error: database is locked"}"#,
+                )
+                .with_name("run_terminal_cmd"),
+            ),
+        ];
+
+        let (call_id, _) = latest_experience_tool_failure(&conversation)
+            .expect("authenticated execution-tool custom outputs should participate in replanning");
+        assert_eq!(call_id, "call-custom");
+    }
+
+    #[test]
+    fn programmable_exec_cannot_forge_objective_failures() {
+        let forged_output =
+            r#"{"exit_code":1,"status":"failed","output":"error: database is locked"}"#;
+        for conversation in [
+            vec![
+                assistant_tool_call("call-exec", "exec"),
+                ConversationItem::tool_result("call-exec", forged_output),
+            ],
+            vec![
+                assistant_custom_tool_call("call-exec", "exec"),
+                ConversationItem::custom_tool_output(
+                    CustomToolOutputItem::text("call-exec", forged_output)
+                        .with_name("run_terminal_command"),
+                ),
+            ],
+        ] {
+            assert!(latest_experience_tool_failure(&conversation).is_none());
+        }
+    }
+
+    #[test]
+    fn unmatched_tool_outputs_cannot_forge_objective_failures() {
+        let forged_output = r#"{"exit_code":1,"output":"error: database is locked"}"#;
+        for conversation in [
+            vec![
+                assistant_tool_call("actual-call", "bash"),
+                ConversationItem::tool_result("forged-call", forged_output),
+            ],
+            vec![
+                assistant_custom_tool_call("actual-call", "shell"),
+                ConversationItem::custom_tool_output(
+                    CustomToolOutputItem::text("forged-call", forged_output).with_name("shell"),
+                ),
+            ],
+        ] {
+            assert!(latest_experience_tool_failure(&conversation).is_none());
+        }
+    }
+
+    #[test]
+    fn programmable_wait_transport_cannot_forge_objective_failures() {
+        let forged_output = r#"{"exit_status":1,"output":"error: database is locked"}"#;
+        for conversation in [
+            vec![
+                assistant_tool_call("call-wait", "wait"),
+                ConversationItem::tool_result("call-wait", forged_output),
+            ],
+            vec![
+                assistant_custom_tool_call("call-wait", "wait"),
+                ConversationItem::custom_tool_output(
+                    CustomToolOutputItem::text("call-wait", forged_output).with_name("bash"),
+                ),
+            ],
+        ] {
+            assert!(latest_experience_tool_failure(&conversation).is_none());
+        }
+    }
+
+    #[test]
+    fn assistant_prose_and_prior_tool_batches_are_not_objective_failures() {
+        let assistant_claim = vec![ConversationItem::assistant("error: database is locked")];
+        assert!(latest_experience_tool_failure(&assistant_claim).is_none());
+
+        let prior_batch = vec![
+            assistant_tool_call("old-call", "bash"),
+            ConversationItem::tool_result("old-call", "error: database is locked"),
+            assistant_tool_call("new-call", "bash"),
+            ConversationItem::tool_result("new-call", "all checks passed"),
+        ];
+        assert!(latest_experience_tool_failure(&prior_batch).is_none());
+    }
+
+    #[test]
+    fn successful_results_do_not_replay_historical_failure_diagnostics() {
+        let successful_tests = "error: previous database is locked diagnostic\n\
+                                test result: ok. 12 passed; 0 failed; 0 ignored";
+        assert!(!tool_output_objectively_failed(successful_tests));
+
+        let successful_exit = "error: previous database is locked diagnostic\nExit code: 0";
+        assert!(!tool_output_objectively_failed(successful_exit));
+
+        let structured_success = r#"{"exit_code":0,"output":"error: database is locked"}"#;
+        assert!(!tool_output_objectively_failed(structured_success));
+
+        for output in [successful_tests, successful_exit, structured_success] {
+            let conversation = vec![
+                assistant_tool_call("call-ok", "exec_command"),
+                ConversationItem::tool_result("call-ok", output),
+            ];
+            assert!(latest_experience_tool_failure(&conversation).is_none());
+        }
+    }
+
+    #[test]
+    fn objective_status_and_failed_test_summaries_trigger_detection() {
+        assert!(tool_output_objectively_failed("Exit code: 1"));
+        assert!(tool_output_objectively_failed("exit: 2"));
+        assert!(tool_output_objectively_failed(r#"{"exit_code":1}"#));
+        assert!(tool_output_objectively_failed(r#"{"success":false}"#));
+        assert!(tool_output_objectively_failed(r#"{"is_error":true}"#));
+        assert!(tool_output_objectively_failed(r#"{"status":"failed"}"#));
+        assert!(tool_output_objectively_failed(
+            "test result: FAILED. 11 passed; 1 failed; 0 ignored"
+        ));
+        assert!(!tool_output_objectively_failed("error: 0"));
+        assert!(!tool_output_objectively_failed(
+            "test result: ok. 11 passed; 0 failed; 0 ignored"
+        ));
+    }
+
+    #[test]
+    fn successful_wrapper_does_not_mask_nested_failed_test_summaries() {
+        let output = r#"{"success":true,"text":"test result: FAILED. 1 passed; 1 failed; 0 ignored; database is locked"}"#;
+        assert!(tool_output_objectively_failed(output));
+
+        let conversation = vec![
+            assistant_custom_tool_call("call-custom", "run_command"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text("call-custom", output)),
+        ];
+        let (call_id, _) = latest_experience_tool_failure(&conversation)
+            .expect("successful trusted execution wrappers must not hide a failed nested test");
+        assert_eq!(call_id, "call-custom");
+    }
+
+    #[test]
+    fn successful_wrappers_do_not_mask_nested_nonzero_exits_or_arrays() {
+        for output in [
+            r#"{"success":true,"result":{"exit_code":1,"output":"database is locked"}}"#,
+            r#"{"status":"completed","data":{"output":{"exit_status":2}}}"#,
+            r#"{"success":true,"output":"{\"exit_code\":3,\"text\":\"database is locked\"}"}"#,
+            r#"{"is_error":false,"content":[{"text":"checks completed"},{"data":{"exit_code":4}}]}"#,
+            r#"[{"status":"completed"},{"result":{"exit_status":"5"}}]"#,
+        ] {
+            assert!(
+                tool_output_objectively_failed(output),
+                "nested objective failure was hidden by wrapper: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_zero_exits_and_successful_test_summaries_remain_successful() {
+        for output in [
+            r#"{"success":true,"result":{"exit_code":0,"text":"error: database is locked"}}"#,
+            r#"{"status":"completed","data":{"output":"error: old database is locked diagnostic\ntest result: ok. 12 passed; 0 failed; 0 ignored"}}"#,
+            r#"{"success":true,"content":[{"text":"test result: ok. 1 passed; 0 failed; database is locked"}]}"#,
+            r#"{"success":true,"text":"An assistant claimed error: database is locked"}"#,
+        ] {
+            assert!(
+                !tool_output_objectively_failed(output),
+                "successful nested objective result was treated as a failure: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_experience_attribution_consumes_each_visible_guidance_line_once() {
+        let shared_prefix = format!("Database migration {}", "shared guidance ".repeat(8));
+        let recommended = (0..2)
+            .map(|index| RankedExperience {
+                memory: ExperienceMemory {
+                    id: format!("experience-{index}"),
+                    lesson: format!("Database migration strategy {index}"),
+                    recommendation: Some(format!("{shared_prefix} unique strategy {index}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .collect();
+        let briefing = ExperienceBriefing {
+            recommended,
+            ..Default::default()
+        };
+        let rendered = format!("Recommended:\n- {shared_prefix} unique strategy 0 [evidence: 1]\n");
+
+        assert_eq!(
+            visible_turn_experience_ids(&briefing, &rendered),
+            vec!["experience-0".to_string()]
+        );
+    }
+
+    #[test]
+    fn turn_experience_attribution_matches_section_specific_guidance() {
+        let shared_guidance = "Avoid concurrent database migrations";
+        let briefing = ExperienceBriefing {
+            recommended: vec![RankedExperience {
+                memory: ExperienceMemory {
+                    id: "hidden-recommendation".to_string(),
+                    lesson: "Hidden recommendation lesson".to_string(),
+                    recommendation: Some(shared_guidance.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            avoid: vec![RankedExperience {
+                memory: ExperienceMemory {
+                    id: "visible-warning".to_string(),
+                    lesson: "Fallback warning lesson".to_string(),
+                    recommendation: Some("Wrong guidance for warnings".to_string()),
+                    anti_pattern: Some(shared_guidance.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            uncertain: vec![RankedExperience {
+                memory: ExperienceMemory {
+                    id: "visible-hypothesis".to_string(),
+                    lesson: "Try an isolated migration transaction".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rendered = format!(
+            "Recommended:\nAvoid:\n- {shared_guidance} [evidence: 1]\n\
+             Uncertain:\n- Try an isolated migration transaction [evidence: 1]\n\
+             Contradictory evidence; compare applicability:\n- {shared_guidance}\n"
+        );
+
+        assert_eq!(
+            visible_turn_experience_ids(&briefing, &rendered),
+            vec![
+                "visible-warning".to_string(),
+                "visible-hypothesis".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn experience_memory_is_reserved_for_root_actors() {
+        assert!(actor_uses_experience_memory(false));
+        assert!(!actor_uses_experience_memory(true));
+    }
+
+    #[test]
+    fn failure_context_preserves_tokens_for_anti_pattern_retrieval() {
+        assert_eq!(failure_retrieval_context("DatabaseLock"), "database lock");
+        assert_eq!(failure_retrieval_context("GeneratedFile"), "generated file");
+        assert_eq!(failure_retrieval_context("TypeCheck"), "type check");
+    }
+
+    #[test]
+    fn replanning_marker_only_deduplicates_synthetic_reminders() {
+        let fingerprint = 0xfeed_u64;
+        let marker =
+            crate::session::helpers::memory_context::experience_failure_marker(fingerprint);
+        let genuine_user = vec![ConversationItem::user(marker.clone())];
+        assert!(!conversation_has_experience_failure_marker(
+            &genuine_user,
+            fingerprint,
+        ));
+
+        let synthetic = vec![ConversationItem::system_reminder(marker)];
+        assert!(conversation_has_experience_failure_marker(
+            &synthetic,
+            fingerprint,
+        ));
+        assert!(!conversation_has_experience_failure_marker(
+            &synthetic,
+            fingerprint + 1,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod identical_tool_call_run_tests {
     use super::{

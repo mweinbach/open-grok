@@ -630,6 +630,11 @@ impl SessionActor {
         let shared_codex_recovery = Arc::new(tokio::sync::OnceCell::<bool>::const_new());
         let workspace_ops = self.workspace_ops.clone();
         let pending_interjections = self.pending_interjections.clone();
+        let native_agents_enabled = {
+            let sampling = self.rebuild_spec.active_sampling_config.read();
+            self.models_manager
+                .model_supports_codex_multi_agent_v2(&sampling.model)
+        };
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
         let dispatch_futures: Vec<_> = approved
             .iter()
@@ -647,7 +652,8 @@ impl SessionActor {
                 let pending_interjections = pending_interjections.clone();
                 let blocking_wait_depth = self.tool_context.blocking_wait_depth.clone();
                 let interruptible =
-                    is_interruptible_wait_tool(&prepared.tool_name, &prepared.parsed_args);
+                    is_interruptible_wait_tool(&prepared.tool_name, &prepared.parsed_args)
+                        || (native_agents_enabled && prepared.tool_name == "wait_agent");
                 let lock = lock_path_for_args(&prepared.parsed_args)
                     .and_then(|fp| file_locks.get(fp).cloned());
                 async move {
@@ -682,7 +688,16 @@ impl SessionActor {
                                     tool = %prepared.tool_name,
                                     "abort wait tool: interjection pending"
                                 );
-                                Ok(interrupted_wait_tool_result(&prepared.parsed_args))
+                                if native_agents_enabled && prepared.tool_name == "wait_agent" {
+                                    let value = serde_json::json!({"updates": [], "interrupted": true, "timed_out": false});
+                                    Ok(ToolRunResult {
+                                        prompt_text: value.to_string(),
+                                        output: ToolsToolOutput::Dynamic(value.into()),
+                                        effective_tool_name: None,
+                                    })
+                                } else {
+                                    Ok(interrupted_wait_tool_result(&prepared.parsed_args))
+                                }
                             }
                         }
                     } else {
@@ -972,15 +987,17 @@ impl SessionActor {
     /// same parsing, plan-mode, hook, permission, auth-retry, and workspace
     /// path as a model-emitted function call. The result is returned to the
     /// JavaScript runtime and is deliberately not appended as a top-level
-    /// function-call output in the model conversation.
+    /// function-call output in the model conversation. Tool stream progress
+    /// items are forwarded through `progress` as observation-only chunks.
     pub(crate) async fn dispatch_code_mode_nested_tool(
         &self,
         invocation: xai_grok_code_mode_protocol::CodeModeNestedToolCall,
         cancellation_token: tokio_util::sync::CancellationToken,
+        progress: xai_grok_code_mode_protocol::NestedToolProgressSink,
     ) -> Result<serde_json::Value, String> {
         MODEL_TOOL_RESULT_SINK
             .scope(ModelToolResultSink::CodeMode, async move {
-                self.dispatch_code_mode_nested_tool_inner(invocation, cancellation_token)
+                self.dispatch_code_mode_nested_tool_inner(invocation, cancellation_token, progress)
                     .await
             })
             .await
@@ -1000,6 +1017,7 @@ impl SessionActor {
         &self,
         invocation: xai_grok_code_mode_protocol::CodeModeNestedToolCall,
         cancellation_token: tokio_util::sync::CancellationToken,
+        progress: xai_grok_code_mode_protocol::NestedToolProgressSink,
     ) -> Result<serde_json::Value, String> {
         use xai_grok_code_mode_protocol::{CodeModeToolKind, PUBLIC_TOOL_NAME, WAIT_TOOL_NAME};
 
@@ -1009,7 +1027,7 @@ impl SessionActor {
         }
         if crate::session::code_mode::is_code_mode_direct_only_tool(&tool_name) {
             return Err(format!(
-                "`{tool_name}` pauses the turn for user interaction and cannot run inside a \
+                "`{tool_name}` is a direct-only control tool and cannot run inside a \
                  Code Mode cell; call the `{tool_name}` function tool directly instead"
             ));
         }
@@ -1078,6 +1096,33 @@ impl SessionActor {
             }
         };
 
+        // Bind observations to the real task before dispatch yields: an
+        // interjection during execution must not reattribute an older tool
+        // result to a newer user request.
+        let nested_experience_context = if !self.startup_hints.is_subagent
+            && self
+                .memory
+                .storage()
+                .is_some_and(|storage| !storage.is_ephemeral())
+        {
+            let conversation = self.chat_state_handle.get_conversation().await;
+            Some((
+                crate::session::memory::experience_ledger::latest_task_fingerprint(&conversation),
+                self.current_turn_number.get(),
+                conversation.len(),
+            ))
+        } else {
+            None
+        };
+        let nested_experience_tool_identity = nested_experience_context.as_ref().and_then(|_| {
+            self.agent
+                .borrow()
+                .tool_bridge()
+                .toolset()
+                .get_tool_metadata(&prepared.tool_name)
+                .map(|metadata| (metadata.kind(), metadata.tool_namespace()))
+        });
+
         // Start lifecycle tracking only after preflight succeeds. Permission,
         // hook, parsing, and availability failures are already represented by
         // `prepare_tool_call`; opening an execution lifecycle before that point
@@ -1097,10 +1142,13 @@ impl SessionActor {
         self.signals_handle().record_tool_call(&prepared.tool_name);
         let tool_started_at = std::time::Instant::now();
         let dispatch = || {
-            dispatch_tool(
+            dispatch_code_mode_nested_tool_streaming(
                 &self.workspace_ops,
                 &prepared,
                 self.session_info.id.0.as_ref(),
+                &cancellation_token,
+                &progress,
+                |update| self.send_update(acp::SessionUpdate::ToolCallUpdate(update), None),
             )
         };
         let (result, was_cancelled) = tokio::select! {
@@ -1135,6 +1183,30 @@ impl SessionActor {
                         .or_else(|| prepared.dispatch_target_name.clone())
                         .unwrap_or_else(|| prepared.tool_name.clone());
                     let drained = DrainedToolSuccess::new(tool_result);
+                    let trusted_nested_evidence = nested_experience_context
+                        .as_ref()
+                        .zip(nested_experience_tool_identity)
+                        .filter(|(_, (kind, namespace))| {
+                            crate::session::memory::experience_ledger::is_trusted_registered_tool(
+                                &prepared.tool_name,
+                                &effective_tool_name,
+                                *kind,
+                                *namespace,
+                            )
+                        })
+                        .and_then(
+                            |((task_fingerprint, turn_number, conversation_position), _)| {
+                                crate::session::memory::experience_ledger::evidence_from_output(
+                                    &prepared.call_id,
+                                    &effective_tool_name,
+                                    &prepared.parsed_args,
+                                    drained.output(),
+                                    task_fingerprint.clone(),
+                                    *turn_number,
+                                    *conversation_position,
+                                )
+                            },
+                        );
                     // Reject failed apply_patch into JS *after* the ACP card is
                     // emitted. The TUI already shows ApplicationError; without
                     // this reject, Code Mode resolves `{}` and the model treats
@@ -1158,6 +1230,17 @@ impl SessionActor {
                     )
                     .await
                     .map_err(|error| error.to_string())?;
+                    if let Some(evidence) = trusted_nested_evidence
+                        && self
+                            .memory
+                            .storage()
+                            .is_some_and(|storage| !storage.is_ephemeral())
+                    {
+                        crate::session::memory::experience_ledger::record(
+                            self.memory.experience_run_id(),
+                            evidence,
+                        );
+                    }
                     if let Some(tool_result_value) = post_tool_use_result {
                         let raw_input = serde_json::from_str(&prepared.raw_arguments)
                             .unwrap_or(serde_json::Value::Null);
@@ -1273,7 +1356,9 @@ impl SessionActor {
         call: crate::sampling::types::ToolCallResponse,
         deferred_followups: &mut Vec<ConversationItem>,
     ) -> Result<Result<PreparedToolCall, ToolLoop>, acp::Error> {
-        let tool_call_id = acp::ToolCallId::new(Arc::from(call.id.clone()));
+        let tool_call_id = acp::ToolCallId::new(Arc::from(
+            xai_grok_sampling_types::conversation::provider_tool_call_id(&call.id),
+        ));
         let model_id_str = self.current_model_id().await;
         tracing::info!(
             "Model requesting tool: name='{}', call_id='{}'",
@@ -1312,6 +1397,60 @@ impl SessionActor {
             .await;
         }
         let mcp_parts = parse_mcp_tool_name(&call.function.name);
+        if matches!(
+            call.function.name.as_str(),
+            "send_message" | "followup_task"
+        ) && xai_grok_sampling_types::conversation::decode_codex_function_call_id(&call.id)
+            .is_some()
+        {
+            let enabled = {
+                let sampling = self.rebuild_spec.active_sampling_config.read();
+                sampling.provider == xai_grok_sampling_types::ModelProvider::Codex
+                    && sampling.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                    && self
+                        .models_manager
+                        .model_supports_codex_multi_agent_v2(&sampling.model)
+            };
+            if !enabled {
+                let error =
+                    anyhow::anyhow!("Native agent messages are no longer enabled on this route");
+                deferred_followups.extend(
+                    self.handle_tool_error(
+                        &tool_call_id,
+                        &call.id,
+                        &call.function.name,
+                        None,
+                        &error,
+                        &model_id_str,
+                    )
+                    .await,
+                );
+                return Ok(Err(ToolLoop::NonExistingTool));
+            }
+        }
+        if matches!(
+            call.function.name.as_str(),
+            "send_user_message_async" | "spawn_agent" | "interrupt_agent"
+        ) {
+            let provider = self.rebuild_spec.active_sampling_config.read().provider;
+            if !self.local_tool_allowed_for_provider(&call.function.name, provider) {
+                let error = anyhow::anyhow!(
+                    "This metadata-gated tool is not enabled for the current model or session"
+                );
+                let followups = self
+                    .handle_tool_error(
+                        &tool_call_id,
+                        &call.id,
+                        &call.function.name,
+                        None,
+                        &error,
+                        &model_id_str,
+                    )
+                    .await;
+                deferred_followups.extend(followups);
+                return Ok(Err(ToolLoop::NonExistingTool));
+            }
+        }
         let is_mcp_tool = mcp_parts.is_some();
         if is_mcp_tool && !self.mcp_state.lock().await.is_initialized() {
             match self.mcp_strategy.get() {
@@ -2320,6 +2459,20 @@ impl SessionActor {
                     vec![],
                 )
             }
+            ToolInput::ExperienceSearch(search) => {
+                let end = search
+                    .query
+                    .char_indices()
+                    .nth(60)
+                    .map_or(search.query.len(), |(i, _)| i);
+                let display = &search.query[..end];
+                (
+                    format!("Experience search: \"{display}\""),
+                    acp::ToolKind::Other,
+                    vec![],
+                    vec![],
+                )
+            }
             ToolInput::MemoryGet(mg) => (
                 format!("Memory read: {}", mg.path),
                 acp::ToolKind::Read,
@@ -3158,6 +3311,11 @@ impl SessionActor {
                 })
                 .await;
             }
+            SamplingEvent::ToolCallArgumentsComplete { .. } => {
+                // The canonical finalized tool call is still dispatched by
+                // `Completed`; this optional streaming hint has no separate
+                // ACP representation until an early-execution consumer is wired.
+            }
             SamplingEvent::ResponseStarted {
                 message_id,
                 model,
@@ -3754,6 +3912,51 @@ mod plan_mode_edit_gate_tests {
             ),
             PlanEditGate::Allow
         );
+    }
+
+    #[test]
+    fn freeform_apply_patch_keeps_the_normal_plan_edit_gate() {
+        let fixture = active_fixture();
+        let surface = crate::session::tool_surface::EffectiveToolSurface::build(
+            vec![xai_grok_sampling_types::ToolSpec {
+                name: "apply_patch".into(),
+                description: None,
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+            &[],
+            &[],
+            xai_grok_sampling_types::ToolMode::Direct,
+            xai_grok_sampling_types::ModelProvider::Codex,
+            &xai_grok_sampling_types::ApiBackend::Responses,
+            false,
+        )
+        .unwrap()
+        .with_freeform_apply_patch(true);
+        for (patch, allowed) in [
+            (
+                "*** Begin Patch\n*** Add File: ../../gate-session/plan.md\n+# Plan\n*** End Patch",
+                true,
+            ),
+            (
+                "*** Begin Patch\n*** Add File: source.rs\n+changed\n*** End Patch",
+                false,
+            ),
+            ("invalid patch", false),
+        ] {
+            let call = xai_grok_sampling_types::ToolCall::custom(
+                "patch-call",
+                "patch-item",
+                "apply_patch",
+                patch,
+            );
+            let dispatch = surface.freeform_apply_patch_call(&call).unwrap();
+            let input: xai_grok_tools::implementations::codex::apply_patch::ApplyPatchInput =
+                serde_json::from_str(&dispatch.function.arguments).unwrap();
+            assert_eq!(
+                gate(&fixture, &ToolInput::ApplyPatch(input)) == PlanEditGate::Allow,
+                allowed
+            );
+        }
     }
 
     #[test]

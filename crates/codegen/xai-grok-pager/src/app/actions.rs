@@ -3632,6 +3632,11 @@ pub enum TaskResult {
     /// Best-effort xAI `x.ai/auth/cancel` completed. UI state already left
     /// `Authenticating`, so dispatch intentionally treats this as a no-op.
     AuthCancelComplete,
+    CodexLoginUrlReady {
+        agent_id: Option<AgentId>,
+        purpose: CodexLoginPurpose,
+        authorization_url: Option<String>,
+    },
     /// Independent OpenAI Codex browser OAuth finished.
     CodexLoginComplete {
         agent_id: Option<AgentId>,

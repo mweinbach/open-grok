@@ -94,7 +94,7 @@ async fn dispatch_workspace_info_reports_server_version() {
         .await
         .expect("workspace.info dispatch");
     let info: WorkspaceInfo = serde_json::from_value(value).expect("typed WorkspaceInfo");
-    assert_eq!(Some(xai_grok_version::VERSION.to_owned()), info.version);
+    assert_eq!(Some(xai_grok_version::version().to_owned()), info.version);
 }
 #[tokio::test]
 async fn dispatch_unknown_method_returns_unknown_method_error() {

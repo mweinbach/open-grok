@@ -8,6 +8,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use xai_grok_code_mode_protocol::NestedToolProgressSink;
 
 use crate::session_runtime::CellEvent;
 use crate::session_runtime::ObserveMode;
@@ -38,10 +39,12 @@ pub(crate) struct CellToolCall {
 /// Implementations must not return from `closed` until the session can no longer
 /// route requests to the cell.
 pub(crate) trait CellHost: Send + Sync + 'static {
+    /// `progress` receives observation-only chunks while the invocation runs.
     fn invoke_tool(
         &self,
         invocation: CellToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
     ) -> impl Future<Output = Result<JsonValue, String>> + Send;
 
     fn notify(

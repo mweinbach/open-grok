@@ -16,6 +16,7 @@ use crate::scrollback::blocks::tool::{
     ReadMediaKind, ReadToolCallBlock, ToolCallBlock, UseToolCallBlock, WebFetchToolCallBlock,
     WebSearchToolCallBlock,
 };
+use crate::scrollback::blocks::{CodeModeStreamBlock, CodeModeStreamTool};
 use crate::scrollback::entry::{EntryId, ScrollbackEntry};
 use crate::scrollback::state::ScrollbackState;
 use crate::scrollback::state::verb_group::verb_group_kind_changed;
@@ -224,6 +225,44 @@ impl WritingToolCall {
 }
 /// Cap on remembered per-index tool names per sample (model-driven input).
 const MAX_WRITING_TOOL_NAMES: usize = 64;
+/// Candidate transport names; canonical ACP cards always remain authoritative.
+const CODE_MODE_EXEC_TOOL: &str = "exec";
+const CODE_MODE_WAIT_TOOL: &str = "wait";
+/// Max concurrent remembered Code Mode transport streams per sample
+/// (model-driven indices; bounded like [`MAX_WRITING_TOOL_NAMES`]).
+const MAX_CODE_MODE_STREAMS: usize = 8;
+/// Live transport payload trim threshold (chars). Past this, the retained
+/// buffer shrinks to [`CODE_MODE_STREAM_TRIM_TO_CHARS`] keeping the tail.
+pub(crate) const CODE_MODE_STREAM_TRIM_AT_CHARS: usize = 6_000;
+/// Retained tail size after a live transport payload trim.
+pub(crate) const CODE_MODE_STREAM_TRIM_TO_CHARS: usize = 4_000;
+/// Which transport tool a live stream belongs to, plus its capped payload and
+/// scrollback entry. Keyed by `tool_index` within the current sample.
+#[derive(Debug)]
+struct CodeModeStreamState {
+    tool: CodeModeStreamTool,
+    payload: String,
+    dropped_chars: u64,
+    entry_id: Option<EntryId>,
+}
+impl CodeModeStreamState {
+    fn new(tool: CodeModeStreamTool) -> Self {
+        Self {
+            tool,
+            payload: String::new(),
+            dropped_chars: 0,
+            entry_id: None,
+        }
+    }
+}
+/// Transport-tool match for a delta chunk's `name`, if any.
+fn code_mode_transport_kind(name: &str) -> Option<CodeModeStreamTool> {
+    match name {
+        CODE_MODE_EXEC_TOOL => Some(CodeModeStreamTool::Exec),
+        CODE_MODE_WAIT_TOOL => Some(CodeModeStreamTool::Wait),
+        _ => None,
+    }
+}
 /// `strings`-greppable marker proving a binary carries this fix (kept by `#[used]`).
 #[used]
 static PAGER_IMPL_WAIT_STATUS_MIDTURN: &str = "PAGER_IMPL_wait_status_midturn";
@@ -411,6 +450,9 @@ pub struct AcpUpdateTracker {
     /// switch-back; `None` marks an index observed before its name arrived
     /// (it still ranks for ordinals). Cleared together with `writing_tool_call`.
     writing_tool_names: HashMap<u32, Option<String>>,
+    /// Bounded private transport fragments used solely to infer nested tools.
+    /// Visible entries contain sanitized tool names, never transport payloads.
+    code_mode_streams: HashMap<u32, CodeModeStreamState>,
     /// Pending ACP commands from the most recent `AvailableCommandsUpdate`.
     /// Consumed by the caller via `take_pending_acp_commands()`. The caller
     /// is responsible for copying to `AgentSession.available_commands` and
@@ -737,6 +779,179 @@ impl AcpUpdateTracker {
             *at = std::time::Instant::now() - age;
         }
     }
+    /// Infer sanitized nested-tool previews from transport fragments without
+    /// exposing transport names, JavaScript, arguments, or wait payloads.
+    ///
+    /// The chunk's `name` is present only on its first fragment per tool per
+    /// sample; later fragments carry only `arguments_delta` and are matched
+    /// by `tool_index`.
+    ///
+    /// Returns `true` when visible state changed (redraw warranted).
+    pub fn handle_tool_call_delta(
+        &mut self,
+        scrollback: &mut ScrollbackState,
+        name: Option<&str>,
+        arguments_delta: Option<&str>,
+        tool_index: u32,
+    ) -> bool {
+        // Same retry-override release as the spinner path: streaming data
+        // proves sampling resumed.
+        let retry_cleared = self.retry_activity.take().is_some();
+        let transport = match name {
+            Some(name) => match code_mode_transport_kind(name) {
+                // First fragment of this index this sample — reset stale
+                // payload but reuse a still-visible entry so an index reused
+                // across samples updates in place instead of stacking blocks.
+                Some(tool) => {
+                    if !self.code_mode_streams.contains_key(&tool_index)
+                        && self.code_mode_streams.len() >= MAX_CODE_MODE_STREAMS
+                        && let Some(oldest) = self.code_mode_streams.keys().copied().min()
+                    {
+                        self.retire_code_mode_stream(scrollback, oldest);
+                    }
+                    let state = self
+                        .code_mode_streams
+                        .entry(tool_index)
+                        .or_insert_with(|| CodeModeStreamState::new(tool));
+                    state.tool = tool;
+                    state.payload.clear();
+                    state.dropped_chars = 0;
+                    Some(tool)
+                }
+                None => {
+                    // An ordinary tool claimed this index: any live block
+                    // here belongs to a previous sample — retire it.
+                    self.retire_code_mode_stream(scrollback, tool_index);
+                    None
+                }
+            },
+            None => self.code_mode_streams.get(&tool_index).map(|s| s.tool),
+        };
+        let changed = match transport {
+            Some(tool) => self.append_code_mode_stream_delta(
+                scrollback,
+                tool_index,
+                tool,
+                arguments_delta.unwrap_or(""),
+            ),
+            None => self.note_tool_call_arguments_delta(name, tool_index),
+        };
+        retry_cleared | changed
+    }
+
+    pub(crate) fn note_registered_tool_call_arguments_delta(
+        &mut self,
+        scrollback: &mut ScrollbackState,
+        name: Option<&str>,
+        tool_index: u32,
+    ) -> bool {
+        let retired = self.retire_code_mode_stream(scrollback, tool_index);
+        self.note_tool_call_arguments_delta(name, tool_index) || retired
+    }
+
+    fn append_code_mode_stream_delta(
+        &mut self,
+        scrollback: &mut ScrollbackState,
+        tool_index: u32,
+        tool: CodeModeStreamTool,
+        delta: &str,
+    ) -> bool {
+        if !self.code_mode_streams.contains_key(&tool_index)
+            && self.code_mode_streams.len() >= MAX_CODE_MODE_STREAMS
+        {
+            // Deterministic eviction: drop the lowest tracked index.
+            if let Some(oldest) = self.code_mode_streams.keys().copied().min() {
+                self.retire_code_mode_stream(scrollback, oldest);
+            }
+        }
+        let state = self
+            .code_mode_streams
+            .entry(tool_index)
+            .or_insert_with(|| CodeModeStreamState::new(tool));
+        if !delta.is_empty() {
+            state.payload.push_str(delta);
+            let len = state.payload.chars().count();
+            if len > CODE_MODE_STREAM_TRIM_AT_CHARS {
+                let drop = len - CODE_MODE_STREAM_TRIM_TO_CHARS;
+                state.payload = state.payload.chars().skip(drop).collect();
+                state.dropped_chars += drop as u64;
+            }
+        }
+        let nested_tools = CodeModeStreamBlock::nested_tool_names(tool, &state.payload);
+        if nested_tools.is_empty() {
+            return state
+                .entry_id
+                .take()
+                .is_some_and(|entry_id| scrollback.remove_entry(entry_id));
+        }
+
+        let first_nested_tool = nested_tools[0].clone();
+        let visible_payload = nested_tools.join("\n");
+        let entry_changed = match state.entry_id {
+            Some(entry_id) => {
+                let unchanged = scrollback.get_by_id(entry_id).is_some_and(|entry| {
+                    matches!(&entry.block, RenderBlock::CodeModeStream(block) if block.payload() == visible_payload)
+                });
+                if unchanged {
+                    false
+                } else {
+                    scrollback.set_code_mode_stream_payload(
+                        entry_id,
+                        &state.payload,
+                        state.dropped_chars,
+                    )
+                }
+            }
+            None => {
+                let entry_id = scrollback.push_block(RenderBlock::CodeModeStream(
+                    CodeModeStreamBlock::new(tool, &state.payload, state.dropped_chars),
+                ));
+                state.entry_id = Some(entry_id);
+                true
+            }
+        };
+        let activity_changed =
+            self.note_tool_call_arguments_delta(Some(&first_nested_tool), tool_index);
+        entry_changed || activity_changed
+    }
+    /// Remove one transport stream's block and forget its state.
+    /// Returns `true` when a visible entry was removed.
+    fn retire_code_mode_stream(
+        &mut self,
+        scrollback: &mut ScrollbackState,
+        tool_index: u32,
+    ) -> bool {
+        match self.code_mode_streams.remove(&tool_index) {
+            Some(state) => match state.entry_id {
+                Some(entry_id) => scrollback.remove_entry(entry_id),
+                None => false,
+            },
+            None => false,
+        }
+    }
+    /// Remove every visible transport block without forgetting per-index
+    /// state, so nameless continuation deltas can resurrect their stream
+    /// (interleaved text/thought chunks must not strand a half-written call).
+    /// Returns `true` when any entry was removed.
+    fn retire_code_mode_stream_entries(&mut self, scrollback: &mut ScrollbackState) -> bool {
+        let ids: Vec<EntryId> = self
+            .code_mode_streams
+            .values_mut()
+            .filter_map(|s| s.entry_id.take())
+            .collect();
+        let mut changed = false;
+        for entry_id in ids {
+            changed |= scrollback.remove_entry(entry_id);
+        }
+        changed
+    }
+    /// Forget all transport streams and remove their blocks (turn or sample
+    /// boundary). Returns `true` when any visible entry was removed.
+    pub fn finish_code_mode_streams(&mut self, scrollback: &mut ScrollbackState) -> bool {
+        let changed = self.retire_code_mode_stream_entries(scrollback);
+        self.code_mode_streams.clear();
+        changed
+    }
     /// Take pending ACP commands, if any. Returns `None` if no update arrived
     /// since the last drain.
     ///
@@ -970,6 +1185,9 @@ impl AcpUpdateTracker {
                 if let Some(agent_id) = self.current_agent_msg.take() {
                     scrollback.finish_running(agent_id);
                 }
+                // New LLM response: transport streams of the previous sample
+                // finished writing (their cells already ran or were dropped).
+                self.finish_code_mode_streams(scrollback);
                 if !meta.is_replay
                     && self.current_thinking.is_none()
                     && self.activity_known_blocking_wait().is_none()
@@ -986,9 +1204,15 @@ impl AcpUpdateTracker {
                 | acp::SessionUpdate::ToolCall(_)
                 | acp::SessionUpdate::ToolCallUpdate(_)
         );
+        let mut code_mode_retired = false;
         if is_agent_output && !matches!(&update, acp::SessionUpdate::ToolCallUpdate(_)) {
             self.writing_tool_call = None;
             self.writing_tool_names.clear();
+            // Canonical output (text, thought, or a tool card) means any
+            // transport call stopped streaming — retire its live view.
+            // Per-index state survives so a continuation delta can still
+            // resurrect an interleaved stream.
+            code_mode_retired = self.retire_code_mode_stream_entries(scrollback);
         }
         let changed = match update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
@@ -1018,6 +1242,7 @@ impl AcpUpdateTracker {
             acp::SessionUpdate::Plan(_) | acp::SessionUpdate::CurrentModeUpdate(_) => false,
             _ => false,
         };
+        let changed = changed || code_mode_retired;
         if is_agent_output && changed && !meta.is_replay {
             self.bump_agent_output_epoch();
         }
@@ -1050,6 +1275,7 @@ impl AcpUpdateTracker {
         self.retry_activity = None;
         self.writing_tool_call = None;
         self.writing_tool_names.clear();
+        self.finish_code_mode_streams(scrollback);
         self.suppressed_tools.clear();
         self.blocking_waits.clear();
         self.orphan_updates.clear();
@@ -1121,6 +1347,13 @@ impl AcpUpdateTracker {
         if text.is_empty() {
             return false;
         }
+        let async_message = chunk.meta.as_ref().is_some_and(|meta| {
+            meta.get(xai_grok_tools::implementations::codex::send_user_message_async::ASYNC_USER_MESSAGE_META_KEY)
+                .and_then(serde_json::Value::as_bool) == Some(true)
+        });
+        if async_message && let Some(previous) = self.current_agent_msg.take() {
+            scrollback.finish_running(previous);
+        }
         if self.current_agent_msg.is_none() && text.trim().is_empty() {
             tracing::warn!(
                 text = %text.escape_debug(),
@@ -1140,11 +1373,16 @@ impl AcpUpdateTracker {
         {
             entry.created_at = Some(utc_ms_to_local(ts_ms));
         }
-        if meta.is_replay {
+        let changed = if meta.is_replay {
             scrollback.push_chunk_to_agent_deferred(id, &text)
         } else {
             scrollback.push_chunk_to_agent(id, &text)
+        };
+        if async_message {
+            scrollback.finish_running(id);
+            self.current_agent_msg = None;
         }
+        changed
     }
     /// Handle an agent thought chunk (streaming thinking).
     fn handle_thought_chunk(

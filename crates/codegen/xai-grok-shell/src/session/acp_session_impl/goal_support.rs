@@ -1353,8 +1353,14 @@ impl SessionActor {
             .await
             .map(|c| c.model)
             .unwrap_or_default();
-        // Fork owns history; fail-open stays OBJECTIVE-only (no last-assistant CONTEXT).
-        let context = String::new();
+        let memory_storage = self.memory.storage();
+        let context = crate::session::goal_planner::goal_experience_planning_context(
+            memory_storage.as_ref(),
+            self.memory.initial_injection_config.enabled,
+            &attempt_objective,
+            "",
+            self.memory.experience_run_id(),
+        );
 
         let task_tool_name = self.resolve_goal_tool_names().await.task;
         // Tag the planner with the goal-creation turn's prompt id so its

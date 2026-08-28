@@ -683,7 +683,7 @@ mod tests {
             FakeLeaderBehavior::Normal {
                 versions: FakeVersions {
                     protocol_version: Some(999),
-                    binary_version: Some(xai_grok_version::VERSION.to_string()),
+                    binary_version: Some(xai_grok_version::version().to_string()),
                 },
                 caps: fake_caps(true, false),
             },

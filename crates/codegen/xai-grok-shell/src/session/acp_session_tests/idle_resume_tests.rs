@@ -1,6 +1,47 @@
 use super::support::*;
 use super::*;
 use tokio::sync::mpsc;
+
+#[tokio::test(flavor = "current_thread")]
+async fn experience_run_identity_is_unique_per_session_activation() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (first_gateway_tx, _) = mpsc::unbounded_channel();
+            let (first_persistence_tx, _) = mpsc::unbounded_channel();
+            let first =
+                create_test_actor(50_000, 100_000, 85, first_gateway_tx, first_persistence_tx)
+                    .await;
+
+            let (resumed_gateway_tx, _) = mpsc::unbounded_channel();
+            let (resumed_persistence_tx, _) = mpsc::unbounded_channel();
+            let resumed = create_test_actor(
+                50_000,
+                100_000,
+                85,
+                resumed_gateway_tx,
+                resumed_persistence_tx,
+            )
+            .await;
+
+            assert_eq!(first.session_info.id, resumed.session_info.id);
+            assert_eq!(
+                first.memory.experience_run_id(),
+                first.memory.experience_run_id()
+            );
+            assert_ne!(
+                first.memory.experience_run_id(),
+                resumed.memory.experience_run_id(),
+                "resuming the same persistent session must create a fresh experience run"
+            );
+            assert!(uuid::Uuid::try_parse(first.memory.experience_run_id()).is_ok());
+            assert!(uuid::Uuid::try_parse(resumed.memory.experience_run_id()).is_ok());
+            assert!(first.memory.experience_prior_tool_result_ids().is_empty());
+            assert!(resumed.memory.experience_prior_tool_result_ids().is_empty());
+        })
+        .await;
+}
+
 /// Test that `last_api_request_at` is recorded and used for idle detection.
 ///
 /// The `maybe_refresh_model_metadata_on_resume` method checks this timestamp
@@ -207,6 +248,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
+                    experience_run_id: uuid::Uuid::now_v7().to_string(),
+                    experience_prior_tool_result_ids: std::collections::HashSet::new(),
                     embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
                     active_provider: std::cell::Cell::new(
                         xai_grok_sampling_types::ModelProvider::Xai,
@@ -237,6 +280,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 max_retries: 3,
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
+                pending_native_agent_messages: Default::default(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,

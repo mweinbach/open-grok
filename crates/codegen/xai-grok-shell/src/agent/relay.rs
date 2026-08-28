@@ -387,7 +387,7 @@ fn build_relay_request(config: &RelayConfig) -> anyhow::Result<axum::http::Reque
     );
     req.headers_mut().insert(
         "x-grok-client-version",
-        axum::http::header::HeaderValue::from_static(xai_grok_version::VERSION),
+        axum::http::header::HeaderValue::from_static(xai_grok_version::version()),
     );
     req.headers_mut().insert(
         crate::http::CLIENT_MODE_HEADER,

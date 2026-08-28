@@ -7,8 +7,8 @@ use super::render::int_step_sizes;
 use super::state::{
     RowEntry, SettingsEntryPoint, SettingsKeyOutcome, SettingsModalState, SettingsMode,
     SettingsModeKind, action_for_bool, action_for_enum, action_for_enum_commit, action_for_int,
-    action_for_string, dynamic_group_choices, effective_enum_choices, group_children,
-    validate_string,
+    action_for_string, dynamic_group_choices, effective_enum_choices, filtered_group_choices,
+    group_children, validate_string,
 };
 use crate::app::actions::Action;
 use crate::input::line_editor::LineEditOutcome;
@@ -59,6 +59,18 @@ pub fn handle_settings_paste(state: &mut SettingsModalState, text: &str) -> Sett
         SettingsModeKind::FilterFocused => {
             let outcome = state.state.filter.insert_paste(text);
             apply_filter_edit(state, outcome)
+        }
+        // Sub-sheet search box (OpenRouter / OpenCode Go / custom model
+        // catalogs) accepts pasted queries too.
+        SettingsModeKind::PickingGroup if state.group_filter_focused => {
+            let group_key = match &state.state.mode {
+                SettingsMode::PickingGroup { key, .. } => *key,
+                _ => unreachable!("mode kind changed before paste"),
+            };
+            let outcome = state
+                .group_filter
+                .insert_paste_with_policy(text, safe_settings_char, usize::MAX);
+            apply_group_filter_edit(state, group_key, outcome)
         }
         SettingsModeKind::EditingString => {
             let (validator, outcome) = {
@@ -245,6 +257,13 @@ fn handle_picking_enum(state: &mut SettingsModalState, key: &KeyEvent) -> Settin
 /// Group sub-sheet key routing. Up/Down moves between the child toggles;
 /// Space/Enter toggles the focused child in place (the sheet stays open);
 /// Esc returns to Browse.
+///
+/// Dynamic multi-select sheets (OpenRouter / OpenCode Go / custom model
+/// catalogs) additionally support `/` search: typing edits the query,
+/// which filters the list case-insensitively; Enter commits (unfocuses
+/// the query so toggles work); Esc clears a non-empty query first and
+/// exits the sheet on the second press. `child_idx` indexes the
+/// *filtered* list while a dynamic sheet is open.
 fn handle_picking_group(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyOutcome {
     let (group_key, child_idx) = match &state.state.mode {
         SettingsMode::PickingGroup { key, child_idx } => (*key, *child_idx),
@@ -252,38 +271,81 @@ fn handle_picking_group(state: &mut SettingsModalState, key: &KeyEvent) -> Setti
     };
     let children = group_children(state, group_key);
     let dynamic_choices = dynamic_group_choices(state, group_key);
-    let choice_len = if dynamic_choices.is_empty() {
-        children.len()
+    let has_dynamic = !dynamic_choices.is_empty();
+    let filtered_len = if has_dynamic {
+        filtered_group_choices(state, group_key).len()
     } else {
-        dynamic_choices.len()
+        0
     };
-    if choice_len == 0 {
+    let choice_len = if has_dynamic {
+        filtered_len
+    } else {
+        children.len()
+    };
+    if choice_len == 0 && !(has_dynamic && state.group_filter_focused) {
         // Defensive: a group with no children can't be navigated — back out.
+        // (A focused filter on an empty result set stays open so Esc can
+        // clear the query instead of closing the sheet.)
         state.transition_to_browse();
         return SettingsKeyOutcome::Changed;
     }
 
     match key.code {
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j')
+            if !state.group_filter_focused || !has_dynamic =>
+        {
             if child_idx + 1 >= choice_len {
                 return SettingsKeyOutcome::Unchanged;
             }
             state.transition_to_picking_group(group_key, child_idx + 1);
             SettingsKeyOutcome::Changed
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k') if !state.group_filter_focused || !has_dynamic => {
             if child_idx == 0 {
                 return SettingsKeyOutcome::Unchanged;
             }
             state.transition_to_picking_group(group_key, child_idx - 1);
             SettingsKeyOutcome::Changed
         }
+        KeyCode::PageDown if has_dynamic && !state.group_filter_focused => {
+            let next = (child_idx + 10).min(choice_len.saturating_sub(1));
+            if next == child_idx {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_picking_group(group_key, next);
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::PageUp if has_dynamic && !state.group_filter_focused => {
+            let next = child_idx.saturating_sub(10);
+            if next == child_idx {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_picking_group(group_key, next);
+            SettingsKeyOutcome::Changed
+        }
+        // `/` focuses the sub-sheet search box (dynamic catalogs only).
+        KeyCode::Char('/') if has_dynamic => {
+            state.group_filter_focused = true;
+            SettingsKeyOutcome::Changed
+        }
         // Space/Enter toggle the focused child Bool and stay in the sheet so the
         // user can flip several tips in a row. The dispatcher refreshes the
         // modal snapshot, so the new value paints on the next frame.
         KeyCode::Char(' ') | KeyCode::Enter => {
-            if !dynamic_choices.is_empty() {
-                return toggle_dynamic_multi_select(state, group_key, child_idx, &dynamic_choices);
+            if has_dynamic {
+                // Enter while the search box is focused commits the query
+                // (unfocuses it) without toggling — matching Browse's
+                // FilterFocused Enter semantics.
+                if state.group_filter_focused && key.code == KeyCode::Enter {
+                    state.group_filter_focused = false;
+                    return SettingsKeyOutcome::Changed;
+                }
+                let choices = filtered_group_choices(state, group_key);
+                let Some((orig_idx, _)) = choices.get(child_idx) else {
+                    return SettingsKeyOutcome::Unchanged;
+                };
+                let orig_idx = *orig_idx;
+                return toggle_dynamic_multi_select(state, group_key, orig_idx, &dynamic_choices);
             }
             let Some(child_key) = children.get(child_idx).copied() else {
                 return SettingsKeyOutcome::Unchanged;
@@ -291,10 +353,52 @@ fn handle_picking_group(state: &mut SettingsModalState, key: &KeyEvent) -> Setti
             activate_group_child(state, child_key)
         }
         KeyCode::Esc => {
+            // Forgiving exit: a non-empty query is cleared first (and focus
+            // clamps to the top of the now-unfiltered list); the second Esc
+            // leaves the sheet.
+            if has_dynamic && !state.group_filter.text().trim().is_empty() {
+                state.group_filter.reset();
+                state.group_filter_focused = false;
+                state.transition_to_picking_group(group_key, 0);
+                return SettingsKeyOutcome::Changed;
+            }
             state.transition_to_browse();
             SettingsKeyOutcome::Changed
         }
-        _ => SettingsKeyOutcome::Unchanged,
+        _ => {
+            if has_dynamic && state.group_filter_focused {
+                let outcome = state
+                    .group_filter
+                    .handle_key_with_insert_policy(key, safe_settings_char);
+                return apply_group_filter_edit(state, group_key, outcome);
+            }
+            SettingsKeyOutcome::Unchanged
+        }
+    }
+}
+
+/// Apply a `LineEditor` outcome for the group sub-sheet search box:
+/// text changes re-filter the list and clamp focus into the filtered set.
+fn apply_group_filter_edit(
+    state: &mut SettingsModalState,
+    group_key: SettingKey,
+    outcome: LineEditOutcome,
+) -> SettingsKeyOutcome {
+    match outcome {
+        LineEditOutcome::TextChanged => {
+            let len = filtered_group_choices(state, group_key).len();
+            let cur = match &state.state.mode {
+                SettingsMode::PickingGroup { child_idx, .. } => *child_idx,
+                _ => 0,
+            };
+            let new_idx = cur.min(len.saturating_sub(1));
+            state.transition_to_picking_group(group_key, new_idx);
+            SettingsKeyOutcome::Changed
+        }
+        LineEditOutcome::HandledNoChange | LineEditOutcome::CursorChanged => {
+            SettingsKeyOutcome::Changed
+        }
+        LineEditOutcome::Unhandled => SettingsKeyOutcome::Unchanged,
     }
 }
 
@@ -1668,7 +1772,10 @@ fn handle_picker_mouse(
 ///
 /// Hover tracks the child row under the cursor; a left-click moves focus to the
 /// clicked child AND toggles it in one click (toggles, unlike the enum picker's
-/// commit-on-Enter). Scroll wheel is a no-op (the sub-sheet is bounded).
+/// commit-on-Enter). The scroll wheel scrolls the sub-sheet viewport (dynamic
+/// catalogs like OpenRouter can be hundreds of rows long); clicks on the
+/// search bar focus the query editor; clicks on list rows map through the
+/// active filter to the underlying choice.
 fn handle_group_mouse(
     state: &mut SettingsModalState,
     kind: MouseEventKind,
@@ -1686,9 +1793,35 @@ fn handle_group_mouse(
         }
         return SettingsKeyOutcome::Unchanged;
     }
+    // Scroll wheel pans the sub-sheet viewport by ~3 rows per tick. The
+    // offset is clamped against the real item count at render time.
+    match kind {
+        MouseEventKind::ScrollDown => {
+            let next = state.group_scroll.saturating_add(3);
+            if next == state.group_scroll {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.group_scroll = next;
+            return SettingsKeyOutcome::Changed;
+        }
+        MouseEventKind::ScrollUp => {
+            let next = state.group_scroll.saturating_sub(3);
+            if next == state.group_scroll {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.group_scroll = next;
+            return SettingsKeyOutcome::Changed;
+        }
+        _ => {}
+    }
     let MouseEventKind::Down(crossterm::event::MouseButton::Left) = kind else {
         return SettingsKeyOutcome::Unchanged;
     };
+    // Click on the search bar focuses the query editor.
+    if rect_contains(state.group_search_rect, column, row) {
+        state.group_filter_focused = true;
+        return SettingsKeyOutcome::Changed;
+    }
     let group_key = match &state.state.mode {
         SettingsMode::PickingGroup { key, .. } => *key,
         _ => unreachable!("group mouse handler requires PickingGroup state"),
@@ -1704,7 +1837,14 @@ fn handle_group_mouse(
     };
     state.transition_to_picking_group(group_key, idx);
     if !dynamic_choices.is_empty() {
-        return toggle_dynamic_multi_select(state, group_key, idx, &dynamic_choices);
+        // Map the clicked *display* row through the active filter back to
+        // its catalog entry before toggling.
+        let choices = filtered_group_choices(state, group_key);
+        let Some((orig_idx, _)) = choices.get(idx) else {
+            return SettingsKeyOutcome::Unchanged;
+        };
+        let orig_idx = *orig_idx;
+        return toggle_dynamic_multi_select(state, group_key, orig_idx, &dynamic_choices);
     }
     let Some(child_key) = children.get(idx).copied() else {
         return SettingsKeyOutcome::Changed;

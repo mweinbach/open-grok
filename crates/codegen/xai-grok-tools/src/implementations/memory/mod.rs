@@ -1,14 +1,20 @@
 //! Memory tools for cross-session knowledge retrieval.
 //!
+//! - `experience_search` — search evidence-backed successes and failures
 //! - `memory_search` — search indexed memory for relevant chunks
 //! - `memory_get` — read a specific memory file by path
 
+pub mod experience_search_tool;
 pub mod get_tool;
 pub mod search_tool;
 pub mod types;
 
+pub use experience_search_tool::ExperienceSearchImpl;
 pub use get_tool::MemoryGetImpl;
 pub use search_tool::MemorySearchImpl;
+
+/// Registered name of the evidence-backed `experience_search` tool.
+pub const EXPERIENCE_SEARCH_TOOL_NAME: &str = "experience_search";
 
 /// Registered name of the `memory_search` tool.
 ///
@@ -29,8 +35,13 @@ mod tests {
     /// `/flush` and `/dream`. Pin both halves.
     #[test]
     fn memory_tool_constants_match_registered_ids() {
+        assert_eq!(EXPERIENCE_SEARCH_TOOL_NAME, "experience_search");
         assert_eq!(MEMORY_SEARCH_TOOL_NAME, "memory_search");
         assert_eq!(MEMORY_GET_TOOL_NAME, "memory_get");
+        assert_eq!(
+            xai_tool_runtime::Tool::id(&ExperienceSearchImpl).to_string(),
+            EXPERIENCE_SEARCH_TOOL_NAME
+        );
         assert_eq!(
             xai_tool_runtime::Tool::id(&MemorySearchImpl).to_string(),
             MEMORY_SEARCH_TOOL_NAME

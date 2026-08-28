@@ -40,6 +40,7 @@ OPENGROK_HOME=/tmp/og-test ./bin/open-grok-dev   # isolated state
 3. Default routine validation to **package-scoped `cargo check`** (`cargo check --locked -p xai-grok-shell`). It skips final linking and avoids creating executable churn. Use `cargo build`, Clippy, or tests only when the change requires them.
 4. Cargo uses its machine-aware default job count (one job per logical CPU). Do not hard-code a repository-wide `-j` limit; use a temporary override only when diagnosing contention.
 5. Features of note on `xai-grok-pager-bin`: `jemalloc`, `sandbox-enforce`; release uses profile **`release-dist`** + feature `release-dist`.
+6. Stamp release identity only in composition-root binaries. Shared crates must read `xai_grok_version::version()` / `version_with_commit()` after the binary initializes `BuildInfo`; embedding `GROK_VERSION` or Git commit metadata in a shared crate invalidates nearly the entire release dependency graph.
 
 ## Formatting and lint
 
@@ -162,16 +163,18 @@ Produces under `dist/`:
 
 Binaries are stripped and ad-hoc signed, **not** notarized.
 
-### Linux release build (x86_64)
+### Linux release build (x86_64 / arm64)
 
 ```sh
-# Clean worktree required; ripgrep 15.0.0 x86_64 on PATH or GROK_TOOLS_BUNDLE_RG_PATH
+# Clean worktree required; ripgrep 15.0.0 for the host arch on PATH or
+# GROK_TOOLS_BUNDLE_RG_PATH
 ./scripts/build-linux-release.sh
 ```
 
 Produces under `dist/`:
 
-- `open-grok-linux-x86_64` + `.sha256`
+- `open-grok-linux-x86_64` + `.sha256` (on x86_64 hosts)
+- `open-grok-linux-aarch64` + `.sha256` (on arm64 hosts)
 - `install.sh`, `LICENSE`, `THIRD-PARTY-NOTICES`
 
 Binaries are stripped ELF executables, **not** signed.
@@ -197,9 +200,19 @@ archive, verifies the archive digest, and caches it under
 After tests pass, commit the version/release note and create the matching tag
 on that exact commit. Dispatch [`.github/workflows/release.yml`](../../.github/workflows/release.yml)
 with the existing tag. It checks out the tagged source independently on
-Windows x86_64, Apple Silicon macOS, and Linux x86_64, builds and verifies
-all three asset sets, publishes one full GitHub Release, re-downloads the
-public bytes, and verifies the tag is Latest.
+Windows x86_64, Apple Silicon macOS, Linux x86_64, and Linux arm64, builds and
+verifies all four asset sets, publishes one full GitHub Release, re-downloads
+the public bytes, and verifies the tag is Latest.
+
+Release CI preserves Cargo workspace artifacts across fresh GitHub checkouts by
+recording the cached source revision and restoring Git commit mtimes only for
+tracked files unchanged since that revision. Changed, renamed, and new files
+keep their checkout mtimes so Cargo cannot reuse stale outputs. Keep full Git
+history for platform builds, preserve the cache marker and guarded restoration
+order, and run `python3 scripts/test_restore_cargo_mtimes.py` after changing this
+pipeline. CI uses optimized thin-local LTO instead of cross-crate ThinLTO to
+avoid long serial links on GitHub's three- and four-core runners; local
+`release-dist` builds retain their existing profile unless explicitly overridden.
 
 ## Contribution hygiene
 

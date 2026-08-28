@@ -5,7 +5,8 @@
 //! - `chunks` — indexed text chunks with blake3 content hashes
 //! - `chunks_fts` — contentless FTS5 virtual table for BM25 keyword search
 //!
-//! When sqlite-vec is available, a fourth table is created:
+//! Structured experience tables are added non-destructively alongside legacy
+//! Markdown chunks. When sqlite-vec is available, an additional table is created:
 //! - `chunks_vec` — vec0 virtual table for KNN vector search
 
 /// Generate the SQL schema for the memory index.
@@ -48,6 +49,8 @@ INSERT OR IGNORE INTO meta(key, value) VALUES ('reindex_claim', '');
 "#
     );
 
+    sql.push_str(crate::experience::store::EXPERIENCE_SCHEMA_SQL);
+
     if vec_available {
         sql.push_str(&format!(
             "\nCREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(\n    \
@@ -74,6 +77,11 @@ mod tests {
         let sql = schema_sql(1536, false);
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS chunks"));
         assert!(sql.contains("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts"));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS experiences"));
+        assert!(sql.contains("CREATE VIRTUAL TABLE IF NOT EXISTS experience_fts"));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS experience_reuse"));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS experience_source_provenance"));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS experience_finalized_runs"));
         assert!(!sql.contains("chunks_vec"));
         // Connection pragmas live on the open path, not in the schema batch.
         assert!(!sql.contains("PRAGMA"));

@@ -220,7 +220,7 @@ impl HubHandle {
             .url(server_url)
             .auth_provider(config.auth.clone())
             .allow_insecure_ws(config.allow_insecure_ws)
-            .binary_version(xai_grok_version::VERSION)
+            .binary_version(xai_grok_version::version())
             .image_capabilities(
                 crate::image_capabilities::image_capabilities()
                     .wire()

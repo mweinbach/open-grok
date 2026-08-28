@@ -80,6 +80,32 @@ pub enum SamplingEvent {
         arguments_delta: Option<String>,
     },
 
+    /// A single tool call's arguments are final mid-stream.
+    ///
+    /// Emitted exactly once per tool call, after the last
+    /// [`SamplingEvent::ToolCallDelta`] fragment for that `tool_index`.
+    /// Consumers that accumulated the streamed fragments may act on the
+    /// complete payload before the overall response finishes (pipelined
+    /// Code Mode `exec` start); every consumer must still process the
+    /// canonical call carried by `SamplingEvent::Completed`.
+    ///
+    /// Responses: fired on `function_call_arguments.done` /
+    /// `custom_tool_call_input.done`, with `output_item.done` and terminal
+    /// response backstops when per-call done events are absent. Messages: fired on
+    /// `content_block_stop` for `tool_use` blocks. Chat Completions has no
+    /// per-call completion signal and calls may interleave, so it completes
+    /// calls only at `finish_reason` or stream end.
+    ///
+    /// Never emitted after `Completed`/`Failed` for that call. `id`/`name`
+    /// repeat the identity only when this event is the first to carry it;
+    /// consumers must not rely on their presence.
+    ToolCallArgumentsComplete {
+        request_id: RequestId,
+        tool_index: u32,
+        id: Option<String>,
+        name: Option<String>,
+    },
+
     /// The provider opened a response (Messages `message_start`). Carries the
     /// real message id, model, and input-side token counts exactly as they
     /// arrive on the wire, before any content. Surfaced in order so partial-mode

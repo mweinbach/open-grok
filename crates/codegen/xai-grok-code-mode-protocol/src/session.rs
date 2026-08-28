@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::CodeModeNestedToolCall;
 use crate::ExecuteRequest;
+use crate::NestedToolProgressSink;
 use crate::RuntimeResponse;
 use crate::WaitOutcome;
 use crate::WaitRequest;
@@ -86,10 +87,15 @@ impl StartedCell {
 
 /// Host callbacks used by a code-mode session while cells are executing.
 pub trait CodeModeSessionDelegate: Send + Sync {
+    /// Invokes one nested tool. `progress` is an opt-in observation channel:
+    /// implementations may push [`crate::NestedToolProgress`] chunks while the
+    /// tool runs so the calling cell can surface them incrementally. Pushing
+    /// never blocks and must never influence the final result.
     fn invoke_tool<'a>(
         &'a self,
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
     ) -> ToolInvocationFuture<'a>;
 
     fn notify<'a>(

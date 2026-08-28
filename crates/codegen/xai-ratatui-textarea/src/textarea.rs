@@ -1,6 +1,6 @@
 use crate::editor::{
     ApplyEditPlanError, EditBuffer, EditCommand, EditCommandCategory, EditOutcome, EditPlan,
-    WordStyle, classify_key_event,
+    HorizontalEdge, Movement, WordStyle, classify_key_event, resolve_movement,
 };
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -964,8 +964,14 @@ impl TextArea {
         let start = sel.anchor.min(sel.head);
         let end = sel.anchor.max(sel.head);
         let expanded = self.expand_range_to_element_boundaries(start..end);
-        let clamped_start = expanded.start.min(self.text.len());
-        let clamped_end = expanded.end.min(self.text.len());
+        let mut clamped_start = expanded.start.min(self.text.len());
+        let mut clamped_end = expanded.end.min(self.text.len());
+        while clamped_start > 0 && !self.text.is_char_boundary(clamped_start) {
+            clamped_start -= 1;
+        }
+        while clamped_end < self.text.len() && !self.text.is_char_boundary(clamped_end) {
+            clamped_end += 1;
+        }
         if clamped_start >= clamped_end {
             None
         } else {
@@ -1000,9 +1006,45 @@ impl TextArea {
         true
     }
 
+    /// Insert text, replacing the active selection as a single undo step.
+    pub fn insert_str_replacing_selection(&mut self, text: &str) {
+        if self.selection_range().is_none() {
+            self.clear_selection();
+            self.insert_str(text);
+            return;
+        }
+        self.begin_undo_group();
+        self.delete_selection();
+        self.insert_str(text);
+        self.end_undo_group();
+    }
+
     /// Set the selection programmatically.
     pub fn set_selection(&mut self, anchor: usize, head: usize) {
         self.selection = Some(Selection { anchor, head });
+    }
+
+    fn collapse_selection_to(&mut self, position: usize) {
+        self.set_cursor(position);
+        self.clear_selection();
+    }
+
+    fn extend_selection(&mut self, movement: Movement) {
+        let anchor = match self.selection {
+            Some(selection) => {
+                if self.cursor() != selection.head {
+                    self.set_cursor(selection.head);
+                }
+                selection.anchor
+            }
+            None => self.cursor(),
+        };
+        self.apply_movement(movement);
+        if self.cursor() == anchor {
+            self.clear_selection();
+        } else {
+            self.set_selection(anchor, self.cursor());
+        }
     }
 
     /// Take the clipboard contents (returns `None` if empty).
@@ -1901,18 +1943,60 @@ impl TextArea {
         self.apply_edit_command(command, mutation_kind);
     }
 
+    fn apply_movement(&mut self, movement: Movement) {
+        match movement {
+            Movement::Command(command, _) => {
+                self.apply_edit_command(command, None);
+            }
+            Movement::VisualRowUp => self.move_cursor_up(),
+            Movement::VisualRowDown => self.move_cursor_down(),
+            Movement::VisualRowStart => self.move_cursor_to_beginning_of_line(false),
+            Movement::VisualRowEnd => self.move_cursor_to_end_of_line(false),
+            Movement::LogicalLineStart => self.set_cursor(self.beginning_of_current_line()),
+            Movement::LogicalLineEnd => self.set_cursor(self.end_of_current_line()),
+        }
+    }
+
     pub fn input(&mut self, event: KeyEvent) {
-        // ── Selection-aware interception ──
-        // When a selection is active, certain keys interact with the selected
-        // range rather than performing their normal single-char action.
-        if self.selection.is_some() {
-            if let Some(EditCommand::Insert(character)) = classify_key_event(&event) {
-                self.begin_undo_group();
-                if !self.delete_selection() {
-                    self.clear_selection();
+        if event.modifiers.contains(KeyModifiers::SHIFT)
+            && !(matches!(event.code, KeyCode::Up | KeyCode::Down)
+                && event.modifiers.contains(KeyModifiers::SUPER))
+        {
+            let code = match event.code {
+                KeyCode::Char(character) if character.is_ascii_uppercase() => {
+                    KeyCode::Char(character.to_ascii_lowercase())
                 }
-                self.insert_str(&character.to_string());
-                self.end_undo_group();
+                code => code,
+            };
+            let unshifted = KeyEvent::new(code, event.modifiers.difference(KeyModifiers::SHIFT));
+            if let Some(movement) = resolve_movement(&unshifted) {
+                self.extend_selection(movement);
+                return;
+            }
+        }
+
+        if self.selection.is_some() {
+            let classified = classify_key_event(&event);
+            if let Some(EditCommand::Insert(character)) = classified {
+                self.insert_str_replacing_selection(&character.to_string());
+                return;
+            }
+            let category = classified.map(EditCommand::category);
+            if let Some(range) = self.selection_range()
+                && let Some(movement) = resolve_movement(&event)
+            {
+                let edge = match movement.collapse_edge() {
+                    HorizontalEdge::Start => range.start,
+                    HorizontalEdge::End => range.end,
+                };
+                let preferred_column = self.preferred_col;
+                self.collapse_selection_to(edge);
+                if matches!(movement, Movement::VisualRowUp | Movement::VisualRowDown) {
+                    self.preferred_col = preferred_column;
+                }
+                if !movement.stops_at_collapse_edge() {
+                    self.apply_movement(movement);
+                }
                 return;
             }
             match event {
@@ -1926,58 +2010,65 @@ impl TextArea {
                     code: KeyCode::Enter,
                     ..
                 } => {
-                    self.begin_undo_group();
-                    if !self.delete_selection() {
-                        self.clear_selection();
-                    }
-                    self.insert_str("\n");
-                    self.end_undo_group();
+                    self.insert_str_replacing_selection("\n");
                     return;
                 }
-                // Backspace / Delete → delete the selection only (no extra char).
-                // If the selection is zero-width (anchor == head), delete_selection()
-                // returns false — clear the stale selection and fall through to the
-                // normal single-char delete so Backspace/Delete aren't silently swallowed.
-                KeyEvent {
-                    code: KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('\x08' | '\x7f'),
-                    ..
-                }
-                | KeyEvent {
-                    code: KeyCode::Char('h'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                }
-                | KeyEvent {
-                    code: KeyCode::Char('d'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                } => {
+                _ if matches!(
+                    category,
+                    Some(EditCommandCategory::Delete | EditCommandCategory::Kill)
+                ) =>
+                {
+                    if category == Some(EditCommandCategory::Kill)
+                        && let Some(text) = self.selected_text()
+                    {
+                        self.kill_buffer = text;
+                    }
                     if self.delete_selection() {
                         return;
                     }
-                    // Zero-width selection — clear and fall through.
                     self.clear_selection();
                 }
-                // Ctrl-X → cut selection (copy to clipboard + delete).
                 KeyEvent {
                     code: KeyCode::Char('x'),
-                    modifiers: KeyModifiers::CONTROL,
+                    modifiers,
                     ..
-                } => {
+                } if modifiers == KeyModifiers::CONTROL
+                    || modifiers.contains(KeyModifiers::SUPER) =>
+                {
                     if let Some(text) = self.selected_text() {
                         self.set_clipboard_text(text);
                     }
                     if self.delete_selection() {
                         return;
                     }
-                    // Zero-width selection — clear and fall through.
                     self.clear_selection();
                 }
-                // All other keys → clear selection, fall through to normal handling.
+                KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers,
+                    ..
+                } if modifiers.contains(KeyModifiers::SUPER) => {
+                    if let Some(text) = self.selected_text() {
+                        self.set_clipboard_text(text);
+                    } else {
+                        self.clear_selection();
+                    }
+                    return;
+                }
+                KeyEvent {
+                    code: KeyCode::Char('y' | 'v'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {}
                 _ => {
                     self.clear_selection();
                 }
             }
+        }
+
+        if let Some(movement) = resolve_movement(&event) {
+            self.apply_movement(movement);
+            return;
         }
 
         if let Some(command) = classify_key_event(&event) {
@@ -2025,68 +2116,15 @@ impl TextArea {
                 self.redo();
             }
 
-            // Ctrl-V → paste from clipboard provider.
+            // Ctrl-V pastes from the clipboard, replacing any selection.
             KeyEvent {
                 code: KeyCode::Char('v'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
                 if let Some(text) = self.clipboard_provider.get() {
-                    self.insert_str(&text);
+                    self.insert_str_replacing_selection(&text);
                 }
-            }
-
-            // Cmd+Left / Cmd+Right (macOS): terminals using the Kitty keyboard
-            // protocol (Ghostty, Kitty, WezTerm) send these as Super+Arrow.
-            KeyEvent {
-                code: KeyCode::Left,
-                modifiers: KeyModifiers::SUPER,
-                ..
-            } => {
-                self.move_cursor_to_beginning_of_line(false);
-            }
-            KeyEvent {
-                code: KeyCode::Right,
-                modifiers: KeyModifiers::SUPER,
-                ..
-            } => {
-                self.move_cursor_to_end_of_line(false);
-            }
-            KeyEvent {
-                code: KeyCode::Up, ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.move_cursor_up();
-            }
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.move_cursor_down();
-            }
-            // Home/End → logical line (full left/right even when soft-wrapped).
-            // Super+Left/Right stay on the visual wrap row; Ctrl+A/E chain
-            // across logical lines when already at BOL/EOL.
-            KeyEvent {
-                code: KeyCode::Home,
-                ..
-            } => {
-                self.set_cursor(self.beginning_of_current_line());
-            }
-
-            KeyEvent {
-                code: KeyCode::End, ..
-            } => {
-                self.set_cursor(self.end_of_current_line());
             }
             _o => {
                 #[cfg(feature = "debug-logs")]
@@ -2390,12 +2428,20 @@ impl TextArea {
         if self.kill_buffer.is_empty() {
             return;
         }
+        let replacing_selection = self.selection_range().is_some();
+        if replacing_selection {
+            self.begin_undo_group();
+            self.delete_selection();
+        }
         let text = self.kill_buffer.clone();
         self.apply_edit_replacement(
             self.cursor()..self.cursor(),
             &text,
             Some(MutationKind::Insert),
         );
+        if replacing_selection {
+            self.end_undo_group();
+        }
         if let Some(last) = text.chars().last() {
             self.undo.last_insert_ws = last.is_whitespace();
         }

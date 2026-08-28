@@ -116,7 +116,7 @@ pub struct PromptContext {
     pub build_timestamp_utc: String,
     /// Whether the memory system is enabled for this session.
     /// When true, the system prompt includes a `<memory>` section telling
-    /// the model it can use `memory_search` and `memory_get`.
+    /// the model it can use the available Markdown and experience-memory tools.
     #[serde(default)]
     pub memory_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -862,6 +862,37 @@ mod tests {
             rendered.contains("memory_search"),
             "should reference memory_search"
         );
+        assert!(
+            rendered.contains("experience_search"),
+            "should describe evidence-backed experience search when memory is enabled"
+        );
+        assert!(
+            rendered.contains("When `experience_search` is available"),
+            "curated subagents must not be told an unavailable optional tool is registered"
+        );
+    }
+    #[test]
+    fn child_rendered_prompt_omits_experience_search_when_memory_is_disabled() {
+        let ctx = minijinja::context! {
+            os_name => "linux",
+            shell_path => "/bin/bash",
+            working_directory => "/workspace",
+            current_date => "2026-03-26",
+            memory_enabled => false,
+            role_instructions => "",
+            persona_instructions => "",
+            tools => minijinja::context! {
+                by_kind => minijinja::context! {
+                    read => "read_file",
+                    memory_search => "memory_search",
+                    memory_get => "memory_get",
+                }
+            },
+        };
+
+        let rendered = render_subagent_template(ctx);
+        assert!(!rendered.contains("<memory>"));
+        assert!(!rendered.contains("experience_search"));
     }
     #[test]
     fn child_rendered_prompt_includes_user_info_block() {
@@ -931,6 +962,10 @@ mod tests {
         assert!(
             !rendered.contains("<memory>"),
             "memory should be absent when disabled"
+        );
+        assert!(
+            !rendered.contains("experience_search"),
+            "experience search guidance must be absent when memory is disabled"
         );
     }
     #[test]

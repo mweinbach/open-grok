@@ -640,7 +640,7 @@ async fn upload_harness_trace_turns_numbers_siblings_and_persists_counter() {
     let queue = crate::upload::trace::spawn_upload_queue(
         queue_home.path(),
         &queue_cfg,
-        Some(xai_grok_version::VERSION),
+        Some(xai_grok_version::version()),
         agent.auth_manager.clone(),
         crate::session::persistence::ProviderBoundary::default(),
     );
@@ -762,7 +762,7 @@ async fn upload_harness_trace_turns_build_per_turn_manifest() {
     let queue = crate::upload::trace::spawn_upload_queue(
         queue_home.path(),
         &queue_cfg,
-        Some(xai_grok_version::VERSION),
+        Some(xai_grok_version::version()),
         agent.auth_manager.clone(),
         crate::session::persistence::ProviderBoundary::default(),
     );
@@ -2752,6 +2752,9 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            apply_patch_tool_type: None,
+            use_responses_lite: false,
+            experimental_supported_tools: Vec::new(),
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),

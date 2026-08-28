@@ -57,6 +57,75 @@ fn test_manager() -> ModelsManager {
     .build()
 }
 
+#[test]
+fn model_capability_opt_ins_resolve_aliases_and_reject_other_providers() {
+    let manager = test_manager();
+    let mut entry = ModelEntry::fallback("catalog-test-model", &config::EndpointsConfig::default());
+    entry.info.provider = xai_grok_sampling_types::ModelProvider::Codex;
+    entry.info.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    entry.info.use_responses_lite = true;
+    entry.info.experimental_supported_tools = vec!["send_user_message_async".into()];
+    manager
+        .inner
+        .catalog
+        .write()
+        .models
+        .insert("catalog-alias".into(), entry.clone());
+    for model in ["catalog-alias", "catalog-test-model"] {
+        assert!(manager.model_uses_responses_lite(model));
+        assert_eq!(
+            manager.model_experimental_supported_tools(model),
+            vec!["send_user_message_async"]
+        );
+    }
+    entry.info.provider = xai_grok_sampling_types::ModelProvider::Xai;
+    manager
+        .inner
+        .catalog
+        .write()
+        .models
+        .insert("catalog-alias".into(), entry);
+    for model in ["catalog-alias", "catalog-test-model", "missing-model"] {
+        assert!(!manager.model_uses_responses_lite(model));
+        assert!(manager.model_experimental_supported_tools(model).is_empty());
+    }
+}
+
+#[test]
+fn freeform_apply_patch_requires_exact_catalog_capability_and_codex_responses() {
+    let manager = test_manager();
+    for provider in [
+        xai_grok_sampling_types::ModelProvider::Codex,
+        xai_grok_sampling_types::ModelProvider::Xai,
+    ] {
+        for backend in [
+            xai_grok_sampling_types::ApiBackend::Responses,
+            xai_grok_sampling_types::ApiBackend::ChatCompletions,
+        ] {
+            for selector in [None, Some("function"), Some("freeform"), Some("unknown")] {
+                let mut entry =
+                    ModelEntry::fallback("patch-test-model", &config::EndpointsConfig::default());
+                entry.info.provider = provider;
+                entry.info.api_backend = backend;
+                entry.info.apply_patch_tool_type = selector.map(str::to_owned);
+                manager
+                    .inner
+                    .catalog
+                    .write()
+                    .models
+                    .insert("patch-alias".into(), entry);
+                let enabled = provider == xai_grok_sampling_types::ModelProvider::Codex
+                    && backend == xai_grok_sampling_types::ApiBackend::Responses
+                    && selector == Some("freeform");
+                for model in ["patch-alias", "patch-test-model"] {
+                    assert_eq!(manager.model_supports_freeform_apply_patch(model), enabled);
+                }
+            }
+        }
+    }
+    assert!(!manager.model_supports_freeform_apply_patch("missing-model"));
+}
+
 /// Cold manager (no prefetch, isolated cache and auth) over `endpoint`.
 fn cold_manager(cfg: config::Config, endpoint: Arc<dyn ModelsEndpoint>) -> ModelsManager {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1581,7 +1650,7 @@ fn reload_from_disk_cache_ignores_stale_cache() {
     let auth_method = mgr.inner.fetch_auth.read().cache_auth_method();
     let stale = ModelsCache {
         fetched_at: Utc::now() - ChronoDuration::seconds(3600),
-        grok_version: Some(xai_grok_version::VERSION.to_string()),
+        grok_version: Some(xai_grok_version::version().to_string()),
         auth_method: Some(auth_method),
         origin: Some(mgr.cache_origin()),
         etag: Some("etag-stale".into()),
@@ -1645,7 +1714,7 @@ fn reload_from_disk_cache_ignores_legacy_cache_without_origin() {
     let auth_method = mgr.inner.fetch_auth.read().cache_auth_method();
     let legacy = ModelsCache {
         fetched_at: Utc::now(),
-        grok_version: Some(xai_grok_version::VERSION.to_string()),
+        grok_version: Some(xai_grok_version::version().to_string()),
         auth_method: Some(auth_method),
         origin: None,
         etag: Some("etag-legacy".into()),
@@ -2038,6 +2107,9 @@ fn make_entry_config_with_id(
         tool_mode: None,
         subagent_context_default: None,
         codex_multi_agent_v2: false,
+        use_responses_lite: false,
+        experimental_supported_tools: Vec::new(),
+        apply_patch_tool_type: None,
         context_window: std::num::NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
         system_prompt_label: None,

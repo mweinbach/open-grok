@@ -1,6 +1,6 @@
 //! Grok tools library.
 
-pub use xai_grok_version::VERSION;
+pub use xai_grok_version::version;
 
 /// Default maximum output size (in bytes) for tool results sent to the model.
 /// 40 KB ≈ 10 000 tokens

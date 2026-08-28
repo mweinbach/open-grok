@@ -117,6 +117,14 @@ fn make_sentinel() -> String {
 /// Parameter-expansion-modifier forms (`${VAR:-x}`, `${VAR%pat}`, etc.)
 /// are ALSO preserved verbatim; see the module-level rustdoc for why.
 pub fn expand_env_vars_with_extra(input: &str, extra: &HashMap<String, String>) -> String {
+    expand_env_vars_with_process_skip(input, extra, &[])
+}
+
+pub(crate) fn expand_env_vars_with_process_skip(
+    input: &str,
+    extra: &HashMap<String, String>,
+    skip_process_env: &[&str],
+) -> String {
     // Generate a fresh per-call sentinel. 128 bits of entropy means a
     // natural collision with any input substring or extra-env value is
     // ~2^-128 probability. See `make_sentinel` rustdoc.
@@ -144,6 +152,9 @@ pub fn expand_env_vars_with_extra(input: &str, extra: &HashMap<String, String>) 
     let context = |name: &str| -> Option<String> {
         if let Some(v) = extra.get(name) {
             return Some(v.clone());
+        }
+        if skip_process_env.contains(&name) {
+            return None;
         }
         std::env::var(name).ok()
     };
@@ -394,6 +405,43 @@ mod tests {
             let out = expand_env_vars_with_extra(input, &extra);
             assert_eq!(out, input);
         });
+    }
+
+    #[test]
+    fn process_skip_preserves_ambient_values_for_runtime_resolution() {
+        const NAME: &str = "GROK_HOOKS_ENV_EXPAND_TEST_PROCESS_SKIP";
+        with_env_var(NAME, Some("ambient-value"), || {
+            let extra = HashMap::new();
+            assert_eq!(
+                expand_env_vars_with_process_skip(
+                    "${GROK_HOOKS_ENV_EXPAND_TEST_PROCESS_SKIP}/hook",
+                    &extra,
+                    &[NAME],
+                ),
+                "${GROK_HOOKS_ENV_EXPAND_TEST_PROCESS_SKIP}/hook",
+            );
+
+            let extra = HashMap::from([(NAME.to_owned(), "hook-owned-value".to_owned())]);
+            assert_eq!(
+                expand_env_vars_with_process_skip(
+                    "${GROK_HOOKS_ENV_EXPAND_TEST_PROCESS_SKIP}/hook",
+                    &extra,
+                    &[NAME],
+                ),
+                "hook-owned-value/hook",
+            );
+        });
+    }
+
+    #[test]
+    fn runner_variables_and_shell_defaults_survive_parse_time_expansion() {
+        assert_eq!(
+            crate::config::expand_env_vars_with_extra_skipping_runner_vars(
+                "${CLAUDE_PROJECT_DIR:-.}/${GROK_SESSION_ID}",
+                &HashMap::new(),
+            ),
+            "${CLAUDE_PROJECT_DIR:-.}/${GROK_SESSION_ID}",
+        );
     }
 
     #[test]

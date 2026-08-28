@@ -519,6 +519,12 @@ impl CodexRawInputItem {
                 return format!("[OpenAI retained {role} context] {text}");
             }
         }
+        if item_type == "agent_message" {
+            let text = compact_message_text(&self.raw);
+            if !text.is_empty() {
+                return format!("[Untrusted agent message] {text}");
+            }
+        }
         if item_type == "compaction" {
             self.cross_provider_fallback
                 .clone()
@@ -782,6 +788,19 @@ pub enum ToolCallKind {
 
 const CUSTOM_TOOL_CALL_ID_PREFIX: &str = "__xai_custom_tool_call__";
 
+pub use xai_grok_tools::implementations::codex::multi_agent_wire::{
+    decode_function_call_id as decode_codex_function_call_id,
+    encode_function_call as encode_codex_function_call,
+    private_function_arguments as codex_private_function_arguments,
+};
+
+pub fn provider_tool_call_id(id: &str) -> &str {
+    decode_custom_tool_call_id(id)
+        .map(|(call_id, _)| call_id)
+        .or_else(|| decode_codex_function_call_id(id).map(|(call_id, _)| call_id))
+        .unwrap_or(id)
+}
+
 fn encode_custom_tool_call_id(call_id: &str, item_id: &str) -> Arc<str> {
     Arc::<str>::from(format!(
         "{CUSTOM_TOOL_CALL_ID_PREFIX}{}:{call_id}{item_id}",
@@ -833,9 +852,7 @@ impl ToolCall {
     /// The provider call ID. For ordinary function calls this is the stored ID;
     /// for custom calls it is decoded from the compatibility envelope.
     pub fn call_id(&self) -> &str {
-        decode_custom_tool_call_id(&self.id)
-            .map(|(call_id, _)| call_id)
-            .unwrap_or(&self.id)
+        provider_tool_call_id(&self.id)
     }
 
     /// The Responses output-item ID for a custom call.
@@ -1380,7 +1397,33 @@ impl ConversationRequest {
         &mut self,
         provider: crate::ModelProvider,
     ) -> Result<(), CodeModeProjectionError> {
+        self.redact_codex_function_calls();
         self.project_code_mode_for_transport(provider, crate::CodeModeTransport::FunctionEnvelope)
+    }
+
+    fn redact_codex_function_calls(&mut self) {
+        for item in &mut self.items {
+            match item {
+                ConversationItem::Assistant(assistant) => {
+                    for call in &mut assistant.tool_calls {
+                        if let Some((call_id, _)) = decode_codex_function_call_id(&call.id) {
+                            let private = codex_private_function_arguments(&call.id, &call.name);
+                            call.id = Arc::from(call_id);
+                            if private {
+                                call.arguments = Arc::from("{}");
+                            }
+                        }
+                    }
+                }
+                ConversationItem::ToolResult(result) => {
+                    if let Some((call_id, _)) = decode_codex_function_call_id(&result.tool_call_id)
+                    {
+                        result.tool_call_id = call_id.to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn project_code_mode_for_transport(
@@ -1390,6 +1433,9 @@ impl ConversationRequest {
     ) -> Result<(), CodeModeProjectionError> {
         use crate::CodeModeTransport;
 
+        if provider != crate::ModelProvider::Codex {
+            self.redact_codex_function_calls();
+        }
         coalesce_function_exec_outputs(&mut self.items, provider)?;
 
         if transport == CodeModeTransport::NativeCustomGrammar {
@@ -1626,6 +1672,21 @@ impl ConversationRequest {
         let mut replacements = Vec::new();
         let mut input_item_index = 0usize;
         for item in &self.items {
+            if dialect == Some(crate::ResponsesDialect::Codex)
+                && let ConversationItem::Assistant(assistant) = item
+            {
+                let flattened = conversation_item_to_input_items(item);
+                for (offset, call) in assistant.tool_calls.iter().enumerate() {
+                    if let Some(value) = xai_grok_tools::implementations::codex::multi_agent_wire::restore_function_call(
+                        &call.id, &call.name, &call.arguments,
+                    ) {
+                        replacements.push(RawInputItemReplacement {
+                            input_item_index: input_item_index + flattened.len() - assistant.tool_calls.len() + offset,
+                            value,
+                        });
+                    }
+                }
+            }
             if let ConversationItem::BackendToolCall(backend) = item {
                 let value = match (dialect, &backend.kind) {
                     (Some(crate::ResponsesDialect::Codex), BackendToolKind::CodexRawInput(raw)) => {
@@ -3272,6 +3333,9 @@ pub fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
 /// model-visible record; `"{}"` is only the wire representation sent to the
 /// provider to prevent a 400.
 fn sanitize_tool_arguments(id: &str, name: &str, arguments: Arc<str>) -> Arc<str> {
+    if codex_private_function_arguments(id, name) {
+        return Arc::from("{}");
+    }
     // Use `IgnoredAny` instead of `serde_json::Value`: we only need to know
     // whether the JSON is valid, not build a DOM.  `IgnoredAny` validates
     // structure without allocating any data, making this zero-cost on the
@@ -4159,7 +4223,7 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                     let arguments = sanitize_tool_arguments(&tc.id, &tc.name, tc.arguments.clone());
                     items.push(rs::InputItem::Item(rs::Item::FunctionCall(
                         rs::FunctionToolCall {
-                            call_id: tc.id.as_ref().to_owned(),
+                            call_id: tc.call_id().to_owned(),
                             name: tc.name.clone(),
                             arguments: arguments.as_ref().to_owned(),
                             id: None,
@@ -4235,7 +4299,9 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
             };
             vec![rs::InputItem::Item(rs::Item::FunctionCallOutput(
                 rs::FunctionCallOutputItemParam {
-                    call_id: t.tool_call_id.clone(),
+                    call_id: decode_codex_function_call_id(&t.tool_call_id)
+                        .map(|(call_id, _)| call_id.to_owned())
+                        .unwrap_or_else(|| t.tool_call_id.clone()),
                     output,
                     id: None,
                     status: None,
@@ -4673,7 +4739,9 @@ pub fn transform_conversation_cwd(
                 //   Reverse (worktree → root): so the synced-back session doesn't reference
                 //     a deleted worktree directory on the next turn.
                 for tc in &mut a.tool_calls {
-                    if tc.arguments.contains(source_cwd) {
+                    if !codex_private_function_arguments(&tc.id, &tc.name)
+                        && tc.arguments.contains(source_cwd)
+                    {
                         tc.arguments =
                             Arc::<str>::from(tc.arguments.replace(source_cwd, target_cwd));
                     }
@@ -4765,6 +4833,9 @@ fn tool_output_call_id(item: &ConversationItem) -> Option<&str> {
         ConversationItem::ToolResult(result) => Some(
             decode_custom_tool_call_id(&result.tool_call_id)
                 .map(|(call_id, _)| call_id)
+                .or_else(|| {
+                    decode_codex_function_call_id(&result.tool_call_id).map(|(call_id, _)| call_id)
+                })
                 .unwrap_or(result.tool_call_id.as_str()),
         ),
         ConversationItem::CustomToolOutput(output) => Some(output.call_id.as_str()),
@@ -6281,6 +6352,67 @@ mod tests {
             .expect("custom output replayed");
         assert_eq!(custom_output["call_id"], "call_code");
         assert_eq!(custom_output["output"], "42");
+    }
+
+    #[test]
+    fn native_agent_history_preserves_wire_metadata_and_redacts_other_providers() {
+        let raw_call = serde_json::json!({
+            "type":"function_call","id":"fc_native","call_id":"call_native","namespace":"collaboration",
+            "name":"send_message","arguments":"{\"target\":\"/root/worker\",\"message\":\"opaque-test-content\"}",
+            "encrypted_function_args":["message"],
+        });
+        let mut encoded_call = raw_call.clone();
+        encode_codex_function_call(&mut encoded_call);
+        let call_id = encoded_call["call_id"].as_str().unwrap();
+        let mut assistant = ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: Arc::from(call_id),
+            name: "send_message".into(),
+            arguments: Arc::from(raw_call["arguments"].as_str().unwrap()),
+        }]);
+        if let ConversationItem::Assistant(assistant) = &mut assistant {
+            assistant.content = Arc::from("Working");
+        }
+        let raw_message = serde_json::json!({
+            "type":"agent_message","id":"msg_native","author":"/root/worker","recipient":"/root",
+            "content":[{"type":"encrypted_content","encrypted_content":"opaque-test-content"}],
+            "internal_chat_message_metadata_passthrough":{"test_marker":"retained"},
+        });
+        let items = vec![
+            ConversationItem::user("Work"),
+            assistant,
+            ConversationItem::tool_result(call_id.to_owned(), "queued"),
+            ConversationItem::BackendToolCall(BackendToolCallItem {
+                kind: BackendToolKind::CodexRawInput(CodexRawInputItem {
+                    id: "msg_native".into(),
+                    raw: raw_message.clone(),
+                    cross_provider_fallback: None,
+                }),
+            }),
+        ];
+        let persisted = serde_json::to_value(&items).unwrap();
+        let items: Vec<ConversationItem> = serde_json::from_value(persisted).unwrap();
+        let mut repaired = items.clone();
+        repair_dangling_tool_calls(&mut repaired, DanglingToolCallReason::UserCancelled);
+        assert_eq!(repaired.len(), items.len());
+        for provider in [crate::ModelProvider::Codex, crate::ModelProvider::Xai] {
+            let mut request = ConversationRequest::from_items(items.clone());
+            request.project_code_mode_for_provider(provider).unwrap();
+            let replacements = request.raw_responses_input_replacements(provider);
+            let response: rs::CreateResponse = (&request).into();
+            let mut wire = serde_json::to_value(response).unwrap();
+            for replacement in replacements {
+                wire["input"][replacement.input_item_index] = replacement.value;
+            }
+            if provider == crate::ModelProvider::Codex {
+                assert_eq!(wire["input"][2], raw_call);
+                assert_eq!(wire["input"][3]["call_id"], "call_native");
+                assert_eq!(wire["input"][4], raw_message);
+            } else {
+                assert!(!wire.to_string().contains("opaque-test-content"));
+                assert!(!wire.to_string().contains("encrypted_function_args"));
+                assert!(!wire.to_string().contains("__codex_function_call__"));
+            }
+        }
     }
 
     #[test]

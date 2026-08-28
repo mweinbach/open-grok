@@ -7,12 +7,18 @@ use std::time::{Duration, Instant};
 ///
 /// Compared against each registering client's `ClientCapabilities::client_version`
 /// to detect mismatches early and surface a structured ACP notification.
-/// In development builds where `VERSION_WITH_COMMIT` is not set, this is
-/// `"unknown"` and version-mismatch detection is disabled (no notification sent).
-const LEADER_VERSION: &str = match option_env!("VERSION_WITH_COMMIT") {
-    Some(v) => v,
-    None => "unknown",
-};
+/// A standalone library process without a registered binary identity reports
+/// `"unknown"`, which disables version-mismatch notification.
+fn leader_version() -> &'static str {
+    leader_version_from_build_info(xai_grok_version::registered_build_info())
+}
+
+fn leader_version_from_build_info(info: Option<xai_grok_version::BuildInfo>) -> &'static str {
+    match info {
+        Some(info) if info.kind() == xai_grok_version::BuildKind::Release => info.version(),
+        Some(_) | None => "unknown",
+    }
+}
 use super::protocol::{
     ClientCapabilities, ClientId, ClientMessage, ClientMode, ControlCommand, ControlPayload,
     InternalMethod, LEADER_PROTOCOL_VERSION, LeaderCapabilities, ProtocolError, ServerMessage,
@@ -1544,10 +1550,10 @@ fn make_version_mismatch_notification(
 ///   [`ControlCommand::RelaunchForUpdate`] handler send [`ShutdownReason::AutoUpdate`]
 ///   before cancelling so clients see the real reason; senders must write before
 ///   cancelling.
-/// * `leader_version_override` - If `Some`, overrides [`LEADER_VERSION`] for version
+/// * `leader_version_override` - If `Some`, overrides [`leader_version`] for version
 ///   mismatch detection. Pass `None` in production; pass a test version string in
-///   integration tests to bypass the `"unknown"` constant that appears in dev builds
-///   where `VERSION_WITH_COMMIT` is not set.
+///   integration tests to bypass the `"unknown"` fallback in an uninitialized
+///   standalone library process.
 /// * `control_state` - Leader-local control metadata and CPU profiling state
 pub async fn run_leader_server(
     socket_path: std::path::PathBuf,
@@ -1664,7 +1670,7 @@ pub async fn run_leader_server(
                             }
                         }
                         let effective_leader_version =
-                            leader_version_override.unwrap_or(LEADER_VERSION);
+                            leader_version_override.unwrap_or_else(leader_version);
                         if let Some(ref cv) = client.capabilities.client_version
                             && let Some(payload) = make_version_mismatch_notification(
                                 cv.as_str(),
@@ -4461,6 +4467,20 @@ mod tests {
             make_version_mismatch_notification("0.1.150", "0.1.150").is_none(),
             "matching versions must not produce a notification"
         );
+    }
+    #[test]
+    fn release_leader_compares_plain_registered_version() {
+        let release = xai_grok_version::BuildInfo::release(
+            "1.0.0-open-grok.83",
+            "1.0.0-open-grok.83 (abc1234)",
+        );
+        let version = leader_version_from_build_info(Some(release));
+        assert_eq!(version, "1.0.0-open-grok.83");
+        assert!(make_version_mismatch_notification(version, version).is_none());
+
+        let local = xai_grok_version::BuildInfo::local("1.0.0 (abc1234)");
+        assert_eq!(leader_version_from_build_info(Some(local)), "unknown");
+        assert_eq!(leader_version_from_build_info(None), "unknown");
     }
     #[test]
     fn version_mismatch_notification_is_none_for_unknown_leader_version() {

@@ -760,6 +760,7 @@ pub(crate) struct SessionActor {
     /// Pushed by `SessionCommand::Interject` handler, drained at safe
     /// points in `process_conversation_turn`. Internally synchronized.
     pub(crate) pending_interjections: InterjectionBuffer<acp::ImageContent>,
+    pub(crate) pending_native_agent_messages: Mutex<Vec<ConversationItem>>,
     /// Skill-announcement reminders that arrived while a turn was running,
     /// flushed at the same safe points as `pending_interjections` plus on
     /// cancel/idle. The flush also delivers the plan tracker's buffered

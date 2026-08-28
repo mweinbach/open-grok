@@ -25,3 +25,5 @@ pub use apply::derive_new_contents;
 pub use errors::{ApplyPatchError, ParseError};
 pub use parser::{Hunk, ParsedPatch, UpdateFileChunk, parse_patch};
 pub use tool::{ApplyPatchInput, ApplyPatchTool};
+
+pub const FREEFORM_GRAMMAR: &str = include_str!("grammar.lark");

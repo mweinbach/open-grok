@@ -86,6 +86,41 @@ fn streaming_agent_message() {
     assert_eq!(sb.len(), 1);
     assert!(tracker.current_agent_msg.is_some());
 }
+
+#[test]
+fn async_user_message_is_a_completed_message_without_finishing_the_turn() {
+    use xai_grok_tools::implementations::codex::send_user_message_async::ASYNC_USER_MESSAGE_META_KEY;
+    for is_replay in [false, true] {
+        let mut scrollback = ScrollbackState::new();
+        let mut tracker = AcpUpdateTracker::new();
+        let metadata = NotificationMeta {
+            is_replay,
+            ..Default::default()
+        };
+        tracker.handle_update(agent_chunk("Working"), &metadata, &mut scrollback);
+        let mut message_meta = acp::Meta::new();
+        message_meta.insert(
+            ASYNC_USER_MESSAGE_META_KEY.into(),
+            serde_json::Value::Bool(true),
+        );
+        let message = acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                "Which option?",
+            )))
+            .meta(Some(message_meta)),
+        );
+        assert!(tracker.handle_update(message, &metadata, &mut scrollback));
+        assert_eq!(scrollback.len(), 2);
+        assert!(tracker.current_agent_msg.is_none());
+        assert!(tracker.handle_update(
+            agent_chunk("Continuing other work"),
+            &metadata,
+            &mut scrollback
+        ));
+        assert_eq!(scrollback.len(), 3);
+        assert!(tracker.current_agent_msg.is_some());
+    }
+}
 #[test]
 fn agent_output_epoch_tracks_visible_live_output() {
     crate::appearance::cache::set_show_thinking_blocks(true);
@@ -2677,6 +2712,253 @@ fn writing_tool_call_survives_bg_deferred_stdout_update() {
         matches!(tracker.activity(), Some(TurnActivity::WritingToolCall(_))),
         "a deferred bg stdout update must not strip the writing label"
     );
+}
+// ── Code Mode transport live streams (`handle_tool_call_delta`) ─────────
+
+/// Collect sanitized inferred nested-tool names from ephemeral preview blocks.
+fn code_mode_stream_payloads(sb: &ScrollbackState) -> Vec<String> {
+    (0..sb.len())
+        .filter_map(|i| sb.get(i))
+        .filter_map(|e| match &e.block {
+            RenderBlock::CodeModeStream(b) => Some(b.payload().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn code_mode_exec_delta_renders_nested_tool_without_transport_or_source() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    assert!(!tracker.handle_tool_call_delta(
+        &mut sb,
+        Some("exec"),
+        Some("const results = await Promise.all([to"),
+        0,
+    ));
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert!(
+        tracker.handle_tool_call_delta(
+            &mut sb,
+            None,
+            Some("ols.run_terminal_command({command: 'secret'})]);"),
+            0,
+        ),
+        "a completed nested tool name must request a redraw"
+    );
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["run_terminal_command".to_string()]
+    );
+    let Some(TurnActivity::WritingToolCall(activity)) = tracker.activity() else {
+        panic!("expected inferred nested-tool activity");
+    };
+    assert_eq!(activity.label(), "Writing command…");
+    assert!(!activity.label().contains("exec"));
+}
+
+#[test]
+fn code_mode_wait_delta_never_creates_visible_payload_or_activity() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    assert!(!tracker.handle_tool_call_delta(&mut sb, Some("wait"), Some("{\"cell_id\":"), 0));
+    assert!(!tracker.handle_tool_call_delta(&mut sb, None, Some("\"private-cell\"}"), 0));
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert_eq!(tracker.activity(), None);
+}
+
+#[test]
+fn code_mode_stream_retires_on_agent_output_and_resurrects_on_continuation() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("tools.read_file({"), 0);
+    // Interleaved reasoning: entry hides but per-index state survives.
+    tracker.handle_update(thought_chunk("thinking"), &meta(), &mut sb);
+    assert!(
+        code_mode_stream_payloads(&sb).is_empty(),
+        "agent output must retire the visible block"
+    );
+    // Nameless continuation resurrects the same stream with its payload.
+    assert!(tracker.handle_tool_call_delta(&mut sb, None, Some("file_path: 'private'})"), 0));
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["read_file".to_string()]
+    );
+}
+
+#[test]
+fn code_mode_stream_cleared_at_sample_boundary_and_finish_turn() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    let first_sample = NotificationMeta {
+        stream_start_ms: Some(1_000),
+        ..NotificationMeta::default()
+    };
+    let next_sample = NotificationMeta {
+        stream_start_ms: Some(6_000),
+        ..NotificationMeta::default()
+    };
+    tracker.handle_update(agent_chunk("hi"), &first_sample, &mut sb);
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("tools.read_file({})"), 0);
+    assert!(!code_mode_stream_payloads(&sb).is_empty());
+
+    // New LLM sample (different stream_start_ms) retires previous-sample streams.
+    tracker.handle_update(agent_chunk("next"), &next_sample, &mut sb);
+    assert!(
+        code_mode_stream_payloads(&sb).is_empty(),
+        "sample boundary must retire previous-sample blocks"
+    );
+
+    // finish_turn also clears everything.
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("tools.grep_files({})"), 1);
+    tracker.finish_turn(&mut sb);
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert!(tracker.code_mode_streams.is_empty());
+}
+
+#[test]
+fn code_mode_index_reuse_resets_payload_and_keeps_single_block() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("tools.read_file({});"), 0);
+    // Same sample reuses index 0 for an ordinary tool: block retires,
+    // spinner takes over.
+    tracker.handle_tool_call_delta(&mut sb, Some("write"), Some("{\"path\""), 0);
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert!(matches!(
+        tracker.activity(),
+        Some(TurnActivity::WritingToolCall(_))
+    ));
+    // A later exec on the same index starts fresh.
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("tools.grep_files({});"), 0);
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["grep_files".to_string()]
+    );
+}
+
+#[test]
+fn code_mode_streams_support_concurrent_indexes() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("tools.read_file({"), 0);
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("tools.grep_files({"), 1);
+    tracker.handle_tool_call_delta(&mut sb, None, Some("file_path: 'secret'})"), 0);
+    tracker.handle_tool_call_delta(&mut sb, None, Some("pattern: 'private'})"), 1);
+    let payloads = code_mode_stream_payloads(&sb);
+    assert_eq!(payloads.len(), 2, "two concurrent streams: {payloads:?}");
+    assert!(payloads.contains(&"read_file".to_string()));
+    assert!(payloads.contains(&"grep_files".to_string()));
+    assert!(!payloads.iter().any(|payload| payload.contains("secret")));
+    assert!(!payloads.iter().any(|payload| payload.contains("private")));
+}
+
+#[test]
+fn code_mode_concurrent_transport_state_is_bounded() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+
+    for index in 0..(MAX_CODE_MODE_STREAMS as u32 + 4) {
+        tracker.handle_tool_call_delta(
+            &mut sb,
+            Some("exec"),
+            Some(&format!("tools.tool_{index}({{}})")),
+            index,
+        );
+    }
+
+    assert_eq!(tracker.code_mode_streams.len(), MAX_CODE_MODE_STREAMS);
+    assert_eq!(code_mode_stream_payloads(&sb).len(), MAX_CODE_MODE_STREAMS);
+    assert!(!tracker.code_mode_streams.contains_key(&0));
+}
+
+#[test]
+fn code_mode_promise_all_stream_exposes_each_nested_call_only() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    assert!(tracker.handle_tool_call_delta(
+        &mut sb,
+        Some("exec"),
+        Some("await Promise.all([tools.read_file({file_path: 'secret'}), too"),
+        0,
+    ));
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["read_file".to_string()]
+    );
+    assert!(tracker.handle_tool_call_delta(
+        &mut sb,
+        None,
+        Some("ls.grep_files({pattern: 'private'}), tools.apply_patch('sensitive')]);"),
+        0,
+    ));
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["read_file\ngrep_files\napply_patch".to_string()]
+    );
+
+    tracker.handle_update(
+        tool_call("nested-1", acp::ToolKind::Read, "read_file"),
+        &meta(),
+        &mut sb,
+    );
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert!(matches!(
+        &sb.get(sb.len() - 1).expect("canonical nested card").block,
+        RenderBlock::ToolCall(_)
+    ));
+}
+
+#[test]
+fn code_mode_large_private_payload_is_bounded_without_leaking_source() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    let big = "x".repeat(CODE_MODE_STREAM_TRIM_AT_CHARS + 2_000);
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some(&big), 0);
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    tracker.handle_tool_call_delta(
+        &mut sb,
+        None,
+        Some(";tools.read_file({file_path: 'secret'})"),
+        0,
+    );
+    let payloads = code_mode_stream_payloads(&sb);
+    assert_eq!(payloads, vec!["read_file".to_string()]);
+    let retained = &tracker
+        .code_mode_streams
+        .get(&0)
+        .expect("bounded private state")
+        .payload;
+    assert!(
+        retained.chars().count() <= CODE_MODE_STREAM_TRIM_TO_CHARS + 48,
+        "retained buffer must stay near the tail cap, got {}",
+        retained.chars().count()
+    );
+    let dropped = (0..sb.len())
+        .filter_map(|i| sb.get(i))
+        .filter_map(|e| match &e.block {
+            RenderBlock::CodeModeStream(b) => Some(b.dropped_chars()),
+            _ => None,
+        })
+        .sum::<u64>();
+    assert!(
+        dropped > 0,
+        "private bounded state must record the dropped head size"
+    );
+}
+
+#[test]
+fn code_mode_ordinary_names_keep_today_spinner_exactly() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    assert!(tracker.handle_tool_call_delta(&mut sb, Some("read_file"), Some("{}"), 3));
+    assert!(matches!(
+        tracker.activity(),
+        Some(TurnActivity::WritingToolCall(_))
+    ));
+    // Continuation without any prior transport state stays on the spinner path.
+    assert!(!tracker.handle_tool_call_delta(&mut sb, None, Some(",{}"), 3));
+    assert!(code_mode_stream_payloads(&sb).is_empty());
 }
 /// The blocking bg-plumbing tools are kept out of scrollback but the turn
 /// IS blocked on them — `activity()` must name the wait instead of the old

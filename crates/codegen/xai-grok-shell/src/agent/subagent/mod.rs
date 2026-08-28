@@ -443,6 +443,9 @@ impl SubagentSpawnContext {
 pub(crate) struct ShellChildRuntime {
     pub child_handle: SessionHandle,
     pub _child_thread: SessionThread,
+    pub provider: xai_grok_sampling_types::ModelProvider,
+    pub api_backend: xai_grok_sampling_types::ApiBackend,
+    pub native_agent_protocol: bool,
 }
 impl ChildControl for ShellChildRuntime {
     type ProgressFuture = LocalBoxFuture<SubagentProgress>;
@@ -479,11 +482,54 @@ impl ChildControl for ShellChildRuntime {
         &self,
         message: &xai_grok_tools::implementations::grok_build::task::types::AgentMailboxMessage,
     ) -> bool {
+        if message.native.is_some()
+            && (!self.accepts_native_message(message)
+                || self
+                    .child_handle
+                    .current_prompt_id
+                    .lock()
+                    .ok()
+                    .and_then(|prompt| prompt.clone())
+                    .is_none())
+        {
+            return false;
+        }
+        self.deliver_initial_message(message)
+    }
+    fn accepts_native_message(
+        &self,
+        message: &xai_grok_tools::implementations::grok_build::task::types::AgentMailboxMessage,
+    ) -> bool {
+        !message
+            .native
+            .as_ref()
+            .is_some_and(|native| native.encrypted)
+            || (self.provider == xai_grok_sampling_types::ModelProvider::Codex
+                && self.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                && self.native_agent_protocol)
+    }
+    fn deliver_initial_message(
+        &self,
+        message: &xai_grok_tools::implementations::grok_build::task::types::AgentMailboxMessage,
+    ) -> bool {
+        if !self.accepts_native_message(message) {
+            return false;
+        }
         self.child_handle
             .cmd_tx
             .send(SessionCommand::AgentMessage {
                 message: message.clone(),
             })
+            .is_ok()
+    }
+    fn interrupt(&self) -> bool {
+        self.child_handle
+            .cmd_tx
+            .send(SessionCommand::Cancel(crate::session::CancelOptions {
+                cancel_subagents: false,
+                kill_background_tasks: false,
+                ..Default::default()
+            }))
             .is_ok()
     }
 }
@@ -918,6 +964,17 @@ async fn read_parent_sampling_config(
                 codex_multi_agent_v2: ctx
                     .models_manager
                     .model_supports_codex_multi_agent_v2(ctx.model_id.0.as_ref()),
+                use_responses_lite: ctx
+                    .models_manager
+                    .model_uses_responses_lite(ctx.model_id.0.as_ref()),
+                experimental_supported_tools: ctx
+                    .models_manager
+                    .model_experimental_supported_tools(ctx.model_id.0.as_ref()),
+                codex_permissions: ctx
+                    .sampling_config
+                    .codex_permissions
+                    .clone()
+                    .filter(|_| provider == xai_grok_sampling_types::ModelProvider::Codex),
                 compactions_remaining: ctx
                     .models_manager
                     .model_compactions_remaining(ctx.model_id.0.as_ref()),
@@ -1304,6 +1361,10 @@ fn clean_fork_prefix_len(
         fn plain_call_id(id: &str) -> &str {
             xai_grok_sampling_types::conversation::decode_custom_tool_call_id(id)
                 .map(|(call_id, _)| call_id)
+                .or_else(|| {
+                    xai_grok_sampling_types::conversation::decode_codex_function_call_id(id)
+                        .map(|(call_id, _)| call_id)
+                })
                 .unwrap_or(id)
         }
         let mut dangling: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1351,6 +1412,29 @@ fn clean_fork_prefix_len(
 ///
 /// Input that is empty or only `System` item(s) — before OR after filtering —
 /// inherited nothing, so it fails open to `New` rather than a hollow fork.
+fn select_native_fork_turns(
+    mut items: Vec<ConversationItem>,
+    count: Option<usize>,
+) -> Vec<ConversationItem> {
+    let Some(count) = count else { return items };
+    items.truncate(clean_fork_prefix_len(&items));
+    let start = items.iter().enumerate().rev()
+        .filter(|(_, item)| matches!(item, ConversationItem::User(user) if user.synthetic_reason.is_none()))
+        .take(count).last().map(|(index, _)| index).unwrap_or(0);
+    if start == 0 {
+        return items;
+    }
+    let head = items
+        .first()
+        .filter(|item| matches!(item, ConversationItem::System(_)))
+        .cloned();
+    let mut selected = items.split_off(start);
+    if let Some(head) = head {
+        selected.insert(0, head);
+    }
+    selected
+}
+
 fn verbatim_or_normalize_fork(
     items: Vec<xai_grok_sampling_types::conversation::ConversationItem>,
     child_context_window: u64,
@@ -1623,14 +1707,31 @@ async fn bootstrap_initial_context(
         )
         .await;
     }
-    let live_items = match ctx.parent_chat_state.as_ref() {
+    let native_turns = request
+        .runtime_overrides
+        .native_agent
+        .as_ref()
+        .and_then(|native| native.fork_turns);
+    let mut live_items = match ctx.parent_chat_state.as_ref() {
         Some(chat_state) => {
             let items = chat_state.get_conversation().await;
             if items.is_empty() { None } else { Some(items) }
         }
         None => None,
     };
+    if live_items.is_none()
+        && native_turns.is_some()
+        && let Some(parent_info) = &ctx.parent_session_info
+    {
+        let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
+            crate::util::grok_home::grok_home(),
+        );
+        live_items = storage
+            .load_chat_history_from_dir(&session::persistence::session_dir(parent_info))
+            .ok();
+    }
     if let Some(items) = live_items {
+        let items = select_native_fork_turns(items, native_turns);
         let ctx_out = verbatim_or_normalize_fork(items, child_context_window);
         tracing::info!(
             subagent_id = %request.id,
@@ -1787,6 +1888,14 @@ async fn digest_fork_initial_context(
     {
         return fresh("parent conversation unavailable".to_string());
     }
+    let items = select_native_fork_turns(
+        items,
+        request
+            .runtime_overrides
+            .native_agent
+            .as_ref()
+            .and_then(|native| native.fork_turns),
+    );
     let budget_chars = ((child_context_window * DIGEST_BUDGET_PERCENT / 100) as usize)
         .saturating_mul(4)
         .max(DIGEST_MIN_BUDGET_CHARS);

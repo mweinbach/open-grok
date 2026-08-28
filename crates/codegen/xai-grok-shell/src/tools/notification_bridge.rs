@@ -665,6 +665,31 @@ async fn handle_notification(
                 "User question asked"
             );
         }
+        ToolNotification::AsyncUserMessage(message) => {
+            let mut meta = acp::Meta::new();
+            meta.insert(
+                xai_grok_tools::implementations::codex::send_user_message_async::ASYNC_USER_MESSAGE_META_KEY.into(),
+                serde_json::Value::Bool(true),
+            );
+            meta.insert(
+                "toolCallId".into(),
+                serde_json::Value::String(message.tool_call_id),
+            );
+            let mut notification = acp::SessionNotification::new(
+                config.session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(
+                    acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                        message.message,
+                    )))
+                    .meta(Some(meta)),
+                ),
+            );
+            stamp_event_id(config, &mut notification.meta);
+            let _ = config.persistence.tx.send(PersistenceMsg::Update(
+                crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
+            ));
+            config.gateway.forward_fire_and_forget(notification);
+        }
         ToolNotification::LspServerStarting(s) => {
             tracing::debug!(server = %s.server_name, command = %s.command, "LSP server starting");
         }

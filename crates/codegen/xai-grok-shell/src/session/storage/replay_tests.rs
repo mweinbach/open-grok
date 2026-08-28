@@ -940,6 +940,78 @@ fn stream_replay_collapses_tool_call_and_skips_in_progress() {
 }
 
 #[test]
+fn stream_replay_hides_code_mode_transport_and_keeps_nested_and_plugin_tools() {
+    let home = tempfile::tempdir().unwrap();
+    let session_id = "child-code-mode";
+    let directory = home.path().join("sessions").join("cwd").join(session_id);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join(SUMMARY_FILE), "{}").unwrap();
+
+    let outer = acp_envelope_with_meta(
+        r#"{"sessionUpdate":"tool_call","toolCallId":"outer","title":"exec","kind":"other","status":"in_progress","rawInput":{"source":"RAW_JS"}}"#,
+        r#"{"eventId":"ev1","open-grok/codeModeTransport":true}"#,
+    );
+    let nested = acp_envelope_with_meta(
+        r#"{"sessionUpdate":"tool_call","toolCallId":"nested","title":"read_file","kind":"read","status":"completed","rawOutput":{"text":"visible nested result"}}"#,
+        r#"{"eventId":"ev2"}"#,
+    );
+    let outer_done = acp_envelope_with_meta(
+        r#"{"sessionUpdate":"tool_call_update","toolCallId":"outer","status":"completed","rawOutput":{"text":"RAW_RESULT"}}"#,
+        r#"{"eventId":"ev3"}"#,
+    );
+    let plugin = acp_envelope_with_meta(
+        r#"{"sessionUpdate":"tool_call","toolCallId":"plugin-exec","title":"exec","kind":"other","status":"completed","rawInput":{"command":"safe"},"rawOutput":{"text":"visible plugin result"}}"#,
+        r#"{"eventId":"ev4"}"#,
+    );
+    std::fs::write(
+        directory.join(UPDATES_FILE),
+        format!("{outer}\n{nested}\n{outer_done}\n{plugin}\n"),
+    )
+    .unwrap();
+
+    let mut updates = Vec::new();
+    let emission =
+        stream_replay_updates_at(session_id, home.path(), |update| updates.push(update)).unwrap();
+    let serialized = serde_json::to_string(&updates).unwrap();
+
+    assert_eq!(emission, ReplayEmission::Emitted);
+    assert_eq!(updates.len(), 2);
+    assert!(serialized.contains("visible nested result"));
+    assert!(serialized.contains("visible plugin result"));
+    assert!(!serialized.contains("RAW_JS"));
+    assert!(!serialized.contains("RAW_RESULT"));
+}
+
+#[test]
+fn typed_replay_hides_code_mode_transport_marked_only_on_terminal_update() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(UPDATES_FILE);
+    let outer = acp_envelope_with_meta(
+        r#"{"sessionUpdate":"tool_call","toolCallId":"outer","title":"exec","kind":"other","status":"in_progress","rawInput":{"source":"RAW_JS"}}"#,
+        r#"{"eventId":"ev1"}"#,
+    );
+    let nested = acp_envelope_with_meta(
+        r#"{"sessionUpdate":"tool_call","toolCallId":"nested","title":"apply_patch","kind":"edit","status":"completed"}"#,
+        r#"{"eventId":"ev2"}"#,
+    );
+    let outer_done = acp_envelope_with_meta(
+        r#"{"sessionUpdate":"tool_call_update","toolCallId":"outer","status":"completed","rawOutput":{"text":"RAW_RESULT"}}"#,
+        r#"{"eventId":"ev3","open-grok/codeModeTransport":true}"#,
+    );
+    std::fs::write(&path, format!("{outer}\n{nested}\n{outer_done}\n")).unwrap();
+
+    let mut updates = Vec::new();
+    let forwarded = for_each_replay_update_in_file(&path, |update| updates.push(update)).unwrap();
+    let serialized = serde_json::to_string(&updates).unwrap();
+
+    assert!(forwarded);
+    assert_eq!(updates.len(), 1);
+    assert!(serialized.contains("apply_patch"));
+    assert!(!serialized.contains("RAW_JS"));
+    assert!(!serialized.contains("RAW_RESULT"));
+}
+
+#[test]
 fn stream_replay_forwards_completed_tool_call_update_without_base() {
     let home = tempfile::tempdir().unwrap();
     let cwd = "/tmp/orphan-complete";

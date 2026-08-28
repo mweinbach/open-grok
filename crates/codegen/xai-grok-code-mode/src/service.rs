@@ -17,6 +17,7 @@ use xai_grok_code_mode_protocol::ExecuteRequest;
 use xai_grok_code_mode_protocol::ExecuteToPendingOutcome;
 use xai_grok_code_mode_protocol::FunctionCallOutputContentItem;
 use xai_grok_code_mode_protocol::ImageDetail;
+use xai_grok_code_mode_protocol::NestedToolProgressSink;
 use xai_grok_code_mode_protocol::NotificationFuture;
 use xai_grok_code_mode_protocol::RuntimeResponse;
 use xai_grok_code_mode_protocol::StartedCell;
@@ -49,6 +50,7 @@ impl CodeModeSessionDelegate for NoopCodeModeSessionDelegate {
         &'a self,
         _invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        _progress: NestedToolProgressSink,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             cancellation_token.cancelled().await;
@@ -270,6 +272,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
         &self,
         invocation: runtime::NestedToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
     ) -> Result<JsonValue, String> {
         self.delegate
             .invoke_tool(
@@ -287,6 +290,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
                     input: invocation.input,
                 },
                 cancellation_token,
+                progress,
             )
             .await
     }

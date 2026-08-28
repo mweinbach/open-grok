@@ -5,7 +5,7 @@
 //! and are dispatched by the single local task started with
 //! [`CodeModeRuntime::start_dispatch_loop`].
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -19,11 +19,13 @@ use xai_grok_code_mode::InProcessCodeModeSessionProvider;
 use xai_grok_code_mode_protocol::{
     CellId, CodeModeNestedToolCall, CodeModeSession, CodeModeSessionDelegate,
     CodeModeSessionProvider, CodeModeToolKind, ExecuteRequest, FunctionCallOutputContentItem,
-    ImageDetail, NotificationFuture, RuntimeResponse, ToolDefinition as CodeModeToolDefinition,
-    ToolInvocationFuture, ToolName, WaitOutcome, WaitRequest,
+    ImageDetail, NestedToolProgress, NestedToolProgressSink, NotificationFuture, RuntimeResponse,
+    ToolDefinition as CodeModeToolDefinition, ToolInvocationFuture, ToolName, WaitOutcome,
+    WaitRequest,
 };
 use xai_grok_tools::types::definition::ToolDefinition as GrokToolDefinition;
 use xai_grok_tools::util::{ceil_char_boundary, truncate_str};
+use xai_tool_runtime::ToolProgress;
 
 use super::acp_session::SessionActor;
 use crate::sampling::rs::{CustomGrammarFormatParam, CustomToolParamFormat, GrammarSyntax};
@@ -55,7 +57,7 @@ pub(crate) fn is_code_mode_transport_meta(meta: Option<&acp::Meta>) -> bool {
 /// Human-interaction tools must remain model-visible in Code Mode Only: a
 /// JavaScript callback cannot safely own an ACP question whose answer pauses
 /// the model turn. Collaboration lifecycle tools also stay direct, matching
-/// GPT-5.6 Sol's Codex multi-agent-v2 `DirectModelOnly` exposure.
+/// Codex multi-agent-v2 `DirectModelOnly` exposure.
 ///
 /// The plan-mode lifecycle tools are on the list for the same reason as
 /// `ask_user_question`: `exit_plan_mode` parks the turn on the user's plan
@@ -70,10 +72,13 @@ pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
         name,
         "ask_user_question"
             | "request_user_input"
+            | "send_user_message_async"
             | "enter_plan_mode"
             | "exit_plan_mode"
             | "task"
             | "spawn_subagent"
+            | "spawn_agent"
+            | "interrupt_agent"
             | "agent_swarm"
             | "swarm_wait"
             | "workflow"
@@ -150,6 +155,7 @@ enum DispatchMessage {
     InvokeTool {
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
         response_tx: oneshot::Sender<Result<serde_json::Value, String>>,
     },
     Notify {
@@ -325,6 +331,19 @@ impl CodeModeRuntime {
         ))
     }
 
+    /// Best-effort termination of one live cell. Unknown / already-terminal
+    /// cells are a no-op, so callers never need to pre-check liveness.
+    pub(crate) async fn terminate_cell(self: &Arc<Self>, cell_id: &str) -> Result<(), String> {
+        let cell_id = CellId::new(cell_id.to_string());
+        if !self.known_cells.lock().contains(&cell_id) {
+            return Ok(());
+        }
+        let session = self.session().await?;
+        session.terminate(cell_id.clone()).await?;
+        self.known_cells.lock().remove(&cell_id);
+        Ok(())
+    }
+
     /// Shuts down an initialized runtime without creating an otherwise unused
     /// session. Initialization racing with shutdown is joined and cancelled,
     /// matching Codex's session-lifecycle contract.
@@ -424,14 +443,20 @@ impl CodeModeSessionDelegate for CodeModeRuntimeDelegate {
         &'a self,
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             let runtime = self
                 .runtime
                 .upgrade()
                 .ok_or_else(|| "code mode runtime owner is unavailable".to_string())?;
-            CodeModeSessionDelegate::invoke_tool(runtime.as_ref(), invocation, cancellation_token)
-                .await
+            CodeModeSessionDelegate::invoke_tool(
+                runtime.as_ref(),
+                invocation,
+                cancellation_token,
+                progress,
+            )
+            .await
         })
     }
 
@@ -480,6 +505,187 @@ struct BindRuntimeRequest {
 impl RuntimeGeneration {
     fn is_current(&self) -> bool {
         self.current.load(Ordering::Acquire) == self.expected
+    }
+}
+
+/// Per-sample turn context for streaming early-start of `exec` cells.
+///
+/// Captured from `process_conversation_turn` right before sampling begins so
+/// mid-stream `ToolCallArgumentsComplete` events can decode and execute an
+/// `exec` call with exactly the same transport and nested-tool registry the
+/// canonical post-response path would use. Cleared when the next sample is
+/// prepared and on retry/failure.
+pub(crate) struct EarlyExecTurnContext {
+    pub(crate) transport: Option<xai_grok_sampling_types::CodeModeTransport>,
+    pub(crate) tools: Vec<GrokToolDefinition>,
+}
+
+impl EarlyExecTurnContext {
+    /// Decodes the streamed payload of one `exec` call into raw JavaScript,
+    /// mirroring `tool_surface::code_mode_exec_source` for the transport.
+    fn exec_source(&self, raw_arguments: &str) -> Result<String, String> {
+        use xai_grok_sampling_types::CodeModeTransport;
+        match self.transport {
+            Some(CodeModeTransport::NativeCustomGrammar) => Ok(raw_arguments.to_string()),
+            Some(CodeModeTransport::FunctionEnvelope) => {
+                let arguments = serde_json::from_str::<serde_json::Value>(raw_arguments)
+                    .map_err(|error| format!("exec arguments must be valid JSON: {error}"))?;
+                arguments
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        "exec arguments must contain a string `source` field".to_string()
+                    })
+            }
+            Some(active @ CodeModeTransport::Unsupported) => Err(format!(
+                "Code Mode received an incompatible `exec` call for the active {active:?} transport"
+            )),
+            None => Err("received an `exec` call while Code Mode is inactive".to_string()),
+        }
+    }
+
+    fn accepts_early_exec(&self) -> bool {
+        use xai_grok_sampling_types::CodeModeTransport;
+        matches!(
+            self.transport,
+            Some(CodeModeTransport::NativeCustomGrammar | CodeModeTransport::FunctionEnvelope)
+        )
+    }
+}
+
+/// One in-flight early-started `exec`, resolved through a oneshot so the
+/// canonical control-call path can await the exact outcome instead of
+/// re-executing the cell.
+type EarlyExecOutcome = Result<CodeModeToolOutput, String>;
+
+/// Streaming early-start bookkeeping for pipelined `exec` cells.
+///
+/// Rides [`CodeModeRuntimeSlot`] because its lifetime is bounded by the same
+/// timeline generation: a rewind / provider-mode transition replaces the
+/// runtime and clears this state, so stale entries can never attach to the
+/// replacement timeline.
+#[derive(Default)]
+pub(crate) struct CodeModeEarlyExecState {
+    /// Turn context for the currently-preparing / active sample, if Code Mode
+    /// is effective with a compatible transport.
+    context: Option<Arc<EarlyExecTurnContext>>,
+    /// Streamed argument accumulation per tool index for the active sample.
+    pending: HashMap<u32, PendingExecArgs>,
+    /// Cells started before response completion, keyed by provider call id.
+    started: HashMap<String, oneshot::Receiver<EarlyExecOutcome>>,
+    /// Call ids whose cells must be terminated instead of published after
+    /// their execution finishes (retry / failure invalidation).
+    aborted: HashSet<String>,
+}
+
+#[derive(Default)]
+struct PendingExecArgs {
+    call_id: Option<String>,
+    args: String,
+}
+
+impl CodeModeEarlyExecState {
+    fn set_context(&mut self, context: Option<Arc<EarlyExecTurnContext>>) {
+        // A new sample starts with fresh tool indexes and fresh call ids;
+        // anything left here belonged to a sample that will never be consumed.
+        self.pending.clear();
+        self.started.clear();
+        self.aborted.clear();
+        self.context = context;
+    }
+
+    fn accepts_early_exec(&self) -> bool {
+        self.context
+            .as_ref()
+            .is_some_and(|c| c.accepts_early_exec())
+    }
+
+    fn note_delta(&mut self, tool_index: u32, id: Option<&str>, arguments_delta: Option<&str>) {
+        if !self.accepts_early_exec() {
+            return;
+        }
+        let entry = self.pending.entry(tool_index).or_default();
+        if let Some(id) = id {
+            entry.call_id = Some(id.to_string());
+        }
+        if let Some(delta) = arguments_delta {
+            entry.args.push_str(delta);
+        }
+    }
+
+    /// Takes the accumulated payload for a completed `exec` call, returning
+    /// `(call_id, raw_arguments)` when early-start applies.
+    fn take_completed_args(
+        &mut self,
+        tool_index: u32,
+        id: Option<&str>,
+    ) -> Option<(String, String)> {
+        if !self.accepts_early_exec() {
+            return None;
+        }
+        let entry = self.pending.remove(&tool_index)?;
+        let call_id = entry.call_id.or_else(|| id.map(str::to_string))?;
+        Some((call_id, entry.args))
+    }
+
+    fn exec_source(&self, raw_arguments: &str) -> Result<String, String> {
+        self.context
+            .as_ref()
+            .ok_or_else(|| "no active Code Mode early-exec context".to_string())?
+            .exec_source(raw_arguments)
+    }
+
+    fn register_started(&mut self, call_id: &str) -> Option<oneshot::Sender<EarlyExecOutcome>> {
+        if !self.accepts_early_exec() {
+            return None;
+        }
+        let (sender, receiver) = oneshot::channel();
+        self.started.insert(call_id.to_string(), receiver);
+        Some(sender)
+    }
+
+    /// Publishes one early-start outcome. Aborted calls are never published:
+    /// their cells are terminated best-effort and the receiver (already
+    /// dropped by the abort) simply disappears.
+    async fn publish(
+        &mut self,
+        runtime: &Arc<CodeModeRuntime>,
+        call_id: &str,
+        sender: oneshot::Sender<EarlyExecOutcome>,
+        result: EarlyExecOutcome,
+    ) {
+        if self.aborted.remove(call_id) {
+            if let Ok(output) = &result
+                && let Some(cell_id) = &output.cell_id
+            {
+                if let Err(error) = runtime.terminate_cell(cell_id).await {
+                    tracing::warn!(%error, cell_id, "failed to terminate aborted early-exec cell");
+                }
+            }
+            return;
+        }
+        let _ = sender.send(result);
+    }
+
+    /// Waits for (if still running) an early-started call's outcome. Removing
+    /// the entry guarantees single consumption.
+    async fn take_result(&mut self, call_id: &str) -> Option<EarlyExecOutcome> {
+        let receiver = self.started.remove(call_id)?;
+        Some(match receiver.await {
+            Ok(result) => result,
+            Err(_) => Err("code mode early-exec worker dropped its result".to_string()),
+        })
+    }
+
+    /// Drops all state for the current sample. Started-but-unpublished calls
+    /// are marked aborted so their workers terminate their cells when the
+    /// execution observes completion.
+    fn clear_for_abort(&mut self) {
+        for id in self.started.drain().map(|(id, _)| id) {
+            self.aborted.insert(id);
+        }
+        self.pending.clear();
     }
 }
 
@@ -636,6 +842,7 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
         &'a self,
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             if cancellation_token.is_cancelled() {
@@ -646,6 +853,7 @@ impl CodeModeSessionDelegate for CodeModeRuntime {
                 .send(DispatchMessage::InvokeTool {
                     invocation,
                     cancellation_token: cancellation_token.clone(),
+                    progress,
                     response_tx,
                 })
                 .map_err(|_| "code mode nested tool dispatcher is unavailable".to_string())?;
@@ -719,6 +927,7 @@ async fn dispatch_message(
         DispatchMessage::InvokeTool {
             invocation,
             cancellation_token,
+            progress,
             response_tx,
         } => {
             let response = match wait_for_active_code_mode_turn(
@@ -729,15 +938,15 @@ async fn dispatch_message(
             )
             .await
             {
-                Ok(session_actor) => tokio::select! {
-                    response = session_actor.dispatch_code_mode_nested_tool(
-                        invocation,
-                        cancellation_token.clone(),
-                    ) => response,
-                    _ = cancellation_token.cancelled() => {
-                        Err("code mode nested tool call cancelled".to_string())
-                    }
-                },
+                Ok(session_actor) => {
+                    session_actor
+                        .dispatch_code_mode_nested_tool(
+                            invocation,
+                            cancellation_token.clone(),
+                            progress,
+                        )
+                        .await
+                }
                 Err(error) => Err(error),
             };
             let _ = response_tx.send(response);
@@ -847,9 +1056,6 @@ pub(crate) fn to_code_mode_tool_definition(
 ) -> CodeModeToolDefinition {
     let raw_name = definition.function.name.clone();
     let (kind, input_schema) = if raw_name == APPLY_PATCH_TOOL_NAME {
-        // GPT-5.6 Sol's pinned Codex profile exposes apply_patch as a
-        // free-form nested tool. The shell dispatcher adapts the raw patch
-        // string back into Grok Build's existing `{ patch }` function input.
         (CodeModeToolKind::Freeform, None)
     } else {
         (
@@ -899,6 +1105,28 @@ pub(crate) fn collect_code_mode_tool_definitions(
     definitions.sort_by(|left, right| left.name.cmp(&right.name));
     definitions.dedup_by(|left, right| left.name == right.name);
     definitions
+}
+
+/// Projects a tool-layer progress item onto the nested-tool progress wire
+/// shape. Text keeps its natural form; content blocks and tool-defined custom
+/// payloads travel as the structured payload. Observation-only either way.
+pub(crate) fn nested_tool_progress_from_tool_progress(
+    progress: ToolProgress,
+) -> NestedToolProgress {
+    match progress {
+        ToolProgress::Text { text } => NestedToolProgress::text(text),
+        ToolProgress::Content { blocks } => match serde_json::to_value(blocks) {
+            Ok(blocks) => NestedToolProgress::with_payload(
+                String::new(),
+                serde_json::json!({"blocks": blocks}),
+            ),
+            Err(_) => NestedToolProgress::text(String::new()),
+        },
+        ToolProgress::Custom { subkind, payload } => NestedToolProgress::with_payload(
+            String::new(),
+            serde_json::json!({ "subkind": subkind, "payload": payload }),
+        ),
+    }
 }
 
 /// Creates the native Responses custom `exec` declaration.
@@ -1337,6 +1565,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nested_tool_progress_mapping_preserves_text_chunks_verbatim() {
+        let mapped = nested_tool_progress_from_tool_progress(ToolProgress::Text {
+            text: "partial output".to_string(),
+        });
+        assert_eq!(mapped.text, "partial output");
+        assert_eq!(mapped.payload, None);
+    }
+
+    #[test]
+    fn nested_tool_progress_mapping_wraps_content_blocks_as_payload() {
+        let mapped = nested_tool_progress_from_tool_progress(ToolProgress::Content {
+            blocks: vec![xai_tool_runtime::ContentBlock::Text {
+                text: "block".to_string(),
+            }],
+        });
+        assert_eq!(mapped.text, String::new());
+        assert_eq!(
+            mapped.payload,
+            Some(serde_json::json!({
+                "blocks": [{ "type": "text", "text": "block" }]
+            }))
+        );
+    }
+
+    #[test]
+    fn nested_tool_progress_mapping_keeps_custom_subkind_and_payload() {
+        let mapped = nested_tool_progress_from_tool_progress(ToolProgress::Custom {
+            subkind: "bash_output_chunk".to_string(),
+            payload: serde_json::json!({ "delta": "out" }),
+        });
+        assert_eq!(mapped.text, String::new());
+        assert_eq!(
+            mapped.payload,
+            Some(serde_json::json!({
+                "subkind": "bash_output_chunk",
+                "payload": { "delta": "out" }
+            }))
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cold_runtime_rejects_wait_from_a_prior_generation_without_initializing_v8() {
         let runtime = CodeModeRuntime::new();
@@ -1589,6 +1858,11 @@ mod tests {
                 json!({"type": "object"}),
             ),
             GrokToolDefinition::function(
+                "send_user_message_async",
+                Some("Send a nonblocking user message"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
                 "read_file",
                 Some("Read a file"),
                 json!({"type": "object"}),
@@ -1596,6 +1870,16 @@ mod tests {
             GrokToolDefinition::function(
                 "spawn_subagent",
                 Some("Launch a subagent"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "spawn_agent",
+                Some("Launch a named native agent"),
+                json!({"type": "object"}),
+            ),
+            GrokToolDefinition::function(
+                "interrupt_agent",
+                Some("Interrupt a named agent"),
                 json!({"type": "object"}),
             ),
             GrokToolDefinition::function(
@@ -1630,6 +1914,7 @@ mod tests {
         for direct_only in [
             "ask_user_question",
             "request_user_input",
+            "send_user_message_async",
             "enter_plan_mode",
             "exit_plan_mode",
             "task",

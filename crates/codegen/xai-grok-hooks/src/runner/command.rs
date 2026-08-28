@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use xai_grok_tools::util::ProcessGroup;
 
-use crate::config::HookSpec;
+use crate::config::{HookSpec, RUNNER_ALWAYS_SET_ENV};
 use crate::event::HookEventEnvelope;
 use crate::result::{HookDecision, StopHookOutcome};
 
@@ -301,25 +301,6 @@ pub async fn run_command_hook(
         }
     }
 }
-
-/// Env vars the runner sets unconditionally on every spawned hook.
-///
-/// Used by:
-///
-/// * [`find_unresolved_env_vars`] to avoid flagging vars that *are* set
-///   by the runner itself,
-/// * [`crate::config::parse_hook_file`] and the plugin adapter to strip
-///   user-supplied attempts to override these keys via the JSON `env`
-///   map (those attempts would be silently ignored by the spawn-time
-///   precedence ordering anyway, but stripping them at load time gives
-///   users a clear "ignored, reserved key" warning).
-pub(crate) const RUNNER_ALWAYS_SET_ENV: &[&str] = &[
-    "GROK_HOOK_EVENT",
-    "GROK_HOOK_NAME",
-    "GROK_SESSION_ID",
-    "GROK_WORKSPACE_ROOT",
-    "CLAUDE_PROJECT_DIR",
-];
 
 /// Parse `command_str` for `${VAR}` and `$VAR` references and return the
 /// names that aren't resolvable from any of:

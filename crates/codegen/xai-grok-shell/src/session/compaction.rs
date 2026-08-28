@@ -364,7 +364,10 @@ impl SessionActor {
                 .web_search_state()
                 .native_hosted_web_search_suppressed(sampling_config.provider),
         ) {
-            Ok(surface) => surface,
+            Ok(surface) => surface.with_freeform_apply_patch(
+                self.models_manager
+                    .model_supports_freeform_apply_patch(&sampling_config.model),
+            ),
             Err(error) => {
                 tracing::warn!(%error, "two_pass: incompatible effective tool surface");
                 return None;
@@ -1051,6 +1054,9 @@ impl SessionActor {
         let new_len = replacement.len();
         self.chat_state_handle
             .replace_conversation_for_compaction(replacement);
+        crate::session::memory::experience_ledger::mark_history_compacted(
+            self.memory.experience_run_id(),
+        );
         self.compaction
             .auto_compact_suppressed
             .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
@@ -1613,6 +1619,10 @@ impl SessionActor {
                 .native_hosted_web_search_suppressed(sampling_config.provider),
         )
         .map_err(|error| acp::Error::internal_error().data(error))?;
+        let compaction_surface = compaction_surface.with_freeform_apply_patch(
+            self.models_manager
+                .model_supports_freeform_apply_patch(&sampling_config.model),
+        );
         let compaction_tool_tokens = compaction_surface.estimated_definition_tokens();
         let compaction_tools = compaction_surface.function_tools;
         let compaction_hosted_tools = compaction_surface.hosted_tools;
@@ -2367,6 +2377,9 @@ impl SessionActor {
         let new_len = compacted_history.len();
         self.chat_state_handle
             .replace_conversation_for_compaction(compacted_history);
+        crate::session::memory::experience_ledger::mark_history_compacted(
+            self.memory.experience_run_id(),
+        );
         if self.startup_hints.inherited_prefix_len.is_some() {
             let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
             if xai_token_estimation::exceeds_threshold(
@@ -3101,6 +3114,8 @@ mod inline_auto_compact_flow_tests {
                 cancel: Default::default(),
             },
             memory: crate::session::memory_state::SessionMemory {
+                experience_run_id: uuid::Uuid::now_v7().to_string(),
+                experience_prior_tool_result_ids: std::collections::HashSet::new(),
                 embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
                 active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
                 flush_config: crate::config::MemoryFlushConfig::default(),
@@ -3129,6 +3144,7 @@ mod inline_auto_compact_flow_tests {
             max_retries: 3,
             max_turns: None,
             pending_interjections: InterjectionBuffer::new(),
+            pending_native_agent_messages: Default::default(),
             pending_skill_reminders: Mutex::new(Vec::new()),
             idle_flush_timeout: None,
             dream_check_timeout: None,
@@ -4349,6 +4365,8 @@ mod inline_auto_compact_flow_tests {
         )
         .await;
         actor.memory = crate::session::memory_state::SessionMemory {
+            experience_run_id: uuid::Uuid::now_v7().to_string(),
+            experience_prior_tool_result_ids: std::collections::HashSet::new(),
             embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
             active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: memory_config

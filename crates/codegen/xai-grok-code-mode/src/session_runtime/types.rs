@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
+use xai_grok_code_mode_protocol::NestedToolProgressSink;
 
 /// Identifies one execution cell within a session runtime.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -121,6 +122,7 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
         &self,
         invocation: NestedToolCall,
         cancellation_token: CancellationToken,
+        progress: NestedToolProgressSink,
     ) -> impl Future<Output = Result<JsonValue, String>> + Send;
 
     fn notify(

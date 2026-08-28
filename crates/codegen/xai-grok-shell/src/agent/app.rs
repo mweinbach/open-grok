@@ -313,7 +313,7 @@ pub async fn run_stdio_agent(
     }
     // Stamp binary version into unified log entries so zombie processes
     // are identifiable by version in diagnostic logs.
-    xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
+    xai_grok_telemetry::unified_log::set_version(xai_grok_version::version());
 
     // Clean up orphaned upload queue temp files from previous sessions (best-effort).
     // Uses DEFAULT_MAX_AGE to stay in sync with the upload queue's retry policy.
@@ -437,7 +437,7 @@ async fn run_headless_inner(
     memory_config: Option<crate::config::MemoryConfig>,
 ) -> anyhow::Result<()> {
     register_fs_watch_runtime();
-    xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
+    xai_grok_telemetry::unified_log::set_version(xai_grok_version::version());
     // `open-grok agent [headless]` serves non-TUI automation; stamp proxy requests
     // as headless. IDE-facing `open-grok agent stdio` stays interactive.
     crate::http::set_process_client_mode_headless();
@@ -882,7 +882,7 @@ pub async fn run_leader(
     use tokio_util::sync::CancellationToken;
 
     register_fs_watch_runtime();
-    xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
+    xai_grok_telemetry::unified_log::set_version(xai_grok_version::version());
 
     // Clean up orphaned upload queue temp files from previous sessions
     // (best-effort). Detached onto a blocking thread so it never stalls leader
@@ -1013,7 +1013,7 @@ pub async fn run_leader(
         socket_path: socket_path.clone(),
         lock_path: lock.lock_path().clone(),
         ws_url_suffix: compute_ws_url_suffix(ws_url),
-        leader_binary_version: xai_grok_version::VERSION.to_string(),
+        leader_binary_version: xai_grok_version::version().to_string(),
     })
     .with_default_hub_url(agent_config.hub.url.clone());
 

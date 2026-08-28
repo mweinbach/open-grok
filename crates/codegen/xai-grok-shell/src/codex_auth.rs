@@ -777,23 +777,47 @@ pub async fn run_cli_login(device_code: bool) -> Result<CodexAccountSummary> {
     let credentials = if device_code {
         run_device_login_at(&path, &endpoints).await?
     } else {
-        run_browser_login_at(&path, &endpoints, true).await?
+        run_browser_login_at(&path, &endpoints, true, None).await?
     };
     Ok(CodexAccountSummary::from(&credentials))
 }
 
+#[derive(Debug)]
+pub struct CodexBrowserFallback {
+    pub authorization_url: String,
+    pub error: String,
+}
+
 /// Browser OAuth for the pager. Unlike the CLI entrypoint, this does not write
 /// directly to stderr and disturb the terminal alternate screen.
-pub async fn run_tui_login() -> Result<CodexAccountSummary> {
+pub async fn run_tui_login(
+    browser_fallback: tokio::sync::oneshot::Sender<CodexBrowserFallback>,
+) -> Result<CodexAccountSummary> {
     let endpoints = CodexEndpoints::default();
-    let credentials = run_browser_login_at(&auth_file_path(), &endpoints, false).await?;
+    let credentials =
+        run_browser_login_at(&auth_file_path(), &endpoints, false, Some(browser_fallback)).await?;
     Ok(CodexAccountSummary::from(&credentials))
+}
+
+fn report_browser_launch_failure(
+    browser_fallback: Option<tokio::sync::oneshot::Sender<CodexBrowserFallback>>,
+    authorization_url: &str,
+    error: String,
+) {
+    tracing::warn!(error = %error, "Codex OAuth browser launch failed; waiting for manual sign-in");
+    if let Some(browser_fallback) = browser_fallback {
+        let _ = browser_fallback.send(CodexBrowserFallback {
+            authorization_url: authorization_url.to_owned(),
+            error,
+        });
+    }
 }
 
 async fn run_browser_login_at(
     path: &Path,
     endpoints: &CodexEndpoints,
     announce: bool,
+    browser_fallback: Option<tokio::sync::oneshot::Sender<CodexBrowserFallback>>,
 ) -> Result<CodexCredentials> {
     let listener = bind_callback_listener()
         .await
@@ -824,23 +848,12 @@ async fn run_browser_login_at(
         eprintln!("  {auth_url}");
     }
     let open_url = auth_url.clone();
-    let browser_result = tokio::task::spawn_blocking(move || webbrowser::open(&open_url)).await;
-    if !announce {
-        match browser_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                server.abort();
-                return Err(anyhow!(
-                    "could not open a browser for Codex login: {error}. Run `open-grok login --codex` instead"
-                ));
-            }
-            Err(error) => {
-                server.abort();
-                return Err(anyhow!(
-                    "could not launch Codex browser login: {error}. Run `open-grok login --codex` instead"
-                ));
-            }
-        }
+    let browser_result = tokio::task::spawn_blocking(move || webbrowser::open(&open_url))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    if let Err(error) = browser_result {
+        report_browser_launch_failure(browser_fallback, &auth_url, error);
     }
 
     let callback_result = tokio::time::timeout(CALLBACK_TIMEOUT, result_rx).await;
@@ -1517,6 +1530,22 @@ mod tests {
             query.get("originator").map(String::as_str),
             Some("codex_cli_rs")
         );
+    }
+
+    #[tokio::test]
+    async fn browser_launch_failure_exposes_manual_authorization_url() {
+        let (fallback_tx, fallback_rx) = tokio::sync::oneshot::channel();
+        let authorization_url = "https://auth.openai.com/oauth/authorize?state=test-state";
+
+        report_browser_launch_failure(
+            Some(fallback_tx),
+            authorization_url,
+            "browser unavailable".to_owned(),
+        );
+
+        let fallback = fallback_rx.await.unwrap();
+        assert_eq!(fallback.authorization_url, authorization_url);
+        assert_eq!(fallback.error, "browser unavailable");
     }
 
     #[tokio::test]

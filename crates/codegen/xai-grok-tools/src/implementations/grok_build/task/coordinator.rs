@@ -9,6 +9,7 @@
 //! associated futures may be `Send` or non-`Send`; the resulting actor future
 //! inherits that property naturally on stable Rust.
 
+mod native;
 mod query;
 mod queue;
 mod spawn;
@@ -66,6 +67,11 @@ pub struct SubagentCoordinator<R: ChildRunner> {
     waiters: HashMap<String, Vec<BlockingWaiter>>,
     mailboxes: HashMap<MailboxKey, VecDeque<AgentMailboxMessage>>,
     mailbox_waiters: HashMap<MailboxKey, AgentMailboxWaiter>,
+    native_names: HashMap<MailboxKey, String>,
+    native_records: HashMap<MailboxKey, super::types::NativeAgentRecord>,
+    native_loaded: HashSet<String>,
+    native_activity: HashMap<MailboxKey, Vec<String>>,
+    native_waiters: HashMap<MailboxKey, native::NativeWaiter>,
     workflow_cancel_waiters: HashMap<String, Vec<oneshot::Sender<SubagentCancelOutcome>>>,
     /// Per-parent delete-path teardown drain, present only while a
     /// responder-bearing `TeardownSession` (`/delete`) waits for the session's
@@ -156,6 +162,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             waiters: HashMap::new(),
             mailboxes: HashMap::new(),
             mailbox_waiters: HashMap::new(),
+            native_names: HashMap::new(),
+            native_records: HashMap::new(),
+            native_loaded: HashSet::new(),
+            native_activity: HashMap::new(),
+            native_waiters: HashMap::new(),
             workflow_cancel_waiters: HashMap::new(),
             teardown_drains: HashMap::new(),
             spawn_blocked_sessions: HashSet::new(),
@@ -223,7 +234,18 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 let Some(id) = self.completed_order.pop_front() else {
                     break;
                 };
-                self.completed.remove(&id);
+                if self.native_names.values().any(|current| current == &id) {
+                    self.completed_order.push_back(id);
+                    if self
+                        .completed_order
+                        .iter()
+                        .all(|id| self.native_names.values().any(|current| current == id))
+                    {
+                        break;
+                    }
+                } else {
+                    self.completed.remove(&id);
+                }
             }
         }
 
@@ -233,6 +255,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     fn handle_command(&mut self, command: SubagentEvent) {
         match command {
             SubagentEvent::Spawn(command) => self.handle_spawn(command),
+            SubagentEvent::NativeAgent(request) => self.handle_native_agent(request),
             SubagentEvent::Query(query) => {
                 self.handle_query(
                     query.subagent_id,
@@ -318,6 +341,15 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 self.pending_completions
                     .retain(|completion| completion.parent_session_id != parent_session_id);
                 self.mailboxes
+                    .retain(|key, _| key.team_scope_id != parent_session_id);
+                self.native_names
+                    .retain(|key, _| key.team_scope_id != parent_session_id);
+                self.native_records
+                    .retain(|key, _| key.team_scope_id != parent_session_id);
+                self.native_loaded.remove(&parent_session_id);
+                self.native_activity
+                    .retain(|key, _| key.team_scope_id != parent_session_id);
+                self.native_waiters
                     .retain(|key, _| key.team_scope_id != parent_session_id);
                 let closed_waiters: Vec<_> = self
                     .mailbox_waiters
@@ -701,10 +733,21 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         };
         let mut retained = VecDeque::new();
         let mut steering_live = true;
-        for message in mailbox {
+        for mut message in mailbox {
+            if message.native.is_some() && !child.control.accepts_native_message(&message) {
+                self.runner
+                    .on_agent_message(&message, AgentMessageDeliveryStatus::Rejected);
+                continue;
+            }
+            if matches!(
+                message.kind,
+                super::types::AgentMailboxMessageKind::NativeFollowup
+            ) {
+                message.kind = super::types::AgentMailboxMessageKind::NativeMessage;
+            }
             if steering_live
                 && message.kind.steers_recipient()
-                && child.control.deliver_followup(&message)
+                && child.control.deliver_initial_message(&message)
             {
                 continue;
             }
@@ -718,6 +761,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         if !retained.is_empty() {
             self.mailboxes.insert(key.clone(), retained);
         }
+        self.persist_native_registry(&key.team_scope_id);
     }
 
     fn enqueue_agent_message(
@@ -745,11 +789,18 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         const MAX_DRAIN_MESSAGES: usize = 20;
         let key = MailboxKey::from(&identity);
         if let Some(mailbox) = self.mailboxes.get_mut(&key)
-            && !mailbox.is_empty()
+            && mailbox.iter().any(|message| message.native.is_none())
         {
-            let messages = (0..MAX_DRAIN_MESSAGES)
-                .filter_map(|_| mailbox.pop_front())
-                .collect();
+            let mut messages = Vec::new();
+            while messages.len() < MAX_DRAIN_MESSAGES {
+                let Some(index) = mailbox.iter().position(|message| message.native.is_none())
+                else {
+                    break;
+                };
+                if let Some(message) = mailbox.remove(index) {
+                    messages.push(message);
+                }
+            }
             if mailbox.is_empty() {
                 self.mailboxes.remove(&key);
             }
@@ -788,7 +839,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 child,
                 respond_to,
             } => {
-                let Some(pending) = self.pending.remove(&subagent_id) else {
+                let Some(mut pending) = self.pending.remove(&subagent_id) else {
                     let _ = respond_to.send(false);
                     return;
                 };
@@ -801,6 +852,18 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     team_scope_id: pending.request.parent_session_id.clone(),
                     agent_id: subagent_id.clone(),
                 };
+                if pending.request.runtime_overrides.native_agent.is_some()
+                    && pending.handle_only
+                    && let Some(reply) = pending.spawn_reply.take()
+                {
+                    let _ = reply.send(SubagentResult {
+                        success: true,
+                        backgrounded: true,
+                        subagent_id: subagent_id.clone(),
+                        child_session_id: child.child_session_id.clone(),
+                        ..Default::default()
+                    });
+                }
                 self.active.insert(
                     subagent_id,
                     ActiveChild {
@@ -1048,6 +1111,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         };
         self.completed.insert(id.to_owned(), completed);
         self.completed_order.push_back(id.to_owned());
+        self.notify_native_completion(&request);
         self.running_count_changed();
         let workflow_run_id = request.owner.workflow_run_id().map(str::to_owned);
         let parent_session_id = request.parent_session_id.clone();
@@ -1324,6 +1388,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     .map(|waiter| waiter.deadline),
             )
             .chain(self.mailbox_waiters.values().map(|waiter| waiter.deadline))
+            .chain(self.native_waiters.values().map(|waiter| waiter.deadline))
             .chain(self.teardown_drains.values().map(|drain| drain.deadline))
             .min()
     }
@@ -1348,6 +1413,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     }
 
     fn process_deadlines(&mut self) {
+        self.expire_native_waiters();
         self.reap_abandoned_callers();
         let now = tokio::time::Instant::now();
         // Backstop: a delete-path hold whose drain deadline elapsed force-clears

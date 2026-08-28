@@ -5834,7 +5834,9 @@ fn copy_on_selection_finalized_sets_provider() {
     ta.handle_mouse(mouse_drag(5, 0), area, state);
     ta.handle_mouse(mouse_up(5, 0), area, state);
 
-    // Now Ctrl-V should paste "hello" (from provider)
+    // Mouse-up copies to the provider; clear the highlight so paste inserts
+    // rather than replacing the selected source text.
+    ta.clear_selection();
     ta.set_cursor(5);
     ta.input(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
     assert_eq!(ta.text(), "hellohello");
@@ -6230,4 +6232,138 @@ fn shift_number_trusts_terminal_character() {
     let mut t = TextArea::new();
     t.input(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::SHIFT));
     assert_eq!(t.text(), "/");
+}
+
+#[test]
+fn shift_arrow_selection_extends_and_collapses_at_directional_edges() {
+    let mut textarea = ta_with("alpha beta");
+    textarea.set_cursor(0);
+
+    textarea.input(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+    textarea.input(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+    assert_eq!(textarea.selection_range(), Some(0..2));
+
+    textarea.input(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    assert_eq!(textarea.selection_range(), None);
+    assert_eq!(textarea.cursor(), 0);
+}
+
+#[test]
+fn shift_word_selection_keeps_anchor_and_replaces_in_one_undo_step() {
+    let mut textarea = ta_with("alpha beta");
+    textarea.clear_history();
+    textarea.set_cursor(0);
+
+    textarea.input(KeyEvent::new(
+        KeyCode::Right,
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(textarea.selected_text().as_deref(), Some("alpha"));
+
+    textarea.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(textarea.text(), "x beta");
+    textarea.undo();
+    assert_eq!(textarea.text(), "alpha beta");
+}
+
+#[test]
+fn shift_home_end_and_super_arrows_extend_selection() {
+    for (left, right, modifiers) in [
+        (KeyCode::Home, KeyCode::End, KeyModifiers::SHIFT),
+        (
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ),
+    ] {
+        let mut textarea = ta_with("hello world");
+        let anchor = textarea.text().find(' ').expect("space");
+        textarea.set_cursor(anchor);
+
+        textarea.input(KeyEvent::new(right, modifiers));
+        assert_eq!(
+            textarea.selection_range(),
+            Some(anchor..textarea.text().len())
+        );
+
+        textarea.input(KeyEvent::new(left, modifiers));
+        assert_eq!(textarea.selection_range(), Some(0..anchor));
+    }
+}
+
+#[test]
+fn shift_vertical_selection_extends_between_lines() {
+    let mut textarea = ta_with("one\ntwo\nthree");
+    let two = textarea.text().find("two").expect("second line");
+    let three = textarea.text().find("three").expect("third line");
+    textarea.set_cursor(two);
+
+    textarea.input(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+    assert_eq!(textarea.selection_range(), Some(two..three));
+    textarea.input(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+    assert_eq!(textarea.selection_range(), None);
+}
+
+#[test]
+fn super_copy_keeps_selection_and_super_cut_removes_it() {
+    let mut textarea = ta_with("alpha beta");
+    textarea.set_selection(0, 5);
+
+    textarea.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+    assert_eq!(textarea.take_clipboard().as_deref(), Some("alpha"));
+    assert_eq!(textarea.selection_range(), Some(0..5));
+
+    textarea.input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::SUPER));
+    assert_eq!(textarea.take_clipboard().as_deref(), Some("alpha"));
+    assert_eq!(textarea.text(), " beta");
+    assert_eq!(textarea.selection_range(), None);
+}
+
+#[test]
+fn paste_and_yank_replace_selected_text() {
+    let mut pasted = ta_with("hello world");
+    pasted.set_clipboard_text("replacement".to_owned());
+    pasted.set_selection(6, pasted.text().len());
+    pasted.input(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    assert_eq!(pasted.text(), "hello replacement");
+
+    let mut yanked = ta_with("alpha beta");
+    yanked.set_cursor(5);
+    yanked.input(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    yanked.set_selection(0, 5);
+    yanked.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    assert_eq!(yanked.text(), " beta");
+}
+
+#[test]
+fn kill_selected_text_preserves_it_for_yank() {
+    let mut textarea = ta_with("alpha beta");
+    textarea.set_selection(0, 5);
+    textarea.input(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    assert_eq!(textarea.text(), " beta");
+
+    textarea.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    assert_eq!(textarea.text(), "alpha beta");
+}
+
+#[test]
+fn selection_range_snaps_stale_offsets_to_utf8_character_boundaries() {
+    let mut textarea = ta_with("a💡z");
+    textarea.set_selection(2, 3);
+    assert_eq!(textarea.selected_text().as_deref(), Some("💡"));
+}
+
+#[test]
+fn ctrl_shift_uppercase_navigation_extends_selection() {
+    let mut textarea = ta_with("hello world");
+    let anchor = textarea.text().find(' ').expect("space");
+    textarea.set_cursor(anchor);
+    textarea.input(KeyEvent::new(
+        KeyCode::Char('E'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(
+        textarea.selection_range(),
+        Some(anchor..textarea.text().len())
+    );
 }

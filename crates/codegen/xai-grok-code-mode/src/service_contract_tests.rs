@@ -56,6 +56,7 @@ impl CodeModeSessionDelegate for HeldNotificationDelegate {
         &'a self,
         _invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        _progress: xai_grok_code_mode_protocol::NestedToolProgressSink,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             cancellation_token.cancelled().await;
@@ -110,6 +111,7 @@ impl CodeModeSessionDelegate for BlockingDelegate {
         &'a self,
         _invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
+        _progress: xai_grok_code_mode_protocol::NestedToolProgressSink,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             let _ = self.events_tx.send(DelegateEvent::ToolStarted);

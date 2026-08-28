@@ -427,6 +427,16 @@ impl AgentRebuildSpec {
             slugs
         })
         .with_ask_user_question_enabled(*ask_user_question_enabled)
+        .with_async_user_messages_enabled(
+            *subagent_depth == 0 && active_sampling_config.read().supports_async_user_messages(),
+        )
+        .with_native_agents_enabled({
+            let sampling = active_sampling_config.read();
+            (*subagents_enabled || *subagent_depth > 0)
+                && sampling.provider == xai_grok_sampling_types::ModelProvider::Codex
+                && sampling.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                && models_manager.model_supports_codex_multi_agent_v2(&sampling.model)
+        })
         .with_persona_summaries(persona_summaries.clone())
         .with_prompt_audience(*prompt_audience)
         .with_role_instructions(role_instructions.clone())
@@ -1175,6 +1185,49 @@ mod tests {
             })
             .await;
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_user_messages_follow_model_opt_in_and_root_session_on_rebuild() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for subagent_depth in [0, 1] {
+                    let mut spec = test_rebuild_spec_default();
+                    Arc::get_mut(&mut spec).unwrap().subagent_depth = subagent_depth;
+                    for (provider, opted_in) in [
+                        (ModelProvider::Codex, false),
+                        (ModelProvider::Codex, true),
+                        (ModelProvider::Xai, true),
+                        (ModelProvider::Codex, false),
+                    ] {
+                        spec.replace_active_sampling_config(xai_grok_sampler::SamplerConfig {
+                            provider,
+                            api_backend: xai_grok_sampling_types::ApiBackend::Responses,
+                            experimental_supported_tools: if opted_in {
+                                vec!["send_user_message_async".into()]
+                            } else {
+                                Vec::new()
+                            },
+                            ..Default::default()
+                        });
+                        let agent = spec
+                            .build_agent(AgentDefinition::default_grok_build())
+                            .await
+                            .unwrap();
+                        let available = agent
+                            .tool_bridge()
+                            .tool_definitions()
+                            .await
+                            .iter()
+                            .any(|tool| tool.function.name == "send_user_message_async");
+                        assert_eq!(
+                            available,
+                            subagent_depth == 0 && opted_in && provider == ModelProvider::Codex
+                        );
+                    }
+                }
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn rebuild_registers_standalone_web_run_for_supported_native_route() {
         tokio::task::LocalSet::new()

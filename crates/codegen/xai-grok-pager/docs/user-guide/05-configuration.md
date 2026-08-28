@@ -120,6 +120,14 @@ sessions:
 | `"code_mode"` | Mixed Code Mode: `exec` and `wait` are available alongside ordinary top-level tools. This is the normal xAI Code Mode choice. |
 | `"code_mode_only"` | Ordinary tools are available only through nested `tools.*` calls. |
 
+In either Code Mode setting, Open Grok displays the actual file, terminal,
+search, or other nested tool activity and its progress as ordinary tool cards.
+The internal `exec`/`wait` wrappers, JavaScript source, and wrapper arguments
+are never shown, including while a response streams or a session is restored.
+Code Mode also lets the model observe supported nested-tool progress through
+`p.onProgress(handler)`; user-visible progress does not depend on the model
+registering that handler.
+
 Legacy `true` and `false` values remain accepted and map to `"code_mode"` and
 `"direct"`, respectively. New writes use the string values above. Restart Open
 Grok after changing the setting; the running process keeps the configuration it

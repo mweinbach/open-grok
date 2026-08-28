@@ -444,6 +444,24 @@ impl SessionActor {
         provider: xai_grok_sampling_types::ModelProvider,
     ) -> bool {
         let web_search = self.rebuild_spec.web_search_state();
+        if matches!(tool_name, "spawn_agent" | "interrupt_agent") {
+            let sampling = self.rebuild_spec.active_sampling_config.read();
+            return provider == xai_grok_sampling_types::ModelProvider::Codex
+                && sampling.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                && self
+                    .models_manager
+                    .model_supports_codex_multi_agent_v2(&sampling.model);
+        }
+        if tool_name == "send_user_message_async" {
+            let sampling = self.rebuild_spec.active_sampling_config.read();
+            return provider == xai_grok_sampling_types::ModelProvider::Codex
+                && self.rebuild_spec.subagent_depth == 0
+                && self
+                    .models_manager
+                    .model_experimental_supported_tools(&sampling.model)
+                    .iter()
+                    .any(|tool| tool == "send_user_message_async");
+        }
         if tool_name == "web_search" {
             return web_search.allowed_for_provider(provider);
         }
@@ -467,7 +485,7 @@ impl SessionActor {
             // Memory storage and FTS are local/provider-neutral. Semantic
             // search may independently use the user's connected xAI embedding
             // route while chat runs through Codex.
-            "memory_search" | "memory_get" => self.memory.is_enabled(),
+            "memory_search" | "experience_search" | "memory_get" => self.memory.is_enabled(),
             _ => true,
         }
     }
@@ -831,6 +849,10 @@ impl SessionActor {
             self.rebuild_spec.multi_agent_policy_enabled,
         );
         let reasoning_summary = self.models_manager.model_reasoning_summary(&cfg.model);
+        let use_responses_lite = self.models_manager.model_uses_responses_lite(&cfg.model);
+        let experimental_supported_tools = self
+            .models_manager
+            .model_experimental_supported_tools(&cfg.model);
         let stream_tool_calls = crate::agent::config::resolve_stream_tool_calls_inject(
             self.models_manager
                 .model_stream_tool_calls_override(&cfg.model)
@@ -838,6 +860,8 @@ impl SessionActor {
             provider,
             cfg.api_backend,
         );
+        let codex_permissions = (provider == xai_grok_sampling_types::ModelProvider::Codex)
+            .then(|| self.codex_permissions());
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
@@ -908,10 +932,63 @@ impl SessionActor {
                 .active_sampling_config()
                 .supports_standalone_web_search,
             codex_multi_agent_v2,
+            use_responses_lite,
+            experimental_supported_tools,
+            codex_permissions,
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+        }
+    }
+
+    fn codex_permissions(&self) -> xai_grok_sampler::CodexPermissions {
+        let active_profile = xai_grok_sandbox::profile_name();
+        let sandbox_mode = match active_profile {
+            None => "danger-full-access",
+            Some("read-only" | "readonly") => "read-only",
+            Some(_) => "workspace-write",
+        };
+        let sandbox = if active_profile.is_none() {
+            "none"
+        } else if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else if cfg!(target_os = "linux") {
+            "landlock"
+        } else if cfg!(target_os = "windows") {
+            "windows_sandbox"
+        } else {
+            "external"
+        };
+        let cwd = std::path::Path::new(self.session_info.cwd.as_str());
+        let writable_roots = active_profile
+            .and_then(|profile| profile.parse::<xai_grok_sandbox::ProfileName>().ok())
+            .and_then(|profile| {
+                let config = xai_grok_sandbox::load_sandbox_config(cwd);
+                profile.resolve_profile(cwd, &config).ok()
+            })
+            .map(|profile| {
+                profile
+                    .read_write
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let auto_review_enabled = self.permissions.is_auto_mode();
+        let approval_policy = if self.permissions.is_yolo_mode() {
+            xai_grok_sampler::CodexApprovalPolicy::Never
+        } else {
+            xai_grok_sampler::CodexApprovalPolicy::OnRequest
+        };
+        xai_grok_sampler::CodexPermissions {
+            sandbox: sandbox.to_owned(),
+            sandbox_mode: sandbox_mode.to_owned(),
+            sandbox_profile: active_profile.map(str::to_owned),
+            network_access: !xai_grok_sandbox::should_restrict_child_network(),
+            writable_roots,
+            approval_policy,
+            auto_review_enabled,
         }
     }
     /// Install auto-mode permission classifier with a live LLM side-query
@@ -1773,7 +1850,7 @@ impl SessionActor {
         } else {
             format!("{auth_mode:?}")
         };
-        let client_version = xai_grok_version::VERSION;
+        let client_version = xai_grok_version::version();
         if request_provider == xai_grok_sampling_types::ModelProvider::Xai
             && auth_mode == crate::auth::AuthMode::WebLogin
         {

@@ -23,6 +23,7 @@ reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 # rusqlite 0.37 + bundled = self-contained SQLite (>= 3.50.2) with FTS5.
 rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 # sqlite-vec: vec0 virtual table for KNN vector search.
 sqlite-vec = "=0.1.7-alpha.2"

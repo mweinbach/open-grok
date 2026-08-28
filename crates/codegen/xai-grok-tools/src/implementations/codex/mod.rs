@@ -14,9 +14,13 @@
 pub mod apply_patch;
 pub mod grep_files;
 pub mod list_dir;
+pub mod multi_agent_v2;
+pub mod multi_agent_wire;
 pub mod read_file;
+pub mod send_user_message_async;
 
 pub use apply_patch::ApplyPatchTool;
 pub use grep_files::CodexGrepFilesTool;
 pub use list_dir::CodexListDirTool;
 pub use read_file::CodexReadFileTool;
+pub use send_user_message_async::SendUserMessageAsyncTool;

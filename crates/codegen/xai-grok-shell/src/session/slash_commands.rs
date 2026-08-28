@@ -549,6 +549,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "welcome",
     "workflows",
     "yolo",
+    "yolo-2",
 ];
 /// Unconditional reservations for `grok inspect`. Live advertising still
 /// includes currently gated-on shell builtins plus [`PAGER_COMMAND_KEYS`].

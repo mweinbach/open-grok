@@ -353,7 +353,12 @@ snapshot is the fork baseline because the upstream repository currently has
 replacement, unrelated history. Compatible upstream snapshots have since been
 ported through Grok Build `1.0.0` at
 `8a14c91d88875a831a38b3a066b1683116bcb31c` (2026-08-09), without merging the
-unrelated histories. Codex behavior is ported from a pinned revision of
+unrelated histories. Additional compatible improvements from Grok Build
+`1.0.6` snapshot `19d42e35c07a9c9244f03f6df0c4c353f970d4f9` (2026-08-19)
+were selectively replayed, including unhealthy-repository session recovery,
+keyboard-driven prompt selection, authenticated hook environment expansion,
+and sanitized MCP server/tool icon metadata. Codex behavior is ported from a
+pinned revision of
 [`openai/codex`](https://github.com/openai/codex). The pinned commits and
 deliberate compatibility differences are recorded in the documents linked above.
 

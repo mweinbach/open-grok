@@ -54,6 +54,8 @@ open-grok logout --codex
 
 Inside an active session, use `/login codex` and `/logout codex` for the same
 independent account. Bare `/login` and `/logout` continue to operate on xAI.
+If the browser cannot open automatically, Open Grok displays the authorization
+URL so you can open it manually without leaving the session.
 
 The Codex flow follows the OpenAI Codex OAuth authorization-code + PKCE setup,
 refreshes access tokens automatically, and stores the resulting tokens in

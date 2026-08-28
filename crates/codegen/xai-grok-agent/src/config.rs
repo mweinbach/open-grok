@@ -211,6 +211,7 @@ pub fn workspace_grok_build_toolset() -> ToolServerConfig {
     tools.push((&grok_build::ReferenceToVideoTool).into());
     tools.push((&grok_build::WebFetchTool).into());
     tools.push((&memory::search_tool::MemorySearchImpl).into());
+    tools.push((&memory::ExperienceSearchImpl).into());
     tools.push((&memory::get_tool::MemoryGetImpl).into());
     tools.push((&grok_build::LspTool).into());
     ToolServerConfig {
@@ -490,6 +491,7 @@ fn orchestrator_toolset() -> ToolServerConfig {
             (&grok_build::ReferenceToVideoTool).into(),
             // Memory
             (&memory::MemorySearchImpl).into(),
+            (&memory::ExperienceSearchImpl).into(),
             (&memory::MemoryGetImpl).into(),
             // Intentionally excluded:
             // - SearchReplaceTool (no file editing — delegate to subagents)
@@ -798,9 +800,9 @@ pub struct AgentDefinition {
     #[serde(default = "default_true")]
     pub agents_md: bool,
     /// When true (the default), the AgentBuilder layers session-level optional
-    /// tools on top of the agent's declared `tool_config`: memory_search/get,
-    /// web_search, web_fetch, lsp, image_gen, video_gen, OpenCode write
-    /// fallback, and the plan-mode tools.
+    /// tools on top of the agent's declared `tool_config`: memory_search,
+    /// experience_search, memory_get, web_search, web_fetch, lsp, image_gen,
+    /// video_gen, OpenCode write fallback, and the plan-mode tools.
     ///
     /// Set this to `false` for harnesses that need an exact, minimal toolset
     /// (e.g. the compat harness, where every advertised tool must match the
@@ -1792,6 +1794,35 @@ mod tests {
             );
         }
         assert!(toolset_for_preset("does-not-exist").is_none());
+    }
+    #[test]
+    fn memory_toolsets_include_experience_search_after_legacy_memory_search() {
+        for (name, toolset) in [
+            ("workspace", workspace_grok_build_toolset()),
+            ("orchestrator", orchestrator_toolset()),
+        ] {
+            let legacy_search = toolset
+                .tools
+                .iter()
+                .position(|tool| short_tool_name(&tool.id) == memory::MEMORY_SEARCH_TOOL_NAME)
+                .unwrap_or_else(|| panic!("{name} must expose memory_search"));
+            let experience_search = toolset
+                .tools
+                .iter()
+                .position(|tool| short_tool_name(&tool.id) == memory::EXPERIENCE_SEARCH_TOOL_NAME)
+                .unwrap_or_else(|| panic!("{name} must expose experience_search"));
+            assert!(
+                legacy_search < experience_search,
+                "{name} must preserve memory_search as the first MemorySearch-kind tool"
+            );
+            assert!(
+                toolset
+                    .tools
+                    .iter()
+                    .any(|tool| short_tool_name(&tool.id) == memory::MEMORY_GET_TOOL_NAME),
+                "{name} must preserve memory_get"
+            );
+        }
     }
     #[test]
     fn presets_select_distinct_toolsets_by_size() {

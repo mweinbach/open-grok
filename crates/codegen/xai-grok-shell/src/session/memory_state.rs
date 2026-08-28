@@ -4,11 +4,18 @@
 //! that were previously scattered across 15 fields on `SessionActor`.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 /// Memory subsystem state for a session.
 pub(crate) struct SessionMemory {
+    /// Fresh identity for this actor activation, distinct from the persistent
+    /// session ID so a resumed session starts an independent experience run.
+    pub experience_run_id: String,
+    /// Tool results already present when this actor was created. Their calls
+    /// must not be attributed to this activation after a persisted resume.
+    pub experience_prior_tool_result_ids: HashSet<String>,
     /// Provider active when the memory backend was created. Embeddings may use
     /// an independently resolved xAI route even when chat runs on Codex.
     pub embedding_provider: xai_grok_sampling_types::ModelProvider,
@@ -63,6 +70,35 @@ pub(crate) struct SessionMemory {
 }
 
 impl SessionMemory {
+    /// Stable, safe attribution identity for this session actor activation.
+    pub(crate) fn experience_run_id(&self) -> &str {
+        &self.experience_run_id
+    }
+
+    /// Collect completed tool-result identities without excluding inherited
+    /// assistant calls that have not produced an output yet.
+    pub(crate) fn collect_prior_tool_result_ids(
+        conversation: &[crate::sampling::ConversationItem],
+    ) -> HashSet<String> {
+        conversation
+            .iter()
+            .filter_map(|item| match item {
+                crate::sampling::ConversationItem::ToolResult(result) => {
+                    Some(result.tool_call_id.clone())
+                }
+                crate::sampling::ConversationItem::CustomToolOutput(output) => {
+                    Some(output.call_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Result identities inherited from an earlier activation of this session.
+    pub(crate) fn experience_prior_tool_result_ids(&self) -> &HashSet<String> {
+        &self.experience_prior_tool_result_ids
+    }
+
     /// Whether memory is enabled for this session.
     pub(crate) fn is_enabled(&self) -> bool {
         self.storage.borrow().is_some()
@@ -240,4 +276,34 @@ pub(crate) struct MemoryTelemetry {
     pub dream_count: u64,
     pub dream_success_count: u64,
     pub dream_error_count: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionMemory;
+    use crate::sampling::conversation::{ConversationItem, CustomToolOutputItem, ToolCall};
+
+    #[test]
+    fn prior_tool_result_ids_include_outputs_but_not_pending_assistant_calls() {
+        let conversation = vec![
+            ConversationItem::assistant_tool_calls(vec![ToolCall {
+                id: "inherited-pending-call".into(),
+                name: "run_terminal_command".to_owned(),
+                arguments: "{}".into(),
+            }]),
+            ConversationItem::tool_result("inherited-direct-result", "exit: 0"),
+            ConversationItem::custom_tool_output(CustomToolOutputItem::text(
+                "inherited-custom-result",
+                "exit: 0",
+            )),
+            ConversationItem::tool_result("inherited-direct-result", "duplicate output"),
+        ];
+
+        let prior_results = SessionMemory::collect_prior_tool_result_ids(&conversation);
+
+        assert_eq!(prior_results.len(), 2);
+        assert!(prior_results.contains("inherited-direct-result"));
+        assert!(prior_results.contains("inherited-custom-result"));
+        assert!(!prior_results.contains("inherited-pending-call"));
+    }
 }

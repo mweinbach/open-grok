@@ -254,7 +254,7 @@ macro_rules! merge_text_chunks {
         $new_chunk_meta:ident $(,)?
     ) => {{
         let no_annotations = $prev_text.annotations.is_none() && $new_text.annotations.is_none();
-        if no_annotations {
+        if no_annotations && $prev_chunk_meta == $new_chunk_meta {
             (
                 false,
                 acp::SessionNotification::new(
@@ -587,6 +587,27 @@ mod tests {
             .as_object()
             .cloned(),
         )
+    }
+
+    #[test]
+    fn async_user_message_boundaries_survive_chunk_buffering() {
+        use xai_grok_tools::implementations::codex::send_user_message_async::ASYNC_USER_MESSAGE_META_KEY;
+        let mut message = msg_chunk("session", 1, "Question");
+        let acp::SessionUpdate::AgentMessageChunk(chunk) = &mut message.update else {
+            unreachable!()
+        };
+        chunk.meta = Some(serde_json::Map::from_iter([
+            (ASYNC_USER_MESSAGE_META_KEY.into(), json!(true)),
+            ("toolCallId".into(), json!("async-call")),
+        ]));
+        for (new, previous) in [
+            (message.clone(), msg_chunk("session", 0, "Before")),
+            (msg_chunk("session", 2, "After"), message),
+        ] {
+            let (flush, _, remaining) = merge_acp_chunks(new, previous);
+            assert!(flush);
+            assert!(remaining.is_some());
+        }
     }
 
     fn pending_text(buf: &ReplayBuffer) -> Option<String> {

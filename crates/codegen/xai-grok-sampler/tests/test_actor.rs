@@ -141,6 +141,9 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         supports_backend_search: false,
         supports_standalone_web_search: false,
         codex_multi_agent_v2: false,
+        use_responses_lite: false,
+        experimental_supported_tools: Vec::new(),
+        codex_permissions: None,
         compactions_remaining: None,
         compaction_at_tokens: None,
         doom_loop_recovery: None,
@@ -1051,6 +1054,157 @@ fn responses_config(base_url: String, doom_loop: Option<DoomLoopRecoveryPolicy>)
     cfg.api_backend = ApiBackend::Responses;
     cfg.doom_loop_recovery = doom_loop;
     cfg
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_lite_is_model_gated_for_stream_unary_and_compact_requests() {
+    use std::sync::Mutex;
+    let legacy_id = "00000000-0000-7000-8000-000000000001";
+    let legacy_message = json!({
+        "type": "agent_message", "id": legacy_id,
+        "author": "/root", "recipient": "/root/worker",
+        "content": [{"type": "encrypted_content", "encrypted_content": "opaque-test-message"}],
+    });
+    let stored_message: ConversationItem = serde_json::from_value(json!({
+        "type": "backend_tool_call",
+        "kind": {"tool_type": "codex_raw_input", "id": legacy_id, "raw": legacy_message},
+    }))
+    .unwrap();
+    let mut repaired_message = legacy_message.clone();
+    repaired_message["id"] = format!("amsg_{legacy_id}").into();
+    let captured = Arc::new(Mutex::new(Vec::<(HeaderMap, serde_json::Value)>::new()));
+    let response_capture = Arc::clone(&captured);
+    let compact_capture = Arc::clone(&captured);
+    let app = Router::new()
+        .route(
+            "/v1/responses",
+            post(
+                move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                    let captured = Arc::clone(&response_capture);
+                    async move {
+                        let streaming = body["stream"].as_bool().unwrap_or(false);
+                        captured.lock().unwrap().push((headers, body));
+                        let events = sse::responses_api_reasoning_and_text_events(
+                            "reasoning",
+                            "answer",
+                            "catalog-test-model",
+                        );
+                        if streaming {
+                            Sse::new(stream::iter(
+                                sse_events_to_axum(events)
+                                    .into_iter()
+                                    .map(Ok::<_, std::convert::Infallible>),
+                            ))
+                            .into_response()
+                        } else {
+                            let response = events
+                                .into_iter()
+                                .find_map(|event| {
+                                    let payload =
+                                        serde_json::from_str::<serde_json::Value>(&event.data)
+                                            .ok()?;
+                                    (payload["type"] == "response.completed")
+                                        .then(|| payload["response"].clone())
+                                })
+                                .unwrap();
+                            axum::Json(response).into_response()
+                        }
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(
+                move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                    let captured = Arc::clone(&compact_capture);
+                    async move {
+                        captured.lock().unwrap().push((headers, body));
+                        axum::Json(json!({"output": [
+                            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Retained context"}]},
+                            {"type": "compaction", "encrypted_content": "opaque-test-summary"},
+                        ]}))
+                    }
+                },
+            ),
+        );
+    let server = MockServer::spawn(app).await;
+    for (provider, enabled) in [
+        (ModelProvider::Codex, false),
+        (ModelProvider::Codex, true),
+        (ModelProvider::Codex, false),
+        (ModelProvider::Xai, true),
+    ] {
+        let mut config = SamplerConfig {
+            provider,
+            use_responses_lite: enabled,
+            ..responses_config(server.base_url(), None)
+        };
+        config.extra_headers.insert(
+            "x-openai-internal-codex-responses-lite".into(),
+            "untrusted-value".into(),
+        );
+        let client = SamplingClient::new(config).unwrap();
+        let request = || {
+            ConversationRequest::from_items(vec![
+                ConversationItem::system("Base instructions"),
+                ConversationItem::user("Hello"),
+                stored_message.clone(),
+            ])
+        };
+        client.conversation_responses(request()).await.unwrap();
+        let (mut events, _, _) = client
+            .conversation_stream_responses(request())
+            .await
+            .unwrap();
+        while let Some(event) = events.next().await {
+            event.unwrap();
+        }
+        if provider == ModelProvider::Codex {
+            client
+                .compact_codex_conversation(request(), "Compact instructions")
+                .await
+                .unwrap();
+        }
+        let requests = std::mem::take(&mut *captured.lock().unwrap());
+        assert_eq!(
+            requests.len(),
+            if provider == ModelProvider::Codex {
+                3
+            } else {
+                2
+            }
+        );
+        let opted_in = provider == ModelProvider::Codex && enabled;
+        for (headers, body) in requests {
+            let agent_messages: Vec<_> = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "agent_message")
+                .collect();
+            if provider == ModelProvider::Codex {
+                assert_eq!(agent_messages, vec![&repaired_message]);
+            } else {
+                assert!(agent_messages.is_empty());
+                assert!(!body.to_string().contains("opaque-test-message"));
+            }
+            assert_eq!(
+                headers.contains_key("x-openai-internal-codex-responses-lite"),
+                opted_in
+            );
+            assert_eq!(body["input"][0]["type"] == "additional_tools", opted_in);
+            assert_eq!(body["reasoning"]["context"] == "all_turns", opted_in);
+            if opted_in {
+                assert_eq!(headers["x-openai-internal-codex-responses-lite"], "true");
+                assert!(body.get("tools").is_none());
+                assert!(body.get("instructions").is_none());
+                assert_eq!(body["parallel_tool_calls"], false);
+                assert_eq!(body["input"][1]["role"], "developer");
+            }
+        }
+    }
+    server.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

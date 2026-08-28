@@ -3940,7 +3940,7 @@ async fn strict_bind_without_explicit_toolset_fails_closed_end_to_end() {
         "reason must name the fail-closed cause: {reason}"
     );
     assert!(
-        reason.contains(xai_grok_version::VERSION),
+        reason.contains(xai_grok_version::version()),
         "reason must carry the server version: {reason}"
     );
 }

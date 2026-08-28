@@ -8,7 +8,7 @@
 //!   ([`stream_replay_updates_at`]); [`load_updates_for_replay_at`] stays a
 //!   typed materialize-all reference for tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -254,10 +254,13 @@ pub fn stream_replay_updates_at_hinted<F: FnMut(acp::SessionUpdate)>(
     };
     let raw_contents = std::fs::read_to_string(&updates_path)?;
     let live = rewind_filtered_live(&raw_contents);
+    let transport_ids = super::code_mode_transport_call_ids(live.iter().copied(), &HashSet::new());
     let mut collapser = ReplayToolCollapser::new();
     let mut forwarded = false;
     for line in live {
-        if line_is_dropped_on_replay(line) {
+        if line_is_dropped_on_replay(line)
+            || super::line_is_code_mode_transport_update(line, &transport_ids)
+        {
             continue;
         }
         match SessionUpdateEnvelope::from_str(line) {
@@ -291,8 +294,12 @@ pub(crate) fn for_each_replay_update_in_file<F: FnMut(acp::SessionUpdate)>(
 ) -> std::io::Result<bool> {
     let raw_contents = std::fs::read_to_string(updates_path)?;
     let live = rewind_filtered_live(&raw_contents);
+    let transport_ids = super::code_mode_transport_call_ids(live.iter().copied(), &HashSet::new());
     let mut forwarded = false;
     for line in live {
+        if super::line_is_code_mode_transport_update(line, &transport_ids) {
+            continue;
+        }
         match SessionUpdateEnvelope::from_str(line) {
             Ok(SessionUpdate::Acp(notif)) => {
                 forwarded = true;

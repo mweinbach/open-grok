@@ -2,15 +2,21 @@
 
 Sandbox mode restricts what the agent process and its spawned commands can access on your filesystem and network using OS-level kernel primitives (Landlock on Linux, Seatbelt on macOS). The kernel enforces these limits for the process lifetime.
 
-Sandbox mode is off by default.
+New sessions use the `workspace` sandbox by default: the agent can read the
+system, but writes are limited to the current workspace, `~/.opengrok/`, and
+temporary directories. Pass `--sandbox off` or set `[sandbox] profile = "off"`
+only when unrestricted filesystem access is explicitly required.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Run with workspace sandbox (read everywhere, write to CWD + temp dirs + ~/.opengrok/)
-open-grok --sandbox workspace
+# Run with the default workspace sandbox
+open-grok
+
+# Explicitly disable sandboxing when unrestricted access is required
+open-grok --sandbox off
 
 # Read-only mode (read everywhere, write only to ~/.opengrok/ + temp dirs)
 open-grok --sandbox read-only
@@ -25,8 +31,8 @@ open-grok --sandbox strict
 
 | Profile               | FS Read            | FS Write                                       | Child Network | Use Case                          |
 | --------------------- | ------------------ | ---------------------------------------------- | ------------- | --------------------------------- |
-| `off` (default)       | Unrestricted       | Unrestricted                                   | Unrestricted  | No sandbox                        |
-| `workspace`           | Everywhere         | CWD + `~/.opengrok/` + `/tmp` + `/var/tmp`         | Allowed       | Normal development                |
+| `off`                 | Unrestricted       | Unrestricted                                   | Unrestricted  | Explicitly disable sandboxing     |
+| `workspace` (default) | Everywhere         | CWD + `~/.opengrok/` + `/tmp` + `/var/tmp`      | Allowed       | Normal development                |
 | `devbox`              | Everywhere         | All top-level dirs except `/data`              | Allowed       | Disposable dev VMs                |
 | `read-only`           | Everywhere         | `~/.opengrok/` + `/tmp` + `/var/tmp`               | Blocked¹      | Exploration, code review          |
 | `strict`              | CWD + system paths | CWD + `~/.opengrok/` + `/tmp` + `/var/tmp`         | Blocked¹      | Untrusted code                    |
@@ -170,11 +176,14 @@ The sandbox is applied to the **entire Open Grok process** at startup using kern
 - `bash` commands, `grep` (rg) -- child processes inherit FS restrictions automatically
 - Network -- on Linux, child processes can be blocked via seccomp; on macOS this is a no-op
 
-When a non-`off` sandbox profile is **requested** (CLI, `GROK_SANDBOX`, config, or a managed requirement):
+When a non-`off` sandbox profile is selected (the default, CLI, `GROK_SANDBOX`,
+config, or a managed requirement):
 
 - The agent runs **in-process**, not through the shared leader, so tool calls stay in this process when the profile is enforced. If leader mode would otherwise have been on, a one-line note at startup says so
 - If a built-in profile fails to apply, Open Grok warns and continues without enforcement (see [Platform Support](#platform-support)), but still refuses the leader so tools are not delegated elsewhere
-- `open-grok workspace start`, `restart`, and `resume` are unavailable; `pause`, `stop`, and `status` still work
+- `open-grok workspace start`, `restart`, and `resume` are unavailable; `pause`,
+  `stop`, and `status` still work. Explicitly pass `--sandbox off` when a trusted
+  shared-leader workspace operation requires unrestricted access.
 
 Disable the profile at the source that selected it to use the refused commands.
 
@@ -204,7 +213,7 @@ Profile resolution order for a **new** session:
 
 1. An explicit `--sandbox <profile>` flag or `GROK_SANDBOX` environment variable
 2. The `[sandbox] profile` in your config
-3. `off` (no sandbox)
+3. `workspace` (the secure default)
 
 ---
 

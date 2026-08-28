@@ -8617,3 +8617,174 @@ fn click_settings_breadcrumb_ignores_close_on_picker_exit() {
     );
     assert!(!s.close_on_picker_exit);
 }
+
+// ---------------------------------------------------------------------------
+// Group sub-sheet search + mouse scrolling (OpenRouter model catalogs)
+// ---------------------------------------------------------------------------
+
+fn seed_openrouter_catalog(state: &mut SettingsModalState) {
+    use xai_grok_shell::openrouter_models::OpenRouterModelDescriptor;
+    let model = |key: &str, id: &str, name: &str| OpenRouterModelDescriptor {
+        key: key.to_string(),
+        id: id.to_string(),
+        name: name.to_string(),
+        api_backend: xai_grok_shell::sampling::ApiBackend::ChatCompletions,
+    };
+    state.pager_snapshot.openrouter_models = vec![
+        model("openrouter:openai/gpt-4o", "openai/gpt-4o", "OpenAI: GPT-4o"),
+        model(
+            "openrouter:anthropic/claude",
+            "anthropic/claude-sonnet-4",
+            "Anthropic: Claude Sonnet 4",
+        ),
+        model("openrouter:deepseek/v4", "deepseek/deepseek-v4", "DeepSeek: V4"),
+    ];
+    state.pager_snapshot.openrouter_enabled_models.clear();
+}
+
+fn enter_openrouter_sheet(state: &mut SettingsModalState) {
+    state.selected = state
+        .rows
+        .iter()
+        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "openrouter_models"))
+        .expect("openrouter_models row present");
+    assert!(state.try_enter_picking_group());
+}
+
+#[test]
+fn openrouter_sheet_slash_search_filters_and_toggles_matched_model() {
+    let mut s = make_state();
+    seed_openrouter_catalog(&mut s);
+    enter_openrouter_sheet(&mut s);
+
+    // `/` focuses the sub-sheet search box.
+    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(s.group_filter_focused);
+
+    // Typing filters the catalog case-insensitively.
+    for c in "claude".chars() {
+        let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert_eq!(s.group_filter.text(), "claude");
+    assert!(matches!(
+        &s.state.mode,
+        SettingsMode::PickingGroup { child_idx: 0, .. }
+    ));
+
+    // Enter commits the query (unfocuses) without toggling.
+    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(!s.group_filter_focused);
+
+    // Space toggles the focused (filtered) model — the Claude one, not row
+    // 0 of the unfiltered catalog.
+    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(
+        matches!(
+            out,
+            SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
+                if models == &["anthropic/claude-sonnet-4".to_string()]
+        ),
+        "Space must toggle the filtered model, got {out:?}"
+    );
+}
+
+#[test]
+fn openrouter_sheet_esc_clears_query_before_exiting() {
+    let mut s = make_state();
+    seed_openrouter_catalog(&mut s);
+    enter_openrouter_sheet(&mut s);
+
+    let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    for c in "zzz-no-match".chars() {
+        let _ = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert_eq!(s.group_filter.text(), "zzz-no-match");
+
+    // First Esc clears the query and stays in the sheet (even with an empty
+    // filtered set).
+    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert_eq!(s.group_filter.text(), "");
+    assert!(matches!(s.mode(), SettingsModalMode::PickingGroup { .. }));
+
+    // Second Esc leaves the sheet.
+    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
+}
+
+#[test]
+fn group_sheet_mouse_wheel_scrolls_viewport_offset() {
+    let mut s = make_state();
+    seed_openrouter_catalog(&mut s);
+    enter_openrouter_sheet(&mut s);
+
+    let out = handle_settings_mouse(&mut s, MouseEventKind::ScrollDown, 10, 10);
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert_eq!(s.group_scroll, 3);
+
+    let out = handle_settings_mouse(&mut s, MouseEventKind::ScrollDown, 10, 10);
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert_eq!(s.group_scroll, 6);
+
+    let out = handle_settings_mouse(&mut s, MouseEventKind::ScrollUp, 10, 10);
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert_eq!(s.group_scroll, 3);
+}
+
+#[test]
+fn group_sheet_click_maps_through_active_filter() {
+    let mut s = make_state();
+    seed_openrouter_catalog(&mut s);
+    enter_openrouter_sheet(&mut s);
+
+    // Filter to DeepSeek only; its display row is index 0 of the filtered
+    // list but index 2 of the catalog.
+    s.group_filter.set_text("deepseek");
+    s.picker_choice_rects = vec![Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 1,
+    }];
+    let out = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        1,
+        0,
+    );
+    assert!(
+        matches!(
+            out,
+            SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
+                if models == &["deepseek/deepseek-v4".to_string()]
+        ),
+        "click through the filter must toggle the matched model, got {out:?}"
+    );
+}
+
+#[test]
+fn static_group_sheet_keeps_plain_typing_unfiltered() {
+    // Static groups (contextual hints) have no dynamic choices: `/` is a
+    // no-op and j/k navigation keeps working without a query.
+    let mut s = make_state();
+    s.selected = s
+        .rows
+        .iter()
+        .position(|r| matches!(r, RowEntry::Setting { key, .. } if *key == "contextual_hints"))
+        .expect("contextual_hints row present");
+    assert!(s.try_enter_picking_group());
+
+    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert!(matches!(out, SettingsKeyOutcome::Unchanged));
+    assert!(!s.group_filter_focused);
+
+    let out = handle_settings_key(&mut s, &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(matches!(
+        s.mode(),
+        SettingsModalMode::PickingGroup { child_idx: 1, .. }
+    ));
+}

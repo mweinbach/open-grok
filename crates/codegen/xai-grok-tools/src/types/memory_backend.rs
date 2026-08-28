@@ -95,6 +95,63 @@ pub struct MemorySearchResult {
     pub created_at: Option<i64>,
 }
 
+/// A directly observed outcome that supports a stored experience.
+///
+/// Run and session identifiers are kept separate because one stable session can
+/// have multiple independently attributed runtime activations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExperienceEvidenceReference {
+    /// Observed evidence type, such as a command execution or file edit.
+    pub kind: String,
+    /// Objective evidence verdict, such as `passed` or `failed`.
+    pub verdict: String,
+    /// Executed command, when the observation came from a command.
+    pub command: Option<String>,
+    /// Compact, already-redacted diagnostic or observed result.
+    pub summary: String,
+    /// Unix timestamp in seconds when the evidence was observed.
+    pub observed_at: i64,
+    /// Runtime activation that produced this evidence, when known.
+    pub source_run_id: Option<String>,
+    /// Stable session that owns the source activation, when resolvable.
+    pub source_session_id: Option<String>,
+}
+
+/// Backend-agnostic, evidence-backed result from experience-memory search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExperienceSearchResult {
+    /// Stable experience identifier, suitable for an `experience:` reference.
+    pub id: String,
+    /// Experience category, such as a debugging strategy or anti-pattern.
+    pub category: String,
+    /// Redacted summary of the task that produced this experience.
+    pub task_summary: String,
+    /// The durable lesson learned from observed outcomes.
+    pub lesson: String,
+    /// Recommended or avoided strategy associated with the lesson.
+    pub strategy: String,
+    /// Whether the overall strategy succeeded (`true`) or failed (`false`).
+    pub outcome: bool,
+    /// Aggregated confidence based on independent supporting evidence.
+    pub confidence: f64,
+    /// Search relevance score, where larger values indicate stronger matches.
+    pub score: f64,
+    /// Why a failed strategy did not work, when an objective reason is known.
+    pub failure_reason: Option<String>,
+    /// Concrete actions observed to work.
+    pub what_worked: Vec<String>,
+    /// Concrete actions observed not to work.
+    pub what_failed: Vec<String>,
+    /// Verification commands or checks associated with the strategy.
+    pub tests_run: Vec<String>,
+    /// Independent source activation identifiers.
+    pub source_run_ids: Vec<String>,
+    /// Stable source sessions resolved from the activation identifiers.
+    pub source_session_ids: Vec<String>,
+    /// Detailed, authenticated observations supporting this result.
+    pub evidence: Vec<ExperienceEvidenceReference>,
+}
+
 /// Backend-agnostic interface for memory queries.
 ///
 /// Implementations must be `Send + Sync` to be stored in `Arc<dyn MemoryBackend>`
@@ -115,6 +172,20 @@ pub trait MemoryBackend: Send + Sync {
         max_results: usize,
         min_score: f64,
     ) -> Result<Vec<MemorySearchResult>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Search structured experience records and their authenticated evidence.
+    ///
+    /// `outcome` filters for successes (`Some(true)`) or failures
+    /// (`Some(false)`); `None` searches both. The default is intentionally
+    /// backward-compatible so Markdown-only backends remain valid.
+    fn search_experiences(
+        &self,
+        _query: &str,
+        _max_results: usize,
+        _outcome: Option<bool>,
+    ) -> Result<Vec<ExperienceSearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
+    }
 
     /// Read a memory file by path, optionally returning a range of lines.
     fn get(

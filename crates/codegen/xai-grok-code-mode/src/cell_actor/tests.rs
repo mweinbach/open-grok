@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use xai_grok_code_mode_protocol::ExecuteRequest;
 use xai_grok_code_mode_protocol::FunctionCallOutputContentItem;
+use xai_grok_code_mode_protocol::NestedToolProgressSink;
 use xai_grok_code_mode_protocol::ToolName;
 
 use super::*;
@@ -29,6 +30,7 @@ impl CellHost for TestHost {
         &self,
         _invocation: CellToolCall,
         _cancellation_token: CancellationToken,
+        _progress: NestedToolProgressSink,
     ) -> Result<JsonValue, String> {
         Err("unexpected tool call".to_string())
     }
@@ -60,6 +62,7 @@ impl CellHost for RecordingHost {
         &self,
         _invocation: CellToolCall,
         _cancellation_token: CancellationToken,
+        _progress: NestedToolProgressSink,
     ) -> Result<JsonValue, String> {
         Err("unexpected tool call".to_string())
     }

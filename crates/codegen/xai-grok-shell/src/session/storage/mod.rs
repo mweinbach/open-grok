@@ -1633,11 +1633,19 @@ fn code_mode_transport_call_ids<'a>(
     let mut transport_ids = known_transport_ids.clone();
 
     for persisted in &persisted {
-        if let acp::SessionUpdate::ToolCall(call) = &persisted.update
-            && crate::session::code_mode::is_code_mode_transport_tool(&call.title)
-            && crate::session::code_mode::is_code_mode_transport_meta(persisted.meta.as_ref())
-        {
-            transport_ids.insert(call.tool_call_id.clone());
+        if !crate::session::code_mode::is_code_mode_transport_meta(persisted.meta.as_ref()) {
+            continue;
+        }
+        match &persisted.update {
+            acp::SessionUpdate::ToolCall(call)
+                if crate::session::code_mode::is_code_mode_transport_tool(&call.title) =>
+            {
+                transport_ids.insert(call.tool_call_id.clone());
+            }
+            acp::SessionUpdate::ToolCallUpdate(update) => {
+                transport_ids.insert(update.tool_call_id.clone());
+            }
+            _ => {}
         }
     }
 
@@ -3275,6 +3283,7 @@ mod tests {
         )
     }
 
+    #[test]
     fn replay_hides_code_mode_transport_but_keeps_nested_tool_cards() {
         let outer = acp_envelope_with_meta(
             r#"{"sessionUpdate":"tool_call","toolCallId":"outer","title":"exec","kind":"other","status":"in_progress","rawInput":"tools.exec_command({cmd:'echo RAW_MARKER'})"}"#,
@@ -3318,6 +3327,7 @@ mod tests {
         assert!(cursor.lines.iter().all(|line| line.contains("nested")));
     }
 
+    #[test]
     fn replay_preserves_unmarked_plugin_tools_named_exec_or_wait() {
         let exec = acp_envelope_with_meta(
             r#"{"sessionUpdate":"tool_call","toolCallId":"plugin-exec","title":"exec","kind":"other","status":"in_progress","rawInput":{"command":"safe"}}"#,
@@ -3350,6 +3360,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn replay_recovers_unmarked_legacy_transport_after_compaction() {
         let legacy_outer = acp_envelope_with_meta(
             r#"{"sessionUpdate":"tool_call","toolCallId":"legacy-outer","title":"exec","kind":"other","status":"in_progress","rawInput":"tools.exec_command({cmd:'echo RAW'})"}"#,
@@ -3397,6 +3408,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn replay_hides_only_authoritative_legacy_transport_ids() {
         let legacy_outer = acp_envelope_with_meta(
             r#"{"sessionUpdate":"tool_call","toolCallId":"legacy-outer","title":"exec","kind":"other","status":"in_progress","rawInput":"tools.exec_command({cmd:'echo RAW'})"}"#,
@@ -3423,6 +3435,7 @@ mod tests {
         assert!(!replay.lines[0].contains("RAW"));
     }
 
+    #[test]
     fn delta_replay_seeds_hidden_transport_ids_from_prior_prefix() {
         let outer = acp_envelope_with_meta(
             r#"{"sessionUpdate":"tool_call","toolCallId":"outer","title":"exec","kind":"other","status":"in_progress","rawInput":"RAW_JS"}"#,
@@ -3442,6 +3455,54 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert!(live[0].contains("apply_patch"));
         assert!(!live[0].contains("RAW_JS"));
+    }
+
+    #[test]
+    fn replay_hides_transport_when_only_terminal_update_is_marked() {
+        let outer = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"outer","title":"exec","kind":"other","status":"in_progress","rawInput":{"source":"RAW_JS"}}"#,
+            r#"{"eventId":"ev1"}"#,
+        );
+        let nested = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"nested","title":"read_file","kind":"read","status":"completed","rawOutput":{"text":"visible"}}"#,
+            r#"{"eventId":"ev2"}"#,
+        );
+        let outer_done = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"outer","status":"completed","rawOutput":{"text":"RAW_RESULT"}}"#,
+            r#"{"eventId":"ev3","open-grok/codeModeTransport":true}"#,
+        );
+        let raw = format!("{outer}\n{nested}\n{outer_done}\n");
+
+        let replay =
+            prepare_replay_lines_with_transport_ids(&raw, None, &std::collections::HashSet::new());
+
+        assert_eq!(replay.lines.len(), 1);
+        assert!(replay.lines[0].contains("read_file"));
+        assert!(!replay.lines[0].contains("RAW_JS"));
+        assert!(!replay.lines[0].contains("RAW_RESULT"));
+    }
+
+    #[test]
+    fn delta_replay_hides_transport_when_delta_terminal_update_is_marked() {
+        let outer = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"outer","title":"exec","kind":"other","status":"in_progress","rawInput":{"source":"RAW_JS"}}"#,
+            r#"{"eventId":"ev1"}"#,
+        );
+        let nested = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"nested","title":"apply_patch","kind":"edit","status":"completed"}"#,
+            r#"{"eventId":"ev2"}"#,
+        );
+        let outer_done = acp_envelope_with_meta(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"outer","status":"completed","rawOutput":{"text":"RAW_RESULT"}}"#,
+            r#"{"eventId":"ev3","open-grok/codeModeTransport":true}"#,
+        );
+        let delta = format!("{nested}\n{outer_done}\n");
+
+        let live = filter_delta_replay_lines_with_prior(&delta, &outer);
+
+        assert_eq!(live.len(), 1);
+        assert!(live[0].contains("apply_patch"));
+        assert!(!live[0].contains("RAW_RESULT"));
     }
 
     // ── collect_assistant_text / collect_tool_metadata tests ──────────────────

@@ -8,6 +8,10 @@ use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use xai_grok_code_mode_protocol::NESTED_TOOL_PROGRESS_CAPACITY;
+use xai_grok_code_mode_protocol::NestedToolProgress;
+use xai_grok_code_mode_protocol::NestedToolProgressSink;
+use xai_grok_code_mode_protocol::nested_tool_progress_channel;
 
 use super::*;
 use crate::cell_actor::CellState;
@@ -24,6 +28,7 @@ impl CellHost for PanickingCallbackHost {
         &self,
         _invocation: CellToolCall,
         _cancellation_token: CancellationToken,
+        _progress: NestedToolProgressSink,
     ) -> Result<JsonValue, String> {
         panic!("tool callback panic probe");
     }
@@ -129,4 +134,97 @@ async fn callback_wrapper_join_error_reports_failure() {
 
     let failure_reason = failure_rx.recv().await.expect("wrapper failure");
     assert!(failure_reason.contains("code mode tool task failed"));
+}
+
+#[tokio::test]
+async fn progress_forwarder_keeps_backlogged_chunks_in_the_bounded_queue() {
+    let (sink, receiver) = nested_tool_progress_channel();
+    let (runtime_tx, runtime_rx) = std_mpsc::channel();
+    let forwarder = spawn_progress_forwarder(
+        "tool-1".to_string(),
+        receiver,
+        runtime_tx,
+        CancellationToken::new(),
+    );
+
+    sink.push(NestedToolProgress::text("first"));
+    let first_command = next_runtime_command(&runtime_rx).await;
+    let RuntimeCommand::ToolProgress {
+        progress,
+        acknowledgement,
+        ..
+    } = first_command
+    else {
+        panic!("expected the first progress command");
+    };
+    assert_eq!(progress, NestedToolProgress::text("first"));
+
+    for index in 0..=NESTED_TOOL_PROGRESS_CAPACITY {
+        sink.push(NestedToolProgress::text(format!("chunk-{index}")));
+    }
+
+    assert_eq!(sink.dropped_chunks(), 1);
+    assert!(matches!(
+        runtime_rx.try_recv(),
+        Err(std_mpsc::TryRecvError::Empty)
+    ));
+    sink.close();
+    acknowledgement.send(()).unwrap();
+
+    for index in 1..=NESTED_TOOL_PROGRESS_CAPACITY {
+        let command = next_runtime_command(&runtime_rx).await;
+        let RuntimeCommand::ToolProgress {
+            progress,
+            acknowledgement,
+            ..
+        } = command
+        else {
+            panic!("expected a queued progress command");
+        };
+        assert_eq!(progress, NestedToolProgress::text(format!("chunk-{index}")));
+        acknowledgement.send(()).unwrap();
+    }
+
+    forwarder.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_stops_a_progress_forwarder_waiting_for_v8() {
+    let (sink, receiver) = nested_tool_progress_channel();
+    let (runtime_tx, runtime_rx) = std_mpsc::channel();
+    let cancellation_token = CancellationToken::new();
+    let forwarder = spawn_progress_forwarder(
+        "tool-1".to_string(),
+        receiver,
+        runtime_tx,
+        cancellation_token.clone(),
+    );
+    sink.push(NestedToolProgress::text("first"));
+    let command = next_runtime_command(&runtime_rx).await;
+    let RuntimeCommand::ToolProgress {
+        acknowledgement, ..
+    } = command
+    else {
+        panic!("expected a progress command");
+    };
+
+    cancellation_token.cancel();
+
+    tokio::time::timeout(Duration::from_secs(1), forwarder)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(acknowledgement.send(()).is_err());
+    assert!(sink.is_closed());
+}
+
+async fn next_runtime_command(receiver: &std_mpsc::Receiver<RuntimeCommand>) -> RuntimeCommand {
+    for _ in 0..10_000 {
+        match receiver.try_recv() {
+            Ok(command) => return command,
+            Err(std_mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+            Err(std_mpsc::TryRecvError::Disconnected) => panic!("runtime channel disconnected"),
+        }
+    }
+    panic!("timed out waiting for a runtime command");
 }

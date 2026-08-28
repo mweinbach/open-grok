@@ -706,6 +706,12 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::SendAgentMessageTool>();
         b.register::<grok_build::FollowupAgentTaskTool>();
         b.register::<grok_build::WaitAgentTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::SpawnAgentTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::SendMessageTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::FollowupTaskTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::ListAgentsTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::WaitAgentTool>();
+        b.register::<crate::implementations::codex::multi_agent_v2::InterruptAgentTool>();
         b.register::<grok_build::ListSessionsTool>();
         b.register::<grok_build::ReadSessionTool>();
         b.register::<grok_build::MessageSessionTool>();
@@ -732,6 +738,7 @@ impl ToolRegistryBuilder {
         b.register::<codex::list_dir::CodexListDirTool>();
         b.register::<codex::grep_files::CodexGrepFilesTool>();
         b.register::<codex::read_file::CodexReadFileTool>();
+        b.register::<codex::SendUserMessageAsyncTool>();
         b.register::<opencode::OpenCodeBashTool>();
         b.register::<opencode::OpenCodeReadTool>();
         b.register::<opencode::OpenCodeEditTool>();
@@ -741,6 +748,8 @@ impl ToolRegistryBuilder {
         b.register::<opencode::OpenCodeTodoWriteTool>();
         b.register::<opencode::OpenCodeSkillTool>();
         b.register::<crate::implementations::memory::search_tool::MemorySearchImpl>();
+        b.register::<crate::implementations::memory::experience_search_tool::ExperienceSearchImpl>(
+        );
         b.register::<crate::implementations::memory::get_tool::MemoryGetImpl>();
         b.register::<crate::implementations::search_tool::SearchTool>();
         b.register_with_params::<
@@ -1617,6 +1626,25 @@ impl FinalizedToolset {
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> xai_tool_runtime::ToolStream<ToolRunResult> {
+        self.call_streaming_with_cancellation_and_viewer_context(
+            tool_name,
+            tool_args,
+            tool_call_id,
+            cwd_override,
+            cancellation,
+            None,
+        )
+    }
+    /// Streaming dispatch with an optional call-scoped viewer-context override.
+    pub fn call_streaming_with_cancellation_and_viewer_context(
+        self: &Arc<Self>,
+        tool_name: &str,
+        tool_args: serde_json::Value,
+        tool_call_id: &str,
+        cwd_override: Option<std::path::PathBuf>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+        viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
+    ) -> xai_tool_runtime::ToolStream<ToolRunResult> {
         use futures::StreamExt;
         let this = Arc::clone(self);
         let tool_name = tool_name.to_owned();
@@ -1637,11 +1665,14 @@ impl FinalizedToolset {
             };
             let DispatchParts {
                 lr_handle,
-                ctx,
+                mut ctx,
                 canonical_params,
                 output_converter,
                 effective_tool_name,
             } = parts;
+            if let Some(viewer_ctx) = viewer_ctx {
+                ctx.extensions.insert(viewer_ctx);
+            }
 
             let mut inner = lr_handle.execute(ctx, canonical_params).await;
             while let Some(item) = inner.next().await {
@@ -1706,9 +1737,24 @@ impl FinalizedToolset {
             None
         };
         let contract_version = self.get_contract_version(tool_name);
-        let rt_call_id = xai_tool_protocol::ToolCallId::new(tool_call_id)
+        let native_metadata =
+            crate::implementations::codex::multi_agent_wire::decode_function_call_id(tool_call_id);
+        let runtime_call_id = native_metadata
+            .as_ref()
+            .map(|(call_id, _)| *call_id)
+            .unwrap_or(tool_call_id);
+        let rt_call_id = xai_tool_protocol::ToolCallId::new(runtime_call_id)
             .unwrap_or_else(|_| xai_tool_protocol::ToolCallId::new_v7());
         let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
+        if native_metadata.is_some() {
+            ctx.insert(
+                crate::implementations::codex::multi_agent_wire::NativeMessageEncryption(
+                    crate::implementations::codex::multi_agent_wire::codex_message_is_encrypted(
+                        tool_call_id,
+                    ),
+                ),
+            );
+        }
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
         ctx.extensions.insert(
@@ -2143,6 +2189,86 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct ExperienceSearchTestBackend {
+        calls: parking_lot::Mutex<Vec<(String, usize, Option<bool>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::types::memory_backend::MemoryBackend for ExperienceSearchTestBackend {
+        async fn search(
+            &self,
+            _query: &str,
+            _max_results: usize,
+            _min_score: f64,
+        ) -> Result<
+            Vec<crate::types::memory_backend::MemorySearchResult>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(Vec::new())
+        }
+
+        fn search_experiences(
+            &self,
+            query: &str,
+            max_results: usize,
+            outcome: Option<bool>,
+        ) -> Result<
+            Vec<crate::types::memory_backend::ExperienceSearchResult>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            self.calls
+                .lock()
+                .push((query.to_owned(), max_results, outcome));
+
+            Ok([true, false]
+                .into_iter()
+                .map(|success| {
+                    let verdict = if success { "success" } else { "failure" };
+                    crate::types::memory_backend::ExperienceSearchResult {
+                        id: verdict.to_owned(),
+                        category: "debugging".to_owned(),
+                        task_summary: "Repair provider authentication".to_owned(),
+                        lesson: format!("Observed {verdict}"),
+                        strategy: "Refresh isolated credentials".to_owned(),
+                        outcome: success,
+                        confidence: 0.9,
+                        score: 0.8,
+                        failure_reason: (!success).then(|| "Expired credential".to_owned()),
+                        what_worked: vec!["Refresh".to_owned()],
+                        what_failed: vec!["Blind retry".to_owned()],
+                        tests_run: vec!["cargo test provider_auth".to_owned()],
+                        source_run_ids: vec!["activation-1".to_owned()],
+                        source_session_ids: vec!["session-1".to_owned()],
+                        evidence: vec![crate::types::memory_backend::ExperienceEvidenceReference {
+                            kind: "command".to_owned(),
+                            verdict: verdict.to_owned(),
+                            command: Some("cargo test provider_auth".to_owned()),
+                            summary: format!("Test {verdict}"),
+                            observed_at: 1_700_000_000,
+                            source_run_id: Some("activation-1".to_owned()),
+                            source_session_id: Some("session-1".to_owned()),
+                        }],
+                    }
+                })
+                .collect())
+        }
+
+        fn get(
+            &self,
+            _path: &str,
+            _from: Option<usize>,
+            _lines: Option<usize>,
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(String::new())
+        }
+
+        fn total_chunks(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(0)
+        }
+    }
+
     /// Build a `SessionContext` for tests using a temp dir and real local
     /// filesystem/terminal backends.
     fn test_session_context(tmp: &TempDir) -> SessionContext {
@@ -2176,6 +2302,92 @@ mod tests {
             system_reminder_tag: crate::reminders::DEFAULT_REMINDER_TAG,
         }
     }
+
+    #[tokio::test]
+    async fn experience_search_dispatch_is_read_only_filtered_and_preserves_legacy_kind() {
+        let tmp = TempDir::new().expect("temporary session directory");
+        let backend = Arc::new(ExperienceSearchTestBackend::default());
+        let mut context = test_session_context(&tmp);
+        context.memory_backend = Some(backend.clone());
+
+        let config = ToolServerConfig {
+            tools: vec![
+                ToolConfig::for_tool::<crate::implementations::memory::MemorySearchImpl>(),
+                ToolConfig::for_tool::<crate::implementations::memory::ExperienceSearchImpl>(),
+                ToolConfig::for_tool::<crate::implementations::memory::MemoryGetImpl>(),
+            ],
+            behavior_preset: None,
+        };
+        let toolset = Arc::new(
+            ToolRegistryBuilder::new()
+                .finalize(config, context)
+                .expect("all memory tools must finalize together"),
+        );
+
+        assert_eq!(
+            toolset
+                .renderer
+                .render("${{ tools.by_kind.memory_search }}")
+                .expect("memory-search kind must render"),
+            "memory_search",
+            "adding experience search must not replace legacy Markdown search by kind"
+        );
+        assert!(
+            toolset
+                .tool_definitions()
+                .iter()
+                .any(|tool| tool.function.name == "experience_search"),
+            "experience_search must have its own independently callable wire name"
+        );
+
+        let result = toolset
+            .call(
+                "experience_search",
+                serde_json::json!({
+                    "query": "expired provider token",
+                    "outcome": "failure",
+                    "max_results": 999
+                }),
+                "experience-search-test",
+                None,
+            )
+            .await
+            .expect("experience search must dispatch successfully");
+
+        assert_eq!(
+            backend.calls.lock().as_slice(),
+            &[("expired provider token".to_owned(), 20, Some(false))],
+            "query, bounded result count, and typed verdict must reach the backend"
+        );
+        assert!(result.prompt_text.contains("experience:failure"));
+        assert!(result.prompt_text.contains("run:activation-1"));
+        assert!(result.prompt_text.contains("session:session-1"));
+        assert!(result.prompt_text.contains("cargo test provider_auth"));
+        assert!(
+            !result.prompt_text.contains("experience:success"),
+            "the tool must enforce filters even when a backend ignores them"
+        );
+
+        let empty = toolset
+            .call(
+                "experience_search",
+                serde_json::json!({
+                    "query": "expired provider token",
+                    "max_results": 0
+                }),
+                "experience-search-empty",
+                None,
+            )
+            .await
+            .expect("zero-result experience search must dispatch successfully");
+        assert!(
+            empty
+                .prompt_text
+                .contains("No evidence-backed experience results found"),
+            "tool must enforce result bounds when a backend ignores them"
+        );
+    }
+
     /// Regression test: `kind_params` must merge input params from ALL tools
     /// that share a `ToolKind`, not just the first one.
     ///
@@ -4876,6 +5088,64 @@ mod tests {
         (Arc::new(toolset), tmp)
     }
     #[tokio::test]
+    async fn native_agent_dispatch_keeps_public_call_id_and_encryption_context() {
+        use crate::implementations::codex::multi_agent_wire::{
+            NativeMessageEncryption, encode_function_call,
+        };
+        let tmp = TempDir::new().unwrap();
+        let config = ToolServerConfig {
+            tools: vec![ToolConfig {
+                id: "Codex:send_message".to_owned(),
+                params: None,
+                name_override: None,
+                params_name_overrides: None,
+                description_override: None,
+                behavior_version: None,
+                kind: None,
+            }],
+            behavior_preset: None,
+        };
+        let toolset = Arc::new(
+            ToolRegistryBuilder::new()
+                .finalize_with_trunc_config(
+                    config,
+                    test_session_context(&tmp),
+                    Default::default(),
+                    None,
+                )
+                .unwrap(),
+        );
+        for encrypted in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!(["message"])),
+        ] {
+            let mut call = serde_json::json!({
+                "type":"function_call", "call_id":"call_native", "name":"send_message",
+                "arguments":"{}", "namespace":"functions",
+            });
+            if let Some(encrypted) = &encrypted {
+                call["encrypted_function_args"] = encrypted.clone();
+            }
+            encode_function_call(&mut call);
+            let parts = toolset
+                .prepare_dispatch(
+                    "send_message",
+                    serde_json::json!({"target":"/root/worker", "message":"test"}),
+                    call["call_id"].as_str().unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(parts.ctx.call_id.as_str(), "call_native");
+            assert_eq!(
+                parts.ctx.get::<NativeMessageEncryption>().unwrap().0,
+                encrypted != Some(serde_json::json!([]))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn prepare_dispatch_stamps_workspace_viewer_ctx_when_present() {
         let (toolset, _tmp) =
             toolset_with_viewer_ctx(Some(xai_tool_runtime::WorkspaceViewerContext {
@@ -4917,6 +5187,43 @@ mod tests {
                 .is_none(),
             "no extension must be stamped when workspace_viewer_ctx is None",
         );
+    }
+    #[tokio::test]
+    async fn streaming_dispatch_override_enables_progress_without_workspace_viewer_context() {
+        use futures::StreamExt;
+
+        let (toolset, temp_dir) = toolset_with_viewer_ctx(None);
+        let file_path = temp_dir.path().join("streaming.txt");
+        std::fs::write(&file_path, "first line\nsecond line\n").expect("write streamed file");
+
+        let mut stream = toolset.call_streaming_with_cancellation_and_viewer_context(
+            "read_file",
+            serde_json::json!({ "target_file": file_path }),
+            "stream-override",
+            None,
+            None,
+            Some(xai_tool_runtime::WorkspaceViewerContext {
+                stream_tool_progress: true,
+            }),
+        );
+        let mut progress_count = 0;
+        let mut observed_terminal = false;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                xai_tool_runtime::ToolStreamItem::Progress(_) => progress_count += 1,
+                xai_tool_runtime::ToolStreamItem::Terminal(result) => {
+                    result.expect("streamed read succeeds");
+                    observed_terminal = true;
+                }
+            }
+        }
+
+        assert!(
+            progress_count > 0,
+            "call override must enable tool progress"
+        );
+        assert!(observed_terminal, "stream must retain its terminal result");
     }
     /// End-to-end: `FinalizedToolset` with `stream_tool_progress: true`
     /// produces `bash_output_chunk` Progress frames via `call_streaming`.

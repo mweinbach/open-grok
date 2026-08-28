@@ -235,7 +235,7 @@ impl WorkspaceBindConfig {
                 tracing::warn!(
                     unserved = ?unserved_tool_ids,
                     config_manifest_version = ?self.manifest_version,
-                    running_version = xai_grok_version::VERSION,
+                    running_version = xai_grok_version::version(),
                     "session.bind: serving known subset of pinned tools"
                 );
             }

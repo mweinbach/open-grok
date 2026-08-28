@@ -74,6 +74,7 @@ pub mod vim_mode;
 pub mod voice;
 pub mod workflows;
 pub mod working_dirs;
+pub mod yolo_two;
 use super::command::SlashCommand;
 use std::sync::Arc;
 /// All pager-local builtin commands, in display order.
@@ -106,6 +107,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         // Immediately after /model (Codex catalogs expose Fast as a service tier).
         Arc::new(fast::FastCommand),
         Arc::new(always_approve::AlwaysApproveCommand),
+        Arc::new(yolo_two::YoloTwoCommand),
         Arc::new(auto::AutoCommand),
         Arc::new(multiline::MultilineCommand),
         Arc::new(compact_mode::CompactModeCommand),
@@ -358,6 +360,7 @@ mod tests {
             "welcome",
             "workflows",
             "yolo",
+            "yolo-2",
         ];
         for command in builtin_commands() {
             for key in std::iter::once(command.name()).chain(command.aliases().iter().copied()) {

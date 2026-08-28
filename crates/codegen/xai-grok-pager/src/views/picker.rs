@@ -372,7 +372,7 @@ pub(crate) fn render_picker_search_bar_with_label(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_line_editor_search_bar_with_label(
+pub(crate) fn render_line_editor_search_bar_with_label(
     buf: &mut Buffer,
     x: u16,
     y: u16,

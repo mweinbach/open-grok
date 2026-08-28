@@ -105,6 +105,8 @@ pub struct AgentBuilder {
     subagents_enabled: bool,
     background_workflows_enabled: bool,
     ask_user_question_enabled: bool,
+    async_user_messages_enabled: bool,
+    native_agents_enabled: bool,
     subagent_toggle: HashMap<String, bool>,
     task_model_slugs: Vec<String>,
     skills_config: crate::prompt::skills::SkillsConfig,
@@ -247,6 +249,8 @@ impl AgentBuilder {
             subagents_enabled: false,
             background_workflows_enabled: false,
             ask_user_question_enabled: true,
+            async_user_messages_enabled: false,
+            native_agents_enabled: false,
             subagent_toggle: HashMap::new(),
             task_model_slugs: Vec::new(),
             skills_config: Default::default(),
@@ -403,9 +407,9 @@ impl AgentBuilder {
     }
     /// Set the memory backend for cross-session knowledge retrieval.
     ///
-    /// When set, the `memory_search` and `memory_get` tools can access
-    /// the indexed memory store. When `None` (default), those tools
-    /// return "Memory is not enabled".
+    /// When set, the `memory_search`, `experience_search`, and `memory_get`
+    /// tools can access the indexed memory store. When `None` (default),
+    /// those tools return "Memory is not enabled".
     pub fn with_memory_backend(
         mut self,
         backend: Arc<dyn xai_grok_tools::types::memory_backend::MemoryBackend>,
@@ -601,6 +605,16 @@ impl AgentBuilder {
         self.ask_user_question_enabled = enabled;
         self
     }
+
+    pub fn with_async_user_messages_enabled(mut self, enabled: bool) -> Self {
+        self.async_user_messages_enabled = enabled;
+        self
+    }
+
+    pub fn with_native_agents_enabled(mut self, enabled: bool) -> Self {
+        self.native_agents_enabled = enabled;
+        self
+    }
     /// Set per-subagent enable/disable toggles from `[subagents.toggle]`.
     ///
     /// Keys are agent names, values are booleans. Omitted agents default
@@ -734,6 +748,17 @@ impl AgentBuilder {
         let tool_bridge_builder = ToolBridge::get_builder();
         let state_path = self.state_path.clone().unwrap_or_default();
         let mut tool_config = definition.tool_config.clone();
+        tool_config.tools.retain(|tool| {
+            !matches!(
+                tool.id.as_str(),
+                "Codex:spawn_agent"
+                    | "Codex:send_message"
+                    | "Codex:followup_task"
+                    | "Codex:list_agents"
+                    | "Codex:wait_agent"
+                    | "Codex:interrupt_agent"
+            )
+        });
         if !definition.inject_default_tools && tool_config.tools.is_empty() {
             return Err(AgentBuildError::InvalidConfig(format!(
                 "agent '{}' declares a curated toolset (inject_default_tools = false) \
@@ -743,12 +768,25 @@ impl AgentBuilder {
                 definition.name
             )));
         }
+        let async_user_messages_enabled =
+            self.async_user_messages_enabled && self.prompt_audience == PromptAudience::Primary;
+        tool_config
+            .tools
+            .retain(|tool| tool.id != "Codex:send_user_message_async");
+        if async_user_messages_enabled {
+            tool_config
+                .tools
+                .push((&xai_grok_tools::implementations::codex::SendUserMessageAsyncTool).into());
+        }
         if definition.inject_default_tools {
             if self.memory_backend.is_some() {
                 use xai_grok_tools::implementations::memory;
                 tool_config
                     .tools
                     .push((&memory::search_tool::MemorySearchImpl).into());
+                tool_config
+                    .tools
+                    .push((&memory::ExperienceSearchImpl).into());
                 tool_config
                     .tools
                     .push((&memory::get_tool::MemoryGetImpl).into());
@@ -810,13 +848,17 @@ impl AgentBuilder {
                 "{grok_build_ns}:{}",
                 xai_grok_tools::implementations::memory::MEMORY_SEARCH_TOOL_NAME
             );
+            let experience_search_id = format!(
+                "{grok_build_ns}:{}",
+                xai_grok_tools::implementations::memory::EXPERIENCE_SEARCH_TOOL_NAME
+            );
             let mem_get_id = format!(
                 "{grok_build_ns}:{}",
                 xai_grok_tools::implementations::memory::MEMORY_GET_TOOL_NAME
             );
-            tool_config
-                .tools
-                .retain(|tc| tc.id != mem_search_id && tc.id != mem_get_id);
+            tool_config.tools.retain(|tc| {
+                tc.id != mem_search_id && tc.id != experience_search_id && tc.id != mem_get_id
+            });
         }
         if !self.ask_user_question_enabled {
             let ask_user_id = format!(
@@ -1106,6 +1148,33 @@ impl AgentBuilder {
                 }
             }
         }
+        if self.native_agents_enabled {
+            use xai_grok_tools::implementations::codex::multi_agent_v2;
+            let can_spawn = self.subagents_enabled
+                && tool_config.tools.iter().any(|tool| {
+                    xai_grok_tools::implementations::grok_build::task::is_task_tool_id(
+                        short_tool_name(&tool.id),
+                    )
+                });
+            tool_config.tools.retain(|tool| {
+                !matches!(
+                    short_tool_name(&tool.id),
+                    "send_message" | "followup_task" | "list_agents" | "wait_agent"
+                )
+            });
+            if can_spawn {
+                tool_config
+                    .tools
+                    .push((&multi_agent_v2::SpawnAgentTool).into());
+            }
+            tool_config.tools.extend([
+                (&multi_agent_v2::SendMessageTool).into(),
+                (&multi_agent_v2::FollowupTaskTool).into(),
+                (&multi_agent_v2::ListAgentsTool).into(),
+                (&multi_agent_v2::WaitAgentTool).into(),
+                (&multi_agent_v2::InterruptAgentTool).into(),
+            ]);
+        }
         let use_backend_search = self.backend_search;
         let standalone_web_search_backend = self.standalone_web_search_backend.take();
         // Backend-hosted web search uses the primary model provider and does
@@ -1145,6 +1214,20 @@ impl AgentBuilder {
         )
         .await
         .map_err(|e| AgentBuildError::ToolError(e.to_string()))?;
+        tool_bridge
+            .update_resource(
+                xai_grok_tools::implementations::codex::multi_agent_v2::NativeAgentsEnabled(
+                    self.native_agents_enabled,
+                ),
+            )
+            .await;
+        tool_bridge
+            .update_resource(
+                xai_grok_tools::implementations::codex::send_user_message_async::AsyncUserMessagesEnabled(
+                    async_user_messages_enabled,
+                ),
+            )
+            .await;
         if let Some(bytes) = self.mcp_max_output_bytes {
             tool_bridge.toolset().resources.lock().await.insert(
                 xai_grok_tools::types::resources::TruncationCfg(
@@ -1685,6 +1768,62 @@ mod tests {
         .expect("agent should build for every pager-reachable flag combination")
     }
     #[tokio::test]
+    async fn native_agents_replace_legacy_tools_but_keep_child_communication() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        for (enabled, can_spawn, audience) in [
+            (false, true, PromptAudience::Primary),
+            (true, true, PromptAudience::Primary),
+            (true, false, PromptAudience::Subagent),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let agent = AgentBuilder::new(
+                directory.path().to_owned(),
+                Arc::new(LocalTerminalBackend::new()),
+                ToolNotificationHandle::noop(),
+            )
+            .from_definition(crate::config::AgentDefinition::codex())
+            .with_subagents_enabled(can_spawn)
+            .with_native_agents_enabled(enabled)
+            .with_prompt_audience(audience)
+            .build()
+            .await
+            .unwrap();
+            let definitions = agent.tool_definitions().await;
+            let names: Vec<_> = definitions
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect();
+            assert_eq!(names.contains(&"spawn_agent"), enabled && can_spawn);
+            assert_eq!(
+                names.iter().any(|name| {
+                    xai_grok_tools::implementations::grok_build::task::is_task_tool_id(name)
+                }),
+                can_spawn
+            );
+            assert_eq!(names.contains(&"interrupt_agent"), enabled);
+            for name in ["send_message", "followup_task", "list_agents", "wait_agent"] {
+                assert_eq!(
+                    names.iter().filter(|candidate| **candidate == name).count(),
+                    1
+                );
+            }
+            let send = definitions
+                .iter()
+                .find(|tool| tool.function.name == "send_message")
+                .unwrap();
+            assert_eq!(
+                send.function
+                    .parameters
+                    .pointer("/properties/message/encrypted")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                enabled
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn subagent_audience_strips_plan_mode_after_default_injection() {
         for profile in [
             crate::config::AgentDefinition::explore(),
@@ -1706,6 +1845,42 @@ mod tests {
                 names.contains(&"ask_user_question"),
                 "[{label}] stripping plan mode must preserve independently enabled ask-user: {names:?}"
             );
+        }
+    }
+    #[tokio::test]
+    async fn memory_disabled_strips_all_memory_tools_from_primary_and_subagent() {
+        use xai_grok_tools::implementations::{grok_build, memory};
+
+        for audience in [PromptAudience::Primary, PromptAudience::Subagent] {
+            let mut profile = crate::config::AgentDefinition::default_grok_build();
+            profile.inject_default_tools = false;
+            profile.tool_config.tools = vec![
+                (&grok_build::ReadFileTool).into(),
+                (&memory::MemorySearchImpl).into(),
+                (&memory::ExperienceSearchImpl).into(),
+                (&memory::MemoryGetImpl).into(),
+            ];
+            let agent = build_pager_agent(profile, false, false, audience).await;
+            let definitions = agent.tool_definitions().await;
+            let names: Vec<&str> = definitions
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect();
+
+            assert!(
+                names.contains(&"read_file"),
+                "[{audience:?}] non-memory tools must remain available: {names:?}"
+            );
+            for memory_tool in [
+                memory::MEMORY_SEARCH_TOOL_NAME,
+                memory::EXPERIENCE_SEARCH_TOOL_NAME,
+                memory::MEMORY_GET_TOOL_NAME,
+            ] {
+                assert!(
+                    !names.contains(&memory_tool),
+                    "[{audience:?}] {memory_tool} must be absent without a memory backend: {names:?}"
+                );
+            }
         }
     }
     #[tokio::test]
@@ -2396,6 +2571,8 @@ mod tests {
             model: "test-web-search-model".into(),
             extra_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
         })
         .with_x_search_config(XsWebSearchConfig::Enabled {
             api_key: "test-key".into(),
@@ -2403,6 +2580,8 @@ mod tests {
             model: "test-web-search-model".into(),
             extra_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
         })
         .build()
         .await

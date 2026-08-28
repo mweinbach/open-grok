@@ -53,6 +53,15 @@ pub trait SubagentBackend: Send + Sync + 'static {
     /// Request cancellation of a subagent by ID.
     async fn cancel(&self, id: &str) -> SubagentCancelOutcome;
 
+    async fn native_agent(
+        &self,
+        identity: AgentMailboxIdentity,
+        operation: super::types::NativeAgentOperation,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (identity, operation);
+        Err("Native agent collaboration is unavailable in this host".to_owned())
+    }
+
     async fn list_agents(&self, identity: AgentMailboxIdentity) -> ListAgentsOutput {
         ListAgentsOutput {
             team_scope_id: identity.team_scope_id,
@@ -357,6 +366,33 @@ impl Drop for CancelResultReceiverOnDrop {
 
 #[async_trait::async_trait]
 impl SubagentBackend for ChannelBackend {
+    async fn native_agent(
+        &self,
+        identity: AgentMailboxIdentity,
+        operation: super::types::NativeAgentOperation,
+    ) -> Result<serde_json::Value, String> {
+        if self
+            .parent_session_id
+            .as_deref()
+            .is_some_and(|id| id != identity.agent_id)
+        {
+            return Err("Agent identity does not match the calling session".to_owned());
+        }
+        let (respond_to, response_rx) = oneshot::channel();
+        self.tx
+            .send(SubagentEvent::NativeAgent(
+                super::types::NativeAgentRequest {
+                    identity,
+                    operation,
+                    respond_to,
+                },
+            ))
+            .map_err(|_| "Subagent coordinator channel closed".to_owned())?;
+        response_rx
+            .await
+            .map_err(|_| "Subagent coordinator dropped the response".to_owned())?
+    }
+
     async fn spawn(&self, mut request: SubagentRequest) -> Result<SubagentResult, ToolError> {
         if let Some(parent_session_id) = self.parent_session_id.as_deref() {
             request.parent_session_id = parent_session_id.to_owned();

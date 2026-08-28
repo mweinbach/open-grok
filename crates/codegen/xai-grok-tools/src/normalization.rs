@@ -125,6 +125,7 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::CodexReadFile(_)
         | ToolInput::CodexListDir(_)
         | ToolInput::CodexGrepFiles(_)
+        | ToolInput::ExperienceSearch(_)
         | ToolInput::MemorySearch(_)
         | ToolInput::MemoryGet(_)
         | ToolInput::SearchTool(_)

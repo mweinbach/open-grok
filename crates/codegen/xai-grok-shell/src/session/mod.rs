@@ -6,6 +6,7 @@ pub(crate) mod compaction_config;
 pub mod handle;
 pub(crate) mod memory_state;
 pub mod merge;
+pub(crate) mod native_agents;
 pub mod notifications;
 pub mod pending_interaction;
 pub mod prompt_queue;

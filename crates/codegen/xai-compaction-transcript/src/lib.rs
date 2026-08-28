@@ -172,6 +172,20 @@ fn arg_value_plain(v: &serde_json::Value) -> String {
     }
 }
 
+fn tool_call_args(
+    call: &xai_grok_sampling_types::ToolCall,
+) -> serde_json::Map<String, serde_json::Value> {
+    if xai_grok_sampling_types::conversation::codex_private_function_arguments(&call.id, &call.name)
+    {
+        serde_json::Map::from_iter([(
+            "message".to_owned(),
+            serde_json::Value::String("[provider-private tool arguments omitted]".to_owned()),
+        )])
+    } else {
+        tool_args(&call.arguments)
+    }
+}
+
 fn tool_args(arguments: &str) -> serde_json::Map<String, serde_json::Value> {
     match serde_json::from_str::<serde_json::Value>(arguments) {
         Ok(serde_json::Value::Object(map)) => map,
@@ -218,7 +232,7 @@ fn compute_turn_stats(items: &[ConversationItem]) -> TurnStats {
                 }
                 for tc in &a.tool_calls {
                     *tool_counts.entry(tc.name.clone()).or_insert(0) += 1;
-                    let args = tool_args(&tc.arguments);
+                    let args = tool_call_args(tc);
                     for key in FILE_ARG_KEYS {
                         if let Some(serde_json::Value::String(v)) = args.get(key)
                             && !v.is_empty()
@@ -324,7 +338,7 @@ fn render_turn_verbose(item: &ConversationItem, index: usize) -> String {
             }
             for tc in &a.tool_calls {
                 parts.push(format!("[tool_request: {}]", tc.name));
-                for (k, v) in tool_args(&tc.arguments) {
+                for (k, v) in tool_call_args(tc) {
                     parts.push(format!("- {k}: {}", arg_value_plain(&v)));
                 }
             }
@@ -359,7 +373,7 @@ fn render_turn_balanced(item: &ConversationItem, index: usize) -> String {
             }
             for tc in &a.tool_calls {
                 parts.push(format!("[tool_request: {}]", tc.name));
-                for (k, v) in tool_args(&tc.arguments) {
+                for (k, v) in tool_call_args(tc) {
                     let v = truncate_chars(
                         &arg_value_plain(&v),
                         BALANCED_RESPONSE_CHARS,
@@ -398,7 +412,7 @@ fn render_turn_signature(item: &ConversationItem, index: usize) -> String {
                 .tool_calls
                 .iter()
                 .map(|tc| {
-                    let args = tool_args(&tc.arguments);
+                    let args = tool_call_args(tc);
                     let key_arg = [
                         "target_file",
                         "file_path",
@@ -796,6 +810,26 @@ mod tests {
         );
         assert_eq!(s.unique_files, vec!["src/", "src/a.py", "src/b.py"]);
         assert_eq!(s.tool_error_count, 0);
+    }
+
+    #[test]
+    fn native_agent_arguments_stay_out_of_plaintext_compaction_artifacts() {
+        let mut raw = serde_json::json!({
+            "type":"function_call","name":"send_message","call_id":"native-call","namespace":"collaboration",
+            "arguments":"{\"message\":\"opaque-test-content\"}","encrypted_function_args":["message"],
+        });
+        xai_grok_sampling_types::conversation::encode_codex_function_call(&mut raw);
+        let item =
+            ConversationItem::assistant_tool_calls(vec![xai_grok_sampling_types::ToolCall {
+                id: raw["call_id"].as_str().unwrap().into(),
+                name: "send_message".into(),
+                arguments: raw["arguments"].as_str().unwrap().into(),
+            }]);
+        for detail in [CompactionDetail::Verbose, CompactionDetail::Balanced] {
+            let rendered = render_segment_md(&[item.clone()], "test-session", 0, detail, "test");
+            assert!(!rendered.contains("opaque-test-content"));
+            assert!(!rendered.contains("encrypted_function_args"));
+        }
     }
 
     /// Mirrors `test_error_counting` + `test_last_assistant_excerpt`.

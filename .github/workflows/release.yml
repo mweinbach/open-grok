@@ -28,6 +28,8 @@ env:
   RUSTUP_TOOLCHAIN: "1.94.0"
   CARGO_PROFILE_RELEASE_DIST_CODEGEN_UNITS: "16"
   CARGO_PROFILE_RELEASE_DIST_DEBUG: "0"
+  # Keep optimized thin-local LTO without the 9-19 minute cross-crate link.
+  CARGO_PROFILE_RELEASE_DIST_LTO: "false"
 
 jobs:
   resolve:
@@ -78,7 +80,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve.outputs.tag }}
-          fetch-depth: 1
+          # Cargo's workspace fingerprints need stable per-file Git mtimes.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify tag and version
@@ -102,6 +105,7 @@ jobs:
           rustc -vV
 
       - name: Restore Cargo cache
+        id: cargo-cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -109,18 +113,35 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          # Unique primary key so this run can save. restore-keys prefix-matches
-          # the newest previous release cache (GitHub cache is write-once).
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Keep one reusable cache per dependency/toolchain configuration.
+          # Source fingerprints still make Cargo rebuild changed workspace crates.
+          key: rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-
+            rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore tracked-source modification times
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/restore-cargo-mtimes.py --cache-marker target/.open-grok-cache-commit
+          else
+            python scripts/restore-cargo-mtimes.py --cache-marker target/.open-grok-cache-commit
+          fi
 
       - name: Build and verify Windows release
         shell: pwsh
         run: .\scripts\build-windows-release.ps1
 
+      - name: Record Cargo cache source revision
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: git rev-parse HEAD > target/.open-grok-cache-commit
+
       - name: Save Cargo cache
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -129,7 +150,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Upload Windows assets
         uses: actions/upload-artifact@v7
@@ -150,7 +171,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve.outputs.tag }}
-          fetch-depth: 1
+          # Cargo's workspace fingerprints need stable per-file Git mtimes.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify tag and version
@@ -171,6 +193,7 @@ jobs:
           rustc -vV
 
       - name: Restore Cargo cache
+        id: cargo-cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -178,9 +201,21 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-
+            rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore tracked-source modification times
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/restore-cargo-mtimes.py --cache-marker target/.open-grok-cache-commit
+          else
+            python scripts/restore-cargo-mtimes.py --cache-marker target/.open-grok-cache-commit
+          fi
 
       - name: Install pinned ripgrep
         shell: bash
@@ -245,8 +280,13 @@ jobs:
           "$smoke_root/bin/open-grok" --version | grep -F "$(cat OPEN_GROK_VERSION)"
           "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
 
+      - name: Record Cargo cache source revision
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: git rev-parse HEAD > target/.open-grok-cache-commit
+
       - name: Save Cargo cache
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -255,7 +295,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Upload macOS and common assets
         uses: actions/upload-artifact@v7
@@ -278,7 +318,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve.outputs.tag }}
-          fetch-depth: 1
+          # Cargo's workspace fingerprints need stable per-file Git mtimes.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify tag and version
@@ -299,6 +340,7 @@ jobs:
           rustc -vV
 
       - name: Restore Cargo cache
+        id: cargo-cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -306,9 +348,21 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: |
+            rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-
+            rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
             rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore tracked-source modification times
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/restore-cargo-mtimes.py --cache-marker target/.open-grok-cache-commit
+          else
+            python scripts/restore-cargo-mtimes.py --cache-marker target/.open-grok-cache-commit
+          fi
 
       - name: Install pinned ripgrep
         shell: bash
@@ -373,8 +427,13 @@ jobs:
           "$smoke_root/bin/open-grok" --version | grep -F "$(cat OPEN_GROK_VERSION)"
           "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
 
+      - name: Record Cargo cache source revision
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: git rev-parse HEAD > target/.open-grok-cache-commit
+
       - name: Save Cargo cache
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -383,7 +442,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Upload Linux assets
         uses: actions/upload-artifact@v7
@@ -395,9 +454,154 @@ jobs:
             dist/open-grok-linux-x86_64.sha256
             dist/install.sh
 
+  linux-arm64:
+    name: Linux arm64
+    needs: resolve
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          # Cargo's workspace fingerprints need stable per-file Git mtimes.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < OPEN_GROK_VERSION)"
+          test "v${version}" = '${{ needs.resolve.outputs.tag }}'
+          test "$(git rev-parse HEAD)" = '${{ needs.resolve.outputs.sha }}'
+
+      - name: Install minimal Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install 1.94.0 --profile minimal --no-self-update
+          rustup default 1.94.0
+          rustc -vV
+
+      - name: Restore Cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: |
+            rust-release-v4-${{ runner.os }}-${{ runner.arch }}-lto-${{ env.CARGO_PROFILE_RELEASE_DIST_LTO }}-
+            rust-release-v3-${{ runner.os }}-${{ runner.arch }}-
+            rust-release-v2-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore tracked-source modification times
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/restore-cargo-mtimes.py --cache-marker target/.open-grok-cache-commit
+          else
+            python scripts/restore-cargo-mtimes.py --cache-marker target/.open-grok-cache-commit
+          fi
+
+      - name: Install pinned ripgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ripgrep-15.0.0-aarch64-unknown-linux-gnu.tar.gz"
+          curl -fL \
+            https://github.com/BurntSushi/ripgrep/releases/download/15.0.0/ripgrep-15.0.0-aarch64-unknown-linux-gnu.tar.gz \
+            -o "$archive"
+          printf '%s  %s\n' \
+            15f8cc2fab12d88491c54d49f38589922a9d6a7353c29b0a0856727bcdf80754 \
+            "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "GROK_TOOLS_BUNDLE_RG_PATH=$RUNNER_TEMP/ripgrep-15.0.0-aarch64-unknown-linux-gnu/rg" \
+            >> "$GITHUB_ENV"
+
+      - name: Install pinned protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/protoc-29.3-linux-aarch_64.zip"
+          protoc_root="$RUNNER_TEMP/protoc-29.3"
+          curl -fL \
+            https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-aarch_64.zip \
+            -o "$archive"
+          printf '%s  %s\n' \
+            6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32 \
+            "$archive" | sha256sum -c -
+          mkdir -p "$protoc_root"
+          unzip -q "$archive" -d "$protoc_root"
+          protoc="$protoc_root/bin/protoc"
+          printf '%s  %s\n' \
+            cd44329bfd4f65e25579f747afcef747591cd8445b700c906881f75c161b3c25 \
+            "$protoc" | sha256sum -c -
+          test "$("$protoc" --version)" = "libprotoc 29.3"
+          echo "PROTOC=$protoc" >> "$GITHUB_ENV"
+
+      - name: Build and verify Linux release
+        shell: bash
+        run: ./scripts/build-linux-release.sh
+
+      - name: Upload Linux Cargo timings on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-arm64-cargo-timings
+          if-no-files-found: ignore
+          path: target/cargo-timings/
+
+      - name: Smoke Linux installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$smoke_root"' EXIT
+          export HOME="$smoke_root/profile-home"
+          export OPENGROK_HOME="$smoke_root/home"
+          export OPEN_GROK_BIN_DIR="$smoke_root/bin"
+          export OPEN_GROK_RELEASE_BASE_URL="file://$PWD/dist"
+          mkdir -p "$HOME"
+          bash dist/install.sh '${{ needs.resolve.outputs.tag }}'
+          "$smoke_root/bin/open-grok" --version | grep -F "$(cat OPEN_GROK_VERSION)"
+          "$smoke_root/bin/open-grok" --version | grep -F "$(git rev-parse --short HEAD)"
+
+      - name: Record Cargo cache source revision
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: git rev-parse HEAD > target/.open-grok-cache-commit
+
+      - name: Save Cargo cache
+        if: always() && !cancelled() && steps.cargo-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      - name: Upload Linux arm64 assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-arm64-release
+          if-no-files-found: error
+          path: |
+            dist/open-grok-linux-aarch64
+            dist/open-grok-linux-aarch64.sha256
+            dist/install.sh
+
   publish:
     name: Publish and verify GitHub release
-    needs: [resolve, windows, macos, linux]
+    needs: [resolve, windows, macos, linux, linux-arm64]
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}

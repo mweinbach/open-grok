@@ -118,6 +118,7 @@ fn stamped_message(
         kind,
         body,
         created_at_ms,
+        native: None,
     }
 }
 

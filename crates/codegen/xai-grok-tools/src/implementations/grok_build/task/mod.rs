@@ -497,6 +497,9 @@ impl xai_tool_runtime::Tool for TaskTool {
             resume_from,
             cwd,
             runtime_overrides: SubagentRuntimeOverrides {
+                native_agent: ctx
+                    .get::<NativeAgentSpawn>()
+                    .map(|options| (*options).clone()),
                 model,
                 model_override_provenance: ModelOverrideProvenance::Tool,
                 reasoning_effort,
@@ -529,6 +532,24 @@ impl xai_tool_runtime::Tool for TaskTool {
         // Coordinator stores the result for TaskOutputTool polling.
         // Both transport errors and coordinator rejections are logged so
         // late failures (worktree creation, etc.) remain visible.
+        if let Some(options) = ctx.get::<NativeAgentSpawn>() {
+            let result = backend.backend().spawn(request).await?;
+            if !result.success {
+                return Err(xai_tool_runtime::ToolError::custom(
+                    "spawn_failed",
+                    result
+                        .error
+                        .unwrap_or_else(|| "Agent could not be started".to_owned()),
+                ));
+            }
+            return Ok(ToolOutput::Dynamic(
+                serde_json::json!({
+                    "task_name": format!("/root/{}", options.task_name),
+                    "agent_id": result.subagent_id,
+                })
+                .into(),
+            ));
+        }
         if input.run_in_background {
             let bg_backend = backend.clone();
             let bg_id = id.clone();

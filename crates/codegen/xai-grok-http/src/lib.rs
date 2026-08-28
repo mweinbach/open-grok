@@ -194,7 +194,7 @@ impl UserAgent {
 }
 
 fn agent_version() -> String {
-    xai_grok_version::VERSION.to_string()
+    xai_grok_version::version().to_string()
 }
 
 /// Set the process-level fallback origin client type for `User-Agent`.

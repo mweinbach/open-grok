@@ -31,7 +31,7 @@ pub(crate) const CODEX_CLIENT_VERSION_ENV: &str = "OPENGROK_CODEX_CLIENT_VERSION
 /// Compatibility version of the pinned official Codex snapshot whose model
 /// catalog contract Open Grok implements. This is intentionally independent
 /// from Open Grok's own package version.
-pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.144.5";
+pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.150.0";
 const CODEX_MODELS_CACHE_TTL: Duration = Duration::from_secs(300);
 const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
@@ -254,6 +254,12 @@ struct CodexWireModel {
     subagent_context_default: Option<String>,
     #[serde(default)]
     multi_agent_version: Option<String>,
+    #[serde(default)]
+    use_responses_lite: bool,
+    #[serde(default)]
+    experimental_supported_tools: Vec<String>,
+    #[serde(default)]
+    apply_patch_tool_type: Option<String>,
     /// Deprecated Codex field; treat `fast` as a priority service tier.
     #[serde(default)]
     additional_speed_tiers: Vec<String>,
@@ -357,7 +363,7 @@ impl CodexModelsClient {
             http: reqwest::Client::new(),
             cache_path: crate::util::grok_home::grok_home().join(CODEX_MODELS_CACHE_FILE),
             base_url: codex_auth::inference_base_url(),
-            open_grok_version: xai_grok_version::VERSION.to_owned(),
+            open_grok_version: xai_grok_version::version().to_owned(),
             client_version: codex_client_version(),
             cache_ttl: CODEX_MODELS_CACHE_TTL,
             auth: Arc::new(ProductionCodexModelsAuthSource),
@@ -624,6 +630,9 @@ impl CodexModelsClient {
             },
         };
         info.codex_multi_agent_v2 = wire.multi_agent_version.as_deref() == Some("v2");
+        info.use_responses_lite = wire.use_responses_lite;
+        info.experimental_supported_tools = wire.experimental_supported_tools;
+        info.apply_patch_tool_type = wire.apply_patch_tool_type;
         info.agent_type = "codex".to_owned();
         info.hidden = !wire.visibility.is_list_visible();
         // This transport is backed exclusively by ChatGPT OAuth credentials.
@@ -1589,6 +1598,57 @@ mod tests {
     }
 
     #[test]
+    fn model_capability_opt_ins_survive_catalog_conversion_and_cache_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = test_client(
+            &temp,
+            "https://chatgpt.example/codex".to_owned(),
+            "1.2.3",
+            Duration::from_secs(300),
+            auth_source(credentials("token", "workspace-1", false)),
+        );
+        for metadata in [
+            json!({}),
+            json!({"apply_patch_tool_type": "freeform"}),
+            json!({"apply_patch_tool_type": "function"}),
+            json!({"apply_patch_tool_type": "unknown"}),
+            json!({"use_responses_lite": true}),
+            json!({"experimental_supported_tools": ["send_user_message_async"]}),
+            json!({"use_responses_lite": true, "experimental_supported_tools": ["send_user_message_async", "unknown_tool"]}),
+            json!({"use_responses_lite": false, "experimental_supported_tools": []}),
+        ] {
+            let mut wire =
+                json!({"slug": "catalog-test-model", "display_name": "Catalog test model"});
+            wire.as_object_mut()
+                .unwrap()
+                .extend(metadata.as_object().unwrap().clone());
+            let model = client
+                .convert_model(serde_json::from_value(wire).unwrap())
+                .unwrap();
+            let restored: CodexCatalogModel =
+                serde_json::from_value(serde_json::to_value(&model).unwrap()).unwrap();
+            assert_eq!(
+                restored.entry.info.apply_patch_tool_type.as_deref(),
+                metadata["apply_patch_tool_type"].as_str()
+            );
+            assert_eq!(
+                restored.entry.info.use_responses_lite,
+                metadata["use_responses_lite"].as_bool().unwrap_or(false)
+            );
+            assert_eq!(
+                restored.entry.info.experimental_supported_tools,
+                metadata["experimental_supported_tools"]
+                    .as_array()
+                    .map(|tools| tools
+                        .iter()
+                        .map(|tool| tool.as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>())
+                    .unwrap_or_default()
+            );
+        }
+    }
+
+    #[test]
     fn multi_agent_version_is_independent_from_ultra_effort() {
         let temp = tempfile::tempdir().unwrap();
         let client = test_client(
@@ -1749,6 +1809,6 @@ mod tests {
             Some("0.145.0".to_owned())
         );
         assert_eq!(normalize_whole_semver("not-a-version"), None);
-        assert_eq!(DEFAULT_CODEX_CLIENT_VERSION, "0.144.5");
+        assert_eq!(DEFAULT_CODEX_CLIENT_VERSION, "0.150.0");
     }
 }

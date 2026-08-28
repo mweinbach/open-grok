@@ -233,6 +233,7 @@ mod tests {
         reasoning_effort: Option<&str>,
     ) -> SubagentRuntimeOverrides {
         SubagentRuntimeOverrides {
+            native_agent: None,
             model: model.map(String::from),
             model_override_provenance: ModelOverrideProvenance::Harness,
             reasoning_effort: reasoning_effort.map(String::from),

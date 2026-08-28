@@ -408,11 +408,21 @@ Paste:            Ctrl+V (text, files, screenshots on macOS/Linux)
 Selected text:    Middle click or Shift+Insert (Linux X11/XWayland PRIMARY)
 Paste image:      Alt+V (Windows only — for screenshots / "Copy Image")
 Select all:       Cmd+A (macOS, Ghostty only — see note below)
+Select text:      Shift+←/→ (character) · Alt+Shift+←/→ (word) ·
+                  Cmd+Shift+←/→ (visual row) · Shift+Home/End (logical line) ·
+                  Shift+↑/↓ (row)
+Copy / Cut:       Cmd+C / Cmd+X (with a selection; Kitty-protocol terminals)
 Leave:            Tab (back to scrollback)
 Cancel (running): Ctrl+C (empty prompt; non-empty draft clears first)
 Clear (idle):     Esc Esc within 800ms (non-empty prompt)
 Rewind (idle):    Esc Esc within 800ms (empty prompt + messages)
 ```
+
+With a selection active, typing, `Enter`, and paste replace it; delete and
+word-kill chords delete only the selection. Arrow keys collapse the highlight
+to the corresponding edge, while word and line movements continue from that
+edge. `Shift+←/→` selects text only while the prompt is focused; in scrollback,
+those shortcuts continue jumping between turns.
 
 > **Cmd+A is gated to Ghostty.** Grok's in-app `Cmd+A` handler is only
 > wired up when the detected terminal is Ghostty. Other terminals

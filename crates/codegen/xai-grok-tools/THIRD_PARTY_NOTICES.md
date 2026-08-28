@@ -16,9 +16,13 @@ Apache License 2.0 §4(b).
 ### openai/codex
 
 The tool implementations under `src/implementations/codex/` (`apply_patch`,
-`grep_files`, `list_dir`, `read_file`) are ported from the
+`grep_files`, `list_dir`, `read_file`, `send_user_message_async`, `multi_agent_v2`,
+`multi_agent_wire`) are ported from or adapted to the contracts of the
 [openai/codex](https://github.com/openai/codex) project
 (`codex-rs/core/src/tools/handlers/`).
+The native patch grammar and v2 collaboration adapter follow the 0.150 tool
+and protocol contracts, adapted to this project's existing coordinator,
+permissions, and provider-isolation boundaries.
 The standalone web-search description and adapted command contract under
 `src/implementations/grok_build/web_run/` derive from
 `codex-rs/ext/web-search/` in the same project.

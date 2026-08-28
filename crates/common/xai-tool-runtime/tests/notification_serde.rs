@@ -311,6 +311,10 @@ fn variant_count_matches_variant_name() {
             tool_call_id: String::new(),
             questions_json: json!(null),
         }),
+        ToolNotification::AsyncUserMessage(xai_tool_runtime::notification::AsyncUserMessage {
+            tool_call_id: "async-call".into(),
+            message: "Question".into(),
+        }),
         ToolNotification::LspServerStarting(LspServerStarting {
             server_name: String::new(),
             command: String::new(),
@@ -358,10 +362,10 @@ fn variant_count_matches_variant_name() {
         all_variants.iter().map(|n| n.variant_name()).collect();
     assert_eq!(
         names.len(),
-        19,
-        "expected 19 distinct variant names; if you added a notification, extend the test list and `variant_name`"
+        20,
+        "expected 20 distinct variant names; if you added a notification, extend the test list and `variant_name`"
     );
-    assert_eq!(all_variants.len(), 19);
+    assert_eq!(all_variants.len(), 20);
 }
 
 #[test]

@@ -506,7 +506,7 @@ impl MvpAgent {
                 team_id,
                 cfg.endpoints.deployment_key.clone(),
                 self.origin_client_info_from_meta(None),
-                xai_grok_version::VERSION.to_owned(),
+                xai_grok_version::version().to_owned(),
                 subscription_tier,
                 crate::http::shared_client(),
             );
@@ -1715,7 +1715,7 @@ impl MvpAgent {
             grok_team_id,
             deployment_key,
             self.origin_client_info_from_meta(None),
-            xai_grok_version::VERSION.to_owned(),
+            xai_grok_version::version().to_owned(),
             subscription_tier,
             crate::http::shared_client(),
         );
@@ -2244,7 +2244,7 @@ impl MvpAgent {
         let version = cfg
             .client_version
             .clone()
-            .unwrap_or_else(|| xai_grok_version::VERSION.to_string());
+            .unwrap_or_else(|| xai_grok_version::version().to_string());
         let alpha_test_key = cfg.endpoints.alpha_test_key.clone();
         let mut headers = indexmap::IndexMap::new();
         headers.insert("user-agent".to_string(), format!("xai-grok-build/{version}"));
@@ -2300,7 +2300,7 @@ impl MvpAgent {
         let version = cfg
             .client_version
             .clone()
-            .unwrap_or_else(|| xai_grok_version::VERSION.to_string());
+            .unwrap_or_else(|| xai_grok_version::version().to_string());
         let alpha_test_key = cfg.endpoints.alpha_test_key.clone();
         let mut headers = indexmap::IndexMap::new();
         headers.insert("user-agent".to_string(), format!("xai-grok-build/{version}"));
@@ -3725,7 +3725,7 @@ impl MvpAgent {
                 prompt_verbatim: Some(true),
                 cwd: Some(info.cwd.clone()),
                 agent_type: None,
-                shell_version: Some(xai_grok_version::VERSION.to_string()),
+                shell_version: Some(xai_grok_version::version().to_string()),
                 workspace_type: None,
                 sandbox: local_sandbox_telemetry(),
             };
@@ -3851,7 +3851,7 @@ impl MvpAgent {
                 let queue = crate::upload::trace::spawn_upload_queue(
                     &grok_home,
                     &gcs_config,
-                    Some(xai_grok_version::VERSION),
+                    Some(xai_grok_version::version()),
                     self.auth_manager.clone(),
                     session_handle.feedback_manager.provider_boundary(),
                 );

@@ -150,7 +150,7 @@ pub(crate) async fn upload_to_auth_diagnostics(
 ) {
     let email = email.replace('/', "_");
     let ts = chrono::Utc::now().timestamp_millis();
-    let version = xai_grok_version::VERSION;
+    let version = xai_grok_version::version();
     let object_path = format!("auth-diagnostics/{version}/{email}/{ts}.jsonl");
     let config = crate::session::repo_changes::TraceExportConfig {
         bucket_url: None,

@@ -68,7 +68,7 @@ pub(crate) fn new_submission(
     content: FeedbackContent,
 ) -> FeedbackSubmission {
     let mut s = FeedbackSubmission::with_content(session_id, client_type, content);
-    s.shell_version = Some(xai_grok_version::VERSION.to_string());
+    s.shell_version = Some(xai_grok_version::version().to_string());
     s
 }
 
