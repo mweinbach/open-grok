@@ -14,13 +14,19 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 Install the latest Apple Silicon macOS or Linux x86_64 release:
 
 ```bash
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/megascan/open-grok/releases/latest/download/install.sh | bash
+```
+
+64-bit Windows PowerShell:
+
+```powershell
+irm https://github.com/megascan/open-grok/releases/latest/download/install.ps1 | iex
 ```
 
 Install a specific version:
 
 ```bash
-curl -fsSL https://github.com/mweinbach/open-grok/releases/latest/download/install.sh | bash -s 0.1.220-open-grok.24
+curl -fsSL https://github.com/megascan/open-grok/releases/latest/download/install.sh | bash -s 0.1.220-open-grok.24
 ```
 
 The installer writes only `open-grok` under

@@ -107,6 +107,11 @@ pub(crate) struct CodexCatalogModel {
     /// projection. Needed because upstream clamps against the raw window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolved_context_window: Option<i64>,
+    /// Live `max_context_window` ceiling used to clamp Codex-style
+    /// `model_context_window` overrides. Absent when the catalog omitted both
+    /// raw window fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_raw_context_window: Option<u64>,
     pub(crate) entry: ModelEntry,
 }
 
@@ -187,6 +192,13 @@ impl CodexModelsCatalog {
                 auto_compact_token_limit: model.resolved_auto_compact_token_limit(),
                 comp_hash: model.comp_hash.clone(),
             })
+    }
+
+    pub(crate) fn max_raw_context_window(&self, slug: &str) -> Option<u64> {
+        self.models
+            .iter()
+            .find(|model| model.slug() == slug)
+            .and_then(|model| model.max_raw_context_window)
     }
 }
 
@@ -639,6 +651,11 @@ impl CodexModelsClient {
         info.default_reasoning_summary = wire.default_reasoning_summary;
 
         let resolved_context_window = wire.context_window.or(wire.max_context_window);
+        let max_raw_context_window = wire
+            .max_context_window
+            .or(wire.context_window)
+            .filter(|tokens| *tokens > 0)
+            .and_then(|tokens| u64::try_from(tokens).ok());
         if let Some(context_window) = effective_context_window(
             resolved_context_window,
             wire.effective_context_window_percent,
@@ -738,6 +755,7 @@ impl CodexModelsClient {
             auto_compact_token_limit: wire.auto_compact_token_limit,
             comp_hash: wire.comp_hash,
             resolved_context_window,
+            max_raw_context_window,
             entry: ModelEntry {
                 info,
                 api_key: None,
@@ -1247,6 +1265,7 @@ mod tests {
         assert_eq!(live.slug(), "gpt-5.6-sol");
         assert_eq!(live.entry.info.name.as_deref(), Some("GPT-5.6 Sol Live"));
         assert_eq!(live.entry.info.context_window.get(), 353_400);
+        assert_eq!(live.max_raw_context_window, Some(400_000));
         assert_eq!(live.auto_compact_token_limit, Some(300_123));
         assert_eq!(live.resolved_auto_compact_token_limit(), Some(300_123));
         assert_eq!(live.comp_hash.as_deref(), Some("comp-v3"));

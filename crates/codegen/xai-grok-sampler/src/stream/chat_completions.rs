@@ -777,6 +777,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openrouter_reasoning_alias_emits_reasoning_channel() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chunk-or",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "anthropic/claude-sonnet-4",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "reasoning": "gateway thoughts" },
+                "finish_reason": null
+            }]
+        }))
+        .expect("OpenRouter reasoning delta deserializes");
+
+        let chunks: Vec<Result<ChatCompletionChunk, SamplingError>> = vec![
+            Ok(chunk),
+            Ok(text_chunk("done")),
+            Ok(final_chunk(FinishReason::Stop)),
+        ];
+        let raw = stream::iter(chunks).boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let reasoning_tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Reasoning,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning_tokens, vec!["gateway thoughts"]);
+    }
+
+    #[tokio::test]
     async fn tool_call_stream_emits_deltas_and_assembles_final_call() {
         // First chunk has id + name + part of arguments.
         let chunk1 = make_chunk(vec![ChatChunkDelta {

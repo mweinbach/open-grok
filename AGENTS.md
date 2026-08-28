@@ -154,7 +154,7 @@ Three independent axes: **`ApiBackend`** × **`ProviderProfile`** × **`AuthSche
 | RunInfra | `auth.json` scope `runinfra::api_key` | Chat Completions; live `/models` + curated hosted fallback; `/login runinfra` |
 | Google Gemini | `auth.json` scope `gemini::api_key` | Chat Completions; live `/models` enrich-only + curated four models; `/login gemini` |
 | OpenCode Go | `auth.json` scope `opencode_go::api_key` | Chat or Messages per model; opt-in live catalog; `/login opencode-go` |
-| OpenRouter | `auth.json` scope `openrouter::api_key` | Chat Completions; opt-in live `/models` checklist; `/login openrouter` |
+| OpenRouter | `auth.json` scope `openrouter::api_key` | Chat Completions; live `/models` catalog + efforts; `/login openrouter` |
 
 After any non-xAI profile that denies xAI services, the session export boundary closes monotonically (compatibility field still named `ever_used_codex`).
 

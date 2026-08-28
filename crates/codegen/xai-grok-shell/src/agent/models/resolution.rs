@@ -470,11 +470,13 @@ fn resolve_model_catalog_with_live_provider_entries(
         .iter()
         .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
-    catalog.retain(|key, entry| {
-        entry.info.provider != xai_grok_sampling_types::ModelProvider::OpenRouter
-            || enabled_openrouter.contains(key.as_str())
-            || enabled_openrouter.contains(entry.info.model.as_str())
-    });
+    if !enabled_openrouter.is_empty() {
+        catalog.retain(|key, entry| {
+            entry.info.provider != xai_grok_sampling_types::ModelProvider::OpenRouter
+                || enabled_openrouter.contains(key.as_str())
+                || enabled_openrouter.contains(entry.info.model.as_str())
+        });
+    }
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {
         let before = catalog.len();
@@ -533,6 +535,10 @@ fn resolve_model_catalog_with_live_provider_entries(
             }
         }
     }
+
+    crate::agent::model_context::apply_codex_style_context_overrides(cfg, &mut catalog, |slug| {
+        codex_catalog.and_then(|catalog| catalog.max_raw_context_window(slug))
+    });
 
     catalog
 }

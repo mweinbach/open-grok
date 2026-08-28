@@ -2000,25 +2000,43 @@ impl ModelsManager {
             .and_then(|entry| config::model_reasoning_summary(entry.info()))
     }
 
-    /// Live Codex compaction metadata for a catalog key or routing slug.
-    /// Embedded/offline models deliberately return `None`, retaining the
-    /// historical 90%-of-raw fallback and no hash-triggered compaction.
+    /// Live Codex compaction metadata for a catalog key or routing slug,
+    /// after Codex-style `model_context_window` /
+    /// `model_auto_compact_token_limit` overrides.
+    ///
+    /// Embedded/offline models return `None` unless the operator raised the
+    /// window or set an absolute compact limit, retaining the historical
+    /// 90%-of-raw fallback and no hash-triggered compaction.
     pub(crate) fn codex_compaction_metadata(
         &self,
         model_id: &str,
     ) -> Option<CodexCompactionMetadata> {
-        let routing_slug = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
-            let entry = config::find_model_by_id(&models, model_id)?;
-            (entry.info.provider == xai_grok_sampling_types::ModelProvider::Codex)
-                .then(|| entry.info.model.clone())?
+        let cfg = self.inner.cfg.read().clone();
+        let (routing_slug, session_effective) = {
+            let catalog = self.inner.catalog.read();
+            let models = &catalog.models;
+            let entry = config::find_model_by_id(models, model_id)?;
+            if entry.info.provider != xai_grok_sampling_types::ModelProvider::Codex {
+                return None;
+            }
+            (entry.info.model.clone(), entry.info.context_window.get())
         };
-        self.inner
+        let live = self
+            .inner
             .codex_catalog
             .read()
             .as_ref()
-            .and_then(|catalog| catalog.compaction_metadata(&routing_slug))
+            .and_then(|catalog| catalog.compaction_metadata(&routing_slug));
+        if let Some(limit) = crate::agent::model_context::overridden_auto_compact_token_limit(
+            &cfg,
+            session_effective,
+        ) {
+            return Some(CodexCompactionMetadata {
+                auto_compact_token_limit: Some(limit),
+                comp_hash: live.and_then(|metadata| metadata.comp_hash),
+            });
+        }
+        live
     }
 
     pub(crate) fn model_compactions_remaining(
