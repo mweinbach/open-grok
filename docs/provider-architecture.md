@@ -37,6 +37,7 @@ Codex provider does not override an explicit model API key.
 | Google Gemini | Chat | none | client function tools | no | standard only | provider API key | denied |
 | OpenCode Go | Chat, Messages | none | client function tools | no | standard only | provider API key | denied |
 | OpenRouter | Chat | none | client function tools | no | standard only | provider API key | denied |
+| Custom endpoint | Chat, Responses, Messages | OpenAI (vanilla) | client function tools | no | standard only | user key on the model row | denied |
 
 The sampler's built-in `ProviderAdapter` registry applies the transport policy
 for each profile. The xAI adapter owns xAI request metadata and doom-loop
@@ -97,6 +98,34 @@ client function tools. It has no Responses dialect, hosted tools, native web
 search, or xAI export path. Stored keys stay on
 `https://generativelanguage.googleapis.com`.
 
+### Custom endpoint (user-supplied server address)
+
+`custom` is not a service: it is the profile for a server address the user
+typed. Identity still comes from model metadata — each wizard-saved
+`[model.<key>]` row carries `provider = "custom"`, its own `base_url`,
+`api_backend`, `auth_scheme`, and credential. The host name never selects a
+protocol, a credential, or a policy; the saved `api_backend` does.
+
+The profile is deliberately the least privileged one in the table. Code Mode is
+`Unsupported`, hosted tools are absent, native web search is off, request
+metadata is standard-headers-only, session credential is `ApiKeyOnly`, and xAI
+services are `Denied`. Because `ApiKeyOnly` resolves a built-in session
+credential only for hosts that module trusts, no first-party credential can ever
+be sent to a user address: the only credential that reaches it is the model row's
+own `api_key`, `env_key`, or an operator `auth_provider` command.
+
+Responses traffic uses the vanilla OpenAI dialect: stateless, `store: false`,
+no `previous_response_id`, no cache-key affinity, no service tier, no
+`x-grok-*` fields, and no opaque-history replay. A user endpoint therefore
+cannot receive xAI or Codex encrypted reasoning history.
+
+Model discovery (`crates/codegen/xai-grok-shell/src/custom_providers.rs`) is
+`GET {base}/models` with `Authorization: Bearer` for both OpenAI formats and
+`x-api-key` plus `anthropic-version` for Messages. It never follows a redirect,
+so a key cannot be forwarded to a host the user did not type, and every error
+excerpt is trimmed and key-redacted before it reaches the TUI. Discovery writes
+nothing: the wizard persists only the models the user selected.
+
 `ConversationRequest` and `ConversationResponse` remain provider neutral.
 Provider-native opaque history is retained with a typed backend item and is
 projected only by the matching Responses dialect, so xAI X Search history and
@@ -127,10 +156,13 @@ Codex compaction history cannot cross providers on the wire.
 6. Add table-driven registry coverage plus request, stream, tool, structured
    output, credential-isolation, retry, and export-boundary tests.
 
-Custom endpoints can already reuse an existing provider profile and select any
-backend supported by that profile with an explicit API key. A genuinely
-different provider contract is a compile-time registration so missing security
-and wire policies fail closed rather than silently inheriting xAI defaults.
+A server whose contract is genuinely its own (own credential flow, hosted-tool
+schema, or opaque history) is still a compile-time registration: add a profile
+and adapter rather than teaching `custom` new tricks. `custom` exists for
+endpoints that speak one of the three supported protocols unmodified. The
+advanced `[model_providers.<id>]` shared blocks remain available for hand-written
+configuration that several model rows inherit.
+
 Remote catalog entries with an explicit unknown provider or backend are
 rejected; provider omission remains the legacy xAI default for old catalogs.
 
