@@ -277,7 +277,7 @@ pub async fn discover_models(
     let mut notes = endpoint.notes.clone();
     let models = list_models(&endpoint.base_url, format, api_key.as_deref())
         .await
-        .map_err(|error| {
+        .inspect_err(|error| {
             let message = error.to_string();
             notes.push(format!("{} listing failed: {message}", format.label()));
             tracing::warn!(
@@ -286,7 +286,6 @@ pub async fn discover_models(
                 error = %message,
                 "custom provider model discovery failed"
             );
-            error
         })?;
     if models.is_empty() {
         notes.push(format!(
@@ -501,13 +500,17 @@ mod tests {
     use axum::{Json, Router};
     use std::sync::{Arc, Mutex};
 
+    /// `Authorization`, `x-api-key`, `anthropic-version` as the stub server saw
+    /// them.
+    type SeenHeaders = (Option<String>, Option<String>, Option<String>);
+
     /// Captured request headers from the last discovery call, so a test can
     /// prove which credential header each wire format sends.
     #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>>);
+    struct Captured(Arc<Mutex<Vec<SeenHeaders>>>);
 
     impl Captured {
-        fn last(&self) -> (Option<String>, Option<String>, Option<String>) {
+        fn last(&self) -> SeenHeaders {
             self.0
                 .lock()
                 .expect("capture lock")
