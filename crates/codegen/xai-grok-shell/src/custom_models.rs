@@ -32,6 +32,13 @@ pub struct CustomModelRecord {
     /// Persist only when the user typed one. Prefer [`Self::env_key`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Credential header: `bearer` or `x_api_key`.
+    ///
+    /// Written by the custom-provider wizard from the chosen wire format, and by
+    /// any hand-written `[model.*]` table. Left unset for built-in providers,
+    /// whose identity already fixes the header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_scheme: Option<String>,
 }
 
 /// List/mutation record. Never includes `api_key`.
@@ -51,6 +58,9 @@ pub struct CustomModelPublicRecord {
     pub api_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_key: Option<String>,
+    /// Resolved credential header for this row, never the credential itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_scheme: Option<String>,
     pub has_api_key: bool,
 }
 
@@ -70,6 +80,12 @@ pub fn normalize_custom_model(
     record.api_backend = trim_opt(record.api_backend);
     record.env_key = trim_opt(record.env_key);
     record.api_key = trim_opt(record.api_key);
+    record.auth_scheme = trim_opt(record.auth_scheme);
+    if let Some(raw) = record.auth_scheme.as_deref() {
+        // Reject a typo here rather than letting it silently fall back to a
+        // bearer token against a server that wants `x-api-key`.
+        parse_auth_scheme(raw)?;
+    }
 
     validate_model_key(&record.key)?;
     validate_model_id(&record.model)?;
@@ -134,6 +150,10 @@ impl CustomModelRecord {
             context_window: self.context_window,
             api_backend: self.api_backend.clone(),
             env_key: self.env_key.clone(),
+            auth_scheme: self
+                .resolved_auth_scheme()
+                .map(auth_scheme_as_str)
+                .map(str::to_owned),
             has_api_key: has_secret(&self.api_key),
         }
     }
@@ -165,7 +185,35 @@ impl CustomModelRecord {
         if let Some(api_key) = &self.api_key {
             table.insert("api_key".into(), TomlValue::String(api_key.clone()));
         }
+        if let Some(scheme) = self.resolved_auth_scheme() {
+            table.insert(
+                "auth_scheme".into(),
+                TomlValue::String(auth_scheme_as_str(scheme).to_owned()),
+            );
+        }
         table
+    }
+
+    /// The credential header this row should carry.
+    ///
+    /// An explicit `auth_scheme` always wins. Otherwise only a user endpoint
+    /// speaking Anthropic Messages is assumed to be a native Anthropic server
+    /// (`x-api-key`); an OpenAI-compatible server keeps the historical bearer
+    /// default, which is also what a gateway or proxy expects.
+    pub fn resolved_auth_scheme(&self) -> Option<xai_grok_sampler::AuthScheme> {
+        if let Some(raw) = self.auth_scheme.as_deref() {
+            return parse_auth_scheme(raw).ok();
+        }
+        // Only a row that explicitly declares `provider = "custom"` is a user
+        // endpoint. A row without `provider` keeps the built-in default (xAI),
+        // so deriving a header for it would silently change first-party auth.
+        let is_user_endpoint = self
+            .provider
+            .as_deref()
+            .and_then(|raw| parse_provider(raw).ok())
+            == Some(ModelProvider::Custom);
+        (is_user_endpoint && self.api_backend.as_deref() == Some("messages"))
+            .then_some(xai_grok_sampler::AuthScheme::XApiKey)
     }
 
     pub fn to_override(&self) -> ConfigModelOverride {
@@ -184,6 +232,7 @@ impl CustomModelRecord {
                 .and_then(|raw| parse_api_backend(raw).ok()),
             env_key: self.env_key.clone().map(EnvKeys::single),
             api_key: self.api_key.clone(),
+            auth_scheme: self.resolved_auth_scheme(),
             ..ConfigModelOverride::default()
         }
     }
@@ -203,6 +252,7 @@ pub fn override_to_public(key: &str, model: &ConfigModelOverride) -> CustomModel
             .as_ref()
             .and_then(EnvKeys::primary)
             .map(str::to_owned),
+        auth_scheme: model.auth_scheme.map(auth_scheme_as_str).map(str::to_owned),
         has_api_key: has_secret(&model.api_key),
     }
 }
@@ -261,10 +311,29 @@ fn parse_provider(raw: &str) -> Result<ModelProvider> {
             Ok(ModelProvider::Gemini)
         }
         "openrouter" | "open_router" | "open-router" => Ok(ModelProvider::OpenRouter),
+        "custom" | "custom_endpoint" | "custom endpoint" | "byo" | "byok" => {
+            Ok(ModelProvider::Custom)
+        }
         other => bail!(
             "invalid provider `{other}`; expected xai, codex, kimi, fireworks, \
-             deepseek, meta, wafer, zai, runinfra, gemini, opencode_go, or openrouter"
+             deepseek, meta, wafer, zai, runinfra, gemini, opencode_go, openrouter, \
+             or custom"
         ),
+    }
+}
+
+/// Parse the `auth_scheme` config value (`bearer` or `x_api_key`).
+fn parse_auth_scheme(raw: &str) -> Result<xai_grok_sampler::AuthScheme> {
+    serde_json::from_value::<xai_grok_sampler::AuthScheme>(serde_json::Value::String(
+        raw.trim().to_owned(),
+    ))
+    .map_err(|_| anyhow::anyhow!("invalid auth_scheme `{raw}`; expected bearer or x_api_key"))
+}
+
+fn auth_scheme_as_str(scheme: xai_grok_sampler::AuthScheme) -> &'static str {
+    match scheme {
+        xai_grok_sampler::AuthScheme::Bearer => "bearer",
+        xai_grok_sampler::AuthScheme::XApiKey => "x_api_key",
     }
 }
 
@@ -447,6 +516,107 @@ mod tests {
         assert!(!public.has_api_key);
         let json = serde_json::to_value(&public).unwrap();
         assert!(json.get("api_key").is_none());
+    }
+
+    #[test]
+    fn custom_provider_is_accepted_and_canonicalized() {
+        for raw in [
+            "custom",
+            "custom_endpoint",
+            "custom endpoint",
+            "byo",
+            "byok",
+        ] {
+            let (got, _) = normalize_custom_model(CustomModelRecord {
+                provider: Some(raw.to_owned()),
+                ..record("localhost-11434:qwen3", "qwen3:latest")
+            })
+            .unwrap();
+            assert_eq!(got.provider.as_deref(), Some("custom"), "for `{raw}`");
+        }
+        let err = normalize_custom_model(CustomModelRecord {
+            provider: Some("teleprompter".into()),
+            ..record("k", "m")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("or custom"), "{err}");
+    }
+
+    /// A user endpoint speaking Anthropic Messages is assumed native and gets
+    /// `x-api-key`; OpenAI-compatible endpoints and every built-in provider keep
+    /// the bearer default, and an explicit value always wins.
+    #[test]
+    fn auth_scheme_is_derived_only_for_a_custom_messages_endpoint() {
+        let cases = [
+            (Some("custom"), Some("messages"), Some("x_api_key")),
+            (Some("custom"), Some("responses"), None),
+            (Some("custom"), Some("chat_completions"), None),
+            (Some("custom"), None, None),
+            (Some("zai"), Some("messages"), None),
+            (None, Some("messages"), None),
+        ];
+        for (provider, api_backend, expected) in cases {
+            let (got, _) = normalize_custom_model(CustomModelRecord {
+                provider: provider.map(str::to_owned),
+                api_backend: api_backend.map(str::to_owned),
+                ..record("k-m", "model-id")
+            })
+            .unwrap();
+            assert_eq!(
+                got.to_public().auth_scheme.as_deref(),
+                expected,
+                "provider={provider:?} api_backend={api_backend:?}"
+            );
+        }
+        let explicit = CustomModelRecord {
+            provider: Some("custom".into()),
+            api_backend: Some("messages".into()),
+            auth_scheme: Some("bearer".into()),
+            ..record("proxy-gateway:claude", "claude-x")
+        };
+        assert_eq!(
+            explicit.resolved_auth_scheme(),
+            Some(xai_grok_sampler::AuthScheme::Bearer)
+        );
+        let json = serde_json::to_value(explicit.to_public()).unwrap();
+        assert_eq!(json.get("auth_scheme"), Some(&serde_json::json!("bearer")));
+    }
+
+    #[test]
+    fn auth_scheme_lands_in_toml_the_override_and_the_public_record() {
+        let (record, _) = normalize_custom_model(CustomModelRecord {
+            provider: Some("custom".into()),
+            api_backend: Some("messages".into()),
+            base_url: Some("https://gateway.example.com/anthropic".into()),
+            api_key: Some("sk-ant-user".into()),
+            ..record("gateway.example.com:claude-x", "claude-x")
+        })
+        .unwrap();
+        let table = record.to_toml_table();
+        assert_eq!(
+            table.get("auth_scheme").and_then(TomlValue::as_str),
+            Some("x_api_key")
+        );
+        assert_eq!(
+            record.to_override().auth_scheme,
+            Some(xai_grok_sampler::AuthScheme::XApiKey)
+        );
+        let public = override_to_public("gateway.example.com:claude-x", &record.to_override());
+        assert_eq!(public.auth_scheme.as_deref(), Some("x_api_key"));
+        assert!(public.has_api_key);
+    }
+
+    #[test]
+    fn a_misspelled_auth_scheme_is_rejected_rather_than_ignored() {
+        let err = normalize_custom_model(CustomModelRecord {
+            auth_scheme: Some("x-api-key".into()),
+            ..record("k", "m")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid auth_scheme"), "{err}");
+        assert!(err.contains("x_api_key"), "{err}");
     }
 
     #[test]

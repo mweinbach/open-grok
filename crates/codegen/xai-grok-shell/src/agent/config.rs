@@ -4738,6 +4738,10 @@ impl ConfigModelOverride {
                 | ModelProvider::Gemini
                 | ModelProvider::OpenCodeGo
                 | ModelProvider::OpenRouter => ApiBackend::ChatCompletions,
+                // Overriding to a user endpoint resets to the most widely
+                // supported protocol; the wizard always writes an explicit
+                // `api_backend`, so this is only a hand-edit fallback.
+                ModelProvider::Custom => ApiBackend::ChatCompletions,
             };
             if self.base_url.is_none() {
                 entry.info.base_url.clear();

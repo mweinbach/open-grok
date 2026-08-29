@@ -3007,6 +3007,14 @@ impl SessionActor {
                         "OpenRouter API-key authentication cannot be refreshed automatically",
                     ));
                 }
+                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                    provider: xai_grok_sampling_types::ModelProvider::Custom,
+                    ..
+                } => {
+                    return Err(acp::Error::internal_error().data(
+                        "Custom endpoint authentication cannot be refreshed automatically: check the API key, credential header (bearer vs x_api_key), and wire format saved for this model",
+                    ));
+                }
             };
             auth_retry_schedule.reset_on_success();
             codex_auth_retry_attempted = false;

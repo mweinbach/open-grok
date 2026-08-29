@@ -236,6 +236,13 @@ struct CustomModelDeleteParams {
     key: String,
 }
 
+/// Params for `open-grok/custom-models/upsert-many`: the model rows the wizard
+/// just confirmed for one server address.
+#[derive(serde::Deserialize)]
+struct CustomModelBatchParams {
+    models: Vec<crate::custom_models::CustomModelRecord>,
+}
+
 fn persisted_perplexity_web_search_enabled() -> anyhow::Result<bool> {
     let root = crate::config::load_effective_config()?;
     Ok(root
@@ -2748,6 +2755,32 @@ impl acp::Agent for MvpAgent {
                             self.models_manager.current_model_id(),
                             available.values().cloned().collect(),
                         );
+                        crate::extensions::to_ext_response(Ok(custom_models_mutation_payload(
+                            models,
+                            self.models_manager.list_custom_models(),
+                            warning,
+                        )))
+                    }
+                    Err(error) => crate::extensions::to_ext_response::<serde_json::Value>(Err(error)),
+                }
+            }
+            "open-grok/custom-providers/discover" => {
+                let params =
+                    crate::extensions::parse_params::<crate::custom_providers::CustomProviderDiscoverParams>(&args)?;
+                crate::extensions::to_ext_response(
+                    crate::custom_providers::discover_models(params).await,
+                )
+            }
+            "open-grok/custom-models/upsert-many" => {
+                let params = crate::extensions::parse_params::<CustomModelBatchParams>(&args)?;
+                match self.models_manager.upsert_custom_models(params.models).await {
+                    Ok(warnings) => {
+                        let available = self.models_manager.available();
+                        let models = acp::SessionModelState::new(
+                            self.models_manager.current_model_id(),
+                            available.values().cloned().collect(),
+                        );
+                        let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
                         crate::extensions::to_ext_response(Ok(custom_models_mutation_payload(
                             models,
                             self.models_manager.list_custom_models(),

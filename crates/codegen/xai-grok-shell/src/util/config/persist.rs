@@ -347,6 +347,26 @@ pub(crate) fn persist_custom_model_upsert_at(
     Ok(model)
 }
 
+/// Write several `[model.<key>]` tables to `path` in one read-modify-write.
+///
+/// The wizard saves a whole endpoint's model list at once, so N rows must land
+/// as one atomic change: a half-written list would leave the user with models
+/// whose credentials were never stored.
+pub(crate) fn persist_custom_model_upserts_at(
+    path: &std::path::Path,
+    records: &[crate::custom_models::CustomModelRecord],
+) -> Result<Vec<(String, crate::agent::config::ConfigModelOverride)>> {
+    let contents = read_to_string_or_empty(path)?;
+    let mut root = parse_user_config_root(&contents, path)?;
+    let mut written = Vec::with_capacity(records.len());
+    for record in records {
+        let model = persist_custom_model_upsert_to_root(&mut root, record)?;
+        written.push((record.key.clone(), model));
+    }
+    atomic_write_string(path, &toml::to_string_pretty(&root)?)?;
+    Ok(written)
+}
+
 /// Delete one `[model.<key>]` table at `path`.
 pub(crate) fn persist_custom_model_delete_at(path: &std::path::Path, key: &str) -> Result<bool> {
     let contents = read_to_string_or_empty(path)?;
@@ -1813,6 +1833,105 @@ model = "gone"
         assert!(
             root.get("model").is_none(),
             "empty [model] section must be dropped"
+        );
+    }
+
+    /// The wizard saves a whole endpoint at once: every row must land in one
+    /// file write, keep unrelated config intact, and carry the credential
+    /// header derived from the chosen wire format.
+    #[test]
+    fn custom_model_batch_upsert_writes_every_row_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ui]\ntheme = \"groknight\"\n[model.keep-me]\nmodel = \"kept\"\n",
+        )
+        .unwrap();
+        let records: Vec<_> = [
+            ("localhost-11434:qwen3", "qwen3:latest", "responses"),
+            ("localhost-11434:llama", "llama3:latest", "chat_completions"),
+        ]
+        .into_iter()
+        .map(|(key, model, api_backend)| {
+            crate::custom_models::normalize_custom_model(crate::custom_models::CustomModelRecord {
+                provider: Some("custom".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+                api_backend: Some(api_backend.into()),
+                context_window: Some(131_072),
+                key: key.into(),
+                model: model.into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .0
+        })
+        .collect();
+
+        let written = persist_custom_model_upserts_at(&path, &records).unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(
+            written
+                .iter()
+                .all(|(_, model)| model.base_url.as_deref() == Some("http://localhost:11434/v1")),
+            "each row carries the endpoint it was discovered from"
+        );
+
+        let parsed: TomlValue = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed
+                .get("ui")
+                .and_then(|v| v.get("theme"))
+                .and_then(TomlValue::as_str),
+            Some("groknight"),
+            "unrelated config survives a batch write"
+        );
+        let models = parsed.get("model").and_then(TomlValue::as_table).unwrap();
+        assert!(models.contains_key("keep-me"));
+        assert_eq!(
+            models
+                .get("localhost-11434:qwen3")
+                .and_then(TomlValue::as_table)
+                .and_then(|t| t.get("model"))
+                .and_then(TomlValue::as_str),
+            Some("qwen3:latest")
+        );
+    }
+
+    /// An Anthropic-format batch must persist the header choice, or the saved
+    /// models would authenticate with the wrong header on the next start.
+    #[test]
+    fn custom_model_batch_upsert_persists_the_messages_auth_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (record, _) =
+            crate::custom_models::normalize_custom_model(crate::custom_models::CustomModelRecord {
+                key: "gateway.example.com:claude-x".into(),
+                model: "claude-x".into(),
+                provider: Some("custom".into()),
+                api_backend: Some("messages".into()),
+                base_url: Some("https://gateway.example.com/anthropic".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        persist_custom_model_upserts_at(&path, std::slice::from_ref(&record)).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("auth_scheme = \"x_api_key\""), "{written}");
+        let parsed: TomlValue = toml::from_str(&written).unwrap();
+        let entry: crate::agent::config::ConfigModelOverride = parsed
+            .get("model")
+            .and_then(|models| models.get("gateway.example.com:claude-x"))
+            .cloned()
+            .expect("written table")
+            .try_into()
+            .expect("[model.*] table reparses as an override");
+        assert_eq!(
+            entry.auth_scheme,
+            Some(xai_grok_sampler::AuthScheme::XApiKey)
+        );
+        assert_eq!(
+            entry.api_backend,
+            Some(xai_grok_sampling_types::ApiBackend::Messages)
         );
     }
 

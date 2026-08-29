@@ -22,6 +22,7 @@ pub mod codex_auth;
 pub(crate) mod codex_models;
 pub mod config;
 pub mod custom_models;
+pub mod custom_providers;
 pub mod deepseek_models;
 pub mod fireworks_models;
 pub mod gemini_models;

@@ -367,6 +367,10 @@ pub enum WebSearchSourceTarget {
     Gemini,
     OpenCodeGo,
     OpenRouter,
+    /// A user-supplied server address. Kept as its own target so a BYO
+    /// endpoint can select a search source without borrowing another
+    /// provider's setting.
+    Custom,
 }
 
 impl WebSearchSourceTarget {
@@ -392,6 +396,7 @@ impl WebSearchSourceTarget {
             ModelProvider::Gemini => Self::Gemini,
             ModelProvider::OpenCodeGo => Self::OpenCodeGo,
             ModelProvider::OpenRouter => Self::OpenRouter,
+            ModelProvider::Custom => Self::Custom,
         }
     }
 }
@@ -415,6 +420,8 @@ pub struct WebSearchSourceConfig {
     pub gemini: Option<WebSearchSource>,
     pub opencode_go: Option<WebSearchSource>,
     pub openrouter: Option<WebSearchSource>,
+    #[serde(default)]
+    pub custom: Option<WebSearchSource>,
 }
 
 impl WebSearchSourceConfig {
@@ -434,6 +441,7 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::Gemini => self.gemini,
             WebSearchSourceTarget::OpenCodeGo => self.opencode_go,
             WebSearchSourceTarget::OpenRouter => self.openrouter,
+            WebSearchSourceTarget::Custom => self.custom,
         }
     }
 
@@ -452,7 +460,8 @@ impl WebSearchSourceConfig {
             | WebSearchSourceTarget::Runinfra
             | WebSearchSourceTarget::Gemini
             | WebSearchSourceTarget::OpenCodeGo
-            | WebSearchSourceTarget::OpenRouter => WebSearchSource::Xai,
+            | WebSearchSourceTarget::OpenRouter
+            | WebSearchSourceTarget::Custom => WebSearchSource::Xai,
         }
     }
 
@@ -478,6 +487,7 @@ impl WebSearchSourceConfig {
             WebSearchSourceTarget::Gemini => self.gemini = source,
             WebSearchSourceTarget::OpenCodeGo => self.opencode_go = source,
             WebSearchSourceTarget::OpenRouter => self.openrouter = source,
+            WebSearchSourceTarget::Custom => self.custom = source,
         }
     }
 }
@@ -575,7 +585,8 @@ impl WebSearchCandidates {
             | WebSearchSourceTarget::Runinfra
             | WebSearchSourceTarget::Gemini
             | WebSearchSourceTarget::OpenCodeGo
-            | WebSearchSourceTarget::OpenRouter => WebSearchSource::Xai,
+            | WebSearchSourceTarget::OpenRouter
+            | WebSearchSourceTarget::Custom => WebSearchSource::Xai,
         }
     }
 
@@ -610,7 +621,10 @@ impl WebSearchCandidates {
                 | ModelProvider::Runinfra
                 | ModelProvider::Gemini
                 | ModelProvider::OpenCodeGo
-                | ModelProvider::OpenRouter => WebSearchConfig::Disabled,
+                | ModelProvider::OpenRouter
+                // A user endpoint never declares hosted search; the client
+                // tool is the only source it can use.
+                | ModelProvider::Custom => WebSearchConfig::Disabled,
                 // For xAI, "native" and the xAI client tool are the same
                 // service — keep the client declaration as today.
                 ModelProvider::Xai => self.xai.clone(),

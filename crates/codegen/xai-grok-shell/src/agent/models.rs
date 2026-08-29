@@ -1490,6 +1490,24 @@ impl ModelsManager {
         Ok(warning)
     }
 
+    /// Write a whole endpoint's model list at once, then rebuild the catalog a
+    /// single time. Selecting five models from a new server must not leave the
+    /// picker half-updated if one row fails.
+    pub(crate) async fn upsert_custom_models(
+        &self,
+        records: Vec<crate::custom_models::CustomModelRecord>,
+    ) -> anyhow::Result<Vec<String>> {
+        let (written, warnings) = crate::util::config::upsert_custom_models(records).await?;
+        if !written.is_empty() {
+            let mut cfg = self.inner.cfg.read().clone();
+            for (key, model) in written {
+                cfg.config_models.insert(key, model);
+            }
+            self.apply_config(cfg);
+        }
+        Ok(warnings)
+    }
+
     pub(crate) async fn delete_custom_model(&self, key: &str) -> anyhow::Result<()> {
         crate::util::config::delete_custom_model(key).await?;
         self.apply_custom_model_delete(key);

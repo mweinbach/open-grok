@@ -1648,6 +1648,16 @@ impl SessionActor {
                     }
                     eligible
                 }
+                xai_grok_sampling_types::ModelProvider::Custom => {
+                    // A user endpoint is authenticated only by what the user
+                    // saved, so there is nothing to remint: the key, header
+                    // name, or format is wrong and only they can fix it.
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        "Custom endpoint authentication cannot be refreshed; surfacing 401",
+                    );
+                    false
+                }
                 xai_grok_sampling_types::ModelProvider::Kimi => {
                     tracing::warn!(
                         session_id = %self.session_info.id.0,

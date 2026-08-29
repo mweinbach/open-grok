@@ -789,6 +789,46 @@ pub async fn upsert_custom_model(
 }
 
 /// Remove one `[model.<key>]` table. Missing keys are a no-op.
+/// Write a whole batch of custom models in one config transaction.
+///
+/// Returns the written overrides in input order, skipping records the schema
+/// rejects (each rejection is returned as a warning string instead of
+/// aborting the batch).
+pub async fn upsert_custom_models(
+    records: Vec<crate::custom_models::CustomModelRecord>,
+) -> Result<(
+    Vec<(String, crate::agent::config::ConfigModelOverride)>,
+    Vec<String>,
+)> {
+    let _guard = lock_config_writes().await;
+    let path = user_config_path();
+    let mut accepted = Vec::new();
+    let mut warnings = Vec::new();
+    for record in records {
+        match crate::custom_models::normalize_custom_model(record) {
+            Ok((record, warning)) => {
+                accepted.push(record);
+                if let Some(warning) = warning {
+                    warnings.push(format!(
+                        "{}: {warning}",
+                        accepted.last().map(|r| r.key.as_str()).unwrap_or("")
+                    ));
+                }
+            }
+            Err(error) => warnings.push(error.to_string()),
+        }
+    }
+    if accepted.is_empty() {
+        return Ok((Vec::new(), warnings));
+    }
+    let written = tokio::task::spawn_blocking(move || {
+        crate::util::config::persist_custom_model_upserts_at(&path, &accepted)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("persist_custom_models join: {e}"))??;
+    Ok((written, warnings))
+}
+
 pub async fn delete_custom_model(key: &str) -> Result<bool> {
     let key = key.trim();
     crate::custom_models::validate_model_key(key)?;
