@@ -1219,6 +1219,13 @@ pub enum ModelProvider {
     /// catalog, matching OpenCode Go.
     #[serde(alias = "open_router", alias = "open-router")]
     OpenRouter,
+    /// A user-supplied server address speaking one of the three supported wire
+    /// protocols (OpenAI Responses, OpenAI Chat Completions, or Anthropic
+    /// Messages). Selected by the custom-provider wizard, never inferred from
+    /// a model slug or host: the model entry carries the endpoint, so the
+    /// policy below is the only thing that can attach to the wire.
+    #[serde(alias = "custom_endpoint", alias = "byok", alias = "byo")]
+    Custom,
 }
 
 /// Provider-specific wire contract used by the Responses API.
@@ -1235,6 +1242,12 @@ pub enum ResponsesDialect {
     DeepSeek,
     /// Meta Model API's OpenAI-compatible, stateless Responses contract.
     Meta,
+    /// Vanilla OpenAI Responses contract, used by user-supplied endpoints that
+    /// speak it (`https://api.openai.com/v1` and OpenAI-compatible gateways).
+    /// Stateless like DeepSeek/Meta: the full input is replayed every turn, no
+    /// provider-side continuity or cache-routing metadata is sent, and no
+    /// opaque provider-native history carriers are replayed.
+    OpenAi,
 }
 
 /// Wire representation used for Code Mode's client-executed `exec` tool.
@@ -1596,6 +1609,28 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
+    /// A user-supplied server address reached with the model's own API key.
+    ///
+    /// This is the only profile whose endpoint comes from the user rather than
+    /// from a first-party catalog, so it is deliberately fail-closed: every
+    /// hosted-tool dialect, native web search, Code Mode transport, built-in
+    /// session credential, and xAI service path is off. A BYO endpoint gets
+    /// the plain wire protocol it asked for and nothing else.
+    pub const CUSTOM: Self = Self {
+        provider: ModelProvider::Custom,
+        backends: ProviderBackends {
+            chat_completions: true,
+            responses: Some(ResponsesDialect::OpenAi),
+            messages: true,
+        },
+        code_mode_transport: CodeModeTransport::Unsupported,
+        hosted_tool_dialect: None,
+        native_web_search: false,
+        request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+        session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+        xai_services: XaiServicePolicy::Denied,
+    };
+
     pub const fn id(self) -> &'static str {
         self.provider.as_str()
     }
@@ -1652,6 +1687,10 @@ impl ProviderProfile {
         self.provider.is_open_router()
     }
 
+    pub const fn is_custom(self) -> bool {
+        self.provider.is_custom()
+    }
+
     pub const fn allows_xai_services(self) -> bool {
         self.xai_services.allows()
     }
@@ -1685,6 +1724,7 @@ impl ModelProvider {
             Self::Runinfra => "runinfra",
             Self::Gemini => "gemini",
             Self::OpenRouter => "openrouter",
+            Self::Custom => "custom",
         }
     }
 
@@ -1703,6 +1743,7 @@ impl ModelProvider {
             Self::Runinfra => "RunInfra",
             Self::Gemini => "Google Gemini",
             Self::OpenRouter => "OpenRouter",
+            Self::Custom => "Custom endpoint",
         }
     }
 
@@ -1765,6 +1806,13 @@ impl ModelProvider {
         matches!(self, Self::OpenRouter)
     }
 
+    /// Whether this provider is a user-supplied server address with
+    /// user-supplied credentials, and therefore must never receive
+    /// first-party credentials, hosted tools, or xAI request metadata.
+    pub const fn is_custom(self) -> bool {
+        matches!(self, Self::Custom)
+    }
+
     /// Return the built-in provider's complete behavior policy.
     pub const fn profile(self) -> ProviderProfile {
         match self {
@@ -1780,6 +1828,7 @@ impl ModelProvider {
             Self::Runinfra => ProviderProfile::RUNINFRA,
             Self::Gemini => ProviderProfile::GEMINI,
             Self::OpenRouter => ProviderProfile::OPENROUTER,
+            Self::Custom => ProviderProfile::CUSTOM,
         }
     }
 }
@@ -2218,6 +2267,25 @@ mod tests {
                 session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
                 xai_services: XaiServicePolicy::Denied,
             },
+            // The BYO endpoint profile: every supported wire protocol, and
+            // nothing first-party. Adding a capability here means sending it to
+            // infrastructure the user, not Open Grok, operates.
+            Case {
+                provider: ModelProvider::Custom,
+                id: "custom",
+                name: "Custom endpoint",
+                backends: ProviderBackends {
+                    chat_completions: true,
+                    responses: Some(ResponsesDialect::OpenAi),
+                    messages: true,
+                },
+                code_mode_transport: CodeModeTransport::Unsupported,
+                hosted_tools: None,
+                native_web_search: false,
+                request_metadata: RequestMetadataPolicy::StandardHeadersOnly,
+                session_auth: BuiltInSessionAuthKind::ApiKeyOnly,
+                xai_services: XaiServicePolicy::Denied,
+            },
         ];
 
         for case in cases {
@@ -2244,6 +2312,7 @@ mod tests {
             assert_eq!(profile.is_runinfra(), case.provider.is_runinfra());
             assert_eq!(profile.is_gemini(), case.provider.is_gemini());
             assert_eq!(profile.is_open_router(), case.provider.is_open_router());
+            assert_eq!(profile.is_custom(), case.provider.is_custom());
             assert_eq!(profile.allows_xai_services(), case.xai_services.allows());
             for backend in [
                 ApiBackend::ChatCompletions,
@@ -2278,6 +2347,7 @@ mod tests {
             ModelProvider::Runinfra,
             ModelProvider::Gemini,
             ModelProvider::OpenRouter,
+            ModelProvider::Custom,
         ] {
             for backend in [
                 ApiBackend::ChatCompletions,

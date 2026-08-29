@@ -1695,11 +1695,16 @@ impl ConversationRequest {
                     (Some(crate::ResponsesDialect::Xai), BackendToolKind::XSearch(call)) => {
                         Some(x_search_call_wire_value(call))
                     }
-                    // DeepSeek Responses has no opaque provider-native history
-                    // carriers today; keep the match explicit so new dialects
+                    // DeepSeek, Meta, and user-supplied vanilla Responses
+                    // endpoints have no opaque provider-native history
+                    // carriers; keep the match explicit so new dialects
                     // fail closed until their replay contract is defined.
                     (
-                        Some(crate::ResponsesDialect::DeepSeek | crate::ResponsesDialect::Meta),
+                        Some(
+                            crate::ResponsesDialect::DeepSeek
+                            | crate::ResponsesDialect::Meta
+                            | crate::ResponsesDialect::OpenAi,
+                        ),
                         _,
                     ) => None,
                     _ => None,
