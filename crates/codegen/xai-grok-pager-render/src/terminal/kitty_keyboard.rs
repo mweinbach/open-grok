@@ -85,7 +85,7 @@ pub fn negotiated_kitty_flags(
 /// ordered after `init_terminal` by the task creation between them.
 static PUSHED_KITTY_FLAGS: AtomicU8 = AtomicU8::new(0);
 
-fn pushed_kitty_flags() -> KeyboardEnhancementFlags {
+pub fn pushed_kitty_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::from_bits_truncate(PUSHED_KITTY_FLAGS.load(Ordering::Relaxed))
 }
 

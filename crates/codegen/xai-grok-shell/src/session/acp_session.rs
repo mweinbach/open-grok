@@ -50,8 +50,8 @@ use crate::session::result::ExtMethodResult;
 use crate::session::signals::{SessionSignalsHandle, TurnDeltaSnapshot};
 use crate::session::slash_commands::{self, BuiltinAction, SlashCommandOutcome};
 use crate::session::storage::SessionUpdate;
+use crate::session::user_message::construct_user_message_minimal;
 use crate::session::user_message::extract_user_query;
-use crate::session::user_message::{construct_user_message, construct_user_message_minimal};
 use crate::terminal::TerminalRunRequest;
 use crate::tools::ToolContext;
 use agent_client_protocol as acp;
@@ -81,7 +81,7 @@ use xai_grok_tools::types::output::{
 };
 use xai_grok_workspace::file_system::CodebaseIndexManager;
 use xai_grok_workspace::permission::{
-    AccessKind, ClientType, Decision, PermissionEvent, PermissionHandle,
+    AccessKind, ClientType, Decision, HookAsk, PermissionEvent, PermissionHandle, PermissionRequest,
 };
 use xai_grok_workspace::session::file_state::{FileStateHandle, FileStateTracker};
 const SESSION_LOG: &str = "xai_session";
@@ -107,10 +107,32 @@ mod goal;
 mod image_strip;
 #[path = "acp_session_impl/interjection.rs"]
 mod interjection;
+#[path = "acp_session_impl/post_tool_use_delivery.rs"]
+mod post_tool_use_delivery;
 #[path = "acp_session_impl/tool_calls.rs"]
 mod tool_calls;
+use post_tool_use_delivery::{
+    PostToolUseDelivery, plan_post_tool_use_delivery, substitute_rendered_output,
+};
+#[path = "acp_session_impl/length_salvage.rs"]
+mod length_salvage;
+#[path = "acp_session_impl/rate_limit_waits.rs"]
+mod rate_limit_waits;
+pub(crate) use rate_limit_waits::{
+    RateLimitWaitBudget, RateLimitWaitConfig, RateLimitWaitDecision,
+};
+#[path = "acp_session_impl/active_agent_message_presentation.rs"]
+mod active_agent_message_presentation;
+#[path = "acp_session_impl/child_tool_projection.rs"]
+mod child_tool_projection;
+#[path = "acp_session_impl/parent_message.rs"]
+mod parent_message;
+#[path = "acp_session_impl/wait_interrupt.rs"]
+mod wait_interrupt;
+use active_agent_message_presentation::*;
 #[path = "acp_session_impl/turn.rs"]
 mod turn;
+pub(crate) use turn::SUBAGENT_USAGE_DRAIN;
 #[path = "acp_session_impl/workflow.rs"]
 mod workflow_run;
 pub(crate) use interjection::*;
@@ -127,6 +149,8 @@ mod hooks_plugins;
 mod lifecycle;
 #[path = "acp_session_impl/mcp.rs"]
 mod mcp;
+#[path = "acp_session_impl/mcp_failed_reminder.rs"]
+mod mcp_failed_reminder;
 #[path = "acp_session_impl/model_switch.rs"]
 mod model_switch;
 #[path = "acp_session_impl/slash_exec.rs"]
@@ -146,18 +170,50 @@ mod session_mode;
 use session_mode::*;
 #[path = "acp_session_impl/sampler_turn.rs"]
 mod sampler_turn;
+#[path = "acp_session_impl/status_line.rs"]
+mod status_line;
 #[cfg(test)]
 pub(crate) use sampler_turn::trust_loopback_session_auth_for_tests;
 use sampler_turn::*;
 #[path = "acp_session_impl/tool_dispatch.rs"]
 mod tool_dispatch;
 use tool_dispatch::*;
+#[cfg(test)]
+#[path = "acp_session_tests/turn/length_salvage_tests.rs"]
+mod length_salvage_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/mcp_failed_reminder_tests.rs"]
+mod mcp_failed_reminder_tests;
 #[path = "acp_session_impl/mcp_snapshot.rs"]
 mod mcp_snapshot;
+#[cfg(test)]
+#[path = "acp_session_tests/pre_tool_use_decision_tests.rs"]
+mod pre_tool_use_decision_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/prompt_gate_tests.rs"]
+mod prompt_gate_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/turn/rate_limit_backoff_tests.rs"]
+mod rate_limit_backoff_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/slash_authority_turn_tests.rs"]
+mod slash_authority_turn_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/turn/transient_retry_loop_tests.rs"]
+mod transient_retry_loop_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/transient_retry_tests.rs"]
+mod transient_retry_tests;
 use mcp_snapshot::*;
 #[path = "acp_session_impl/tasks_cancel.rs"]
 mod tasks_cancel;
 use tasks_cancel::*;
+#[path = "acp_session_impl/turn_task.rs"]
+mod turn_task;
+use turn_task::*;
+#[path = "acp_session_impl/queue_mutation.rs"]
+mod queue_mutation;
+use queue_mutation::*;
 #[path = "acp_session_impl/reminders.rs"]
 mod reminders;
 use reminders::*;
@@ -204,6 +260,8 @@ mod run_loop;
 mod session_setup;
 #[path = "acp_session_impl/side_call.rs"]
 mod side_call;
+#[path = "acp_session_impl/title_refresh.rs"]
+mod title_refresh;
 #[path = "acp_session_impl/turn_end.rs"]
 mod turn_end;
 #[path = "acp_session_impl/turn_summary.rs"]
@@ -253,6 +311,8 @@ pub(crate) struct InputItem {
     /// land behind earlier still-queued send-now prompts so stacked sends
     /// (e.g. during a goal turn, which promotes but never cancels) run FIFO.
     pub(crate) send_now: bool,
+    pub(crate) initial_child_prompt_ready: Option<oneshot::Sender<()>>,
+    pub(crate) traceparent: Option<String>,
 }
 use crate::session::commands::{NotificationPriority, NotificationSource};
 /// Resolved tool names for goal-mode prompts.
@@ -321,12 +381,14 @@ pub(crate) struct State {
     /// is released.
     pub(crate) lifecycle_mutation: Option<LifecycleMutationKind>,
     pub(crate) pending_web_search_reload: Option<PendingWebSearchReload>,
+    pub(super) finalization_gate: FinalizationGate,
     /// Prompt ids held out of combine-on-promote (composer edit in progress).
-    pub(crate) combine_edit_holds: std::collections::HashSet<String>,
+    pub(crate) edit_holds: HashMap<String, std::time::Instant>,
     /// When true, notifications are buffered but not drained until genuine
     /// user re-engagement. Set by an interactive stop, cleared by a user
     /// prompt.
     pub(crate) notifications_suppressed: bool,
+    pub(crate) hook_block_hold: HookBlockHold,
     /// Active prompt is still rewindable until the first outbound
     /// prompt-scoped event is emitted; armed at promote, cleared at first
     /// output or by the rewind pop itself.
@@ -346,7 +408,25 @@ pub(crate) struct State {
     /// only manual mode may be restored once a stable storage field is available.
     pub(crate) swarm_mode: crate::session::swarm_mode::SwarmModeTracker,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HookBlockHold {
+    #[default]
+    Ready,
+    Held,
+}
+
 impl State {
+    pub(crate) fn arm_hook_block_hold(&mut self) {
+        self.hook_block_hold = HookBlockHold::Held;
+    }
+
+    pub(crate) fn take_hook_block_hold(&mut self) -> bool {
+        std::mem::take(&mut self.hook_block_hold) == HookBlockHold::Held
+    }
+
+    pub(crate) fn hook_block_held(&self) -> bool {
+        self.hook_block_hold == HookBlockHold::Held
+    }
     pub(crate) fn clear_pending_notifications(&mut self) {
         self.pending_notifications.clear();
     }
@@ -386,7 +466,10 @@ impl State {
         let mut dropped = Vec::new();
         let mut kept = VecDeque::with_capacity(self.pending_inputs.len());
         for item in std::mem::take(&mut self.pending_inputs) {
-            if running_pid.as_deref() != Some(item.prompt_id.as_str()) && drop_if(&item) {
+            if !matches!(item.origin, PromptOrigin::ParentAgentMessage { .. })
+                && running_pid.as_deref() != Some(item.prompt_id.as_str())
+                && drop_if(&item)
+            {
                 dropped.push(item);
             } else {
                 kept.push_back(item);
@@ -410,7 +493,9 @@ pub(crate) fn is_session_idle_for_injection(state: &State) -> bool {
     state.running_task.is_none()
         && state.pending_inputs.is_empty()
         && state.lifecycle_mutation.is_none()
+        && !state.finalization_gate.is_active()
         && !state.notifications_suppressed
+        && !state.hook_block_held()
 }
 /// Predicate behind `SessionCommand::IsBusy`: the session has work in flight
 /// when a turn is running, inputs are queued, **or** a lifecycle mutation is
@@ -422,6 +507,7 @@ pub(crate) fn state_is_busy(state: &State) -> bool {
     state.running_task.is_some()
         || !state.pending_inputs.is_empty()
         || state.lifecycle_mutation.is_some()
+        || state.finalization_gate.is_active()
 }
 use crate::auth::AuthManager;
 #[derive(Clone)]
@@ -606,6 +692,8 @@ pub(crate) struct PreparedToolCall {
     dispatch_target_name: Option<String>,
     /// Read-only per `ToolKind`; decides whether the call takes the per-file lock.
     is_read_only: bool,
+    rewriting_hook: Option<String>,
+    additional_context: Vec<xai_grok_hooks::dispatcher::AdditionalContext>,
 }
 impl PreparedToolCall {
     /// The tool name hooks see: the resolved dispatch target, else the wire name.
@@ -629,6 +717,42 @@ pub(crate) struct ModelAuthMemo {
     pub(crate) provider: Option<crate::auth::AuthProviderRef>,
 }
 /// Phase 3: Post-flight handling after dispatch (inline in execute_tool_calls for now).
+pub(crate) struct PendingImageStrip {
+    pub(crate) urls: Vec<std::sync::Arc<str>>,
+    pub(crate) timed_out: bool,
+    pub(crate) applying: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct ImageStripRewriteBarrier {
+    gate: Arc<tokio::sync::RwLock<()>>,
+    strips: Arc<tokio::sync::Mutex<()>>,
+}
+
+pub(crate) struct ImageStripWriteGuard {
+    _gate_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    _strip_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl ImageStripRewriteBarrier {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) async fn lock_strip(&self) -> ImageStripWriteGuard {
+        let strip_guard = Arc::clone(&self.strips).lock_owned().await;
+        let gate_guard = Arc::clone(&self.gate).read_owned().await;
+        ImageStripWriteGuard {
+            _strip_guard: strip_guard,
+            _gate_guard: gate_guard,
+        }
+    }
+
+    pub(crate) async fn lock_rewind(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.gate).write_owned().await
+    }
+}
+
 pub(crate) struct SessionActor {
     pub(crate) session_info: SessionInfo,
     /// Shared live handle to the current ACP auth method. Normal sessions hold a
@@ -737,7 +861,7 @@ pub(crate) struct SessionActor {
     /// `UpdateMcpServers` sent by the same resident load. The frozen
     /// `startup_hints.non_interactive` keeps governing spawn-time structure
     /// (system prompt variant, user-message prefix, git-status mode).
-    pub(crate) attach_non_interactive: std::cell::Cell<bool>,
+    pub(crate) attach_non_interactive: std::rc::Rc<std::cell::Cell<bool>>,
     /// Verbatim mirror-fork override: when `Some`, every turn sends this exact
     /// parent tool schema instead of the locally-built toolset, keeping the
     /// child's request prefix byte-identical to the parent for radix cache reuse.
@@ -749,6 +873,12 @@ pub(crate) struct SessionActor {
     pub(crate) memory: super::memory_state::SessionMemory,
     /// Telemetry counters for session summary.
     pub(crate) session_start: std::time::Instant,
+    pub(crate) status_wake: status_line::StatusWake,
+    pub(crate) status_line_enabled: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) transient_turn_retries: bool,
+    pub(crate) transient_retries_prompt_total: std::cell::Cell<u32>,
+    pub(crate) transient_episode_start: std::cell::Cell<Option<tokio::time::Instant>>,
+    pub(crate) rate_limit_waits: rate_limit_waits::RateLimitWaitConfig,
     /// Per-chunk idle timeout for inference streaming. If no SSE chunk is received
     /// within this duration, the stream is aborted with a non-retryable error.
     /// Resolved at construction: per-model config.toml → remote settings → 300s default.
@@ -761,6 +891,7 @@ pub(crate) struct SessionActor {
     /// points in `process_conversation_turn`. Internally synchronized.
     pub(crate) pending_interjections: InterjectionBuffer<acp::ImageContent>,
     pub(crate) pending_native_agent_messages: Mutex<Vec<ConversationItem>>,
+    pub(crate) code_mode_hook_followups: std::cell::RefCell<Vec<ConversationItem>>,
     /// Skill-announcement reminders that arrived while a turn was running,
     /// flushed at the same safe points as `pending_interjections` plus on
     /// cancel/idle. The flush also delivers the plan tracker's buffered
@@ -953,8 +1084,7 @@ pub(crate) struct SessionActor {
         Arc<std::sync::Mutex<crate::session::tool_index::ToolMetadataSnapshot>>,
     /// Tracks which servers have been announced via system-reminder, for
     /// change detection. Maps server_name -> (tool_count, description_hash).
-    pub(crate) mcp_announced_servers:
-        Mutex<HashMap<String, xai_grok_tools::implementations::search_tool::ServerFingerprint>>,
+    pub(crate) mcp_announcements: Mutex<crate::session::announcement_state::McpAnnounced>,
     /// Controls whether MCP server reminders inject only changes (Delta)
     /// or the full server list (Full). Read from `MCP_REMINDER_MODE` env var.
     pub(crate) mcp_reminder_mode: McpReminderMode,
@@ -968,6 +1098,7 @@ pub(crate) struct SessionActor {
     pub(crate) mcp_handshakes_done: Arc<tokio::sync::Notify>,
     /// Background-computed user-message prefix, injected before the first prompt.
     pub(crate) deferred_prefix: TaskSlot<String>,
+    pub(crate) repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState,
     /// Extensions to notify at turn and session lifecycle edges. Built once by `session_extension_registry` at actor construction and frozen after.
     pub(crate) extension_registry: xai_agent_lifecycle::LocalExtensionRegistry,
     /// Local date last surfaced to the model, via the `<user_info>` prefix (session start,
@@ -1056,6 +1187,10 @@ pub(crate) struct SessionActor {
     /// Turn-summary gate, resolved once at spawn (env / config / remote
     /// settings — see `Config::resolve_turn_summary`).
     pub(crate) turn_summary_enabled: bool,
+    pub(crate) title_refresh_enabled: bool,
+    pub(crate) title_refresh_task: std::cell::RefCell<Option<tokio::task::JoinHandle<()>>>,
+    pub(crate) title_refresh_generation: std::cell::Cell<u64>,
+    pub(crate) next_title_refresh_idx: std::cell::Cell<usize>,
     /// True while THIS session has a prompt turn in flight (RAII-guarded in
     /// `handle_prompt`, like `tool_context.is_turn_active` — which is the
     /// agent-wide coordinator flag shared by all sessions and so unusable
@@ -1107,13 +1242,17 @@ pub(crate) struct SessionActor {
     /// response arrives; the drainer fires it the moment it processes the
     /// terminal `SamplingEvent::Completed` (every text/thought chunk has been
     /// `send_update`d by then). `None` between turns.
-    pub(crate) turn_stream_drained: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    pub(crate) turn_stream_drained: parking_lot::Mutex<
+        HashMap<xai_grok_sampler::RequestId, Option<tokio::sync::oneshot::Sender<()>>>,
+    >,
+    pub(crate) sampling_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// A server-confirmed image strip awaiting proof that the stripped retry
     /// helped: URLs buffered by request id on `ImagesStripped`, persisted to
     /// stored history only when that request's `Completed` arrives, dropped
     /// on `Failed`. See `acp_session_impl/image_strip.rs`.
     pub(crate) pending_image_strip:
-        parking_lot::Mutex<Option<(xai_grok_sampler::RequestId, Vec<std::sync::Arc<str>>)>>,
+        parking_lot::Mutex<HashMap<xai_grok_sampler::RequestId, PendingImageStrip>>,
+    pub(crate) image_strip_rewrite_barrier: ImageStripRewriteBarrier,
     /// Handle to the per-session `xai-grok-sampler` actor.
     ///
     /// Live sessions get a real handle from `spawn_session_actor`;
@@ -1260,6 +1399,8 @@ impl SessionActor {
     /// shares the slice across both calls (see
     /// `send_available_commands_update`).
     async fn command_availability(&self) -> slash_commands::CommandAvailability {
+        #[cfg(test)]
+        crate::session::slash_authority::record_command_availability_call();
         let tool_names = self.registered_tool_names().await;
         let has_workflow_runs = !self.workflow_tracker().await.lock().list().is_empty();
         let availability = self.build_command_availability(&tool_names, has_workflow_runs);
@@ -1268,6 +1409,14 @@ impl SessionActor {
         }
         self.maybe_reconcile_active_goal_without_plan().await;
         availability
+    }
+    async fn command_availability_for_skill_projection(
+        &self,
+    ) -> slash_commands::CommandAvailability {
+        #[cfg(test)]
+        crate::session::slash_authority::record_command_availability_call();
+        let tool_names = self.registered_tool_names().await;
+        self.build_local_command_availability(&tool_names)
     }
     /// Build the `CommandAvailability` snapshot from a precomputed slice
     /// of tool names plus the live session-scoped capability state.
@@ -1281,6 +1430,19 @@ impl SessionActor {
         tool_names: &[String],
         has_workflow_runs: bool,
     ) -> slash_commands::CommandAvailability {
+        let mut availability = self.build_local_command_availability(tool_names);
+        availability.goal = if self.goal_runs_on_workflow_engine() {
+            self.sync_goal_harness()
+        } else {
+            self.sync_goal_harness_from_tools(tool_names)
+        };
+        availability.workflow_management = has_workflow_runs;
+        availability
+    }
+    fn build_local_command_availability(
+        &self,
+        tool_names: &[String],
+    ) -> slash_commands::CommandAvailability {
         use xai_grok_tools::implementations::memory::{
             MEMORY_GET_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME,
         };
@@ -1288,9 +1450,9 @@ impl SessionActor {
             .iter()
             .any(|n| n == MEMORY_SEARCH_TOOL_NAME || n == MEMORY_GET_TOOL_NAME);
         let goal = if self.goal_runs_on_workflow_engine() {
-            self.sync_goal_harness()
+            self.goal_enabled
         } else {
-            self.sync_goal_harness_from_tools(tool_names)
+            goal_slash_and_harness_available(self.goal_enabled, tool_names)
         };
         slash_commands::CommandAvailability {
             feedback: self.feedback_manager.is_enabled(),
@@ -1305,7 +1467,7 @@ impl SessionActor {
             workflows: tool_names.iter().any(|n| {
                 n == xai_grok_tools::implementations::grok_build::workflow::WORKFLOW_TOOL_NAME
             }),
-            workflow_management: has_workflow_runs,
+            workflow_management: false,
         }
     }
     /// Names of every tool registered with the session's tool bridge.
@@ -1921,12 +2083,12 @@ mod tool_meta_stamp_tests {
                 tokio::task::spawn_local(async move {
                     while let Some(cmd) = perm_rx.recv().await {
                         if let PermissionCommand::Request {
-                            tool_call_update,
+                            request,
                             respond_to,
                             ..
                         } = cmd
                         {
-                            *captured_in_task.lock().await = Some(tool_call_update);
+                            *captured_in_task.lock().await = Some(request.tool_call_update);
                             let _ = respond_to.send(
                                 xai_grok_workspace::permission::PermissionResolution {
                                     decision: Decision::Allow,

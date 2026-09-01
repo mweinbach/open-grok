@@ -321,17 +321,16 @@ pub fn shared_client() -> reqwest::Client {
     CLIENT
         .get_or_init(|| {
             let _timer = startup_timer!("startup.http_client_build");
-            xai_grok_extra_ca::with_extra_root_certificates(
-                reqwest::Client::builder()
+            xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder
                     .connect_timeout(std::time::Duration::from_secs(30))
                     .user_agent(process_user_agent_string())
                     .pool_idle_timeout(std::time::Duration::from_secs(30))
                     .http2_keep_alive_interval(std::time::Duration::from_secs(20))
                     .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
                     .http2_keep_alive_while_idle(true)
-                    .tcp_keepalive(std::time::Duration::from_secs(30)),
-            )
-            .build()
+                    .tcp_keepalive(std::time::Duration::from_secs(30))
+            })
             .expect("failed to build shared HTTP client")
         })
         .clone()
@@ -365,8 +364,8 @@ pub fn shared_upload_client() -> reqwest::Client {
     static UPLOAD_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     UPLOAD_CLIENT
         .get_or_init(|| {
-            xai_grok_extra_ca::with_extra_root_certificates(
-                reqwest::Client::builder()
+            xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder
                     // Force HTTP/1.1: batch_upload multipart bodies are silently
                     // dropped when an HTTP/2 connection degrades (GOAWAY, flow-control
                     // exhaustion). Because all streams share one connection, a single
@@ -376,9 +375,8 @@ pub fn shared_upload_client() -> reqwest::Client {
                     .http1_only()
                     .pool_max_idle_per_host(2)
                     .pool_idle_timeout(std::time::Duration::from_secs(10))
-                    .user_agent(process_user_agent_string()),
-            )
-            .build()
+                    .user_agent(process_user_agent_string())
+            })
             .expect("failed to build shared upload HTTP client")
         })
         .clone()
@@ -392,13 +390,12 @@ pub fn shared_upload_client() -> reqwest::Client {
 /// Fallible: build can fail under fd/TLS pressure; the caller must not
 /// panic on error (fallback policy lives at the call site).
 pub(crate) fn fresh_http1_client() -> reqwest::Result<reqwest::Client> {
-    xai_grok_extra_ca::with_extra_root_certificates(
-        reqwest::Client::builder()
+    xai_grok_extra_ca::build_reqwest_client(|builder| {
+        builder
             .http1_only()
             .pool_max_idle_per_host(0)
-            .user_agent(process_user_agent_string()),
-    )
-    .build()
+            .user_agent(process_user_agent_string())
+    })
 }
 
 /// Joins an error's `source()` chain into one string. A `reqwest::Error`'s `Display`
@@ -455,6 +452,8 @@ pub enum TransportFailureKind {
     /// The connection could never be established (`is_connect`): the server is
     /// down or genuinely unreachable. Retrying the same target rarely helps soon.
     Unreachable,
+    CertificateUntrusted,
+    CertificateInvalid,
     /// An established request was cut short — a per-request timeout, an in-flight
     /// reset/close/GOAWAY, or a body-phase drop. Retryable: a fresh connection
     /// can succeed.
@@ -476,17 +475,58 @@ pub struct TransportFailure {
 impl TransportFailure {
     /// Classify a `reqwest` request/send error. `is_connect()` MUST be checked first:
     /// in reqwest 0.12 a connect failure is also `Kind::Request`.
-    pub fn classify(e: &reqwest::Error) -> Self {
-        let detail = error_cause_chain(e);
-        let kind = if e.is_connect() {
-            TransportFailureKind::Unreachable
-        } else if e.is_timeout() || e.is_request() || e.is_body() {
-            TransportFailureKind::Interrupted
-        } else {
-            TransportFailureKind::Permanent
-        };
-        Self { kind, detail }
+    pub fn classify(error: &reqwest::Error) -> Self {
+        Self {
+            kind: transport_kind(
+                certificate_error(error),
+                error.is_connect(),
+                error.is_timeout() || error.is_request() || error.is_body(),
+            ),
+            detail: error_cause_chain(error),
+        }
     }
+}
+
+fn transport_kind(
+    certificate: Option<CertVerdict>,
+    is_connect: bool,
+    is_interrupted: bool,
+) -> TransportFailureKind {
+    match certificate {
+        Some(CertVerdict::UntrustedIssuer) => TransportFailureKind::CertificateUntrusted,
+        Some(CertVerdict::Other) => TransportFailureKind::CertificateInvalid,
+        None if is_connect => TransportFailureKind::Unreachable,
+        None if is_interrupted => TransportFailureKind::Interrupted,
+        None => TransportFailureKind::Permanent,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CertVerdict {
+    UntrustedIssuer,
+    Other,
+}
+
+fn certificate_error(error: &(dyn std::error::Error + 'static)) -> Option<CertVerdict> {
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        if let Some(rustls::Error::InvalidCertificate(certificate)) =
+            cause.downcast_ref::<rustls::Error>()
+        {
+            return Some(match certificate {
+                rustls::CertificateError::UnknownIssuer => CertVerdict::UntrustedIssuer,
+                _ => CertVerdict::Other,
+            });
+        }
+        current = match cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            Some(payload) => Some(payload as &(dyn std::error::Error + 'static)),
+            None => cause.source(),
+        };
+    }
+    None
 }
 
 /// Run `op` with bounded retries, swapping to a fresh pool-less client for the final attempt.
@@ -584,15 +624,14 @@ pub fn shared_startup_blocking_client() -> reqwest::blocking::Client {
     BLOCKING_CLIENT
         .get_or_init(|| {
             let _timer = startup_timer!("startup.http_blocking_client_build");
-            xai_grok_extra_ca::with_extra_root_certificates_blocking(
-                reqwest::blocking::Client::builder()
+            xai_grok_extra_ca::build_blocking_reqwest_client(|builder| {
+                builder
                     .connect_timeout(STARTUP_FETCH_TIMEOUT)
                     .timeout(STARTUP_FETCH_TIMEOUT)
                     .user_agent(process_user_agent_string())
                     .pool_idle_timeout(std::time::Duration::from_secs(30))
-                    .tcp_keepalive(std::time::Duration::from_secs(30)),
-            )
-            .build()
+                    .tcp_keepalive(std::time::Duration::from_secs(30))
+            })
             .expect("failed to build shared blocking HTTP client")
         })
         .clone()
@@ -601,6 +640,49 @@ pub fn shared_startup_blocking_client() -> reqwest::blocking::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_failures_take_precedence_over_connect_and_request_errors() {
+        assert_eq!(
+            transport_kind(Some(CertVerdict::UntrustedIssuer), true, true),
+            TransportFailureKind::CertificateUntrusted
+        );
+        assert_eq!(
+            transport_kind(Some(CertVerdict::Other), true, true),
+            TransportFailureKind::CertificateInvalid
+        );
+        assert_eq!(
+            transport_kind(None, true, true),
+            TransportFailureKind::Unreachable
+        );
+        assert_eq!(
+            transport_kind(None, false, true),
+            TransportFailureKind::Interrupted
+        );
+        assert_eq!(
+            transport_kind(None, false, false),
+            TransportFailureKind::Permanent
+        );
+    }
+
+    #[test]
+    fn certificate_classifier_descends_into_io_payloads() {
+        let unknown_issuer = std::io::Error::other(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ));
+        assert_eq!(
+            certificate_error(&unknown_issuer),
+            Some(CertVerdict::UntrustedIssuer)
+        );
+        let expired = std::io::Error::other(std::io::Error::other(
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+        ));
+        assert_eq!(certificate_error(&expired), Some(CertVerdict::Other));
+        assert_eq!(
+            certificate_error(&std::io::Error::other("unknown issuer")),
+            None
+        );
+    }
 
     #[test]
     fn find_os_error_code_walks_source_chain() {

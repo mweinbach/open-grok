@@ -11,6 +11,10 @@ pub(crate) fn grok_home() -> PathBuf {
     xai_grok_config::grok_home()
 }
 
+pub(crate) fn sandbox_events_log_path() -> PathBuf {
+    grok_home().join("sessions").join("sandbox-events.jsonl")
+}
+
 // ── Device files & directories ──────────────────────────────────────────────
 
 /// Device files that need write access for normal tool operation.
@@ -82,8 +86,14 @@ pub(crate) fn essential_writable_paths(workspace: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Writable directory paths for the read-only profile (minimal: just ~/.opengrok + temp).
+/// Writable directory paths for strict confinement (workspace, sessions, and temp).
 /// Device files are handled separately via `allow_file` in `to_capability_set_with_config`.
+pub(crate) fn essential_writable_paths_strict(workspace: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![workspace.to_path_buf(), grok_home().join("sessions")];
+    paths.extend(temp_writable_paths());
+    paths
+}
+/// Writable directory paths for the read-only profile (Open Grok home and temp).
 pub(crate) fn essential_writable_paths_minimal() -> Vec<PathBuf> {
     let mut paths = vec![grok_home()];
     paths.extend(temp_writable_paths());

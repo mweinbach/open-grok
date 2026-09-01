@@ -2,6 +2,72 @@
     use super::*;
 
     #[test]
+    fn elicitation_completion_requires_exact_root_and_server() {
+        use crate::views::elicitation_view::ElicitationViewState;
+        use xai_grok_tools::mcp_elicitation::{McpElicitExtRequest, McpElicitExtResponse};
+        let mut app = make_app_with_agent("parent-session");
+        let request: McpElicitExtRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "parent-session",
+            "toolCallId": "elicit-call",
+            "serverName": "owner-server",
+            "message": "Authenticate",
+            "mode": "url",
+            "url": "https://example.com/login",
+            "elicitationId": "shared-id"
+        })).unwrap();
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let mut state = ElicitationViewState::from_request(request, None, Some(response_tx));
+        assert!(state.send_response(McpElicitExtResponse::Accept { content: None }));
+        state.begin_url_waiting();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.elicitation_view = Some(state);
+        agent.subagent_views.insert(
+            "child-session".into(),
+            Box::new(crate::app::agent_view::test_fixtures::make_agent()),
+        );
+        for (session, server, expected) in [
+            ("child-session", "owner-server", false),
+            ("other-session", "owner-server", false),
+            ("parent-session", "other-server", false),
+            ("parent-session", "owner-server", true),
+        ] {
+            let params = serde_json::value::to_raw_value(&serde_json::json!({
+                "sessionId": session,
+                "elicitationId": "shared-id",
+                "serverName": server,
+            })).unwrap();
+            let notification = acp::ExtNotification::new("x.ai/mcp/elicit_complete", params.into());
+            assert_eq!(handle_mcp_elicit_complete(&notification, &mut app), expected);
+        }
+        assert!(app.agents[&AgentId(0)].elicitation_view.is_none());
+    }
+
+    #[test]
+    fn child_elicitation_request_cannot_open_parent_card() {
+        let mut app = make_app_with_agent("parent-session");
+        app.agents.get_mut(&AgentId(0)).unwrap().subagent_views.insert(
+            "child-session".into(),
+            Box::new(crate::app::agent_view::test_fixtures::make_agent()),
+        );
+        let params = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "child-session",
+            "toolCallId": "child-elicit",
+            "serverName": "server",
+            "message": "Confirm",
+            "mode": "url",
+            "url": "https://example.com/login",
+            "elicitationId": "child-id",
+        })).unwrap();
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        assert!(!handle_mcp_elicit(xai_acp_lib::AcpArgs {
+            request: acp::ExtRequest::new("x.ai/mcp/elicit", params.into()),
+            response_tx,
+        }, &mut app));
+        assert!(app.agents[&AgentId(0)].elicitation_view.is_none());
+        assert!(response_rx.try_recv().is_ok());
+    }
+
+    #[test]
     fn interaction_resolved_dismisses_matching_permission() {
         // A peer answered a shared permission → this pane retracts its copy.
         let mut app = make_app_with_agent("sess-1");
@@ -148,6 +214,377 @@
         assert!(
             rx.try_recv().is_err(),
             "response must NOT be sent yet (parked, waiting for user)"
+        );
+    }
+
+    #[test]
+    fn mcp_elicit_opens_elicitation_view_and_parks_response() {
+        let mut app = make_app_with_agent("sess-A");
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let raw = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "sess-A",
+            "toolCallId": "mcp-elicit-1",
+            "serverName": "demo-mcp",
+            "message": "Need your email",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "email": { "type": "string", "format": "email" }
+                },
+                "required": ["email"]
+            }
+        }))
+        .unwrap();
+        let msg = AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+            request: acp::ExtRequest::new("x.ai/mcp/elicit", raw.into()),
+            response_tx: tx,
+        });
+
+        let affected = handle(msg, &mut app);
+        assert!(affected, "active session elicitation should request redraw");
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let ev = agent
+            .elicitation_view
+            .as_ref()
+            .expect("elicitation_view open");
+        assert_eq!(ev.server_name, "demo-mcp");
+        assert_eq!(ev.tool_call_id, "mcp-elicit-1");
+        assert!(
+            rx.try_recv().is_err(),
+            "response must wait for user Accept/Decline/Cancel"
+        );
+    }
+
+    #[test]
+    fn mcp_elicit_does_not_replace_url_waiting() {
+        let mut app = make_app_with_agent("sess-A");
+        let (tx1, mut rx1) = tokio::sync::oneshot::channel();
+        let raw1 = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "sess-A",
+            "toolCallId": "mcp-elicit-url",
+            "serverName": "demo-mcp",
+            "message": "Open login",
+            "mode": "url",
+            "url": "https://example.com/login",
+            "elicitationId": "eid-1"
+        }))
+        .unwrap();
+        handle(
+            AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+                request: acp::ExtRequest::new("x.ai/mcp/elicit", raw1.into()),
+                response_tx: tx1,
+            }),
+            &mut app,
+        );
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            let ev = agent.elicitation_view.as_mut().unwrap();
+            assert!(ev.send_response(
+                xai_grok_tools::mcp_elicitation::McpElicitExtResponse::Accept { content: None },
+            ));
+            ev.begin_url_waiting();
+        }
+        assert!(rx1.try_recv().is_ok(), "URL accept must send ACP immediately");
+
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        let raw2 = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "sess-A",
+            "toolCallId": "mcp-elicit-form",
+            "serverName": "demo-mcp",
+            "message": "Need email",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "email": { "type": "string" } }
+            }
+        }))
+        .unwrap();
+        handle(
+            AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+                request: acp::ExtRequest::new("x.ai/mcp/elicit", raw2.into()),
+                response_tx: tx2,
+            }),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let ev = agent.elicitation_view.as_ref().unwrap();
+        assert!(ev.is_url_waiting());
+        assert_eq!(ev.elicitation_id(), Some("eid-1"));
+        assert!(agent.pending_elicitation.is_some());
+        assert!(
+            rx2.try_recv().is_err(),
+            "the next elicit must wait until Waiting chrome is dismissed"
+        );
+
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        assert!(agent.dismiss_waiting_elicitation("eid-1", None));
+        let ev = agent.elicitation_view.as_ref().expect("parked form shown");
+        assert!(ev.form().is_some(), "promoted card is the parked form");
+        assert_eq!(ev.tool_call_id, "mcp-elicit-form");
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[test]
+    fn peer_resolved_elicitation_hands_draft_to_open_question() {
+        use crate::views::question_view::QuestionViewState;
+
+        let mut app = make_app_with_agent("sess-A");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.prompt.set_text("my precious draft");
+        }
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let raw = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "sess-A",
+            "toolCallId": "mcp-elicit-1",
+            "serverName": "demo-mcp",
+            "message": "Need your email",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "email": { "type": "string" } }
+            }
+        }))
+        .unwrap();
+        handle(
+            AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+                request: acp::ExtRequest::new("x.ai/mcp/elicit", raw.into()),
+                response_tx: tx,
+            }),
+            &mut app,
+        );
+
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            assert_eq!(agent.prompt.text(), "", "elicitation displaced the draft");
+            let stashed = agent.prompt.stash();
+            agent.prompt.set_text("");
+            agent.question_view = Some(QuestionViewState::new("call-q".into(), vec![], stashed));
+        }
+
+        handle_session_notification(&interaction_resolved_ext("sess-A", "mcp-elicit-1"), &mut app);
+        assert!(app.agents[&AgentId(0)].elicitation_view.is_none());
+        assert_eq!(
+            app.agents[&AgentId(0)].prompt.text(),
+            "",
+            "the question still owns the composer; the draft must not write through"
+        );
+
+        handle_session_notification(&interaction_resolved_ext("sess-A", "call-q"), &mut app);
+        assert_eq!(
+            app.agents[&AgentId(0)].prompt.text(),
+            "my precious draft",
+            "the question's close must restore the elicitation's session draft"
+        );
+    }
+
+    #[test]
+    fn elicitation_over_open_question_does_not_wipe_stashed_draft() {
+        use crate::views::question_view::QuestionViewState;
+
+        let mut app = make_app_with_agent("sess-A");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.prompt.set_text("my precious draft");
+            let stashed = agent.prompt.stash();
+            agent.prompt.set_text("");
+            agent.question_view =
+                Some(QuestionViewState::new("call-q".into(), vec![], stashed));
+        }
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let raw = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "sess-A",
+            "toolCallId": "mcp-elicit-1",
+            "serverName": "demo-mcp",
+            "message": "Need your email",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "email": { "type": "string" } }
+            }
+        }))
+        .unwrap();
+        handle(
+            AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+                request: acp::ExtRequest::new("x.ai/mcp/elicit", raw.into()),
+                response_tx: tx,
+            }),
+            &mut app,
+        );
+        {
+            let agent = app.agents.get(&AgentId(0)).unwrap();
+            let ev = agent.elicitation_view.as_ref().expect("elicitation open");
+            assert!(
+                ev.stashed_prompt.is_none(),
+                "the question already owns the draft; the elicitation must not stash the blank composer"
+            );
+        }
+
+        handle_session_notification(&interaction_resolved_ext("sess-A", "call-q"), &mut app);
+        assert_eq!(
+            app.agents[&AgentId(0)].prompt.text(),
+            "my precious draft",
+            "question close must put the draft back"
+        );
+
+        handle_session_notification(&interaction_resolved_ext("sess-A", "mcp-elicit-1"), &mut app);
+        assert!(app.agents[&AgentId(0)].elicitation_view.is_none());
+        assert_eq!(
+            app.agents[&AgentId(0)].prompt.text(),
+            "my precious draft",
+            "elicitation close must not restore an empty stash over the draft"
+        );
+    }
+
+    #[test]
+    fn parked_elicit_is_dropped_when_peer_resolves_it() {
+        let mut app = make_app_with_agent("sess-A");
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let raw1 = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "sess-A",
+            "toolCallId": "mcp-elicit-url",
+            "serverName": "demo-mcp",
+            "message": "Open login",
+            "mode": "url",
+            "url": "https://example.com/login",
+            "elicitationId": "eid-1"
+        }))
+        .unwrap();
+        handle(
+            AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+                request: acp::ExtRequest::new("x.ai/mcp/elicit", raw1.into()),
+                response_tx: tx1,
+            }),
+            &mut app,
+        );
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            let ev = agent.elicitation_view.as_mut().unwrap();
+            assert!(ev.send_response(
+                xai_grok_tools::mcp_elicitation::McpElicitExtResponse::Accept { content: None },
+            ));
+            ev.begin_url_waiting();
+        }
+
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        let raw2 = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "sess-A",
+            "toolCallId": "mcp-elicit-form",
+            "serverName": "demo-mcp",
+            "message": "Need email",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "email": { "type": "string" } }
+            }
+        }))
+        .unwrap();
+        handle(
+            AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+                request: acp::ExtRequest::new("x.ai/mcp/elicit", raw2.into()),
+                response_tx: tx2,
+            }),
+            &mut app,
+        );
+        assert!(app.agents[&AgentId(0)].pending_elicitation.is_some());
+
+        let changed = handle_session_notification(
+            &interaction_resolved_ext("sess-A", "mcp-elicit-form"),
+            &mut app,
+        );
+        assert!(changed);
+        assert!(
+            app.agents[&AgentId(0)].pending_elicitation.is_none(),
+            "peer resolve must drop the parked form"
+        );
+        match rx2.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+            other => panic!("parked oneshot must be dropped, got {other:?}"),
+        }
+
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        assert!(agent.dismiss_waiting_elicitation("eid-1", None));
+        assert!(
+            agent.elicitation_view.is_none(),
+            "must not promote a peer-resolved parked form"
+        );
+    }
+
+    #[test]
+    fn elicit_complete_requires_matching_server_name() {
+        let mut app = make_app_with_agent("sess-A");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let raw = serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": "sess-A",
+            "toolCallId": "mcp-elicit-url",
+            "serverName": "demo-mcp",
+            "message": "Open login",
+            "mode": "url",
+            "url": "https://example.com/login",
+            "elicitationId": "eid-1"
+        }))
+        .unwrap();
+        handle(
+            AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+                request: acp::ExtRequest::new("x.ai/mcp/elicit", raw.into()),
+                response_tx: tx,
+            }),
+            &mut app,
+        );
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            let ev = agent.elicitation_view.as_mut().unwrap();
+            assert!(ev.send_response(
+                xai_grok_tools::mcp_elicitation::McpElicitExtResponse::Accept { content: None },
+            ));
+            ev.begin_url_waiting();
+        }
+
+        let complete = |server_name: &str| {
+            serde_json::value::to_raw_value(&serde_json::json!({
+                "sessionId": "sess-A",
+                "elicitationId": "eid-1",
+                "serverName": server_name,
+            }))
+            .unwrap()
+        };
+
+        let (tx_bad, _rx_bad) = tokio::sync::oneshot::channel();
+        let changed = handle(
+            AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+                request: acp::ExtNotification::new(
+                    "x.ai/mcp/elicit_complete",
+                    complete("evil-mcp").into(),
+                ),
+                response_tx: tx_bad,
+            }),
+            &mut app,
+        );
+        assert!(!changed);
+        assert!(
+            app.agents[&AgentId(0)].elicitation_view.is_some(),
+            "a mismatched serverName must not dismiss the waiting card"
+        );
+
+        let (tx_ok, _rx_ok) = tokio::sync::oneshot::channel();
+        let changed = handle(
+            AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+                request: acp::ExtNotification::new(
+                    "x.ai/mcp/elicit_complete",
+                    complete("demo-mcp").into(),
+                ),
+                response_tx: tx_ok,
+            }),
+            &mut app,
+        );
+        assert!(changed);
+        assert!(
+            app.agents[&AgentId(0)].elicitation_view.is_none(),
+            "the matching serverName must dismiss the waiting card"
         );
     }
 
@@ -549,4 +986,3 @@
             "session draft must retain its own image payload"
         );
     }
-

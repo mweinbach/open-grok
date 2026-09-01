@@ -10,8 +10,7 @@
 use std::path::Path;
 
 use crate::permission::manager::reasons;
-use crate::permission::policy::{CompiledPolicy, GateDecision};
-use crate::permission::shell_access::combine_decisions;
+use crate::permission::policy::{CompiledPolicy, GateDecision, combine_decisions};
 use crate::permission::types::{AccessKind, Decision};
 
 /// One request's managed-policy evaluation, computed before any fast path.
@@ -22,6 +21,7 @@ pub(crate) struct GatePreflight {
     /// Auto mode + a fail-closed gate Ask with no rule match: the classifier
     /// may run (Allow executes, Block denies within budget). A rule-match Ask
     /// never defers.
+    native_symlink_fail_closed: bool,
     defers_gate_ask: bool,
 }
 
@@ -34,7 +34,10 @@ impl GatePreflight {
         cwd: &Path,
         auto_mode: bool,
     ) -> Self {
-        let direct = policy.and_then(|policy| policy.evaluate_with_cwd(access, Some(cwd)));
+        let (direct, native_symlink_fail_closed) = match policy {
+            Some(policy) => policy.evaluate_with_cwd_details(access, Some(cwd)),
+            None => (None, false),
+        };
         let (bash_command, shell_file) = match (policy, access) {
             (Some(policy), AccessKind::Bash(cmd)) => (
                 policy.evaluate_bash_command_gate(cmd),
@@ -55,6 +58,7 @@ impl GatePreflight {
             direct,
             bash_command,
             shell_file,
+            native_symlink_fail_closed,
             defers_gate_ask,
         }
     }
@@ -78,6 +82,7 @@ impl GatePreflight {
     pub(crate) fn shell_forced_prompt(&self) -> bool {
         self.bash_command.as_ref().is_some_and(GateDecision::is_ask)
             || self.shell_file_forced_prompt()
+            || self.native_symlink_fail_closed
     }
 
     /// Blocks bash grants from satisfying a Read/Edit ask escalated from
@@ -195,5 +200,55 @@ mod tests {
         assert!(inert.admits_auto_classifier());
         assert!(!inert.defers_gate_ask());
         assert_eq!(inert.prompt_trigger(None), None);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn native_unresolvable_symlink_forces_shell_prompt() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        symlink(ws.path().join("b"), ws.path().join("a")).unwrap();
+        symlink(ws.path().join("a"), ws.path().join("b")).unwrap();
+
+        let restricted = CompiledPolicy::new(PermissionConfig::new(vec![PermissionRule {
+            action: RuleAction::Deny,
+            tool: ToolFilter::Edit,
+            pattern: Some("**/unrelated/**".into()),
+            pattern_mode: PatternMode::Glob,
+        }]));
+        let access = AccessKind::Edit("a".into());
+        let preflight = GatePreflight::evaluate(Some(&restricted), &access, ws.path(), false);
+        assert!(
+            matches!(preflight.policy_decision(), Some(Decision::Ask)),
+            "expected Ask for unresolvable native symlink"
+        );
+        assert!(
+            preflight.shell_forced_prompt(),
+            "expected shell_forced_prompt for YOLO"
+        );
+        assert_eq!(preflight.prompt_trigger(None), Some(reasons::POLICY_ASK));
+
+        let grep_only = CompiledPolicy::new(PermissionConfig::new(vec![PermissionRule {
+            action: RuleAction::Deny,
+            tool: ToolFilter::Grep,
+            pattern: Some("**/unrelated/**".into()),
+            pattern_mode: PatternMode::Glob,
+        }]));
+        let grep_access = AccessKind::Grep {
+            path: Some("a".into()),
+            glob: None,
+        };
+        let grep_preflight =
+            GatePreflight::evaluate(Some(&grep_only), &grep_access, ws.path(), false);
+        assert!(matches!(
+            grep_preflight.policy_decision(),
+            Some(Decision::Ask)
+        ));
+        assert!(grep_preflight.shell_forced_prompt());
+
+        let open = CompiledPolicy::new(PermissionConfig::new(vec![]));
+        let open_preflight = GatePreflight::evaluate(Some(&open), &access, ws.path(), false);
+        assert!(open_preflight.policy_decision().is_none());
+        assert!(!open_preflight.shell_forced_prompt());
     }
 }

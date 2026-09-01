@@ -65,7 +65,9 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
-        combine_edit_holds: std::collections::HashSet::new(),
+        edit_holds: std::collections::HashMap::new(),
+        finalization_gate: Default::default(),
+        hook_block_hold: Default::default(),
         pending_notifications: Vec::new(),
         lifecycle_mutation: None,
         pending_web_search_reload: None,
@@ -98,7 +100,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
         mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
         delivery_tools: std::cell::RefCell::new(Vec::new()),
-        attach_non_interactive: std::cell::Cell::new(false),
+        attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -226,7 +228,15 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         managed_mcp_handle: Default::default(),
         initial_client_mcp_servers: vec![],
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-        mcp_announced_servers: Mutex::new(HashMap::new()),
+        mcp_announcements: Default::default(),
+        status_wake: Default::default(),
+        status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        transient_turn_retries: false,
+        transient_retries_prompt_total: Default::default(),
+        transient_episode_start: Default::default(),
+        rate_limit_waits: Default::default(),
+        code_mode_hook_followups: Default::default(),
+        sampling_gate: None,
         mcp_reminder_mode: McpReminderMode::Delta,
         mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -234,6 +244,8 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         user_input_generation: std::sync::atomic::AtomicU64::new(0),
         laziness_debug_log: None,
         deferred_prefix: TaskSlot::new(),
+        repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(
+        ),
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
         last_announced_user_info_hash: std::cell::Cell::new(None),
@@ -261,10 +273,15 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         turn_summary_task: std::cell::RefCell::new(None),
         turn_summary_generation: std::cell::Cell::new(0),
         turn_summary_enabled: false,
+        title_refresh_enabled: false,
+        title_refresh_task: std::cell::RefCell::new(None),
+        title_refresh_generation: std::cell::Cell::new(0),
+        next_title_refresh_idx: std::cell::Cell::new(0),
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
-        turn_stream_drained: parking_lot::Mutex::new(None),
-        pending_image_strip: parking_lot::Mutex::new(None),
+        turn_stream_drained: parking_lot::Mutex::new(Default::default()),
+        pending_image_strip: parking_lot::Mutex::new(Default::default()),
+        image_strip_rewrite_barrier: Default::default(),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -511,6 +528,7 @@ async fn channel_tokens_accumulate_into_streaming_capture() {
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-stream-1".to_string());
             actor.current_turn_number.set(7);
             let req = RequestId::random();
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -584,6 +602,7 @@ async fn same_prompt_restart_accumulates_segments_via_handler() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-doomloop".to_string());
             let req = RequestId::random();
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -598,6 +617,7 @@ async fn same_prompt_restart_accumulates_segments_via_handler() {
                     chunk_index: 0,
                 })
                 .await;
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -648,6 +668,7 @@ async fn completed_event_clears_slot_keeps_prior_uncommitted_segments() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-completed".to_string());
             let req = RequestId::random();
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -662,6 +683,7 @@ async fn completed_event_clears_slot_keeps_prior_uncommitted_segments() {
                     chunk_index: 0,
                 })
                 .await;
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -734,8 +756,12 @@ async fn completed_event_releases_stream_drain_barrier() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-barrier".to_string());
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            *actor.turn_stream_drained.lock() = Some(tx);
             let req = RequestId::random();
+            actor
+                .turn_stream_drained
+                .lock()
+                .insert(req.clone(), Some(tx));
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -751,7 +777,7 @@ async fn completed_event_releases_stream_drain_barrier() {
                 })
                 .await;
             assert!(
-                actor.turn_stream_drained.lock().is_some(),
+                !actor.turn_stream_drained.lock().is_empty(),
                 "a mid-stream text chunk must NOT release the stream-drain barrier"
             );
             actor
@@ -773,7 +799,7 @@ async fn completed_event_releases_stream_drain_barrier() {
                 })
                 .await;
             assert!(
-                actor.turn_stream_drained.lock().is_none(),
+                actor.turn_stream_drained.lock().is_empty(),
                 "Completed must take the stream-drain barrier sender"
             );
             assert!(
@@ -803,6 +829,7 @@ async fn failed_event_preserves_streaming_capture_for_takeout() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-failed".to_string());
             let req = RequestId::random();
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -878,6 +905,7 @@ async fn observe_only_confident_completion_stays_warn_only() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-observe".to_string());
             let req = RequestId::random();
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -956,6 +984,7 @@ async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-doom".to_string());
             let req = RequestId::random();
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -981,6 +1010,7 @@ async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
                     doom_loop_aborted_at_chunk: Some(421),
                 })
                 .await;
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -1076,6 +1106,7 @@ async fn tool_call_delta_marks_streaming_capture_phase() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-toolcall".to_string());
             let req = RequestId::random();
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -1206,6 +1237,7 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-doomloop".to_string());
             let req = RequestId::random();
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -1220,6 +1252,7 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                     chunk_index: 0,
                 })
                 .await;
+            own_request(&actor, &req);
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -1303,6 +1336,429 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
             assert_eq!(capture.segments[0].reasoning_text, "thinking attempt 1");
             assert_eq!(capture.segments[1].reasoning_text, "thinking attempt 2");
             assert_eq!(capture.empty_reason.as_deref(), Some("reasoning_only"));
+        })
+        .await;
+}
+
+fn own_request(actor: &SessionActor, request_id: &xai_grok_sampler::RequestId) {
+    actor
+        .turn_stream_drained
+        .lock()
+        .entry(request_id.clone())
+        .or_insert(None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completed_event_releases_stream_drain_barrier_and_timeout_keeps_request_ownership() {
+    use xai_grok_sampler::{InferenceLatencyStats, RequestId, SamplingChannel, SamplingEvent};
+    use xai_grok_sampling_types::{ConversationItem, ConversationResponse};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut fixture = make_replay_send_update_fixture().await;
+            let actor = Arc::new(fixture.actor);
+
+            *actor
+                .current_prompt_id
+                .lock()
+                .expect("current_prompt_id mutex poisoned") = Some("prompt-barrier".to_string());
+
+            let req = RequestId::random();
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            actor
+                .turn_stream_drained
+                .lock()
+                .insert(req.clone(), Some(tx));
+
+            actor
+                .handle_sampling_event(SamplingEvent::StreamStarted {
+                    request_id: req.clone(),
+                    timestamp_ms: 0,
+                })
+                .await;
+
+            actor
+                .handle_sampling_event(SamplingEvent::ChannelToken {
+                    request_id: req.clone(),
+                    channel: SamplingChannel::Text,
+                    text: "the scrollback blo".to_string(),
+                    chunk_index: 0,
+                })
+                .await;
+            assert!(
+                actor.turn_stream_drained.lock().contains_key(&req),
+                "a mid-stream text chunk must NOT release the stream-drain barrier"
+            );
+
+            actor
+                .handle_sampling_event(SamplingEvent::Completed {
+                    request_id: RequestId::random(),
+                    response: Box::new(ConversationResponse {
+                        items: vec![ConversationItem::assistant("unrelated".to_string())],
+                        usage: None,
+                        stop_reason: None,
+                        cost_usd_ticks: None,
+                        message_chunks_emitted: 1,
+                        doom_loop_signals: Vec::new(),
+                        stop_message: None,
+                        message_id: None,
+                        raw_stop_reason: None,
+                        stop_sequence: None,
+                    }),
+                    metrics: InferenceLatencyStats::default(),
+                })
+                .await;
+            assert!(
+                actor.turn_stream_drained.lock().contains_key(&req),
+                "a different request must not release the active turn barrier"
+            );
+            assert_eq!(
+                "the scrollback blo",
+                actor.streaming_turn_capture.lock().response_text,
+                "a different request must not clear the active capture"
+            );
+
+            actor
+                .handle_sampling_event(SamplingEvent::Completed {
+                    request_id: req.clone(),
+                    response: Box::new(ConversationResponse {
+                        items: vec![ConversationItem::assistant("blocks".to_string())],
+                        usage: None,
+                        stop_reason: None,
+                        cost_usd_ticks: None,
+                        message_chunks_emitted: 1,
+                        doom_loop_signals: Vec::new(),
+                        stop_message: None,
+                        message_id: None,
+                        raw_stop_reason: None,
+                        stop_sequence: None,
+                    }),
+                    metrics: InferenceLatencyStats::default(),
+                })
+                .await;
+
+            assert!(
+                !actor.turn_stream_drained.lock().contains_key(&req),
+                "Completed must take the stream-drain barrier sender"
+            );
+            assert!(
+                rx.await.is_ok(),
+                "Completed must fire the stream-drain barrier so \
+                 run_turn_via_sampler can proceed to emit tool calls in order"
+            );
+
+            let late_req = RequestId::random();
+            let (late_tx, late_rx) = tokio::sync::oneshot::channel::<()>();
+            actor
+                .turn_stream_drained
+                .lock()
+                .insert(late_req.clone(), Some(late_tx));
+            actor
+                .handle_sampling_event(SamplingEvent::StreamStarted {
+                    request_id: late_req.clone(),
+                    timestamp_ms: 2,
+                })
+                .await;
+            actor
+                .handle_sampling_event(SamplingEvent::ChannelToken {
+                    request_id: late_req.clone(),
+                    channel: SamplingChannel::Reasoning,
+                    text: "committed request reasoning".to_string(),
+                    chunk_index: 0,
+                })
+                .await;
+            actor
+                .turn_stream_drained
+                .lock()
+                .get_mut(&late_req)
+                .expect("late request remains owned")
+                .take();
+            assert!(late_rx.await.is_err(), "the ordering waiter was dropped");
+            assert!(
+                actor.turn_stream_drained.lock().contains_key(&late_req),
+                "timeout must retain terminal request ownership"
+            );
+            while fixture.event_rx.try_recv().is_ok() {}
+
+            actor
+                .handle_sampling_event(SamplingEvent::ChannelToken {
+                    request_id: late_req.clone(),
+                    channel: SamplingChannel::Reasoning,
+                    text: " queued after timeout".to_string(),
+                    chunk_index: 1,
+                })
+                .await;
+            actor
+                .handle_sampling_event(SamplingEvent::Retrying {
+                    request_id: late_req.clone(),
+                    attempt: 1,
+                    max_retries: 2,
+                    kind: xai_grok_sampler::SamplingErrorKind::DoomLoopDetected,
+                    reason: "queued retry after timeout".to_string(),
+                    doom_loop_triggers: Some(vec!["tail_repetition:8@thinking".to_string()]),
+                    doom_loop_aborted_at_chunk: Some(42),
+                })
+                .await;
+            assert_eq!(
+                actor.streaming_turn_capture.lock().reasoning_text,
+                "committed request reasoning queued after timeout",
+                "timeout must retain queued chunks for the owned request"
+            );
+            assert_eq!(
+                1,
+                actor.doom_loop_turn_tally.lock().attempts,
+                "timeout must retain queued retry metadata for the owned request"
+            );
+            tokio::task::yield_now().await;
+            let event = fixture
+                .event_rx
+                .try_recv()
+                .expect("timeout-owned chunk must enter the client event queue");
+            assert!(matches!(
+                event,
+                SessionEvent::Notification(SessionNotification::Acp(notification))
+                    if matches!(notification.update, acp::SessionUpdate::AgentThoughtChunk(_))
+            ));
+
+            let newer_req = RequestId::random();
+            let (newer_tx, _newer_rx) = tokio::sync::oneshot::channel::<()>();
+            actor
+                .turn_stream_drained
+                .lock()
+                .insert(newer_req.clone(), Some(newer_tx));
+            actor
+                .handle_sampling_event(SamplingEvent::StreamStarted {
+                    request_id: newer_req.clone(),
+                    timestamp_ms: 3,
+                })
+                .await;
+            actor
+                .handle_sampling_event(SamplingEvent::ChannelToken {
+                    request_id: newer_req.clone(),
+                    channel: SamplingChannel::Reasoning,
+                    text: "newer request reasoning".to_string(),
+                    chunk_index: 0,
+                })
+                .await;
+
+            actor
+                .handle_sampling_event(SamplingEvent::Completed {
+                    request_id: late_req.clone(),
+                    response: Box::new(ConversationResponse {
+                        items: vec![ConversationItem::assistant("late".to_string())],
+                        usage: None,
+                        stop_reason: None,
+                        cost_usd_ticks: None,
+                        message_chunks_emitted: 1,
+                        doom_loop_signals: Vec::new(),
+                        stop_message: None,
+                        message_id: None,
+                        raw_stop_reason: None,
+                        stop_sequence: None,
+                    }),
+                    metrics: InferenceLatencyStats::default(),
+                })
+                .await;
+            assert!(
+                !actor.turn_stream_drained.lock().contains_key(&late_req),
+                "late terminal event must finish lifecycle processing and release ownership"
+            );
+            let capture = actor.streaming_turn_capture.lock().clone();
+            assert_eq!(
+                capture.reasoning_text, "newer request reasoning",
+                "late completion must not clear the newer request's live capture"
+            );
+            assert!(
+                capture
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.request_id.as_deref() == Some(late_req.as_str()))
+                    .all(|segment| {
+                        segment.reasoning_text.is_empty() && segment.response_text.is_empty()
+                    }),
+                "the timeout-owned request's committed content must be removed from prior segments"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unowned_stream_events_do_not_mutate_capture_or_notify_the_next_turn() {
+    use xai_grok_sampler::{RequestId, SamplingChannel, SamplingEvent};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let fixture = make_replay_send_update_fixture().await;
+            let actor = Arc::new(fixture.actor);
+            let sent = fixture.sent;
+            let stale = RequestId::random();
+
+            actor
+                .handle_sampling_event(SamplingEvent::StreamStarted {
+                    request_id: stale.clone(),
+                    timestamp_ms: 1,
+                })
+                .await;
+            actor
+                .handle_sampling_event(SamplingEvent::ChannelToken {
+                    request_id: stale.clone(),
+                    channel: SamplingChannel::Reasoning,
+                    text: "stale reasoning".to_string(),
+                    chunk_index: 1,
+                })
+                .await;
+            actor
+                .handle_sampling_event(SamplingEvent::ToolCallDelta {
+                    request_id: stale,
+                    tool_index: 0,
+                    id: Some("stale-call".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments_delta: Some("{}".to_string()),
+                })
+                .await;
+            tokio::task::yield_now().await;
+
+            assert!(actor.streaming_turn_capture.lock().is_empty());
+            assert!(
+                sent.lock().await.is_empty(),
+                "unowned stream events must not reach the next turn's UI"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unowned_backend_tool_completion_closes_visible_card() {
+    use xai_grok_sampler::{RequestId, SamplingEvent};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut fixture = make_replay_send_update_fixture().await;
+            let signals = fixture.actor.signals_handle();
+            let actor = Arc::new(fixture.actor);
+
+            actor
+                .handle_sampling_event(SamplingEvent::BackendToolCallCompleted {
+                    request_id: RequestId::random(),
+                    call_id: "backend-call".to_string(),
+                    name: "web_search".to_string(),
+                    result: Some(serde_json::json!({"status": "failed"})),
+                })
+                .await;
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(1), fixture.event_rx.recv())
+                    .await
+                    .expect("backend completion must enqueue an update")
+                    .expect("event channel stays open");
+            let SessionEvent::Notification(SessionNotification::Acp(notification)) = event else {
+                panic!("expected ACP notification event");
+            };
+            assert!(matches!(
+                &notification.update,
+                acp::SessionUpdate::ToolCallUpdate(update)
+                    if update.tool_call_id.0.as_ref() == "backend-call"
+                        && update.fields.status == Some(acp::ToolCallStatus::Failed)
+            ));
+            let snapshot = signals.snapshot().await.expect("signals actor stays live");
+            assert_eq!(
+                0, snapshot.tool_failure_count,
+                "unowned backend completion may close UI but not mutate telemetry"
+            );
+            assert_eq!(0, snapshot.error_count);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unowned_retry_does_not_notify_the_next_turn() {
+    use xai_grok_sampler::{RequestId, SamplingErrorKind, SamplingEvent};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let fixture = make_replay_send_update_fixture().await;
+            let actor = Arc::new(fixture.actor);
+            let sent = fixture.sent;
+
+            actor
+                .handle_sampling_event(SamplingEvent::Retrying {
+                    request_id: RequestId::random(),
+                    attempt: 1,
+                    max_retries: 2,
+                    kind: SamplingErrorKind::DoomLoopDetected,
+                    reason: "late retry from cancelled request".to_string(),
+                    doom_loop_triggers: Some(vec!["tail_repetition:8@thinking".to_string()]),
+                    doom_loop_aborted_at_chunk: Some(42),
+                })
+                .await;
+            tokio::task::yield_now().await;
+
+            assert!(
+                sent.lock().await.is_empty(),
+                "an unowned retry must not emit a stale RetryState notification"
+            );
+            assert_eq!(0, actor.doom_loop_turn_tally.lock().attempts);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exact_repetition_completion_is_tracked_for_incidence_only() {
+    use xai_grok_sampler::{RequestId, SamplingEvent};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let fixture = make_replay_send_update_fixture().await;
+            let actor = Arc::new(fixture.actor);
+            let response = xai_grok_sampling_types::ConversationResponse {
+                items: vec![xai_grok_sampling_types::ConversationItem::assistant(
+                    "answer",
+                )],
+                stop_reason: None,
+                usage: None,
+                cost_usd_ticks: None,
+                message_chunks_emitted: 1,
+                doom_loop_signals: vec![xai_grok_sampling_types::doom_loop::DoomLoopSignal::parse(
+                    "exact_repetition:42x3@response",
+                )],
+                stop_message: None,
+                message_id: None,
+                raw_stop_reason: None,
+                stop_sequence: None,
+            };
+            let req = RequestId::random();
+            let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+            actor
+                .turn_stream_drained
+                .lock()
+                .insert(req.clone(), Some(tx));
+            actor
+                .handle_sampling_event(SamplingEvent::Completed {
+                    request_id: req,
+                    response: Box::new(response),
+                    metrics: Default::default(),
+                })
+                .await;
+
+            let tally = actor.doom_loop_turn_tally.lock().clone();
+            assert!(tally.detected());
+            assert!(!tally.fired());
+            assert_eq!(
+                tally.triggers,
+                vec!["exact_repetition:42x3@response".to_string()]
+            );
+            assert_eq!(
+                tally.detection_summary(),
+                crate::session::doom_loop_telemetry::DoomLoopDetectionSummary {
+                    detector_kinds: vec!["exact_repetition".to_owned()],
+                    channels: vec!["response".to_owned()],
+                    tightest_tail_threshold: None,
+                    max_exact_sequence_tokens: Some(42),
+                    max_exact_repeat_count: Some(3),
+                }
+            );
         })
         .await;
 }

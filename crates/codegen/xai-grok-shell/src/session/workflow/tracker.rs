@@ -64,7 +64,7 @@ impl WorkflowRunStatus {
     }
 
     pub(crate) fn is_resumable(self) -> bool {
-        self.is_paused() || self == Self::Failed
+        self.is_paused() || self == Self::Failed || self == Self::Cancelled
     }
 
     fn from_pause(kind: PauseKind) -> Self {
@@ -882,8 +882,8 @@ mod tests {
 
         let (mut t, id) = tracker_with_run();
         t.apply_outcome(&id, &WorkflowOutcome::Cancelled);
-        assert!(t.resume_run(&id, None).is_none());
-        assert_eq!(t.get(&id).unwrap().status, WorkflowRunStatus::Cancelled);
+        let resumed = t.resume_run(&id, None).expect("cancelled is resumable");
+        assert_eq!(resumed.status, WorkflowRunStatus::Active);
 
         let (mut t, id) = tracker_with_run();
         t.apply_outcome(

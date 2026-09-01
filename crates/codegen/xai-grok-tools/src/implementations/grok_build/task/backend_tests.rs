@@ -3,6 +3,14 @@ use crate::implementations::grok_build::task::types::SubagentContextRequest;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+const TEST_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+async fn await_with_timeout<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(TEST_WAIT, future)
+        .await
+        .expect("backend test wait timed out")
+}
+
 /// Helper: receive the next event, match the expected variant, or panic.
 macro_rules! recv_event {
     ($rx:expr, Spawn) => {{
@@ -22,6 +30,94 @@ macro_rules! recv_event {
             ),
         }
     }};
+}
+
+struct BackendWithoutActiveMessages;
+
+struct BackendTestControl;
+
+impl super::super::coordinator::ChildControl for BackendTestControl {
+    type ProgressFuture = std::future::Ready<super::super::coordinator::SubagentProgress>;
+
+    fn progress(&self) -> Self::ProgressFuture {
+        std::future::ready(super::super::coordinator::SubagentProgress::default())
+    }
+
+    fn cancel(&self) {}
+}
+
+struct BackendTestRunner;
+
+impl super::super::coordinator::ChildRunner for BackendTestRunner {
+    type Control = BackendTestControl;
+    type CompletionData = ();
+    type RunFuture = super::super::coordinator::SendBoxFuture<
+        super::super::coordinator::ChildRunOutput<Self::CompletionData>,
+    >;
+    type ValidateFuture = super::super::coordinator::SendBoxFuture<SubagentValidateTypeOutcome>;
+    type DescribeFuture = super::super::coordinator::SendBoxFuture<SubagentDescribeOutcome>;
+
+    fn run(&self, _: super::super::coordinator::ChildRunRequest<Self::Control>) -> Self::RunFuture {
+        Box::pin(std::future::pending())
+    }
+
+    fn validate_type(&self, _: String, _: String) -> Self::ValidateFuture {
+        Box::pin(std::future::pending())
+    }
+
+    fn describe_type(&self, _: String, _: Option<String>, _: String) -> Self::DescribeFuture {
+        Box::pin(std::future::pending())
+    }
+
+    fn on_completed(&self, _: super::super::coordinator::ChildCompletion<Self::CompletionData>) {}
+}
+
+#[async_trait::async_trait]
+impl SubagentBackend for BackendWithoutActiveMessages {
+    async fn spawn(&self, _request: SubagentRequest) -> Result<SubagentResult, ToolError> {
+        Err(ToolError::custom("unsupported", "spawn unsupported"))
+    }
+
+    async fn query(
+        &self,
+        _id: &str,
+        _block: bool,
+        _timeout_ms: Option<u64>,
+    ) -> Option<SubagentSnapshot> {
+        None
+    }
+
+    async fn cancel(&self, _id: &str) -> SubagentCancelOutcome {
+        SubagentCancelOutcome::NotFound
+    }
+
+    async fn validate_type(
+        &self,
+        _subagent_type: &str,
+        _parent_session_id: &str,
+    ) -> SubagentValidateTypeOutcome {
+        SubagentValidateTypeOutcome::ValidationUnavailable
+    }
+
+    async fn describe_subagent_type(
+        &self,
+        _subagent_type: &str,
+        _harness_agent_type: Option<&str>,
+        _parent_session_id: &str,
+    ) -> SubagentDescribeOutcome {
+        SubagentDescribeOutcome::Unavailable
+    }
+}
+
+#[tokio::test]
+async fn backend_without_active_message_override_is_unsupported() {
+    let resource = SubagentBackendResource(Arc::new(BackendWithoutActiveMessages));
+    let request = ActiveAgentMessageRequest::try_new("sub-1", "follow up").unwrap();
+
+    assert_eq!(
+        resource.backend().send_active_message(request).await,
+        ActiveAgentMessageOutcome::Unsupported
+    );
 }
 
 #[tokio::test]
@@ -175,6 +271,124 @@ async fn channel_backend_query_non_blocking_passes_through() {
     assert!(snap.is_none());
 
     handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn channel_backend_active_message_binds_parent_and_round_trips() {
+    let (sender, mut receiver) =
+        super::super::coordinator::SubagentCoordinator::<BackendTestRunner>::channel();
+    let backend = ChannelBackend::for_coordinator_session(sender, "bound-parent");
+    let send = tokio::spawn(async move {
+        backend
+            .send_active_message(ActiveAgentMessageRequest::try_new("sub-1", "follow up").unwrap())
+            .await
+    });
+
+    let ingress = await_with_timeout(receiver.active_messages.recv())
+        .await
+        .expect("active-message ingress closed");
+    let super::super::active_message::ActiveMessageIngress { request, permit } = ingress;
+    assert_eq!(request.parent_session_id, "bound-parent");
+    assert_eq!(request.request.subagent_id(), "sub-1");
+    assert_eq!(request.request.text().as_ref(), "follow up");
+    request
+        .respond_to
+        .send(ActiveAgentMessageOutcome::Accepted {
+            message_id: "message-1".to_owned(),
+        })
+        .unwrap();
+    drop(permit);
+
+    assert_eq!(
+        ActiveAgentMessageOutcome::Accepted {
+            message_id: "message-1".to_owned()
+        },
+        await_with_timeout(send).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn stalled_actor_flood_is_rejected_at_ingress_capacity() {
+    const CAPACITY: usize = 2;
+    let (sender, mut receiver) =
+        super::super::coordinator::SubagentCoordinatorReceiver::with_capacity(CAPACITY);
+    let backend = ChannelBackend::for_coordinator_session(sender, "parent");
+    let first = tokio::spawn({
+        let backend = backend.clone();
+        async move {
+            backend
+                .send_active_message(
+                    ActiveAgentMessageRequest::try_new("first", "follow up").unwrap(),
+                )
+                .await
+        }
+    });
+    let first_queued = await_with_timeout(receiver.active_messages.recv())
+        .await
+        .expect("first active message queued");
+    let second = tokio::spawn({
+        let backend = backend.clone();
+        async move {
+            backend
+                .send_active_message(
+                    ActiveAgentMessageRequest::try_new("second", "follow up").unwrap(),
+                )
+                .await
+        }
+    });
+    let second_queued = await_with_timeout(receiver.active_messages.recv())
+        .await
+        .expect("second active message queued");
+
+    assert_eq!(
+        ActiveAgentMessageOutcome::Saturated {
+            max_in_flight: CAPACITY,
+        },
+        await_with_timeout(backend.send_active_message(
+            ActiveAgentMessageRequest::try_new("overflow", "follow up").unwrap(),
+        ))
+        .await
+    );
+    assert!(receiver.active_messages.try_recv().is_err());
+    drop([first_queued, second_queued]);
+    assert_eq!(
+        ActiveAgentMessageOutcome::ChannelClosed,
+        await_with_timeout(first).await.unwrap()
+    );
+    assert_eq!(
+        ActiveAgentMessageOutcome::ChannelClosed,
+        await_with_timeout(second).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn legacy_raw_sender_clones_do_not_create_active_message_budgets() {
+    let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+    let first = ChannelBackend::for_session(tx.clone(), "parent");
+    let second = ChannelBackend::for_session(tx.clone(), "parent");
+
+    for backend in [first, second] {
+        assert_eq!(
+            ActiveAgentMessageOutcome::Unsupported,
+            backend
+                .send_active_message(
+                    ActiveAgentMessageRequest::try_new("child", "follow up").unwrap(),
+                )
+                .await
+        );
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn channel_backend_active_message_unbound_fails_closed() {
+    let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+    let backend = ChannelBackend::new(tx);
+    let outcome = backend
+        .send_active_message(ActiveAgentMessageRequest::try_new("sub-1", "follow up").unwrap())
+        .await;
+    assert_eq!(outcome, ActiveAgentMessageOutcome::NotFoundOrNotOwned);
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -375,14 +589,14 @@ async fn channel_backend_validate_type_propagates_unknown_outcome() {
 }
 
 #[tokio::test]
-async fn channel_backend_validate_type_returns_validation_unavailable_when_channel_closed() {
+async fn channel_backend_validate_type_returns_coordinator_gone_when_channel_closed() {
     let (tx, rx) = mpsc::unbounded_channel::<SubagentEvent>();
     drop(rx);
     let backend = ChannelBackend::new(tx);
     let outcome = backend.validate_type("explore", "p").await;
     assert!(matches!(
         outcome,
-        SubagentValidateTypeOutcome::ValidationUnavailable
+        SubagentValidateTypeOutcome::CoordinatorGone
     ));
 }
 
@@ -420,8 +634,9 @@ async fn channel_backend_validate_type_logs_warn_on_timeout() {
         }
     });
 
+    let timeout = validate_type_timeout();
     let validate = tokio::spawn(async move { backend.validate_type("explore", "p").await });
-    tokio::time::advance(VALIDATE_TYPE_TIMEOUT + std::time::Duration::from_millis(1)).await;
+    tokio::time::advance(timeout + std::time::Duration::from_millis(1)).await;
     let outcome = validate.await.unwrap();
     assert!(matches!(
         outcome,
@@ -434,15 +649,68 @@ async fn channel_backend_validate_type_logs_warn_on_timeout() {
         if event.level == tracing::Level::WARN
             && event.fields.contains("coordinator validation timed out")
             && event.fields.contains("subagent_type=explore")
-            && event.fields.contains("timeout_ms=")
+            && event
+                .fields
+                .contains(&format!("timeout_ms={}", timeout.as_millis()))
         {
             saw_timeout_warn = true;
             break;
         }
     }
-    assert!(saw_timeout_warn, "must emit WARN with timeout_ms field");
+    assert!(
+        saw_timeout_warn,
+        "must emit WARN with the resolved timeout_ms value"
+    );
 
     holder.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn validate_reply_timeout_warn_reports_the_raced_duration() {
+    let captured = test_capture::capture();
+    let override_timeout = std::time::Duration::from_millis(250);
+    let (_respond_to, response_rx) = tokio::sync::oneshot::channel();
+
+    let raced = tokio::spawn(await_validate_reply(
+        "explore",
+        override_timeout,
+        response_rx,
+    ));
+    tokio::time::advance(override_timeout + std::time::Duration::from_millis(1)).await;
+    assert!(matches!(
+        raced.await.unwrap(),
+        SubagentValidateTypeOutcome::ValidationUnavailable
+    ));
+
+    let mut events_rx = captured.events_rx;
+    let mut saw_timeout_warn = false;
+    while let Ok(event) = events_rx.try_recv() {
+        if event.level == tracing::Level::WARN
+            && event.fields.contains("coordinator validation timed out")
+            && event.fields.contains("timeout_ms=250")
+        {
+            saw_timeout_warn = true;
+            break;
+        }
+    }
+    assert!(saw_timeout_warn, "timeout WARN must carry the raced value");
+}
+
+#[tokio::test(start_paused = true)]
+async fn channel_backend_validate_type_waits_out_a_busy_coordinator() {
+    let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+    let backend = ChannelBackend::new(tx);
+
+    let responder = tokio::spawn(async move {
+        if let Some(SubagentEvent::ValidateType(req)) = rx.recv().await {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let _ = req.respond_to.send(SubagentValidateTypeOutcome::Ok);
+        }
+    });
+
+    let outcome = backend.validate_type("explore", "p").await;
+    assert!(matches!(outcome, SubagentValidateTypeOutcome::Ok));
+    responder.await.unwrap();
 }
 
 // ── describe_subagent_type ───────────────────────────────────────
@@ -563,7 +831,7 @@ async fn channel_backend_describe_returns_unavailable_on_timeout() {
 
     let describe =
         tokio::spawn(async move { backend.describe_subagent_type("explore", None, "p").await });
-    tokio::time::advance(VALIDATE_TYPE_TIMEOUT + std::time::Duration::from_millis(1)).await;
+    tokio::time::advance(DESCRIBE_TYPE_TIMEOUT + std::time::Duration::from_millis(1)).await;
     assert!(matches!(
         describe.await.unwrap(),
         SubagentDescribeOutcome::Unavailable
@@ -571,26 +839,76 @@ async fn channel_backend_describe_returns_unavailable_on_timeout() {
     holder.abort();
 }
 
-#[test]
-fn parse_timeout_ms_returns_none_for_unset() {
-    assert_eq!(parse_timeout_ms(None), None);
+#[tokio::test(start_paused = true)]
+async fn channel_backend_describe_times_out_before_validate_default() {
+    use super::super::types::{SubagentDescribeOutcome, SubagentTypeSummary};
+    let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+    let backend = ChannelBackend::new(tx);
+
+    let responder = tokio::spawn(async move {
+        if let Some(SubagentEvent::DescribeType(req)) = rx.recv().await {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let _ = req
+                .respond_to
+                .send(SubagentDescribeOutcome::Ok(SubagentTypeSummary::default()));
+        }
+    });
+
+    assert!(matches!(
+        backend.describe_subagent_type("explore", None, "p").await,
+        SubagentDescribeOutcome::Unavailable
+    ));
+    responder.abort();
 }
 
 #[test]
-fn parse_timeout_ms_returns_none_for_unparseable() {
-    assert_eq!(parse_timeout_ms(Some("not-a-number")), None);
-    assert_eq!(parse_timeout_ms(Some("")), None);
-    assert_eq!(parse_timeout_ms(Some("3.14")), None);
-    assert_eq!(parse_timeout_ms(Some("-100")), None);
+fn duration_or_reads_the_override_as_milliseconds() {
+    assert_eq!(
+        duration_or(Some("250"), VALIDATE_TYPE_TIMEOUT),
+        std::time::Duration::from_millis(250)
+    );
 }
 
 #[test]
-fn parse_timeout_ms_returns_none_for_zero() {
-    assert_eq!(parse_timeout_ms(Some("0")), None);
+fn validate_and_describe_timeouts_have_separate_overrides() {
+    assert_ne!(VALIDATE_TYPE_TIMEOUT_ENV_VAR, DESCRIBE_TYPE_TIMEOUT_ENV_VAR);
+    assert_eq!(
+        duration_or(Some("9000"), VALIDATE_TYPE_TIMEOUT),
+        std::time::Duration::from_millis(9000)
+    );
+    assert_eq!(
+        duration_or(None, DESCRIBE_TYPE_TIMEOUT),
+        std::time::Duration::from_secs(2),
+        "validate override must not leak into describe"
+    );
+    assert_eq!(
+        duration_or(Some("500"), DESCRIBE_TYPE_TIMEOUT),
+        std::time::Duration::from_millis(500)
+    );
+    assert_eq!(
+        duration_or(None, VALIDATE_TYPE_TIMEOUT),
+        std::time::Duration::from_secs(10),
+        "describe override must not leak into validate"
+    );
 }
 
 #[test]
-fn parse_timeout_ms_returns_value_for_positive_integer() {
-    assert_eq!(parse_timeout_ms(Some("5000")), Some(5000));
-    assert_eq!(parse_timeout_ms(Some("1")), Some(1));
+fn duration_or_falls_back_to_the_default() {
+    for bad in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("-100"),
+        Some("3.14"),
+        Some("not-a-number"),
+    ] {
+        assert_eq!(
+            duration_or(bad, VALIDATE_TYPE_TIMEOUT),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            duration_or(bad, DESCRIBE_TYPE_TIMEOUT),
+            std::time::Duration::from_secs(2)
+        );
+    }
 }

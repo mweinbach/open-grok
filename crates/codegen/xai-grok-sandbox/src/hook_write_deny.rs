@@ -1,11 +1,14 @@
 //! Grok-owned hook write-deny: plan, identity revalidation, and post-reexec checks.
 //! Namespace lockdown is in [`crate::child_net`].
 
-#[cfg(any(target_os = "linux", all(unix, test)))]
+#[cfg(any(target_os = "linux", all(unix, test), all(feature = "enforce", unix),))]
 use std::path::Path;
 use std::path::PathBuf;
 
-use xai_grok_config::{GlobalHookSource, missing_configured_sources, resolve_global_hook_sources};
+use xai_grok_config::{
+    GlobalHookSource, missing_configured_sources, resolve_global_hook_sources,
+    resolve_trust_boundary_sources,
+};
 
 #[cfg(unix)]
 use xai_grok_config::validated_hook_json_files_for_sources;
@@ -131,7 +134,9 @@ fn reject_hardlinked_files(sources: &[GlobalHookSource]) -> Result<(), HookWrite
     for s in sources {
         let is_file_slot = matches!(
             s.kind,
-            GlobalHookSourceKind::RegistryFile | GlobalHookSourceKind::ConfiguredSource
+            GlobalHookSourceKind::RegistryFile
+                | GlobalHookSourceKind::ConfiguredSource
+                | GlobalHookSourceKind::TrustBoundaryFile
         );
         if !is_file_slot || !s.path.exists() || s.path.is_dir() {
             continue;
@@ -195,12 +200,14 @@ pub fn resolve_hook_write_deny_snapshot() -> Result<Vec<GlobalHookSource>, HookW
                 .join(", "),
         ));
     }
-    reject_hardlinked_files(&resolved.sources)?;
+    let mut sources = resolved.sources;
+    sources.extend(resolve_trust_boundary_sources(grok.as_path())?);
+    reject_hardlinked_files(&sources)?;
     #[cfg(unix)]
     {
-        validated_hook_json_files_for_sources(&resolved.sources)?;
+        validated_hook_json_files_for_sources(&sources)?;
     }
-    Ok(resolved.sources)
+    Ok(sources)
 }
 
 #[cfg(target_os = "linux")]
@@ -390,7 +397,7 @@ pub fn verify_required_hook_write_denies(paths: &[PathBuf]) -> Result<(), HookWr
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_namespace_lockdown() -> Result<(), String> {
+pub(crate) fn ensure_namespace_lockdown() -> Result<(), String> {
     use std::sync::OnceLock;
     static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
     INSTALLED
@@ -415,16 +422,25 @@ pub fn verify_hook_write_deny_enforced() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-pub fn maybe_install_namespace_lockdown_inside_bwrap(profile: &ProfileName) -> Result<(), String> {
-    if profile_enforces_hook_write_deny(profile) && crate::is_inside_bwrap() {
+#[cfg(all(feature = "enforce", target_os = "linux"))]
+pub fn maybe_install_namespace_lockdown_inside_bwrap(
+    profile: &ProfileName,
+    workspace: &Path,
+) -> Result<(), String> {
+    let protects_mounts = crate::requires_hook_write_deny(profile, workspace)
+        || crate::requires_read_deny(profile, workspace)
+        || crate::requires_data_write_deny(profile, workspace);
+    if protects_mounts && crate::is_inside_bwrap() {
         ensure_namespace_lockdown()?;
     }
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn maybe_install_namespace_lockdown_inside_bwrap(_profile: &ProfileName) -> Result<(), String> {
+#[cfg(all(feature = "enforce", unix, not(target_os = "linux")))]
+pub fn maybe_install_namespace_lockdown_inside_bwrap(
+    _profile: &ProfileName,
+    _workspace: &Path,
+) -> Result<(), String> {
     Ok(())
 }
 

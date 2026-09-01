@@ -6,6 +6,7 @@
 pub mod groups;
 mod layout;
 mod nav;
+mod pin_reserve;
 mod selection;
 mod timeline;
 mod types;
@@ -133,6 +134,12 @@ pub struct ScrollbackState {
     /// prompt at the viewport top while still enabling follow for new content.
     follow_preserve_scroll: bool,
 
+    pin_reserve_active: bool,
+    pin_reserve_pad: usize,
+    pin_reserve_target: Option<usize>,
+    pin_reserve_prompt_id: Option<EntryId>,
+    pin_reserve_after_turn: bool,
+
     // Selection
     /// Currently selected entry index.
     selected: Option<usize>,
@@ -253,6 +260,11 @@ impl ScrollbackState {
             viewport_height: 0,
             follow_mode: true,
             follow_preserve_scroll: false,
+            pin_reserve_active: false,
+            pin_reserve_pad: 0,
+            pin_reserve_target: None,
+            pin_reserve_prompt_id: None,
+            pin_reserve_after_turn: false,
             selected: None,
             selection_box: None,
             turns: Vec::new(),
@@ -393,6 +405,7 @@ impl ScrollbackState {
 
     /// Update the appearance configuration.
     pub fn set_appearance(&mut self, appearance: AppearanceConfig) {
+        crate::render::bidi::set_enabled(appearance.scrollback.display.rtl_bidi);
         self.appearance = appearance;
         // Invalidate caches since appearance affects rendering
         self.layout_cache = None;
@@ -1119,6 +1132,8 @@ impl ScrollbackState {
         self.turns.clear();
         self.current_turn = None;
         self.scroll_offset = 0;
+        self.clear_pin_reserve();
+        self.pin_reserve_pad = 0;
         self.commit_scan_cursor = 0;
         self.commit_expand_ring.clear();
         self.invalidate_layout_cache();
@@ -1250,9 +1265,9 @@ impl ScrollbackState {
     /// the display-mode policy for lifecycle swaps (tracker refinement and
     /// completion):
     ///
-    /// - Edit-to-Edit swaps keep the entry's current mode, so a manual
-    ///   expand of the one-liner survives later refinements and completion.
-    ///   Exception: when the swap first turns the summary untrusted (a later
+    /// - Same-kind tool swaps keep the entry's current mode, so a manual
+    ///   expand survives later refinements and completion.
+    ///   Exception: when an Edit swap first turns the summary untrusted (a later
     ///   Diff revealed a multi-file call), the entry escalates to Expanded —
     ///   the one-liner it was collapsed to no longer tells the truth. The
     ///   escalation fires only on that rising edge, so a user's collapse of
@@ -1288,7 +1303,7 @@ impl ScrollbackState {
             new_tc.set_started_at(t);
         }
         let kind_changed = verb_group::verb_group_kind_changed(&entry.block, &block);
-        let (edit_to_edit, untrusted_rising) = match (&entry.block, &block) {
+        let (is_same_kind, untrusted_rising) = match (&entry.block, &block) {
             (
                 RenderBlock::ToolCall(ToolCallBlock::Edit(old)),
                 RenderBlock::ToolCall(ToolCallBlock::Edit(new)),
@@ -1296,14 +1311,14 @@ impl ScrollbackState {
                 true,
                 new.is_success() && new.summary_untrusted && !old.summary_untrusted,
             ),
+            (RenderBlock::ToolCall(old), RenderBlock::ToolCall(new)) => (
+                std::mem::discriminant(old) == std::mem::discriminant(new),
+                false,
+            ),
             _ => (false, false),
         };
         entry.block = block;
-        if edit_to_edit {
-            // Keep the current mode: the entry was already an Edit, so any
-            // change since materialization is a user gesture — except on the
-            // untrusted rising edge, where the collapsed one-liner became a
-            // lie and Expanded is the only truthful default. Pins still win.
+        if is_same_kind {
             if untrusted_rising && !(respect_manual_folds && entry.display_mode_pinned) {
                 entry.display_mode = DisplayMode::Expanded;
             }
@@ -1470,6 +1485,7 @@ impl ScrollbackState {
                 RenderBlock::ToolCall(ToolCallBlock::WebFetch(b)) => b.finish(),
                 RenderBlock::ToolCall(ToolCallBlock::WebSearch(b)) => b.finish(),
                 RenderBlock::ToolCall(ToolCallBlock::MemorySearch(b)) => b.finish(),
+                RenderBlock::ToolCall(ToolCallBlock::SentMessage(message)) => message.finish(),
                 RenderBlock::ToolCall(ToolCallBlock::Other(b)) => b.finish(),
                 _ => {}
             }
@@ -1674,6 +1690,12 @@ impl ScrollbackState {
             }
             // Full rebuild produces cheap height ESTIMATES for every entry.
             self.ensure_layout_cache(width);
+            if resized && self.pin_reserve_active {
+                self.pin_reserve_target = self.pin_reserve_prompt_scroll_target();
+                if let Some(target) = self.pin_reserve_target {
+                    self.scroll_offset = target;
+                }
+            }
             self.compute_total_height_from_cache();
             // Re-pin the anchored content to the viewport top now that virtual_y
             // is rebuilt at the new width (before settle clamps / re-pins to it).
@@ -1716,6 +1738,7 @@ impl ScrollbackState {
             let top_anchor = self.viewport_top_anchor_point();
             let changes = self.update_dirty_entry_heights(width);
             self.dirty_heights.clear();
+            self.shift_pin_reserve_target_for_changes(&changes);
 
             if !changes.is_empty() {
                 if self.gaps_may_be_dirty {
@@ -1732,8 +1755,11 @@ impl ScrollbackState {
                     // Apply delta directly instead of re-summing entire visible range.
                     // Clamp at 0 to avoid underflow; no upper cap (total_height is
                     // usize, so tall sessions are not truncated).
-                    let new_total = (self.total_height as i64 + total_delta as i64).max(0);
-                    self.total_height = new_total as usize;
+                    let content = self.total_height.saturating_sub(self.pin_reserve_pad);
+                    let new_content = (content as i64 + total_delta as i64).max(0) as usize;
+                    self.release_pin_reserve_if_below_fold();
+                    self.pin_reserve_pad = self.pin_reserve_pad_rows(new_content);
+                    self.total_height = new_content.saturating_add(self.pin_reserve_pad);
                 }
             } else if self.gaps_may_be_dirty {
                 // Heights didn't change, but structural state is dirty (e.g.,
@@ -1861,6 +1887,7 @@ impl ScrollbackState {
             .saturating_sub(self.viewport_height as usize);
         self.scroll_offset = offset.min(max_offset);
         self.follow_mode = false;
+        self.maybe_release_pin_reserve();
         self.bump_generation();
     }
 

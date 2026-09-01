@@ -20,7 +20,7 @@ use crate::{
     },
     util::remap::remap_json_keys,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -290,7 +290,7 @@ pub struct SessionContext {
     /// `deploy_app` tool connects to the service at call time using the shared
     /// API key provider.
     pub app_builder_deployer_config:
-        crate::implementations::grok_build::deploy_app::AppBuilderDeployerConfig,
+        crate::implementations::grok_build::app_builder::AppBuilderDeployerConfig,
     /// Dynamic API key provider for tool HTTP clients.
     /// When set, clients resolve the API key per-request from this provider
     /// instead of using the key baked into their config at construction time.
@@ -613,7 +613,7 @@ impl ToolRegistryBuilder {
                 kind,
                 requires,
                 default_params: serde_json::to_value(P::default()).unwrap_or_default(),
-                input_schema: generate_schema::<T::Args>(),
+                input_schema: generate_schema_cached::<T::Args>(),
                 metadata: Box::new(tool),
                 output_converter: Box::new(|value| {
                     let typed: T::Output = serde_json::from_value(value)?;
@@ -700,6 +700,7 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::GetTerminalCommandOutputTool>();
         b.register::<grok_build::WaitTasksTool>();
         b.register::<grok_build::TaskTool>();
+        b.register::<grok_build::SendSubagentMessageTool>();
         b.register::<grok_build::AgentSwarmTool>();
         b.register::<grok_build::SwarmWaitTool>();
         b.register::<grok_build::ListAgentsTool>();
@@ -1076,19 +1077,19 @@ impl ToolRegistryBuilder {
         if let Some(lsp) = ctx.lsp {
             resources.insert(lsp);
         }
-        let mut image_gen_config = ctx.image_gen_config;
-        let mut video_gen_config = ctx.video_gen_config;
-        if let Some(session_id) = &ctx.owner_session_id {
-            image_gen_config.stamp_session_id_header(session_id);
-            video_gen_config.stamp_session_id_header(session_id);
-        }
+        let image_gen_config = ctx.image_gen_config;
+        let video_gen_config = ctx.video_gen_config;
         if image_gen_config.has_credentials() {
             match crate::implementations::grok_build::image_gen::ImageGenClient::new(
                 &image_gen_config,
                 ctx.api_key_provider.clone(),
             ) {
                 Ok(client) => {
-                    let client = client.with_attribution_callback(ctx.attribution_callback.clone());
+                    let mut client =
+                        client.with_attribution_callback(ctx.attribution_callback.clone());
+                    if let Some(session_id) = &ctx.owner_session_id {
+                        client = client.with_session_id(session_id);
+                    }
                     resources.insert(client);
                 }
                 Err(e) => {
@@ -1102,7 +1103,11 @@ impl ToolRegistryBuilder {
                 ctx.api_key_provider.clone(),
             ) {
                 Ok(client) => {
-                    let client = client.with_attribution_callback(ctx.attribution_callback.clone());
+                    let mut client =
+                        client.with_attribution_callback(ctx.attribution_callback.clone());
+                    if let Some(session_id) = &ctx.owner_session_id {
+                        client = client.with_session_id(session_id);
+                    }
                     resources.insert(client);
                 }
                 Err(e) => {
@@ -1229,6 +1234,13 @@ impl ToolRegistryBuilder {
             .collect();
         resources.insert(crate::types::resources::EnabledNativeToolNames(
             native_tool_names,
+        ));
+        resources.insert(crate::types::resources::NativeToolClientNames(
+            tools
+                .iter()
+                .filter(|tool| !tool.client_name.contains("__"))
+                .map(|tool| (tool.registry_id.clone(), tool.client_name.clone()))
+                .collect(),
         ));
         let proposed: Vec<ProposedTool> = tools
             .iter()
@@ -1383,6 +1395,13 @@ impl FinalizedToolset {
     pub fn tool_name_for_kind(&self, kind: ToolKind) -> Option<String> {
         self.renderer.tool_for_kind(kind).map(str::to_owned)
     }
+    pub fn tool_name_for_registry_id(&self, registry_id: &str) -> Option<String> {
+        self.tools
+            .read()
+            .iter()
+            .find(|tool| tool.registry_id == registry_id)
+            .map(|tool| tool.client_name.clone())
+    }
     /// Map of client-facing tool name → snake_case [`ToolKind`] key.
     pub fn tool_kinds(&self) -> HashMap<String, String> {
         self.tools
@@ -1410,6 +1429,12 @@ impl FinalizedToolset {
     }
     pub async fn update_resource<T: Send + Sync + 'static>(&self, resource: T) {
         self.resources.lock().await.insert(resource);
+    }
+    pub async fn update_resources_with(
+        &self,
+        seed: impl FnOnce(&mut crate::types::resources::Resources),
+    ) {
+        seed(&mut *self.resources.lock().await);
     }
     /// Clone a typed resource out of this toolset, if present.
     ///
@@ -1461,7 +1486,12 @@ impl FinalizedToolset {
     fn tool_not_found_error(tool_name: &str) -> xai_tool_runtime::ToolError {
         let tid = xai_tool_protocol::ToolId::new(tool_name)
             .unwrap_or_else(|_| xai_tool_protocol::ToolId::new("unknown").expect("valid"));
-        xai_tool_runtime::ToolError::not_found(tid, format!("Tool not found: {tool_name}"))
+        xai_tool_runtime::ToolError::not_found(
+            tid,
+            format!(
+                "Tool not found: {tool_name}. No enabled tool has this name; use an available tool name or discover the required integration first."
+            ),
+        )
     }
     pub async fn try_parse(
         &self,
@@ -1881,7 +1911,7 @@ impl FinalizedToolset {
         let description = tool.description_template().to_string();
         let kind = tool.kind();
         let registry_id = xai_tool_runtime::Tool::id(&tool).as_str().to_owned();
-        let input_schema = input_schema_override.unwrap_or_else(generate_schema::<T::Args>);
+        let input_schema = input_schema_override.unwrap_or_else(generate_schema_cached::<T::Args>);
         let definition = ToolDefinition::function(&name, Some(&description), input_schema.clone());
         self.local_registry.register(tool);
         tools.push(FinalizedTool {
@@ -1955,11 +1985,40 @@ impl FinalizedToolset {
         self.resources_persistence.state_path()
     }
 }
-/// Generate a JSON Schema for type `T`.
-///
-/// Public so out-of-tree tool packs can
-/// schema-test their tool inputs exactly the way the registry generates
-/// definitions.
+fn schema_cache() -> &'static RwLock<HashMap<std::any::TypeId, serde_json::Value>> {
+    static CACHE: OnceLock<RwLock<HashMap<std::any::TypeId, serde_json::Value>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+pub(crate) fn generate_schema_cached<T: schemars::JsonSchema + 'static>() -> serde_json::Value {
+    let key = std::any::TypeId::of::<T>();
+    if let Some(cached) = schema_cache().read().get(&key) {
+        return cached.clone();
+    }
+    let mut cache = schema_cache().write();
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    #[cfg(test)]
+    {
+        *schema_uncached_counts().lock().entry(key).or_insert(0) += 1;
+    }
+    let value = generate_schema::<T>();
+    cache.insert(key, value.clone());
+    value
+}
+#[cfg(test)]
+fn schema_uncached_counts() -> &'static Mutex<HashMap<std::any::TypeId, u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<std::any::TypeId, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+#[cfg(test)]
+fn schema_uncached_calls(key: std::any::TypeId) -> u64 {
+    schema_uncached_counts()
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or(0)
+}
 pub fn generate_schema<T: schemars::JsonSchema>() -> serde_json::Value {
     let settings = schemars::generate::SchemaSettings::draft07().with(|s| {
         s.inline_subschemas = true;
@@ -2190,6 +2249,86 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn unpublished_app_builder_remains_disabled_and_unregistered() {
+        let config = grok_build::app_builder::AppBuilderDeployerConfig::default();
+        let legacy_config: grok_build::deploy_app::AppBuilderDeployerConfig = config;
+        assert!(!legacy_config.is_enabled());
+        let directory = TempDir::new().unwrap();
+        for name in [
+            grok_build::DEPLOY_APP_TOOL_NAME,
+            grok_build::INIT_OR_UPDATE_APP_TOOL_NAME,
+        ] {
+            let registry_id = format!("GrokBuild:{name}");
+            let builder = ToolRegistryBuilder::new();
+            assert!(!builder.has_tool_id(&registry_id));
+            let result = builder.finalize(
+                ToolServerConfig {
+                    tools: vec![ToolConfig::from_id(registry_id)],
+                    behavior_preset: None,
+                },
+                test_session_context(&directory),
+            );
+            assert!(
+                result.is_err(),
+                "unpublished tool must not be enabled: {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_lookup_and_resources_honor_native_tool_renames() {
+        let directory = TempDir::new().unwrap();
+        let config = ToolServerConfig {
+            tools: vec![
+                ToolConfig::for_tool::<grok_build::SchedulerCreateTool>()
+                    .with_name("start_schedule"),
+                ToolConfig::from_id("GrokBuild:scheduler_delete").with_name("stop_schedule"),
+            ],
+            behavior_preset: None,
+        };
+        let toolset = ToolRegistryBuilder::new()
+            .finalize(config, test_session_context(&directory))
+            .unwrap();
+        assert_eq!(
+            toolset
+                .tool_name_for_registry_id("scheduler_delete")
+                .as_deref(),
+            Some("stop_schedule")
+        );
+        assert_eq!(
+            toolset
+                .tool_name_for_registry_id("scheduler_create")
+                .as_deref(),
+            Some("start_schedule"),
+        );
+        assert!(
+            toolset
+                .tool_name_for_registry_id("scheduler_list")
+                .is_none()
+        );
+        let resources = toolset.resources.lock().await;
+        let names = resources
+            .get::<crate::types::resources::NativeToolClientNames>()
+            .unwrap();
+        assert_eq!(
+            names.0.get("scheduler_delete").map(String::as_str),
+            Some("stop_schedule")
+        );
+        assert_eq!(
+            names.0.get("scheduler_create").map(String::as_str),
+            Some("start_schedule")
+        );
+        assert!(!names.0.contains_key("scheduler_list"));
+    }
+
+    #[test]
+    fn missing_tool_error_includes_recovery_guidance() {
+        let error = FinalizedToolset::tool_not_found_error("unknown_tool").to_string();
+        assert!(error.contains("Tool not found: unknown_tool"));
+        assert!(error.contains("use an available tool name or discover the required integration"));
+    }
+
     #[derive(Default)]
     struct ExperienceSearchTestBackend {
         calls: parking_lot::Mutex<Vec<(String, usize, Option<bool>)>>,
@@ -2295,7 +2434,7 @@ mod tests {
             video_gen_config:
                 crate::implementations::grok_build::video_gen::VideoGenConfig::default(),
             app_builder_deployer_config:
-                crate::implementations::grok_build::deploy_app::AppBuilderDeployerConfig::default(),
+                crate::implementations::grok_build::app_builder::AppBuilderDeployerConfig::default(),
             api_key_provider: None,
             auth_provider: None,
             attribution_callback: None,
@@ -2529,6 +2668,7 @@ mod tests {
         use crate::implementations::grok_build::{
             IMAGE_GEN_TOOL_NAME, IMAGE_TO_VIDEO_TOOL_NAME, REFERENCE_TO_VIDEO_TOOL_NAME,
             SCHEDULER_CREATE_TOOL_NAME, SCHEDULER_DELETE_TOOL_NAME,
+            SEND_SUBAGENT_MESSAGE_TOOL_NAME,
         };
         let builder = ToolRegistryBuilder::new();
         let config = ToolServerConfig {
@@ -2545,6 +2685,7 @@ mod tests {
                 "exit_plan_mode",
                 "todo_write",
                 "task",
+                SEND_SUBAGENT_MESSAGE_TOOL_NAME,
                 "web_search",
                 "web_fetch",
                 "lsp",
@@ -5057,6 +5198,23 @@ mod tests {
                 .as_object()
                 .is_some_and(|p| !p.is_empty()),
             "per-property schema must be retained: {schema}"
+        );
+    }
+    #[test]
+    fn generate_schema_memoizes_per_type() {
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct SchemaMemoProbe {
+            field: String,
+        }
+        let key = std::any::TypeId::of::<SchemaMemoProbe>();
+        let first = generate_schema_cached::<SchemaMemoProbe>();
+        let second = generate_schema_cached::<SchemaMemoProbe>();
+        assert_eq!(first, second);
+        assert_eq!(
+            schema_uncached_calls(key),
+            1,
+            "a type's schema must be generated at most once per process"
         );
     }
     fn toolset_with_viewer_ctx(

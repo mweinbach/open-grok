@@ -205,7 +205,7 @@ pub struct AuthChannels {
 
 /// Sets no `GROK_AUTH_EXPIRED`: operator binaries, which live outside this
 /// repo, read that variable as "headless, don't prompt" and decline the run.
-async fn run_external_auth_provider(
+pub(super) async fn run_external_auth_provider(
     command: &str,
     auth_manager: &Arc<AuthManager>,
     over_stale_credential: bool,
@@ -463,6 +463,8 @@ fn failure_kind(transport: TransportFailureKind, is_decode: bool) -> LoginFailur
     match transport {
         TransportFailureKind::Unreachable => LoginFailureKind::TransportConnect,
         TransportFailureKind::Interrupted => LoginFailureKind::TransportInterrupted,
+        TransportFailureKind::CertificateUntrusted => LoginFailureKind::CertificateUntrusted,
+        TransportFailureKind::CertificateInvalid => LoginFailureKind::CertificateInvalid,
         TransportFailureKind::Permanent => LoginFailureKind::TransportPermanent,
     }
 }
@@ -787,20 +789,8 @@ pub(crate) async fn try_noninteractive_auth_no_mint(
 /// Policy behind [`try_noninteractive_auth_no_mint`], with the `AuthManager`
 /// injected for tests.
 async fn try_noninteractive_auth_no_mint_with(auth_manager: &Arc<AuthManager>) -> Option<GrokAuth> {
-    match tokio::time::timeout(
-        crate::http::STARTUP_AUTH_REFRESH_TIMEOUT,
-        try_ensure_fresh_auth_with(auth_manager),
-    )
-    .await
-    {
-        Ok(Some(auth)) => return Some(auth),
-        Ok(None) => {}
-        Err(_elapsed) => {
-            tracing::warn!(
-                timeout_secs = crate::http::STARTUP_AUTH_REFRESH_TIMEOUT.as_secs(),
-                "boot auth refresh timed out; using cached/expired session (mint deferred to background)"
-            );
-        }
+    if let super::SilentRefresh::Renewed(auth) = auth_manager.silent_refresh().await {
+        return Some(*auth);
     }
     // Expired-but-refreshable cached session self-heals on the first 401; no
     // cold mint on the readiness path.
@@ -869,7 +859,7 @@ async fn persist_or_use_minted(auth_manager: &AuthManager, new_auth: GrokAuth) -
 }
 
 /// Print the CLI "signed in" confirmation, clearing the spinner line first.
-fn report_signed_in(auth: &GrokAuth) {
+pub(super) fn report_signed_in(auth: &GrokAuth) {
     eprint!("\r\x1b[K");
     match auth.email {
         Some(ref email) => eprintln!("✓ Signed in as {email}"),
@@ -1027,6 +1017,10 @@ pub async fn run_cli_login(
     // Sync this principal's config now rather than waiting for the background
     // tick. Stay quiet about absence/failure during login — confirm only when
     // config was actually applied; `open-grok setup` reports the no-config case.
+    apply_post_login_config(authenticated).await
+}
+
+pub(super) async fn apply_post_login_config(authenticated: GrokAuth) -> anyhow::Result<()> {
     let outcome = crate::managed_config::post_login_sync(Some(authenticated)).await;
     match outcome {
         crate::managed_config::ManagedConfigSync::Updated { is_team: true } => {

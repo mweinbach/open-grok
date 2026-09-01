@@ -469,10 +469,13 @@ pub(crate) fn join_searchable(parts: impl IntoIterator<Item = Option<String>>) -
 
 impl RenderBlock {
     pub(crate) fn rendered_output(&self, ctx: &BlockContext) -> RenderedBlockOutput {
-        let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) = self else {
-            return RenderedBlockOutput::from(self.output(ctx));
+        let mut rendered = match self {
+            RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) => edit.rendered_output(ctx),
+            RenderBlock::ToolCall(ToolCallBlock::SentMessage(message)) => {
+                message.rendered_output(ctx)
+            }
+            _ => return RenderedBlockOutput::from(self.output(ctx)),
         };
-        let mut rendered = edit.rendered_output(ctx);
         if self.has_bullet(ctx) {
             prepend_bullet(&mut rendered.output, ctx, self.bullet(ctx));
         }
@@ -948,6 +951,14 @@ impl RenderBlock {
                             Some(theme.accent_error)
                         }
                     }
+                    ToolCallBlock::SentMessage(message) => Some(match &message.presentation {
+                        super::blocks::SentMessagePresentation::Sending
+                        | super::blocks::SentMessagePresentation::Sent => theme.accent_tool,
+                        super::blocks::SentMessagePresentation::Rejected { .. } => {
+                            theme.accent_error
+                        }
+                        super::blocks::SentMessagePresentation::Unconfirmed { .. } => theme.warning,
+                    }),
                     ToolCallBlock::Other(b) => {
                         if b.is_success() {
                             Some(theme.accent_tool)
@@ -1175,6 +1186,35 @@ impl RenderBlock {
             RenderBlock::Thinking(b) => b.content().with_hyperlinks(f),
             RenderBlock::Btw(b) => b.content().with_hyperlinks(f),
             _ => f(&[]),
+        }
+    }
+
+    pub fn with_table_copy_meta<Output>(
+        &self,
+        callback: impl FnOnce(&[xai_grok_markdown::TableCopyMeta]) -> Output,
+    ) -> Output {
+        match self {
+            RenderBlock::AgentMessage(block) => block.content().with_table_copy_meta(callback),
+            RenderBlock::Thinking(block) => block.content().with_table_copy_meta(callback),
+            RenderBlock::Btw(block) => block.content().with_table_copy_meta(callback),
+            _ => callback(&[]),
+        }
+    }
+
+    pub fn markdown_body_line_offset(
+        &self,
+        mode: DisplayMode,
+        appearance: &AppearanceConfig,
+    ) -> usize {
+        match self {
+            RenderBlock::Btw(_) if mode != DisplayMode::Collapsed => 2,
+            RenderBlock::Thinking(_)
+                if mode != DisplayMode::Collapsed
+                    && appearance.scrollback.blocks.thinking.header =>
+            {
+                2
+            }
+            _ => 0,
         }
     }
 

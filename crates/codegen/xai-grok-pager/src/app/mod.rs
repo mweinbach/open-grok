@@ -22,6 +22,7 @@ pub mod edit_highlight_worker;
 pub mod mermaid_worker;
 pub use xai_prompt_queue as prompt_queue;
 mod acp_handler;
+pub(crate) mod cancel_latency;
 mod csi_filter;
 mod dispatch;
 /// Display-refresh probe + motion cadence + terminal telemetry at startup.
@@ -35,6 +36,7 @@ pub mod status_blocks;
 pub mod subagent;
 pub mod subscription;
 pub(crate) use effects::sanitize_user_error;
+mod connect_timeout;
 mod event_loop;
 mod exit_timeout;
 pub(crate) mod external_editor;
@@ -43,12 +45,17 @@ mod inline_edit;
 #[cfg(all(test, unix))]
 mod leader_cluster;
 mod modals;
+pub(crate) mod mode_switch;
 mod mouse;
 mod queue_edit;
 pub(crate) mod screen_mode_relaunch;
 mod session_load_barrier;
 pub mod signal_handler;
+pub(crate) mod status_line;
+mod status_line_policy;
 mod turn_completion;
+pub(crate) mod workspace_sync;
+mod x10_filter;
 mod xt_filter;
 pub(crate) use crate::terminal::{kitty_flags_pushed, kitty_releases_reported};
 pub use cli::{
@@ -358,6 +365,25 @@ impl ScreenMode {
         }
     }
 }
+static CURRENT_SCREEN_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+pub(crate) fn set_current_screen_mode(mode: ScreenMode) {
+    let value = match mode {
+        ScreenMode::Fullscreen => 0,
+        ScreenMode::Inline => 1,
+        ScreenMode::Minimal => 2,
+    };
+    CURRENT_SCREEN_MODE.store(value, Ordering::Release);
+    signal_handler::set_mode(mode);
+}
+
+pub(crate) fn current_screen_mode() -> ScreenMode {
+    match CURRENT_SCREEN_MODE.load(Ordering::Acquire) {
+        0 => ScreenMode::Fullscreen,
+        2 => ScreenMode::Minimal,
+        _ => ScreenMode::Inline,
+    }
+}
 /// Install the process-wide render globals that depend on the screen mode.
 ///
 /// Consolidates every "minimal behaves differently here" toggle into one place
@@ -367,6 +393,7 @@ impl ScreenMode {
 /// mode is safe and keeps the effective-mode source of truth singular.
 fn apply_screen_mode_globals(screen_mode: ScreenMode) {
     let minimal = screen_mode.is_minimal();
+    set_current_screen_mode(screen_mode);
     MINIMAL_MODE_ACTIVE.store(minimal, Ordering::Release);
     crate::terminal::image::set_inline_overlay_force_off(minimal);
     crate::views::modal_window::set_embedded(minimal);
@@ -383,6 +410,7 @@ fn engage_startup_theme(screen_mode: ScreenMode) {
     } else {
         let initial_theme = crate::theme::cache::resolve_initial_theme();
         crate::theme::cache::set(initial_theme);
+        mode_switch::mark_theme_resolved();
     }
 }
 /// Step 2 of the startup theme handshake: if a `--minimal` start was
@@ -393,6 +421,7 @@ fn finish_theme_after_probe(requested_minimal: bool, effective_mode: ScreenMode)
         let late_theme = crate::theme::cache::resolve_initial_theme_no_osc11();
         crate::theme::cache::set(late_theme);
         crate::theme::apply_cursor_color();
+        mode_switch::mark_theme_resolved();
         tracing::info!(?late_theme, "minimal downgrade: resolved regular theme");
     }
 }
@@ -548,11 +577,12 @@ pub fn join_early_prefetch(
     std::thread::spawn(move || {
         let _ = tx.send(handle.join());
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+    match rx.recv_timeout(EARLY_PREFETCH_WAIT) {
         Ok(Ok(r)) => r.settings,
         _ => None,
     }
 }
+pub const EARLY_PREFETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// First non-blank of CLI > env > config (precedence + blank-skip). `None` →
 /// nothing set; `acp::initialize` canonicalizes and applies the default.
 fn resolve_hunk_tracker_mode(
@@ -653,26 +683,33 @@ pub async fn run(
     let startup_start = std::time::Instant::now();
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-    let grok_com_config = match xai_grok_shell::agent::config::Config::new_from_toml_cfg(
-        &raw_config,
-    ) {
-        Ok(c) => c.grok_com_config,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to parse config for auth refresh, using defaults");
-            xai_grok_shell::auth::GrokComConfig::default()
+    let startup_config = match xai_grok_shell::agent::config::Config::new_from_toml_cfg(&raw_config)
+    {
+        Ok(mut config) => {
+            if let Some(model) = &args.model {
+                config.default_model_override = Some(model.clone());
+            }
+            Some(config)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to parse config for startup auth; skipping refresh");
+            None
         }
     };
-    // Bound token refresh so a wedged IdP cannot hang the first draw.
-    let refreshed_auth = tokio::time::timeout(
-        xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
-        xai_grok_shell::auth::try_ensure_fresh_auth(&grok_com_config),
-    )
-    .await
-    .unwrap_or(None);
-    let early_prefetch = match refreshed_auth {
-        Some(auth) => xai_grok_shell::agent::models::start_early_prefetch_with_auth(Some(auth)),
-        None => xai_grok_shell::agent::models::start_early_prefetch(Some(grok_com_config.clone())),
-    };
+    if let Some(config) = startup_config
+        && args.startup_uses_xai_session(&config)
+    {
+        let refreshed_auth = tokio::time::timeout(
+            xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+            xai_grok_shell::auth::try_ensure_fresh_auth(&config.grok_com_config),
+        )
+        .await
+        .unwrap_or(None);
+        xai_grok_shell::agent::models::startup_prefetch::begin_with_config_and_auth(
+            &config,
+            refreshed_auth,
+        );
+    }
     xai_grok_shell::agent::mvp_agent::warm_async_http_client();
     tokio::task::spawn_blocking(|| {});
     if let Ok(cwd) = std::env::current_dir() {
@@ -685,7 +722,6 @@ pub async fn run(
     // block startup joining the fetch — the prefetch thread still warms the
     // model catalog and auth in the background. The shell drops any
     // remote-settings payload at session init for the same reason.
-    drop(early_prefetch);
     let remote_settings: Option<xai_grok_shell::util::config::RemoteSettings> = None;
     xai_grok_shell::util::config::cache_remote_auto_mode(
         remote_settings.as_ref().and_then(|s| s.auto_mode.clone()),
@@ -933,7 +969,11 @@ pub async fn run(
     if let Some(ref t) = session_title {
         set_terminal_title(t);
     }
-    const CONNECT_UI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let connect_ui_timeout = connect_timeout::resolve(
+        std::env::var(connect_timeout::CONNECT_UI_TIMEOUT_ENV)
+            .ok()
+            .as_deref(),
+    );
     let fallback_flags = use_leader.then(|| connect_flags.clone());
     let primary_target = if use_leader {
         crate::acp::AgentKind::Leader
@@ -954,7 +994,7 @@ pub async fn run(
     let primary_started = std::time::Instant::now();
     let connect_result = bounded_connect(
         &cancel,
-        CONNECT_UI_TIMEOUT,
+        connect_ui_timeout,
         primary_target,
         startup_failure::ConnectAttempt::First,
         &timer,
@@ -976,7 +1016,7 @@ pub async fn run(
             let target = crate::acp::AgentKind::Embedded;
             let fallback = bounded_connect(
                 &cancel,
-                CONNECT_UI_TIMEOUT,
+                connect_ui_timeout,
                 target,
                 startup_failure::ConnectAttempt::AfterFallback(startup_failure::EarlierAttempt {
                     target: primary_target,
@@ -1706,12 +1746,12 @@ fn restore_terminal_with(
 fn restore_terminal(
     terminal: PagerTerminal,
     writer_thread: crate::render::draw::WriterThread,
-    mode: ScreenMode,
+    _mode: ScreenMode,
 ) -> io::Result<()> {
     restore_terminal_with(
         terminal,
         writer_thread,
-        mode,
+        current_screen_mode(),
         drain_writer_thread_before_teardown,
         emit_terminal_teardown_sequences,
     )
@@ -1736,10 +1776,10 @@ fn terminal_title_string(title: &str) -> String {
         format!("{} - open-grok", truncated)
     }
 }
-fn set_panic_hook(mode: ScreenMode) {
+fn set_panic_hook(_mode: ScreenMode) {
     let hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        emit_terminal_teardown_sequences(mode, None);
+        emit_terminal_teardown_sequences(current_screen_mode(), None);
         let _ = terminal::disable_raw_mode();
         signal_handler::mark_restored();
         xai_crash_handler::disable_terminal_escape_restore();
@@ -1811,7 +1851,7 @@ mod tests {
         xai_grok_telemetry::unified_log::redirect_to_temp_for_tests();
         let cancel = CancellationToken::new();
         let timer = crate::acp::StartupTimer::new();
-        timer.enter(crate::acp::StartupPhase::LoadConfig);
+        timer.enter(crate::acp::StartupPhase::ConfigLoad);
         timer.enter(crate::acp::StartupPhase::ModelCatalog);
         let r = bounded_connect(
             &cancel,

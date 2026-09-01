@@ -38,6 +38,7 @@ pub struct WorkflowAgentInfo {
 /// `_meta` key on rename fan-out (`SessionSummaryGenerated` + ACP
 /// `SessionInfoUpdate`). Old clients ignore unknown meta.
 pub const TITLE_IS_MANUAL_META_KEY: &str = "x.ai/titleIsManual";
+pub const PROMPT_COMPLETE_ERROR_KIND_KEY: &str = "errorKind";
 
 /// `_meta` object carried on a manual-rename fan-out.
 pub fn title_is_manual_meta() -> serde_json::Value {
@@ -481,6 +482,7 @@ pub enum AutoCompactCancelReason {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "sessionUpdate")]
 pub enum SessionUpdate {
+    SessionStatus(Box<xai_grok_status_line::StatusLineContext>),
     /// Swarm-mode state changed. Persisted through the normal xAI session-update path.
     SwarmModeChanged {
         enabled: bool,
@@ -973,9 +975,13 @@ pub enum SessionUpdate {
     },
     /// Prompt images dropped before send (integrity / upscale-cap). The
     /// model is told via a system-reminder; this surfaces them to the UI.
-    ImageDropped { notes: Vec<String> },
+    ImageDropped {
+        notes: Vec<String>,
+    },
     /// Memory file listing for the pager's /memory modal.
-    MemoryFiles { files: Vec<MemoryFileInfo> },
+    MemoryFiles {
+        files: Vec<MemoryFileInfo>,
+    },
     WorkflowUpdated {
         run_id: String,
         #[serde(default)]
@@ -1137,7 +1143,9 @@ pub enum SessionUpdate {
     /// A previously-pending reverse-request **resolved** (answered, cancelled,
     /// or errored). Fire-and-forget, **never persisted**. Subscribers clear the
     /// pending ⏳ for this `tool_call_id`.
-    InteractionResolved { tool_call_id: String },
+    InteractionResolved {
+        tool_call_id: String,
+    },
     /// The durable, replayable signal that a turn reached its terminal
     /// outcome. Rides the persisted `_x.ai/session/update` rail (unlike the
     /// fire-and-forget `x.ai/session/prompt_complete` notification), so a
@@ -1153,7 +1161,11 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_result: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<PromptUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
     },
     /// One model response opened (Messages `message_start`), carrying the real
     /// message id, model, and input-side token counts. Rides the buffered chunk
@@ -1255,6 +1267,9 @@ impl From<&crate::session::image_normalize::ImageCompressionInfo> for ImageCompr
 
 pub const DISK_FULL_ERROR_TYPE: &str = "disk_full";
 pub const DISK_FULL_USER_MESSAGE: &str = "Out of disk space. Free some space and try again.";
+pub const CONTEXT_LENGTH_ERROR_TYPE: &str = "context_length";
+pub const UNAUTHORIZED_NEEDLE: &str = "Unauthorized (401)";
+pub const HTTP_401_NEEDLE: &str = "(401)";
 
 /// State of a retry operation or error for visual feedback in the TUI
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -1268,6 +1283,8 @@ pub enum RetryState {
         max_retries: u32,
         /// Human-readable reason for the retry
         reason: String,
+        #[serde(default)]
+        error_type: Option<String>,
     },
     /// All retries have been exhausted
     Exhausted {
@@ -1306,7 +1323,7 @@ pub fn is_reauthable_failure(error_type: Option<&str>, message: &str) -> bool {
     if matches!(error_type, Some("legacy_auth") | Some("auth_transient")) {
         return false;
     }
-    error_type == Some("auth") || message.contains("Unauthorized (401)")
+    error_type == Some("auth") || message.contains(UNAUTHORIZED_NEEDLE)
 }
 
 /// Status updates for relay sync (session sharing) feature.
@@ -1567,6 +1584,34 @@ pub struct RecapRequestFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retrying_old_wire_defaults_error_type() {
+        let state: RetryState = serde_json::from_value(serde_json::json!({
+            "type": "retrying", "attempt": 1, "max_retries": 3, "reason": "retry"
+        }))
+        .unwrap();
+        assert!(matches!(
+            state,
+            RetryState::Retrying {
+                error_type: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn retrying_wire_preserves_error_type() {
+        let state = RetryState::Retrying {
+            attempt: 1,
+            max_retries: 3,
+            reason: "context window exceeded".into(),
+            error_type: Some(CONTEXT_LENGTH_ERROR_TYPE.into()),
+        };
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(serde_json::from_value::<RetryState>(wire).unwrap(), state);
+        assert!(UNAUTHORIZED_NEEDLE.contains(HTTP_401_NEEDLE));
+    }
 
     #[test]
     fn recap_request_file_roundtrips() {
@@ -2469,6 +2514,8 @@ mod tests {
             stop_reason: "end_turn".into(),
             agent_result: Some("done".into()),
             usage: None,
+            error_kind: None,
+            elapsed_ms: None,
         };
         let json = serde_json::to_value(&update).unwrap();
         assert_eq!(json["sessionUpdate"], "turn_completed");
@@ -2484,6 +2531,8 @@ mod tests {
             stop_reason: "cancelled".into(),
             agent_result: None,
             usage: None,
+            error_kind: None,
+            elapsed_ms: None,
         };
         let json = serde_json::to_value(&update).unwrap();
         assert_eq!(json["sessionUpdate"], "turn_completed");
@@ -2498,12 +2547,16 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_result: Some("result text".into()),
                 usage: None,
+                error_kind: None,
+                elapsed_ms: None,
             },
             SessionUpdate::TurnCompleted {
                 prompt_id: "p-min".into(),
                 stop_reason: "error".into(),
                 agent_result: None,
                 usage: None,
+                error_kind: None,
+                elapsed_ms: None,
             },
         ] {
             let json_str = serde_json::to_string(&update).unwrap();

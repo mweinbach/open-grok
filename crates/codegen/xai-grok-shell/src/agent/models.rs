@@ -2005,6 +2005,12 @@ impl ModelsManager {
             .and_then(|entry| entry.info().stream_tool_calls)
     }
 
+    pub(crate) fn model_subagent_rate_limit_max_attempts(&self, model_id: &str) -> Option<u32> {
+        let catalog = self.inner.catalog.read();
+        config::find_model_by_id(&catalog.models, model_id)
+            .and_then(|entry| entry.info().subagent_rate_limit_max_attempts)
+    }
+
     /// Resolve the effective Codex reasoning-summary mode by catalog key or
     /// routing slug. The authenticated models.json snapshot remains
     /// authoritative across client rebuilds and subagent inheritance.
@@ -3048,6 +3054,8 @@ mod cache;
 mod endpoint;
 mod fetch;
 mod resolution;
+mod settings_cache;
+pub mod startup_prefetch;
 
 pub(crate) use cache::*;
 pub(crate) use endpoint::*;
@@ -3057,6 +3065,7 @@ pub use fetch::{
     start_early_prefetch_settings_only, start_early_prefetch_with_auth,
 };
 pub(crate) use resolution::*;
+pub(crate) use settings_cache::*;
 
 #[cfg(test)]
 mod tests;

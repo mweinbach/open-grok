@@ -247,6 +247,7 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
     if worktree {
         vec![Effect::CreateWorktreeSession {
             agent_id: new_id,
+            permission_mode_override: None,
             load_session_id: Some(parent_session_id.0.to_string()),
             label: None,
             git_ref: None,
@@ -304,6 +305,8 @@ fn build_fork_placeholder(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
@@ -422,7 +425,7 @@ pub(in crate::app::dispatch) fn handle_worktree_forked(
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "WorktreeForked");
         agent.session.finish_command();
-        agent.mark_turn_finished();
+        agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
         agent.bind_session_id(session_id);
         agent.scrollback.begin_batch();
         agent.begin_replay_window();
@@ -500,7 +503,7 @@ pub(in crate::app::dispatch) fn handle_fork_session_ready(
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "ForkSessionReady");
         agent.session.finish_command();
-        agent.mark_turn_finished();
+        agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
         agent.bind_session_id(new_session_id);
         agent.scrollback.begin_batch();
         agent.begin_replay_window();
@@ -533,7 +536,7 @@ pub(in crate::app::dispatch) fn handle_fork_session_failed(
         agent.pending_extensions_fetch = false;
         agent.session.finish_command();
         let elapsed = agent.turn_elapsed();
-        agent.mark_turn_finished();
+        agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
         agent.pending_first_prompt = None;
         agent.pending_fork_banner = None;
         agent

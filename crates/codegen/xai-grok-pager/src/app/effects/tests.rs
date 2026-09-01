@@ -1,5 +1,296 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
+
+#[test]
+fn session_permission_override_is_explicit_and_preserves_provider_metadata() {
+    for (mode, yolo, auto) in [
+        (actions::PermissionModeKind::Ask, false, false),
+        (actions::PermissionModeKind::Auto, false, true),
+        (actions::PermissionModeKind::AlwaysApprove, true, false),
+    ] {
+        let mut meta = Some(acp::Meta::from_iter([
+            ("modelId".into(), serde_json::json!("provider-owned-model")),
+            ("yoloMode".into(), serde_json::json!(true)),
+            ("autoMode".into(), serde_json::json!(true)),
+        ]));
+        apply_permission_mode_override(&mut meta, Some(mode));
+        let meta = meta.unwrap();
+        assert_eq!(meta["modelId"], "provider-owned-model");
+        assert_eq!(meta["yoloMode"], yolo);
+        assert_eq!(meta["autoMode"], auto);
+    }
+    let mut meta = None;
+    apply_permission_mode_override(&mut meta, None);
+    assert!(meta.is_none());
+}
+
+#[test]
+fn format_acp_error_typed_truncation_kind_renders_truncation_copy() {
+    let err = acp::Error::internal_error()
+        .data(
+            serde_json::json!({
+            "message": "turn ended early",
+            "error_kind": "max_tokens_truncation"
+        }),
+        );
+    assert_eq!(
+            format_acp_error(&err, false),
+            "Response truncated: turn ended early"
+        );
+    let unknown = acp::Error::internal_error()
+        .data(
+            serde_json::json!({
+            "message": "a future failure quoting: response truncated by max_tokens",
+            "error_kind": "a_future_kind"
+        }),
+        );
+    assert_eq!(
+            format_acp_error(&unknown, false),
+            "Request failed: a future failure quoting: response truncated by max_tokens. Try sending again."
+        );
+}
+
+#[test]
+fn picker_parses_last_recap_and_last_turn_summary() {
+    let recent = chrono::Utc::now().to_rfc3339();
+    let payload = serde_json::json!({
+            "sessions": [{
+                "sessionId": "s_recap",
+                "cwd": "/Users/me/xai",
+                "summary": "Auth refactor",
+                "source": "local",
+                "updatedAt": recent,
+                "lastTurnSummary": "Wired retries into billing",
+                "lastRecap": "Where we left off: auth refactor across the API"
+            }]
+        });
+    let entries = parse_session_picker_entries(&payload);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+            entries[0].last_turn_summary.as_deref(),
+            Some("Wired retries into billing")
+        );
+    assert_eq!(
+            entries[0].last_recap.as_deref(),
+            Some("Where we left off: auth refactor across the API")
+        );
+}
+
+#[test]
+fn picker_parses_session_kind() {
+    let recent = chrono::Utc::now().to_rfc3339();
+    let payload = serde_json::json!({
+            "sessions": [
+                {
+                    "sessionId": "s_headless",
+                    "cwd": "/Users/me/xai",
+                    "summary": "Classify clip",
+                    "source": "local",
+                    "updatedAt": recent,
+                    "sessionKind": "headless"
+                },
+                {
+                    "sessionId": "s_plain",
+                    "cwd": "/Users/me/xai",
+                    "summary": "Interactive work",
+                    "source": "local",
+                    "updatedAt": recent
+                }
+            ]
+        });
+    let entries = parse_session_picker_entries(&payload);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].session_kind.as_deref(), Some("headless"));
+    assert_eq!(entries[1].session_kind, None);
+}
+
+#[tokio::test]
+async fn fetch_dashboard_sessions_explicitly_excludes_headless() {
+    use std::sync::{Arc, Mutex};
+    use xai_acp_lib::AcpAgentMessage;
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::default();
+    let captured_for_task = captured.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let AcpAgentMessage::ExtMethod(args) = msg {
+                assert_eq!(args.request.method.as_ref(), "x.ai/session/list");
+                let params = serde_json::from_str(args.request.params.get())
+                    .expect("params JSON");
+                *captured_for_task.lock().unwrap() = Some(params);
+                let body = serde_json::json!({ "result": { "sessions": [] } });
+                let raw = serde_json::value::RawValue::from_string(body.to_string())
+                    .expect("serialize list response");
+                let _ = args.response_tx.send(Ok(acp::ExtResponse::new(Arc::from(raw))));
+                break;
+            }
+        }
+    });
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+    execute(
+        Effect::FetchDashboardSessions,
+        &mut tasks,
+        &tx,
+        Path::new("."),
+        &SessionFlags::default(),
+        &progress_tx,
+    );
+    match tasks.join_next().await.expect("task").expect("no panic") {
+        TaskResult::DashboardSessionsLoaded { sessions } => assert!(sessions.is_empty()),
+        other => panic!("expected DashboardSessionsLoaded, got {other:?}"),
+    }
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.as_ref().unwrap()["headless"], "exclude");
+}
+
+#[tokio::test]
+async fn fetch_session_list_sends_kind_facet_filter() {
+    use std::sync::{Arc, Mutex};
+    use xai_acp_lib::AcpAgentMessage;
+    let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let captured_for_task = captured.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let AcpAgentMessage::ExtMethod(args) = msg {
+                let params: serde_json::Value = serde_json::from_str(
+                        args.request.params.get(),
+                    )
+                    .expect("params JSON");
+                captured_for_task.lock().unwrap().push(params);
+                let body = serde_json::json!({ "result": { "sessions": [] } });
+                let raw = serde_json::value::RawValue::from_string(body.to_string())
+                    .expect("ser");
+                let _ = args.response_tx.send(Ok(acp::ExtResponse::new(Arc::from(raw))));
+            }
+        }
+    });
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+    execute(
+        Effect::FetchSessionList {
+            host: crate::views::session_picker_surface::SessionPickerHost::Welcome,
+            generation: 1,
+            query: None,
+            seq: 1,
+            kind_filter: Some(vec!["build".into()]),
+            headless_policy: Default::default(),
+        },
+        &mut tasks,
+        &tx,
+        Path::new("."),
+        &SessionFlags::default(),
+        &progress_tx,
+    );
+    let _ = tasks.join_next().await;
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+            captured[0]["_meta"]["x.ai/facetFilters"]["kind"],
+            serde_json::json!(["build"])
+        );
+}
+
+#[tokio::test]
+async fn deep_search_sessions_echoes_routing_and_policy() {
+    use std::sync::{Arc, Mutex};
+    use crate::views::session_picker_surface::SessionPickerHost;
+    use xai_acp_lib::AcpAgentMessage;
+    let captured: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+    let captured_for_task = captured.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let AcpAgentMessage::ExtMethod(args) = msg {
+                let params = serde_json::from_str(args.request.params.get())
+                    .expect("deep-search params JSON");
+                captured_for_task
+                    .lock()
+                    .unwrap()
+                    .push((args.request.method.as_ref().to_string(), params));
+                let body = serde_json::json!({
+                        "result": { "results": [], "bootstrapping": false }
+                    });
+                let raw = serde_json::value::RawValue::from_string(body.to_string())
+                    .expect("serialize search response");
+                let _ = args.response_tx.send(Ok(acp::ExtResponse::new(Arc::from(raw))));
+            }
+        }
+    });
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+    execute(
+        Effect::DeepSearchSessions {
+            host: SessionPickerHost::AgentModal,
+            generation: 11,
+            query: "abc".into(),
+            seq: 4,
+            headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy::Only,
+        },
+        &mut tasks,
+        &tx,
+        Path::new("."),
+        &SessionFlags::default(),
+        &progress_tx,
+    );
+    match tasks.join_next().await.expect("task").expect("no panic") {
+        TaskResult::DeepSearchResults { host, generation, results, seq } => {
+            assert_eq!(host, SessionPickerHost::AgentModal, "host must be echoed");
+            assert_eq!(generation, 11, "generation must be echoed");
+            assert_eq!(seq, 4, "seq must be echoed");
+            assert!(results.is_empty());
+        }
+        other => panic!("expected DeepSearchResults, got {other:?}"),
+    }
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].0, "x.ai/session/search");
+    assert_eq!(captured[0].1["headless"], "only");
+}
+
+#[tokio::test]
+async fn load_card_detail_echoes_identity_and_zeroes_missing_session() {
+    use crate::views::session_picker_surface::SessionPickerHost;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+    execute(
+        Effect::LoadCardDetail {
+            host: SessionPickerHost::Welcome,
+            generation: 6,
+            source: "local".into(),
+            session_id: "wire-echo-missing-session-e5b1".into(),
+            cwd: "/nonexistent/effects-test".into(),
+            seq: 3,
+        },
+        &mut tasks,
+        &tx,
+        Path::new("."),
+        &SessionFlags::default(),
+        &progress_tx,
+    );
+    match tasks.join_next().await.expect("task").expect("no panic") {
+        TaskResult::CardDetailLoaded {
+            host,
+            generation,
+            source,
+            session_id,
+            seq,
+            detail,
+        } => {
+            assert_eq!(host, SessionPickerHost::Welcome, "host must be echoed");
+            assert_eq!(generation, 6, "generation must be echoed");
+            assert_eq!(seq, 3, "seq must be echoed");
+            assert_eq!(source, "local");
+            assert_eq!(session_id, "wire-echo-missing-session-e5b1");
+            assert_eq!(detail.turn_count, 0);
+            assert_eq!(detail.tool_call_count, 0);
+            assert!(detail.first_prompt_preview.is_empty());
+        }
+        other => panic!("expected CardDetailLoaded, got {other:?}"),
+    }
+}
 use xai_grok_shell::extensions::billing::{BillingConfig, Cent, UsagePeriod};
 use xai_grok_shell::sampling::error::FREE_USAGE_USER_MESSAGE;
 /// The invalid-params server detail survives `attach_prompt_usage`
@@ -28,14 +319,14 @@ fn format_acp_error_formats_http_500_dump() {
         );
     assert_eq!(
             format_acp_error(&err, false),
-            "Server error (500) \u{2014} Something went wrong on our side. Wait a minute and send again."
+            "Server error (500): Something went wrong on our side. Wait a minute and send again."
         );
 }
 #[test]
 fn format_acp_error_rate_limit_surfaces_detail_or_fallback() {
     use xai_grok_shell::sampling::error::{
-        RATE_LIMITED_ERROR_CODE, RATE_LIMITED_USER_MESSAGE_API_KEY,
-        RATE_LIMITED_USER_MESSAGE_OAUTH,
+        FREE_USAGE_USER_MESSAGE, RATE_LIMITED_ERROR_CODE,
+        RATE_LIMITED_USER_MESSAGE_API_KEY, RATE_LIMITED_USER_MESSAGE_OAUTH,
     };
     let cap_body = "The service is temporarily at capacity. Please retry your request shortly.";
     let capacity = acp::Error::new(RATE_LIMITED_ERROR_CODE, "Rate limited")
@@ -1639,14 +1930,28 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
         );
         tasks
     };
+    use crate::views::session_picker_surface::SessionPickerHost;
     let mut tasks = run(Effect::FetchSessionList {
+        host: SessionPickerHost::AgentModal,
+        generation: 41,
         query: Some("hit".into()),
         seq: 7,
         kind_filter: None,
+        headless_policy: Default::default(),
     });
     match tasks.join_next().await.expect("task").expect("no panic") {
-        TaskResult::SessionListLoaded { sessions, scope, seq, query, .. } => {
+        TaskResult::SessionListLoaded {
+            host,
+            generation,
+            sessions,
+            scope,
+            seq,
+            query,
+            ..
+        } => {
             assert!(sessions.is_empty());
+            assert_eq!(host, SessionPickerHost::AgentModal, "host must be echoed");
+            assert_eq!(generation, 41, "generation must be echoed");
             assert_eq!(seq, 7, "seq must be echoed, not reconstructed");
             assert_eq!(query.as_deref(), Some("hit"), "query must be echoed");
             assert!(
@@ -1657,9 +1962,12 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
         other => panic!("expected SessionListLoaded, got {other:?}"),
     }
     let mut tasks = run(Effect::FetchSessionList {
+        host: SessionPickerHost::Welcome,
+        generation: 42,
         query: None,
         seq: 8,
         kind_filter: None,
+        headless_policy: Default::default(),
     });
     match tasks.join_next().await.expect("task").expect("no panic") {
         TaskResult::SessionListLoaded { scope, seq, query, .. } => {
@@ -1673,13 +1981,18 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
         other => panic!("expected SessionListLoaded, got {other:?}"),
     }
     let mut tasks = run(Effect::FetchSessionList {
+        host: SessionPickerHost::Welcome,
+        generation: 43,
         query: Some("fail-me".into()),
         seq: 9,
         kind_filter: None,
+        headless_policy: Default::default(),
     });
     match tasks.join_next().await.expect("task").expect("no panic") {
-        TaskResult::SessionListFailed { error, seq, query } => {
+        TaskResult::SessionListFailed { host, generation, error, seq, query } => {
             assert_eq!(error, "boom");
+            assert_eq!(host, SessionPickerHost::Welcome, "failure must echo the host");
+            assert_eq!(generation, 43, "failure must echo the generation");
             assert_eq!(seq, 9);
             assert_eq!(
                     query.as_deref(),
@@ -1693,6 +2006,9 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
     assert_eq!(captured.len(), 3);
     assert_eq!(captured[0]["query"], "hit");
     assert_eq!(captured[0]["limit"], 30);
+    assert_eq!(captured[0]["headless"], "exclude");
+    assert_eq!(captured[1]["headless"], "exclude");
+    assert_eq!(captured[2]["headless"], "exclude");
     assert!(captured[0]["cwd"].is_string());
     assert!(
             captured[0].get("allowRelax").is_none(),
@@ -1772,8 +2088,11 @@ async fn debounce_session_search_echoes_query_and_seq() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut tasks = JoinSet::new();
+    use crate::views::session_picker_surface::SessionPickerHost;
     execute(
         Effect::DebounceSessionSearch {
+            host: SessionPickerHost::Welcome,
+            generation: 5,
             query: "abc".into(),
             seq: 9,
         },
@@ -1784,7 +2103,9 @@ async fn debounce_session_search_echoes_query_and_seq() {
         &progress_tx,
     );
     match tasks.join_next().await.expect("task").expect("no panic") {
-        TaskResult::SessionSearchDebounceExpired { query, seq } => {
+        TaskResult::SessionSearchDebounceExpired { host, generation, query, seq } => {
+            assert_eq!(host, SessionPickerHost::Welcome, "host must be echoed");
+            assert_eq!(generation, 5, "generation must be echoed");
             assert_eq!(query, "abc");
             assert_eq!(seq, 9);
         }
@@ -2447,6 +2768,8 @@ fn session_picker_entry_maps_to_dormant_roster_row() {
     use crate::app::roster::RosterActivity;
     let updated = chrono::Utc::now();
     let entry = SessionPickerEntry {
+        last_recap: None,
+        session_kind: None,
         id: "sess-1".to_string(),
         summary: "Wire up dashboard".to_string(),
         updated_at: updated,

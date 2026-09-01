@@ -1,4 +1,11 @@
 //! Native permission rule-string DSL and permission-mode vocabulary.
+//!
+//! `AgentMessage`, `SendSubagentMessage`, and `SendAgentMessage` share a dedicated
+//! agent-message filter; they do not grant file reads or command execution.
+//! Bash allow rules must cover every parsed command-chain segment. Deny and ask
+//! rules still outrank allows, including rules appended by `/add-dir`.
+//! Startup `alwaysAllow` hints require a trusted client and cannot override an
+//! explicit default mode, managed bypass restriction, hook Ask, or shell-file Ask.
 
 use std::str::FromStr;
 
@@ -77,11 +84,15 @@ pub(crate) struct DefaultModeEffects {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleParseError {
     /// Tool prefix is recognized but not supported (e.g., "EnterWorktree", "NotebookEdit", "NotebookRead").
-    UnsupportedToolPrefix { prefix: String },
-    /// Tool prefix is unrecognized.
-    UnknownToolPrefix { prefix: String },
-    /// Rule string is malformed (e.g., missing closing paren).
-    MalformedRule { detail: String },
+    UnsupportedToolPrefix {
+        prefix: String,
+    },
+    UnknownToolPrefix {
+        prefix: String,
+    },
+    MalformedRule {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for RuleParseError {
@@ -292,6 +303,9 @@ pub(crate) fn tool_name_to_filter(name: &str) -> Option<ToolFilter> {
         "Grep" | "Glob" => Some(ToolFilter::Grep),
         "WebFetch" => Some(ToolFilter::WebFetch),
         "WebSearch" => Some(ToolFilter::WebSearch),
+        "AgentMessage" | "SendSubagentMessage" | "SendAgentMessage" => {
+            Some(ToolFilter::AgentMessage)
+        }
         _ => None,
     }
 }
@@ -377,6 +391,22 @@ mod tests {
 
     /// `mcp__…` rule spellings (the `.claude/settings.json` form) map onto
     /// `ToolFilter::Mcp` globs over Grok's qualified `<server>__<tool>` names.
+    #[test]
+    fn parses_agent_message_filter_forms_including_legacy_alias() {
+        for (rule_str, action) in [
+            ("AgentMessage", RuleAction::Ask),
+            ("SendSubagentMessage(*)", RuleAction::Ask),
+            ("SendAgentMessage", RuleAction::Deny),
+            ("SendAgentMessage", RuleAction::Ask),
+            ("SendAgentMessage(*)", RuleAction::Deny),
+            ("SendAgentMessage(*)", RuleAction::Ask),
+        ] {
+            let rule = parse_permission_rule(rule_str, action).unwrap();
+            assert_eq!(rule.action, action, "{rule_str}");
+            assert_eq!(rule.tool, ToolFilter::AgentMessage, "{rule_str}");
+            assert!(rule.pattern.is_none(), "{rule_str}");
+        }
+    }
     #[test]
     fn parse_claude_mcp_rule_forms() {
         for (rule_str, expected_pattern) in [

@@ -399,7 +399,7 @@ fn paint_committed(
         let style = footer_style.bg(Color::Reset);
         // Clear any clipped content that landed on the footer row first.
         buf.set_style(row, style);
-        let text = format!("\u{2026} {hidden} more lines \u{2014} /transcript to view");
+        let text = format!("\u{2026} {hidden} more lines \u{00b7} /transcript to view");
         buf.set_span(buf.area.x, y, &Span::styled(text, style), width);
     }
 }
@@ -441,7 +441,7 @@ pub fn commit_active(app: &mut AppView, terminal: &mut PagerTerminal) {
     // Whether a turn is actively running. When idle, every remaining entry is
     // stable and committable (see `is_committable`); a stale `is_running` flag
     // left by the tracker must not wedge the frontier.
-    let turn_running = agent.session.state.is_turn_running();
+    let turn_running = minimal_api::is_turn_or_wake_running(agent);
     let cwd = agent.session.cwd.as_path();
     let sb = &mut agent.scrollback;
 

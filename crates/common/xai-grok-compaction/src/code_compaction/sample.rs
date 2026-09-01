@@ -140,7 +140,7 @@ where
             }
             Err(e) => {
                 let message = e.to_string();
-                let context_overflow = is_context_length_error(&message);
+                let context_overflow = e.is_context_overflow() || is_context_length_error(&message);
                 // A context overflow is deterministic for *this* input — retrying
                 // the same payload cannot help.
                 let deterministic = e.is_deterministic() || context_overflow;
@@ -163,6 +163,7 @@ where
                     });
                 }
                 if !will_retry {
+                    debug_assert!(!context_overflow);
                     return Err(SampleRetryError::Failure {
                         message,
                         deterministic: false,
@@ -319,6 +320,38 @@ mod tests {
         assert_eq!(sampler.call_count(), 1, "overflow must not retry");
     }
 
+    #[tokio::test]
+    async fn structured_context_overflow_flags_without_text_match() {
+        let sampler = MockSampler::scripted(vec![Err(CompactionSampleError::ContextOverflow(
+            "opaque upstream rejection".into(),
+        ))]);
+        let err = run(&sampler, 3).await.expect_err("should fail");
+        assert!(matches!(
+            err,
+            SampleRetryError::Failure {
+                deterministic: true,
+                context_overflow: true,
+                ..
+            }
+        ));
+        assert_eq!(sampler.call_count(), 1, "overflow must not retry");
+    }
+    #[tokio::test]
+    async fn rendered_413_message_is_context_overflow() {
+        let sampler = MockSampler::scripted(vec![Err(CompactionSampleError::Other(
+            anyhow::anyhow!("API error (status 413 Payload Too Large): Request failed (HTTP 413)."),
+        ))]);
+        let err = run(&sampler, 3).await.expect_err("should fail");
+        assert!(matches!(
+            err,
+            SampleRetryError::Failure {
+                deterministic: true,
+                context_overflow: true,
+                ..
+            }
+        ));
+        assert_eq!(sampler.call_count(), 1, "overflow must not retry");
+    }
     #[tokio::test]
     async fn conversation_exceeds_budget_is_context_overflow() {
         let sampler =

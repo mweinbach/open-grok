@@ -77,6 +77,7 @@ pub struct SessionHandle {
     /// notifications to the client via the gateway. See
     /// [`SessionActor::gateway_enabled`] for details.
     pub gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub status_line_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// MCP server configs for this session (merged local + client-provided).
     /// Stored on the handle so forked sessions can inherit the parent's
     /// MCP servers without requiring a round-trip through the session actor.
@@ -188,6 +189,15 @@ pub struct SessionHandle {
         Option<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle>,
 }
 impl SessionHandle {
+    pub(crate) fn set_status_line_wanted(&self, wanted: bool) {
+        self.status_line_enabled
+            .store(wanted, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn request_status_snapshot(&self) {
+        let _ = self.cmd_tx.send(SessionCommand::EmitStatusSnapshot);
+    }
+
     /// Last assistant `model_id` / `model_fingerprint` in conversation (global, not turn-scoped).
     pub(crate) async fn get_model_metadata(&self) -> xai_chat_state::ModelMetadata {
         let (tx, rx) = oneshot::channel();

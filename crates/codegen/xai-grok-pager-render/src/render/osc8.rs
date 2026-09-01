@@ -97,9 +97,11 @@ pub struct OverlayLink {
 }
 
 /// Accumulates link positions for post-flush OSC 8 emission.
+const SCANNER_ID_BASE: u32 = 1 << 31;
 #[derive(Debug, Clone)]
 pub struct LinkOverlay {
     links: Vec<OverlayLink>,
+    next_id: u32,
 }
 
 impl Default for LinkOverlay {
@@ -110,7 +112,10 @@ impl Default for LinkOverlay {
 
 impl LinkOverlay {
     pub fn new() -> Self {
-        Self { links: Vec::new() }
+        Self {
+            links: Vec::new(),
+            next_id: SCANNER_ID_BASE,
+        }
     }
 
     pub fn push(&mut self, link: OverlayLink) {
@@ -122,6 +127,9 @@ impl LinkOverlay {
         );
         if link.col_start > link.col_end {
             return; // Silently skip inverted ranges in release mode.
+        }
+        if let Some(id) = link.id {
+            self.next_id = self.next_id.max(id.saturating_add(1));
         }
         self.links.push(link);
     }
@@ -508,13 +516,15 @@ fn push_link_segments(
             return false;
         };
         if overlay.overlaps(row.screen_row, cs, ce) {
-            return false;
+            continue;
         }
         segments.push((row.screen_row, cs, ce));
     }
     if segments.is_empty() {
         return false;
     }
+    let id = overlay.next_id;
+    overlay.next_id = overlay.next_id.saturating_add(1);
     for (screen_row, col_start, col_end) in segments {
         overlay.push(OverlayLink {
             screen_row,
@@ -522,7 +532,7 @@ fn push_link_segments(
             col_end,
             target: target.clone(),
             presentation,
-            id: None,
+            id: Some(id),
         });
     }
     true
@@ -1160,7 +1170,7 @@ mod tests {
         // "See " = 4 display cols, content_x = 2
         assert_eq!(link.col_start, 6);
         assert_eq!(link.col_end, 6 + 19); // "https://example.com" = 19 chars
-        assert_eq!(link.id, None);
+        assert_eq!(link.id, Some(SCANNER_ID_BASE));
     }
 
     #[test]
@@ -1183,6 +1193,7 @@ mod tests {
             "https://b.example"
         );
         assert!(overlay.links()[0].col_end <= overlay.links()[1].col_start);
+        assert_ne!(overlay.links()[0].id, overlay.links()[1].id);
     }
 
     #[test]
@@ -1530,6 +1541,66 @@ mod tests {
                 "https://example.com/some/long/path?key=val"
             );
         }
+        assert_eq!(overlay.links()[0].id, overlay.links()[1].id);
+        assert!(
+            overlay.links()[0].id.is_some(),
+            "wrap fragments must share a nonempty OSC 8 id"
+        );
+    }
+
+    #[test]
+    fn scan_wrapped_url_fills_uncovered_continuation() {
+        let row0 = make_line("See https://example.com/some/lo");
+        let row1 = make_line("ng/path?key=val for details.");
+        let rows: Vec<(u16, &Line<'static>, Option<&str>)> =
+            vec![(0, &row0, None), (1, &row1, Some(""))];
+        let mut overlay = LinkOverlay::new();
+        overlay.push(OverlayLink {
+            screen_row: 0,
+            col_start: 4,
+            col_end: UnicodeWidthStr::width("See https://example.com/some/lo") as u16,
+            target: LinkTarget::Url(Arc::from("https://example.com/some/long/path?key=val")),
+            presentation: LinkPresentation::Opaque,
+            id: Some(7),
+        });
+        scan_lines_for_url_overlays(rows.into_iter(), 0, &[], &mut overlay);
+
+        assert_eq!(overlay.links().len(), 2);
+        assert_eq!(overlay.links()[1].screen_row, 1);
+        assert_eq!(overlay.links()[1].col_start, 0);
+        assert_eq!(
+            overlay.links()[1].col_end,
+            UnicodeWidthStr::width("ng/path?key=val") as u16
+        );
+        assert_eq!(
+            &*resolve_link_target(&overlay.links()[1].target)
+                .and_then(|resolved| resolved.osc8_url)
+                .expect("url"),
+            "https://example.com/some/long/path?key=val"
+        );
+    }
+
+    #[test]
+    fn scanner_id_never_collides_with_markdown_id() {
+        let line = make_line("See https://example.com for details.");
+        let mut overlay = LinkOverlay::new();
+        overlay.push(OverlayLink {
+            screen_row: 0,
+            col_start: 0,
+            col_end: 19,
+            target: LinkTarget::Url(Arc::from("https://example.com")),
+            presentation: LinkPresentation::Opaque,
+            id: Some(0),
+        });
+        scan_unjoined(std::iter::once((1, &line)), 0, &[], &mut overlay);
+
+        assert_eq!(overlay.links().len(), 2);
+        let scanned = &overlay.links()[1];
+        assert!(
+            scanned.id.is_some_and(|id| id >= SCANNER_ID_BASE),
+            "scanned id must come from the scanner namespace, got {:?}",
+            scanned.id
+        );
     }
 
     #[test]

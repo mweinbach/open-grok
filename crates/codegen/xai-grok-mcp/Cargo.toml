@@ -55,6 +55,7 @@ regex = { workspace = true }
 which = { workspace = true }
 # Atomic descriptor writes (NamedTempFile + persist) in materialize_descriptors.
 tempfile = { workspace = true }
+xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 xai-grok-tools = { workspace = true }
 xai-grok-telemetry = { workspace = true }
 xai-grok-workspace-types = { workspace = true }
@@ -66,6 +67,7 @@ xai-tool-types = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+serial_test = { workspace = true }
 # Used in servers.rs test `test_same_raw_name_different_servers_no_local_registry_collision`
 # to verify MCP tools register into a `LocalRegistry` without collision.
 xai-computer-hub-sdk = { workspace = true }

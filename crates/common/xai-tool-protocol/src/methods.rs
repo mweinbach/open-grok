@@ -135,6 +135,15 @@ define_methods! {
     /// Hub tells the server to stop serving a session
     /// (hub → server). Notification — no response expected.
     SessionUnbind => "session.unbind",
+    BotCommand => "bot.command",
+    BotVncDescriptor => "bot.vncDescriptor",
+    BotRoster => "bot.roster",
+    BotStatus => "bot.status",
+    BotTranscriptOffbox => "bot.transcript.offbox",
+    BotSubscribe => "bot.subscribe",
+    BotUnsubscribe => "bot.unsubscribe",
+    BotBindConversation => "bot.bindConversation",
+    BotEvent => "bot.event",
 }
 
 impl std::fmt::Display for Method {
@@ -149,45 +158,8 @@ mod tests {
 
     #[test]
     fn round_trip_as_wire_str_from_wire_str() {
-        let all = [
-            Method::SessionOpen,
-            Method::SessionClose,
-            Method::SessionBindServer,
-            Method::SessionUnbindServer,
-            Method::SessionAttachServer,
-            Method::ToolsList,
-            Method::ToolsSearch,
-            Method::ToolCall,
-            Method::ToolCancel,
-            Method::ToolNotify,
-            Method::SystemNotify,
-            Method::SubscribeNotifications,
-            Method::UnsubscribeNotifications,
-            Method::Hook,
-            Method::Hello,
-            Method::HelloAck,
-            Method::Ping,
-            Method::Pong,
-            Method::ToolCallProgress,
-            Method::ToolNotification,
-            Method::HookReply,
-            Method::TracesDonate,
-            Method::LogsDonate,
-            Method::MetricsDonate,
-            Method::ToolCallRequest,
-            Method::ToolsChanged,
-            Method::SubscribeAck,
-            Method::UnsubscribeAck,
-            Method::ServersList,
-            Method::ToolServerStatus,
-            Method::ToolServerGetStatus,
-            Method::ToolServerEvict,
-            Method::Serve,
-            Method::SessionBind,
-            Method::SessionUnbind,
-        ];
-        for m in all {
-            assert_eq!(Method::from_wire_str(m.as_wire_str()), Some(m));
+        for m in Method::ALL {
+            assert_eq!(Method::from_wire_str(m.as_wire_str()), Some(*m));
         }
     }
 
@@ -204,5 +176,21 @@ mod tests {
         assert_eq!(json.as_str(), Some("tool.call"));
         let back: Method = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, method);
+    }
+    #[test]
+    fn snake_case_bot_method_aliases_are_rejected() {
+        for alias in [
+            "bot.vnc_descriptor",
+            "bot.bind_conversation",
+            "bot.link_status",
+            "bot.linkStatus",
+            "bot.transcript_offbox",
+            "bot.ensure_box",
+            "bot.ensureBox",
+        ] {
+            assert_eq!(Method::from_wire_str(alias), None, "{alias}");
+            let err = serde_json::from_value::<Method>(serde_json::json!(alias)).unwrap_err();
+            assert!(!err.to_string().is_empty(), "{alias}");
+        }
     }
 }

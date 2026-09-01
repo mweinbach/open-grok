@@ -14,6 +14,7 @@ authors = ["xAI"]
 ignored = ["xai-ratatui-inline"]
 
 [dependencies]
+xai-grok-status-line = { path = "../xai-grok-status-line" }
 # The pager crate whose view-model (AppView / views / scrollback) this render
 # mode reads. NOTE: the dependency only points this way — `xai-grok-pager` must
 # NOT depend on this crate (that would be a cargo cycle). The pager invokes this

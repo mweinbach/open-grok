@@ -625,7 +625,7 @@ impl PastedImage {
         Some(PromptImagePreviewPreparation {
             preview: self.preview.clone(),
             source: self.encoded_bytes.as_ref()?.clone(),
-            protocol: crate::terminal::image::detect_graphics_protocol(),
+            protocol: crate::terminal::image::prompt_preview_graphics_protocol(),
             dimensions: self.dimensions,
         })
     }

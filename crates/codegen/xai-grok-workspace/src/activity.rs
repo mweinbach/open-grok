@@ -1,6 +1,17 @@
 //! Per-session and connection-level activity tracking for tool server
 //! lifecycle status reporting.
 
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -38,6 +49,14 @@ pub(crate) const RPC_ACTIVITY_WINDOW_MS: u64 = PREVIEW_ACTIVITY_WINDOW_MS;
 pub(crate) const PRESENCE_ACTIVITY_WINDOW_MS: u64 =
     xai_grok_workspace_types::rpc::presence::PRESENCE_ACTIVITY_WINDOW_MS;
 
+pub(crate) const SCHEDULED_TASK_KEEP_AWAKE_WINDOW_MS: u64 = 13 * 60 * 60 * 1000; // 13 hours
+
+const SCHEDULER_POLL_MAX_AGE_MS: u64 = 5 * 60 * 1000; // 5 minutes
+
+struct ScheduledPoll {
+    next_fire_ms: u64,
+    seen_at_ms: u64,
+}
 struct SessionActivity {
     active_tool_calls: AtomicU32,
     active_tools: DashMap<String, String>,
@@ -119,6 +138,8 @@ pub struct ActivityTracker {
     /// Window (ms) a client-presence note withholds idle for; `0` disables.
     presence_activity_window_ms: u64,
     /// Epoch ms a visible client-presence note was last received (`0` = none).
+    scheduled_task_keep_awake_window_ms: u64,
+    scheduled_poll: Mutex<Option<ScheduledPoll>>,
     last_presence_ms: AtomicU64,
     /// Highest presence-note `seq` applied (`0` = none). Guards against a
     /// slow superseded visible note landing after a newer hidden note and
@@ -216,6 +237,8 @@ impl ActivityTracker {
             rpc_activity_window_ms: RPC_ACTIVITY_WINDOW_MS,
             last_client_rpc_ms: AtomicU64::new(0),
             presence_activity_window_ms: PRESENCE_ACTIVITY_WINDOW_MS,
+            scheduled_task_keep_awake_window_ms: SCHEDULED_TASK_KEEP_AWAKE_WINDOW_MS,
+            scheduled_poll: Mutex::new(None),
             last_presence_ms: AtomicU64::new(0),
             last_presence_seq: Mutex::new(0),
             preview_ws_tunnels_open: AtomicU64::new(0),
@@ -262,6 +285,53 @@ impl ActivityTracker {
     /// [`tool_call_completed`](Self::tool_call_completed) can emit `Tool*`
     /// events. Set once during `WorkspaceHandle` construction; calling it a
     /// second time is a no-op (the first map wins).
+    pub fn with_scheduled_task_keep_awake_window_ms(mut self, window_ms: u64) -> Self {
+        self.scheduled_task_keep_awake_window_ms = window_ms;
+        self
+    }
+
+    pub fn record_scheduler_poll(&self, next_fire_ms: Option<u64>) {
+        self.record_scheduler_poll_at(next_fire_ms, now_ms());
+    }
+
+    fn record_scheduler_poll_at(&self, next_fire_ms: Option<u64>, seen_at_ms: u64) {
+        let next = next_fire_ms.map(|next_fire_ms| ScheduledPoll {
+            next_fire_ms,
+            seen_at_ms,
+        });
+
+        let mut poll = self
+            .scheduled_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed =
+            poll.as_ref().map(|p| p.next_fire_ms) != next.as_ref().map(|p| p.next_fire_ms);
+        *poll = next;
+        drop(poll);
+
+        if changed {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn scheduled_fire_withholds_idle(&self, now: u64) -> bool {
+        if self.scheduled_task_keep_awake_window_ms == 0 {
+            return false;
+        }
+
+        let poll = self
+            .scheduled_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(poll) = poll.as_ref() else {
+            return false;
+        };
+        if now.saturating_sub(poll.seen_at_ms) > SCHEDULER_POLL_MAX_AGE_MS {
+            return false;
+        }
+
+        now.saturating_add(self.scheduled_task_keep_awake_window_ms) >= poll.next_fire_ms
+    }
     pub fn set_event_writers(&self, writers: Arc<DashMap<String, EventWriter>>) {
         let _ = self.event_writers.set(writers);
     }
@@ -321,7 +391,10 @@ impl ActivityTracker {
         // Gate and stamp under one lock: split across two atomics, a slow
         // older visible note racing a newer hidden one could pass the seq
         // check and stamp after the hidden note, re-arming the withhold.
-        let mut last_seq = self.last_presence_seq.lock().unwrap();
+        let mut last_seq = self
+            .last_presence_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(seq) = seq {
             if *last_seq >= seq {
                 return;
@@ -528,6 +601,9 @@ impl ActivityTracker {
             // the hub's ceiling genuinely bounds an attached-but-idle client.
             return (true, Some(IdleWithholdReason::ClientPresence), anchor);
         }
+        if self.scheduled_fire_withholds_idle(now) {
+            return (true, Some(IdleWithholdReason::ScheduledTask), anchor);
+        }
         (false, None, anchor)
     }
 
@@ -655,6 +731,7 @@ impl ActivityTracker {
                 outcome,
                 tool_call_id: call_id.to_owned(),
                 source: ToolCompletedSource::Workspace,
+                rewriting_hook: None,
             });
         }
     }
@@ -1099,14 +1176,6 @@ mod tests {
     }
 
     #[test]
-    fn background_task_started_dedups_by_id() {
-        let t = ActivityTracker::new();
-        t.background_task_started("dup");
-        t.background_task_started("dup");
-        assert_eq!(t.snapshot().background_tasks, 1);
-    }
-
-    #[test]
     fn background_task_completed_unknown_id_does_not_underflow() {
         let t = ActivityTracker::new();
         t.background_task_completed("never-started");
@@ -1202,17 +1271,6 @@ mod tests {
             assert!(t.is_drained());
             assert!(t.tools_idle());
         }
-    }
-
-    #[test]
-    fn snapshot_payloads_report_idle_ignores_background_flag() {
-        let on = ActivityTracker::new().with_idle_ignores_background(true);
-        assert!(on.snapshot().idle_ignores_background);
-        assert!(on.snapshot_session("sess-a").idle_ignores_background);
-
-        let off = ActivityTracker::new();
-        assert!(!off.snapshot().idle_ignores_background);
-        assert!(!off.snapshot_session("sess-a").idle_ignores_background);
     }
 
     #[test]
@@ -1626,6 +1684,90 @@ mod tests {
         assert!(
             s.idle_since_ms.is_some(),
             "window 0 is the kill switch: the stamp must never withhold"
+        );
+        assert_eq!(s.withhold_reason, None);
+    }
+
+    #[test]
+    fn live_scheduler_with_pending_fire_withholds_idle() {
+        let t = ActivityTracker::new();
+        let started = t.started_at_ms;
+        t.record_scheduler_poll(Some(now_ms() + 60 * 60 * 1000));
+
+        let s = t.snapshot();
+        assert!(
+            s.idle_since_ms.is_none(),
+            "a live loop with a coming run withholds idle at any cadence inside the window"
+        );
+        assert_eq!(s.withhold_reason, Some(IdleWithholdReason::ScheduledTask));
+        assert_eq!(
+            s.withhold_since_ms,
+            Some(started),
+            "a waiting loop is not user activity, so the anchor stays on process start"
+        );
+
+        let per_session = t.snapshot_session("some-session");
+        assert!(
+            per_session.idle_since_ms.is_none(),
+            "the hold is aggregate: per-session payloads withhold too"
+        );
+    }
+
+    #[test]
+    fn dead_scheduler_releases_the_hold() {
+        let t = ActivityTracker::new();
+        t.record_scheduler_poll(Some(now_ms() + 60_000));
+
+        assert_eq!(
+            t.snapshot().withhold_reason,
+            Some(IdleWithholdReason::ScheduledTask)
+        );
+
+        t.record_scheduler_poll(None);
+        let s = t.snapshot();
+        assert!(s.idle_since_ms.is_some());
+        assert_eq!(s.withhold_reason, None);
+    }
+
+    #[test]
+    fn stale_poll_stamp_releases_the_hold() {
+        let t = ActivityTracker::new();
+        t.record_scheduler_poll_at(
+            Some(now_ms() + 60_000),
+            now_ms() - SCHEDULER_POLL_MAX_AGE_MS - 1,
+        );
+
+        assert_eq!(
+            t.snapshot().withhold_reason,
+            None,
+            "a dead poller cannot keep the sandbox awake"
+        );
+    }
+
+    #[test]
+    fn a_run_beyond_the_window_does_not_keep_awake() {
+        let t = ActivityTracker::new();
+        t.record_scheduler_poll(Some(
+            now_ms() + SCHEDULED_TASK_KEEP_AWAKE_WINDOW_MS + 60_000,
+        ));
+
+        let s = t.snapshot();
+        assert!(
+            s.idle_since_ms.is_some(),
+            "no sandbox lives to see a run past the window, so it must not keep awake"
+        );
+        assert_eq!(s.withhold_reason, None);
+    }
+
+    #[test]
+    fn zero_window_turns_the_keep_awake_off() {
+        let t = ActivityTracker::new().with_scheduled_task_keep_awake_window_ms(0);
+        t.record_scheduler_poll(Some(now_ms() + 60_000));
+
+        let s = t.snapshot();
+        assert!(
+            s.idle_since_ms.is_some(),
+            "window 0 is the off switch: a live loop must never keep the sandbox awake"
         );
         assert_eq!(s.withhold_reason, None);
     }
@@ -2074,18 +2216,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_completion_is_noop() {
-        let t = ActivityTracker::new();
-        t.tool_call_started("c1", "read_file", None);
-        assert_eq!(t.snapshot().active_tool_calls, 1);
-        t.tool_call_completed("c1", None, ToolOutcome::Success);
-        assert_eq!(t.snapshot().active_tool_calls, 0);
-        // Second completion of the same call_id must not underflow.
-        t.tool_call_completed("c1", None, ToolOutcome::Success);
-        assert_eq!(t.snapshot().active_tool_calls, 0);
-    }
-
-    #[test]
     fn unknown_call_id_completion_is_noop() {
         let t = ActivityTracker::new();
         // Completing a call_id that was never started must not underflow.
@@ -2113,13 +2243,6 @@ mod tests {
         assert_eq!(t.snapshot().background_tasks, 0);
         // Second completion must not underflow.
         t.background_task_completed("bg1");
-        assert_eq!(t.snapshot().background_tasks, 0);
-    }
-
-    #[test]
-    fn unknown_background_task_completion_is_noop() {
-        let t = ActivityTracker::new();
-        t.background_task_completed("never-started");
         assert_eq!(t.snapshot().background_tasks, 0);
     }
 
@@ -2436,5 +2559,41 @@ mod tests {
         // writer being open, and "unopened-sess" has none — so the map is empty
         // (this is exactly the production flag-off shape: sink wired, map empty).
         assert!(t.call_started_ms.is_empty());
+    }
+    #[test]
+    fn background_task_started_dedups_by_id() {
+        let t = ActivityTracker::new();
+        t.background_task_started("dup");
+        t.background_task_started("dup");
+        assert_eq!(t.snapshot().background_tasks, 1);
+    }
+
+    #[test]
+    fn snapshot_payloads_report_idle_ignores_background_flag() {
+        let on = ActivityTracker::new().with_idle_ignores_background(true);
+        assert!(on.snapshot().idle_ignores_background);
+        assert!(on.snapshot_session("sess-a").idle_ignores_background);
+
+        let off = ActivityTracker::new();
+        assert!(!off.snapshot().idle_ignores_background);
+        assert!(!off.snapshot_session("sess-a").idle_ignores_background);
+    }
+
+    #[test]
+    fn duplicate_completion_is_noop() {
+        let t = ActivityTracker::new();
+        t.tool_call_started("c1", "read_file", None);
+        assert_eq!(t.snapshot().active_tool_calls, 1);
+        t.tool_call_completed("c1", None, ToolOutcome::Success);
+        assert_eq!(t.snapshot().active_tool_calls, 0);
+        t.tool_call_completed("c1", None, ToolOutcome::Success);
+        assert_eq!(t.snapshot().active_tool_calls, 0);
+    }
+
+    #[test]
+    fn unknown_background_task_completion_is_noop() {
+        let t = ActivityTracker::new();
+        t.background_task_completed("never-started");
+        assert_eq!(t.snapshot().background_tasks, 0);
     }
 }

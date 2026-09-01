@@ -104,6 +104,7 @@ impl ToolCategory {
             ToolCallBlock::WebSearch(_) => Self::WebSearch,
             ToolCallBlock::IntegrationSearch(_) | ToolCallBlock::UseTool(_) => Self::Other,
             ToolCallBlock::MemorySearch(_)
+            | ToolCallBlock::SentMessage(_)
             | ToolCallBlock::Other(_)
             | ToolCallBlock::Lifecycle(_) => Self::Other,
         }
@@ -122,6 +123,7 @@ pub enum BlockStatus {
     Success,
     /// Tool failed with an error.
     Failed,
+    Unconfirmed,
     /// Tool is currently running/streaming.
     Running,
 }
@@ -159,6 +161,10 @@ impl CategoryStats {
     /// Number of failed operations.
     pub fn failed_count(&self) -> usize {
         *self.by_status.get(&BlockStatus::Failed).unwrap_or(&0)
+    }
+
+    pub fn unconfirmed_count(&self) -> usize {
+        *self.by_status.get(&BlockStatus::Unconfirmed).unwrap_or(&0)
     }
 
     /// Number of running operations.
@@ -284,7 +290,10 @@ impl ToolUsageStats {
                     let category = ToolCategory::from_tool_block(tc);
                     let status = if entry.is_running {
                         BlockStatus::Running
-                    } else if !Self::tool_block_is_success(tc) {
+                    } else if matches!(tc, ToolCallBlock::SentMessage(message) if message.is_unconfirmed())
+                    {
+                        BlockStatus::Unconfirmed
+                    } else if Self::tool_block_is_failure(tc) {
                         BlockStatus::Failed
                     } else {
                         BlockStatus::Success
@@ -367,9 +376,17 @@ impl ToolUsageStats {
             ToolCallBlock::IntegrationSearch(b) => b.is_success(),
             ToolCallBlock::UseTool(b) => b.is_success(),
             ToolCallBlock::MemorySearch(b) => b.is_success(),
+            ToolCallBlock::SentMessage(message) => message.is_success(),
             ToolCallBlock::Skill(b) => b.is_success(),
             ToolCallBlock::Other(b) => b.is_success(),
             ToolCallBlock::Lifecycle(_) => true,
+        }
+    }
+
+    fn tool_block_is_failure(block: &ToolCallBlock) -> bool {
+        match block {
+            ToolCallBlock::SentMessage(message) => message.is_failure(),
+            _ => !Self::tool_block_is_success(block),
         }
     }
 
@@ -386,6 +403,7 @@ impl ToolUsageStats {
             ToolCallBlock::IntegrationSearch(b) => b.elapsed_ms(),
             ToolCallBlock::UseTool(b) => b.elapsed_ms(),
             ToolCallBlock::MemorySearch(b) => b.elapsed_ms(),
+            ToolCallBlock::SentMessage(message) => message.elapsed_ms(),
             ToolCallBlock::Skill(b) => b.elapsed_ms(),
             ToolCallBlock::Other(b) => b.elapsed_ms(),
             ToolCallBlock::Lifecycle(_) => None,
@@ -427,6 +445,28 @@ mod tests {
         };
         assert_eq!(stats.percent_of(100), 10.0);
         assert_eq!(stats.percent_of(0), 0.0);
+    }
+
+    #[test]
+    fn unconfirmed_sent_message_is_not_counted_as_failed() {
+        let mut scrollback = ScrollbackState::new();
+        scrollback.push_block(RenderBlock::ToolCall(ToolCallBlock::SentMessage(
+            crate::scrollback::blocks::tool::SentMessageToolCallBlock::new(
+                crate::scrollback::blocks::tool::SentMessagePresentation::Unconfirmed {
+                    reason: "delivery could not be confirmed".into(),
+                },
+                Some("sub-1".into()),
+                Some("follow up".into()),
+            ),
+        )));
+
+        let stats = ToolUsageStats::from_scrollback(&scrollback);
+        let other = stats
+            .categories
+            .get(&ToolCategory::Other)
+            .expect("other stats");
+        assert_eq!(other.failed_count(), 0);
+        assert_eq!(other.unconfirmed_count(), 1);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use xai_grok_config_types::DisplayRefreshSettings;
+use xai_grok_status_line::StatusLineConfig;
 
 pub use xai_grok_tools::types::ImageGenerationProvider;
 
@@ -273,6 +274,12 @@ pub struct UiConfig {
     /// Written by the pager's Advanced Settings toggle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    #[serde(default, skip_serializing_if = "status_line_should_not_be_saved")]
+    pub status_line: StatusLineConfig,
+}
+
+fn status_line_should_not_be_saved(status_line: &StatusLineConfig) -> bool {
+    status_line.is_default() || status_line.problem().is_some()
 }
 
 /// User-config opt-outs for the per-tip contextual hints, serialized as
@@ -393,6 +400,7 @@ impl Default for UiConfig {
             enter_steers: None,
             display_refresh: DisplayRefreshSettings::default(),
             stream_tool_calls: None,
+            status_line: StatusLineConfig::default(),
         }
     }
 }
@@ -479,6 +487,45 @@ impl UiConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_typo_in_the_status_line_cannot_fail_the_rest_of_the_ui_table() {
+        let ui: UiConfig = serde_json::from_str(
+            r#"{"theme": "kanagawa", "status_line": {"type": "builtin", "items": "cwd"}}"#,
+        )
+        .expect("[ui] must survive whatever the status line says");
+        assert_eq!(ui.theme.as_deref(), Some("kanagawa"));
+        assert!(ui.status_line.problem().is_some());
+        let saved = serde_json::to_value(&ui).expect("[ui] serializes");
+        assert_eq!(saved["theme"], "kanagawa");
+        assert!(
+            saved.get("status_line").is_none(),
+            "a section we misread must not be written back over"
+        );
+    }
+    #[test]
+    fn only_a_status_line_we_read_in_full_is_written_back() {
+        for json in [
+            r#"{"status_line": {"type": "enabled"}}"#,
+            r#"{"status_line": {"type": "static", "text": "hi"}}"#,
+            r#"{"status_line": {"type": "builtin", "items": "cwd"}}"#,
+            r#"{"status_line": "builtin"}"#,
+            r#"{"status_line": {"padding": 2}}"#,
+            "{}",
+        ] {
+            let ui: UiConfig = serde_json::from_str(json).expect("[ui] survives it");
+            let saved = serde_json::to_value(&ui).expect("[ui] serializes");
+            assert!(saved.get("status_line").is_none(), "{json}");
+        }
+        for json in [
+            r#"{"status_line": {"type": "command", "command": "x"}}"#,
+            r#"{"status_line": {"type": "off"}}"#,
+        ] {
+            let ui: UiConfig = serde_json::from_str(json).expect("[ui] survives it");
+            let saved = serde_json::to_value(&ui).expect("[ui] serializes");
+            assert!(saved.get("status_line").is_some(), "{json}");
+        }
+    }
+
     use super::*;
 
     #[test]

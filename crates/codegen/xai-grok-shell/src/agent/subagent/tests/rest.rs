@@ -1754,8 +1754,7 @@ fn resume_route_pins_overlapping_slug_to_its_provider_profile() {
 fn resume_window_safety_rejects_instead_of_swapping() {
     let estimated_tokens: u64 = 100_000;
     let child_window: u64 = 256_000;
-    const SAFE_RESUME_PERCENT: u64 = 80;
-    let threshold = child_window * SAFE_RESUME_PERCENT / 100;
+    let threshold = resume_token_limit(child_window, 80);
     assert!(
             estimated_tokens <= threshold,
             "100k tokens should be within 80% of 256k window"

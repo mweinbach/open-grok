@@ -119,7 +119,10 @@ open-grok mcp doctor github        # Check one server
 open-grok mcp doctor --json        # Machine-readable output
 ```
 
-The transport defaults to `stdio`; pass `--transport http` or `--transport sse` for remote servers.
+An otherwise bare positional `http://` or `https://` URL automatically selects
+HTTP, including when `--header` is supplied. Commands, extra arguments, and
+`--env` keep the `stdio` default. Explicit `--transport` always wins; use
+`--transport sse` for SSE or `--transport stdio` to force a URL-looking command.
 
 By default `open-grok mcp add` writes to `~/.opengrok/config.toml` (`--scope user`). Use `--scope project` to write to `.opengrok/config.toml` in the current directory instead, which can be committed and shared with your team (see [Project-Scoped MCP Servers](#project-scoped-mcp-servers)). Header and environment variable values are stored verbatim, so reference secrets as `${VAR}` instead of pasting them into a committed project config (see [Example Configurations](#example-configurations)). `open-grok mcp list` shows servers from both scopes, marking project-scoped ones with `(project)` and disabled ones with `(disabled)`.
 

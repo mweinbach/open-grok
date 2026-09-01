@@ -31,12 +31,19 @@ Grok stores each session in its own directory, grouped by working directory. It 
   plan.json               # TODO/task list state
   rewind_points.jsonl     # rewind points for /rewind undo
   signals.json            # session signals (token usage, tool/turn counters)
+  usage.json              # session/turn model usage and reported cost summaries
   feedback.jsonl          # user feedback and ratings
   compaction_checkpoints/ # saved state from compaction (manual or auto)
   subagents/              # per-subagent metadata (meta.json); the child sessions live in the normal sessions tree
 ```
 
 `summary.json` is the index entry. It records the session summary and generated title, the model ID, the creation and update timestamps, the message counts, and a parent session reference for forked or restored sessions. `updates.jsonl` is the authoritative conversation log that drives `/resume` and session restore.
+
+Completed turns retain elapsed time and structured failure/cancellation
+metadata so resumed conversations can show the original turn footer. Older
+sessions without those optional fields remain readable. New headless sessions
+are classified separately for browsing, rather than being mixed into the
+default interactive-session list.
 
 ---
 
@@ -207,6 +214,19 @@ open-grok -p "What were we doing?" -c
 ```
 
 In headless mode, resume an existing session with `-r`/`--resume`, which errors if the session does not exist, or continue the most recent session in the current directory with `-c`/`--continue`. A non-ID value is matched against session titles for the current directory, ignoring letter case (a sole manually renamed match wins among duplicates; remaining duplicates error with their IDs; UUID-shaped values always take the ID path) — scripts should pass the session ID from JSON output (see below) to `-r`.
+
+`--memory-flush` requests a memory flush after a headless prompt. It can also
+run without a new prompt when resuming an existing session:
+
+```sh
+open-grok --memory-flush -r <session-id>
+open-grok --memory-flush -p "Finish the task" -r <session-id>
+```
+
+Flush-only mode requires `--resume` or `--continue`; it does not silently
+create an empty conversation. Memory configuration and the selected provider's
+normal routing rules still apply. Read persisted usage with
+`open-grok usage <session-id> [turn]`.
 
 Use `-s`/`--session-id` only to **create** a new session with a **UUID** (errors if the value is not a UUID, or if that ID already has a session under the target session directory). It does **not** resume an existing session — that was the old hidden upsert behavior; use `-r`/`-c` instead. Combine `-s` with `-r`/`-c` only when also passing `--fork-session` (forks history into a new ID; optional `-s` names the child UUID). This matches Claude Code’s anti-overwrite model (client preflight under the write cwd; sequential use is reliable, concurrent same-ID is best-effort).
 

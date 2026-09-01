@@ -89,6 +89,81 @@ async fn handle_btw(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     }
 }
 
+fn parse_feedback_input(params: &str) -> Result<ClientFeedbackInput, acp::Error> {
+    let max_request_bytes =
+        crate::session::feedback::MAX_FEEDBACK_IMAGE_TOTAL_BYTES.div_ceil(3) * 4 + 64 * 1024;
+    if params.len() > max_request_bytes {
+        return Err(acp::Error::invalid_params()
+            .data("Feedback request exceeds the attachment size budget"));
+    }
+    match serde_json::from_str::<ClientFeedbackInput>(params) {
+        Ok(input) => Ok(input),
+        Err(_) => {
+            let raw_input: serde_json::Value = serde_json::from_str(params)
+                .map_err(|_| acp::Error::invalid_params().data("Invalid feedback request"))?;
+            if raw_input.get("images").is_some() {
+                return Err(acp::Error::invalid_params().data("Invalid feedback image request"));
+            }
+            let simple: crate::session::FeedbackRequest = serde_json::from_value(raw_input)
+                .map_err(|_| acp::Error::invalid_params().data("Invalid feedback request"))?;
+            Ok(ClientFeedbackInput {
+                session_id: simple.session_id,
+                client_type: prod_mc_cli_chat_proxy_types::feedback_types::ClientType::Tui,
+                rating_type: None,
+                rating_value: None,
+                feedback_text: Some(simple.feedback_text),
+                images: vec![],
+                feedback_categories: vec![],
+                context_type: None,
+                turn_number: None,
+                request_id: None,
+                client_version: None,
+                metadata: None,
+                terminal_info: None,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod feedback_input_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_text_feedback_remains_compatible() {
+        let input =
+            parse_feedback_input(r#"{"session_id":"session","feedback_text":"feedback"}"#).unwrap();
+        assert!(input.images.is_empty());
+        assert_eq!(input.feedback_text.as_deref(), Some("feedback"));
+        assert_eq!(
+            input.client_type,
+            prod_mc_cli_chat_proxy_types::feedback_types::ClientType::Tui
+        );
+    }
+
+    #[test]
+    fn malformed_images_cannot_fall_back_to_legacy_text() {
+        assert!(parse_feedback_input(r#"{"session_id":"session","client_type":"tui","feedback_text":"feedback","images":"bad"}"#).is_err());
+        assert!(
+            parse_feedback_input(
+                r#"{"session_id":"session","feedback_text":"feedback","images":[]}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn oversized_feedback_is_rejected_before_json_parsing() {
+        let oversized = " ".repeat(
+            crate::session::feedback::MAX_FEEDBACK_IMAGE_TOTAL_BYTES.div_ceil(3) * 4
+                + 64 * 1024
+                + 1,
+        );
+        let error = parse_feedback_input(&oversized).unwrap_err();
+        assert!(error.to_string().contains("attachment size budget"));
+    }
+}
+
 async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     if !agent.cfg.borrow().is_feedback_enabled() {
         return Err(acp::Error::internal_error().data(
@@ -99,35 +174,23 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
 
     match args.method.as_ref() {
         "x.ai/feedback" => {
-            // Parse the input -- try the full ClientFeedbackInput first,
-            // then fall back to the simple FeedbackRequest (from /feedback slash command)
-            // which only has {session_id, feedback_text} and no client_type.
-            let feedback_input: ClientFeedbackInput =
-                match serde_json::from_str::<ClientFeedbackInput>(args.params.get()) {
-                    Ok(input) => input,
-                    Err(_) => {
-                        // Fallback: parse simple FeedbackRequest from /feedback command
-                        let simple: crate::session::FeedbackRequest = parse_params(args)?;
-                        ClientFeedbackInput {
-                            session_id: simple.session_id,
-                            client_type:
-                                prod_mc_cli_chat_proxy_types::feedback_types::ClientType::Tui,
-                            rating_type: None,
-                            rating_value: None,
-                            feedback_text: Some(simple.feedback_text),
-                            feedback_categories: vec![],
-                            context_type: None,
-                            turn_number: None,
-                            request_id: None,
-                            client_version: None,
-                            metadata: None,
-                            terminal_info: None,
-                        }
-                    }
-                };
+            let feedback_input = parse_feedback_input(args.params.get())?;
 
             let session_id = acp::SessionId::new(feedback_input.session_id.clone());
             let session_handle = agent.resident_handle(&session_id);
+
+            if !feedback_input.images.is_empty() {
+                if !session_handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.feedback_manager.allows_xai_export())
+                {
+                    return Err(acp::Error::invalid_params().data(
+                        "Feedback image attachments are unavailable for this provider or session",
+                    ));
+                }
+                crate::session::feedback::validate_feedback_image_payloads(&feedback_input.images)
+                    .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+            }
 
             let (model_id, model_metadata) = if let Some(ref session) = session_handle {
                 let (tx1, rx1) = tokio::sync::oneshot::channel();

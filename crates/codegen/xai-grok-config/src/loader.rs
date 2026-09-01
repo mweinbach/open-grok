@@ -13,6 +13,7 @@ use crate::version_overrides::{self, apply_version_overrides};
 /// Shared core of [`load_toml_file`] and the hook-layer read.
 fn read_toml_file(path: &Path) -> std::io::Result<toml::Value> {
     match std::fs::read_to_string(path) {
+        Ok(contents) if contents.trim().is_empty() => Ok(toml::Value::Table(toml::map::Map::new())),
         Ok(s) => match toml::from_str::<toml::Value>(&s) {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -24,7 +25,7 @@ fn read_toml_file(path: &Path) -> std::io::Result<toml::Value> {
                 Err(std::io::Error::other(detail))
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(toml::Value::Table(toml::map::Map::new()))
         }
         Err(e) => {
@@ -98,6 +99,10 @@ pub const MANAGED_CONFIG_FILENAME: &str = "managed_config.toml";
 /// Requirements (cloud-cache) filename — the sibling server-synced artifact.
 pub const REQUIREMENTS_FILENAME: &str = "requirements.toml";
 
+pub const TRUSTED_FOLDERS_FILENAME: &str = "trusted_folders.toml";
+pub const SANDBOX_CONFIG_FILENAME: &str = "sandbox.toml";
+pub const TRUSTED_HOOK_PROJECTS_FILENAME: &str = "trusted-hook-projects";
+pub const TRUSTED_PLUGINS_FILENAME: &str = "trusted-plugins";
 pub fn load_managed_config() -> std::io::Result<toml::Value> {
     load_user_config_layer(user_grok_home().as_deref(), MANAGED_CONFIG_FILENAME)
 }
@@ -178,6 +183,7 @@ pub enum HookProvenance {
     Managed,
     /// `requirements.toml` (user or system tier).
     Requirements,
+    UserRequirements,
     /// `$OPENGROK_HOME/config.toml`.
     User,
     /// A JSON hook file (the hooks directory, a vendor settings file, or a
@@ -201,12 +207,27 @@ impl Default for HookProvenance {
 }
 
 impl HookProvenance {
+    pub fn is_managed_policy(self) -> bool {
+        matches!(self, Self::SystemManaged | Self::Requirements)
+    }
+    pub fn authority_rank(self) -> u8 {
+        match self {
+            Self::SystemManaged => 6,
+            Self::Requirements => 5,
+            Self::Managed => 4,
+            Self::UserRequirements => 3,
+            Self::User => 2,
+            Self::File | Self::Plugin => 1,
+            Self::Unknown => 0,
+        }
+    }
     /// The snake_case wire string (matches the derived serde representation).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SystemManaged => "system_managed",
             Self::Managed => "managed",
             Self::Requirements => "requirements",
+            Self::UserRequirements => "user_requirements",
             Self::User => "user",
             Self::File => "file",
             Self::Plugin => "plugin",
@@ -225,6 +246,7 @@ impl std::str::FromStr for HookProvenance {
             "system_managed" => Self::SystemManaged,
             "managed" => Self::Managed,
             "requirements" => Self::Requirements,
+            "user_requirements" => Self::UserRequirements,
             "user" => Self::User,
             "file" => Self::File,
             "plugin" => Self::Plugin,
@@ -291,6 +313,29 @@ pub fn hook_config_layers() -> Vec<HookConfigLayer> {
     hook_config_layers_at(system_config_dir().as_deref(), user_grok_home().as_deref())
 }
 
+#[cfg(unix)]
+fn warn_unless_root_owned(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => tracing::warn!(
+            path = %path.display(),
+            "policy-tier hooks file is a symlink; its hooks cannot be disabled — ensure the target is admin-controlled"
+        ),
+        Ok(meta) if meta.uid() != 0 => tracing::warn!(
+            path = %path.display(),
+            uid = meta.uid(),
+            "policy-tier hooks file is not root-owned; its hooks cannot be disabled — enforcement assumes admin ownership"
+        ),
+        Ok(meta) if meta.mode() & 0o022 != 0 => tracing::warn!(
+            path = %path.display(),
+            mode = format!("{:o}", meta.mode() & 0o777),
+            "policy-tier hooks file is group- or world-writable; its hooks cannot be disabled — restrict write access to root"
+        ),
+        _ => {}
+    }
+}
+#[cfg(not(unix))]
+fn warn_unless_root_owned(_path: &Path) {}
 /// [`hook_config_layers`] with explicit directories, for tests.
 pub fn hook_config_layers_at(
     system_dir: Option<&Path>,
@@ -319,7 +364,7 @@ pub fn hook_config_layers_at(
         LayerSpec {
             dir: user_home,
             filename: REQUIREMENTS_FILENAME,
-            provenance: HookProvenance::Requirements,
+            provenance: HookProvenance::UserRequirements,
             source_name: "requirements/user",
         },
         LayerSpec {
@@ -355,6 +400,9 @@ pub fn hook_config_layers_at(
         };
         if !path.is_file() {
             continue;
+        }
+        if provenance.is_managed_policy() {
+            warn_unless_root_owned(&path);
         }
         // No `$VAR` expansion: a literal `${VAR}` must reach the hook runner, which
         // does the single expansion (expanding here would double-expand).
@@ -394,6 +442,7 @@ pub struct ConfigLayers {
     pub system_managed: toml::Value,
     pub managed: toml::Value,
     pub user: toml::Value,
+    pub env_overlay: Option<toml::Value>,
     pub user_requirements: Option<toml::Value>,
     pub system_requirements: Option<toml::Value>,
     /// macOS MDM requirements; highest requirements tier when present.
@@ -407,6 +456,7 @@ impl Default for ConfigLayers {
             system_managed: toml::Value::Table(Default::default()),
             managed: toml::Value::Table(Default::default()),
             user: toml::Value::Table(Default::default()),
+            env_overlay: None,
             user_requirements: None,
             system_requirements: None,
             mdm_requirements: None,
@@ -470,6 +520,7 @@ impl ConfigLayers {
             system_managed,
             managed,
             user,
+            env_overlay: crate::env_overlay::load_env_overlay(),
             user_requirements,
             system_requirements,
             mdm_requirements,
@@ -484,9 +535,20 @@ impl ConfigLayers {
 
     /// Layer merge only (no campaign overlay).
     pub fn effective_config_base(&self) -> toml::Value {
+        self.merge_with_overlay(true)
+    }
+
+    pub fn effective_config_base_without_overlay(&self) -> toml::Value {
+        self.merge_with_overlay(false)
+    }
+
+    fn merge_with_overlay(&self, include_overlay: bool) -> toml::Value {
         let mut merged = self.system_managed.clone();
         deep_merge_toml(&mut merged, &self.managed);
         deep_merge_toml(&mut merged, &self.user);
+        if include_overlay && let Some(overlay) = &self.env_overlay {
+            deep_merge_toml(&mut merged, overlay);
+        }
         if let Some(req) = &self.user_requirements {
             deep_merge_toml(&mut merged, req);
         }
@@ -558,6 +620,9 @@ impl ConfigLayers {
         active: &[crate::campaigns::CampaignEntry],
     ) {
         crate::campaigns::apply_active_campaign_patches(merged, active);
+        if let Some(overlay) = &self.env_overlay {
+            deep_merge_toml(merged, overlay);
+        }
         self.reapply_requirements(merged);
     }
 
@@ -654,7 +719,7 @@ pub fn load_dismissed_ids_from_home() -> std::collections::HashSet<String> {
 pub fn apply_version_overrides_with_registered(value: &mut toml::Value) -> std::io::Result<()> {
     match xai_grok_version::installed_semver() {
         Ok(version) => apply_version_overrides(value, &version)
-            .map_err(|e| std::io::Error::other(e.to_string())),
+            .map_err(|error| std::io::Error::other(error.redacted())),
         Err(_) => {
             if let Some(table) = value.as_table_mut() {
                 table.remove(version_overrides::VERSION_OVERRIDES_KEY);
@@ -754,6 +819,58 @@ pub fn expand_env_vars_in_string(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_hook_authority_is_not_user_claimable() {
+        use super::HookProvenance;
+        for provenance in [HookProvenance::SystemManaged, HookProvenance::Requirements] {
+            assert!(provenance.is_managed_policy());
+            assert!(provenance.authority_rank() > HookProvenance::Managed.authority_rank());
+        }
+        for provenance in [
+            HookProvenance::Managed,
+            HookProvenance::UserRequirements,
+            HookProvenance::User,
+            HookProvenance::File,
+            HookProvenance::Plugin,
+            HookProvenance::Unknown,
+        ] {
+            assert!(!provenance.is_managed_policy());
+            assert_eq!(
+                provenance.as_str().parse::<HookProvenance>().unwrap(),
+                provenance
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<HookProvenance>("\"future_policy\"").unwrap(),
+            HookProvenance::Unknown,
+        );
+    }
+
+    #[test]
+    fn env_overlay_is_excluded_from_security_view_and_clamped_by_requirements() {
+        let layers = super::ConfigLayers {
+            user: toml::from_str("[features]\nweb_fetch = false\n[models]\ndefault = 'local'")
+                .unwrap(),
+            env_overlay: Some(
+                toml::from_str("[features]\nweb_fetch = true\n[models]\ndefault = 'overlay'")
+                    .unwrap(),
+            ),
+            user_requirements: Some(toml::from_str("[models]\ndefault = 'required'").unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            layers.effective_config_base()["features"]["web_fetch"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            layers.effective_config_base_without_overlay()["features"]["web_fetch"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            layers.effective_config_base()["models"]["default"].as_str(),
+            Some("required")
+        );
+    }
     use super::*;
 
     fn write(dir: &Path, name: &str, contents: &str) {
@@ -793,6 +910,20 @@ mod tests {
         assert_eq!(cmd, "${HOME}/u.sh");
     }
 
+    #[test]
+    fn user_requirements_layer_is_not_managed_policy() {
+        let user_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_home.path().join("requirements.toml"),
+            "[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"x.sh\"\n",
+        )
+        .unwrap();
+        let layers = hook_config_layers_at(None, Some(user_home.path()));
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].provenance(), HookProvenance::UserRequirements);
+        assert_eq!(layers[0].source_name(), "requirements/user");
+        assert!(!layers[0].provenance().is_managed_policy());
+    }
     #[test]
     fn hook_config_layers_bad_user_layer_does_not_drop_managed() {
         // A broken user config.toml must not drop the admin managed layer.
@@ -1084,6 +1215,15 @@ mod tests {
         assert_eq!(v.as_table().map(|t| t.is_empty()), Some(true));
     }
 
+    #[test]
+    fn load_user_config_layer_treats_empty_file_as_empty_table() {
+        let dir = std::env::temp_dir().join(format!("grok-load-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), b"").unwrap();
+        let v = load_user_config_layer(Some(&dir), "config.toml").unwrap();
+        assert_eq!(v.as_table().map(|t| t.is_empty()), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn load_user_config_layer_reads_file_when_home_present() {
         use std::io::Write;

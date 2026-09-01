@@ -21,9 +21,14 @@ impl AgentView {
             .pending_prompts
             .iter()
             .position(|p| p.id == id)?;
-        // Deleting the row being edited discards the edit — and must exit
-        // BEFORE the removal so a potential auto-hide pane switch can't hit
-        // the editing lock (see queue_edit.rs ordering invariant).
+        if self
+            .session
+            .blocked_prompt
+            .as_ref()
+            .is_none_or(|b| b.row_id == id)
+        {
+            self.release_hook_block_hold();
+        }
         if matches!(
             self.prompt_mode,
             PromptMode::EditingQueued { id: editing_id, server_id: None, .. } if editing_id == id
@@ -36,6 +41,32 @@ impl AgentView {
             self.hide_queue_pane();
         }
         prompt
+    }
+
+    pub(in crate::app) fn resolve_queue_row(
+        &self,
+        id: u64,
+    ) -> (bool, Option<crate::views::queue_pane::QueueRowRef>) {
+        let row = self.queue.row_ref(id);
+        let is_server = matches!(
+            row.as_ref().map(|r| r.origin),
+            Some(crate::views::queue_pane::QueueRowOrigin::Server)
+        );
+        (is_server, row)
+    }
+
+    pub(super) fn try_focus_queue_from_prompt(&mut self) -> Option<InputOutcome> {
+        self.sync_queue_pane();
+        let id = *self.queue.entry_ids().last()?;
+
+        if !self.set_active_pane(AgentPane::Queue, false) {
+            return Some(InputOutcome::Changed);
+        }
+
+        self.queue.overlay.visible = true;
+        self.queue.overlay.focused = true;
+        self.queue.list_state.select_by_id(id);
+        Some(InputOutcome::Changed)
     }
 
     /// Force-send a queued follow-up mid-turn from the prompt (empty composer).
@@ -272,22 +303,6 @@ impl AgentView {
         watchers
     }
 
-    /// Shared tail of every turn-end marker push
-    /// (`push_turn_terminal_marker`).
-    pub(crate) fn push_end_marker_block(
-        &mut self,
-        event: crate::scrollback::blocks::SessionEvent,
-        stop_hooks: Vec<(String, Vec<crate::scrollback::blocks::tool::HookRunEntry>)>,
-        prompt_id: Option<String>,
-    ) {
-        // The marker keeps its turn's pid for the tail-merge attribution check.
-        let block = crate::scrollback::blocks::SessionEventBlock::with_stop_hooks(
-            event, stop_hooks, prompt_id,
-        );
-        self.scrollback
-            .push_block(crate::scrollback::block::RenderBlock::SessionEvent(block));
-    }
-
     /// `Some(is_prompt_like)` for a resolvable merged-queue row; `None` when it
     /// can't be resolved. Prompt-like rows may interject: plain prompts, plus
     /// raw skill slash rows (`/find-session args`) whose wire payload IS the
@@ -498,6 +513,9 @@ impl AgentView {
             .or_else(|| handle_overlay_nav_key(&mut self.queue.overlay, key));
         if let Some(action) = action {
             self.queue.on_state_change();
+            if !self.queue.overlay.visible && crate::views::dock::enabled() {
+                self.dock_queued_expanded = false;
+            }
             // Overlay dismiss skips hide_queue_pane; reset edge when queue is empty.
             if !self.queue.overlay.visible && self.visible_queue_is_empty() {
                 self.queue.reset_auto_show_edge();

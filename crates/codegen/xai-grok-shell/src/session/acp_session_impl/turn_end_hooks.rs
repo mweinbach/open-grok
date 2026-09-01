@@ -276,9 +276,7 @@ impl SessionActor {
         if !self.has_enabled_hooks_for(event::HookEventName::StopCancelled) {
             return None;
         }
-        self.chat_state_handle
-            .get_last_assistant_text_in_turn()
-            .await
+        self.chat_state_handle.get_trailing_assistant_report().await
     }
 
     /// Reports the running turn, reading the epoch without awaiting so no next turn can start

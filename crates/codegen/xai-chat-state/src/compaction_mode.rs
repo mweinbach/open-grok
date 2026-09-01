@@ -7,16 +7,19 @@ use crate::compaction_transcript::CompactionDetail;
 /// How compaction exposes pre-compaction history to the model afterwards.
 /// `Segments` carries its verbatim detail level inline, since detail is
 /// meaningful only there.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::Display)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display)]
 #[strum(serialize_all = "snake_case")]
 pub enum CompactionMode {
-    /// Summary only — no pointer back to pre-compaction history. Default.
-    #[default]
     Summary,
     /// Summary + pointer to the full raw `updates.jsonl`.
     Transcript,
-    /// Summary + a `compaction/` folder of clean per-segment markdown.
     Segments(CompactionDetail),
+}
+
+impl Default for CompactionMode {
+    fn default() -> Self {
+        Self::Segments(CompactionDetail::default())
+    }
 }
 
 impl CompactionMode {
@@ -100,7 +103,10 @@ mod tests {
             Some(CompactionMode::Segments(CompactionDetail::default()))
         );
         assert_eq!(CompactionMode::parse("nonsense"), None);
-        assert_eq!(CompactionMode::default(), CompactionMode::Summary);
+        assert_eq!(
+            CompactionMode::default(),
+            CompactionMode::Segments(CompactionDetail::default())
+        );
     }
 
     /// Detail is only attached to `Segments`; other modes ignore the override.

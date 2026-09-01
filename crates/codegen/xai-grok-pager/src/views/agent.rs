@@ -25,6 +25,9 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Padding, Widget};
+
+pub(crate) const SCROLLBACK_MIN_ROWS: u16 = 5;
+
 /// Which pane is currently active in the agent view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActivePane {
@@ -35,6 +38,7 @@ pub enum ActivePane {
     Prompt,
     Tasks,
     Catalog,
+    Dock,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum InputMode {
@@ -51,6 +55,7 @@ pub struct PaneAreas {
     pub prompt: Rect,
     pub tasks: Rect,
     pub catalog: Rect,
+    pub dock: Rect,
 }
 impl PaneAreas {
     /// Determine which pane a screen position falls in, if any.
@@ -67,6 +72,9 @@ impl PaneAreas {
         }
         if self.queue.area() > 0 && self.queue.contains(pos) {
             return Some(ActivePane::Queue);
+        }
+        if self.dock.area() > 0 && self.dock.contains(pos) {
+            return Some(ActivePane::Dock);
         }
         if self.scrollback.contains(pos) {
             return Some(ActivePane::Scrollback);
@@ -109,6 +117,7 @@ pub struct AgentViewLayout {
     pub scrollback: Rect,
     pub todo: Rect,
     pub queue: Rect,
+    pub dock: Rect,
     /// Inline /btw side question panel (above queue / turn status / prompt).
     pub btw: Rect,
     pub turn_status: Rect,
@@ -123,6 +132,7 @@ pub struct AgentViewLayout {
     pub voice_recording: Rect,
     pub prompt: Rect,
     pub shortcuts: Rect,
+    pub status_line: Rect,
     /// Scrollback area narrowed for scrollbar (content rendering uses this).
     pub scrollback_content: Rect,
     /// Scrollbar track position (x coordinate).
@@ -174,6 +184,8 @@ impl AgentViewLayout {
         prompt_gap: u16,
         voice_recording_height: u16,
         shortcuts_height: u16,
+        dock_height: u16,
+        status_line_height: u16,
         compact: bool,
     ) -> Self {
         let outer_vpad = layout_cfg.eff_outer_vpad(compact);
@@ -221,7 +233,7 @@ impl AgentViewLayout {
         }
         let status_gap = if top_vpad == 0 { 0u16 } else { 1 };
         constraints.push(Constraint::Length(status_gap));
-        constraints.push(Constraint::Min(5));
+        constraints.push(Constraint::Min(SCROLLBACK_MIN_ROWS));
         if btw_height > 0 {
             constraints.push(Constraint::Length(1));
             constraints.push(Constraint::Length(btw_height));
@@ -246,6 +258,10 @@ impl AgentViewLayout {
             constraints.push(Constraint::Length(1));
             constraints.push(Constraint::Length(follow_ups_height));
         }
+        if dock_height > 0 {
+            constraints.push(Constraint::Length(1));
+            constraints.push(Constraint::Length(dock_height));
+        }
         if prompt_gap > 0 {
             constraints.push(Constraint::Length(prompt_gap));
         }
@@ -253,9 +269,22 @@ impl AgentViewLayout {
             constraints.push(Constraint::Length(voice_recording_height));
         }
         constraints.push(Constraint::Length(prompt_height));
-        let shortcuts_gap = if bottom_vpad == 0 { 0u16 } else { 1 };
+        let reserved = constraints
+            .iter()
+            .map(|constraint| match constraint {
+                Constraint::Length(length) | Constraint::Min(length) | Constraint::Max(length) => {
+                    *length
+                }
+                _ => 0,
+            })
+            .fold(shortcuts_height, u16::saturating_add);
+        let status_line_height = status_line_height.min(inner_area.height.saturating_sub(reserved));
+        let shortcuts_gap = u16::from(bottom_vpad > 0 && status_line_height == 0);
         if shortcuts_gap > 0 {
             constraints.push(Constraint::Length(shortcuts_gap));
+        }
+        if status_line_height > 0 {
+            constraints.push(Constraint::Length(status_line_height));
         }
         constraints.push(Constraint::Length(shortcuts_height));
         let chunks = Layout::vertical(constraints).split(inner_area);
@@ -344,6 +373,14 @@ impl AgentViewLayout {
         } else {
             Rect::default()
         };
+        let dock = if dock_height > 0 {
+            i += 1;
+            let dock_area = chunks[i];
+            i += 1;
+            dock_area
+        } else {
+            Rect::default()
+        };
         if prompt_gap > 0 {
             i += 1;
         }
@@ -359,6 +396,13 @@ impl AgentViewLayout {
         if shortcuts_gap > 0 {
             i += 1;
         }
+        let status_line = if status_line_height > 0 {
+            let status_area = chunks[i];
+            i += 1;
+            status_area
+        } else {
+            Rect::default()
+        };
         let shortcuts = chunks[i];
         let scrollbar_x = area.right().saturating_sub(scrollbar_cfg.gap_right + 1);
         let timeline_width = if scrollbar_cfg.enabled {
@@ -389,6 +433,7 @@ impl AgentViewLayout {
             scrollback,
             todo,
             queue,
+            dock,
             btw,
             turn_status,
             banner,
@@ -397,6 +442,7 @@ impl AgentViewLayout {
             voice_recording,
             prompt,
             shortcuts,
+            status_line,
             scrollback_content,
             scrollbar_x,
             timeline_x,
@@ -426,6 +472,7 @@ impl AgentViewLayout {
             prompt: self.prompt,
             tasks: self.tasks,
             catalog: self.catalog,
+            dock: self.dock,
         }
     }
 }
@@ -680,7 +727,7 @@ pub fn render_hook_hover_popup(
         if y >= inner.y + inner.height {
             break;
         }
-        buf.set_line_safe(inner.x, y, &line.content, inner.width);
+        buf.set_line_safe_bidi(inner.x, y, &line.content, inner.width);
     }
 }
 /// Selection/hover chrome for a side pane (todo / queue / tasks). Focused panes get a dismiss control.
@@ -1068,6 +1115,11 @@ pub fn build_hints(
             hints
         }
         ActivePane::Catalog => vec![],
+        ActivePane::Dock => vec![
+            HintItem::paired(crate::key!('j'), crate::key!('k'), "navigate"),
+            HintItem::new(crate::key!(Enter), "open"),
+            HintItem::new(crate::key!('x'), "kill"),
+        ],
         ActivePane::Scrollback if scrollback_search.is_some() => {
             let mut hints = Vec::new();
             if vim_mode {
@@ -2122,11 +2174,57 @@ mod tests {
             0,
             0,
             1,
+            0,
+            0,
             false,
         )
     }
     fn layout_with_cta(area: Rect, cta_height: u16) -> AgentViewLayout {
         layout_with_rows(area, 0, cta_height, 0)
+    }
+
+    #[test]
+    fn dock_layout_preserves_prompt_and_status_line_rows() {
+        let layout = AgentViewLayout::compute(
+            Rect::new(0, 0, 100, 40),
+            &LayoutConfig::default(),
+            &ScrollbarConfig::default(),
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            4,
+            1,
+            false,
+        );
+        assert_eq!(layout.dock.height, 4);
+        assert_eq!(layout.status_line.height, 1);
+        assert_eq!(layout.prompt.height, 2);
+        assert!(layout.dock.bottom() <= layout.prompt.y);
+        assert!(layout.prompt.bottom() <= layout.status_line.y);
+        assert_eq!(layout.pane_areas().dock, layout.dock);
+    }
+
+    #[test]
+    fn dock_embedded_queue_takes_hit_test_precedence() {
+        let areas = PaneAreas {
+            dock: Rect::new(2, 10, 50, 8),
+            queue: Rect::new(2, 14, 50, 4),
+            ..Default::default()
+        };
+        assert_eq!(areas.hit_test(5, 12), Some(ActivePane::Dock));
+        assert_eq!(areas.hit_test(5, 15), Some(ActivePane::Queue));
     }
     /// Minimal layout with a timeline rail request — hides the cfg-dependent
     /// arity of `compute` like `layout_with_rows` does.
@@ -2155,6 +2253,8 @@ mod tests {
             0,
             0,
             1,
+            0,
+            0,
             false,
         )
     }

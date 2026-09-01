@@ -223,6 +223,52 @@ pub async fn presign_get_url(
     Ok(presigned.uri().to_string())
 }
 
+struct AbortMultipartOnDrop {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    armed: bool,
+}
+
+impl AbortMultipartOnDrop {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+
+    async fn abort(mut self) {
+        let _ = self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .send()
+            .await;
+        self.armed = false;
+    }
+}
+
+impl Drop for AbortMultipartOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let abort = self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id);
+        handle.spawn(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), abort.send()).await;
+        });
+    }
+}
+
 /// Multipart upload for payloads that exceed [`MULTIPART_THRESHOLD`].
 ///
 /// Splits `content` into [`MULTIPART_PART_SIZE`] chunks and uploads each as a
@@ -250,6 +296,13 @@ async fn multipart_upload_bytes(
         .upload_id()
         .context("CreateMultipartUpload response missing upload_id")?
         .to_owned();
+    let abort_guard = AbortMultipartOnDrop {
+        client: client.clone(),
+        bucket: bucket.to_owned(),
+        key: object_path.to_owned(),
+        upload_id: upload_id.clone(),
+        armed: true,
+    };
 
     let mut completed_parts = Vec::new();
     let mut offset = 0usize;
@@ -310,13 +363,9 @@ async fn multipart_upload_bytes(
     .await;
 
     if result.is_err() {
-        let _ = client
-            .abort_multipart_upload()
-            .bucket(bucket)
-            .key(object_path)
-            .upload_id(&upload_id)
-            .send()
-            .await;
+        abort_guard.abort().await;
+    } else {
+        abort_guard.disarm();
     }
 
     result
@@ -636,6 +685,200 @@ mod tests {
     struct MockS3State {
         objects: RwLock<HashMap<String, Vec<u8>>>,
         multipart_uploads: RwLock<MultipartUploads>,
+    }
+
+    async fn dropped_multipart_upload_aborts_the_upload() {
+        use axum::extract::Query;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TarpitState {
+            part_started: tokio::sync::Notify,
+            abort_seen: tokio::sync::Notify,
+            aborted: AtomicBool,
+        }
+        let state = Arc::new(TarpitState {
+            part_started: tokio::sync::Notify::new(),
+            abort_seen: tokio::sync::Notify::new(),
+            aborted: AtomicBool::new(false),
+        });
+
+        let shared_state = state.clone();
+        let put_handler = move |AxumPath((_, _key)): AxumPath<(String, String)>,
+                                _query: Query<HashMap<String, String>>,
+                                _body: axum::body::Bytes| {
+            let state = shared_state.clone();
+            async move {
+                state.part_started.notify_one();
+                std::future::pending::<()>().await;
+                StatusCode::OK.into_response()
+            }
+        };
+        let post_handler = move |AxumPath((_, _key)): AxumPath<(String, String)>,
+                                 query: Query<HashMap<String, String>>| async move {
+            if query.contains_key("uploads") {
+                return xml_response(
+                    200,
+                    "<InitiateMultipartUploadResult><UploadId>tarpit-upload</UploadId></InitiateMultipartUploadResult>".into(),
+                );
+            }
+            StatusCode::BAD_REQUEST.into_response()
+        };
+        let shared_state = state.clone();
+        let delete_handler =
+            move |AxumPath((_, _key)): AxumPath<(String, String)>,
+                  query: Query<HashMap<String, String>>| {
+                let state = shared_state.clone();
+                async move {
+                    if query.contains_key("uploadId") {
+                        state.aborted.store(true, Ordering::Relaxed);
+                        state.abort_seen.notify_one();
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                }
+            };
+        let router = Router::new()
+            .route(
+                "/{bucket}/{*key}",
+                axum::routing::put(put_handler)
+                    .post(post_handler)
+                    .delete(delete_handler),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(
+                2 * MULTIPART_PART_SIZE,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = build_s3_client(
+            "us-east-1",
+            Some(r#"{"aws_access_key_id":"test","aws_secret_access_key":"test"}"#),
+            None,
+            Some(&format!("http://{addr}")),
+        )
+        .await
+        .unwrap();
+        let content = vec![0u8; MULTIPART_THRESHOLD];
+        let mut upload = Box::pin(multipart_upload_bytes(
+            &client,
+            "test-bucket",
+            "obj.bin",
+            &content,
+            "application/octet-stream",
+        ));
+        tokio::select! {
+            _ = &mut upload => panic!("tarpitted part upload must not complete"),
+            _ = state.part_started.notified() => {}
+        }
+        drop(upload);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.abort_seen.notified(),
+        )
+        .await
+        .expect("dropped multipart upload must send AbortMultipartUpload");
+        assert!(state.aborted.load(Ordering::Relaxed));
+    }
+
+    /// Regression: cancelling the awaited error-path abort mid-send must leave
+    /// the drop backstop armed, so the abort still reaches the bucket.
+    #[tokio::test]
+    async fn cancelled_error_path_abort_still_aborts_via_drop_backstop() {
+        use axum::extract::Query;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AbortTarpitState {
+            abort_requests: AtomicUsize,
+            first_abort_started: tokio::sync::Notify,
+            second_abort_seen: tokio::sync::Notify,
+        }
+        let state = Arc::new(AbortTarpitState {
+            abort_requests: AtomicUsize::new(0),
+            first_abort_started: tokio::sync::Notify::new(),
+            second_abort_seen: tokio::sync::Notify::new(),
+        });
+
+        let put_handler = move |AxumPath((_, _key)): AxumPath<(String, String)>,
+                                _query: Query<HashMap<String, String>>,
+                                _body: axum::body::Bytes| async move {
+            StatusCode::FORBIDDEN.into_response()
+        };
+        let post_handler = move |AxumPath((_, _key)): AxumPath<(String, String)>,
+                                 query: Query<HashMap<String, String>>| async move {
+            if query.contains_key("uploads") {
+                return xml_response(
+                    200,
+                    "<InitiateMultipartUploadResult><UploadId>abort-tarpit</UploadId></InitiateMultipartUploadResult>".into(),
+                );
+            }
+            StatusCode::BAD_REQUEST.into_response()
+        };
+        let shared_state = state.clone();
+        let delete_handler =
+            move |AxumPath((_, _key)): AxumPath<(String, String)>,
+                  query: Query<HashMap<String, String>>| {
+                let state = shared_state.clone();
+                async move {
+                    if query.contains_key("uploadId") {
+                        let request_count =
+                            state.abort_requests.fetch_add(1, Ordering::Relaxed) + 1;
+                        if request_count == 1 {
+                            state.first_abort_started.notify_one();
+                            std::future::pending::<()>().await;
+                        } else {
+                            state.second_abort_seen.notify_one();
+                        }
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                }
+            };
+        let router = Router::new()
+            .route(
+                "/{bucket}/{*key}",
+                axum::routing::put(put_handler)
+                    .post(post_handler)
+                    .delete(delete_handler),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(
+                2 * MULTIPART_PART_SIZE,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = build_s3_client(
+            "us-east-1",
+            Some(r#"{"aws_access_key_id":"test","aws_secret_access_key":"test"}"#),
+            None,
+            Some(&format!("http://{addr}")),
+        )
+        .await
+        .unwrap();
+        let content = vec![0u8; MULTIPART_THRESHOLD];
+        let mut upload = Box::pin(multipart_upload_bytes(
+            &client,
+            "test-bucket",
+            "obj.bin",
+            &content,
+            "application/octet-stream",
+        ));
+        tokio::select! {
+            _ = &mut upload => panic!("upload must park on the tarpitted abort"),
+            _ = state.first_abort_started.notified() => {}
+        }
+        drop(upload);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.second_abort_seen.notified(),
+        )
+        .await
+        .expect("an abort cancelled mid-send must re-send via the drop backstop");
     }
 
     fn xml_response(status: u16, body: String) -> axum::response::Response {

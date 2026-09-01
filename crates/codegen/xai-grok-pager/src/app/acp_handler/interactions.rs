@@ -1,5 +1,92 @@
 use super::*;
 
+fn cancel_elicitation_request(
+    response_tx: tokio::sync::oneshot::Sender<xai_acp_lib::AcpResult<acp::ExtResponse>>,
+) {
+    let cancelled = xai_grok_tools::mcp_elicitation::McpElicitExtResponse::Cancel;
+    if let Ok(raw) = serde_json::value::to_raw_value(&cancelled) {
+        response_tx.send(Ok(acp::ExtResponse::new(raw.into()))).ok();
+    }
+}
+
+pub(crate) fn handle_mcp_elicit(
+    ext: xai_acp_lib::AcpArgs<acp::ExtRequest>,
+    app: &mut AppView,
+) -> bool {
+    use crate::views::elicitation_view::ElicitationViewState;
+    use xai_grok_tools::mcp_elicitation::McpElicitExtRequest;
+
+    let ext_req: McpElicitExtRequest = match serde_json::from_str(ext.request.params.get()) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to parse McpElicitExtRequest");
+            ext.response_tx
+                .send(Err(acp::Error::new(-32602, format!("Invalid params: {e}"))))
+                .ok();
+            return false;
+        }
+    };
+
+    let requested_session = acp::SessionId::new(ext_req.session_id.clone());
+    if matches!(
+        find_session_match(app, &requested_session),
+        Some(SessionMatch::Child(_))
+    ) {
+        cancel_elicitation_request(ext.response_tx);
+        return false;
+    }
+    let Some(id) = interaction_target_agent(app, &ext_req.session_id) else {
+        tracing::info!(
+            session_id = %ext_req.session_id,
+            "mcp elicit for a session with no local view; parked for leader replay-on-attach"
+        );
+        drop(ext.response_tx);
+        return false;
+    };
+    let is_active = is_matched_agent_active(app, id);
+    let Some(agent) = app.agents.get_mut(&id) else {
+        drop(ext.response_tx);
+        return false;
+    };
+
+    let waiting = agent
+        .elicitation_view
+        .as_ref()
+        .is_some_and(|ev| ev.is_url_waiting());
+    if waiting {
+        if let Some((_, old_tx)) = agent.pending_elicitation.take() {
+            cancel_elicitation_request(old_tx);
+        }
+        agent.pending_elicitation = Some((ext_req, ext.response_tx));
+        return is_active;
+    }
+
+    if let Some((_, old_tx)) = agent.pending_elicitation.take() {
+        cancel_elicitation_request(old_tx);
+    }
+
+    if let Some(mut old) = agent.elicitation_view.take() {
+        if let Some(old_tx) = old.take_response_tx() {
+            cancel_elicitation_request(old_tx);
+        }
+        agent.restore_elicitation_prompt(old.stashed_prompt);
+    }
+
+    let stashed = agent.stash_prompt_for_elicitation();
+    agent.elicitation_view = Some(ElicitationViewState::from_request(
+        ext_req,
+        stashed,
+        Some(ext.response_tx),
+    ));
+    agent.last_active_at = Some(std::time::Instant::now());
+
+    tracing::info!(
+        target_active = is_active,
+        "Opened MCP elicitation view from ext_method"
+    );
+    is_active
+}
+
 /// Handle `x.ai/ask_user_question` ext-method.
 ///
 /// Parses the typed request, creates a `QuestionViewState` with the
@@ -75,6 +162,7 @@ pub(crate) fn handle_ask_user_question(
         if let Some(ref kind) = old_qv.local_kind {
             use crate::views::question_view::LocalQuestionKind;
             let cmd = match kind {
+                LocalQuestionKind::PromptBlocked { .. } => "blocked prompt review",
                 LocalQuestionKind::Fork { .. } => "/fork",
                 LocalQuestionKind::NewSession => "/new",
                 LocalQuestionKind::CreditLimitUpsell { .. } => "credit-limit upsell",
@@ -84,7 +172,9 @@ pub(crate) fn handle_ask_user_question(
                 LocalQuestionKind::DeleteCurrentSession => "/delete",
                 LocalQuestionKind::Feedback => "/feedback",
             };
-            let message = if matches!(kind, LocalQuestionKind::DoctorFix { .. }) {
+            let message = if matches!(kind, LocalQuestionKind::PromptBlocked { .. }) {
+                "The blocked-prompt card was replaced by another question. Your prompt is still held at the front of the queue.".to_owned()
+            } else if matches!(kind, LocalQuestionKind::DoctorFix { .. }) {
                 "/doctor fix was cancelled because another question opened.".to_owned()
             } else {
                 format!("{cmd} cancelled because another question opened.")

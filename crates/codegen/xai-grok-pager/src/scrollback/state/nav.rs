@@ -389,6 +389,7 @@ impl ScrollbackState {
     pub fn scroll_up(&mut self, rows: u16) {
         self.scroll_offset = self.scroll_offset.saturating_sub(rows as usize);
         self.follow_mode = false;
+        self.maybe_release_pin_reserve();
         self.bump_generation();
     }
 
@@ -527,6 +528,7 @@ impl ScrollbackState {
     pub fn goto_top(&mut self) {
         self.scroll_offset = 0;
         self.follow_mode = false;
+        self.maybe_release_pin_reserve();
         let range = self.visible_entry_range();
         if !range.is_empty() {
             // Find first selectable entry
@@ -538,6 +540,7 @@ impl ScrollbackState {
 
     /// Go to bottom.
     pub fn goto_bottom(&mut self) {
+        self.release_pin_reserve();
         // Set scroll to bottom - fills screen with content, last entry at very bottom
         let max_offset = self
             .total_height
@@ -608,7 +611,11 @@ impl ScrollbackState {
     pub fn follow_new_turn(&mut self, prompt_idx: Option<usize>, page_flip: bool) {
         if page_flip {
             if let Some(idx) = prompt_idx {
+                self.arm_pin_reserve();
                 self.scroll_to_entry_top(idx);
+                self.pin_reserve_target = Some(self.scroll_offset);
+                self.pin_reserve_prompt_id = self.entries.get_index(idx).map(|(id, _)| *id);
+                self.compute_total_height_from_cache();
             }
             self.enable_follow_with_preserve();
         } else if prompt_idx.is_none() {
@@ -874,6 +881,21 @@ impl ScrollbackState {
         compute_sticky_layout(self.scroll_offset, self.viewport_height, &relative_prompts)
     }
 
+    pub(super) fn sticky_adjusted_entry_top(
+        &self,
+        cache: &LayoutCache,
+        visible_range: &Range<usize>,
+        entry_y: usize,
+    ) -> usize {
+        let relative_prompts = self.build_relative_prompt_descriptors(cache, visible_range);
+        let mut scroll = entry_y;
+        for _ in 0..3 {
+            let sticky = compute_sticky_layout(scroll, self.viewport_height, &relative_prompts);
+            scroll = entry_y.saturating_sub(sticky.header_screen_rows() as usize);
+        }
+        scroll
+    }
+
     /// Find scroll position that puts entry_y at top of content area.
     ///
     /// Uses relative prompt descriptors and iterates to find stable position
@@ -950,15 +972,7 @@ impl ScrollbackState {
         //
         // But header_height depends on scroll_offset (sticky headers collapse
         // as you scroll). Iterate to convergence (2 passes suffice).
-        let relative_prompts = self.build_relative_prompt_descriptors(cache, &visible_range);
-        let mut scroll = entry_y;
-        for _ in 0..3 {
-            let sticky = compute_sticky_layout(scroll, self.viewport_height, &relative_prompts);
-            let header = sticky.header_screen_rows();
-            scroll = entry_y.saturating_sub(header as usize);
-        }
-
-        Some(scroll)
+        Some(self.sticky_adjusted_entry_top(cache, &visible_range, entry_y))
     }
 
     pub fn scroll_to_entry_center(&mut self, entry_idx: usize) {
@@ -1189,12 +1203,14 @@ impl ScrollbackState {
         // No explicit invalidation needed — any user interaction (scroll,
         // fold, turn nav) sets follow_mode=false, making this unreachable.
         if self.follow_preserve_scroll {
-            let max_offset = self.max_scroll_offset();
-            if max_offset > self.scroll_offset {
+            let unpadded_total = self.total_height.saturating_sub(self.pin_reserve_pad);
+            let unpadded_max = unpadded_total.saturating_sub(self.viewport_height as usize);
+            if unpadded_max > self.scroll_offset && !self.pin_reserve_after_turn {
                 // Content overflowed past the viewport. Start following.
                 self.follow_preserve_scroll = false;
-                self.scroll_offset = max_offset;
-            } else if self.scroll_offset >= self.total_height {
+                self.release_pin_reserve();
+                self.scroll_offset = self.max_scroll_offset();
+            } else if self.scroll_offset >= unpadded_total {
                 // Content SHRANK under the pin (e.g. a tall running tool
                 // demoted to a collapsed background task), stranding the
                 // pinned offset past the END of the transcript: the paint
@@ -1206,7 +1222,10 @@ impl ScrollbackState {
                 // total_height), so it is never clamped here; this pin's
                 // referent is gone — consume it and re-pin to the bottom.
                 self.follow_preserve_scroll = false;
-                self.scroll_offset = max_offset;
+                self.clear_pin_reserve();
+                self.total_height = unpadded_total;
+                self.pin_reserve_pad = 0;
+                self.scroll_offset = self.max_scroll_offset();
             }
             // Otherwise: all new content still fits below the prompt. Stay put.
         } else {
@@ -1619,6 +1638,39 @@ mod tests {
         h.assert_at_bottom("should be at bottom after overflow");
     }
 
+    #[test]
+    fn page_flip_overflow_releases_reserve_before_finish_shrink() {
+        let mut harness = ScrollTestHarness::new(80, 10);
+        harness.push_prompt("old");
+        harness.push_agent("old response");
+        harness.send_prompt("new question");
+        let tall_id = harness.state.push_block(tall_agent_block());
+        let tall_idx = harness.state.len() - 1;
+        harness.frame();
+        assert!(!harness.is_preserve(), "overflow consumes preserve");
+        assert!(
+            !harness.state.is_pin_reserve_active(),
+            "overflow releases reserve"
+        );
+        let live_tail = harness.state.scroll_offset;
+        {
+            let entry = harness.state.entry_mut(tall_idx).expect("response entry");
+            entry.block = stub_block("short");
+            entry.invalidate_cache();
+        }
+        harness.state.mark_height_dirty(tall_id);
+        harness.frame();
+        assert!(
+            harness.state.scroll_offset < live_tail,
+            "collapsed content moves the real tail up"
+        );
+        assert!(
+            !harness.state.is_pin_reserve_active(),
+            "finish shrink cannot recreate the reserve"
+        );
+        harness.assert_at_bottom("finish shrink remains at the real tail");
+    }
+
     /// Regression (v0.2.89 live-transcript freeze): the page-flip pin holds
     /// an interjected prompt at the viewport top while the tall running tool
     /// ABOVE it demotes to a collapsed background task — a many-row height
@@ -1642,10 +1694,15 @@ mod tests {
 
         let pin = h.state.scroll_offset;
         assert!(h.is_preserve(), "setup: preserve pin armed");
-        assert!(
-            pin > h.max_offset() && pin < h.state.total_height,
-            "setup: page-flip pin above max_offset ({pin} > {}) but on real content ({pin} < {})",
+        assert_eq!(
+            pin,
             h.max_offset(),
+            "setup: pin pose is the padded bottom ({pin} == {})",
+            h.max_offset(),
+        );
+        assert!(
+            pin < h.state.total_height,
+            "setup: pin sits on real content ({pin} < {})",
             h.state.total_height,
         );
 

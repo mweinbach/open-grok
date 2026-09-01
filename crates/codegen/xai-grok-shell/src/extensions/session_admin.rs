@@ -169,6 +169,9 @@ async fn handle_session_rename(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
         let _ = handle
             .persistence_tx
             .send(PersistenceMsg::ManualTitleRenamed(req.title.clone()));
+        let _ = handle
+            .cmd_tx
+            .send(crate::session::commands::SessionCommand::TitleRenamed { manual: true });
     }
 
     // Update session search index with new title
@@ -253,6 +256,9 @@ async fn reset_session_title_to_auto(
     if cleared {
         if let Some(handle) = agent.resident_handle(&session_id_acp) {
             let _ = handle.persistence_tx.send(PersistenceMsg::ResetTitleToAuto);
+            let _ = handle
+                .cmd_tx
+                .send(crate::session::commands::SessionCommand::TitleRenamed { manual: false });
         }
         // Non-resident sessions have no persistence actor / RemoteSync.
         // Mirror the rename writeback path so a dormant unpin cannot leave

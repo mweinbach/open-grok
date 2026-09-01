@@ -102,12 +102,9 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
             (b.estimated_content_len() as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
         ConversationItem::Reasoning(r) => {
-            // Summary + content text follow the standard bytes-per-token
-            // estimate; encrypted blobs are base64 and don't survive
-            // tokenization 1:1, so estimate at len/4 as well.
             let text_bytes = xai_grok_sampling_types::reasoning_item_text(r).len();
             let enc_bytes = r.encrypted_content.as_deref().map(str::len).unwrap_or(0);
-            ((text_bytes + enc_bytes) as u64) / xai_token_estimation::BYTES_PER_TOKEN
+            (text_bytes.max(enc_bytes * 3 / 4) as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
     }
 }
@@ -353,6 +350,36 @@ mod tests {
             ((4_000usize * 3 / 4).saturating_sub(650) as u64)
                 / xai_token_estimation::BYTES_PER_TOKEN,
             "automatic compaction must count the opaque replacement item without rendering it"
+        );
+    }
+
+    #[test]
+    fn reasoning_estimate_takes_max_of_text_and_encrypted_not_sum() {
+        let mut reasoning = xai_grok_sampling_types::synthesized_reasoning_item("x".repeat(4000));
+        reasoning.encrypted_content = Some("e".repeat(4000));
+        assert_eq!(
+            estimate_item_tokens(&ConversationItem::Reasoning(reasoning)),
+            1000
+        );
+    }
+
+    #[test]
+    fn reasoning_estimate_encrypted_only_scales_base64_down() {
+        let mut reasoning = xai_grok_sampling_types::synthesized_reasoning_item("");
+        reasoning.summary.clear();
+        reasoning.encrypted_content = Some("e".repeat(4000));
+        assert_eq!(
+            estimate_item_tokens(&ConversationItem::Reasoning(reasoning)),
+            750
+        );
+    }
+
+    #[test]
+    fn reasoning_estimate_text_only_is_plain_bytes_per_token() {
+        let reasoning = xai_grok_sampling_types::synthesized_reasoning_item("x".repeat(4000));
+        assert_eq!(
+            estimate_item_tokens(&ConversationItem::Reasoning(reasoning)),
+            1000
         );
     }
 

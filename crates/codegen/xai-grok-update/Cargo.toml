@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+flate2 = { workspace = true }
 futures = { workspace = true }
 indicatif = { workspace = true }
 reqwest = { workspace = true }
@@ -13,6 +14,7 @@ semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tar = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["serde"] }
 tokio = { workspace = true, features = ["fs", "process", "io-util", "macros", "time"] }
@@ -22,6 +24,7 @@ xai-grok-shell = { workspace = true }
 xai-grok-telemetry = { workspace = true }
 xai-grok-tools = { workspace = true }
 xai-grok-version = { workspace = true }
+zstd = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }

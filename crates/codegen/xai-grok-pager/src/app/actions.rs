@@ -7,6 +7,7 @@
 //! - [`Effect`] — produced by dispatch, consumed by the event loop (async).
 //! - [`TaskResult`] — produced by spawned tasks, fed back into dispatch.
 use super::agent::AgentId;
+use crate::app::status_line::StatusLineRun;
 use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::ReasoningEffort;
@@ -57,6 +58,10 @@ pub enum SwitchModelError {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Action {
+    PromptBlockAnswered {
+        row_id: u64,
+        choice: PromptBlockChoice,
+    },
     /// Quit the application.
     Quit,
     /// Restart the binary to pick up a downloaded update.
@@ -86,6 +91,7 @@ pub enum Action {
     },
     /// Open grok.com in the browser for SuperGrok subscription upsell.
     OpenSupergrokUrl,
+    RetryCreditLimitPrompt,
     /// Re-check subscription status via the shell's `x.ai/auth/check_subscription`.
     CheckSubscription,
     /// Open an arbitrary URL in the system browser (with scheme validation).
@@ -929,9 +935,16 @@ pub enum Action {
     /// Enable swarm mode for exactly this prompt, then submit it normally.
     StartSwarmTask(String),
     /// Open the freeform feedback bottom pane (bare `/feedback`).
-    OpenFeedbackPane,
+    OpenFeedbackPane {
+        prefill: Option<String>,
+        images: crate::views::prompt_widget::FeedbackImages,
+    },
     /// Submit feedback text (inline `/feedback <text>` or pane submit).
-    SendFeedback(String),
+    SendFeedback {
+        text: String,
+        images: crate::views::prompt_widget::FeedbackImages,
+        trace: Option<FeedbackTraceChoice>,
+    },
     /// Enter remember mode (visual prompt change, not a send).
     EnterRememberMode,
     /// Send a remember note from # mode. Routes through LLM rewrite when a
@@ -1359,6 +1372,18 @@ pub enum PlanModeKind {
     /// Agent in `SessionMode::Default`.
     Off,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackTraceChoice {
+    AlwaysUpload,
+    NoUpload,
+    NeverAsk,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptBlockChoice {
+    Edit,
+    Resend,
+    Discard,
+}
 impl PlanModeKind {
     /// Canonical persisted/wire string for the kind. Matches the
     /// `EnumChoice.canonical` values in
@@ -1423,6 +1448,7 @@ pub enum ClipboardPasteTarget {
     AgentPrompt {
         agent_id: AgentId,
         images_dir: Option<std::path::PathBuf>,
+        feedback_tool_call_id: Option<String>,
     },
     /// Dashboard new-session dispatch input.
     DashboardDispatch,
@@ -1640,10 +1666,17 @@ pub enum AfterSessionDelete {
 /// [`TaskResult`] as `Action::TaskComplete`.
 #[derive(Debug)]
 pub enum Effect {
+    LoadAgentsPluginRegistry {
+        agent_id: AgentId,
+        cwd: std::path::PathBuf,
+        request_id: uuid::Uuid,
+    },
+    RunStatusLineCommand(StatusLineRun),
     /// Create a new ACP session.
     CreateSession {
         agent_id: AgentId,
         cwd: std::path::PathBuf,
+        permission_mode_override: Option<PermissionModeKind>,
         /// When set, injected as `_meta.modelId` into the
         /// `NewSessionRequest` so the shell spawns the session with
         /// the correct model and agent type from the start — avoids a
@@ -1845,6 +1878,7 @@ pub enum Effect {
     /// instead of creating a fresh one (`--resume` + `--worktree` combination).
     CreateWorktreeSession {
         agent_id: AgentId,
+        permission_mode_override: Option<PermissionModeKind>,
         load_session_id: Option<String>,
         label: Option<String>,
         /// Optional branch/tag/commit to base the worktree on (CLI `--ref`).
@@ -1901,24 +1935,31 @@ pub enum Effect {
     },
     /// Fetch session list for the welcome screen session picker.
     FetchSessionList {
-        /// Text search pushed down to `x.ai/session/list` as `query` (chat
-        /// mode: forwarded to the backend conversations search). `None`
-        /// fetches the unfiltered list.
+        /// The picker this fetch was issued for; the result routes back to this host's storage only.
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Live generation of the requesting picker at dispatch time.
+        generation: u64,
+        /// Text search pushed down to `x.ai/session/list` as `query` (chat mode: forwarded to the backend conversations search).
+        /// `None` fetches the unfiltered list.
         query: Option<String>,
-        /// Snapshot of [`crate::app::app_view::AppView::session_picker_list_seq`];
-        /// the response is dropped when no longer current, so out-of-order
-        /// completions can't clobber newer results.
+        /// Snapshot of [`crate::app::app_view::AppView::session_picker_list_seq`].
+        /// The response is dropped when no longer current, so out-of-order completions can't clobber newer results.
         seq: u64,
         /// Optional unified-list `kind` facet filter (`"chat"` / `"build"`).
-        /// When set, stamped as `_meta["x.ai/facetFilters"].kind` so the shell
-        /// honors multi-source history under `--chat` instead of forcing chat-only.
+        /// When set, stamped as `_meta["x.ai/facetFilters"].kind`.
+        /// The shell then honors multi-source history under `--chat` instead of forcing chat-only.
         kind_filter: Option<Vec<String>>,
+        /// Server-side `session_kind=headless` policy: `Only` while the picker is on the Headless page, `Exclude` everywhere else.
+        /// Applied by the shell before its page truncation, so it cannot be a client refilter.
+        headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy,
     },
     /// Coalesce picker search keystrokes: fires
     /// [`TaskResult::SessionSearchDebounceExpired`] after a short sleep; the
     /// expiry acts only if `seq` is still current (Build: FTS5 deep search
     /// against the deep-search seq; chat: server refetch against the list seq).
     DebounceSessionSearch {
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        generation: u64,
         query: String,
         seq: u64,
     },
@@ -1931,12 +1972,24 @@ pub enum Effect {
     /// FleetView roster. Issued while the dashboard is open and NOT in leader
     /// mode so the dashboard shows idle sessions instead of being empty.
     FetchDashboardSessions,
+    LoadWorkspaceSnapshot {
+        db_path: std::path::PathBuf,
+    },
+    UpsertWorkspaceMembers {
+        store: xai_grok_dashboard_store::WorkspaceStore,
+        members: Vec<xai_grok_dashboard_store::NewMember>,
+    },
     /// Load card detail for a specific session (lazy, reads chat history from disk).
     LoadCardDetail {
+        /// The picker whose row expansion requested the detail.
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Live generation of the requesting picker at dispatch time.
+        generation: u64,
         source: String,
         session_id: String,
         cwd: String,
-        generation: u64,
+        /// Snapshot of the requesting picker's detail seq; the result is dropped when the picker's rows or filters changed meanwhile.
+        seq: u64,
     },
     /// Restore a remote session from GCS then load it. Only Build rows reach
     /// this effect: conversation rows have no GCS archive.
@@ -2394,6 +2447,7 @@ pub enum Effect {
         agent_id: AgentId,
         session_id: acp::SessionId,
         feedback_text: String,
+        images: crate::views::prompt_widget::FeedbackImages,
     },
     /// Save a remember note to global MEMORY.md (async file write).
     SaveMemoryNote {
@@ -2560,8 +2614,15 @@ pub enum Effect {
     },
     /// Deep-search sessions by content (FTS via ACP).
     DeepSearchSessions {
+        /// The picker this search was issued for; the result routes back to this host's storage only.
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Live generation of the requesting picker at dispatch time.
+        generation: u64,
         query: String,
         seq: u64,
+        /// Server-side headless policy of the page that consumes the hits: `Only` on the Headless page, `Exclude` everywhere else.
+        /// Unresolved index rows are omitted from both classified views.
+        headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy,
     },
     /// Call `x.ai/session/fork` to create a peer session that resumes
     /// from `parent_session_id` in the same cwd (no worktree). Mirror of
@@ -2789,8 +2850,24 @@ impl TaskResult {
     }
 }
 #[derive(Debug)]
+pub struct WorkspaceMemberUpsertFailure {
+    pub session_id: String,
+    pub error: String,
+    pub retryable: bool,
+}
+
+#[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    AgentsPluginRegistryLoaded {
+        agent_id: AgentId,
+        request_id: uuid::Uuid,
+        result: Result<crate::views::agents_modal::AgentsPluginCatalog, String>,
+    },
+    StatusLineCommandFinished {
+        id: crate::app::status_line::RunId,
+        outcome: crate::app::status_line::RunOutcome,
+    },
     PerplexityWebSearchUpdated {
         enabled: bool,
         api_key_configured: bool,
@@ -3104,18 +3181,20 @@ pub enum TaskResult {
     },
     /// Session list fetched for the welcome screen picker.
     SessionListLoaded {
+        /// Echo of [`Effect::FetchSessionList::host`]; results apply only to the requesting host's picker storage.
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::FetchSessionList::generation`]; results for a superseded picker incarnation are dropped.
+        generation: u64,
         sessions: Vec<crate::app::app_view::SessionPickerEntry>,
-        /// Degraded conversations lane (`_meta["x.ai/partial"]`), surfaced
-        /// as an actionable picker notice instead of a silent empty list.
+        /// A degraded conversations lane (`_meta["x.ai/partial"]`), shown as an actionable picker notice instead of a silent empty list.
         partial: Option<crate::app::effects::ConversationsPartial>,
         /// Directory scope `sessions` were drawn from (`x.ai/listScope`).
         scope: xai_grok_shell::session::unified_list::ListScope,
         /// Echo of [`Effect::FetchSessionList::seq`]; stale results are dropped.
         seq: u64,
-        /// Echo of [`Effect::FetchSessionList::query`]. `Some` marks the
-        /// sessions as server-side search results: stamped so the local fuzzy
-        /// re-filter doesn't hide content-only hits, with zero hits a normal
-        /// outcome rather than an empty-directory error.
+        /// Echo of [`Effect::FetchSessionList::query`].
+        /// `Some` marks the sessions as server-side search results, so the local fuzzy re-filter doesn't hide content-only hits.
+        /// Zero hits are then a normal outcome rather than an empty-directory error.
         query: Option<String>,
     },
     /// A background foreign-session scan completed.
@@ -3137,16 +3216,24 @@ pub enum TaskResult {
     },
     /// Session list fetch failed.
     SessionListFailed {
+        /// Echo of [`Effect::FetchSessionList::host`].
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::FetchSessionList::generation`].
+        generation: u64,
         error: String,
         /// Echo of [`Effect::FetchSessionList::seq`]; stale failures are dropped.
         seq: u64,
-        /// Echo of [`Effect::FetchSessionList::query`]. `Some` (a failed
-        /// search) clears the search in-flight indicator; `None` must leave
-        /// it alone — in Build mode the flag belongs to the FTS5 deep search.
+        /// Echo of [`Effect::FetchSessionList::query`].
+        /// `Some` (a failed search) clears the search in-flight indicator.
+        /// `None` must leave it alone; in Build mode the flag belongs to the FTS5 deep search.
         query: Option<String>,
     },
     /// Picker search debounce elapsed ([`Effect::DebounceSessionSearch`]).
     SessionSearchDebounceExpired {
+        /// Echo of [`Effect::DebounceSessionSearch::host`].
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::DebounceSessionSearch::generation`].
+        generation: u64,
         query: String,
         seq: u64,
     },
@@ -3165,11 +3252,33 @@ pub enum TaskResult {
     DashboardSessionsLoaded {
         sessions: Vec<crate::app::roster::RosterEntry>,
     },
+    WorkspaceSnapshotLoaded {
+        store: xai_grok_dashboard_store::WorkspaceStore,
+        snapshot: xai_grok_dashboard_store::WorkspaceSnapshot,
+    },
+    WorkspaceSnapshotFailed {
+        error: String,
+    },
+    WorkspaceMembersUpserted {
+        store: xai_grok_dashboard_store::WorkspaceStore,
+        snapshot: Result<xai_grok_dashboard_store::WorkspaceSnapshot, String>,
+        failures: Vec<WorkspaceMemberUpsertFailure>,
+        attempted: Vec<xai_grok_dashboard_store::NewMember>,
+    },
+    WorkspaceMembersUpsertTaskFailed {
+        db_path: std::path::PathBuf,
+        error: String,
+    },
     /// Card detail loaded for a session in the picker.
     CardDetailLoaded {
+        /// Echo of [`Effect::LoadCardDetail::host`].
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::LoadCardDetail::generation`].
+        generation: u64,
         source: String,
         session_id: String,
-        generation: u64,
+        /// Echo of [`Effect::LoadCardDetail::seq`].
+        seq: u64,
         detail: crate::app::app_view::CardDetail,
     },
     /// Remote session restored successfully — now load it. Always a Build
@@ -3678,6 +3787,10 @@ pub enum TaskResult {
         generation: u64,
     },
     DeepSearchResults {
+        /// Echo of [`Effect::DeepSearchSessions::host`].
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::DeepSearchSessions::generation`].
+        generation: u64,
         results: Vec<xai_grok_shell::extensions::session_search::SearchSessionHit>,
         seq: u64,
     },

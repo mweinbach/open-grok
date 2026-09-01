@@ -181,8 +181,7 @@ pub(super) async fn run_session(
     index_root: std::path::PathBuf,
     fs_watch_caps: fs_watch::FsWatchCapabilities,
 ) {
-    let (completion_tx, mut completion_rx) =
-        mpsc::unbounded_channel::<(String, PromptTurnResult)>();
+    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<TurnCompletionMsg>();
     let mut turn_end_queue = super::turn_end_hooks::TurnEndQueue::spawn(session.clone());
     tracing::debug!("fs_notify_config: {:?}", fs_notify_config);
     let mut replay_buffer = ReplayBuffer::new(session.buffering_settings.clone());
@@ -292,6 +291,26 @@ pub(super) async fn run_session(
             .await;
         });
     }
+    let _elicitation_coordinator = if !session.startup_hints.is_subagent {
+        let inbox = xai_grok_mcp::elicitation::ElicitationInbox::new();
+        session
+            .mcp_state
+            .lock()
+            .await
+            .set_elicitation_tx(Some(inbox.clone()));
+        Some(
+            crate::session::mcp_elicitation::spawn_elicitation_coordinator(
+                inbox,
+                session.notifications.gateway.clone(),
+                session.session_info.id.clone(),
+                session.pending_interactions.clone(),
+                std::rc::Rc::clone(&session.attach_non_interactive),
+            ),
+        )
+    } else {
+        None
+    };
+    tokio::task::spawn_local(status_line::run_status_emitter(Arc::downgrade(&session)));
     let session_for_mcp = session.clone();
     let completion_tx_for_mcp = completion_tx.clone();
     tokio::task::spawn_local(async move {
@@ -448,7 +467,7 @@ pub(super) async fn run_session(
                     }
                 }
                 maybe_completion = completion_rx.recv() => {
-                    let Some((prompt_id, result)) = maybe_completion else {
+                    let Some(completion) = maybe_completion else {
                         // Completion channel closed: full feedback teardown so
                         // final signal sync + upload drain still run (cancel
                         // alone no longer force-syncs — shutdown owns that).
@@ -460,6 +479,7 @@ pub(super) async fn run_session(
                         finish_session_exit_feedback(&session).await;
                         return;
                     };
+                    let TurnCompletionMsg { prompt_id, epoch, task_identity, result, elapsed_ms, #[cfg(test)] processed } = completion;
                     // Flush any buffered turn deltas before `handle_completion`
                     // emits the durable `TurnCompleted`, so the terminal lands
                     // in updates.jsonl strictly after the turn's last
@@ -480,7 +500,9 @@ pub(super) async fn run_session(
                         })
                     );
                     let completed_prompt_id = prompt_id.clone();
-                    let owned_completion = session.handle_completion(prompt_id, result).await;
+                    let owned_completion = session.handle_completion(prompt_id, epoch, &task_identity, result, elapsed_ms).await;
+                    #[cfg(test)]
+                    if let Some(processed) = processed { let _ = processed.send(()); }
                     session.auto_exit_swarm_mode().await;
                     session.maybe_apply_pending_web_search_reload().await;
                     // Drain any monitor events that were routed to the mid-turn buffer
@@ -536,10 +558,12 @@ pub(super) async fn run_session(
                     // work the user aborted.
                     if turn_ran && turn_succeeded && owned_completion {
                         session.restart_turn_summary(completed_prompt_id);
+                        session.maybe_refresh_title();
                     }
                 }
                 maybe_cmd = cmd_rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
+                        session.abort_title_refresh();
                         // ── session_end (channel-closed path) ────────
                         // Queued reports first, so an earlier turn's report precedes the
                         // session-end `Stop`. Hooks fire BEFORE memory auto-save per plan contract.
@@ -603,13 +627,16 @@ pub(super) async fn run_session(
                                 s.resume_plan_approval(completion_tx).await;
                             });
                         }
+                        SessionCommand::TitleRenamed { manual } => {
+                            session.on_title_renamed(manual);
+                        }
                         SessionCommand::GetToolOverrides { respond_to } => {
                             let _ = respond_to.send(session.effective_tool_overrides());
                         }
                         SessionCommand::SetToolOverrides { overrides } => {
                             session.set_tool_overrides(overrides);
                         }
-                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, persist_ack, parsed_prompt_tx } => {
+                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, persist_ack, parsed_prompt_tx, initial_child_prompt_ready } => {
                             let origin = super::PromptOrigin::from_prompt_id(&prompt_id);
                             let (actor_admitted, task_wake_fallback) = match admission {
                                 Some(admission) => {
@@ -634,6 +661,7 @@ pub(super) async fn run_session(
                                 }
                                 let mut state = session.state.lock().await;
                                 state.notifications_suppressed = false;
+                                state.take_hook_block_hold();
                                 xai_grok_telemetry::unified_log::info(
                                     "shell.task_wake.gate_cleared",
                                     Some(session.session_info.id.0.as_ref()),
@@ -698,10 +726,12 @@ pub(super) async fn run_session(
                                     respond_to,
                                     persist_ack,
                                     parsed_prompt_tx,
+                                    initial_child_prompt_ready,
+                                    traceparent,
                                 })
                                 .await;
-                            if cancel_for_send_now {
-                                session.cancel_turn_for_send_now(&mut replay_buffer).await;
+                            if cancel_for_send_now && !session.cancel_turn_for_send_now(&mut replay_buffer).await.settled {
+                                continue;
                             }
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
@@ -810,17 +840,16 @@ pub(super) async fn run_session(
                                 .await;
                             let _ = respond_to.send(result);
                         }
+                        SessionCommand::ParentAgentMessage { delivery, receipt_sink, telemetry, respond_to } => {
+                            session.admit_parent_agent_message(delivery, receipt_sink, telemetry, respond_to, completion_tx.clone()).await;
+                        }
+                        SessionCommand::EmitStatusSnapshot => {
+                            session.status_wake.notify_one();
+                        }
                         SessionCommand::GetHooksList { respond_to } => {
-                            use crate::extensions::hooks::hook_spec_to_info;
-
-                            let hooks = match &*session.hook_registry.borrow() {
-                                Some(registry) => registry
-                                    .all_hooks()
-                                    .iter()
-                                    .map(|spec| hook_spec_to_info(spec))
-                                    .collect(),
-                                None => Vec::new(),
-                            };
+                            let hooks = crate::extensions::hooks::current_hook_infos(
+                                session.hook_registry.borrow().as_deref(),
+                            );
 
                             // Report the folder-trust verdict so the flag matches
                             // the gated registry built above.
@@ -970,30 +999,41 @@ pub(super) async fn run_session(
                             session.record_reparented_goal_turn_task_ids(task_ids);
                         }
                         SessionCommand::RemoveQueuedPrompt { id, expected_version, owner } => {
-                            session.handle_remove_queued_prompt(&id, expected_version, owner.as_deref()).await;
+                            if session.handle_remove_queued_prompt(&id, expected_version, owner.as_deref()).await {
+                                session.state.lock().await.take_hook_block_hold();
+                                SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
+                            }
                         }
                         SessionCommand::ReorderQueue { ordered_ids } => {
-                            session.handle_reorder_queue(&ordered_ids).await;
+                            if session.handle_reorder_queue(&ordered_ids).await {
+                                session.state.lock().await.take_hook_block_hold();
+                                SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
+                            }
                         }
                         SessionCommand::ClearQueue { owner } => {
-                            session.handle_clear_queue(owner.as_deref()).await;
+                            if session.handle_clear_queue(owner.as_deref()).await {
+                                session.state.lock().await.take_hook_block_hold();
+                                SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
+                            }
                         }
                         SessionCommand::EditQueuedPrompt { id, new_text, editor } => {
-                            session.handle_edit_queued_prompt(&id, new_text, editor.as_deref()).await;
+                            if session.handle_edit_queued_prompt(&id, new_text, editor.as_deref()).await {
+                                session.state.lock().await.take_hook_block_hold();
+                                SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
+                            }
                         }
                         SessionCommand::HoldCombineEdit { id } => {
-                            let mut state = session.state.lock().await;
-                            state.combine_edit_holds.insert(id);
+                            session.handle_hold_edit(id).await;
                         }
                         SessionCommand::ReleaseCombineEdit { id } => {
-                            let mut state = session.state.lock().await;
-                            state.combine_edit_holds.remove(&id);
+                            session.handle_release_edit(&id).await;
+                            SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
                         SessionCommand::InterjectQueuedPrompt { id, expected_version, owner, new_text } => {
                             // Send-now: the handler promoted the row; cancel the running turn and start it.
                             let cancel_for_send_now = session.handle_interject_queued_prompt(&id, expected_version, owner.as_deref(), new_text.as_deref()).await;
-                            if cancel_for_send_now {
-                                session.cancel_turn_for_send_now(&mut replay_buffer).await;
+                            if cancel_for_send_now && !session.cancel_turn_for_send_now(&mut replay_buffer).await.settled {
+                                continue;
                             }
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
@@ -1019,6 +1059,7 @@ pub(super) async fn run_session(
                             // under show-until-replaced the prior line should still
                             // finish. New real prompts and rewind abort separately.
                             let cancel = session.cancel_running_task(options).await;
+                            if !cancel.settled { continue; }
 
                             // Auto-pause the active goal on any cancel so timers stop
                             // and the pager shows "paused" instead of "active".
@@ -1808,6 +1849,7 @@ pub(super) async fn run_session(
                             let s = session.clone();
                             tokio::task::spawn_local(async move {
                                 s.retry_auth_required_servers().await;
+                                s.retry_unreachable_servers().await;
                                 let _ = respond_to.send(());
                             });
                         }
@@ -2098,8 +2140,10 @@ pub(super) async fn run_session(
                                         respond_to,
                                         persist_ack: None,
                                         parsed_prompt_tx: None,
-                                        queue_meta: None,
-                                        send_now: false,
+                                       queue_meta: None,
+                                       send_now: false,
+                                        initial_child_prompt_ready: None,
+                                        traceparent: None,
                                     });
                                 }
                                 SessionActor::maybe_start_running_task(
@@ -2185,8 +2229,10 @@ pub(super) async fn run_session(
                                         respond_to,
                                         persist_ack: None,
                                         parsed_prompt_tx: None,
-                                        queue_meta: None,
-                                        send_now: false,
+                                       queue_meta: None,
+                                       send_now: false,
+                                        initial_child_prompt_ready: None,
+                                        traceparent: None,
                                     });
                                 }
                                 SessionActor::maybe_start_running_task(
@@ -2221,8 +2267,10 @@ pub(super) async fn run_session(
                                     respond_to,
                                     persist_ack: None,
                                     parsed_prompt_tx: None,
-                                    queue_meta: None,
-                                    send_now: false,
+                                   queue_meta: None,
+                                   send_now: false,
+                                    initial_child_prompt_ready: None,
+                                    traceparent: None,
                                 });
                             }
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
@@ -2274,8 +2322,10 @@ pub(super) async fn run_session(
                                     respond_to,
                                     persist_ack: None,
                                     parsed_prompt_tx: None,
-                                    queue_meta: None,
-                                    send_now: false,
+                                   queue_meta: None,
+                                   send_now: false,
+                                    initial_child_prompt_ready: None,
+                                    traceparent: None,
                                 });
                             }
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
@@ -2349,6 +2399,7 @@ pub(super) async fn run_session(
                             // Session is ending: do not leave a side-call
                             // holding an Arc into this actor.
                             session.abort_turn_summary();
+                            session.abort_title_refresh();
                             // This arm returns; an unanswered turn would race
                             // teardown and report `EndTurn` for unfinished work.
                             if kind == crate::session::ShutdownKind::CancelRunningTurn {
@@ -2358,7 +2409,7 @@ pub(super) async fn run_session(
                                     .cancel_running_task(crate::session::CancelOptions {
                                         cancel_subagents: true,
                                         kill_background_tasks: true,
-                                        rewind_if_no_output: false,
+                                        history: crate::session::CancelHistoryDisposition::Keep,
                                         trigger: Some(crate::session::CancelTrigger::Shutdown),
                                         user_initiated: false,
                                     })

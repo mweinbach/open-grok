@@ -10,6 +10,9 @@ use crate::app::actions::Action;
 use std::time::Instant;
 
 impl AgentView {
+    const ITERM2_RESIZE_PREVIEW_QUIET: std::time::Duration = std::time::Duration::from_millis(300);
+    const ITERM2_RESIZE_TICK_MARGIN: std::time::Duration = std::time::Duration::from_millis(100);
+
     /// Show a brief toast message (e.g., "Copied!").
     ///
     /// Displayed for ~3 seconds (90 ticks at 30fps). Previous transient toast
@@ -210,12 +213,34 @@ impl AgentView {
     /// frame's worth of events, and a refusal burns nothing.
     pub(crate) fn note_terminal_resize(&mut self) {
         self.terminal_size_stale = true;
+        self.last_resize_at = Some(std::time::Instant::now());
+    }
+
+    pub(crate) fn resize_hides_prompt_preview(&self) -> bool {
+        self.within_resize_quiet(std::time::Duration::ZERO)
+    }
+
+    pub(crate) fn resize_preview_needs_tick(&self) -> bool {
+        self.within_resize_quiet(Self::ITERM2_RESIZE_TICK_MARGIN)
+    }
+
+    fn within_resize_quiet(&self, margin: std::time::Duration) -> bool {
+        use crate::terminal::image::{GraphicsProtocol, prompt_preview_graphics_protocol};
+        prompt_preview_graphics_protocol() == GraphicsProtocol::ITerm2
+            && self.last_resize_at.is_some_and(|resized_at| {
+                resized_at.elapsed() < Self::ITERM2_RESIZE_PREVIEW_QUIET + margin
+            })
     }
 
     /// Set or clear the sticky status banner (process-wide indicators should
     /// use [`Self::set_sticky_toast_recursive`] on every agent view).
     pub fn set_sticky_toast(&mut self, msg: Option<&str>) {
         self.sticky_toast = msg.map(|m| crate::glyphs::sanitize_toast_message(m).into_owned());
+    }
+
+    pub(in crate::app) fn release_hook_block_hold(&mut self) {
+        self.session.hook_block_hold = false;
+        self.session.blocked_prompt = None;
     }
 
     /// Propagate sticky status to this view and every nested subagent view.
@@ -360,6 +385,21 @@ impl AgentView {
                 // Best-effort clipboard so SSH/VM users can paste into a
                 // browser on another machine without selecting TUI text.
                 let _ = crate::clipboard::SystemClipboard::try_set(url);
+                self.show_toast("Browser unavailable - URL shown above");
+            }
+        }
+    }
+
+    pub(crate) fn open_untrusted_url_or_show(&mut self, url: &str) {
+        use crate::app::link_opener::{OpenUrlResult, browser_unavailable_message, try_open_url};
+        use crate::scrollback::block::RenderBlock;
+        use crate::terminal::hyperlinks::SchemeFilter;
+
+        match try_open_url(url, SchemeFilter::Standard) {
+            OpenUrlResult::Opened | OpenUrlResult::RejectedScheme => {}
+            OpenUrlResult::BrowserUnavailable => {
+                self.scrollback
+                    .push_block(RenderBlock::system(browser_unavailable_message(url)));
                 self.show_toast("Browser unavailable - URL shown above");
             }
         }

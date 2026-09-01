@@ -240,6 +240,31 @@ mod tests {
     }
 
     #[test]
+    fn work_policy_preserves_action_safety_and_gates_delegation() {
+        let prompt = render_base(&default_renderer(), &default_placeholders());
+        assert!(prompt.contains("<work_policy>"));
+        assert!(prompt.contains("<action_safety>"));
+        assert!(prompt.contains("Claim that something is done"));
+        assert!(prompt.contains("Before executing any actions that are hard to reverse"));
+        let renderer = TemplateRenderer::new(
+            HashMap::from([
+                (ToolKind::Read, "read_file".into()),
+                (ToolKind::Task, "spawn_subagent".into()),
+            ]),
+            HashMap::new(),
+        );
+        let prompt = render_base(&renderer, &default_placeholders());
+        assert!(prompt.contains("make the `spawn_subagent` calls near the start"));
+        let renderer = TemplateRenderer::new(
+            HashMap::from([(ToolKind::Read, "read_file".into())]),
+            HashMap::new(),
+        );
+        let prompt = render_base(&renderer, &default_placeholders());
+        assert!(!prompt.contains("make the `spawn_subagent` calls near the start"));
+        assert!(!prompt.contains("When the user explicitly asks you to use subagents"));
+    }
+
+    #[test]
     fn test_base_template_with_overridden_tool_names() {
         let tools: HashMap<ToolKind, String> = [
             (ToolKind::Read, "view_file".to_string()),

@@ -942,6 +942,9 @@ pub(crate) fn parse_remote_model_value(
         max_retries: get_u64(obj, "maxRetries")
             .or_else(|| get_u64(obj, "max_retries"))
             .and_then(|v| u32::try_from(v).ok()),
+        subagent_rate_limit_max_attempts: get_u64(obj, "subagentRateLimitMaxAttempts")
+            .or_else(|| get_u64(obj, "subagent_rate_limit_max_attempts"))
+            .and_then(|attempts| u32::try_from(attempts).ok()),
         hidden: obj
             .get("hidden")
             .or_else(|| meta.and_then(|m| m.get("hidden")))
@@ -1583,12 +1586,101 @@ mod tests {
     }
 
     #[test]
+    fn parse_subagent_rate_limit_attempts_accepts_aliases_and_u32_boundaries() {
+        for field in [
+            "subagentRateLimitMaxAttempts",
+            "subagent_rate_limit_max_attempts",
+        ] {
+            for attempts in [0, 8, u32::MAX] {
+                let mut value = serde_json::json!({"model": "retry-model"});
+                value[field] = serde_json::json!(attempts);
+                let parsed = parse_remote_model_value(&value, "https://model.invalid/v1").unwrap();
+                assert_eq!(parsed.subagent_rate_limit_max_attempts, Some(attempts));
+            }
+        }
+        let parsed = parse_remote_model_value(
+            &serde_json::json!({"model": "retry-model"}),
+            "https://model.invalid/v1",
+        )
+        .unwrap();
+        assert_eq!(parsed.subagent_rate_limit_max_attempts, None);
+    }
+
+    #[test]
+    fn parse_subagent_rate_limit_attempts_ignores_invalid_values_without_rejecting_model() {
+        for field in [
+            "subagentRateLimitMaxAttempts",
+            "subagent_rate_limit_max_attempts",
+        ] {
+            for invalid in [
+                serde_json::json!(u64::from(u32::MAX) + 1),
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("8"),
+                serde_json::json!(true),
+                serde_json::json!([]),
+                serde_json::Value::Null,
+            ] {
+                let mut value = serde_json::json!({"model": "retry-model"});
+                value[field] = invalid;
+                let parsed = parse_remote_model_value(&value, "https://model.invalid/v1").unwrap();
+                assert_eq!(parsed.subagent_rate_limit_max_attempts, None, "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_subagent_rate_limit_attempts_preserves_alias_precedence() {
+        for (camel, expected) in [
+            (serde_json::json!(0), Some(0)),
+            (serde_json::json!(8), Some(8)),
+            (serde_json::Value::Null, Some(12)),
+            (serde_json::json!("invalid"), Some(12)),
+            (serde_json::json!(u64::from(u32::MAX) + 1), None),
+        ] {
+            let value = serde_json::json!({
+                "model": "retry-model",
+                "subagentRateLimitMaxAttempts": camel,
+                "subagent_rate_limit_max_attempts": 12,
+            });
+            let parsed = parse_remote_model_value(&value, "https://model.invalid/v1").unwrap();
+            assert_eq!(parsed.subagent_rate_limit_max_attempts, expected);
+        }
+    }
+
+    #[test]
+    fn parse_subagent_rate_limit_attempts_preserves_provider_contract() {
+        for provider in ["xai", "openai", "fireworks", "custom"] {
+            let mut value = serde_json::json!({
+                "model": "shared-slug",
+                "provider": provider,
+                "apiBackend": "responses",
+                "baseUrl": "https://model.invalid/v1",
+                "apiBaseUrl": "https://key-route.invalid/v1",
+                "apiKey": "fixture-only-key",
+                "toolMode": "code_mode_only",
+                "subagentContextDefault": "fork",
+            });
+            let mut expected =
+                parse_remote_model_value(&value, "https://fallback.invalid/v1").unwrap();
+            expected.subagent_rate_limit_max_attempts = Some(8);
+            value["subagentRateLimitMaxAttempts"] = serde_json::json!(8);
+            let actual = parse_remote_model_value(&value, "https://fallback.invalid/v1").unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn parse_rejects_explicit_unknown_tool_mode() {
         for tool_mode in [serde_json::json!("automatic"), serde_json::json!(42)] {
             let value = serde_json::json!({
                 "model": "future-model",
                 "apiBackend": "responses",
                 "toolMode": tool_mode,
+                "subagentRateLimitMaxAttempts": 8,
                 "provider": "xai"
             });
             assert!(
@@ -1632,6 +1724,7 @@ mod tests {
     fn parse_rejects_explicit_unknown_provider_or_backend() {
         let unknown_provider = serde_json::json!({
             "model": "future-model",
+            "subagentRateLimitMaxAttempts": 8,
             "provider": "misspelled-provider"
         });
         assert!(
@@ -1641,6 +1734,7 @@ mod tests {
 
         let unknown_backend = serde_json::json!({
             "model": "future-model",
+            "subagentRateLimitMaxAttempts": 8,
             "apiBackend": "misspelled-backend"
         });
         assert!(

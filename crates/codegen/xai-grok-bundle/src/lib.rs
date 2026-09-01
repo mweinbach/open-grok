@@ -38,6 +38,7 @@ enum BundleFileKind {
     Role,
     Agent,
     Skill,
+    Workflow,
 }
 
 impl BundleFileKind {
@@ -47,6 +48,7 @@ impl BundleFileKind {
             Self::Role => "roles",
             Self::Agent => "agents",
             Self::Skill => "skills",
+            Self::Workflow => "workflows",
         }
     }
 
@@ -54,6 +56,7 @@ impl BundleFileKind {
         match self {
             Self::Agent | Self::Skill => "md",
             Self::Persona | Self::Role => "toml",
+            Self::Workflow => "rhai",
         }
     }
 
@@ -63,6 +66,7 @@ impl BundleFileKind {
             Self::Role => "role",
             Self::Agent => "agent",
             Self::Skill => "skill",
+            Self::Workflow => "workflow",
         }
     }
 
@@ -72,6 +76,7 @@ impl BundleFileKind {
             "roles" => Some(Self::Role),
             "agents" => Some(Self::Agent),
             "skills" => Some(Self::Skill),
+            "workflows" => Some(Self::Workflow),
             _ => None,
         }
     }
@@ -137,6 +142,16 @@ pub fn write_bundle_to_cache(root: &Path, bundle: &SubagentBundle) -> Result<Bun
                     next_checksums
                         .insert(bundle_file.relative_path.clone(), previous_checksum.clone());
                 }
+            }
+        }
+    }
+
+    if let Some(old_manifest) = old_manifest.as_ref() {
+        for (path, checksum) in &old_manifest.checksums {
+            if path.starts_with("workflows/") {
+                next_checksums
+                    .entry(path.clone())
+                    .or_insert_with(|| checksum.clone());
             }
         }
     }
@@ -277,6 +292,35 @@ pub fn checksum_file(path: &Path) -> Result<String> {
     Ok(checksum_bytes(&bytes))
 }
 
+pub fn is_managed_bundle_file(root: &Path, relative_path: &str) -> bool {
+    let relative_path = relative_path.replace('\\', "/");
+    let Some(relative_path) = sanitize_relative_path(&relative_path) else {
+        return false;
+    };
+    if !std::fs::symlink_metadata(manifest_path(root)).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    let mut absolute_path = root.to_path_buf();
+    for component in Path::new(&relative_path).components() {
+        absolute_path.push(component);
+        if !std::fs::symlink_metadata(&absolute_path)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+        {
+            return false;
+        }
+    }
+    let Ok(Some(manifest)) = read_cached_manifest(root) else {
+        return false;
+    };
+    let Some(expected) = manifest.checksums.get(&relative_path) else {
+        return false;
+    };
+    matches!(
+        bundle_file_state(&root.join(&relative_path), Some(expected.as_str())),
+        Ok(BundleFileState::MatchesManaged)
+    )
+}
+
 fn prune_removed_files(
     root: &Path,
     old_manifest: &BundleManifest,
@@ -307,7 +351,7 @@ fn ensure_bundle_dirs(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root)
         .with_context(|| format!("failed to create {}", root.display()))?;
 
-    for dir_name in ["personas", "roles", "agents", "skills"] {
+    for dir_name in ["personas", "roles", "agents", "skills", "workflows"] {
         let dir = root.join(dir_name);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
@@ -416,6 +460,9 @@ fn map_archive_path_to_cache_path(archive_path: &str) -> Option<String> {
     if archive_path.starts_with("skills/") {
         return sanitize_relative_path(archive_path);
     }
+    if archive_path.starts_with("workflows/") {
+        return sanitize_relative_path(archive_path);
+    }
     None
 }
 
@@ -496,6 +543,7 @@ pub mod test_helpers {
 
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::{bundle_json, make_test_archive};
     use super::*;
     use tempfile::TempDir;
 
@@ -531,6 +579,65 @@ mod tests {
             "instructions = \"hello\""
         );
         assert_eq!(read_cached_manifest(&root).unwrap(), Some(manifest));
+    }
+
+    #[test]
+    fn managed_verification_requires_valid_paths_and_matching_bytes() {
+        let directory = TempDir::new().unwrap();
+        let root = cache_root(&directory);
+        let bundle = bundle_with_persona("v1", "researcher", "instructions = \"original\"");
+        let mut manifest = write_bundle_to_cache(&root, &bundle).unwrap();
+        assert!(is_managed_bundle_file(&root, "personas/researcher.toml"));
+        assert!(!is_managed_bundle_file(&root, "personas/missing.toml"));
+        let outside = directory.path().join("outside.toml");
+        std::fs::write(&outside, "outside").unwrap();
+        manifest
+            .checksums
+            .insert("../outside.toml".into(), checksum_file(&outside).unwrap());
+        std::fs::write(manifest_path(&root), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(!is_managed_bundle_file(&root, "../outside.toml"));
+        assert!(!is_managed_bundle_file(&root, "personas/../outside.toml"));
+        std::fs::write(root.join("personas/researcher.toml"), "edited").unwrap();
+        assert!(!is_managed_bundle_file(&root, "personas/researcher.toml"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_managed_files_do_not_gain_builtin_privileges() {
+        let directory = TempDir::new().unwrap();
+        let root = cache_root(&directory);
+        let content = "instructions = \"original\"";
+        write_bundle_to_cache(&root, &bundle_with_persona("v1", "researcher", content)).unwrap();
+        let outside = directory.path().join("outside.toml");
+        std::fs::write(&outside, content).unwrap();
+        let file = root.join("personas/researcher.toml");
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&outside, &file).unwrap();
+        assert!(!is_managed_bundle_file(&root, "personas/researcher.toml"));
+    }
+
+    #[test]
+    fn json_fallback_does_not_prune_managed_workflows() {
+        let tmp = TempDir::new().unwrap();
+        let root = cache_root(&tmp);
+        let bundle = bundle_json("v1");
+        let archive = make_test_archive(&[
+            ("bundle.json", bundle.as_bytes()),
+            (
+                "workflows/deep-research.rhai",
+                b"let meta = #{ name: \"deep-research\", description: \"d\" };",
+            ),
+        ]);
+        extract_bundle_archive(&root, &archive).unwrap();
+        assert!(root.join("workflows/deep-research.rhai").is_file());
+
+        let manifest = write_bundle_to_cache(&root, &SubagentBundle::empty("v2")).unwrap();
+        assert!(root.join("workflows/deep-research.rhai").is_file());
+        assert!(
+            manifest
+                .checksums
+                .contains_key("workflows/deep-research.rhai")
+        );
     }
 
     #[test]
@@ -924,6 +1031,10 @@ mod tests {
             ("subagents/roles/reviewer.toml", b"description = \"review\""),
             ("subagents/agents/default.md", b"# agent"),
             ("skills/commit/SKILL.md", b"# Commit skill"),
+            (
+                "workflows/deep-research.rhai",
+                b"let meta = #{ name: \"deep-research\", description: \"d\" };",
+            ),
         ]);
 
         let manifest = extract_bundle_archive(&root, &archive).unwrap();
@@ -945,10 +1056,28 @@ mod tests {
             std::fs::read_to_string(root.join("skills/commit/SKILL.md")).unwrap(),
             "# Commit skill"
         );
+        assert_eq!(
+            std::fs::read_to_string(root.join("workflows/deep-research.rhai")).unwrap(),
+            "let meta = #{ name: \"deep-research\", description: \"d\" };"
+        );
         assert!(manifest.checksums.contains_key("personas/researcher.toml"));
         assert!(manifest.checksums.contains_key("roles/reviewer.toml"));
         assert!(manifest.checksums.contains_key("agents/default.md"));
         assert!(manifest.checksums.contains_key("skills/commit/SKILL.md"));
+        assert!(
+            manifest
+                .checksums
+                .contains_key("workflows/deep-research.rhai")
+        );
+        assert!(is_managed_bundle_file(
+            &root,
+            "workflows/deep-research.rhai"
+        ));
+        std::fs::write(root.join("workflows/deep-research.rhai"), "tampered").unwrap();
+        assert!(!is_managed_bundle_file(
+            &root,
+            "workflows/deep-research.rhai"
+        ));
     }
 
     #[test]

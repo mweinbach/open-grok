@@ -183,3 +183,52 @@ pub fn make_feature_branch(dir: &Path, picks: usize) -> String {
     run_git(dir, &["checkout", "feature"]);
     base
 }
+
+pub fn git_init_seed(dir: &Path) {
+    run_git(dir, &["init", "-b", "main"]);
+    let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    run_git(dir, &["config", "core.excludesFile", null_path]);
+}
+pub fn seed_repo(temp: &Path) -> PathBuf {
+    let repo = temp.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_git_repo(&repo);
+    std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+    git_commit_all(&repo, "initial");
+    repo
+}
+pub fn seed_repo_with_remote(temp: &Path) -> (PathBuf, PathBuf) {
+    let repo = seed_repo(temp);
+    let remote = temp.join("remote.git");
+    run_git(temp, &["init", "--bare", remote.to_str().unwrap()]);
+    run_git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    run_git(&repo, &["push", "origin", "HEAD:refs/heads/main"]);
+    run_git(&repo, &["fetch", "origin"]);
+    (repo, remote)
+}
+pub fn reflog_only_commit(worktree: &Path, when: Option<&str>) -> String {
+    std::fs::write(worktree.join("tracked.txt"), "three hours of work\n").unwrap();
+    let dates = when.map(|date| [("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)]);
+    run_git_with_env(
+        worktree,
+        &["commit", "-am", "work only this worktree saw"],
+        dates
+            .as_ref()
+            .map(|deserializer| &deserializer[..])
+            .unwrap_or(&[]),
+    );
+    let discarded = run_git(worktree, &["rev-parse", "HEAD"]);
+    run_git(worktree, &["reset", "--hard", "HEAD~1"]);
+    assert_eq!(
+        run_git(
+            worktree,
+            &["rev-list", "--max-count=1", &discarded, "--not", "--all"]
+        ),
+        discarded,
+        "no ref names it, so only the reflog does"
+    );
+    discarded
+}

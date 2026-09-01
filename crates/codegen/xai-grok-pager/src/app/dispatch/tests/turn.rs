@@ -319,6 +319,9 @@ fn lost_cancel_is_resent_while_still_cancelling() {
             prompt_id: "p1".into(),
             stop_reason: Some("cancelled".into()),
             agent_result: None,
+            cancellation_category: None,
+            cancellation_context: None,
+            error_kind: None,
             cancel_trigger: None,
             received_at: std::time::Instant::now(),
         });
@@ -390,6 +393,9 @@ fn cancel_retry_reuses_recorded_subagent_choice() {
             prompt_id: "p1".into(),
             stop_reason: Some("cancelled".into()),
             agent_result: None,
+            cancellation_category: None,
+            cancellation_context: None,
+            error_kind: None,
             cancel_trigger: None,
             received_at: std::time::Instant::now(),
         });
@@ -434,6 +440,9 @@ fn confirmed_stop_retry_does_not_rearm_auto_resend() {
             prompt_id: "p1".into(),
             stop_reason: Some("cancelled".into()),
             agent_result: None,
+            cancellation_category: None,
+            cancellation_context: None,
+            error_kind: None,
             cancel_trigger: None,
             received_at: std::time::Instant::now(),
         });
@@ -637,7 +646,11 @@ fn do_cancel_turn_cancels_running_wake_turn() {
         });
     }
 
-    let effects = super::super::turn::do_cancel_turn(&mut app, true);
+    let effects = super::super::turn::do_cancel_turn(
+        &mut app,
+        true,
+        crate::app::cancel_latency::CancelOrigin::Programmatic,
+    );
     assert!(
         matches!(
             effects.as_slice(),
@@ -1250,6 +1263,9 @@ fn reconcile_error_formats_marker_and_defers_to_banner() {
                 prompt_id: "pid-stuck".into(),
                 stop_reason: Some("error".into()),
                 agent_result: Some("boom".into()),
+                cancellation_category: None,
+                cancellation_context: None,
+                error_kind: None,
                 cancel_trigger: None,
                 received_at: std::time::Instant::now()
                     - (TURN_END_RECONCILE_GRACE + std::time::Duration::from_secs(1)),
@@ -1274,7 +1290,7 @@ fn reconcile_error_formats_marker_and_defers_to_banner() {
 
     assert_eq!(
         run(false).as_deref(),
-        Some("Request failed \u{2014} boom. Try sending again."),
+        Some("Request failed: boom. Try sending again."),
         "the raw agent_result must render as a formatted marker"
     );
     assert_eq!(
@@ -1755,7 +1771,6 @@ fn build_rows_collapses_many_subagents() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1784,7 +1799,6 @@ fn build_rows_seven_subagents_no_placeholder() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1810,7 +1824,6 @@ fn build_rows_eight_subagents_no_placeholder() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1837,7 +1850,6 @@ fn build_rows_sixteen_subagents_placeholder_counts_remainder() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1867,7 +1879,6 @@ fn build_rows_with_roster_hides_subagent_rows() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1883,7 +1894,6 @@ fn build_rows_with_roster_hides_subagent_rows() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -1910,7 +1920,6 @@ fn subagent_label_strips_control_characters() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,

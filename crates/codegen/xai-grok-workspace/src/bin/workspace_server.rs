@@ -1,6 +1,6 @@
 //! Standalone workspace ToolServer for remote sandboxes.
 //!
-//! Reads OIDC credentials from `~/.grok/auth.json`, connects to a
+//! Reads OIDC credentials from `~/.opengrok/auth.json`, connects to a
 //! server, exposes workspace tools, and refreshes tokens
 //! automatically.
 use clap::Parser;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 use xai_grok_diag_server::{self as diag_server, DiagHandle, ErrorClass};
-use xai_grok_workspace::config::WorkspaceServerMetadata;
+use xai_grok_workspace::config::merge_session_metadata;
 use xai_grok_workspace::error::WorkspaceError;
 use xai_grok_workspace_daemon::daemonize;
 use xai_grok_workspace_daemon::preview_supervisor::{
@@ -69,7 +69,7 @@ struct Args {
     /// launcher a definitive feature probe.
     #[arg(long)]
     capabilities: bool,
-    #[arg(long, default_value = "wss://computer-hub.grok.com/v1/tools")]
+    #[arg(long, default_value = "wss://computer-hub.opengrok.com/v1/tools")]
     hub_url: String,
     #[arg(long)]
     auth_config: Option<PathBuf>,
@@ -202,7 +202,11 @@ struct PreviewCliArgs {
     preview_workspace_server_port: Option<u16>,
 }
 impl PreviewCliArgs {
-    fn into_preview_args(self, workspace_dir: PathBuf) -> PreviewArgs {
+    fn into_preview_args(
+        self,
+        workspace_dir: PathBuf,
+        discovery_refresh_ms: Option<u64>,
+    ) -> PreviewArgs {
         PreviewArgs {
             enabled: self.preview_enabled,
             port: self.preview_port,
@@ -212,6 +216,7 @@ impl PreviewCliArgs {
             auth_redirect: self.preview_auth_redirect,
             allow_public: self.preview_allow_public,
             workspace_server_port: self.preview_workspace_server_port,
+            discovery_refresh_ms,
             workspace_dir,
         }
     }
@@ -318,7 +323,7 @@ async fn run(
     oom_protection: std::io::Result<()>,
     oom_protect_applied: Option<bool>,
 ) -> anyhow::Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    xai_grok_extra_ca::ensure_default_crypto_provider();
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -395,7 +400,13 @@ async fn run(
             );
         }
     }
-    let auth_provider = xai_grok_workspace::hub_auth::provider(&url, args.auth_config.as_deref())?;
+    let mut status_config = xai_grok_workspace::StatusConfig::from_env();
+    status_config.preview_control_port = args.preview.preview_control_port;
+    let auth_provider = xai_grok_workspace::hub_auth::provider_with_refresh(
+        &url,
+        args.auth_config.as_deref(),
+        &status_config.oidc_refresh,
+    )?;
     tracing::info!(
         hub_url = %url,
         cwd = %cwd.display(),
@@ -410,7 +421,7 @@ async fn run(
         ),
         None => None,
     };
-    let metadata = WorkspaceServerMetadata::merge_session_metadata(parsed_metadata, session_id);
+    let metadata = merge_session_metadata(parsed_metadata, session_id);
     let launch_id = metadata
         .as_ref()
         .and_then(|v| v.get("launch_id"))
@@ -447,11 +458,11 @@ async fn run(
         "Workspace server starting — sessions created dynamically via server bind"
     );
     let server_id = args.server_id.clone();
-    let mut status_config = xai_grok_workspace::StatusConfig::from_env();
-    status_config.preview_control_port = args.preview.preview_control_port;
     let preview_shutdown = if args.preview.preview_enabled {
         let control_port = args.preview.preview_control_port;
-        let cfg = args.preview.into_preview_args(cwd.clone());
+        let cfg = args
+            .preview
+            .into_preview_args(cwd.clone(), status_config.preview_discovery_refresh_ms());
         let (tx, rx) = tokio::sync::watch::channel(false);
         tokio::spawn(preview_supervisor::supervise_preview(cfg, rx));
         Some((tx, control_port))
@@ -575,6 +586,34 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn into_preview_args_forwards_the_discovery_refresh_only_when_resolved() {
+        let cli = || PreviewCliArgs {
+            preview_enabled: true,
+            preview_port: None,
+            preview_control_port: Some(6015),
+            preview_visibility: None,
+            preview_instance_suffix: None,
+            preview_auth_redirect: None,
+            preview_allow_public: false,
+            preview_workspace_server_port: None,
+        };
+        let argv = cli()
+            .into_preview_args(PathBuf::from("/workspace"), Some(500))
+            .to_argv();
+        assert_eq!(
+            argv,
+            vec!["--control-port", "6015", "--discovery-refresh-ms", "500"],
+        );
+        let argv = cli()
+            .into_preview_args(PathBuf::from("/workspace"), None)
+            .to_argv();
+        assert_eq!(
+            argv,
+            vec!["--control-port", "6015"],
+            "without the env the flag must be omitted"
+        );
+    }
     #[test]
     fn hub_connect_failed_dwell_is_within_design_bounds() {
         assert!(HUB_CONNECT_FAILED_DWELL >= Duration::from_millis(500));
@@ -886,7 +925,9 @@ mod tests {
     fn preview_defaults_are_inert() {
         let args = Args::try_parse_from(["xai-workspace-server"]).unwrap();
         assert!(!args.preview.preview_enabled);
-        let cfg = args.preview.into_preview_args(PathBuf::from("/workspace"));
+        let cfg = args
+            .preview
+            .into_preview_args(PathBuf::from("/workspace"), None);
         assert!(!cfg.enabled);
         assert!(
             cfg.to_argv().is_empty(),
@@ -914,7 +955,9 @@ mod tests {
         ])
         .unwrap();
         assert!(args.preview.preview_enabled);
-        let cfg = args.preview.into_preview_args(PathBuf::from("/workspace"));
+        let cfg = args
+            .preview
+            .into_preview_args(PathBuf::from("/workspace"), None);
         assert!(cfg.enabled);
         assert_eq!(cfg.port, Some(6014));
         assert_eq!(cfg.control_port, Some(6015));
@@ -967,7 +1010,9 @@ mod tests {
             "owner",
         ])
         .unwrap();
-        let cfg = args.preview.into_preview_args(PathBuf::from("/workspace"));
+        let cfg = args
+            .preview
+            .into_preview_args(PathBuf::from("/workspace"), None);
         assert_eq!(cfg.visibility, Some(PreviewVisibility::Owner));
         assert_eq!(cfg.to_argv(), vec!["--visibility", "owner"]);
     }

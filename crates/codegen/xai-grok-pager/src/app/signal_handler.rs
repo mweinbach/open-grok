@@ -29,6 +29,10 @@ use super::ScreenMode;
 /// Whether the active screen mode is fullscreen. Set by [`install`].
 static SCREEN_MODE_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
+pub(crate) fn set_mode(mode: ScreenMode) {
+    SCREEN_MODE_FULLSCREEN.store(mode.is_fullscreen(), Ordering::Release);
+}
+
 /// Most recently active session ID for signal-handler cleanup.
 /// `parking_lot::Mutex` avoids poisoning in the `-> !` exit path.
 static CURRENT_SESSION_ID: parking_lot::Mutex<Option<acp::SessionId>> =

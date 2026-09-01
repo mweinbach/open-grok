@@ -1,6 +1,18 @@
 use super::*;
 use ring::signature::KeyPair;
 
+#[test]
+fn empty_policy_slots_are_not_unsigned_policy() {
+    let home = tempfile::tempdir().unwrap();
+    for filename in [crate::REQUIREMENTS_FILENAME, crate::MANAGED_CONFIG_FILENAME] {
+        assert!(!policy_file_has_content(home.path(), filename));
+        std::fs::write(home.path().join(filename), " \n\t").unwrap();
+        assert!(!policy_file_has_content(home.path(), filename));
+        std::fs::write(home.path().join(filename), "fail_closed = true").unwrap();
+        assert!(policy_file_has_content(home.path(), filename));
+    }
+}
+
 fn test_keypair() -> (ring::signature::Ed25519KeyPair, Vec<u8>) {
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();

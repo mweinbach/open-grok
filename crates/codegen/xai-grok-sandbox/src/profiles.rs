@@ -19,7 +19,9 @@ use crate::hook_write_deny::profile_hook_write_deny;
 use crate::paths::grok_home;
 #[cfg(all(feature = "enforce", unix))]
 use crate::paths::{DEVICE_DIRS, DEVICE_FILES};
-use crate::paths::{essential_writable_paths, essential_writable_paths_minimal};
+use crate::paths::{
+    essential_writable_paths, essential_writable_paths_minimal, essential_writable_paths_strict,
+};
 use xai_grok_config::GlobalHookSource;
 
 /// A resolved sandbox profile ready to be converted to a `CapabilitySet`.
@@ -169,6 +171,9 @@ fn merge_project_profiles(config: &mut SandboxConfig, project: SandboxConfig) {
 
 fn load_config_file(path: &Path) -> Option<SandboxConfig> {
     let content = std::fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        return Some(SandboxConfig::default());
+    }
     match toml::from_str(&content) {
         Ok(config) => Some(config),
         Err(e) => {
@@ -230,6 +235,40 @@ impl ProfileName {
     }
 
     #[cfg(all(feature = "enforce", unix))]
+    fn read_write_grant_path(path: &Path, home: &Path) -> Option<PathBuf> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if !(path != home && path.starts_with(home)) {
+                    return Some(path.to_path_buf());
+                }
+                let real = dunce::canonicalize(path).ok()?;
+                if !real.is_dir() {
+                    return None;
+                }
+                if real == home.join(path.file_name()?) {
+                    return Some(real);
+                }
+                let default_sessions =
+                    dirs::home_dir().map(|user_home| user_home.join(".opengrok").join("sessions"));
+                if path.file_name() == Some(std::ffi::OsStr::new("sessions"))
+                    && default_sessions.as_ref() == Some(&real)
+                {
+                    return Some(real);
+                }
+                None
+            }
+            Ok(_) => Some(path.to_path_buf()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::create_dir_all(path).is_err() {
+                    return None;
+                }
+                Some(path.to_path_buf())
+            }
+            Err(_) => None,
+        }
+    }
+
+    #[cfg(all(feature = "enforce", unix))]
     pub(crate) fn capability_set_from_profile(
         workspace: &Path,
         profile: &SandboxProfile,
@@ -257,13 +296,18 @@ impl ProfileName {
         // apply time (it opens an O_PATH fd), but new files within it can
         // be created freely after the sandbox is applied. Pre-create
         // directories like ~/.opengrok/ that may not exist on first run.
+        let home = grok_home();
         for path in &profile.read_write {
-            if !path.exists() && std::fs::create_dir_all(path).is_err() {
-                tracing::warn!(path = ?path, "read_write path does not exist and could not be created, skipping");
+            let Some(grant) = Self::read_write_grant_path(path, &home) else {
+                tracing::warn!(path = ?path, "skipping read_write grant");
+                continue;
+            };
+            if !grant.exists() && std::fs::create_dir_all(&grant).is_err() {
+                tracing::warn!(path = ?grant, "read_write path does not exist and could not be created, skipping");
                 continue;
             }
-            let Some(path_str) = path.to_str() else {
-                tracing::warn!(path = ?path, "Skipping non-UTF8 read_write path");
+            let Some(path_str) = grant.to_str() else {
+                tracing::warn!(path = ?grant, "Skipping non-UTF8 read_write path");
                 continue;
             };
             caps = caps.allow_path(path_str, AccessMode::ReadWrite)?;
@@ -337,7 +381,25 @@ impl ProfileName {
         workspace: &Path,
         config: &SandboxConfig,
     ) -> anyhow::Result<SandboxProfile> {
-        self.resolve(workspace, config)
+        let (profile, _) = self.resolve_profile_with_runtime_sockets(workspace, config)?;
+        Ok(profile)
+    }
+
+    pub(crate) fn resolve_profile_with_runtime_sockets(
+        &self,
+        workspace: &Path,
+        config: &SandboxConfig,
+    ) -> anyhow::Result<(SandboxProfile, Vec<PathBuf>)> {
+        let mut profile = self.resolve(workspace, config)?;
+        let mut runtime_socket_denies = Vec::new();
+        if profile.restrict_network {
+            crate::runtime_sockets::append_runtime_socket_denies(
+                &mut profile.deny,
+                &mut runtime_socket_denies,
+            )
+            .map_err(|error| anyhow::anyhow!("runtime-socket deny resolution failed: {error}"))?;
+        }
+        Ok((profile, runtime_socket_denies))
     }
 
     fn resolve(&self, workspace: &Path, config: &SandboxConfig) -> anyhow::Result<SandboxProfile> {
@@ -437,7 +499,7 @@ impl ProfileName {
                 Ok(SandboxProfile {
                     name: "strict".to_string(),
                     read_only: system_read,
-                    read_write: essential_writable_paths(workspace),
+                    read_write: essential_writable_paths_strict(workspace),
                     deny: vec![],
                     write_deny: resolve_write_deny(self)?,
                     default_read: false,
@@ -517,6 +579,7 @@ impl ProfileName {
 mod tests {
     use super::*;
 
+    use crate::test_util::{network_inheritance_config, skip_if_host_hook_write_deny_unresolvable};
     #[test]
     fn parse_profile_names() {
         assert_eq!(
@@ -571,18 +634,6 @@ mod tests {
 
     /// Hosts with a retargetable `$OPENGROK_HOME/hooks` symlink (fail-closed under
     /// write-deny) cannot resolve enforcing profiles against the real home.
-    fn skip_if_host_hook_write_deny_unresolvable() -> bool {
-        if !crate::hook_write_deny::profile_enforces_hook_write_deny(&ProfileName::Workspace) {
-            return false;
-        }
-        match crate::hook_write_deny::resolve_hook_write_deny_snapshot() {
-            Ok(_) => false,
-            Err(e) => {
-                eprintln!("skipping profile resolve test: host hook write-deny unresolvable ({e})");
-                true
-            }
-        }
-    }
 
     #[test]
     fn built_in_network_restriction_values() {
@@ -600,53 +651,6 @@ mod tests {
         ] {
             let resolved = name.resolve_profile(&workspace, &config).unwrap();
             assert_eq!(resolved.restrict_network, expected, "{name}");
-        }
-    }
-
-    fn network_inheritance_config() -> SandboxConfig {
-        SandboxConfig {
-            profiles: HashMap::from([
-                (
-                    "strict-inherited".to_string(),
-                    ProfileConfig {
-                        extends: Some("strict".to_string()),
-                        restrict_network: None,
-                        read_only: vec![],
-                        read_write: vec![],
-                        deny: vec![],
-                    },
-                ),
-                (
-                    "read-only-inherited".to_string(),
-                    ProfileConfig {
-                        extends: Some("read-only".to_string()),
-                        restrict_network: None,
-                        read_only: vec![],
-                        read_write: vec![],
-                        deny: vec![],
-                    },
-                ),
-                (
-                    "strict-unrestricted".to_string(),
-                    ProfileConfig {
-                        extends: Some("strict".to_string()),
-                        restrict_network: Some(false),
-                        read_only: vec![],
-                        read_write: vec![],
-                        deny: vec![],
-                    },
-                ),
-                (
-                    "workspace-restricted".to_string(),
-                    ProfileConfig {
-                        extends: Some("workspace".to_string()),
-                        restrict_network: Some(true),
-                        read_only: vec![],
-                        read_write: vec![],
-                        deny: vec![],
-                    },
-                ),
-            ]),
         }
     }
 
@@ -694,6 +698,87 @@ mod tests {
                 profile.read_only.iter().any(|p| p == Path::new("/var")),
                 "strict read_only must include exact /var for NSS/SSSD; got {:?}",
                 profile.read_only
+            );
+        }
+    }
+
+    #[test]
+    fn strict_reads_grok_home_but_only_sessions_writable() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let workspace = std::env::temp_dir();
+        let home = grok_home();
+        let sessions = home.join("sessions");
+
+        let cases = [
+            (
+                "strict",
+                ProfileName::Strict.resolve_profile(&workspace, &SandboxConfig::default()),
+            ),
+            (
+                "strict-inherited",
+                ProfileName::Custom("strict-inherited".to_string())
+                    .resolve_profile(&workspace, &network_inheritance_config()),
+            ),
+        ];
+        for (label, resolved) in cases {
+            let profile = resolved.unwrap_or_else(|e| panic!("{label} resolves: {e}"));
+            assert!(
+                profile.read_only.iter().any(|p| p == &home),
+                "{label} read_only must include grok_home: {:?}",
+                profile.read_only
+            );
+            for required in [home.join("hooks"), home.join("hooks-paths")] {
+                assert!(
+                    profile
+                        .read_only
+                        .iter()
+                        .any(|p| p == &required || required.starts_with(p)),
+                    "{label} read_only must cover {required:?}: {:?}",
+                    profile.read_only
+                );
+            }
+            assert!(
+                !profile.read_write.iter().any(|p| p == &home),
+                "{label} read_write must not include grok_home itself: {:?}",
+                profile.read_write
+            );
+            let events = crate::paths::sandbox_events_log_path();
+            assert!(events.starts_with(&sessions));
+            for p in &profile.read_write {
+                if !p.starts_with(&home) {
+                    continue;
+                }
+                assert!(
+                    p.starts_with(&sessions),
+                    "{label} read_write path under grok_home must be under sessions/: {p:?}"
+                );
+            }
+            assert!(
+                profile.read_write.iter().any(|p| p == &sessions),
+                "{label} read_write must include sessions/: {:?}",
+                profile.read_write
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_and_read_only_still_include_grok_home() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let workspace = std::env::temp_dir();
+        let config = SandboxConfig::default();
+        let home = grok_home();
+        for name in [ProfileName::Workspace, ProfileName::ReadOnly] {
+            let profile = name
+                .resolve_profile(&workspace, &config)
+                .unwrap_or_else(|e| panic!("{name} resolves: {e}"));
+            assert!(
+                profile.read_write.iter().any(|p| p == &home),
+                "{name} read_write must include grok_home: {:?}",
+                profile.read_write
             );
         }
     }
@@ -778,50 +863,30 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_profile_names_only_reports_different_conflicts() {
-        let global: SandboxConfig = toml::from_str(
-            r#"
-[profiles.same]
-extends = "workspace"
-restrict_network = false
+    fn mismatched_profile_names_reports_only_changed_custom_profiles() {
+        let profile = |restrict_network| ProfileConfig {
+            extends: Some("workspace".to_string()),
+            restrict_network: Some(restrict_network),
+            read_only: vec![],
+            read_write: vec![],
+            deny: vec![],
+        };
+        let global = SandboxConfig {
+            profiles: HashMap::from([
+                ("dev".to_string(), profile(false)),
+                ("same".to_string(), profile(false)),
+            ]),
+        };
+        let project = SandboxConfig {
+            profiles: HashMap::from([
+                ("dev".to_string(), profile(true)),
+                ("same".to_string(), profile(false)),
+                ("project-only".to_string(), profile(true)),
+                ("devbox".to_string(), profile(true)),
+            ]),
+        };
 
-[profiles.changed]
-extends = "workspace"
-restrict_network = false
-
-[profiles.user_only]
-extends = "strict"
-
-[profiles.devbox]
-extends = "workspace"
-restrict_network = false
-"#,
-        )
-        .unwrap();
-        let project: SandboxConfig = toml::from_str(
-            r#"
-[profiles.same]
-extends = "workspace"
-restrict_network = false
-
-[profiles.changed]
-extends = "workspace"
-restrict_network = true
-
-[profiles.project_only]
-extends = "devbox"
-
-[profiles.devbox]
-extends = "strict"
-restrict_network = true
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            mismatched_profile_names(&global, &project),
-            vec!["changed".to_string()]
-        );
+        assert_eq!(mismatched_profile_names(&global, &project), vec!["dev"]);
     }
 
     #[test]
@@ -1121,5 +1186,51 @@ read_write = ["/tmp/ci-artifacts"]
                 "expected /dev/fd to be a directory on this platform"
             );
         }
+    }
+    #[test]
+    fn mismatched_profile_names_only_reports_different_conflicts() {
+        let global: SandboxConfig = toml::from_str(
+            r#"
+[profiles.same]
+extends = "workspace"
+restrict_network = false
+
+[profiles.changed]
+extends = "workspace"
+restrict_network = false
+
+[profiles.user_only]
+extends = "strict"
+
+[profiles.devbox]
+extends = "workspace"
+restrict_network = false
+"#,
+        )
+        .unwrap();
+        let project: SandboxConfig = toml::from_str(
+            r#"
+[profiles.same]
+extends = "workspace"
+restrict_network = false
+
+[profiles.changed]
+extends = "workspace"
+restrict_network = true
+
+[profiles.project_only]
+extends = "devbox"
+
+[profiles.devbox]
+extends = "strict"
+restrict_network = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mismatched_profile_names(&global, &project),
+            vec!["changed".to_string()]
+        );
     }
 }

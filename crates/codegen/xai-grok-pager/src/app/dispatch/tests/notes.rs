@@ -29,6 +29,195 @@ fn recap_unavailable_toast_empty_vs_with_messages() {
 }
 
 #[test]
+fn automatic_recap_waits_until_background_wake_finishes() {
+    let mut app = test_app_with_agent();
+    app.session_recap_available = true;
+    app.agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .note_streaming_wake_turn("wake-recap-test");
+    let effects = dispatch(Action::SendRecap { auto: true }, &mut app);
+    assert!(effects.is_empty());
+    assert!(app.agents[&AgentId(0)].pending_recap_entry.is_none());
+}
+
+#[test]
+fn feedback_attachments_do_not_use_another_providers_services() {
+    let mut app = test_app_with_agent();
+    app.primary_provider = crate::app::app_view::PrimaryProvider::Codex;
+    let image = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+        data: vec![1, 2, 3],
+        mime_type: "image/png".into(),
+    });
+    let effects = dispatch(
+        Action::SendFeedback {
+            text: "Feedback with an attachment".into(),
+            images: vec![image].into(),
+            trace: None,
+        },
+        &mut app,
+    );
+    assert!(effects.is_empty());
+}
+
+fn feedback_test_png() -> crate::prompt_images::PastedImage {
+    let image = image::ImageBuffer::from_pixel(8, 8, image::Rgba([128u8, 64, 32, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encode PNG");
+    crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+        data: bytes.into_inner(),
+        mime_type: "image/png".into(),
+    })
+}
+
+#[test]
+fn send_feedback_accepts_image_only_and_rejects_empty_reports() {
+    let mut app = test_app_with_agent();
+    app.agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .prompt
+        .set_text("keep this draft");
+    let image = feedback_test_png();
+    let expected_bytes = image.encoded_bytes.clone().expect("PNG bytes");
+    let effects = dispatch(
+        Action::SendFeedback {
+            text: " \n ".into(),
+            images: vec![image].into(),
+            trace: None,
+        },
+        &mut app,
+    );
+    let [
+        Effect::SendFeedback {
+            feedback_text,
+            images,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("expected image-only feedback effect: {effects:?}");
+    };
+    assert!(feedback_text.is_empty());
+    assert_eq!(images.len(), 1);
+    let (bytes, mime_type) = crate::prompt_images::load_for_send(&images.as_slice()[0])
+        .expect("valid feedback image survives send preparation");
+    assert_eq!(bytes.as_slice(), expected_bytes.as_ref());
+    assert_eq!(mime_type, "image/png");
+    assert!(image::load_from_memory(&bytes).is_ok());
+    assert_eq!(app.agents[&AgentId(0)].prompt.text(), "keep this draft");
+
+    let effects = dispatch(
+        Action::SendFeedback {
+            text: " \n ".into(),
+            images: Default::default(),
+            trace: None,
+        },
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert!(last_system_text(&app, AgentId(0)).contains("Please provide feedback text."));
+}
+
+#[test]
+fn image_only_feedback_does_not_cross_provider_access_boundaries() {
+    use crate::app::app_view::PrimaryProvider;
+
+    for provider in [
+        PrimaryProvider::Codex,
+        PrimaryProvider::Kimi,
+        PrimaryProvider::Fireworks,
+        PrimaryProvider::DeepSeek,
+        PrimaryProvider::Meta,
+        PrimaryProvider::OpenCodeGo,
+        PrimaryProvider::Wafer,
+        PrimaryProvider::Zai,
+        PrimaryProvider::Runinfra,
+        PrimaryProvider::Gemini,
+        PrimaryProvider::OpenRouter,
+    ] {
+        let mut app = test_app_with_agent();
+        app.primary_provider = provider;
+        let effects = dispatch(
+            Action::SendFeedback {
+                text: String::new(),
+                images: vec![feedback_test_png()].into(),
+                trace: None,
+            },
+            &mut app,
+        );
+        assert!(
+            effects.is_empty(),
+            "attachment escaped provider gate: {provider:?}"
+        );
+    }
+}
+
+#[test]
+fn feedback_pane_submits_image_only_with_original_attachment() {
+    use crate::app::app_view::InputOutcome;
+
+    let mut app = app_with_feedback_pane(" \n ");
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    let image = feedback_test_png();
+    let expected_bytes = image.encoded_bytes.clone().expect("PNG bytes");
+    agent
+        .prompt
+        .insert_image(image)
+        .expect("insert live image chip");
+    let outcome = agent.submit_question_answers_for_test(false);
+    let InputOutcome::Action(Action::SendFeedback {
+        text,
+        images,
+        trace: None,
+    }) = outcome
+    else {
+        panic!("expected image-only feedback action: {outcome:?}");
+    };
+    assert_eq!(text, "[Image #1]");
+    assert_eq!(images.len(), 1);
+    assert_eq!(
+        images.as_slice()[0].encoded_bytes.as_ref(),
+        Some(&expected_bytes)
+    );
+    assert!(agent.question_view.is_none());
+    assert!(agent.prompt.images.is_empty());
+    assert_eq!(agent.prompt.text(), "");
+
+    let effects = dispatch(
+        Action::SendFeedback {
+            text,
+            images,
+            trace: None,
+        },
+        &mut app,
+    );
+    let [Effect::SendFeedback { images, .. }] = effects.as_slice() else {
+        panic!("expected feedback effect carrying original attachment: {effects:?}");
+    };
+    assert_eq!(images.len(), 1);
+    let (bytes, mime_type) = crate::prompt_images::load_for_send(&images.as_slice()[0])
+        .expect("original image remains sendable after closing feedback");
+    assert_eq!(bytes.as_slice(), expected_bytes.as_ref());
+    assert_eq!(mime_type, "image/png");
+}
+
+#[test]
+fn feedback_pane_does_not_submit_after_all_image_chips_are_removed() {
+    use crate::app::app_view::InputOutcome;
+
+    let mut app = app_with_feedback_pane(" \n ");
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    agent.prompt.images.push(feedback_test_png());
+    let outcome = agent.submit_question_answers_for_test(false);
+    assert!(matches!(outcome, InputOutcome::Changed));
+    assert!(agent.question_view.is_some());
+    assert!(agent.prompt.images.is_empty());
+}
+
+#[test]
 fn manual_recap_with_no_messages_toasts_empty_state_and_skips_request() {
     let mut app = test_app_with_agent();
     app.session_recap_available = true;
@@ -435,7 +624,13 @@ fn enter_feedback_mode_opens_local_question_pane() {
         agent.prompt.set_text("draft");
     }
 
-    let effects = dispatch(Action::OpenFeedbackPane, &mut app);
+    let effects = dispatch(
+        Action::OpenFeedbackPane {
+            prefill: None,
+            images: Default::default(),
+        },
+        &mut app,
+    );
     assert!(effects.is_empty(), "pane open is synchronous: {effects:?}");
 
     let agent = app.agents.get(&id).unwrap();
@@ -476,7 +671,16 @@ fn enter_feedback_mode_requires_session() {
 
     let mut fullscreen = test_app_with_agent();
     fullscreen.agents.get_mut(&id).unwrap().session.session_id = None;
-    assert!(dispatch(Action::OpenFeedbackPane, &mut fullscreen).is_empty());
+    assert!(
+        dispatch(
+            Action::OpenFeedbackPane {
+                prefill: None,
+                images: Default::default()
+            },
+            &mut fullscreen
+        )
+        .is_empty()
+    );
     let agent = fullscreen.agents.get(&id).unwrap();
     assert!(agent.question_view.is_none());
     assert_eq!(
@@ -489,7 +693,16 @@ fn enter_feedback_mode_requires_session() {
     let mut minimal = test_app_with_agent();
     minimal.screen_mode = crate::app::ScreenMode::Minimal;
     minimal.agents.get_mut(&id).unwrap().session.session_id = None;
-    assert!(dispatch(Action::OpenFeedbackPane, &mut minimal).is_empty());
+    assert!(
+        dispatch(
+            Action::OpenFeedbackPane {
+                prefill: None,
+                images: Default::default()
+            },
+            &mut minimal
+        )
+        .is_empty()
+    );
     let agent = minimal.agents.get(&id).unwrap();
     assert!(agent.question_view.is_none());
     assert!(agent.toast.is_none(), "minimal must not rely on toast");
@@ -522,7 +735,16 @@ fn enter_feedback_mode_busy_question_is_mode_specific() {
 
     let mut fullscreen = test_app_with_agent();
     occupy(fullscreen.agents.get_mut(&id).unwrap());
-    assert!(dispatch(Action::OpenFeedbackPane, &mut fullscreen).is_empty());
+    assert!(
+        dispatch(
+            Action::OpenFeedbackPane {
+                prefill: None,
+                images: Default::default()
+            },
+            &mut fullscreen
+        )
+        .is_empty()
+    );
     assert_eq!(
         fullscreen.agents[&id]
             .toast
@@ -534,7 +756,16 @@ fn enter_feedback_mode_busy_question_is_mode_specific() {
     let mut minimal = test_app_with_agent();
     minimal.screen_mode = crate::app::ScreenMode::Minimal;
     occupy(minimal.agents.get_mut(&id).unwrap());
-    assert!(dispatch(Action::OpenFeedbackPane, &mut minimal).is_empty());
+    assert!(
+        dispatch(
+            Action::OpenFeedbackPane {
+                prefill: None,
+                images: Default::default()
+            },
+            &mut minimal
+        )
+        .is_empty()
+    );
     assert!(minimal.agents[&id].toast.is_none());
     assert!(last_system_text(&minimal, id).contains("Finish answering the current question first"));
 }
@@ -555,7 +786,13 @@ fn casual_commenting_keeps_its_parked_draft_when_a_card_closes() {
         agent.prompt.set_text("the casual comment");
     }
 
-    let _ = dispatch(Action::OpenFeedbackPane, &mut app);
+    let _ = dispatch(
+        Action::OpenFeedbackPane {
+            prefill: None,
+            images: Default::default(),
+        },
+        &mut app,
+    );
     let agent = app.agents.get_mut(&id).unwrap();
     assert!(
         agent.question_view.is_some(),
@@ -593,7 +830,16 @@ fn enter_feedback_mode_refuses_under_a_line_viewer() {
         assert!(agent.line_viewer.is_some(), "the preview is open");
     }
 
-    assert!(dispatch(Action::OpenFeedbackPane, &mut app).is_empty());
+    assert!(
+        dispatch(
+            Action::OpenFeedbackPane {
+                prefill: None,
+                images: Default::default()
+            },
+            &mut app
+        )
+        .is_empty()
+    );
 
     assert!(
         app.agents[&id].question_view.is_none(),
@@ -614,7 +860,16 @@ fn enter_feedback_mode_refuses_under_a_plan_approval() {
             Some(crate::app::agent_view::test_fixtures::make_plan_approval_view_state());
     }
 
-    assert!(dispatch(Action::OpenFeedbackPane, &mut app).is_empty());
+    assert!(
+        dispatch(
+            Action::OpenFeedbackPane {
+                prefill: None,
+                images: Default::default()
+            },
+            &mut app
+        )
+        .is_empty()
+    );
 
     let agent = &app.agents[&id];
     assert!(
@@ -666,7 +921,17 @@ fn send_feedback_without_a_session_says_so() {
     let mut app = test_app_with_agent();
     app.agents.get_mut(&id).unwrap().session.session_id = None;
 
-    assert!(dispatch(Action::SendFeedback("long report".into()), &mut app).is_empty());
+    assert!(
+        dispatch(
+            Action::SendFeedback {
+                text: "long report".into(),
+                images: Default::default(),
+                trace: None
+            },
+            &mut app
+        )
+        .is_empty()
+    );
 
     assert!(last_system_text(&app, id).contains("No active session"));
 }
@@ -676,7 +941,13 @@ fn app_with_feedback_pane(report: &str) -> crate::app::app_view::AppView {
     // Typing a slash command means the keyboard is on the prompt, and a card parked in the scrollback owns no keys.
     app.agents.get_mut(&AgentId(0)).unwrap().active_pane =
         crate::app::agent_view::AgentPane::Prompt;
-    let effects = dispatch(Action::OpenFeedbackPane, &mut app);
+    let effects = dispatch(
+        Action::OpenFeedbackPane {
+            prefill: None,
+            images: Default::default(),
+        },
+        &mut app,
+    );
     assert!(effects.is_empty(), "pane open is synchronous: {effects:?}");
     let agent = app.agents.get_mut(&AgentId(0)).unwrap();
     agent.prompt.set_text(report);
@@ -695,7 +966,7 @@ fn feedback_pane_enter_sends_report() {
         .unwrap()
         .submit_question_answers_for_test(false);
     match outcome {
-        InputOutcome::Action(Action::SendFeedback(text)) => {
+        InputOutcome::Action(Action::SendFeedback { text, .. }) => {
             assert_eq!(text, "the tool crashed on empty input");
         }
         other => panic!("expected SendFeedback action, got {other:?}"),
@@ -744,7 +1015,13 @@ fn feedback_pane_dismiss_leaves_the_composer_alone() {
         .unwrap()
         .prompt
         .set_text("draft from before");
-    dispatch(Action::OpenFeedbackPane, &mut app);
+    dispatch(
+        Action::OpenFeedbackPane {
+            prefill: None,
+            images: Default::default(),
+        },
+        &mut app,
+    );
     app.agents
         .get_mut(&id)
         .unwrap()
@@ -761,7 +1038,13 @@ fn feedback_pane_dismiss_leaves_the_composer_alone() {
         "the pre-slash draft comes back untouched"
     );
 
-    dispatch(Action::OpenFeedbackPane, &mut app);
+    dispatch(
+        Action::OpenFeedbackPane {
+            prefill: None,
+            images: Default::default(),
+        },
+        &mut app,
+    );
     assert_eq!(
         app.agents[&id]
             .question_view
@@ -855,7 +1138,13 @@ fn permission_holding_the_composer_gets_the_draft_back_not_the_report() {
         .unwrap()
         .prompt
         .set_text("pre-slash draft");
-    let _ = dispatch(Action::OpenFeedbackPane, &mut app);
+    let _ = dispatch(
+        Action::OpenFeedbackPane {
+            prefill: None,
+            images: Default::default(),
+        },
+        &mut app,
+    );
 
     let agent = app.agents.get_mut(&id).unwrap();
     agent.prompt.set_text("report the permission interrupted");
@@ -889,7 +1178,14 @@ fn send_feedback_preserves_composer_draft() {
         agent.prompt.set_text("keep this draft");
     }
 
-    let effects = dispatch(Action::SendFeedback("report".into()), &mut app);
+    let effects = dispatch(
+        Action::SendFeedback {
+            text: "report".into(),
+            images: Default::default(),
+            trace: None,
+        },
+        &mut app,
+    );
     assert!(
         matches!(
             effects.as_slice(),

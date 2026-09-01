@@ -6,6 +6,7 @@ edition.workspace = true
 description = "Shared config loading for Grok — grok_home, effective config (requirements > user > managed), TOML merge"
 
 [dependencies]
+xai-dirs = { path = "../xai-dirs" }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 dunce = { workspace = true }
@@ -37,3 +38,6 @@ test-support = []
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

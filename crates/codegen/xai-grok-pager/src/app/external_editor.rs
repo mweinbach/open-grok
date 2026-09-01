@@ -77,7 +77,8 @@ pub(crate) struct PromptEditorFile {
 
 impl PromptEditorFile {
     fn create(text: &str) -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!("grok-prompt-{}.md", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("open-grok-prompt-{}.md", uuid::Uuid::new_v4()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -151,7 +152,7 @@ fn revalidate(app: &mut AppView, request: PendingEditorRequest) -> Option<Pendin
     let access = app
         .agents
         .get(&agent_id)
-        .map(|agent| agent.external_prompt_editor_access(true));
+        .map(|agent| agent.external_prompt_editor_access());
     let message = if app.voice_recording_target()
         == Some(crate::app::app_view::VoiceTarget::Agent(agent_id))
     {
@@ -288,8 +289,17 @@ pub(crate) fn finish(
             file,
             ..
         } => {
+            let strip_editor_newline = !original_text.ends_with('\n');
             let outcome = match editor_result {
-                Ok(status) if status.success() => file.read(),
+                Ok(status) if status.success() => file.read().map(|mut text| {
+                    if strip_editor_newline && text.ends_with('\n') {
+                        text.pop();
+                        if text.ends_with('\r') {
+                            text.pop();
+                        }
+                    }
+                    text
+                }),
                 Ok(_) => Err(PROMPT_EDITOR_NONZERO),
                 Err(error) => {
                     tracing::warn!(%error, "external prompt editor: child failed");
@@ -534,6 +544,40 @@ mod tests {
     }
 
     #[test]
+    fn finish_preserves_draft_newlines_and_strips_editor_newlines() {
+        let agent_id = AgentId(0);
+        let mut app = crate::app::app_view::tests::test_app();
+        let mut agent = crate::test_util::make_agent_view(Some("session"), "/work");
+        agent.session.id = agent_id;
+        app.agents.insert(agent_id, agent);
+        app.active_view = ActiveView::Agent(agent_id);
+        for (original, saved, expected) in [
+            ("line\n", "edited\n", "edited\n"),
+            ("text", "text\n\n", "text\n"),
+            ("text", "edited\r\n", "edited"),
+            ("text", "edited", "edited"),
+        ] {
+            app.agents
+                .get_mut(&agent_id)
+                .unwrap()
+                .prompt
+                .set_text(original);
+            let file = PromptEditorFile::create(saved).unwrap();
+            let prepared = PreparedEditorRequest::PromptDraft {
+                launch: EditorLaunch {
+                    argv: vec!["editor".to_owned()],
+                    path: file.path().to_path_buf(),
+                },
+                agent_id,
+                original_text: original.to_owned(),
+                file,
+            };
+            finish(&mut app, prepared, Ok(success_status()));
+            assert_eq!(app.agents[&agent_id].prompt.text(), expected);
+        }
+    }
+
+    #[test]
     fn finish_success_failure_and_stale_paths_preserve_contracts() {
         let id = AgentId(0);
         let mut app = crate::app::app_view::tests::test_app();
@@ -554,7 +598,7 @@ mod tests {
             file,
         };
         finish(&mut app, prepared, Ok(success_status()));
-        assert_eq!(app.agents[&id].prompt.text(), "edited\n");
+        assert_eq!(app.agents[&id].prompt.text(), "edited");
 
         app.agents.get_mut(&id).unwrap().prompt.set_text("newer");
         apply_prompt_outcome(&mut app, id, "original".to_owned(), Ok("stale".to_owned()));

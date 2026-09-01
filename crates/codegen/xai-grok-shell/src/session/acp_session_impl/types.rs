@@ -44,6 +44,10 @@ pub(crate) enum SamplerFailureRecovery {
         credential: xai_grok_sampling_types::SentCredential,
         store: RecoveredStore,
     },
+    RetryTransient {
+        kind: xai_grok_sampler::SamplingErrorKind,
+        status_code: Option<u16>,
+    },
 }
 
 /// Outcome of a single turn attempt via the sampler-based path.
@@ -64,6 +68,16 @@ pub(crate) enum SamplerTurnOutcome {
         credential: xai_grok_sampling_types::SentCredential,
         store: RecoveredStore,
     },
+    RetryTransient {
+        kind: xai_grok_sampler::SamplingErrorKind,
+        status_code: Option<u16>,
+    },
+}
+
+pub(crate) enum CompletedStop {
+    EndTurn,
+    MaxTokens,
+    Refusal(String),
 }
 
 /// Outcome of `process_conversation_turn`, distinguishing normal completion from cancellation.
@@ -77,15 +91,13 @@ pub(crate) enum TurnOutcome {
         snapshot: Box<Option<TurnDeltaSnapshot>>,
         tools_called: Vec<String>,
         structured_output: Option<Result<serde_json::Value, String>>,
-        /// `Some(explanation)` marks a content-filter refusal (empty when the
-        /// provider gave no message).
-        refusal: Option<String>,
+        stop: CompletedStop,
     },
     /// The turn was cancelled (user rejection, hook denial, doom loop, etc.).
     /// The category distinguishes the cause for analytics.
     Cancelled {
         category: Option<crate::session::events::CancellationCategory>,
-        context: Option<serde_json::Value>,
+        context: Option<crate::session::commands::CancellationContext>,
     },
     /// The `--max-turns` limit was reached after a tool-execution cycle.
     MaxTurnsReached { limit: usize },

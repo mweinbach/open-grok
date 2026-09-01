@@ -242,13 +242,23 @@ pub struct ServerRecord {
 /// The recency key for bind newest-wins and strictly-older eviction.
 static REGISTRATION_CLOCK: AtomicU64 = AtomicU64::new(0);
 
+pub const REGISTRATION_SEQ_SHIFT: u32 = 10;
+
+pub fn seq_from_wall_ms(wall_ms: u64) -> u64 {
+    wall_ms << REGISTRATION_SEQ_SHIFT
+}
+
+pub fn seq_wall_ms(sequence: u64) -> u64 {
+    sequence >> REGISTRATION_SEQ_SHIFT
+}
+
 /// Issue the next monotonic registration stamp. See [`REGISTRATION_CLOCK`].
 pub fn next_registration_seq() -> u64 {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let candidate = now_ms << 10;
+    let candidate = seq_from_wall_ms(now_ms);
     let mut prev = REGISTRATION_CLOCK.load(Ordering::Relaxed);
     loop {
         let next = candidate.max(prev + 1);

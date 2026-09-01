@@ -70,6 +70,7 @@ fn terminal() -> TerminalContext {
         is_ssh: false,
         is_official_vscode_remote: false,
         term_var: Some("xterm-256color".to_owned()),
+        term_features: None,
         tmux_version: None,
         vte_version: None,
         tmux_extended_keys: None,

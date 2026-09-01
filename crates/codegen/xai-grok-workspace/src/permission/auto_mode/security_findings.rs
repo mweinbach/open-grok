@@ -155,6 +155,9 @@ impl BashSecurityAssessment {
 
     /// Compact `[token, token]` list in canonical order, for tests to pin the
     /// ordered/deduplicated invariant. The system message uses `render_glossary`.
+    pub(crate) fn is_file_write_only(&self) -> bool {
+        self.0.len() == 1 && self.0.contains(&ClassifierSecurityFinding::FileWrite)
+    }
     #[cfg(test)]
     pub(crate) fn render_tokens(&self) -> String {
         let tokens: Vec<&str> = self.0.iter().map(|f| f.token()).collect();

@@ -17,7 +17,7 @@ mod enrichment;
 pub(super) mod lock;
 #[path = "manager/remedy.rs"]
 mod remedy;
-pub(crate) use remedy::{AuthRemedy, SilentRefresh};
+pub(crate) use remedy::{AuthRemedy, BoundedRefresh, SilentRefresh};
 #[path = "manager/sleep_gate.rs"]
 mod sleep_gate;
 
@@ -69,7 +69,11 @@ pub(crate) const AUTH_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 /// Lock timeout for `refresh_chain`, held across the IdP call to prevent
 /// refresh-token reuse. Must exceed the external-auth refresh budget
 /// (a single 7s run) so followers wait rather than retry.
-const REFRESH_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+const REFRESH_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(25);
+
+pub(crate) const BEST_EFFORT_REFRESH_TIMEOUT: StdDuration = StdDuration::from_secs(20);
+
+const _: () = assert!(BEST_EFFORT_REFRESH_TIMEOUT.as_millis() < REFRESH_LOCK_TIMEOUT.as_millis());
 
 /// Long poll interval used by the proactive refresh task when no
 /// productive refresh is possible (see [`compute_proactive_sleep`]).
@@ -1298,7 +1302,14 @@ impl AuthManager {
         &self,
         timeout: StdDuration,
     ) -> Option<AuthFileLock> {
-        try_lock_auth_file_async(&self.path, timeout).await
+        let heartbeat = if timeout >= REFRESH_LOCK_TIMEOUT {
+            lock::Heartbeat::Attach
+        } else {
+            lock::Heartbeat::Skip
+        };
+        try_lock_auth_file_async(&self.path, timeout, heartbeat)
+            .await
+            .into_guard()
     }
 
     // ── Refresher setup ─────────────────────────────────────────────
@@ -1677,6 +1688,11 @@ impl AuthManager {
         // 2. Acquire the exclusive file lock (or adopt a sibling token). The
         //    returned guard is held (via `file_lock` below) across the IdP call
         //    so only one participant ever spends a given refresh token.
+        if let Some(auth) =
+            self.try_adopt_disk_token(reason, "auth: adopted sibling token before lock wait")
+        {
+            return Ok(auth);
+        }
         let file_lock = match self.acquire_refresh_lock_or_adopt(reason).await? {
             LockOutcome::Adopted(auth) => return Ok(*auth),
             LockOutcome::Held(lock) => lock,
@@ -1775,7 +1791,18 @@ impl AuthManager {
         reason: RefreshReason,
     ) -> Result<LockOutcome, AuthError> {
         let lock_started = std::time::Instant::now();
-        let Some(file_lock) = self.try_lock_auth_file_async(REFRESH_LOCK_TIMEOUT).await else {
+        let acquired = lock::try_lock_auth_file_async(
+            &self.path,
+            REFRESH_LOCK_TIMEOUT,
+            lock::Heartbeat::Attach,
+        )
+        .await;
+        let file_lock = match acquired {
+            lock::LockAcquire::Acquired(guard) => Some(guard),
+            lock::LockAcquire::Failed { error } => return Err(AuthError::transient_source(error)),
+            lock::LockAcquire::TimedOut { .. } => None,
+        };
+        let Some(file_lock) = file_lock else {
             tracing::warn!("auth: file lock timed out, waiting for sibling to finish");
             xai_grok_telemetry::unified_log::warn(
                 "auth.refresh.lock_timeout",

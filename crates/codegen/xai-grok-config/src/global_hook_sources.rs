@@ -5,6 +5,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::loader::{
+    MANAGED_CONFIG_FILENAME, REQUIREMENTS_FILENAME, SANDBOX_CONFIG_FILENAME,
+    TRUSTED_FOLDERS_FILENAME, USER_CONFIG_FILENAME,
+};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalHookSourceKind {
     /// `$OPENGROK_HOME/hooks/` (discovered + protected).
@@ -13,6 +17,7 @@ pub enum GlobalHookSourceKind {
     RegistryFile,
     /// Absolute registry target (must exist before sandbox apply).
     ConfiguredSource,
+    TrustBoundaryFile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +30,7 @@ impl GlobalHookSource {
     pub fn is_dir(&self) -> bool {
         match self.kind {
             GlobalHookSourceKind::HookDirectory => true,
-            GlobalHookSourceKind::RegistryFile => false,
+            GlobalHookSourceKind::RegistryFile | GlobalHookSourceKind::TrustBoundaryFile => false,
             GlobalHookSourceKind::ConfiguredSource => {
                 if self.path.exists() {
                     self.path.is_dir()
@@ -38,7 +43,10 @@ impl GlobalHookSource {
 
     /// False for the registry file itself (not hook JSON / not a hook dir).
     pub fn is_discovery_source(&self) -> bool {
-        !matches!(self.kind, GlobalHookSourceKind::RegistryFile)
+        !matches!(
+            self.kind,
+            GlobalHookSourceKind::RegistryFile | GlobalHookSourceKind::TrustBoundaryFile
+        )
     }
 }
 
@@ -274,6 +282,27 @@ fn require_real_file(path: &Path) -> Result<(), GlobalHookSourceError> {
 /// Ensure real `$OPENGROK_HOME/hooks` dir + `hooks-paths` file (create if missing).
 /// Race-resistant create (`create_dir` / `create_new`+`O_NOFOLLOW`); never
 /// truncates an existing registry; rejects symlinks/wrong types.
+fn ensure_real_file_slot(path: &Path) -> Result<(), GlobalHookSourceError> {
+    match open_registry_create_new(path) {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            require_real_file(path)?;
+        }
+        Err(source) => {
+            return Err(GlobalHookSourceError::CreateRegistryFile {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    require_real_file(path)?;
+    if path_has_symlink_component(path) {
+        return Err(GlobalHookSourceError::SymlinkedSource {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
 pub fn ensure_grok_hook_slots(grok_home: &Path) -> Result<(), GlobalHookSourceError> {
     if path_has_symlink_component(grok_home) {
         return Err(GlobalHookSourceError::SymlinkedGrokHome {
@@ -283,8 +312,8 @@ pub fn ensure_grok_hook_slots(grok_home: &Path) -> Result<(), GlobalHookSourceEr
 
     match std::fs::create_dir(grok_home) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             std::fs::create_dir_all(grok_home).map_err(|source| {
                 GlobalHookSourceError::CreateHooksDir {
                     path: grok_home.to_path_buf(),
@@ -319,7 +348,7 @@ pub fn ensure_grok_hook_slots(grok_home: &Path) -> Result<(), GlobalHookSourceEr
     let hooks = grok_home.join("hooks");
     match std::fs::create_dir(&hooks) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             require_real_dir(&hooks)?;
         }
         Err(source) => {
@@ -334,25 +363,51 @@ pub fn ensure_grok_hook_slots(grok_home: &Path) -> Result<(), GlobalHookSourceEr
         return Err(GlobalHookSourceError::SymlinkedSource { path: hooks });
     }
 
-    let registry = grok_home.join("hooks-paths");
-    match open_registry_create_new(&registry) {
-        Ok(f) => drop(f),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            require_real_file(&registry)?;
-        }
-        Err(source) => {
-            return Err(GlobalHookSourceError::CreateRegistryFile {
-                path: registry,
-                source,
-            });
-        }
+    ensure_real_file_slot(&grok_home.join("hooks-paths"))?;
+    ensure_grok_trust_boundary_slots(grok_home)?;
+    Ok(())
+}
+pub const TRUST_BOUNDARY_FILENAMES: &[&str] = &[
+    USER_CONFIG_FILENAME,
+    TRUSTED_FOLDERS_FILENAME,
+    MANAGED_CONFIG_FILENAME,
+    REQUIREMENTS_FILENAME,
+    SANDBOX_CONFIG_FILENAME,
+];
+pub(crate) fn ensure_grok_trust_boundary_slots(
+    grok_home: &Path,
+) -> Result<(), GlobalHookSourceError> {
+    if path_has_symlink_component(grok_home) {
+        return Err(GlobalHookSourceError::SymlinkedGrokHome {
+            path: grok_home.to_path_buf(),
+        });
     }
-    require_real_file(&registry)?;
-    if path_has_symlink_component(&registry) {
-        return Err(GlobalHookSourceError::SymlinkedSource { path: registry });
+    for name in TRUST_BOUNDARY_FILENAMES {
+        ensure_real_file_slot(&grok_home.join(name))?;
     }
 
     Ok(())
+}
+pub fn resolve_trust_boundary_sources(
+    grok_home: &Path,
+) -> Result<Vec<GlobalHookSource>, GlobalHookSourceError> {
+    if path_has_symlink_component(grok_home) {
+        return Err(GlobalHookSourceError::SymlinkedGrokHome {
+            path: grok_home.to_path_buf(),
+        });
+    }
+    let mut out = Vec::with_capacity(TRUST_BOUNDARY_FILENAMES.len());
+    for name in TRUST_BOUNDARY_FILENAMES {
+        let path = grok_home.join(name);
+        if path_has_symlink_component(&path) {
+            return Err(GlobalHookSourceError::SymlinkedSource { path });
+        }
+        out.push(GlobalHookSource {
+            path,
+            kind: GlobalHookSourceKind::TrustBoundaryFile,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -449,7 +504,7 @@ pub fn resolve_global_hook_sources(
                     );
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(e) => {
                 configured_error = Some(GlobalHookSourceError::HooksPathsRead {
                     path: hooks_paths,
@@ -492,7 +547,7 @@ pub fn list_direct_hook_json_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(e),
     };
     for entry in entries {

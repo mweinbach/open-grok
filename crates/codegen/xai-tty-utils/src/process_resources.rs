@@ -29,6 +29,56 @@ pub fn sample_process_resources() -> ProcessResources {
 pub fn sample_process_memory() -> ProcessResources {
     imp::sample_memory()
 }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessCpu {
+    pub self_time: Option<std::time::Duration>,
+    pub self_user_time: Option<std::time::Duration>,
+    pub self_system_time: Option<std::time::Duration>,
+    pub children_time: Option<std::time::Duration>,
+}
+pub fn sample_process_cpu() -> ProcessCpu {
+    cpu::sample()
+}
+pub fn process_start_time() -> Option<std::time::SystemTime> {
+    imp::start_time()
+}
+pub fn process_memory_limit() -> Option<u64> {
+    imp::memory_limit()
+}
+#[cfg(unix)]
+mod cpu {
+    use super::ProcessCpu;
+    use std::time::Duration;
+    pub(super) fn sample() -> ProcessCpu {
+        let self_times = rusage_times(libc::RUSAGE_SELF);
+        ProcessCpu {
+            self_time: self_times.map(|(user, system)| user + system),
+            self_user_time: self_times.map(|(user, _)| user),
+            self_system_time: self_times.map(|(_, system)| system),
+            children_time: rusage_times(libc::RUSAGE_CHILDREN).map(|(user, system)| user + system),
+        }
+    }
+    fn rusage_times(who: libc::c_int) -> Option<(Duration, Duration)> {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+            return None;
+        }
+        let to_duration = |tv: libc::timeval| -> Option<Duration> {
+            Some(
+                Duration::from_secs(u64::try_from(tv.tv_sec).ok()?)
+                    + Duration::from_micros(u64::try_from(tv.tv_usec).ok()?),
+            )
+        };
+        Some((to_duration(usage.ru_utime)?, to_duration(usage.ru_stime)?))
+    }
+}
+#[cfg(not(unix))]
+mod cpu {
+    use super::ProcessCpu;
+    pub(super) fn sample() -> ProcessCpu {
+        ProcessCpu::default()
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -75,27 +125,28 @@ mod imp {
     }
 
     /// Live thread count of this process, one `proc_pidinfo` syscall.
+    unsafe fn proc_pidinfo_self<T>(flavor: libc::c_int) -> Option<T> {
+        let mut info: T = unsafe { std::mem::zeroed() };
+        let size = size_of::<T>() as i32;
+        let filled =
+            unsafe { libc::proc_pidinfo(libc::getpid(), flavor, 0, (&raw mut info).cast(), size) };
+        (filled == size).then_some(info)
+    }
     fn thread_count() -> Option<u64> {
         // SAFETY: `proc_taskinfo` is all integer fields, so the all-zero bit
         // pattern is a valid value.
-        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-        let size = size_of::<libc::proc_taskinfo>() as i32;
         // SAFETY: `info` is a properly sized/aligned out-buffer and
         // `buffersize` tells the kernel its length; self-pid lookups need no
         // extra privileges.
-        let filled = unsafe {
-            libc::proc_pidinfo(
-                libc::getpid(),
-                libc::PROC_PIDTASKINFO,
-                0,
-                (&raw mut info).cast(),
-                size,
-            )
-        };
-        if filled != size {
-            return None;
-        }
+        let info: libc::proc_taskinfo = unsafe { proc_pidinfo_self(libc::PROC_PIDTASKINFO) }?;
         u64::try_from(info.pti_threadnum).ok()
+    }
+    pub(super) fn memory_limit() -> Option<u64> {
+        None
+    }
+    pub(super) fn start_time() -> Option<std::time::SystemTime> {
+        let info: libc::proc_bsdinfo = unsafe { proc_pidinfo_self(libc::PROC_PIDTBSDINFO) }?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(info.pbi_start_tvsec))
     }
 
     pub(super) fn sample() -> ProcessResources {
@@ -166,6 +217,29 @@ mod imp {
     fn count_entries(dir: &str) -> Option<u64> {
         Some(std::fs::read_dir(dir).ok()?.count() as u64)
     }
+    pub(super) fn memory_limit() -> Option<u64> {
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let path = cgroup
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?
+            .trim();
+        let raw = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max")).ok()?;
+        raw.trim().parse().ok()
+    }
+    pub(super) fn start_time() -> Option<std::time::SystemTime> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let after_comm = stat.get(stat.rfind(')')? + 1..)?;
+        let start_ticks: u64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+        let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks_per_sec <= 0 {
+            return None;
+        }
+        let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+        let boot_secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+        let age_secs = boot_secs - start_ticks as f64 / ticks_per_sec as f64;
+        std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::try_from_secs_f64(age_secs).ok()?)
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -179,11 +253,19 @@ mod imp {
     pub(super) fn sample_memory() -> ProcessResources {
         ProcessResources::default()
     }
+    pub(super) fn start_time() -> Option<std::time::SystemTime> {
+        None
+    }
+    pub(super) fn memory_limit() -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{sample_process_memory, sample_process_resources};
+    use super::{
+        process_start_time, sample_process_cpu, sample_process_memory, sample_process_resources,
+    };
 
     #[test]
     fn a_running_process_reports_its_own_gauges() {
@@ -223,6 +305,44 @@ mod tests {
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         assert!(usage.rss_bytes.expect("rss") > 0);
+    }
+    #[test]
+    fn cpu_and_start_time_readers_report_this_process() {
+        let cpu = sample_process_cpu();
+        #[cfg(unix)]
+        {
+            assert!(
+                cpu.self_time.expect("self cpu readable") > std::time::Duration::ZERO,
+                "a running test binary has burned some cpu"
+            );
+            assert_eq!(
+                cpu.self_user_time.expect("user split readable")
+                    + cpu.self_system_time.expect("system split readable"),
+                cpu.self_time.unwrap(),
+                "the split fields must sum to the total, same reading"
+            );
+        }
+        #[cfg(not(unix))]
+        assert_eq!((cpu.self_time, cpu.children_time), (None, None));
+        if let Some(limit) = super::process_memory_limit() {
+            assert!(limit > 0, "a present cgroup ceiling is a real byte count");
+        }
+        let start = process_start_time();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let start = start.expect("start time readable");
+            let now = std::time::SystemTime::now();
+            assert!(
+                start <= now + std::time::Duration::from_secs(1),
+                "derived start must not land in the future beyond tick rounding"
+            );
+            assert!(
+                start >= now - std::time::Duration::from_secs(60 * 60),
+                "the test binary started within the hour"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(start, None);
     }
 
     /// The thread gauge tracks live threads, not a plausible constant:

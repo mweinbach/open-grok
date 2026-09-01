@@ -17,13 +17,15 @@ pub mod types;
 
 pub use self::conversation::*;
 pub use self::doom_loop::{
-    DOOM_LOOP_CHECK_EVENT_TYPE, DOOM_LOOP_CHECK_HEADER, DoomLoopPeek, DoomLoopRecoveryPolicy,
-    DoomLoopSignal, DoomLoopSignalKind, is_check_event, peek_doom_loop,
+    DEFAULT_EXACT_REPETITION_MIN_TOKENS, DOOM_LOOP_CHECK_EVENT_TYPE, DOOM_LOOP_CHECK_HEADER,
+    DoomLoopPeek, DoomLoopRecoveryPolicy, DoomLoopSignal, DoomLoopSignalKind,
+    EXACT_REPETITION_CHECK_HEADER, is_check_event, peek_doom_loop,
 };
 pub use self::error::{
     ApiErrorCode, EmptyReason, EmptyResponseContext, INVALID_IMAGE_ERROR_CODE,
     ResponseModelMetadata, Result, SamplingError, SentCredential, is_context_length_error,
-    is_retryable_api_status, parse_error_code, status_user_message, user_facing_api_error_message,
+    is_retryable_api_status, is_size_overflow_error_code, parse_error_code, status_user_message,
+    user_facing_api_error_message,
 };
 pub use self::tool_overrides::{
     ClearableField, MAX_WEB_SEARCH_DOMAINS, SearchDateBound, SearchDateBoundError, ToolOverrides,

@@ -66,7 +66,7 @@ fn render_image_overlay_inner(
     }
 
     let theme = crate::theme::Theme::current();
-    let protocol = terminal_image::detect_graphics_protocol();
+    let protocol = terminal_image::prompt_preview_graphics_protocol();
     let plan = plan_image_preview(image, protocol);
     let min_height = if plan.show_pixels {
         MIN_PIXEL_BOX_HEIGHT

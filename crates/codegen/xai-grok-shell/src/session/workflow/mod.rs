@@ -1,4 +1,5 @@
 pub(crate) mod host_service;
+pub(crate) mod listing;
 pub(crate) mod manager;
 pub(crate) mod notify;
 pub(crate) mod registry;

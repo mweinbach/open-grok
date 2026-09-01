@@ -137,6 +137,7 @@
             chip_elements: Vec::new(),
         });
         let retry = RetryState::Retrying {
+            error_type: None,
             attempt: 1,
             max_retries: 3,
             reason: "rate limited".into(),
@@ -1123,9 +1124,7 @@
     }
 
     #[test]
-    fn child_compact_started_does_not_reset_context_used() {
-        // Sibling variants in the same outer arm must not touch the numerator;
-        // guards against accidental widening of the AutoCompactCompleted gate.
+    fn child_compact_started_refreshes_context_used() {
         let mut agent = make_agent(Some("root-sess"));
         let child_sid = "child-sess-3";
         agent
@@ -1150,7 +1149,7 @@
         let child_view = agent.subagent_views.get(child_sid).unwrap();
         assert_eq!(
             child_view.context_state.as_ref().map(|c| c.used),
-            Some(90_000)
+            Some(95_000)
         );
     }
 

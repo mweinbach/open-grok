@@ -1,5 +1,36 @@
 use super::*;
 
+#[test]
+fn extra_bundle_precedence_and_explicit_disable() {
+    assert_eq!(
+        select_bundle(Some("extra.pem".into()), Some("system.pem".into())),
+        Some((ENV_OPENGROK_EXTRA_CA_BUNDLE, "extra.pem".into()))
+    );
+    assert_eq!(
+        select_bundle(None, Some("system.pem".into())),
+        Some((ENV_SSL_CERT_FILE, "system.pem".into()))
+    );
+    assert_eq!(
+        select_bundle(Some("".into()), Some("system.pem".into())),
+        None
+    );
+    assert_eq!(select_bundle(None, Some("".into())), None);
+    assert_eq!(select_bundle(None, None), None);
+}
+
+#[test]
+fn clients_share_native_roots_and_websocket_alpn() {
+    build_reqwest_client(|builder| builder).unwrap();
+    build_reqwest_client(|builder| builder.http1_only()).unwrap();
+    let config = rustls_client_config();
+    assert!(Arc::ptr_eq(&config, &rustls_client_config()));
+    assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    assert_eq!(
+        NATIVE_ROOT_LOADS.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
 // Self-signed PEMs for unit tests only (CN=test-extra-ca-1 / -2).
 const VALID_CERT_1: &str = "-----BEGIN CERTIFICATE-----\n\
 MIIDFTCCAf2gAwIBAgIUT2czXTuxSAjDjEh92UMB1OVahZYwDQYJKoZIhvcNAQEL\n\

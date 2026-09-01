@@ -25,6 +25,24 @@ pub struct LspToolResult {
     pub is_error: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskChangeKind {
+    Created,
+    Changed,
+    Deleted,
+}
+
+impl DiskChangeKind {
+    pub(crate) fn to_lsp(self) -> async_lsp::lsp_types::FileChangeType {
+        use async_lsp::lsp_types::FileChangeType;
+        match self {
+            Self::Created => FileChangeType::CREATED,
+            Self::Changed => FileChangeType::CHANGED,
+            Self::Deleted => FileChangeType::DELETED,
+        }
+    }
+}
+
 /// Trait object interface for LSP operations.
 ///
 /// Implemented by `LspBackendAdapter` which wraps `LspManager`.
@@ -41,6 +59,13 @@ pub trait LspBackend: Send + Sync + 'static {
     async fn drain_diagnostics(&self, timeout: std::time::Duration) -> Option<DiagnosticsSummary>;
 
     async fn notify_file_changed(&self, path: &std::path::Path, content: &str);
+
+    async fn notify_file_event(
+        &self,
+        path: &std::path::Path,
+        content: Option<&str>,
+        kind: DiskChangeKind,
+    );
 
     /// Read diagnostics for specific file paths.
     ///

@@ -2340,6 +2340,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             agent_type: crate::agent::config::default_agent_type(),
             inference_idle_timeout_secs: None,
             max_retries: None,
+            subagent_rate_limit_max_attempts: None,
             hidden: false,
             supported_in_api: true,
             reasoning_effort: None,

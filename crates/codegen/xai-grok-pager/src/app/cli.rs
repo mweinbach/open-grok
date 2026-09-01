@@ -62,6 +62,8 @@ pub enum Command {
     Models,
     /// List, search, or restore sessions
     Sessions(crate::sessions_cmd::SessionsArgs),
+    #[command(about = "Print persisted token and cost usage for a session")]
+    Usage(crate::usage_cmd::UsageArgs),
     /// Fetch and install managed configuration
     Setup {
         /// Print the fetched configuration as JSON instead of installing it;
@@ -135,6 +137,8 @@ See ~/.opengrok/README.md for more information.
     },
     /// Manage git worktrees
     Worktree(crate::worktree_cmd::WorktreeArgs),
+    #[command(about = "Clone a Git repository (Grove is opt-in)")]
+    Clone(crate::clone_cmd::CloneArgs),
     /// Show what the Open Grok home (~/.opengrok) uses on disk
     #[command(name = "du", visible_alias = "disk-usage")]
     DiskUsage(crate::disk_usage_cmd::DiskUsageArgs),
@@ -653,6 +657,12 @@ pub struct PagerArgs {
     /// Disable cross-session memory for this session.
     #[arg(long = "no-memory", conflicts_with = "experimental_memory")]
     pub no_memory: bool,
+    #[arg(
+        long = "memory-flush",
+        hide = true,
+        help = "Run a memory flush after the headless turn, or instead of a prompt when resuming"
+    )]
+    pub memory_flush: bool,
     /// Agent name or definition file path.
     #[arg(long = "agent", value_name = "NAME")]
     pub agent: Option<String>,
@@ -821,6 +831,26 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
         .collect()
 }
 impl PagerArgs {
+    pub fn memory_enabled_override(&self) -> Option<bool> {
+        if self.experimental_memory {
+            Some(true)
+        } else if self.no_memory {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn memory_override_flag(&self) -> Option<&'static str> {
+        if self.experimental_memory {
+            Some("--experimental-memory")
+        } else if self.no_memory {
+            Some("--no-memory")
+        } else {
+            None
+        }
+    }
+
     /// Parse CLI arguments without applying side effects.
     pub fn parse_cli() -> Self {
         let bin_name = std::env::args()
@@ -895,6 +925,73 @@ impl PagerArgs {
     pub fn resume_most_recent(&self) -> bool {
         self.resume_session.as_deref() == Some("")
     }
+
+    pub(crate) fn local_resume_selection(
+        &self,
+    ) -> xai_grok_shell::session::persistence::RecentSessionSelection {
+        use xai_grok_shell::session::persistence::RecentSessionSelection;
+
+        if self.single.is_some()
+            || self.prompt_json.is_some()
+            || self.prompt_file.is_some()
+            || self.memory_flush
+        {
+            RecentSessionSelection::Any
+        } else {
+            RecentSessionSelection::Interactive
+        }
+    }
+
+    pub fn startup_uses_xai_session(&self, config: &xai_grok_shell::agent::config::Config) -> bool {
+        self.startup_uses_xai_session_with_api_key(
+            config,
+            std::env::var("XAI_API_KEY").is_ok_and(|key| !key.trim().is_empty()),
+        )
+    }
+
+    fn startup_uses_xai_session_with_api_key(
+        &self,
+        config: &xai_grok_shell::agent::config::Config,
+        has_api_key: bool,
+    ) -> bool {
+        use xai_grok_shell::agent::config::{find_model_by_id, resolve_model_list};
+        use xai_grok_shell::sampling::types::ModelProvider;
+
+        if has_api_key || config.endpoints.has_custom_endpoint() {
+            return false;
+        }
+        let model_override = match self.command.as_ref() {
+            Some(Command::Agent(agent_args))
+                if agent_args.cli_chat_proxy_base_url.is_some()
+                    || agent_args.xai_api_base_url.is_some() =>
+            {
+                return false;
+            }
+            Some(Command::Agent(agent_args)) => agent_args.model.as_deref(),
+            _ => self.model.as_deref(),
+        };
+        if model_override.is_none()
+            && (self.resume_session.is_some()
+                || self.load_session.is_some()
+                || self.continue_last_session)
+        {
+            return false;
+        }
+        let Some(model) = model_override
+            .or(config.default_model_override.as_deref())
+            .or(config.models.default.as_deref())
+        else {
+            return false;
+        };
+        let models = resolve_model_list(config, None);
+        find_model_by_id(&models, model).is_some_and(|entry| {
+            entry.info.provider == ModelProvider::Xai
+                && entry.api_key.is_none()
+                && entry.env_key.is_none()
+                && !entry.has_own_credentials()
+        })
+    }
+
     /// Classify flags for sandbox profile lookup on an existing session.
     ///
     /// Uses [`Self::session_startup_intent`]; invalid combos fall through to
@@ -958,7 +1055,7 @@ impl PagerArgs {
             return Ok(());
         };
         use crate::app::session_title_resolve::{PinnedResumeTarget, presandbox_resume_target};
-        let pinned = presandbox_resume_target(&target, cwd)?;
+        let pinned = presandbox_resume_target(&target, cwd, self.local_resume_selection())?;
         self.resume_target_pinned = true;
         if let PinnedResumeTarget::Title {
             ref id,
@@ -1004,7 +1101,10 @@ impl PagerArgs {
                 )
             }
             ResumeTarget::MostRecentForCwd => {
-                xai_grok_shell::session::persistence::resumed_session_sandbox_profile(None, cwd)
+                xai_grok_shell::session::persistence::resolve_recent_session_sandbox_profile(
+                    cwd,
+                    self.local_resume_selection(),
+                )
             }
             ResumeTarget::None => None,
         }
@@ -1041,6 +1141,240 @@ impl PagerArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_override_preserves_explicit_enable_disable_and_unset() {
+        for (arguments, enabled, flag) in [
+            (vec!["open-grok"], None, None),
+            (
+                vec!["open-grok", "--experimental-memory"],
+                Some(true),
+                Some("--experimental-memory"),
+            ),
+            (
+                vec!["open-grok", "--no-memory"],
+                Some(false),
+                Some("--no-memory"),
+            ),
+        ] {
+            let args = PagerArgs::try_parse_from(arguments).unwrap();
+            assert_eq!(args.memory_enabled_override(), enabled);
+            assert_eq!(args.memory_override_flag(), flag);
+        }
+    }
+
+    #[test]
+    fn usage_command_parses_session_and_optional_turn() {
+        let session = PagerArgs::try_parse_from(["open-grok", "usage", "sess-1"]).unwrap();
+        assert!(matches!(
+            session.command,
+            Some(Command::Usage(crate::usage_cmd::UsageArgs { session_id, turn: None }))
+                if session_id == "sess-1"
+        ));
+        let turn = PagerArgs::try_parse_from(["open-grok", "usage", "sess-1", "3"]).unwrap();
+        assert!(matches!(
+            turn.command,
+            Some(Command::Usage(crate::usage_cmd::UsageArgs { session_id, turn: Some(3) }))
+                if session_id == "sess-1"
+        ));
+        assert!(PagerArgs::try_parse_from(["open-grok", "usage"]).is_err());
+        assert!(PagerArgs::try_parse_from(["open-grok", "usage", "sess-1", "invalid"]).is_err());
+    }
+
+    #[test]
+    fn memory_flush_without_prompt_selects_headless_sessions() {
+        use xai_grok_shell::session::persistence::RecentSessionSelection;
+
+        let args = PagerArgs::try_parse_from(["open-grok", "--resume", "sess-1", "--memory-flush"])
+            .unwrap();
+        assert!(args.memory_flush);
+        assert!(args.single.is_none());
+        assert_eq!(args.local_resume_selection(), RecentSessionSelection::Any);
+
+        let args =
+            PagerArgs::try_parse_from(["open-grok", "-p", "remember this", "--memory-flush"])
+                .unwrap();
+        assert!(args.memory_flush);
+        assert_eq!(args.single.as_deref(), Some("remember this"));
+        assert_eq!(args.local_resume_selection(), RecentSessionSelection::Any);
+
+        let args = PagerArgs::try_parse_from(["open-grok", "--continue"]).unwrap();
+        assert!(!args.memory_flush);
+        assert_eq!(
+            args.local_resume_selection(),
+            RecentSessionSelection::Interactive
+        );
+    }
+
+    fn startup_config(
+        provider: xai_grok_shell::sampling::types::ModelProvider,
+    ) -> xai_grok_shell::agent::config::Config {
+        let mut config = xai_grok_shell::agent::config::Config::default();
+        config.models.default = Some("startup-test-model".into());
+        config.config_models.insert(
+            "startup-test-model".into(),
+            xai_grok_shell::agent::config::ConfigModelOverride {
+                model: Some("same-model-slug".into()),
+                provider: Some(provider),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn startup_auth_requires_xai_metadata_not_slug_or_backend() {
+        use xai_grok_shell::sampling::types::ModelProvider;
+
+        let args = PagerArgs::try_parse_from(["open-grok"]).unwrap();
+        for provider in [
+            ModelProvider::Xai,
+            ModelProvider::Codex,
+            ModelProvider::Kimi,
+            ModelProvider::Fireworks,
+            ModelProvider::DeepSeek,
+            ModelProvider::Meta,
+            ModelProvider::Wafer,
+            ModelProvider::Zai,
+            ModelProvider::Runinfra,
+            ModelProvider::Gemini,
+            ModelProvider::OpenCodeGo,
+            ModelProvider::OpenRouter,
+            ModelProvider::Custom,
+        ] {
+            assert_eq!(
+                args.startup_uses_xai_session_with_api_key(&startup_config(provider), false),
+                provider == ModelProvider::Xai,
+                "{provider:?}"
+            );
+        }
+        let mut config = startup_config(ModelProvider::Xai);
+        config.models.default = None;
+        assert!(!args.startup_uses_xai_session_with_api_key(&config, false));
+        config.models.default = Some("grok-unknown-model".into());
+        assert!(!args.startup_uses_xai_session_with_api_key(&config, false));
+    }
+
+    #[test]
+    fn startup_auth_skips_explicit_credentials_and_custom_endpoints() {
+        use xai_grok_shell::agent::config::ConfigModelOverride;
+        use xai_grok_shell::sampling::types::ModelProvider;
+
+        let args = PagerArgs::try_parse_from(["open-grok"]).unwrap();
+        for overrides in [
+            serde_json::json!({"api_key": "test-model-key"}),
+            serde_json::json!({"env_key": "OPENGROK_STARTUP_TEST_UNSET_KEY"}),
+            serde_json::json!({"auth_provider": "test-model-provider"}),
+        ] {
+            let mut config = startup_config(ModelProvider::Xai);
+            let mut entry: ConfigModelOverride = serde_json::from_value(overrides).unwrap();
+            entry.provider = Some(ModelProvider::Xai);
+            config
+                .config_models
+                .insert("startup-test-model".into(), entry);
+            assert!(!args.startup_uses_xai_session_with_api_key(&config, false));
+        }
+        let mut config = startup_config(ModelProvider::Xai);
+        assert!(!args.startup_uses_xai_session_with_api_key(&config, true));
+        config.endpoints.models_base_url = Some("https://example.invalid".into());
+        assert!(!args.startup_uses_xai_session_with_api_key(&config, false));
+    }
+
+    #[test]
+    fn startup_auth_obeys_explicit_model_and_defers_unknown_resume_route() {
+        use xai_grok_shell::sampling::types::ModelProvider;
+
+        let mut config = startup_config(ModelProvider::Xai);
+        config.config_models.insert(
+            "other-provider".into(),
+            xai_grok_shell::agent::config::ConfigModelOverride {
+                provider: Some(ModelProvider::Custom),
+                ..Default::default()
+            },
+        );
+        for arguments in [
+            vec!["open-grok", "--model", "other-provider"],
+            vec!["open-grok", "agent", "--model", "other-provider", "stdio"],
+            vec!["open-grok", "--resume", "sess-1"],
+            vec!["open-grok", "--load", "sess-1"],
+            vec!["open-grok", "--continue"],
+            vec![
+                "open-grok",
+                "agent",
+                "--xai-api-base-url",
+                "https://example.invalid",
+                "stdio",
+            ],
+            vec![
+                "open-grok",
+                "agent",
+                "--cli-chat-proxy-base-url",
+                "https://example.invalid",
+                "stdio",
+            ],
+        ] {
+            let args = PagerArgs::try_parse_from(arguments).unwrap();
+            assert!(!args.startup_uses_xai_session_with_api_key(&config, false));
+        }
+        config.models.default = Some("other-provider".into());
+        let args =
+            PagerArgs::try_parse_from(["open-grok", "--continue", "--model", "startup-test-model"])
+                .unwrap();
+        assert!(args.startup_uses_xai_session_with_api_key(&config, false));
+    }
+
+    #[test]
+    fn clone_subcommand_accepts_git_defaults_and_optional_grove_flags() {
+        for arguments in [
+            vec![
+                "open-grok",
+                "clone",
+                "https://example.invalid/team/repo.git",
+            ],
+            vec![
+                "open-grok",
+                "clone",
+                "git@example.invalid:team/repo.git",
+                "checkout",
+                "--branch",
+                "main",
+                "--cone",
+                "src",
+                "--cone",
+                "docs",
+                "--full-history",
+                "--grove",
+            ],
+        ] {
+            let args = PagerArgs::try_parse_from(arguments).expect("clone arguments parse");
+            assert!(matches!(args.command, Some(Command::Clone(_))));
+        }
+        assert!(PagerArgs::try_parse_from(["open-grok", "clone"]).is_err());
+    }
+
+    #[test]
+    fn clone_subcommand_help_exposes_git_default_and_grove_opt_in() {
+        use clap::CommandFactory;
+
+        let mut command = PagerArgs::command();
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("Clone a Git repository (Grove is opt-in)"));
+
+        let clone = command
+            .find_subcommand_mut("clone")
+            .expect("clone is registered");
+        let help = clone.render_long_help().to_string();
+        for option in [
+            "<URL>",
+            "[DIR]",
+            "--branch",
+            "--cone",
+            "--full-history",
+            "--grove",
+        ] {
+            assert!(help.contains(option), "missing {option} in {help}");
+        }
+    }
 
     #[test]
     fn version_omits_upstream_channel_badges() {

@@ -90,6 +90,7 @@ pub(crate) struct WorkflowHostParams {
     >,
     pub parent_session_id: String,
     pub allow_fork_context: bool,
+    pub effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     pub templates: std::collections::HashMap<String, String>,
     pub telemetry: TelemetryHook,
     pub stats: Arc<WorkflowAgentStats>,
@@ -492,8 +493,10 @@ impl HostService {
         let isolation = opts
             .isolation_worktree
             .then_some(xai_tool_types::SubagentIsolationMode::Worktree);
-        let reasoning_effort =
-            normalize_workflow_reasoning_effort(opts.reasoning_effort.as_deref())?;
+        let reasoning_effort = normalize_workflow_reasoning_effort(
+            opts.effort.as_deref().or(opts.reasoning_effort.as_deref()),
+        )?
+        .or_else(|| self.params.effort.map(|effort| effort.to_string()));
         let subagent_type = opts
             .agent_type
             .clone()
@@ -1025,6 +1028,7 @@ mod tests {
                 subagent_event_tx,
                 parent_session_id: "parent".into(),
                 allow_fork_context: false,
+                effort: None,
                 templates: Default::default(),
                 telemetry: Arc::new(|_, _, _| {}),
                 stats: Arc::new(WorkflowAgentStats::default()),

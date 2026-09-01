@@ -104,7 +104,9 @@ pub(crate) async fn compute_vcs_status_block(
     working_directory: &Path,
     vcs_kind: VcsKind,
 ) -> Option<String> {
-    use xai_grok_workspace::file_system::{git_status_short, jj_status};
+    use xai_grok_workspace::file_system::{
+        git_status_short_pinned, jj_status, probe_fsmonitor_override,
+    };
 
     if matches!(vcs_kind, VcsKind::None) {
         return None;
@@ -124,7 +126,11 @@ pub(crate) async fn compute_vcs_status_block(
     let result = if vcs_kind.is_jj() {
         tokio::time::timeout(timeout, jj_status(working_directory)).await
     } else {
-        tokio::time::timeout(timeout, git_status_short(working_directory)).await
+        tokio::time::timeout(timeout, async {
+            let fsmonitor = probe_fsmonitor_override(working_directory).await;
+            git_status_short_pinned(working_directory, fsmonitor).await
+        })
+        .await
     };
     match result {
         Ok(Ok(status)) => {

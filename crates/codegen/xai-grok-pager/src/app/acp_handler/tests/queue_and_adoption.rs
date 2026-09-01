@@ -1,6 +1,87 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
     use super::*;
 
+    #[test]
+    fn child_queue_changed_routes_parent_message_without_root_adoption() {
+        let mut app = make_app_with_agent("session-parent");
+        let child_id = "session-child";
+        assert!(handle_ext_notification(
+            &queue_changed_versioned("session-parent", &[("root-prompt", 1, "prompt")], None),
+            &mut app,
+        ));
+        assert!(handle(
+            make_ext_session_notification(
+                "session-parent",
+                test_subagent_spawned("session-parent", child_id),
+            ),
+            &mut app,
+        ));
+        app.agents.get_mut(&AgentId(0)).unwrap().active_subagent = Some(child_id.to_string());
+
+        assert!(handle_ext_notification(
+            &queue_changed_versioned(
+                child_id,
+                &[("parent-message-1", 1, "parent_agent_message")],
+                Some("child-running"),
+            ),
+            &mut app,
+        ));
+        let parent = &app.agents[&AgentId(0)];
+        assert_eq!(parent.shared_queue.len(), 1);
+        assert_eq!(parent.shared_queue[0].id, "root-prompt");
+        assert!(parent.session.current_prompt_id.is_none());
+        assert!(app.pending_running_adoptions.is_empty());
+        assert!(app.pending_effects.is_empty());
+        let child = &parent.subagent_views[child_id];
+        assert_eq!(child.shared_queue.len(), 1);
+        assert_eq!(child.shared_queue[0].id, "parent-message-1");
+        assert_eq!(child.shared_queue[0].kind, "parent_agent_message");
+        assert_eq!(child.shared_queue[0].text, "text parent-message-1");
+        assert_eq!(child.queue.entry_ids().len(), 1);
+        assert!(child.queue.is_visible());
+
+        assert!(handle_ext_notification(
+            &queue_changed_versioned(child_id, &[], None),
+            &mut app,
+        ));
+        assert!(app.shared_prompt_queue(child_id).is_none());
+        let parent = &app.agents[&AgentId(0)];
+        assert_eq!(parent.shared_queue.len(), 1);
+        assert_eq!(parent.shared_queue[0].id, "root-prompt");
+        let child = &parent.subagent_views[child_id];
+        assert!(child.shared_queue.is_empty());
+        assert!(child.queue.entry_ids().is_empty());
+        assert!(!child.queue.is_visible());
+    }
+
+    #[test]
+    fn viewer_prompt_complete_hook_denied_blocks_queue_and_renders_hook_marker() {
+        let mut app = make_app_with_agent("session-view");
+        app.agents.get_mut(&AgentId(0)).unwrap().attached_as_viewer = true;
+        let _ = handle(
+            make_agent_chunk_message_with_prompt("session-view", "chunk", "prompt-driver", false),
+            &mut app,
+        );
+        let notification = acp::ExtNotification::new(
+            "x.ai/session/prompt_complete",
+            std::sync::Arc::from(serde_json::value::to_raw_value(&serde_json::json!({
+                "sessionId": "session-view",
+                "promptId": "prompt-driver",
+                "stopReason": "cancelled",
+                "cancellationCategory": "HookDenied",
+                "cancellationContext": {"hook_name": "prompt-guard", "reason": "blocked"},
+            })).unwrap()),
+        );
+        assert!(handle_ext_notification(&notification, &mut app));
+        let agent = &app.agents[&AgentId(0)];
+        assert!(agent.session.hook_block_hold);
+        assert!(matches!(agent.session.state, AgentState::Idle));
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnBlockedByHook { .. }),
+        ));
+    }
+
     /// The pager reconciles the authoritative shared prompt queue from the
     /// `x.ai/queue/changed` broadcast, and an empty broadcast clears it.
     #[test]
@@ -2424,7 +2505,7 @@
         match last_session_event(&agent.scrollback) {
             Some(SessionEvent::TurnFailed { error, .. }) => {
                 assert_eq!(
-                    error, "Request failed \u{2014} boom. Try sending again.",
+                    error, "Request failed: boom. Try sending again.",
                     "agentResult must propagate into the formatted marker"
                 )
             }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// (`<user_grok_home>/trusted-hook-projects`), or `None` when no user grok home
 /// resolves. Retained only for the one-time migration into folder-trust.
 pub fn legacy_trust_file_path() -> Option<PathBuf> {
-    Some(xai_grok_config::user_grok_home()?.join("trusted-hook-projects"))
+    Some(xai_grok_config::user_grok_home()?.join(xai_grok_config::TRUSTED_HOOK_PROJECTS_FILENAME))
 }
 
 /// Parse the legacy trusted-projects file into a list of project paths.
@@ -46,6 +46,44 @@ pub fn is_hook_disabled(hook_name: &str) -> bool {
     }
 }
 
+pub fn hook_disabled_for_display(spec: &crate::config::HookSpec) -> bool {
+    hook_disabled_for_display_with(spec, &DisabledHooks::load())
+}
+
+pub fn hook_disabled_for_display_with(
+    spec: &crate::config::HookSpec,
+    disabled: &DisabledHooks,
+) -> bool {
+    !spec.is_managed_policy() && (!spec.enabled || disabled.contains(&spec.name))
+}
+
+pub struct DisabledHooks(std::collections::HashSet<String>);
+
+impl DisabledHooks {
+    pub fn from_names<I: IntoIterator<Item = String>>(names: I) -> Self {
+        Self(names.into_iter().collect())
+    }
+
+    pub fn load() -> Self {
+        let names = disabled_hooks_file_path()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .map(|content| {
+                content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self(names)
+    }
+
+    pub fn contains(&self, hook_name: &str) -> bool {
+        self.0.contains(hook_name)
+    }
+}
+
 fn is_hook_disabled_with_file(hook_name: &str, file: &Path) -> bool {
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,
@@ -65,7 +103,7 @@ pub fn disable_hook(hook_name: &str) -> Result<(), String> {
 
 fn disable_hook_with_file(hook_name: &str, file: &Path) -> Result<(), String> {
     if is_hook_disabled_with_file(hook_name, file) {
-        return Ok(()); // Already disabled.
+        return Ok(());
     }
     if let Some(parent) = file.parent() {
         let _ = std::fs::create_dir_all(parent);

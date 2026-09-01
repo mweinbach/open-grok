@@ -166,6 +166,14 @@ impl SessionActor {
     ) -> anyhow::Result<RewindResponse> {
         let target_index = request.target_prompt_index;
         let mode = request.mode;
+        let wants_file_revert = matches!(mode, RewindMode::All | RewindMode::FilesOnly);
+        let wants_conversation_rewind =
+            matches!(mode, RewindMode::All | RewindMode::ConversationOnly);
+        let _strip_guard = if request.force && wants_conversation_rewind {
+            Some(self.prepare_image_strips_for_rewind().await)
+        } else {
+            None
+        };
 
         // Validate: target must be less than current prompt_index. FilesOnly
         // reverts the on-disk snapshot index (bounded by `get_rewind_points`,
@@ -194,10 +202,6 @@ impl SessionActor {
         // ── Build file revert preview (for All and FilesOnly modes) ─────
         let mut clean_files = Vec::new();
         let mut conflicts = Vec::new();
-
-        let wants_file_revert = matches!(mode, RewindMode::All | RewindMode::FilesOnly);
-        let wants_conversation_rewind =
-            matches!(mode, RewindMode::All | RewindMode::ConversationOnly);
 
         // Collect files that would be reverted and detect conflicts.
         // This is read-only — no mutations happen here.
@@ -430,7 +434,15 @@ impl SessionActor {
 
             // Write the truncated conversation back via the actor
             // (handles both state update + persistence).
+            self.cancel_active_sampling_requests();
+            self.cancel_pending_image_strips_for_rewind();
             self.chat_state_handle.replace_conversation(conversation);
+            self.recap_epoch.set(self.recap_epoch.get().wrapping_add(1));
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::LastRecap(None));
+            self.rearm_failed_server_announcements().await;
             // Use a snapshot to set the correct prompt_index and truncated prompt_texts.
             // The actor's TruncateToPromptIndex doesn't apply here because the
             // conversation was already truncated locally. Instead, snapshot + restore
@@ -473,12 +485,27 @@ impl SessionActor {
             // The summary describes turns the rewind just removed; an
             // in-flight generation would re-persist one for them.
             self.abort_turn_summary();
+            self.abort_title_refresh();
             let _ = self
                 .notifications
                 .persistence_tx
                 .send(PersistenceMsg::LastTurnSummary(None));
 
             let _ = self.rebuild_spec.code_mode_runtime.reset().await;
+            let session_dir = crate::session::persistence::session_dir(&self.session_info);
+            if !crate::session::persistence::title_is_manual_in_dir(&session_dir) {
+                let post_rewind_turns = crate::session::helpers::session_recap::main_turn_count(
+                    &self.chat_state_handle.get_conversation().await,
+                );
+                let checkpoint = crate::session::helpers::session_summary::checkpoints_reached(
+                    post_rewind_turns,
+                );
+                self.next_title_refresh_idx.set(checkpoint);
+                crate::session::helpers::session_summary::save_title_refresh_watermark(
+                    &session_dir,
+                    checkpoint,
+                );
+            }
         }
 
         // Update the file state tracker to reflect the rewind.
@@ -504,6 +531,7 @@ impl SessionActor {
         }
 
         self.signals_handle().mark_reverted();
+        self.emit_status_snapshot_detached();
 
         Ok(RewindResponse {
             success: true,

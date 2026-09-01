@@ -119,9 +119,12 @@ fn external_allowed_keys_are_pinned() {
         "output_tokens",
         "reasoning_tokens",
         "cache_read_tokens",
+        "cache_creation_tokens",
+        "cost_usd_micros",
         "status_code",
         "tool_name",
         "success",
+        "hook_rewrote",
         "file_extension",
         "tool_parameters",
         "file_path",
@@ -274,6 +277,10 @@ fn screen_mode_allowlist_is_pinned() {
 fn tool_name_sanitization() {
     assert_eq!(schema::sanitize_tool_name("read_file"), "read_file");
     assert_eq!(
+        schema::sanitize_tool_name("send_subagent_message"),
+        "send_subagent_message"
+    );
+    assert_eq!(
         schema::sanitize_tool_name("nebula__post_message"),
         "mcp_tool"
     );
@@ -378,7 +385,7 @@ fn session_new_increments_session_count_only() {
 fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
     let stream = build(gates_off());
     let mut phase_durations_ms = std::collections::BTreeMap::new();
-    phase_durations_ms.insert("load_config".into(), 12);
+    phase_durations_ms.insert("config_load".into(), 12);
     phase_durations_ms.insert("model_catalog".into(), 28_700);
     emit_event_into(
         &stream,
@@ -386,7 +393,7 @@ fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
             connect_target: crate::startup::AgentKind::Embedded,
             outcome: crate::startup::StartupOutcome::Timeout,
             stuck_in: Some("model_catalog".into()),
-            phases: "load_config=12ms, model_catalog>=28.7s".into(),
+            phases: "config_load=12ms, model_catalog>=28.7s".into(),
             phase_durations_ms,
             elapsed_ms: 30_000,
             timeout_secs: Some(30),
@@ -407,15 +414,21 @@ fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
 }
 
 #[test]
-fn startup_complete_records_the_total_histogram_only() {
+fn startup_completed_records_the_total_histogram_only() {
     let stream = build(gates_off());
     emit_event_into(
         &stream,
-        &events::StartupComplete {
+        &events::StartupCompleted {
             total_ms: 1_234,
             outcome: crate::startup::StartupOutcome::Ok,
-            phases: "load_config=12ms, session_create=800ms".into(),
+            phases: "config_load=12ms, session_create=800ms".into(),
             auth_mode: crate::startup::AuthMode::Team,
+            prefetch_wait_ms: Some(210),
+            session_load_ms: Some(120),
+            session_replay_ms: None,
+            session_git_scan_ms: Some(40),
+            session_spawn_ms: Some(300),
+            time_to_first_frame_ms: Some(650),
         },
     );
     assert!(exported_events(&stream).is_empty());
@@ -438,6 +451,8 @@ fn api_request_snapshot_and_token_usage() {
             completion_tokens: Some(50),
             reasoning_tokens: Some(25),
             cached_prompt_tokens: None,
+            cache_creation_tokens: None,
+            cost_usd_ticks: None,
         },
     );
     let events = exported_events(&stream);
@@ -458,6 +473,36 @@ fn api_request_snapshot_and_token_usage() {
 /// `TurnCompleted{Error}`. `TurnCompleted{Error}` is the single increment
 /// source; the api_error log events carry no metric (Bugbot regression:
 /// double-counted errors at customer collectors).
+#[test]
+fn api_request_cost_and_cache_creation_export_attrs_and_metrics() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::ModelResponseReceived {
+            model_id: "grok-4".into(),
+            duration_ms: 1200,
+            stop_reason: Some("stop".into()),
+            prompt_tokens: Some(100),
+            completion_tokens: Some(50),
+            reasoning_tokens: None,
+            cached_prompt_tokens: None,
+            cache_creation_tokens: Some(40),
+            cost_usd_ticks: Some(5_000_000_000),
+        },
+    );
+    let ev = &exported_events(&stream)[0];
+    assert_eq!(ev.0, "grok_code.api_request");
+    assert_eq!(attr(ev, "cache_creation_tokens").as_deref(), Some("40"));
+    assert_eq!(attr(ev, "cost_usd_micros").as_deref(), Some("500000"));
+    let mut names = exported_metric_names(&stream);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["grok_code.cost.usage", "grok_code.token.usage"],
+        "cost increments cost.usage; cache_creation rides token.usage"
+    );
+}
+
 #[test]
 fn one_failed_turn_increments_error_count_exactly_once() {
     let stream = build(gates_off());
@@ -537,6 +582,28 @@ fn turn_error_increments_error_count() {
 }
 
 #[test]
+fn tool_result_hook_rewrote_is_content_free() {
+    use xai_grok_session_events::types::ToolOutcome;
+    for (hook_rewrote, want) in [(true, "true"), (false, "false")] {
+        let stream = build(gates_off());
+        emit_event_into(
+            &stream,
+            &events::ToolCallCompleted {
+                tool_name: "run_terminal_cmd".into(),
+                outcome: ToolOutcome::Success,
+                hook_rewrote,
+                duration_ms: 5,
+                tool_result_size_bytes: None,
+                file_path: None,
+                parameters: None,
+            },
+        );
+        let events = exported_events(&stream);
+        assert_eq!(attr(&events[0], "hook_rewrote").as_deref(), Some(want));
+    }
+}
+
+#[test]
 fn tool_result_gates_off_collapses_and_reduces() {
     let stream = build(gates_off());
     emit_event_into(
@@ -544,7 +611,9 @@ fn tool_result_gates_off_collapses_and_reduces() {
         &events::ToolCallCompleted {
             tool_name: "nebula__post_message".into(),
             outcome: xai_grok_session_events::types::ToolOutcome::Success,
+            hook_rewrote: false,
             duration_ms: 42,
+            tool_result_size_bytes: None,
             file_path: Some("/Users/alice/secret-project/main.rs".into()),
             parameters: Some(serde_json::json!({"text": "CANARY_TOOL_ARGS"})),
         },
@@ -582,7 +651,9 @@ fn tool_result_details_gate_exposes_verbatim_scrubbed() {
         &events::ToolCallCompleted {
             tool_name: "nebula__post_message".into(),
             outcome: xai_grok_session_events::types::ToolOutcome::Success,
+            hook_rewrote: false,
             duration_ms: 42,
+            tool_result_size_bytes: None,
             file_path: Some(path.clone()),
             parameters: Some(serde_json::json!({"key": "sk-CANARYabcdefghij1234567890"})),
         },
@@ -711,6 +782,42 @@ fn mcp_connection_collapses_server_name_by_default() {
 }
 
 #[test]
+fn agent_message_tool_decision_identity() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::PermissionDecisionPayload {
+            tool_name: "send_subagent_message".into(),
+            access_kind: events::AccessKind::AgentMessage,
+            decision: events::PermissionOutcome::Allow,
+            wait_ms: 10,
+            permission_mode: crate::enums::PermissionMode::Ask,
+            source: Some("allowed".into()),
+            subagent_session_id: None,
+            subagent_type: None,
+            manager_prompt_attempted: Some(true),
+            prompt_outcome: Some(events::PermissionPromptOutcome::Allow),
+            prompt_outcome_detail: Some(events::PermissionPromptOutcomeDetail::AllowOnce),
+            remember_tool_approvals: Some(true),
+            decision_reason: Some(events::PermissionDecisionReason::NeedsUser),
+            classifier_source: None,
+            classifier_verdict: None,
+            security_findings: None,
+            classifier_latency_ms: None,
+            auto_denials_consecutive: None,
+            auto_denials_total: None,
+        },
+    );
+    let events = exported_events(&stream);
+    let ev = &events[0];
+    assert_eq!(
+        attr(ev, "tool_name").as_deref(),
+        Some("send_subagent_message")
+    );
+    assert_eq!(attr(ev, "access_kind").as_deref(), Some("agent_message"));
+}
+
+#[test]
 fn tool_decision_snapshot() {
     let stream = build(gates_off());
     emit_event_into(
@@ -726,6 +833,8 @@ fn tool_decision_snapshot() {
             subagent_type: None,
             manager_prompt_attempted: Some(true),
             prompt_outcome: Some(events::PermissionPromptOutcome::Reject),
+            prompt_outcome_detail: Some(events::PermissionPromptOutcomeDetail::RejectOnce),
+            remember_tool_approvals: Some(true),
             decision_reason: Some(events::PermissionDecisionReason::AutoDenialLimit),
             classifier_source: Some(events::PermissionClassifierSource::Llm),
             classifier_verdict: Some(events::PermissionClassifierVerdict::Block),
@@ -743,6 +852,8 @@ fn tool_decision_snapshot() {
     assert_eq!(attr(ev, "access_kind").as_deref(), Some("bash"));
     assert_eq!(attr(ev, "permission_mode").as_deref(), Some("ask"));
     assert_eq!(attr(ev, "source").as_deref(), Some("user_reject"));
+    assert!(attr(ev, "prompt_outcome_detail").is_none());
+    assert!(attr(ev, "remember_tool_approvals").is_none());
     assert_eq!(
         exported_metric_names(&stream),
         vec!["grok_code.tool.decision"]

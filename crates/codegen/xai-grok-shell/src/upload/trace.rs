@@ -84,9 +84,16 @@ pub(crate) async fn upload_session_state(
     session_copy_rx: oneshot::Receiver<
         anyhow::Result<crate::session::persistence::SessionStateCopy>,
     >,
-    _wait: UploadWait,
+    wait: UploadWait,
 ) -> super::turn::UploadOutcome {
-    let _ = session_copy_rx.await;
+    match wait {
+        UploadWait::Confirm => {
+            let _ = session_copy_rx.await;
+        }
+        UploadWait::Defer { deadline } => {
+            let _ = tokio::time::timeout(blocking_attempt_budget(deadline), session_copy_rx).await;
+        }
+    }
     super::turn::UploadOutcome::Failed {
         reason: "session_state_upload_unavailable",
         status_code: None,
@@ -1339,13 +1346,14 @@ pub(crate) async fn upload_trace_artifact_blocking(
     let queue_result = if let Some(queue) = &ctx.upload_queue {
         let session_id = ctx.session_info.id.0.to_string();
         match queue
-            .enqueue_blocking(
+            .enqueue_blocking_with_inline_flag(
                 content,
                 gcs_path,
                 content_type,
                 artifact_name,
                 &session_id,
                 ctx.turn_number,
+                direct_attempt_started,
             )
             .await
         {

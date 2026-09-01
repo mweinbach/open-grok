@@ -425,7 +425,8 @@ mod static_grok_auth_tests {
 /// production callers should instead pass a tuned client (e.g. shell's
 /// `crate::http::shared_upload_client()`) to `with_provider`.
 fn default_upload_client() -> Client {
-    Client::new()
+    xai_grok_extra_ca::build_reqwest_client(|builder| builder)
+        .expect("default reqwest client builds")
 }
 
 /// Client for uploading files to GCS via cli-chat-proxy.

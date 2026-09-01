@@ -21,6 +21,7 @@ use super::diagnostics::DiagnosticsStore;
 use super::documents::{Documents, Update, end_position};
 use super::pull::PullDiagnostics;
 use super::refresh::{ProjectInitializationComplete, RefreshTarget};
+use super::watched_files::{self, WatchedFiles};
 use super::{DiagnosticsNotify, LspError, LspMainLoop, file_uri, workspace_open};
 use crate::util::{ProcessGroup, ProcessScope};
 
@@ -61,6 +62,7 @@ pub struct LspClient {
     /// (no child) or if group creation failed.
     process_group: Option<Arc<ProcessGroup>>,
     pub shutdown_timeout: std::time::Duration,
+    watched_files: WatchedFiles,
 }
 
 impl std::fmt::Debug for LspClient {
@@ -91,9 +93,10 @@ fn create_client_main_loop(
     documents: Documents,
     diagnostics_notify: DiagnosticsNotify,
     refresh: RefreshTarget,
+    watched_files: WatchedFiles,
 ) -> LspMainLoopAndServer {
     let name = Arc::<str>::from(server_name);
-    async_lsp::MainLoop::new_client(move |_server_socket| {
+    async_lsp::MainLoop::new_client(move |server_socket| {
         let mut router = async_lsp::router::Router::new(());
 
         {
@@ -138,6 +141,35 @@ fn create_client_main_loop(
             router.notification::<ProjectInitializationComplete>(move |_state, _params| {
                 refresh.refresh_all(&name, "server finished loading the workspace");
                 ControlFlow::Continue(())
+            });
+        }
+
+        {
+            let watched_files = watched_files.clone();
+            let socket = server_socket.clone();
+            router.request::<lsp_types::request::RegisterCapability, _>(move |_state, params| {
+                match watched_files::accept_register_capability(&watched_files, params) {
+                    Ok(pending) => {
+                        let mut socket = socket.clone();
+                        for (path, typ) in pending {
+                            watched_files::notify_path_changed(
+                                &mut socket,
+                                &watched_files,
+                                &path,
+                                typ,
+                            );
+                        }
+                        std::future::ready(Ok(()))
+                    }
+                    Err(error) => std::future::ready(Err(error)),
+                }
+            });
+        }
+        {
+            let watched_files = watched_files.clone();
+            router.request::<lsp_types::request::UnregisterCapability, _>(move |_state, params| {
+                watched_files::accept_unregister_capability(&watched_files, params);
+                std::future::ready(Ok(()))
             });
         }
 
@@ -242,12 +274,14 @@ impl LspClient {
         let diagnostics = DiagnosticsStore::new();
         let documents = Documents::new();
         let refresh = RefreshTarget::new();
+        let watched_files = WatchedFiles::new(config.effective_root(workspace_root).to_path_buf());
         let (main_loop, mut server) = create_client_main_loop(
             &server_name,
             diagnostics.clone(),
             documents.clone(),
             diagnostics_notify.clone(),
             refresh.clone(),
+            watched_files.clone(),
         );
 
         let (main_loop_handle, stderr_task, mut child_process) =
@@ -322,6 +356,7 @@ impl LspClient {
             child_process,
             process_group: None,
             shutdown_timeout: std::time::Duration::from_millis(config.shutdown_timeout_ms()),
+            watched_files,
         })
     }
 
@@ -384,6 +419,7 @@ impl LspClient {
             cmd.env(k, v);
         }
         xai_tty_utils::detach_std_command(&mut cmd);
+        xai_grok_sandbox::child_net::restrict_child_network_std(&mut cmd);
         cmd.envs(xai_tty_utils::pager_env());
         #[allow(clippy::disallowed_methods)] // enrolled by LspClient::enroll once started
         let mut child = cmd
@@ -587,6 +623,7 @@ impl LspClient {
                 diagnostic: Some(DiagnosticWorkspaceClientCapabilities {
                     refresh_support: Some(true),
                 }),
+                did_change_watched_files: Some(watched_files::client_capability()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -693,6 +730,37 @@ impl LspClient {
         // Pull-model servers publish nothing; ask them instead.
         self.pull.will_answer(uri);
         Some(version)
+    }
+
+    pub fn notify_watched_path_event(
+        &mut self,
+        path: &Path,
+        typ: async_lsp::lsp_types::FileChangeType,
+    ) {
+        watched_files::notify_path_changed(&mut self.socket, &self.watched_files, path, typ);
+    }
+
+    pub fn close_document(&mut self, path: &Path) {
+        let Ok(uri) = file_uri(path) else {
+            return;
+        };
+        if !self.documents.take(uri.as_str()) {
+            return;
+        }
+        self.diagnostics.forget(uri.as_str());
+        if let Err(e) = self
+            .socket
+            .did_close(lsp_types::DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+            })
+        {
+            tracing::debug!(server = %self.server_name, error = %e, "failed to send didClose");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accepted_file_watch_registrations(&self) -> usize {
+        self.watched_files.accepted()
     }
 
     #[cfg(test)]

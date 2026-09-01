@@ -13,7 +13,7 @@ use crate::scrollback::text_selection::{
     block_drag_threshold_exceeded, compute_autoscroll, configured_word_separators,
     drag_threshold_exceeded, reconstruct_full_selection_text_with_boundaries,
     reconstruct_selection_text, reconstruct_selection_text_with_boundaries,
-    reconstruct_table_selection_text, resolve_table_drag_kind, semantic_selection_at,
+    reconstruct_table_selection_text_with_meta, resolve_table_drag_kind, semantic_selection_at,
 };
 use crate::views::btw_overlay::BTW_OVERLAY_ENTRY_IDX;
 use crossterm::event::MouseEvent;
@@ -26,6 +26,21 @@ use std::time::{Duration, Instant};
 /// enough that the second gesture plausibly continues the first intent.
 const WORD_SELECT_REPEAT_WINDOW: Duration = Duration::from_secs(10);
 
+fn prewrap_line_index(
+    lines: &[crate::scrollback::types::BlockLine],
+    block_line: usize,
+) -> Option<usize> {
+    if block_line >= lines.len() {
+        return None;
+    }
+    Some(
+        lines[..=block_line]
+            .iter()
+            .filter(|line| line.joiner.is_none())
+            .count()
+            .saturating_sub(1),
+    )
+}
 impl AgentView {
     /// Tick the selection highlight timer. Returns true if the selection
     /// was auto-dismissed (needs redraw). When `keep_text_selection` is on
@@ -97,6 +112,58 @@ impl AgentView {
             Some(crate::scrollback::types::derive_selection_text(line))
         };
         Some(f(&source))
+    }
+
+    fn with_entry_table_copy_source<Output>(
+        &self,
+        entry_idx: usize,
+        range_id: u16,
+        width_override: Option<u16>,
+        geom: &TableGeometry,
+        callback: impl FnOnce(
+            &dyn Fn(usize) -> Option<String>,
+            Option<&xai_grok_markdown::TableCopyMeta>,
+        ) -> Output,
+    ) -> Option<Output> {
+        let scrollback = if let Some(ref child_id) = self.active_subagent
+            && let Some(child) = self.subagent_views.get(child_id)
+        {
+            &child.scrollback
+        } else {
+            &self.scrollback
+        };
+        let visible_start = scrollback.visible_entry_range().start;
+        let abs_idx = entry_idx + visible_start;
+        let content_width = width_override.or_else(|| {
+            self.last_scrollback_selection_model
+                .visible_block_content_width(entry_idx)
+        })?;
+        let entry = scrollback.get(abs_idx)?;
+        let appearance = scrollback.appearance();
+        let mode = entry.display_mode();
+        let offset = entry.block.markdown_body_line_offset(mode, appearance);
+        let effective = entry.effective_output(content_width, appearance, false, scrollback.cwd());
+        let lines = &effective.output().lines;
+        let source = |index: usize| -> Option<String> {
+            let line = lines.get(index)?;
+            if line.selection_range != Some(range_id) {
+                return None;
+            }
+            Some(crate::scrollback::types::derive_selection_text(line))
+        };
+        Some(entry.block.with_table_copy_meta(|tables| {
+            let meta = prewrap_line_index(lines, geom.line_range().start)
+                .and_then(|pre| pre.checked_sub(offset))
+                .and_then(|idx| {
+                    tables.iter().find(|table| {
+                        table.line_index == idx
+                            && table.n_cols == geom.n_cols()
+                            && table.line_count == geom.line_range().len()
+                            && table.cells.len() == geom.n_rows() * table.n_cols
+                    })
+                });
+            callback(&source, meta)
+        }))
     }
 
     /// Detect the table grid under a drag anchor (btw drags stay linear).
@@ -640,13 +707,14 @@ impl AgentView {
             && let Some(geom) =
                 self.table_geometry_for_selection(drag.anchor.entry_idx, drag.anchor.range_id)
             && let Some(text) = self
-                .with_entry_output_text_source(
+                .with_entry_table_copy_source(
                     drag.anchor.entry_idx,
                     drag.anchor.range_id,
                     // Snapshot keeps the table copy alive after the block
                     // autoscrolls fully out of the viewport.
                     drag.anchor_content_width,
-                    |src| {
+                    geom,
+                    |src, meta| {
                         // Geometry was frozen at promote; a streaming re-wrap
                         // since then shifts every block_line_idx, so re-detect
                         // and require an exact match before slicing.
@@ -655,7 +723,7 @@ impl AgentView {
                         {
                             return None;
                         }
-                        reconstruct_table_selection_text(geom, drag, src)
+                        reconstruct_table_selection_text_with_meta(geom, drag, src, meta)
                     },
                 )
                 .flatten()
@@ -1361,11 +1429,13 @@ impl AgentView {
         let Some(cell) = geometry.cell_at(hit.block_line_idx, hit.col_within_range) else {
             return self.select_whole_table_at(hit, geometry);
         };
-        let Some(clipboard_text) =
-            self.with_entry_output_text_source(hit.entry_idx, hit.range_id, None, |src| {
-                geometry.cell_text(cell, src)
-            })
-        else {
+        let Some(clipboard_text) = self.with_entry_table_copy_source(
+            hit.entry_idx,
+            hit.range_id,
+            None,
+            &geometry,
+            |src, meta| geometry.cell_text_with_meta(cell, src, meta),
+        ) else {
             return false;
         };
 
@@ -1407,11 +1477,13 @@ impl AgentView {
             row: geometry.n_rows() - 1,
             col: geometry.n_cols() - 1,
         };
-        let Some(clipboard_text) =
-            self.with_entry_output_text_source(hit.entry_idx, hit.range_id, None, |src| {
-                geometry.grid_tsv(anchor_cell, head_cell, src)
-            })
-        else {
+        let Some(clipboard_text) = self.with_entry_table_copy_source(
+            hit.entry_idx,
+            hit.range_id,
+            None,
+            &geometry,
+            |src, meta| geometry.grid_tsv_with_meta(anchor_cell, head_cell, src, meta),
+        ) else {
             return false;
         };
 
@@ -1486,6 +1558,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..20,
                 text: (*text).to_string(),
+                painted_region: None,
                 joiner_to_previous: None,
             });
         }
@@ -1536,6 +1609,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..text.len() as u16,
                 text: (*text).to_string(),
+                painted_region: None,
                 joiner_to_previous: joiner.map(str::to_string),
             });
         }
@@ -1668,6 +1742,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..text.len() as u16,
                 text: text.to_string(),
+                painted_region: None,
                 joiner_to_previous: None,
             };
             boundaries.push(
@@ -1712,6 +1787,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..text.len() as u16,
                 text: text.to_string(),
+                painted_region: None,
                 joiner_to_previous: joiner.map(str::to_string),
             });
         }
@@ -2143,6 +2219,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..40,
                 text: format!("stacked line {}", first_bl + i),
+                painted_region: None,
                 joiner_to_previous: (first_bl + i > 0).then(|| "\n".to_string()),
             });
         }
@@ -2297,6 +2374,7 @@ mod tests {
             screen_x: 0,
             selectable_cols: 0..40,
             text: "btw line".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
         agent.last_btw_selection_model = btw_model;
@@ -2590,6 +2668,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..20,
                 text: format!("entry zero line {bl}"),
+                painted_region: None,
                 joiner_to_previous: (bl > 0).then(|| "\n".to_string()),
             });
         }
@@ -2601,6 +2680,7 @@ mod tests {
             screen_x: 0,
             selectable_cols: 0..20,
             text: "entry one line".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
         let block = |entry_idx: usize, area: Rect, content_width: u16| VisibleBlockGeometry {

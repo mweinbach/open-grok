@@ -99,6 +99,58 @@ pub struct ArgItem {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowChoice {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunChoice {
+    pub name: String,
+    pub status: String,
+    pub builtin: bool,
+}
+
+impl WorkflowRunChoice {
+    pub fn can_pause(&self) -> bool {
+        self.status == "active"
+    }
+
+    pub fn can_resume(&self) -> bool {
+        matches!(self.status.as_str(), "user_paused" | "cancelled")
+    }
+
+    pub fn can_stop(&self) -> bool {
+        !matches!(
+            self.status.as_str(),
+            "interrupted" | "complete" | "failed" | "cancelled"
+        )
+    }
+
+    pub fn can_save(&self, definitions: &[WorkflowChoice]) -> bool {
+        !self.builtin
+            && definitions
+                .iter()
+                .any(|workflow| workflow.name == self.name)
+    }
+}
+
+impl WorkflowChoice {
+    pub fn from_acp(cmd: &acp::AvailableCommand) -> Option<Self> {
+        cmd.meta.as_ref()?.get("workflowSource")?;
+        let description = cmd
+            .description
+            .strip_prefix("Workflow: ")
+            .unwrap_or(&cmd.description)
+            .to_string();
+        Some(Self {
+            name: cmd.name.clone(),
+            description,
+        })
+    }
+}
+
 /// Read-only context for generating suggestions.
 ///
 /// Passed to `SlashCommand::suggest_args()` and `SlashCommand::visible()`.
@@ -112,6 +164,8 @@ pub struct AppCtx<'a> {
     /// Consumer billing surface (`AppView::usage_visible`). Gates `/usage` subcommands.
     pub billing_surface_visible: bool,
     pub workflows_available: bool,
+    pub saved_workflows: &'a [WorkflowChoice],
+    pub workflow_runs: &'a [WorkflowRunChoice],
     /// Effective render mode of this process (gates `/minimal` and
     /// `/fullscreen` visibility). Same source of truth as
     /// [`CommandExecCtx::screen_mode`], carried by the owning
@@ -365,3 +419,69 @@ pub trait SlashCommand: Send + Sync {
     /// the dispatch layer handle the effect pipeline.
     fn run(&self, ctx: &mut CommandExecCtx, args: &str) -> CommandResult;
 }
+macro_rules! slash_meta {
+    (
+        $(name: $name:expr,)?
+        $(aliases: [$($alias:expr),+ $(,)?],)?
+        $(description: $description:expr,)?
+        $(usage: $usage:expr,)?
+        $(takes_args: $takes_args:expr,)?
+        $(args_required: $args_required:expr,)?
+        $(session_scoped: $session_scoped:expr,)?
+        $(offered_when_session_less: $offered_when_session_less:expr,)?
+        $(dashboard_only: $dashboard_only:expr,)?
+        $(mode_support: $mode_support:expr,)?
+        $(arg_placeholder: $arg_placeholder:expr,)?
+        $(required_tools: $required_tools:expr,)?
+    ) => {
+        $(fn name(&self) -> &str {
+            $name
+        })?
+
+        $(fn aliases(&self) -> &[&str] {
+            &[$($alias),+]
+        })?
+
+        $(fn description(&self) -> &str {
+            $description
+        })?
+
+        $(fn usage(&self) -> &str {
+            $usage
+        })?
+
+        $(fn takes_args(&self) -> bool {
+            $takes_args
+        })?
+
+        $(fn args_required(&self) -> bool {
+            $args_required
+        })?
+
+        $(fn session_scoped(&self) -> bool {
+            $session_scoped
+        })?
+
+        $(fn offered_when_session_less(&self) -> bool {
+            $offered_when_session_less
+        })?
+
+        $(fn dashboard_only(&self) -> bool {
+            $dashboard_only
+        })?
+
+        $(fn mode_support(&self) -> crate::slash::mode_support::ModeSupport {
+            $mode_support
+        })?
+
+        $(fn arg_placeholder(&self) -> Option<&str> {
+            Some($arg_placeholder)
+        })?
+
+        $(fn required_tools(&self) -> &[&str] {
+            $required_tools
+        })?
+    };
+}
+
+pub(crate) use slash_meta;

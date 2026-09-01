@@ -5,6 +5,7 @@
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use xai_grok_markdown::{TableCellCopy, TableCopyMeta};
 
 /// A cell position within a detected grid: `row` indexes logical rows
 /// (header = 0), `col` indexes columns left to right.
@@ -285,6 +286,12 @@ impl TableGeometry {
         self.junction_cols.len() - 1
     }
 
+    pub(super) fn checked_n_cols(&self) -> Option<usize> {
+        self.junction_cols
+            .len()
+            .checked_sub(1)
+            .filter(|&count| count > 0)
+    }
     pub fn n_rows(&self) -> usize {
         self.rows.len()
     }
@@ -296,13 +303,19 @@ impl TableGeometry {
 
     /// Content-line range of a logical row.
     pub fn row_lines(&self, row: usize) -> Range<usize> {
-        self.rows[row].clone()
+        self.rows.get(row).cloned().unwrap_or(0..0)
     }
 
     /// Display-column band of a column's cell interior: everything strictly
     /// between the two flanking `│` glyphs (padding included).
     pub fn band(&self, col: usize) -> Range<u16> {
-        self.junction_cols[col].saturating_add(1)..self.junction_cols[col + 1]
+        let Some(&left) = self.junction_cols.get(col) else {
+            return 0..0;
+        };
+        let Some(&right) = self.junction_cols.get(col + 1) else {
+            return 0..0;
+        };
+        left.saturating_add(1)..right
     }
 
     /// The cell at (`line`, `col`), or `None` when `line` is a border row or
@@ -363,21 +376,53 @@ impl TableGeometry {
     /// space (cells wrap at spaces/punctuation, so a space join reconstructs
     /// the content).
     pub fn cell_text(&self, cell: CellRef, text_at: impl Fn(usize) -> Option<String>) -> String {
+        self.cell_text_with_meta(cell, text_at, None)
+    }
+
+    pub fn cell_text_with_meta(
+        &self,
+        cell: CellRef,
+        text_at: impl Fn(usize) -> Option<String>,
+        meta: Option<&TableCopyMeta>,
+    ) -> String {
+        if let Some(copy) = self.cell_copy(cell, meta) {
+            return copy.text.clone();
+        }
+        let Some(n_cols) = self.checked_n_cols() else {
+            return String::new();
+        };
+        if cell.row >= self.n_rows() || cell.col >= n_cols {
+            return String::new();
+        }
         let band = self.band(cell.col);
-        let mut out = String::new();
+        let mut joiner = WrappedCellJoiner::new(band.end.saturating_sub(band.start));
         for line in self.row_lines(cell.row) {
             let Some(text) = text_at(line) else { continue };
             let slice = crate::scrollback::types::slice_display_cols(&text, band.start, band.end);
-            let fragment = slice.trim();
-            if fragment.is_empty() {
-                continue;
-            }
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(fragment);
+            joiner.push(&slice, slice.trim());
         }
-        out
+        joiner.into_string()
+    }
+    pub(super) fn cell_copy<'a>(
+        &self,
+        cell: CellRef,
+        meta: Option<&'a TableCopyMeta>,
+    ) -> Option<&'a TableCellCopy> {
+        let meta = meta?;
+        let n_cols = self.checked_n_cols()?;
+        if meta.n_cols != n_cols {
+            return None;
+        }
+        let n_rows = self.n_rows();
+        let expected = n_rows.checked_mul(meta.n_cols)?;
+        if meta.cells.len() != expected {
+            return None;
+        }
+        if cell.row >= n_rows || cell.col >= n_cols {
+            return None;
+        }
+        let idx = cell.row.checked_mul(meta.n_cols)?.checked_add(cell.col)?;
+        meta.cells.get(idx)
     }
 
     /// TSV for the rectangular cell range spanned by `a` and `b` (order
@@ -389,13 +434,23 @@ impl TableGeometry {
         b: CellRef,
         text_at: impl Fn(usize) -> Option<String>,
     ) -> String {
+        self.grid_tsv_with_meta(a, b, text_at, None)
+    }
+
+    pub fn grid_tsv_with_meta(
+        &self,
+        a: CellRef,
+        b: CellRef,
+        text_at: impl Fn(usize) -> Option<String>,
+        meta: Option<&TableCopyMeta>,
+    ) -> String {
         let (r0, r1) = (a.row.min(b.row), a.row.max(b.row));
         let (c0, c1) = (a.col.min(b.col), a.col.max(b.col));
         let mut rows_out: Vec<String> = Vec::new();
         for row in r0..=r1 {
             let cells: Vec<String> = (c0..=c1)
                 .map(|col| {
-                    self.cell_text(CellRef { row, col }, &text_at)
+                    self.cell_text_with_meta(CellRef { row, col }, &text_at, meta)
                         .replace('\t', " ")
                 })
                 .collect();
@@ -405,12 +460,99 @@ impl TableGeometry {
     }
 }
 
+pub(super) struct WrappedCellJoiner {
+    content_width: usize,
+    out: String,
+    left_filled: bool,
+}
+
+impl WrappedCellJoiner {
+    pub(super) fn new(band_width: u16) -> Self {
+        Self {
+            content_width: (band_width as usize).saturating_sub(2),
+            out: String::new(),
+            left_filled: false,
+        }
+    }
+
+    pub(super) fn push(&mut self, full_band_slice: &str, fragment: &str) {
+        if fragment.is_empty() {
+            self.left_filled = false;
+            return;
+        }
+        let filled = fragment_fills_content_width(full_band_slice.trim(), self.content_width);
+        append_wrapped_cell_fragment(&mut self.out, fragment, self.left_filled);
+        self.left_filled = filled;
+    }
+
+    pub(super) fn into_string(self) -> String {
+        self.out
+    }
+}
+
+fn append_wrapped_cell_fragment(out: &mut String, fragment: &str, left_filled: bool) {
+    if fragment.is_empty() {
+        return;
+    }
+    if !out.is_empty() && !is_token_continuation(out, fragment, left_filled) {
+        out.push(' ');
+    }
+    out.push_str(fragment);
+}
+
+fn fragment_fills_content_width(fragment: &str, content_width: usize) -> bool {
+    let width = UnicodeWidthStr::width(fragment);
+    if width == content_width {
+        return true;
+    }
+    width + 1 == content_width
+        && fragment
+            .chars()
+            .any(|character| unicode_width::UnicodeWidthChar::width(character).unwrap_or(0) >= 2)
+}
+
+fn is_token_continuation(left: &str, right: &str, left_filled: bool) -> bool {
+    let (Some(left_character), Some(right_character)) = (left.chars().last(), right.chars().next())
+    else {
+        return false;
+    };
+    const PATH_BREAK: &[char] = &['/', '-', '_', '=', '&', '%', '#', '+', '~', '@', '\\'];
+    const AMBIGUOUS: &[char] = &['.', ':', '?'];
+    if PATH_BREAK.contains(&left_character)
+        || PATH_BREAK.contains(&right_character)
+        || AMBIGUOUS.contains(&right_character)
+    {
+        return true;
+    }
+    if !left_filled {
+        return false;
+    }
+    if AMBIGUOUS.contains(&left_character) {
+        return true;
+    }
+    left_character.is_alphanumeric()
+        && right_character.is_alphanumeric()
+        && (looks_like_unbreakable_token(left)
+            || !left_character.is_ascii()
+            || !right_character.is_ascii())
+}
+
+fn looks_like_unbreakable_token(text: &str) -> bool {
+    text.contains("://")
+        || text.contains('/')
+        || text.contains('@')
+        || text.contains('\\')
+        || text.contains('-')
+        || text.contains('_')
+        || (text.len() >= 8 && text.chars().all(|character| character.is_ascii_hexdigit()))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
     /// Text source over a static list of lines.
+    use xai_grok_markdown::CellJoin;
     fn src<'a>(lines: &'a [&'a str]) -> impl Fn(usize) -> Option<String> + 'a {
         move |i| lines.get(i).map(|s| s.to_string())
     }
@@ -551,6 +693,107 @@ mod tests {
     }
 
     #[test]
+    fn cell_text_with_meta_returns_original_verbatim() {
+        let geom = TableGeometry::detect(src(WRAPPED), 4).unwrap();
+        let meta = TableCopyMeta {
+            line_index: 0,
+            line_count: WRAPPED.len(),
+            n_cols: 2,
+            cells: vec![
+                TableCellCopy {
+                    text: "Name".into(),
+                    joins: vec![],
+                },
+                TableCellCopy {
+                    text: "Notes".into(),
+                    joins: vec![],
+                },
+                TableCellCopy {
+                    text: "Alice".into(),
+                    joins: vec![],
+                },
+                TableCellCopy {
+                    text: "likes  long   walks".into(),
+                    joins: vec![CellJoin::Gap("  ".into()), CellJoin::Gap("   ".into())],
+                },
+            ],
+        };
+        assert_eq!(
+            geom.cell_text_with_meta(CellRef { row: 1, col: 1 }, src(WRAPPED), Some(&meta)),
+            "likes  long   walks"
+        );
+        assert_eq!(
+            geom.grid_tsv_with_meta(
+                CellRef { row: 1, col: 1 },
+                CellRef { row: 1, col: 1 },
+                src(WRAPPED),
+                Some(&meta)
+            ),
+            "likes  long   walks"
+        );
+    }
+
+    #[test]
+    fn token_continuation_predicate() {
+        let cases = [
+            ("likes", "long", false, false),
+            ("likes", "long", true, false),
+            ("Alice", "Smith", false, false),
+            ("Alice", "Smith", true, false),
+            ("https://github.com/lon", "g/org/repo/pull/9", true, true),
+            ("你好", "世界", true, true),
+            ("foo/", "bar", false, true),
+            ("widget-base", "/01a0…", false, true),
+            ("01a014a2-fcc0-7943-", "990e-…", false, true),
+            ("Dr.", "Smith", false, false),
+            ("Note:", "details", false, false),
+            ("hello,", "world", false, false),
+            ("user@", "host.com", false, true),
+            ("registry.", "example.com", true, true),
+            ("example", ".com", false, true),
+            ("file", ".txt", false, true),
+        ];
+        for (left, right, filled, no_space) in cases {
+            assert_eq!(
+                is_token_continuation(left, right, filled),
+                no_space,
+                "{left}+{right} filled={filled}"
+            );
+        }
+    }
+
+    #[test]
+    fn punctuation_wrap_cell_copies_without_injected_spaces() {
+        const IMAGE_ID: &[&str] = &[
+            "┌───────────────────────────────────────┐",
+            "│ registry.example.com/acme/widget-base │",
+            "│ /01a014a2-fcc0-7943-                  │",
+            "│ 990e-8ee89115c6c5/turn_2:v4           │",
+            "└───────────────────────────────────────┘",
+        ];
+        let geom = TableGeometry::detect(src(IMAGE_ID), 1).unwrap();
+        assert_eq!(
+            geom.cell_text(CellRef { row: 0, col: 0 }, src(IMAGE_ID)),
+            "registry.example.com/acme/widget-base/01a014a2-fcc0-7943-990e-8ee89115c6c5/turn_2:v4"
+        );
+    }
+
+    #[test]
+    fn hard_split_url_cell_copies_without_injected_spaces() {
+        const URL: &[&str] = &[
+            "┌────────────────────────┐",
+            "│ https://github.com/lon │",
+            "│ g/org/repo/pull/9      │",
+            "└────────────────────────┘",
+        ];
+        let geom = TableGeometry::detect(src(URL), 1).unwrap();
+        assert_eq!(
+            geom.cell_text(CellRef { row: 0, col: 0 }, src(URL)),
+            "https://github.com/long/org/repo/pull/9"
+        );
+    }
+
+    #[test]
     fn blockquoted_table_with_quote_bar_prefix() {
         let quoted: &[&str] = &[
             "│ ┌─────┬─────┐",
@@ -615,5 +858,25 @@ mod tests {
         let prose: &[&str] = &["hello world", "─────────", "goodbye"];
         assert_eq!(TableGeometry::detect(src(prose), 0), None);
         assert_eq!(TableGeometry::detect(src(prose), 1), None);
+    }
+    #[test]
+    fn out_of_bounds_cell_access_does_not_panic() {
+        let geom = TableGeometry::detect(src(TABLE), 4).unwrap();
+        assert_eq!(geom.row_lines(99), 0..0);
+        assert_eq!(geom.band(99), 0..0);
+        assert_eq!(geom.cell_text(CellRef { row: 99, col: 0 }, src(TABLE)), "");
+        assert_eq!(geom.cell_text(CellRef { row: 0, col: 99 }, src(TABLE)), "");
+        assert_eq!(
+            geom.cell_text_with_meta(CellRef { row: 99, col: 99 }, src(TABLE), None),
+            ""
+        );
+        assert_eq!(
+            geom.grid_tsv(
+                CellRef { row: 99, col: 99 },
+                CellRef { row: 99, col: 99 },
+                src(TABLE)
+            ),
+            ""
+        );
     }
 }

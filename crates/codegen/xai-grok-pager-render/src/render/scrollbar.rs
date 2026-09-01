@@ -56,6 +56,10 @@ pub fn set_scrollbars_hidden(hidden: bool) {
     SCROLLBARS_HIDDEN.store(hidden, Ordering::Relaxed);
 }
 
+pub fn scrollbars_hidden() -> bool {
+    SCROLLBARS_HIDDEN.load(Ordering::Relaxed)
+}
+
 /// Number of columns reserved between content and the scrollbar track.
 /// This creates the "X" gap in the XSXBXX pattern (gap between selection_right and scrollbar).
 const SCROLLBAR_GAP_COLS: u16 = 1;

@@ -44,7 +44,7 @@ mod syntax;
 mod url_scan;
 
 // Re-export public API
-pub use buffers::MarkdownBuffers;
+pub use buffers::{CellJoin, MarkdownBuffers, TableCellCopy, TableCopyMeta};
 pub use checkpoint::{Checkpoint, CheckpointKind};
 pub use colors::{
     ColorLevel, adapt_color, adapt_style, detect_color_level, get_color_level,

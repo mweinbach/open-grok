@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use crate::copy::CopyStats;
 pub use crate::copy::DirtyFilesReport;
 use crate::copy::ParallelCopyConfig;
+pub use crate::nfs::NfsWorktreeOpts;
 
 // ============================================================================
 // BtrfsDelegate – delegate privileged btrfs ops to an external service
@@ -215,6 +216,10 @@ pub struct WorktreeReport {
     pub commit: String,
     pub unignored_copy: CopyReport,
     pub ignored_copy: Option<CopyReport>,
+    /// Dispatch arm that actually ran (`nfs` / `overlay` / `btrfs` / `copy` / `git` / `standalone`).
+    pub resolved_strategy: &'static str,
+    /// Arm-specific metadata persisted into worktrees.db.
+    pub strategy_metadata: Option<serde_json::Value>,
 }
 
 /// High-level builder API for creating fast git worktrees.
@@ -242,6 +247,7 @@ pub struct WorktreeBuilder {
     worktree_id: Option<String>,
     #[cfg(feature = "metadata")]
     metadata: Option<serde_json::Value>,
+    nfs: Option<NfsWorktreeOpts>,
 }
 
 impl std::fmt::Debug for WorktreeBuilder {
@@ -279,6 +285,7 @@ impl WorktreeBuilder {
             worktree_id: None,
             #[cfg(feature = "metadata")]
             metadata: None,
+            nfs: None,
         }
     }
 
@@ -396,27 +403,52 @@ impl WorktreeBuilder {
         self
     }
 
+    /// Explicit grove worktree enablement (macOS NFS / Linux FUSE).
+    /// The library never reads pager config.
+    pub fn grove_worktree(mut self, opts: NfsWorktreeOpts) -> Self {
+        self.nfs = Some(opts);
+        self
+    }
+
+    /// Deprecated alias for [`Self::grove_worktree`].
+    pub fn nfs_worktree(self, opts: NfsWorktreeOpts) -> Self {
+        self.grove_worktree(opts)
+    }
+
     /// Create the worktree using the configured options.
     ///
     /// This is a **blocking** operation. Callers should use `spawn_blocking`
     /// when calling from async contexts.
     pub fn create(self) -> Result<WorktreeReport> {
-        // Clone source/git_ref/creation_mode for DB registration before the move
-        // into WorktreePlan. These are one-per-create, not a hot path.
+        let dest = crate::worktree::plan::canonicalize_for_id(&self.dest);
+        let worktree_id = {
+            #[cfg(feature = "metadata")]
+            {
+                self.worktree_id
+                    .unwrap_or_else(|| crate::worktree::plan::worktree_id_from_path(&dest))
+            }
+            #[cfg(not(feature = "metadata"))]
+            {
+                crate::worktree::plan::worktree_id_from_path(&dest)
+            }
+        };
+        if !crate::nfs::is_safe_worktree_id(&worktree_id) {
+            anyhow::bail!("invalid worktree id from dest: {worktree_id}");
+        }
+
         #[cfg(feature = "metadata")]
         let meta_fields = (
             self.worktree_kind,
             self.session_id,
-            self.worktree_id,
+            worktree_id.clone(),
             self.source.clone(),
-            self.creation_mode.as_db_str(),
             self.git_ref.clone(),
             self.metadata,
         );
 
         let plan = crate::worktree::WorktreePlan {
             source: self.source,
-            dest: self.dest,
+            dest,
             git_ref: self.git_ref,
             parallelism: self.parallelism,
             channel_buffer: self.channel_buffer,
@@ -426,23 +458,28 @@ impl WorktreeBuilder {
             creation_mode: self.creation_mode,
             cancellation_token: self.cancellation_token,
             btrfs_delegate: self.btrfs_delegate,
+            worktree_id,
+            nfs: self.nfs,
         };
 
         let result = crate::worktree::execute_plan(plan).map_err(annotate_disk_full)?;
 
         #[cfg(feature = "metadata")]
         {
-            let (kind, session_id, wt_id, source, creation_mode, git_ref, metadata) = meta_fields;
+            let (kind, session_id, wt_id, source, git_ref, mut metadata) = meta_fields;
             if let Some(kind) = kind {
+                if let Some(sm) = result.strategy_metadata.clone() {
+                    metadata = Some(merge_strategy_metadata(metadata, sm));
+                }
                 register_worktree(
                     &result.worktree_path,
                     &source,
                     kind,
-                    creation_mode,
+                    result.resolved_strategy,
                     &git_ref,
                     &result.commit,
                     session_id,
-                    wt_id,
+                    Some(wt_id),
                     metadata,
                 );
             }
@@ -456,6 +493,8 @@ impl WorktreeBuilder {
             commit: result.commit,
             unignored_copy,
             ignored_copy: result.ignored_stats.map(Into::into),
+            resolved_strategy: result.resolved_strategy,
+            strategy_metadata: result.strategy_metadata,
         })
     }
 
@@ -569,6 +608,23 @@ fn annotate_disk_full(err: anyhow::Error) -> anyhow::Error {
     }
 }
 
+#[cfg(feature = "metadata")]
+fn merge_strategy_metadata(
+    caller: Option<serde_json::Value>,
+    strategy: serde_json::Value,
+) -> serde_json::Value {
+    match (caller, strategy) {
+        (Some(serde_json::Value::Object(mut caller)), serde_json::Value::Object(strategy)) => {
+            for (key, value) in strategy {
+                caller.insert(key, value);
+            }
+            serde_json::Value::Object(caller)
+        }
+        (Some(caller), _) if caller.is_object() => caller,
+        (_, strategy) => strategy,
+    }
+}
+
 /// Result of removing a worktree.
 #[derive(Clone, Debug)]
 pub struct RemoveReport {
@@ -635,6 +691,10 @@ fn remove_worktree_from_disk(
 
     #[cfg(not(target_os = "linux"))]
     let _ = delegate;
+
+    if let Some(report) = crate::nfs::try_nfs_remove(worktree_path)? {
+        return Ok(report);
+    }
 
     // Try overlay removal first (Linux only) — unmount overlay + delete btrfs snapshot
     #[cfg(target_os = "linux")]
@@ -1446,7 +1506,11 @@ pub(crate) fn register_worktree(
     };
     // Same canonical path as discovery rebuild / WorktreeDb::get so macOS
     // /var vs /private/var (and other symlink roots) do not create duplicate rows.
-    let path = dunce::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+    let path = if crate::worktree::is_grove_strategy(creation_mode) {
+        crate::worktree::plan::canonicalize_for_id(worktree_path)
+    } else {
+        dunce::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf())
+    };
     let source = dunce::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     let record = db::WorktreeRecord {
         id: worktree_id.unwrap_or_else(|| db::id_from_path(&path)),
@@ -1566,6 +1630,14 @@ pub mod gc {
         /// from agents predating this field still deserialize.
         #[serde(default)]
         pub remove_failed: u64,
+        #[serde(default)]
+        pub pin_gc_examined: u64,
+        #[serde(default)]
+        pub pin_gc_pruned: u64,
+        #[serde(default)]
+        pub pin_gc_deferred: u64,
+        #[serde(default)]
+        pub pin_gc_kept: u64,
         // Rebuild / stale-registration hygiene live on `AutoGcReport` (optional
         // auto path), not on every `gc_worktrees` call.
     }
@@ -1751,6 +1823,11 @@ pub mod gc {
     /// physical paths, so also match the canonicalized worktree path — a
     /// symlinked `$OPENGROK_HOME` or custom worktree path would otherwise never match.
     fn cwd_within(wt_path: &Path, live_cwds: &[PathBuf]) -> bool {
+        if !crate::nfs::dest_is_known_unmounted(wt_path) {
+            return live_cwds
+                .iter()
+                .any(|cwd| crate::nfs::dest_path_contains(wt_path, cwd));
+        }
         let wt_canon = dunce::canonicalize(wt_path).unwrap_or_else(|_| wt_path.to_path_buf());
         live_cwds.iter().any(|cwd| {
             if cwd.starts_with(wt_path) || cwd.starts_with(&wt_canon) {
@@ -1809,6 +1886,9 @@ pub mod gc {
         let mut report = GcReport::default();
         let now = crate::db::now_epoch_secs();
 
+        #[cfg(unix)]
+        reclaim_orphan_pins(db, opts, now, &mut report);
+
         // Dead-record reclamation.
         if opts.dry_run {
             // A dry run must not mutate: skip sweep_dead (which flips records to
@@ -1821,7 +1901,15 @@ pub mod gc {
             })?;
             report.dead_removed = all
                 .iter()
-                .filter(|r| r.status == WorktreeStatus::Dead || !Path::new(&r.path).exists())
+                .filter(|record| {
+                    record.status == WorktreeStatus::Dead
+                        || if crate::worktree::is_grove_strategy(&record.creation_mode) {
+                            crate::nfs::nfs_record_is_dead(&record.path, None)
+                        } else {
+                            crate::nfs::dest_is_known_unmounted(&record.path)
+                                && std::fs::symlink_metadata(&record.path).is_err()
+                        }
+                })
                 .count() as u64;
         } else {
             db.sweep_dead()?;
@@ -1882,6 +1970,10 @@ pub mod gc {
                     continue;
                 }
                 let path = Path::new(&rec.path);
+                if !crate::nfs::dest_is_known_unmounted(path) {
+                    report.skipped_alive += 1;
+                    continue;
+                }
                 if !opts.force
                     && (is_guarded(&rec, live_cwds) || is_path_protected(path, &opts.protect_paths))
                 {
@@ -1889,7 +1981,7 @@ pub mod gc {
                     continue;
                 }
                 if opts.dry_run {
-                    if path.exists() {
+                    if std::fs::symlink_metadata(path).is_ok() {
                         report.expired_removed += 1;
                     }
                     continue;
@@ -1920,7 +2012,7 @@ pub mod gc {
                         Ok(None) | Err(_) => continue,
                     }
                 }
-                if path.exists() {
+                if std::fs::symlink_metadata(path).is_ok() {
                     match super::remove_worktree_with_delegate(path, delegate.clone()) {
                         Ok(_) => report.expired_removed += 1,
                         Err(e) => {
@@ -1939,6 +2031,48 @@ pub mod gc {
         }
 
         Ok(report)
+    }
+
+    #[cfg(unix)]
+    fn reclaim_orphan_pins(db: &WorktreeDb, opts: &GcOptions, now: i64, report: &mut GcReport) {
+        let Ok(records) = db.list(&ListFilter {
+            include_dead: true,
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let existing = crate::nfs::identities_from_worktree_records(&records);
+        let mut identities = std::collections::HashMap::new();
+        let directories: Vec<_> = crate::nfs::candidate_data_dirs()
+            .into_iter()
+            .filter(|directory| directory.is_dir())
+            .collect();
+        for directory in &directories {
+            crate::nfs::merge_nfs_identities(
+                &mut identities,
+                crate::nfs::collect_identities(directory, &existing).into_values(),
+            );
+        }
+        let identities: Vec<_> = identities.into_values().collect();
+        let mut pruned_ids = std::collections::HashSet::new();
+        for directory in directories {
+            match crate::nfs::gc_orphan_pins(&directory, &identities, now, opts.dry_run) {
+                Ok(result) => {
+                    report.pin_gc_examined = report.pin_gc_examined.saturating_add(result.examined);
+                    report.pin_gc_deferred =
+                        report.pin_gc_deferred.saturating_add(result.deferred_grace);
+                    report.pin_gc_kept = report.pin_gc_kept.saturating_add(result.kept_live);
+                    for worktree_id in result.pruned_ids {
+                        if pruned_ids.insert(worktree_id) {
+                            report.pin_gc_pruned = report.pin_gc_pruned.saturating_add(1);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "worktree pin GC failed; retaining pins")
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -4075,6 +4209,7 @@ mod tests {
                 expired_removed: 1,
                 skipped_alive: 2,
                 remove_failed: 4,
+                ..Default::default()
             };
             let json = serde_json::to_string(&report).unwrap();
             let deser: gc::GcReport = serde_json::from_str(&json).unwrap();

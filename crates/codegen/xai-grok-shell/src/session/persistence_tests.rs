@@ -54,6 +54,11 @@ fn test_actor_inner(
             gateway: None,
             disk_full_tx,
             disk_full_notified: false,
+            dirty_files: Default::default(),
+            pending_write_error: None,
+            last_usage_live: None,
+            last_usage_turn: None,
+            last_incoming_turn: None,
         }
         .run(),
     );
@@ -251,7 +256,7 @@ async fn pending_drain_disposition_controls_remote_sync() {
     assert_eq!(synced.session_id, info.id);
     assert!(matches!(
         attempts.lock().unwrap().as_slice(),
-        [AppendDurability::Buffered]
+        [AppendDurability::Buffered, AppendDurability::Durable]
     ));
     actor.stop().await;
 }
@@ -903,4 +908,1199 @@ mod prompt_file_tests {
             "sessions root must be 0700"
         );
     }
+}
+
+fn break_plan_writes(dir: &std::path::Path) {
+    std::fs::create_dir(dir.join("plan.json")).unwrap();
+}
+
+#[tokio::test]
+async fn committed_pending_drain_still_writes_the_durable_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("durable-after-committed-drain"),
+        cwd: "/test".into(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "pending")))
+        .unwrap();
+    break_summary_writes(dir.path());
+    assert!(matches!(
+        actor
+            .handle
+            .append_update_durably(neutral_update(&info, "terminal"))
+            .await,
+        Err(DurableAppendError::Committed(_))
+    ));
+    let jsonl = std::fs::read_to_string(dir.path().join("updates.jsonl")).unwrap();
+    assert!(
+        jsonl.contains("pending") && jsonl.contains("terminal"),
+        "a committed drain must not drop the durable terminal: {jsonl}"
+    );
+    actor.stop().await;
+}
+
+fn merge_boundary_update(info: &Info, text: &str) -> SessionUpdate {
+    let mut chunk_meta = serde_json::Map::new();
+    chunk_meta.insert("mergeBoundary".into(), serde_json::json!(true));
+    SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+        info.id.clone(),
+        acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(text)))
+                .meta(Some(chunk_meta)),
+        ),
+    )))
+}
+
+struct SyncBarrierProbe {
+    appends: Arc<std::sync::Mutex<Vec<AppendDurability>>>,
+    syncs: Arc<std::sync::Mutex<Vec<crate::session::storage::SessionFileSet>>>,
+}
+
+fn actor_with_barrier_probes(dir: &std::path::Path, info: &Info) -> (ActorGuard, SyncBarrierProbe) {
+    let appends = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_appends = appends.clone();
+    let syncs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_syncs = syncs.clone();
+    let storage = Arc::new(JsonlStorageAdapter::with_probes(
+        dir.to_path_buf(),
+        move |durability| {
+            observed_appends.lock().unwrap().push(durability);
+            Ok(())
+        },
+        move |files| {
+            observed_syncs.lock().unwrap().push(files);
+            Ok(())
+        },
+    ));
+    let actor = test_actor(info.clone(), storage);
+    (actor, SyncBarrierProbe { appends, syncs })
+}
+
+#[tokio::test]
+async fn flush_and_ack_syncs_only_dirty_files_once_and_keeps_streamed_appends_buffered() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-sync"),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let (actor, probe) = actor_with_barrier_probes(dir.path(), &info);
+
+    for text in ["chunk-a", "chunk-b"] {
+        actor
+            .handle
+            .tx
+            .send(PersistenceMsg::Update(neutral_update(&info, text)))
+            .unwrap();
+    }
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(merge_boundary_update(
+            &info, "boundary",
+        )))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    assert!(
+        matches!(
+            probe.appends.lock().unwrap().as_slice(),
+            [AppendDurability::Buffered, AppendDurability::Buffered]
+        ),
+        "every streamed-chunk append must stay buffered (no per-chunk syncs)"
+    );
+    assert_eq!(
+        probe.syncs.lock().unwrap().as_slice(),
+        [crate::session::storage::SessionFileSet {
+            updates: true,
+            ..Default::default()
+        }],
+        "the barrier must sync exactly once, covering only the dirtied updates file"
+    );
+
+    flush_ack(&actor.handle).await.unwrap();
+    assert_eq!(
+        probe.syncs.lock().unwrap().len(),
+        1,
+        "a second barrier with nothing dirtied since the first must sync no files"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn idle_flush_and_ack_acks_without_syncing_any_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-idle"),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let (actor, probe) = actor_with_barrier_probes(dir.path(), &info);
+
+    flush_ack(&actor.handle).await.unwrap();
+
+    assert!(
+        probe.syncs.lock().unwrap().is_empty(),
+        "an idle barrier must not pay for untouched files"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn buffered_chat_plan_and_rewind_writes_dirty_exactly_their_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-dirty-set"),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let (actor, probe) = actor_with_barrier_probes(dir.path(), &info);
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user("hello")))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::PlanState(TodoState::default()))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::RewindPoint(RewindPoint::new(0)))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    assert_eq!(
+        probe.syncs.lock().unwrap().as_slice(),
+        [crate::session::storage::SessionFileSet {
+            chat: true,
+            rewind_points: true,
+            ..Default::default()
+        }],
+        "buffered chat/rewind writes must dirty exactly their files; \
+         atomic-rename writes (plan, summary bookkeeping) are durable at write time and stay out"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn copy_file_flush_syncs_every_file_regardless_of_dirtiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("copy-file-sync-all"),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let (actor, probe) = actor_with_barrier_probes(dir.path(), &info);
+
+    let (one_shot, copied) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::CopyFile { one_shot })
+        .unwrap();
+    copied.await.unwrap().unwrap();
+
+    assert_eq!(
+        probe.syncs.lock().unwrap().as_slice(),
+        [crate::session::storage::SessionFileSet::ALL],
+        "a CopyFile snapshot must sync the full barrier file set even when clean"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn flush_and_ack_syncs_chat_when_summary_bookkeeping_fails_after_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-chat-committed"),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    break_summary_writes(dir.path());
+    let (actor, probe) = actor_with_barrier_probes(dir.path(), &info);
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user("hello")))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    assert_eq!(
+        probe.syncs.lock().unwrap().as_slice(),
+        [crate::session::storage::SessionFileSet {
+            chat: true,
+            ..Default::default()
+        }],
+        "a chat append that reached the page cache must stay on the barrier dirty set even when summary bookkeeping fails"
+    );
+    assert!(
+        std::fs::read_to_string(dir.path().join("chat_history.jsonl"))
+            .unwrap()
+            .contains("hello"),
+        "the chat JSONL record must survive the bookkeeping failure"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn flush_and_ack_succeeds_after_committed_pending_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-committed-drain"),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let (actor, probe) = actor_with_barrier_probes(dir.path(), &info);
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "pending")))
+        .unwrap();
+    break_summary_writes(dir.path());
+    flush_ack(&actor.handle).await.unwrap();
+
+    assert_eq!(
+        probe.syncs.lock().unwrap().as_slice(),
+        [crate::session::storage::SessionFileSet {
+            updates: true,
+            ..Default::default()
+        }],
+        "a Committed pending drain must not fail FlushAndAck after the prompt bytes are on the dirty set"
+    );
+    assert!(
+        std::fs::read_to_string(dir.path().join("updates.jsonl"))
+            .unwrap()
+            .contains("pending"),
+        "the pending JSONL record must survive the bookkeeping failure"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn flush_and_ack_succeeds_after_not_committed_pending_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-restored-drain"),
+        cwd: "/test".into(),
+    };
+    let remaining_failures = std::sync::atomic::AtomicUsize::new(1);
+    let syncs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_syncs = syncs.clone();
+    let storage = Arc::new(JsonlStorageAdapter::with_probes(
+        dir.path().to_path_buf(),
+        move |durability| {
+            if matches!(durability, AppendDurability::Buffered)
+                && remaining_failures.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1
+            {
+                Err(io::Error::other("pending drain failed"))
+            } else {
+                Ok(())
+            }
+        },
+        move |files| {
+            observed_syncs.lock().unwrap().push(files);
+            Ok(())
+        },
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage);
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "pending")))
+        .unwrap();
+    assert_eq!(
+        actor
+            .handle
+            .append_update_durably(neutral_update(&info, "terminal"))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "pending drain failed"
+    );
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user("hello")))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    assert_eq!(
+        syncs.lock().unwrap().as_slice(),
+        [crate::session::storage::SessionFileSet {
+            chat: true,
+            updates: true,
+            ..Default::default()
+        }],
+        "a restored NotCommitted drain must not latch into the prompt barrier after a later successful redrain and chat append"
+    );
+    assert!(
+        std::fs::read_to_string(dir.path().join("updates.jsonl"))
+            .unwrap()
+            .contains("pending"),
+        "the restored pending record must be written on the next FlushAndAck"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn flush_and_ack_succeeds_after_atomic_plan_write_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-plan-fail"),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    break_plan_writes(dir.path());
+    let (actor, probe) = actor_with_barrier_probes(dir.path(), &info);
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::PlanState(TodoState::default()))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user("hello")))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    assert_eq!(
+        probe.syncs.lock().unwrap().as_slice(),
+        [crate::session::storage::SessionFileSet {
+            chat: true,
+            ..Default::default()
+        }],
+        "a failed atomic-rename plan write must not latch into the prompt barrier or skip a later successful chat append"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn flush_and_ack_succeeds_after_durable_append_never_reached_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-durable-not-committed"),
+        cwd: "/test".into(),
+    };
+    let syncs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_syncs = syncs.clone();
+    let storage = Arc::new(JsonlStorageAdapter::with_probes(
+        dir.path().to_path_buf(),
+        |durability| match durability {
+            AppendDurability::Durable => Err(io::Error::other("durable append failed")),
+            AppendDurability::Buffered => Ok(()),
+        },
+        move |files| {
+            observed_syncs.lock().unwrap().push(files);
+            Ok(())
+        },
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage);
+
+    assert_eq!(
+        actor
+            .handle
+            .append_update_durably(neutral_update(&info, "terminal"))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "durable append failed"
+    );
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user("hello")))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    assert_eq!(
+        syncs.lock().unwrap().as_slice(),
+        [crate::session::storage::SessionFileSet {
+            chat: true,
+            ..Default::default()
+        }],
+        "a NotCommitted durable append must not latch into the prompt barrier or skip a later successful chat append"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn flush_and_ack_retries_fsync_after_durable_append_file_barrier_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-durable-barrier"),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let syncs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_syncs = syncs.clone();
+    let storage = Arc::new(
+        JsonlStorageAdapter::with_probes(
+            dir.path().to_path_buf(),
+            |_| Ok(()),
+            move |files| {
+                observed_syncs.lock().unwrap().push(files);
+                Ok(())
+            },
+        )
+        .with_file_sync_probe(|| Err(io::Error::other("file barrier failed"))),
+    );
+    let actor = test_actor(info.clone(), storage);
+
+    assert!(matches!(
+        actor
+            .handle
+            .append_update_durably(neutral_update(&info, "terminal"))
+            .await,
+        Err(DurableAppendError::Committed(_))
+    ));
+    assert!(
+        std::fs::read_to_string(dir.path().join("updates.jsonl"))
+            .unwrap()
+            .contains("terminal"),
+        "the durable JSONL record must survive the file-barrier failure"
+    );
+
+    flush_ack(&actor.handle).await.unwrap();
+
+    assert_eq!(
+        syncs.lock().unwrap().as_slice(),
+        [crate::session::storage::SessionFileSet {
+            updates: true,
+            ..Default::default()
+        }],
+        "a durable append whose file barrier failed must stay on the dirty set so a later idle FlushAndAck retries the fsync"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn flush_and_ack_fails_after_copy_file_when_a_buffered_write_never_reached_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-copy-file-latch"),
+        cwd: "/test".into(),
+    };
+    let remaining_failures = std::sync::atomic::AtomicUsize::new(1);
+    let storage = Arc::new(JsonlStorageAdapter::with_probes(
+        dir.path().to_path_buf(),
+        move |_| {
+            if remaining_failures.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                Err(io::Error::other("update append failed"))
+            } else {
+                Ok(())
+            }
+        },
+        |_| Ok(()),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage);
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "chunk")))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(merge_boundary_update(
+            &info, "boundary",
+        )))
+        .unwrap();
+
+    let (one_shot, copied) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::CopyFile { one_shot })
+        .unwrap();
+    copied.await.unwrap().unwrap();
+
+    assert_eq!(
+        flush_ack(&actor.handle).await.unwrap_err().to_string(),
+        "update append failed",
+        "CopyFile must not take the write-failure latch; FlushAndAck still withholds persist_ack"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn flush_and_ack_fails_when_a_buffered_update_write_never_reached_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-lost-write"),
+        cwd: "/test".into(),
+    };
+    let remaining_failures = std::sync::atomic::AtomicUsize::new(1);
+    let storage = Arc::new(JsonlStorageAdapter::with_probes(
+        dir.path().to_path_buf(),
+        move |_| {
+            if remaining_failures.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                Err(io::Error::other("update append failed"))
+            } else {
+                Ok(())
+            }
+        },
+        |_| Ok(()),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage);
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "chunk")))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(merge_boundary_update(
+            &info, "boundary",
+        )))
+        .unwrap();
+    assert_eq!(
+        flush_ack(&actor.handle).await.unwrap_err().to_string(),
+        "update append failed"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn flush_and_ack_propagates_session_file_sync_error_through_the_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("flush-ack-sync-error"),
+        cwd: "/test".into(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_probes(
+        dir.path().to_path_buf(),
+        |_| Ok(()),
+        |_| Err(io::Error::other("session file sync failed")),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage);
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "chunk")))
+        .unwrap();
+    assert_eq!(
+        flush_ack(&actor.handle).await.unwrap_err().to_string(),
+        "session file sync failed"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "manual durability-cost measurement; run with --ignored --nocapture and RUST_MIN_STACK=8388608"]
+async fn measure_prompt_barrier_idle_barrier_and_summary_rewrite_cost() {
+    fn median_and_max(mut samples: Vec<std::time::Duration>) -> (String, String) {
+        samples.sort();
+        (
+            format!("{:?}", samples[samples.len() / 2]),
+            format!("{:?}", samples[samples.len() - 1]),
+        )
+    }
+
+    const N: usize = 50;
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("measure-barrier"),
+        cwd: "/test".into(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage.clone());
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user("seed")))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::PlanState(TodoState::default()))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::RewindPoint(RewindPoint::new(0)))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    let mut prompt_shaped_barrier = Vec::with_capacity(N);
+    for index in 0..N {
+        actor
+            .handle
+            .tx
+            .send(PersistenceMsg::Chat(ConversationItem::user(format!(
+                "prompt {index}"
+            ))))
+            .unwrap();
+        actor
+            .handle
+            .tx
+            .send(PersistenceMsg::Update(neutral_update(&info, "user echo")))
+            .unwrap();
+        let start = std::time::Instant::now();
+        flush_ack(&actor.handle).await.unwrap();
+        prompt_shaped_barrier.push(start.elapsed());
+    }
+
+    let mut idle_barrier = Vec::with_capacity(N);
+    for _ in 0..N {
+        let start = std::time::Instant::now();
+        flush_ack(&actor.handle).await.unwrap();
+        idle_barrier.push(start.elapsed());
+    }
+
+    let dirty_two = crate::session::storage::SessionFileSet {
+        updates: true,
+        chat: true,
+        ..Default::default()
+    };
+    let mut sync_two_files = Vec::with_capacity(N);
+    for _ in 0..N {
+        let start = std::time::Instant::now();
+        storage
+            .sync_session_files_selected(&info, dirty_two)
+            .await
+            .unwrap();
+        sync_two_files.push(start.elapsed());
+    }
+
+    let mut sync_all_files = Vec::with_capacity(N);
+    for _ in 0..N {
+        let start = std::time::Instant::now();
+        storage
+            .sync_session_files_selected(&info, crate::session::storage::SessionFileSet::ALL)
+            .await
+            .unwrap();
+        sync_all_files.push(start.elapsed());
+    }
+
+    let summary_path = dir.path().join("summary.json");
+    let payload = std::fs::read(&summary_path).unwrap();
+    let mut summary_rewrite = Vec::with_capacity(N);
+    for _ in 0..N {
+        let start = std::time::Instant::now();
+        crate::session::storage::write_bytes_atomic(&summary_path, &payload).unwrap();
+        summary_rewrite.push(start.elapsed());
+    }
+
+    for (label, samples) in [
+        (
+            "prompt-send FlushAndAck (chat+echo appends, their summary bookkeeping, dirty barrier)",
+            prompt_shaped_barrier,
+        ),
+        ("idle FlushAndAck (nothing dirty)", idle_barrier),
+        ("barrier sync of 2 dirty files + dir", sync_two_files),
+        (
+            "barrier sync of all 5 files + dir (pre-dirty-tracking shape)",
+            sync_all_files,
+        ),
+        (
+            "summary.json atomic rewrite (per-append bookkeeping cost)",
+            summary_rewrite,
+        ),
+    ] {
+        let (median, max) = median_and_max(samples);
+        println!("{label}: median {median}, max {max}");
+    }
+
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn manual_rename_next_flush_does_not_revert_backend_title() {
+    use std::sync::Arc;
+
+    use crate::auth::{AuthManager, GrokAuth};
+    use crate::remote::BackendClient;
+    use crate::session::export::ExportedMetadata;
+    use xai_grok_test_support::MockInferenceServer;
+
+    const OLD_TITLE: &str = "Auto first-prompt summary";
+    const NEW_TITLE: &str = "Manual rename";
+    const SESSION_ID: &str = "rename-writeback";
+
+    let server = MockInferenceServer::start()
+        .await
+        .expect("start MockInferenceServer");
+    let home = tempfile::tempdir().unwrap();
+    let auth = Arc::new(AuthManager::new(
+        home.path(),
+        crate::auth::GrokComConfig::default(),
+    ));
+    auth.hot_swap(GrokAuth {
+        key: "writeback-test-token".into(),
+        ..GrokAuth::test_default()
+    });
+
+    let info = Info {
+        id: acp::SessionId::new(SESSION_ID),
+        cwd: "/test".into(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+
+    let metadata = ExportedMetadata {
+        title: Some(OLD_TITLE.into()),
+        cwd: info.cwd.clone(),
+        model_id: Some("test-model".into()),
+        created_at: None,
+        updated_at: None,
+        total_messages: None,
+        parent_session_id: None,
+        session_kind: None,
+        subagent_type: None,
+        subagent_persona: None,
+        subagent_role: None,
+        fork_context_source: None,
+        subagent_depth: None,
+        title_is_manual: None,
+    };
+    let client = BackendClient::with_base_url(server.origin()).with_auth_manager(auth);
+    let remote_sync = RemoteSync::new(SESSION_ID.to_owned(), metadata, client);
+    let actor = test_actor_with_remote_sync(info.clone(), storage, Some(remote_sync));
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::ManualTitleRenamed(NEW_TITLE.into()))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(
+            &info,
+            "turn after rename",
+        )))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    let titles = wait_for_save_session_title_records(&server, SESSION_ID).await;
+    let last_nonempty = titles
+        .iter()
+        .rev()
+        .find(|token| token.nonempty_messages)
+        .map(|token| token.title.as_str());
+    assert_eq!(
+        last_nonempty,
+        Some(NEW_TITLE),
+        "next RemoteSync flush after ManualTitleRenamed must not revert to {OLD_TITLE:?}"
+    );
+    assert!(
+        titles
+            .iter()
+            .filter(|token| token.nonempty_messages)
+            .all(|token| token.title != OLD_TITLE),
+        "no non-empty save_session_data may carry the pre-rename title"
+    );
+    assert!(
+        titles
+            .iter()
+            .filter(|token| token.title == NEW_TITLE)
+            .all(|token| token.title_is_manual == Some(true)),
+        "every save of the manual title must stamp title_is_manual: {titles:?}"
+    );
+    let upsert_path = format!("/sessions/{SESSION_ID}");
+    let upserted_title = server.requests().into_iter().rev().find_map(|reasoning| {
+        (reasoning.method == "PUT" && reasoning.path == upsert_path)
+            .then(|| {
+                reasoning
+                    .body
+                    .as_ref()?
+                    .get("session")?
+                    .get("title")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .flatten()
+    });
+    assert_eq!(
+        upserted_title.as_deref(),
+        Some(NEW_TITLE),
+        "SetTitle must upsert the session-row title, not only the metadata blob; requests={:?}",
+        request_path_summary(&server)
+    );
+    actor.stop().await;
+}
+
+#[derive(Debug)]
+struct SaveTitle {
+    title: String,
+    title_present: bool,
+    nonempty_messages: bool,
+    title_is_manual: Option<bool>,
+}
+
+fn save_session_title_records(
+    server: &xai_grok_test_support::MockInferenceServer,
+    session_id: &str,
+) -> Vec<SaveTitle> {
+    let path = format!("/sessions/{session_id}/data");
+    server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path == path)
+        .filter_map(|r| {
+            let body = r.body.as_ref()?;
+            let metadata = body.get("metadata");
+            let title_field = metadata.and_then(|m| m.get("title"));
+            let title_present = title_field.is_some();
+            let title = title_field
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let title_is_manual = metadata
+                .and_then(|m| m.get("title_is_manual"))
+                .and_then(|v| v.as_bool());
+            let nonempty_messages = body
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .is_some_and(|msgs| !msgs.is_empty());
+            Some(SaveTitle {
+                title,
+                title_present,
+                nonempty_messages,
+                title_is_manual,
+            })
+        })
+        .collect()
+}
+
+fn request_path_summary(server: &xai_grok_test_support::MockInferenceServer) -> Vec<String> {
+    server
+        .requests()
+        .iter()
+        .map(|reasoning| format!("{} {}", reasoning.method, reasoning.path))
+        .collect()
+}
+
+async fn wait_for_save_session_title_records(
+    server: &xai_grok_test_support::MockInferenceServer,
+    session_id: &str,
+) -> Vec<SaveTitle> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let titles = save_session_title_records(server, session_id);
+        if titles.iter().any(|token| token.nonempty_messages) {
+            return titles;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for flush save_session_data; requests={:?}",
+                request_path_summary(server)
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn manual_after_auto_last_flush_is_manual() {
+    use std::sync::Arc;
+
+    use crate::auth::{AuthManager, GrokAuth};
+    use crate::remote::BackendClient;
+    use crate::session::export::ExportedMetadata;
+    use xai_grok_test_support::MockInferenceServer;
+
+    const AUTO: &str = "Auto title";
+    const MANUAL: &str = "Manual wins";
+    const SESSION_ID: &str = "rename-fifo-auto-then-manual";
+
+    let server = MockInferenceServer::start()
+        .await
+        .expect("start MockInferenceServer");
+    let home = tempfile::tempdir().unwrap();
+    let auth = Arc::new(AuthManager::new(
+        home.path(),
+        crate::auth::GrokComConfig::default(),
+    ));
+    auth.hot_swap(GrokAuth {
+        key: "writeback-test-token".into(),
+        ..GrokAuth::test_default()
+    });
+
+    let info = Info {
+        id: acp::SessionId::new(SESSION_ID),
+        cwd: "/test".into(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+
+    let metadata = ExportedMetadata {
+        title: Some("pre".into()),
+        cwd: info.cwd.clone(),
+        model_id: Some("test-model".into()),
+        created_at: None,
+        updated_at: None,
+        total_messages: None,
+        parent_session_id: None,
+        session_kind: None,
+        subagent_type: None,
+        subagent_persona: None,
+        subagent_role: None,
+        fork_context_source: None,
+        subagent_depth: None,
+        title_is_manual: None,
+    };
+    let client = BackendClient::with_base_url(server.origin()).with_auth_manager(auth);
+    let remote_sync = RemoteSync::new(SESSION_ID.to_owned(), metadata, client);
+    let actor = test_actor_with_remote_sync(info.clone(), storage, Some(remote_sync));
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::GeneratedTitle(AUTO.into()))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::ManualTitleRenamed(MANUAL.into()))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "after")))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    let titles = wait_for_save_session_title_records(&server, SESSION_ID).await;
+    let last = titles
+        .iter()
+        .rev()
+        .find(|token| token.nonempty_messages)
+        .map(|token| token.title.as_str());
+    assert_eq!(
+        last,
+        Some(MANUAL),
+        "auto-then-manual last flush must be manual"
+    );
+    assert!(
+        titles
+            .iter()
+            .filter(|token| token.title == AUTO)
+            .all(|token| token.title_is_manual.is_none()),
+        "auto SetTitle must omit title_is_manual: {titles:?}"
+    );
+    assert!(
+        titles
+            .iter()
+            .filter(|token| token.title == MANUAL)
+            .all(|token| token.title_is_manual == Some(true)),
+        "manual SetTitle/flush must stamp title_is_manual: {titles:?}"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn auto_after_committed_manual_emits_no_set_title() {
+    use std::sync::Arc;
+
+    use crate::auth::{AuthManager, GrokAuth};
+    use crate::remote::BackendClient;
+    use crate::session::export::ExportedMetadata;
+    use xai_grok_test_support::MockInferenceServer;
+
+    const AUTO: &str = "Rejected auto";
+    const MANUAL: &str = "Pinned manual";
+    const SESSION_ID: &str = "rename-fifo-manual-then-auto";
+
+    let server = MockInferenceServer::start()
+        .await
+        .expect("start MockInferenceServer");
+    let home = tempfile::tempdir().unwrap();
+    let auth = Arc::new(AuthManager::new(
+        home.path(),
+        crate::auth::GrokComConfig::default(),
+    ));
+    auth.hot_swap(GrokAuth {
+        key: "writeback-test-token".into(),
+        ..GrokAuth::test_default()
+    });
+
+    let info = Info {
+        id: acp::SessionId::new(SESSION_ID),
+        cwd: "/test".into(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    storage
+        .update_session_title(&info, MANUAL.to_owned())
+        .await
+        .unwrap();
+
+    let metadata = ExportedMetadata {
+        title: Some("stale".into()),
+        cwd: info.cwd.clone(),
+        model_id: Some("test-model".into()),
+        created_at: None,
+        updated_at: None,
+        total_messages: None,
+        parent_session_id: None,
+        session_kind: None,
+        subagent_type: None,
+        subagent_persona: None,
+        subagent_role: None,
+        fork_context_source: None,
+        subagent_depth: None,
+        title_is_manual: None,
+    };
+    let client = BackendClient::with_base_url(server.origin()).with_auth_manager(auth);
+    let remote_sync = RemoteSync::new(SESSION_ID.to_owned(), metadata, client);
+    let actor = test_actor_with_remote_sync(info.clone(), storage, Some(remote_sync));
+
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::ManualTitleRenamed(MANUAL.into()))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::GeneratedTitle(AUTO.into()))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "after")))
+        .unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+
+    let titles = wait_for_save_session_title_records(&server, SESSION_ID).await;
+    assert!(
+        titles.iter().all(|token| token.title != AUTO),
+        "rejected auto title must not reach save_session_data"
+    );
+    let last = titles
+        .iter()
+        .rev()
+        .find(|token| token.nonempty_messages)
+        .map(|token| token.title.as_str());
+    assert_eq!(last, Some(MANUAL));
+    assert!(
+        titles
+            .iter()
+            .filter(|token| token.title == MANUAL)
+            .all(|token| token.title_is_manual == Some(true)),
+        "manual stamp must survive rejected auto + flush: {titles:?}"
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn manual_title_renamed_is_noop_without_remote_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("rename-local-only"),
+        cwd: "/test".into(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::ManualTitleRenamed("Local only".into()))
+        .unwrap();
+    flush_ack(&actor.handle)
+        .await
+        .expect("ManualTitleRenamed with remote_sync=None must not fail");
+    actor.stop().await;
 }

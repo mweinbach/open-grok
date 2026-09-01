@@ -2787,7 +2787,7 @@ fn remove_hooks_path_is_noop_if_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let paths_file = tmp.path().join("hooks-paths");
     let result = remove_hooks_path_from_file("/nonexistent/path", &paths_file);
-    assert!(result.is_ok());
+    assert!(!result.unwrap());
 }
 #[test]
 fn remove_hooks_path_preserves_others() {
@@ -2823,14 +2823,14 @@ fn remove_hooks_path_succeeds_when_present() {
     let paths_file = tmp.path().join("hooks-paths");
     let _ = add_hooks_path_to_file("/present", &paths_file);
     let result = remove_hooks_path_from_file("/present", &paths_file);
-    assert!(result.is_ok());
+    assert!(result.unwrap());
 }
 #[test]
 fn remove_hooks_path_succeeds_when_absent() {
     let tmp = tempfile::tempdir().unwrap();
     let paths_file = tmp.path().join("hooks-paths");
     let result = remove_hooks_path_from_file("/missing", &paths_file);
-    assert!(result.is_ok());
+    assert!(!result.unwrap());
 }
 #[test]
 fn add_dismissed_plugin_cta_creates_table() {
@@ -2841,6 +2841,40 @@ fn add_dismissed_plugin_cta_creates_table() {
     assert!(content.contains("[plugin_cta]"));
     assert!(content.contains("figma"));
     assert!(dismissed_plugin_ctas_in_file(&config_path).contains("figma"));
+}
+
+#[test]
+fn required_bwrap_never_trusts_the_marker_without_verification() {
+    assert_eq!(route_bwrap_startup(Some(()), false, true), BwrapStartup::ReexecRequired(()));
+    assert_eq!(route_bwrap_startup::<()>(None, false, true), BwrapStartup::Refuse);
+    assert_eq!(route_bwrap_startup::<()>(None, true, true), BwrapStartup::Verify);
+    assert_eq!(route_bwrap_startup(Some(()), false, false), BwrapStartup::ReexecOptional(()));
+    assert_eq!(route_bwrap_startup::<()>(None, false, false), BwrapStartup::Continue);
+}
+
+#[test]
+fn subagent_sampling_limit_honors_precedence_and_ceiling() {
+    assert_eq!(SubagentsConfig::resolve_sampling_limit(Some("3"), Some(4), Some(5), 6), 3);
+    assert_eq!(SubagentsConfig::resolve_sampling_limit(Some("invalid"), Some(4), Some(5), 6), 4);
+    assert_eq!(SubagentsConfig::resolve_sampling_limit(None, None, Some(5), 6), 5);
+    assert_eq!(SubagentsConfig::resolve_sampling_limit(None, None, None, 6), 6);
+    assert_eq!(SubagentsConfig::resolve_sampling_limit(None, Some(0), None, 6), 1);
+    assert_eq!(SubagentsConfig::resolve_sampling_limit(Some("1024"), None, None, 6), 512);
+}
+
+#[test]
+fn media_batch_limits_clamp_numeric_layers_and_preserve_other_tools_settings() {
+    assert_eq!(ToolsConfig::resolve_max_parallel_image_gen_calls(Some("0"), Some(4), Some(5)), 1);
+    assert_eq!(ToolsConfig::resolve_max_parallel_image_gen_calls(Some("bad"), Some(4), Some(5)), 4);
+    assert_eq!(ToolsConfig::resolve_max_parallel_video_gen_calls(None, Some(-1), Some(5)), 1);
+    assert_eq!(ToolsConfig::resolve_max_parallel_video_gen_calls(None, None, Some(5)), 5);
+    assert_eq!(ToolsConfig::resolve_max_parallel_image_gen_calls(None, None, None), 8);
+    assert_eq!(ToolsConfig::resolve_max_parallel_video_gen_calls(None, None, None), 4);
+    let config: toml::Value = toml::from_str("[tools]\ndisable_zdr_incompatible_tools = true\n[tools.media_gen]\nmax_parallel_image_gen_calls = 3\nmax_parallel_video_gen_calls = 'bad'\n").unwrap();
+    let resolved = ToolsConfig::resolve(&config);
+    assert!(resolved.disable_zdr_incompatible_tools);
+    assert_eq!(resolved.media_gen.max_parallel_image_gen_calls, Some(3));
+    assert_eq!(resolved.media_gen.max_parallel_video_gen_calls, None);
 }
 #[test]
 fn add_dismissed_plugin_cta_is_idempotent() {

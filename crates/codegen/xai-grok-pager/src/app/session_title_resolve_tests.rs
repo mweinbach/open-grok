@@ -2,8 +2,7 @@ use super::*;
 use crate::test_util::GrokHomeFixture;
 use clap::Parser;
 
-/// In-memory `Summary` via serde: every field without `#[serde(default)]`
-/// must be present, and a struct literal would break on each new field.
+/// Builds a `Summary` through serde: every field without `#[serde(default)]` must be present, and a struct literal would break on each new field.
 fn summary(id: &str, title: Option<&str>, manual: bool) -> Summary {
     serde_json::from_value(serde_json::json!({
         "info": { "id": id, "cwd": "/ws" },
@@ -38,9 +37,8 @@ fn single_match_is_case_insensitive_and_trimmed() {
     assert_eq!(id_of(select_by_title("  FIX login bug ", &s).unwrap()), "a");
 }
 
-/// The contract is a simple lowercase comparison: accented letters match
-/// across case, but one-to-many case folds do not (`to_lowercase` maps
-/// U+00DF to itself, so "STRASSE" never equals a stored "straße").
+/// The contract is a simple lowercase comparison: accented letters match across case, but one-to-many case folds do not.
+/// `to_lowercase` maps U+00DF to itself, so "STRASSE" never equals a stored "straße".
 #[test]
 fn non_ascii_case_matching_contract() {
     let s = [summary("a", Some("Café Löschen"), false)];
@@ -51,8 +49,6 @@ fn non_ascii_case_matching_contract() {
 
 #[test]
 fn duplicate_auto_titles_error_lists_ids_with_escaped_titles() {
-    // A title with a newline would corrupt the one-match-per-line listing if
-    // rendered raw.
     let s = [
         summary("id-a", Some("Dup\nTitle"), false),
         summary("id-b", Some("Dup\nTitle"), false),
@@ -76,6 +72,18 @@ fn sole_manual_rename_wins_among_duplicates() {
         summary("auto2", Some("Dup"), false),
     ];
     assert_eq!(id_of(select_by_title("dup", &s).unwrap()), "man1");
+}
+
+#[test]
+fn pulled_sole_manual_summary_wins_among_duplicate_autos() {
+    let pulled = summary("pulled-hop", Some("Dup"), true);
+    assert_eq!(pulled.manual_title_opt().as_deref(), Some("Dup"));
+    let s = [
+        summary("auto1", Some("Dup"), false),
+        pulled,
+        summary("auto2", Some("Dup"), false),
+    ];
+    assert_eq!(id_of(select_by_title("dup", &s).unwrap()), "pulled-hop");
 }
 
 #[test]
@@ -108,9 +116,9 @@ fn title_miss_hint_escapes_arg_and_suggests_search() {
     );
 }
 
-/// The worktree defer drops the local zero-match context; the failure
-/// message restores it only for a threaded deferred-miss target. A resolved
-/// legacy non-UUID id (no threaded miss) must not get a false no-match hint.
+/// Deferring to the worktree restore loses the fact that no local session matched.
+/// The failure message re-adds the no-match hint only when the missed title was threaded through as `Some`.
+/// A resolved legacy non-UUID id threads `None` and must not get a false no-match hint.
 #[test]
 fn worktree_failure_message_hint_follows_threaded_provenance() {
     let msg = worktree_resume_failure_message(Some("typo title"), "restore failed");
@@ -165,9 +173,39 @@ fn pin_title_resume_finds_saved_profile_and_conflicts() {
     }
 }
 
-/// Regression: a non-UUID remote id with a restored local child pins to the
-/// child, so the peek reads the child's profile instead of an exact same-id
-/// session in another cwd.
+#[serial_test::serial(OPENGROK_HOME)]
+#[test]
+fn headless_title_pin_is_caller_aware() {
+    let mut fx = GrokHomeFixture::new();
+    let cwd_str = fx.cwd_str();
+    let id = "abababab-1111-2222-3333-444444444444";
+    fx.write_summary(
+        &cwd_str,
+        id,
+        serde_json::json!({
+            "generated_title": "Batch Run",
+            "session_kind": "headless",
+        }),
+    );
+
+    let mut interactive =
+        crate::app::cli::PagerArgs::try_parse_from(["grok", "-r", "batch run"]).unwrap();
+    interactive
+        .pin_local_resume_target_for_cwd(Some(&cwd_str))
+        .unwrap();
+    assert_eq!(interactive.session_to_resume(), Some("batch run"));
+
+    let mut headless =
+        crate::app::cli::PagerArgs::try_parse_from(["grok", "-p", "next", "-r", "batch run"])
+            .unwrap();
+    headless
+        .pin_local_resume_target_for_cwd(Some(&cwd_str))
+        .unwrap();
+    assert_eq!(headless.session_to_resume(), Some(id));
+}
+
+/// Regression: a non-UUID remote id with a restored local child pins to the child.
+/// The peek then reads the child's profile instead of an exact same-id session in another cwd.
 #[serial_test::serial(OPENGROK_HOME)]
 #[test]
 fn pin_prefers_restored_child_over_same_id_in_other_cwd() {
@@ -221,8 +259,6 @@ async fn materialization_consumes_pinned_id_after_concurrent_rename() {
         .unwrap();
     assert_eq!(args.session_to_resume(), Some(pinned));
 
-    // Concurrent rename/create after the pin: the pinned session loses the
-    // title and a decoy gains it.
     fx.write_summary(
         &cwd_str,
         pinned,
@@ -245,8 +281,7 @@ async fn materialization_consumes_pinned_id_after_concurrent_rename() {
     }
 }
 
-/// Local-only ctx carrying the composition root's pin outcome
-/// (`resume_target_pinned` maps to `PinnedPreSandbox` in production).
+/// A local-only ctx with the pin already recorded: in production `resume_target_pinned` maps to `PinnedPreSandbox`.
 fn pinned_local_ctx() -> crate::app::session_startup::MaterializeCtx {
     crate::app::session_startup::MaterializeCtx {
         has_worktree: false,
@@ -254,6 +289,7 @@ fn pinned_local_ctx() -> crate::app::session_startup::MaterializeCtx {
         chat_mode: false,
         title_resolution: crate::app::session_startup::TitleResolution::PinnedPreSandbox,
         restore_code: false,
+        recent_session_selection: crate::app::session_startup::RecentSessionSelection::Interactive,
         restore_progress_on_stdout: false,
     }
 }
@@ -322,8 +358,6 @@ async fn pinned_no_match_does_not_retry_title_after_sandbox() {
         msg.contains("no session id or title matched"),
         "must not resume the late title match: {msg}"
     );
-    // Contrast: an unpinned caller (no pre-sandbox pin ran) may still select
-    // the title — the gate, not the data, decides.
     let allowed_ctx = MaterializeCtx {
         title_resolution: TitleResolution::Allowed,
         ..pinned_local_ctx()

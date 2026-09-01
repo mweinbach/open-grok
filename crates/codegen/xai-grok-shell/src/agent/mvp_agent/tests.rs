@@ -1375,6 +1375,7 @@ fn make_test_handle(
     crate::session::SessionHandle {
         cmd_tx,
         persistence_tx,
+        status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
@@ -2766,6 +2767,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             agent_type: config::default_agent_type(),
             inference_idle_timeout_secs: None,
             max_retries: None,
+            subagent_rate_limit_max_attempts: None,
             hidden: false,
             supported_in_api: true,
             reasoning_effort: None,
@@ -4864,11 +4866,17 @@ fn explicit_close_finalizes_the_replica() {
             (
                 options.cancel_subagents,
                 options.kill_background_tasks,
-                options.rewind_if_no_output,
+                options.history,
                 options.trigger.as_ref().map(|t| t.as_str()),
                 options.user_initiated
             ),
-            (true, true, false, Some("session_close"), false),
+            (
+                true,
+                true,
+                crate::session::commands::CancelHistoryDisposition::Keep,
+                Some("session_close"),
+                false
+            ),
         );
         assert!(
             matches!(

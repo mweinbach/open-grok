@@ -174,6 +174,54 @@ fn ensure_figma_user_agent_skips_non_figma() {
     assert!(!invalid_url.contains_key(reqwest::header::USER_AGENT));
 }
 
+#[test]
+fn parse_config_headers_skips_invalid_and_keeps_last_duplicate() {
+    let pairs = [
+        ("X-Api-Key", "first"),
+        ("bad header", "value"),
+        ("X-Other", "bad\nvalue"),
+        ("x-api-key", "second"),
+    ];
+    let headers = parse_config_headers("srv", "transport", pairs.iter().copied());
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers.get("X-Api-Key").unwrap(), "second");
+}
+
+#[test]
+fn apply_user_agent_policy_sets_versioned_grok_cli() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    apply_user_agent_policy(&mut headers, "linear", "https://mcp.linear.app/mcp");
+    let expected = format!("open-grok/{}", xai_grok_version::version());
+    assert_eq!(
+        headers.get(reqwest::header::USER_AGENT).unwrap(),
+        expected.as_str()
+    );
+}
+
+#[test]
+fn apply_user_agent_policy_preserves_configured_user_agent() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static("custom-ua"),
+    );
+    apply_user_agent_policy(&mut headers, "linear", "https://mcp.linear.app/mcp");
+    assert_eq!(
+        headers.get(reqwest::header::USER_AGENT).unwrap(),
+        "custom-ua"
+    );
+}
+
+#[test]
+fn apply_user_agent_policy_preserves_figma_attribution() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    apply_user_agent_policy(&mut headers, "other", "https://mcp.figma.com/mcp");
+    assert_eq!(
+        headers.get(reqwest::header::USER_AGENT).unwrap(),
+        "grok-cli"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn safe_stdio_child_drop_without_entered_runtime_reaps_child() {
@@ -192,6 +240,7 @@ fn safe_stdio_child_drop_without_entered_runtime_reaps_child() {
             "test".to_string(),
             xai_grok_session_events::EventWriter::noop(),
         )
+        .await
         .expect("spawn test child");
         let pid = transport.id().expect("spawned child pid");
         (transport, pid)
@@ -239,6 +288,7 @@ async fn scope_kill_all_reaps_enrolled_mcp_child_while_owner_wedged() {
         "wedge-test".to_string(),
         xai_grok_session_events::EventWriter::noop(),
     )
+    .await
     .expect("spawn enrolled MCP child");
     assert_eq!(
         scope.live_count(),
@@ -284,6 +334,25 @@ fn test_mcp_state_new() {
 }
 
 #[test]
+fn config_update_clears_stale_failure_records() {
+    let mut state = McpState::new(vec![make_http_server("a", "https://old.example/a")]);
+    state.record_init_failure("a", false, Some("old cause".to_string()));
+    let diff = state
+        .update_configs_diff(vec![make_http_server("a", "https://new.example/a")])
+        .expect("configs changed");
+    assert_eq!(diff.removed, vec!["a".to_string()]);
+    assert!(
+        !state.init_failed.contains_key("a"),
+        "changed config must clear the stale failure record"
+    );
+
+    let mut state = McpState::new(vec![make_http_server("b", "https://old.example/b")]);
+    state.record_init_failure("b", false, Some("old cause".to_string()));
+    assert!(state.update_configs(vec![make_http_server("b", "https://new.example/b")]));
+    assert!(state.init_failed.is_empty());
+}
+
+#[test]
 fn test_mcp_state_update_configs_returns_false_when_unchanged() {
     let configs = vec![make_stdio_server("test", "/bin/test")];
     let mut state = McpState::new(configs.clone());
@@ -291,7 +360,7 @@ fn test_mcp_state_update_configs_returns_false_when_unchanged() {
     // Same configs should return false
     let changed = state.update_configs(configs.clone());
     assert!(!changed);
-    assert_eq!(state.generation, 0); // Generation should not change
+    assert_eq!(state.generation, 0);
 }
 
 #[test]
@@ -303,7 +372,7 @@ fn test_mcp_state_update_configs_returns_true_when_changed() {
     let new_configs = vec![make_stdio_server("test2", "/bin/test2")];
     let changed = state.update_configs(new_configs);
     assert!(changed);
-    assert_eq!(state.generation, 1); // Generation should increment
+    assert_eq!(state.generation, 1);
 }
 
 #[test]
@@ -659,7 +728,7 @@ fn test_cancel_init_clears_initializing() {
 
     state.cancel_init();
     assert!(!state.is_initializing());
-    assert!(!state.is_initialized()); // Should NOT be marked as initialized
+    assert!(!state.is_initialized());
 }
 
 #[test]
@@ -1682,6 +1751,18 @@ struct FakeMcpHandles {
     inits: Arc<AtomicUsize>,
     calls: Arc<AtomicUsize>,
     init_version: Arc<parking_lot::Mutex<Option<String>>>,
+    init_user_agents: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+fn header_values(
+    headers: &axum::http::HeaderMap,
+    name: axum::http::header::HeaderName,
+) -> Vec<String> {
+    headers
+        .get_all(name)
+        .iter()
+        .map(|value_v| String::from_utf8_lossy(value_v.as_bytes()).into_owned())
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1692,6 +1773,7 @@ struct FakeMcpState {
 
 async fn fake_handle_post(
     axum::extract::State(state): axum::extract::State<FakeMcpState>,
+    headers: axum::http::HeaderMap,
     axum::Json(req): axum::Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -1715,6 +1797,11 @@ async fn fake_handle_post(
             state.handles.inits.fetch_add(1, Ordering::Relaxed);
             *state.handles.init_version.lock() =
                 req["params"]["protocolVersion"].as_str().map(str::to_owned);
+            state
+                .handles
+                .init_user_agents
+                .lock()
+                .extend(header_values(&headers, axum::http::header::USER_AGENT));
             let result = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id.clone(),
@@ -1776,11 +1863,23 @@ async fn fake_handle_get() -> axum::response::Response {
         .into_response()
 }
 
+async fn spawn_test_http_server(app: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("test server addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/mcp")
+}
+
 async fn spawn_fake_mcp(behavior: CallToolBehavior) -> (String, FakeMcpHandles) {
     let handles = FakeMcpHandles {
         inits: Arc::new(AtomicUsize::new(0)),
         calls: Arc::new(AtomicUsize::new(0)),
         init_version: Arc::new(parking_lot::Mutex::new(None)),
+        init_user_agents: Arc::new(parking_lot::Mutex::new(Vec::new())),
     };
     let app = axum::Router::new()
         .route(
@@ -1791,14 +1890,7 @@ async fn spawn_fake_mcp(behavior: CallToolBehavior) -> (String, FakeMcpHandles) 
             behavior,
             handles: handles.clone(),
         });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    (format!("http://{addr}/mcp"), handles)
+    (spawn_test_http_server(app).await, handles)
 }
 
 fn fake_http_client(url: &str, tool_timeout_sec: u64) -> Arc<McpClient> {
@@ -1836,6 +1928,17 @@ fn event_types(jsonl: &str) -> Vec<serde_json::Value> {
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_transport_sends_default_user_agent_on_initialize() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::HangThenOk { hang_ms: 0 }).await;
+    let client = fake_http_client(&url, 5);
+    client.ensure_initialized().await.expect("handshake");
+    assert_eq!(
+        *handles.init_user_agents.lock(),
+        vec![format!("open-grok/{}", xai_grok_version::version())]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2128,64 +2231,49 @@ fn http_headers_match_false_for_non_http_client() {
 #[test]
 fn refresh_managed_clients_keeps_arc_when_headers_unchanged() {
     let url = "http://localhost:5000/api/mcp";
-    let mut state = McpState::new(vec![make_http_server("managed", url)]);
-    let config = HttpConfig {
-        url: url.to_string(),
-        headers: vec![("authorization".to_string(), "Bearer t".to_string())],
-    };
-    state.owned_clients.insert(
-        "managed".to_string(),
-        Arc::new(McpClient::new_http(
-            "managed".to_string(),
-            config,
-            None,
-            None,
-        )),
-    );
-    let before = Arc::clone(state.owned_clients.get("managed").unwrap());
-
-    let fresh: HashMap<String, String> = [("authorization".to_string(), "Bearer t".to_string())]
-        .into_iter()
-        .collect();
-    state.refresh_managed_clients(std::iter::once((url, &fresh)));
-
-    let after = state.owned_clients.get("managed").unwrap();
-    assert!(
-        Arc::ptr_eq(&before, after),
-        "unchanged headers must not rebuild the client"
-    );
+    let mut configured = make_http_server("managed", url);
+    if let acp::McpServer::Http(config) = &mut configured {
+        config.headers = vec![acp::HttpHeader::new("Authorization", "Bearer unchanged")];
+    }
+    let mut state = McpState::new(vec![configured.clone()]);
+    let client = make_test_client("managed");
+    state
+        .owned_clients
+        .insert("managed".to_string(), Arc::clone(&client));
+    assert!(state.update_configs_diff(vec![configured]).is_none());
+    assert!(Arc::ptr_eq(
+        &client,
+        state.owned_clients.get("managed").unwrap()
+    ));
 }
 
 #[test]
-fn refresh_managed_clients_installs_new_arc_when_headers_differ() {
+fn refresh_managed_clients_evicts_only_named_client_when_headers_differ() {
     let url = "http://localhost:5000/api/mcp";
-    let mut state = McpState::new(vec![make_http_server("managed", url)]);
-    let config = HttpConfig {
-        url: url.to_string(),
-        headers: vec![("authorization".to_string(), "Bearer old".to_string())],
-    };
-    state.owned_clients.insert(
-        "managed".to_string(),
-        Arc::new(McpClient::new_http(
-            "managed".to_string(),
-            config,
-            None,
-            None,
-        )),
-    );
-    let before = Arc::clone(state.owned_clients.get("managed").unwrap());
-
-    let fresh: HashMap<String, String> = [("authorization".to_string(), "Bearer new".to_string())]
-        .into_iter()
-        .collect();
-    state.refresh_managed_clients(std::iter::once((url, &fresh)));
-
-    let after = state.owned_clients.get("managed").unwrap();
-    assert!(
-        !Arc::ptr_eq(&before, after),
-        "changed headers must install a fresh client"
-    );
-    assert!(after.http_headers_match(&fresh));
+    let configured = make_http_server("managed", url);
+    let other_config = make_http_server("other", url);
+    let mut state = McpState::new(vec![configured.clone(), other_config.clone()]);
+    let old_client = make_test_client("managed");
+    let other_client = make_test_client("other");
+    state
+        .owned_clients
+        .insert("managed".to_string(), Arc::clone(&old_client));
+    state
+        .owned_clients
+        .insert("other".to_string(), Arc::clone(&other_client));
+    let mut changed = configured;
+    if let acp::McpServer::Http(config) = &mut changed {
+        config.headers = vec![acp::HttpHeader::new("Authorization", "Bearer changed")];
+    }
+    let diff = state
+        .update_configs_diff(vec![changed, other_config])
+        .unwrap();
+    assert_eq!(diff.removed, vec!["managed".to_string()]);
+    assert!(!state.owned_clients.contains_key("managed"));
+    assert!(Arc::ptr_eq(
+        &other_client,
+        state.owned_clients.get("other").unwrap()
+    ));
 }
 
 // ── reset_transport tests ────────────────────────────────────────
@@ -2375,8 +2463,8 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
     // its duplex ends. The next `call_tool` therefore observes a real
     // `ServiceError::TransportClosed`.
     async fn dead_service() -> McpService {
-        let (client_read, server_write) = tokio::io::duplex(64 * 1024); // server -> client
-        let (server_read, client_write) = tokio::io::duplex(64 * 1024); // client -> server
+        let (client_read, server_write) = tokio::io::duplex(64 * 1024);
+        let (server_read, client_write) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             let mut reader = BufReader::new(server_read);
             let mut writer = server_write;
@@ -2407,9 +2495,10 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
             }
         });
         let handler = GrokClientHandler {
-            info: McpClient::make_client_info("dead"),
+            info: McpClient::make_client_info("dead", true),
             server_name: "dead".to_string(),
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
         };
         let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
             client_read,
@@ -2433,7 +2522,10 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
     ));
     // Inject the closed real service so the FIRST `call_tool` fails retriably.
     let dead = dead_service().await;
-    *client.state.lock().await = ClientState::Ready(dead);
+    *client.state.lock().await = ClientState::Ready {
+        service: dead,
+        _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
+    };
 
     let erased = McpErasedTool {
         tool: McpTool::new(
@@ -2476,7 +2568,117 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
         "successful retry must not be flagged as timeout"
     );
     // reset_transport + re-handshake replaced the dead service with a live one.
-    assert!(matches!(&*client.state.lock().await, ClientState::Ready(_)));
+    assert!(matches!(
+        &*client.state.lock().await,
+        ClientState::Ready { .. }
+    ));
+    assert!(
+        xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.get() >= 1,
+        "a Ready client must hold a connected-gauge slot"
+    );
+}
+
+async fn watched_live_client(name: &str) -> Arc<McpClient> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (client_read, server_write) = tokio::io::duplex(64 * 1024);
+    let (server_read, client_write) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(server_read);
+        let mut writer = server_write;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            if msg.get("method").and_then(|value_m| value_m.as_str()) == Some("initialize") {
+                let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                    "protocolVersion": msg["params"]["protocolVersion"],
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "live", "version": "0.0.0" },
+                }});
+                let mut encoded = serde_json::to_string(&resp).unwrap();
+                encoded.push('\n');
+                let _ = writer.write_all(encoded.as_bytes()).await;
+                let _ = writer.flush().await;
+            }
+        }
+    });
+    let handler = GrokClientHandler {
+        info: McpClient::make_client_info(name, true),
+        server_name: name.to_string(),
+        notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
+    };
+    let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
+        client_read,
+        client_write,
+    );
+    let service: McpService = Arc::new(
+        handler
+            .serve(transport)
+            .await
+            .expect("live-service handshake"),
+    );
+
+    let client = Arc::new(McpClient::new_http(
+        name.to_string(),
+        HttpConfig {
+            url: "http://127.0.0.1:0/".to_string(),
+            headers: Vec::new(),
+        },
+        None,
+        None,
+    ));
+    *client.state.lock().await = ClientState::Ready {
+        service,
+        _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
+    };
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    client.set_event_tx(Some(event_tx));
+    assert!(
+        client
+            .arm_liveness_watcher(std::time::Duration::from_secs(3600))
+            .await,
+        "watcher must arm on a healthy Ready client"
+    );
+    client
+}
+
+async fn assert_watcher_releases(weak: std::sync::Weak<McpClient>, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while weak.upgrade().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} must cancel the watcher and release its client Arc"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn evicting_a_watched_client_releases_the_watcher_arc() {
+    let client = watched_live_client("evict").await;
+    let weak = Arc::downgrade(&client);
+    let mut owned = crate::owned_clients::OwnedClients::new();
+    owned.insert("evict".to_string(), client);
+    owned.remove("evict");
+    assert_watcher_releases(weak, "eviction").await;
+}
+
+#[tokio::test]
+async fn dropping_the_owned_map_releases_watched_clients() {
+    let client = watched_live_client("teardown").await;
+    let weak = Arc::downgrade(&client);
+    let mut owned = crate::owned_clients::OwnedClients::new();
+    owned.insert("teardown".to_string(), client);
+    drop(owned);
+    assert_watcher_releases(weak, "map teardown").await;
 }
 
 #[test]
@@ -2650,7 +2852,7 @@ fn load_expose_image_base64_meta_falls_through_when_none() {
         expose_image_base64: Some(true),
         ..Default::default()
     };
-    let meta = McpServerMetaConfig::default(); // expose_image_base64 = None
+    let meta = McpServerMetaConfig::default();
     assert!(McpClient::load_expose_image_base64(
         Some(&overrides),
         Some(&meta)
@@ -2918,7 +3120,7 @@ async fn ensure_initialized_drop_guard_restores_state_after_holder_aborted() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     match &*client.state.lock().await {
-        ClientState::Pending(_) => {} // expected
+        ClientState::Pending(_) => {}
         other => panic!(
             "expected Pending after holder abort + drop guard, found {}",
             state_label(other)
@@ -3030,7 +3232,7 @@ fn state_label(s: &ClientState) -> &'static str {
         ClientState::Empty => "Empty",
         ClientState::Pending(_) => "Pending",
         ClientState::Initializing => "Initializing",
-        ClientState::Ready(_) => "Ready",
+        ClientState::Ready { .. } => "Ready",
     }
 }
 
@@ -3133,8 +3335,88 @@ async fn is_healthy_pending_does_not_block_on_handshake() {
 #[test]
 fn make_client_info_pins_protocol_version() {
     assert_eq!(
-        McpClient::make_client_info("test-srv").protocol_version,
+        McpClient::make_client_info("test-srv", true).protocol_version,
         rmcp::model::ProtocolVersion::V_2025_11_25
+    );
+}
+
+#[test]
+fn make_client_info_advertises_form_and_url_elicitation() {
+    let info = McpClient::make_client_info("test-srv", true);
+    let elicitation = info
+        .capabilities
+        .elicitation
+        .as_ref()
+        .expect("elicitation capability advertised");
+    assert!(
+        elicitation.form.is_some(),
+        "form elicitation must be advertised"
+    );
+    assert!(
+        elicitation.url.is_some(),
+        "url elicitation must be advertised"
+    );
+    assert_eq!(
+        elicitation
+            .form
+            .as_ref()
+            .and_then(|value_f| value_f.schema_validation),
+        Some(true),
+        "client validates form content before Accept"
+    );
+}
+
+#[test]
+fn acp_zero_ipc_client_info_does_not_advertise_elicitation() {
+    use crate::acp_transport::AcpReverseInvoker;
+    use std::time::Duration;
+
+    struct NoopInvoker;
+    #[async_trait::async_trait]
+    impl AcpReverseInvoker for NoopInvoker {
+        async fn invoke(
+            &self,
+            _server_id: &str,
+            _message: serde_json::Value,
+            _timeout: Duration,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    let acp = McpClient::new_acp(
+        "sdk".to_string(),
+        "srv_0".to_string(),
+        Arc::new(NoopInvoker),
+        None,
+        None,
+    );
+    let acp_info = acp.make_client_handler().get_info();
+    assert!(
+        acp_info.capabilities.elicitation.is_none(),
+        "ACP zero-IPC cannot deliver elicitation/create"
+    );
+
+    let no_bridge = McpClient::stub("stdio");
+    assert!(
+        no_bridge
+            .make_client_handler()
+            .get_info()
+            .capabilities
+            .elicitation
+            .is_none(),
+        "stdio without an elicitation inbox must not advertise"
+    );
+
+    let hitl = McpClient::stub("stdio");
+    hitl.set_elicitation_tx(Some(crate::elicitation::ElicitationInbox::new()));
+    assert!(
+        hitl.make_client_handler()
+            .get_info()
+            .capabilities
+            .elicitation
+            .is_some(),
+        "stdio/HITL path with an inbox must still advertise elicitation"
     );
 }
 
@@ -3153,9 +3435,10 @@ fn make_client_info_pins_protocol_version() {
 async fn client_handler_routes_tools_changed() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<McpClientEvent>();
     let handler = GrokClientHandler {
-        info: McpClient::make_client_info("test"),
+        info: McpClient::make_client_info("test", true),
         server_name: "test".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
+        elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
     };
     handler.emit(McpClientEvent::ToolsChanged {
         server: handler.server_name.clone(),
@@ -3173,9 +3456,10 @@ async fn client_handler_routes_tools_changed() {
 #[tokio::test]
 async fn client_handler_no_dispatcher_is_silent() {
     let handler = GrokClientHandler {
-        info: McpClient::make_client_info("test"),
+        info: McpClient::make_client_info("test", false),
         server_name: "test".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
     };
     handler.emit(McpClientEvent::ToolsChanged {
         server: "test".to_string(),
@@ -3186,11 +3470,12 @@ async fn client_handler_no_dispatcher_is_silent() {
 /// Contract: get_info returns a clone of the stored ClientInfo.
 #[tokio::test]
 async fn client_handler_get_info_round_trips() {
-    let info = McpClient::make_client_info("test-srv");
+    let info = McpClient::make_client_info("test-srv", true);
     let handler = GrokClientHandler {
         info: info.clone(),
         server_name: "test-srv".to_string(),
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
     };
     let got = handler.get_info();
     // ClientInfo doesn't derive PartialEq; check the visible
@@ -3261,6 +3546,269 @@ fn config_added_kind_carries_correct_server_name() {
         server: "srv".to_string(),
     };
     assert_eq!(ev.server_name(), Some("srv"));
+}
+
+#[tokio::test]
+async fn inherited_clients_keep_the_parent_elicitation_inbox() {
+    let client = Arc::new(McpClient::stub("shared"));
+    let mut parent = McpState::new(vec![]);
+    parent
+        .owned_clients
+        .insert("shared".into(), Arc::clone(&client));
+    let parent_inbox = crate::elicitation::ElicitationInbox::new();
+    parent.set_elicitation_tx(Some(parent_inbox.clone()));
+    let pool = SharedMcpPool::from_state(&parent);
+    let mut child = McpState::new(vec![]);
+    child.import_shared_clients(&pool);
+    let child_inbox = crate::elicitation::ElicitationInbox::new();
+    child.set_elicitation_tx(Some(child_inbox.clone()));
+    let task = tokio::spawn(async move {
+        crate::elicitation::bridge_elicit(
+            &client.elicitation_tx,
+            "shared",
+            rmcp::model::ElicitRequestParams::UrlElicitationParams {
+                meta: None,
+                message: "Consent".into(),
+                url: "https://example.com/consent".into(),
+                elicitation_id: "parent-owned".into(),
+            },
+        )
+        .await
+    });
+    let job = tokio::time::timeout(std::time::Duration::from_secs(1), parent_inbox.recv())
+        .await
+        .expect("request must reach the parent's inbox")
+        .expect("request must be present");
+    let _ = job.response_tx.send(crate::elicitation::cancel_result());
+    assert_eq!(
+        task.await.unwrap().action,
+        rmcp::model::ElicitationAction::Cancel
+    );
+    child_inbox.close();
+    assert!(child_inbox.recv().await.is_none());
+}
+
+fn probe_ctx<'a>(
+    event_writer: &'a xai_grok_session_events::EventWriter,
+    mode: OauthInteractivity,
+) -> McpSpawnCtx<'a> {
+    crate::isolate_grok_home_for_tests();
+    McpSpawnCtx {
+        session_id: None,
+        event_writer,
+        mode,
+        scope: None,
+        discovery: McpOauthDiscovery::Network,
+    }
+}
+
+fn session_test_ctx(event_writer: &xai_grok_session_events::EventWriter) -> McpSpawnCtx<'_> {
+    crate::isolate_grok_home_for_tests();
+    McpSpawnCtx::for_session(
+        "sess",
+        event_writer,
+        OauthInteractivity::NonInteractive,
+        None,
+    )
+}
+
+const TEST_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+async fn resolve_tokenless_with_headers(
+    url: &str,
+    headers: &[(String, String)],
+    mode: OauthInteractivity,
+) -> HttpAuthDecision {
+    let event_writer = xai_grok_session_events::EventWriter::noop();
+    let ctx = probe_ctx(&event_writer, mode);
+    decide_http_auth_over_network("fake", url, headers, &ctx, TEST_DISCOVERY_TIMEOUT).await
+}
+
+async fn resolve_tokenless(url: &str, mode: OauthInteractivity) -> HttpAuthDecision {
+    resolve_tokenless_with_headers(url, &[], mode).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inconclusive_oauth_probe_connects_tokenless_streamable_http_headless() {
+    let (url, _handles) = spawn_fake_streamable_http(axum::http::StatusCode::OK).await;
+    let decision = resolve_tokenless(&url, OauthInteractivity::NonInteractive).await;
+    assert!(
+        matches!(decision, HttpAuthDecision::NoOauthSupport),
+        "tokenless streamable-http server must connect plain in non-interactive mode"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anonymous_access_probe_sends_default_user_agent() {
+    let (url, handles) = spawn_fake_streamable_http(axum::http::StatusCode::OK).await;
+    let decision = resolve_tokenless(&url, OauthInteractivity::NonInteractive).await;
+    assert!(matches!(decision, HttpAuthDecision::NoOauthSupport));
+
+    let captured = handles
+        .post_headers
+        .lock()
+        .take()
+        .expect("probe POST must reach the fake server");
+    assert_eq!(
+        header_values(&captured, axum::http::header::USER_AGENT),
+        vec![format!("open-grok/{}", xai_grok_version::version())]
+    );
+    assert_eq!(
+        header_values(&captured, axum::http::header::CONTENT_TYPE),
+        vec!["application/json".to_string()]
+    );
+    assert_eq!(
+        header_values(&captured, axum::http::header::ACCEPT),
+        vec!["application/json, text/event-stream".to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anonymous_access_probe_preserves_configured_user_agent() {
+    let (url, handles) = spawn_fake_streamable_http(axum::http::StatusCode::OK).await;
+    let headers = [
+        ("User-Agent".to_string(), "custom-ua".to_string()),
+        ("Content-Type".to_string(), "text/plain".to_string()),
+        ("Accept".to_string(), "text/html".to_string()),
+    ];
+    let decision =
+        resolve_tokenless_with_headers(&url, &headers, OauthInteractivity::NonInteractive).await;
+    assert!(matches!(decision, HttpAuthDecision::NoOauthSupport));
+
+    let captured = handles
+        .post_headers
+        .lock()
+        .take()
+        .expect("probe POST must reach the fake server");
+    assert_eq!(
+        header_values(&captured, axum::http::header::USER_AGENT),
+        vec!["custom-ua".to_string()]
+    );
+    assert_eq!(
+        header_values(&captured, axum::http::header::CONTENT_TYPE),
+        vec!["application/json".to_string()]
+    );
+    assert_eq!(
+        header_values(&captured, axum::http::header::ACCEPT),
+        vec!["application/json, text/event-stream".to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anonymous_access_probe_accepts_bad_request_reply() {
+    let (url, _handles) = spawn_fake_streamable_http(axum::http::StatusCode::BAD_REQUEST).await;
+    let decision = resolve_tokenless(&url, OauthInteractivity::NonInteractive).await;
+    assert!(matches!(decision, HttpAuthDecision::NoOauthSupport));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inconclusive_oauth_probe_stays_fail_closed_on_auth_challenge() {
+    let (url, _handles) = spawn_fake_streamable_http(axum::http::StatusCode::UNAUTHORIZED).await;
+    let decision = resolve_tokenless(&url, OauthInteractivity::NonInteractive).await;
+    assert!(
+        matches!(decision, HttpAuthDecision::NeedsInteractiveLogin),
+        "auth-challenging server must keep failing closed in non-interactive mode"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inconclusive_oauth_probe_unreachable_fails_closed() {
+    use axum::response::IntoResponse;
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::get(fake_handle_get).post(|| async {
+            futures::future::pending::<()>().await;
+            axum::http::StatusCode::OK.into_response()
+        }),
+    );
+    let url = spawn_test_http_server(app).await;
+    let decision = resolve_tokenless(&url, OauthInteractivity::NonInteractive).await;
+
+    assert!(matches!(decision, HttpAuthDecision::Unreachable));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inconclusive_oauth_probe_connects_plain_interactively() {
+    let (url, _handles) = spawn_fake_streamable_http(axum::http::StatusCode::UNAUTHORIZED).await;
+    let decision = resolve_tokenless(&url, OauthInteractivity::Interactive).await;
+    assert!(matches!(decision, HttpAuthDecision::NoOauthSupport));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inconclusive_oauth_probe_emits_timeout_and_verdict_events() {
+    let (url, _handles) = spawn_fake_streamable_http(axum::http::StatusCode::OK).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let event_writer = xai_grok_session_events::EventWriter::open(tmp.path());
+    let ctx = probe_ctx(&event_writer, OauthInteractivity::NonInteractive);
+    let decision =
+        decide_http_auth_over_network("fake", &url, &[], &ctx, TEST_DISCOVERY_TIMEOUT).await;
+    assert!(matches!(decision, HttpAuthDecision::NoOauthSupport));
+
+    let jsonl = std::fs::read_to_string(tmp.path().join("events.jsonl")).unwrap();
+    let events = event_types(&jsonl);
+    let types: Vec<String> = events
+        .iter()
+        .filter_map(|value_e| value_e.get("type").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        types
+            .iter()
+            .any(|value_t| value_t == "mcp_oauth_discovery_timeout"),
+        "missing timeout event; got {types:?}"
+    );
+    assert!(
+        types
+            .iter()
+            .any(|value_t| value_t == "mcp_oauth_probe_resolved"),
+        "missing verdict event; got {types:?}"
+    );
+}
+
+async fn spawn_counting_http_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler_counter = Arc::clone(&counter);
+    let app = axum::Router::new().fallback(move || {
+        let value_c = Arc::clone(&handler_counter);
+        async move {
+            value_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            axum::http::StatusCode::NOT_FOUND
+        }
+    });
+    (spawn_test_http_server(app).await, counter)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_spawn_sends_zero_network_requests() {
+    let (url, counter) = spawn_counting_http_server().await;
+    let event_writer = xai_grok_session_events::EventWriter::noop();
+
+    let session_ctx = session_test_ctx(&event_writer);
+    let client = start_mcp_server(
+        make_http_server("fake", &url),
+        None,
+        None,
+        None,
+        &session_ctx,
+    )
+    .await
+    .expect("plain HTTP client");
+    assert!(!client.has_auth(), "no stored creds → plain HTTP client");
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "session spawn must perform zero network requests"
+    );
+
+    let login_ctx =
+        session_test_ctx(&event_writer).with_oauth_discovery(McpOauthDiscovery::Network);
+    let _ = start_mcp_server(make_http_server("fake", &url), None, None, None, &login_ctx)
+        .await
+        .expect("discovery resolves no-oauth against the counting fake");
+    assert!(
+        counter.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "login path still runs network discovery (and proves the counter sees requests)"
+    );
 }
 
 #[test]
@@ -3336,4 +3884,336 @@ fn mcp_tool_icons_are_removed_when_refresh_omits_them() {
     assert_eq!(state.mcp_tool_icons.get(&name).map(Vec::len), Some(1));
     state.record_tool_icons(name.clone(), Vec::new());
     assert!(!state.mcp_tool_icons.contains_key(&name));
+}
+
+#[derive(Clone)]
+struct FakeStreamableHttpHandles {
+    post_headers: Arc<parking_lot::Mutex<Option<axum::http::HeaderMap>>>,
+}
+
+async fn spawn_fake_streamable_http(
+    post_status: axum::http::StatusCode,
+) -> (String, FakeStreamableHttpHandles) {
+    use axum::response::IntoResponse;
+    let handles = FakeStreamableHttpHandles {
+        post_headers: Arc::new(parking_lot::Mutex::new(None)),
+    };
+    let post_handles = handles.clone();
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::get(fake_handle_get).post(
+            move |headers: axum::http::HeaderMap| async move {
+                *post_handles.post_headers.lock() = Some(headers);
+                post_status.into_response()
+            },
+        ),
+    );
+    (spawn_test_http_server(app).await, handles)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_the_spawn_guard_kills_grandchildren() {
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "sleep 600 & echo $!; wait"])
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    xai_grok_tools::util::detach_command(&mut cmd);
+    #[allow(clippy::disallowed_methods)]
+    let mut child = cmd.spawn().expect("spawn wrapper");
+    let mut group = ProcessGroup::new().expect("group");
+    group.attach(&child).expect("attach");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut line = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut line)
+        .await
+        .expect("read grandchild pid");
+    let grandchild: u32 = line.trim().parse().expect("parse grandchild pid");
+    let guard = SpawnGuard::new(child, Some(Arc::new(group)));
+    assert!(
+        unix_process_exists(grandchild),
+        "grandchild must be alive before the guard drops"
+    );
+
+    drop(guard);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unix_process_exists(grandchild) {
+        assert!(
+            Instant::now() < deadline,
+            "grandchild {grandchild} survived the guard drop"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_into_a_closed_scope_fails_fast() {
+    let scope = ProcessScope::new();
+    scope.kill_all();
+
+    let mut cmd = Command::new("sleep");
+    cmd.arg("600").kill_on_drop(true);
+    xai_grok_tools::util::detach_command(&mut cmd);
+    let result = SafeTokioChildProcess::spawn(
+        cmd,
+        Some(&scope),
+        "closed-scope".to_string(),
+        xai_grok_session_events::EventWriter::noop(),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "spawning into a closed scope must fail fast, not start a doomed server"
+    );
+}
+
+/// `Unreachable` is a connectivity verdict: never auth, always retryable, still attributable to its server for failure recording.
+#[test]
+fn unreachable_error_is_retryable_not_auth() {
+    let err = McpError::Unreachable {
+        server: "srv".to_string(),
+    };
+    assert!(!err.is_auth_rejection());
+    assert!(err.is_unreachable());
+    assert_eq!(err.server_name(), Some("srv"));
+
+    assert!(
+        McpError::AuthRequired {
+            server: "srv".to_string()
+        }
+        .is_auth_rejection()
+    );
+}
+
+/// Candidates are returned only when the cooldown expired AND the server is still configured.
+/// A taken candidate is in-flight (holding an attempt token) and is not handed to another trigger until its attempt settles.
+#[test]
+fn unreachable_retry_candidates_respect_cooldown_and_config() {
+    let mut state = McpState::new(vec![
+        make_stdio_server("due", "/bin/due"),
+        make_stdio_server("cooling", "/bin/cooling"),
+    ]);
+    let now = std::time::Instant::now();
+    state.record_unreachable_failure_at("due", "conn refused".to_string(), now);
+    state.record_unreachable_failure_at(
+        "cooling",
+        "conn refused".to_string(),
+        now + McpState::UNREACHABLE_RETRY_COOLDOWN,
+    );
+
+    state.record_unreachable_failure_at("unconfigured", "conn refused".to_string(), now);
+
+    let taken = state.take_unreachable_retry_candidates();
+    assert_eq!(taken.len(), 1);
+    let (name, token) = taken[0].clone();
+    assert_eq!(name, "due");
+
+    assert!(state.init_failed.contains_key("due"));
+    assert!(state.init_failed.contains_key("cooling"));
+
+    assert!(state.take_unreachable_retry_candidates().is_empty());
+
+    state.record_unreachable_failure_at("due", "racing".to_string(), now);
+    assert!(state.take_unreachable_retry_candidates().is_empty());
+
+    state.settle_unreachable_attempt_failed("due", token, "still down".to_string());
+    assert_eq!(
+        state.init_failed.get("due").map(String::as_str),
+        Some("still down")
+    );
+    assert!(state.take_unreachable_retry_candidates().is_empty());
+
+    state.record_unreachable_failure_at("due", "again".to_string(), now);
+    let (name, token) = state.take_unreachable_retry_candidates()[0].clone();
+    assert!(state.finish_unreachable_attempt(&name, token));
+    assert!(!state.init_failed.contains_key("due"));
+
+    assert!(!state.finish_unreachable_attempt(&name, token));
+}
+
+/// Config teardown mid-attempt invalidates the attempt token.
+/// A stale attempt can neither install (finish returns false) nor re-pollute the records its teardown cleaned (failed/unretryable settles no-op).
+#[test]
+fn unreachable_attempt_token_invalidated_by_config_teardown() {
+    let mut state = McpState::new(vec![
+        make_stdio_server("keep", "/bin/keep"),
+        make_stdio_server("gone", "/bin/gone"),
+    ]);
+    let now = std::time::Instant::now();
+    state.record_unreachable_failure_at("gone", "down".to_string(), now);
+    let (name, token) = state.take_unreachable_retry_candidates()[0].clone();
+    assert_eq!(name, "gone");
+
+    state
+        .update_configs_diff(vec![make_stdio_server("keep", "/bin/keep")])
+        .expect("should detect change");
+    assert!(!state.init_failed.contains_key("gone"));
+
+    assert!(!state.finish_unreachable_attempt("gone", token));
+    assert!(!state.settle_unreachable_attempt_unretryable("gone", token));
+    state.settle_unreachable_attempt_failed("gone", token, "stale".to_string());
+    assert!(!state.init_failed.contains_key("gone"));
+    assert!(state.take_unreachable_retry_candidates().is_empty());
+}
+
+/// Config updates must not leave a stale unreachable schedule behind: the diff path forgets removed servers, the full-replace path clears everything.
+#[test]
+fn unreachable_schedule_cleared_on_config_updates() {
+    let mut state = McpState::new(vec![
+        make_stdio_server("keep", "/bin/keep"),
+        make_stdio_server("remove", "/bin/remove"),
+    ]);
+    let now = std::time::Instant::now();
+    state.record_unreachable_failure_at("keep", "down".to_string(), now);
+    state.record_unreachable_failure_at("remove", "down".to_string(), now);
+
+    let diff = state
+        .update_configs_diff(vec![make_stdio_server("keep", "/bin/keep")])
+        .expect("should detect change");
+    assert_eq!(diff.removed, vec!["remove"]);
+    assert!(!state.init_failed.contains_key("remove"));
+
+    let taken: Vec<McpServerName> = state
+        .take_unreachable_retry_candidates()
+        .into_iter()
+        .map(|(value_n, _)| value_n)
+        .collect();
+    assert_eq!(taken, vec!["keep".to_string()]);
+
+    assert!(state.update_configs(vec![make_stdio_server("keep", "/bin/keep2")]));
+    assert!(state.take_unreachable_retry_candidates().is_empty());
+    assert!(state.init_failed.is_empty());
+}
+
+/// A fresh init attempt (`mark_servers_initializing`) supersedes any pending unreachable-respawn schedule.
+/// The attempt itself re-records on failure, so a server recovered by a full re-init cannot be respawned over later.
+#[test]
+fn fresh_init_attempt_clears_unreachable_schedule() {
+    let mut state = McpState::new(vec![make_stdio_server("srv", "/bin/srv")]);
+    state.record_unreachable_failure_at("srv", "down".to_string(), std::time::Instant::now());
+
+    state.mark_servers_initializing(vec!["srv".to_string()]);
+    assert!(!state.init_failed.contains_key("srv"));
+    assert!(state.take_unreachable_retry_candidates().is_empty());
+}
+
+/// An attempt whose future was cancelled never settles.
+/// After the lease expires the server is takeable again with a fresh token and the zombie attempt's old token no-ops.
+#[test]
+fn unreachable_attempt_lease_reclaims_cancelled_attempts() {
+    let mut state = McpState::new(vec![make_stdio_server("srv", "/bin/srv")]);
+    let now = std::time::Instant::now();
+    state.record_unreachable_failure_at("srv", "down".to_string(), now);
+    let (_, old_token) = state.take_unreachable_retry_candidates_at(now)[0].clone();
+
+    assert!(
+        state
+            .take_unreachable_retry_candidates_at(now + McpState::UNREACHABLE_ATTEMPT_LEASE)
+            .is_empty()
+    );
+
+    let later = now + McpState::UNREACHABLE_ATTEMPT_LEASE + std::time::Duration::from_secs(1);
+    let taken = state.take_unreachable_retry_candidates_at(later);
+    assert_eq!(taken.len(), 1);
+    let (name, new_token) = taken[0].clone();
+    assert_eq!(name, "srv");
+    assert_ne!(new_token, old_token);
+
+    assert!(!state.finish_unreachable_attempt("srv", old_token));
+    state.settle_unreachable_attempt_failed("srv", old_token, "stale".to_string());
+
+    assert!(state.finish_unreachable_attempt("srv", new_token));
+}
+
+/// Typed verdicts and transport-level handshake/client errors are retryable; protocol junk and auth are not.
+#[test]
+fn transient_connectivity_classification() {
+    assert!(
+        McpError::Unreachable {
+            server: "srv".to_string()
+        }
+        .is_transient_connectivity()
+    );
+    assert!(
+        McpError::Timeout {
+            server: "srv".to_string(),
+            timeout_secs: 65
+        }
+        .is_transient_connectivity()
+    );
+    assert!(
+        McpError::ClientError("transport error: Connection reset by peer (os error 104)".into())
+            .is_transient_connectivity()
+    );
+    assert!(
+        McpError::ClientError("error sending request for url (http://x/mcp)".into())
+            .is_transient_connectivity()
+    );
+
+    assert!(
+        !McpError::ClientError("invalid params: missing field `tools`".into())
+            .is_transient_connectivity()
+    );
+    assert!(
+        !McpError::AuthRequired {
+            server: "srv".to_string()
+        }
+        .is_transient_connectivity()
+    );
+
+    assert!(
+        McpError::Unreachable {
+            server: "srv".to_string()
+        }
+        .is_connect_failure()
+    );
+    assert!(
+        McpError::ClientError("tcp connect error: Connection refused (os error 61)".into())
+            .is_connect_failure()
+    );
+    assert!(
+        !McpError::Timeout {
+            server: "srv".to_string(),
+            timeout_secs: 65
+        }
+        .is_connect_failure()
+    );
+    assert!(
+        !McpError::ClientError("transport error: Connection reset by peer (os error 104)".into())
+            .is_connect_failure()
+    );
+    assert!(
+        !McpError::ClientError("request timed out awaiting the server response".into())
+            .is_connect_failure(),
+        "post-connect timeouts stay out of the connect-phase class"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_connect_handshake_classifies_connect_phase() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    drop(listener);
+
+    let event_writer = xai_grok_session_events::EventWriter::noop();
+    let ctx = session_test_ctx(&event_writer);
+    let client = start_mcp_server(make_http_server("refused", &url), None, None, None, &ctx)
+        .await
+        .expect("a plain HTTP client builds without network");
+    let err = client
+        .ensure_initialized()
+        .await
+        .expect_err("a refused port must fail the handshake");
+    assert!(
+        err.is_connect_failure(),
+        "a real refused-connect handshake must classify connect-phase: {err}"
+    );
 }

@@ -7,6 +7,71 @@ use anyhow::{Context, Result};
 
 use super::MemoryStorage;
 
+const MAX_MEMORY_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn open_regular_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
+fn append_file_snapshot<Writer: std::io::Write>(
+    archive: &mut tar::Builder<Writer>,
+    path: &std::path::Path,
+    name: &str,
+) -> Result<()> {
+    use std::io::Read;
+
+    let file = match open_regular_nofollow(path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "skipping unreadable memory file");
+            return Ok(());
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "skipping unstatable memory file");
+            return Ok(());
+        }
+    };
+    if metadata.len() > MAX_MEMORY_FILE_BYTES {
+        tracing::warn!(path = %path.display(), "skipping oversized memory file");
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(MAX_MEMORY_FILE_BYTES + 1).read_to_end(&mut bytes) {
+        tracing::warn!(path = %path.display(), %error, "skipping unreadable memory file");
+        return Ok(());
+    }
+    if bytes.len() as u64 > MAX_MEMORY_FILE_BYTES {
+        tracing::warn!(path = %path.display(), "skipping oversized memory file");
+        return Ok(());
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&metadata);
+    header.set_size(bytes.len() as u64);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, name, bytes.as_slice())
+        .with_context(|| format!("archive {name}"))
+}
+
 /// Build a `memory.tar.gz` archive with session logs and MEMORY.md files.
 pub fn build_memory_archive(storage: &MemoryStorage) -> Result<Vec<u8>> {
     use flate2::Compression;
@@ -26,8 +91,7 @@ pub fn build_memory_archive(storage: &MemoryStorage) -> Result<Vec<u8>> {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("md") {
                 let name = format!("workspace/sessions/{}", entry.file_name().to_string_lossy());
-                ar.append_path_with_name(&path, &name)
-                    .with_context(|| format!("archive {name}"))?;
+                append_file_snapshot(&mut ar, &path, &name)?;
             }
         }
     }
@@ -35,8 +99,7 @@ pub fn build_memory_archive(storage: &MemoryStorage) -> Result<Vec<u8>> {
     // MEMORY.md files
     let global_mem = storage.global_memory_file();
     if global_mem.is_file() {
-        ar.append_path_with_name(&global_mem, "global/MEMORY.md")
-            .context("archive global MEMORY.md")?;
+        append_file_snapshot(&mut ar, &global_mem, "global/MEMORY.md")?;
     }
 
     let workspace_mem = storage.workspace_memory_file();
@@ -47,8 +110,7 @@ pub fn build_memory_archive(storage: &MemoryStorage) -> Result<Vec<u8>> {
             .and_then(|n| n.to_str())
             .unwrap_or("workspace");
         let archive_path = format!("{ws_dir_name}/MEMORY.md");
-        ar.append_path_with_name(&workspace_mem, &archive_path)
-            .context("archive workspace MEMORY.md")?;
+        append_file_snapshot(&mut ar, &workspace_mem, &archive_path)?;
     }
 
     let enc = ar.into_inner().context("finalize tar")?;
@@ -112,5 +174,74 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.path().unwrap().display().to_string())
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_skips_symlinked_memory_and_session_files() {
+        let directory = TempDir::new().unwrap();
+        let storage = test_storage(&directory);
+        storage.ensure_initialized().unwrap();
+        let secret = directory.path().join("secret");
+        std::fs::write(&secret, "must not be archived").unwrap();
+        let global = storage.global_memory_file();
+        let _ = std::fs::remove_file(&global);
+        std::os::unix::fs::symlink(&secret, &global).unwrap();
+        let sessions = storage.workspace_dir().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::os::unix::fs::symlink(&secret, sessions.join("linked.md")).unwrap();
+
+        let entries = tar_entry_names(&build_memory_archive(&storage).unwrap());
+        assert!(!entries.iter().any(|name| name == "global/MEMORY.md"));
+        assert!(!entries.iter().any(|name| name.ends_with("linked.md")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_skips_fifo_without_blocking() {
+        let directory = TempDir::new().unwrap();
+        let storage = test_storage(&directory);
+        storage.ensure_initialized().unwrap();
+        let sessions = storage.workspace_dir().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("pipe.md");
+        let path_bytes = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+
+        let entries = tar_entry_names(&build_memory_archive(&storage).unwrap());
+        assert!(!entries.iter().any(|name| name.ends_with("pipe.md")));
+    }
+
+    #[test]
+    fn archive_skips_oversized_files() {
+        let directory = TempDir::new().unwrap();
+        let storage = test_storage(&directory);
+        storage.ensure_initialized().unwrap();
+        std::fs::File::create(storage.global_memory_file())
+            .unwrap()
+            .set_len(MAX_MEMORY_FILE_BYTES + 1)
+            .unwrap();
+
+        let entries = tar_entry_names(&build_memory_archive(&storage).unwrap());
+        assert!(!entries.iter().any(|name| name == "global/MEMORY.md"));
+    }
+
+    #[test]
+    fn snapshot_header_and_content_agree() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("note.md");
+        let content = b"# Memory\ncurrent snapshot\n";
+        std::fs::write(&source, content).unwrap();
+        let mut archive = tar::Builder::new(Vec::new());
+        append_file_snapshot(&mut archive, &source, "note.md").unwrap();
+        let bytes = archive.into_inner().unwrap();
+        let mut reader = tar::Archive::new(bytes.as_slice());
+        let mut entries = reader.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.header().size().unwrap(), content.len() as u64);
+        let mut restored = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut restored).unwrap();
+        assert_eq!(restored, content);
+        assert!(entries.next().is_none());
     }
 }

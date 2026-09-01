@@ -1,6 +1,250 @@
 use super::*;
+#[tokio::test]
+async fn a_delivered_foreground_result_empties_the_live_set() {
+    let harness = harness(false, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("settled", false)).await }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["settled".to_owned()],
+        "a running turn-blocking child is live"
+    );
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["settled".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a live turn-blocking child keeps the drain parked"
+    );
+
+    let _ = harness.finish.send(());
+    let result = spawn.await.unwrap().unwrap();
+    assert!(result.success && !result.backgrounded);
+    assert_eq!(
+        drained.await.expect("drain fires when the set empties"),
+        SubagentOutstandingReply::default(),
+        "finish_child wakes the parked drain exactly when the result is delivered"
+    );
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await,
+        SubagentOutstandingReply::default(),
+        "a delivered foreground result leaves the live set empty"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_resolves_when_child_backgrounds_at_deadline() {
+    let harness = harness(false, std::time::Duration::from_secs(1));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("slow", false)).await }
+    });
+    tokio::task::yield_now().await;
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["slow".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a live turn-blocking child keeps the drain parked"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let interim = spawn.await.unwrap().unwrap();
+    assert!(interim.backgrounded);
+    assert_eq!(
+        drained
+            .await
+            .expect("deadline handoff wakes the parked drain"),
+        SubagentOutstandingReply {
+            live_ids: Vec::new(),
+            background_live: true,
+            subagent_usage_not_applied: false,
+        },
+        "an auto-backgrounded child leaves the turn-blocking set and is background_live"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_resolves_when_caller_goes_away() {
+    let harness = harness(false, std::time::Duration::from_secs(600));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("abandoned", false)).await }
+    });
+    tokio::task::yield_now().await;
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["abandoned".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a live turn-blocking child keeps the drain parked"
+    );
+
+    spawn.abort();
+    let _ = spawn.await;
+
+    let before = tokio::time::Instant::now();
+    assert_eq!(
+        drained
+            .await
+            .expect("caller abandonment wakes the parked drain"),
+        SubagentOutstandingReply {
+            live_ids: Vec::new(),
+            background_live: true,
+            subagent_usage_not_applied: false,
+        },
+        "the parked drain resolves via the abandonment reap, not a completion"
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        before,
+        "the drain resolves on abandonment, never advancing to the foreground deadline"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn drain_resolves_when_queued_spawn_is_cancelled() {
+    let mut harness = harness_with_config(false, limited(1, LimitBehavior::Queue));
+    let mut filler = request("filler", true);
+    filler.parent_prompt_id = Some("other".to_owned());
+    let _filler = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(filler).await }
+    });
+    harness
+        .requests
+        .recv()
+        .await
+        .expect("filler occupies the slot");
+
+    let queued = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("queued", false)).await }
+    });
+    await_queued(&harness.backend, 1).await;
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["queued".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a queued turn-blocking spawn keeps the drain parked"
+    );
+
+    harness.backend.cancel_parent_prompt("prompt").await;
+    assert_eq!(
+        drained.await.expect("remove_queued wakes the parked drain"),
+        SubagentOutstandingReply::default(),
+        "a cancelled queued spawn leaves the scope empty"
+    );
+    let result = queued.await.expect("join").expect("spawn round-trips");
+    assert!(
+        result.cancelled,
+        "the queued spawn was cancelled: {result:?}"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn drain_resolves_when_pending_child_starts_background() {
+    let mut harness = harness(true, std::time::Duration::from_secs(60));
+    let mut blocking = request("bg-def", false);
+    blocking.subagent_type = "background-default".to_owned();
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(blocking).await }
+    });
+    harness.requests.recv().await.expect("bg-def admitted");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["bg-def".to_owned()],
+    );
+
+    let mut drained = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["bg-def".to_owned()],
+    );
+    assert!(
+        drained.try_recv().is_err(),
+        "a pending turn-blocking child keeps the drain parked"
+    );
+
+    let _ = harness.start.send(());
+    assert_eq!(harness.started.recv().await.as_deref(), Some("bg-def"));
+    assert_eq!(
+        drained
+            .await
+            .expect("Started handoff wakes the parked drain"),
+        SubagentOutstandingReply {
+            live_ids: Vec::new(),
+            background_live: true,
+            subagent_usage_not_applied: false,
+        },
+        "a definition_background child is background_live once started"
+    );
+
+    let _ = harness.finish.send(());
+    let result = spawn.await.unwrap().unwrap();
+    assert!(result.success && !result.backgrounded);
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn two_parked_drains_on_one_scope_both_fire() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("fanout", false)).await }
+    });
+    assert_eq!(harness.started.recv().await.as_deref(), Some("fanout"));
+
+    let mut first = wait_prompt_drained(&harness.backend, "prompt");
+    let mut second = wait_prompt_drained(&harness.backend, "prompt");
+    assert_eq!(
+        outstanding(&harness.backend, "prompt").await.live_ids,
+        vec!["fanout".to_owned()],
+    );
+    assert!(
+        first.try_recv().is_err() && second.try_recv().is_err(),
+        "a live child keeps both drains parked"
+    );
+
+    let _ = harness.finish.send(());
+    let result = spawn.await.unwrap().unwrap();
+    assert!(result.success);
+    assert_eq!(
+        first.await.expect("first waiter fires"),
+        SubagentOutstandingReply::default(),
+    );
+    assert_eq!(
+        second.await.expect("second waiter fires"),
+        SubagentOutstandingReply::default(),
+        "the second waiter on the scope must also fire"
+    );
+    harness.actor.abort();
+}
+
 use crate::implementations::grok_build::task::admission::{LimitBehavior, SubagentLimits};
 use crate::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
+use crate::implementations::grok_build::task::types::SubagentWaitPromptDrainedRequest;
 use crate::implementations::grok_build::task::types::{
     AgentMailboxIdentity, AgentMailboxMessage, AgentMailboxMessageKind, AgentMessageDeliveryStatus,
     NativeAgentMessage, NativeAgentOperation, NativeAgentRecord, NativeAgentSpawn,
@@ -217,7 +461,7 @@ fn cancelled_result(request: &SubagentRequest) -> SubagentResult {
     }
 }
 
-fn request(id: &str, background: bool) -> SubagentRequest {
+pub(super) fn request(id: &str, background: bool) -> SubagentRequest {
     SubagentRequest {
         id: id.to_owned(),
         prompt: "work".to_owned(),
@@ -350,6 +594,24 @@ async fn outstanding(backend: &ChannelBackend, prompt_id: &str) -> SubagentOutst
         }))
         .expect("actor command channel open");
     response_rx.await.expect("outstanding response")
+}
+
+fn wait_prompt_drained(
+    backend: &ChannelBackend,
+    prompt_id: &str,
+) -> oneshot::Receiver<SubagentOutstandingReply> {
+    let (respond_to, response_rx) = oneshot::channel();
+    backend
+        .sender()
+        .send(SubagentEvent::WaitPromptDrained(
+            SubagentWaitPromptDrainedRequest {
+                parent_session_id: "parent".to_owned(),
+                prompt_id: prompt_id.to_owned(),
+                respond_to,
+            },
+        ))
+        .expect("actor command channel open");
+    response_rx
 }
 
 #[tokio::test]

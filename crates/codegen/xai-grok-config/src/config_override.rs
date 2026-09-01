@@ -90,6 +90,52 @@ pub const PATCH_STRIP_KEYS: &[&str] = &[
 pub const PATCH_STRIP_PATHS: &[PatchPath] =
     &[&["ui", "status_line"], &["ui", "notifications", "hooks"]];
 
+pub const CAMPAIGN_STRIP_KEYS: &[&str] = &[
+    "version_overrides",
+    "campaigns",
+    "auth_provider",
+    "model_providers",
+    "auth",
+    "grok_com_config",
+    "mcp_servers",
+];
+pub const OVERLAY_ALLOW_PATHS: &[&[&str]] = &[
+    &["models"],
+    &["features"],
+    &["toolset", "bash", "login_shell_capture"],
+    &["toolset", "web_search", "allowed_domains"],
+    &["toolset", "web_search", "excluded_domains"],
+    &["shell_environment_policy", "inherit"],
+    &["shell_environment_policy", "ignore_default_excludes"],
+    &["shell_environment_policy", "exclude"],
+    &["shell_environment_policy", "include_only"],
+];
+pub fn retain_overlay_allowed(overlay: &mut toml::Table) {
+    retain_allowed_paths(overlay, OVERLAY_ALLOW_PATHS, true);
+}
+fn retain_allowed_paths(table: &mut toml::Table, paths: &[&[&str]], top_level: bool) {
+    table.retain(|key, value| {
+        let nested: Vec<&[&str]> = paths
+            .iter()
+            .filter(|path| path.first().copied() == Some(key))
+            .map(|path| &path[1..])
+            .collect();
+        if nested.is_empty() {
+            return false;
+        }
+        if nested.iter().any(|path| path.is_empty()) {
+            return !top_level || value.is_table();
+        }
+        match value.as_table_mut() {
+            Some(child) => {
+                retain_allowed_paths(child, &nested, false);
+                !child.is_empty()
+            }
+            None => false,
+        }
+    });
+}
+
 /// Deep-merge each patch in iteration order (later wins on a leaf), stripping
 /// `strip_keys` (top level) first.
 ///

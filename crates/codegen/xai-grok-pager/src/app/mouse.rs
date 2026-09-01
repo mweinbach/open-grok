@@ -451,6 +451,20 @@ impl AgentView {
                     return InputOutcome::Unchanged;
                 }
                 match self.pane_areas.hit_test(mouse.column, mouse.row) {
+                    Some(AgentPane::Dock) => {
+                        self.set_active_pane(AgentPane::Dock, false);
+                        let row = mouse.row.saturating_sub(self.pane_areas.dock.y);
+                        let items = self.dock_items();
+                        if let Some(item) = crate::views::dock::item_at(&self.dock_counts(), row) {
+                            if let Some(index) =
+                                items.iter().position(|candidate| *candidate == item)
+                            {
+                                self.dock_cursor = index;
+                            }
+                            self.dock_activate(item);
+                        }
+                        InputOutcome::Changed
+                    }
                     Some(AgentPane::Todo) => {
                         self.set_active_pane(AgentPane::Todo, false);
                         self.todo.handle_mouse(
@@ -1033,7 +1047,8 @@ impl AgentView {
                         | AgentPane::Queue
                         | AgentPane::Prompt
                         | AgentPane::Tasks
-                        | AgentPane::Catalog => None,
+                        | AgentPane::Catalog
+                        | AgentPane::Dock => None,
                     })
                 };
                 let new_prompt_hover = hit == Some(AgentPane::Prompt)

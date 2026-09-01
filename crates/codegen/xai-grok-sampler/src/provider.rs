@@ -61,6 +61,7 @@ pub struct ProviderRequestHeaders<'a> {
     pub model_id: &'a str,
     pub session_id: &'a str,
     pub turn_idx: Option<&'a str>,
+    pub transient_retry: Option<&'a str>,
     pub agent_id: &'a str,
     pub deployment_id: Option<&'a str>,
     pub user_id: Option<&'a str>,
@@ -80,6 +81,9 @@ impl ProviderRequestHeaders<'_> {
             .header("x-grok-agent-id", self.agent_id);
         if let Some(turn_idx) = self.turn_idx {
             builder = builder.header("x-grok-turn-idx", turn_idx);
+        }
+        if let Some(attempt) = self.transient_retry {
+            builder = builder.header("x-grok-transient-retry", attempt);
         }
         if let Some(deployment_id) = self.deployment_id.filter(|value| !value.is_empty()) {
             builder = builder.header("x-grok-deployment-id", deployment_id);

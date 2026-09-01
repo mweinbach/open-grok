@@ -63,7 +63,7 @@ pub(super) fn dispatch_copy_assistant_message(
             if let Some(entry) = agent.scrollback.entry(i)
                 && let RenderBlock::AgentMessage(msg) = &entry.block
             {
-                agent_messages.push(msg.copy_text(false));
+                agent_messages.push(msg.copy_text(true));
             }
         }
 
@@ -453,6 +453,7 @@ fn extensions_tab_slash_name(tab: crate::views::extensions_modal::ExtensionsTab)
         ExtensionsTab::Plugins => "plugins",
         ExtensionsTab::Marketplace => "marketplace",
         ExtensionsTab::Skills => "skills",
+        ExtensionsTab::Workflows => "workflows",
         ExtensionsTab::McpServers => "mcps",
     }
 }
@@ -559,14 +560,20 @@ pub(super) fn dispatch_open_config_agents_modal(
     if let Some(tab) = initial_tab {
         modal.active_tab = tab;
     }
+    let request_id = modal.begin_plugin_load();
     agent.agents_modal = Some(modal);
+    let mut effects = vec![Effect::LoadAgentsPluginRegistry {
+        agent_id: id,
+        cwd,
+        request_id,
+    }];
     if let Some(session_id) = session_id {
-        return vec![Effect::FetchSessionAgentName {
+        effects.push(Effect::FetchSessionAgentName {
             agent_id: id,
             session_id,
-        }];
+        });
     }
-    vec![]
+    effects
 }
 
 /// `agentType` / `agent_type` from a catalog `ModelInfo` meta blob.
@@ -684,11 +691,7 @@ pub(super) fn handle_hooks_list_loaded(
         modal.hooks_data = match result {
             Ok(response) => {
                 // Default all groups to collapsed.
-                let mut seen = std::collections::HashSet::new();
-                for hook in &response.hooks {
-                    seen.insert(hook.source_dir.clone());
-                }
-                modal.hooks_collapsed_groups = seen;
+                modal.seed_hook_groups_once(&response.hooks);
                 TabDataState::Loaded(response)
             }
             Err(e) => TabDataState::Error(e),

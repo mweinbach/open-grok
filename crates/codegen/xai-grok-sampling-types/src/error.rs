@@ -143,6 +143,11 @@ impl SentCredential {
 /// can never drift from what Display actually emits.
 const SERIALIZATION_DISPLAY_PREFIX: &str = "serialization error: ";
 
+/// Display text of [`SamplingError::MaxTokensTruncation`].
+/// Public: the pager sniffs it to recover the kind from rails predating the typed `errorKind` field.
+/// Sharing the const with the `#[error(...)]` template prevents drift.
+pub const MAX_TOKENS_TRUNCATION_MESSAGE: &str = "response truncated by max_tokens";
+
 #[derive(Debug, Error)]
 pub enum SamplingError {
     #[error("{message}")]
@@ -193,7 +198,7 @@ pub enum SamplingError {
     IdleTimeout { elapsed_secs: u64 },
     #[error("empty response from model ({})", context.reason)]
     EmptyResponse { context: EmptyResponseContext },
-    #[error("response truncated by max_tokens")]
+    #[error("{text}", text = MAX_TOKENS_TRUNCATION_MESSAGE)]
     MaxTokensTruncation,
     /// A confident server-reported doom loop on the attempt (mid-stream or
     /// on the completed response). Retryable on the recovery loop's own
@@ -212,16 +217,45 @@ pub enum SamplingError {
 /// both non-stream error bodies and mid-stream SSE error events.
 pub const INVALID_IMAGE_ERROR_CODE: &str = "invalid_image";
 
-/// A wire `error.code`, parsed once at the boundary so classification
-/// compares variants instead of strings. `#[non_exhaustive]`: the next
-/// semantic code is a new variant, not another const and `||` chain.
+/// Content path some upstream providers key codeless image rejections on (`.image.source.base64.data`/`.url`).
+/// Those arrive as `invalid_request_error` with no `error.code`, so [`INVALID_IMAGE_ERROR_CODE`] misses them.
+/// The fragment appears only when the request carried an image, so stripping is safe recovery.
+/// Fragile to the provider renaming the wire path.
+const IMAGE_CONTENT_PATH_MARKER: &str = ".image.source.";
+
+/// True when a wire `code` slot means the request exceeded a size limit: the 413 status as a numeric string, or a provider size slug.
+/// Structured counterpart of [`is_context_length_error`] for backends that stamp a code but an opaque message.
+///
+/// Size-error decision map for callers choosing a remedy:
+/// - 413 status or byte-size code: strip inline images and retry once.
+///   Detected by [`SamplingError::is_payload_too_large`] and [`SamplingError::is_byte_size_overflow_coded`].
+/// - Token-tier code or token/size text: fail fast via [`SamplingError::is_retry_vetoed`].
+///   Detected by [`SamplingError::is_context_length_error`]; the compaction host steps its input ladder down instead.
+pub fn is_size_overflow_error_code(code: &str) -> bool {
+    is_byte_size_overflow_error_code(code)
+        || code.eq_ignore_ascii_case("exceed_context_size_error")
+        || code.eq_ignore_ascii_case("context_length_exceeded")
+}
+
+/// 413-style subset of [`is_size_overflow_error_code`]: byte-or-count caps where stripping inline images may shrink the request under the limit.
+/// Token-tier codes are excluded: images barely move token counts.
+fn is_byte_size_overflow_error_code(code: &str) -> bool {
+    code.parse::<u16>() == Ok(StatusCode::PAYLOAD_TOO_LARGE.as_u16())
+        || code.eq_ignore_ascii_case("payload_too_large")
+        || code.eq_ignore_ascii_case("request_too_large")
+}
+
+/// A wire `error.code`, parsed once at the boundary so classification compares variants instead of strings.
+/// `#[non_exhaustive]`: the next semantic code is a new variant, not another const and `||` chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApiErrorCode {
     /// The server rejected an image ([`INVALID_IMAGE_ERROR_CODE`]).
     InvalidImage,
-    /// Any other wire code, preserved verbatim (Responses-stream error
-    /// events pass arbitrary codes through).
+    /// A size-overflow code ([`is_size_overflow_error_code`]).
+    /// Carries the verbatim wire code so serialization stays byte-identical.
+    ContextOverflow(String),
+    /// Any other wire code, preserved verbatim (Responses-stream error events pass arbitrary codes through).
     Other(String),
 }
 
@@ -229,6 +263,7 @@ impl ApiErrorCode {
     pub fn parse(code: &str) -> Self {
         match code {
             INVALID_IMAGE_ERROR_CODE => Self::InvalidImage,
+            c if is_size_overflow_error_code(c) => Self::ContextOverflow(c.to_string()),
             _ => Self::Other(code.to_string()),
         }
     }
@@ -236,8 +271,18 @@ impl ApiErrorCode {
     pub fn as_str(&self) -> &str {
         match self {
             Self::InvalidImage => INVALID_IMAGE_ERROR_CODE,
-            Self::Other(code) => code,
+            Self::ContextOverflow(code) | Self::Other(code) => code,
         }
+    }
+
+    /// `true` for size-overflow codes; see [`is_size_overflow_error_code`].
+    pub fn is_size_overflow(&self) -> bool {
+        matches!(self, Self::ContextOverflow(_))
+    }
+
+    /// `true` for the byte-size subset of size-overflow codes; see `is_byte_size_overflow_error_code`.
+    pub fn is_byte_size_overflow(&self) -> bool {
+        matches!(self, Self::ContextOverflow(code) if is_byte_size_overflow_error_code(code))
     }
 }
 
@@ -266,8 +311,26 @@ impl SamplingError {
         }
     }
 
-    /// Rebuild a `Serialization` error from a rendered message for non-`Clone`
-    /// contexts; it must stay `Serialization` so it remains non-retryable.
+    /// Display plus the hidden source() chain.
+    ///
+    /// reqwest Error Display hides DNS/connect causes on source().
+    pub fn detail_with_causes(&self) -> String {
+        match self {
+            Self::Http(err) => {
+                let mut msg = self.to_string();
+                let mut source = std::error::Error::source(err);
+                while let Some(cause) = source {
+                    msg.push_str(": ");
+                    msg.push_str(&cause.to_string());
+                    source = cause.source();
+                }
+                msg
+            }
+            _ => self.to_string(),
+        }
+    }
+
+    /// Rebuild a `Serialization` error from a rendered message for non-`Clone` contexts; it must stay `Serialization` so it remains non-retryable.
     pub fn serialization_message(msg: impl fmt::Display) -> Self {
         Self::Serialization(serde::de::Error::custom(msg))
     }
@@ -381,6 +444,7 @@ impl SamplingError {
                 *error_code == Some(ApiErrorCode::InvalidImage)
                     || message.contains("Could not process image")
                     || is_codex_invalid_image_url_error(message)
+                    || message.contains(IMAGE_CONTENT_PATH_MARKER)
             }
             SamplingError::StreamError { code, .. } => *code == Some(ApiErrorCode::InvalidImage),
             // Explicit like `is_retryable`: a new variant must state its
@@ -442,19 +506,65 @@ impl SamplingError {
     /// so retrying the same payload can't help. See [`is_context_length_error`].
     pub fn is_context_length_error(&self) -> bool {
         match self {
-            SamplingError::Api { message, .. } | SamplingError::StreamError { message, .. } => {
-                is_context_length_error(message)
+            SamplingError::Api {
+                status,
+                message,
+                retry_after_secs,
+                error_code,
+                ..
+            } => {
+                let size_coded = error_code
+                    .as_ref()
+                    .is_some_and(ApiErrorCode::is_size_overflow);
+                if *status == StatusCode::TOO_MANY_REQUESTS
+                    && retry_after_secs.is_some()
+                    && !size_coded
+                {
+                    return false;
+                }
+                size_coded || is_context_length_error(message)
             }
-            _ => false,
+            SamplingError::StreamError { message, code, .. } => {
+                code.as_ref().is_some_and(ApiErrorCode::is_size_overflow)
+                    || is_context_length_error(message)
+            }
+            SamplingError::Auth { .. }
+            | SamplingError::InvalidConfiguration(_)
+            | SamplingError::Http(_)
+            | SamplingError::Serialization(_)
+            | SamplingError::EventStreamError(_)
+            | SamplingError::IdleTimeout { .. }
+            | SamplingError::EmptyResponse { .. }
+            | SamplingError::MaxTokensTruncation
+            | SamplingError::DoomLoopDetected { .. } => false,
         }
     }
 
-    /// Capacity / overload: HTTP 529, a 5xx whose message clearly says
-    /// overloaded (proxies wrap stream overloads in a 500), or a stream
-    /// error whose parsed `error_type` is a capacity type (`overloaded_error`
-    /// / `service_unavailable_error`). Never reachable from a 4xx or a
-    /// request-shaped stream error, whatever the message text. Transient —
-    /// worth a short, bounded retry at the call site.
+    /// Structured 413-style rejection on the envelope or stream event: a byte-tier cap, so image stripping may fix it (unlike token overflows).
+    pub fn is_byte_size_overflow_coded(&self) -> bool {
+        match self {
+            SamplingError::Api { error_code, .. } => error_code
+                .as_ref()
+                .is_some_and(ApiErrorCode::is_byte_size_overflow),
+            SamplingError::StreamError { code, .. } => code
+                .as_ref()
+                .is_some_and(ApiErrorCode::is_byte_size_overflow),
+            SamplingError::Auth { .. }
+            | SamplingError::InvalidConfiguration(_)
+            | SamplingError::Http(_)
+            | SamplingError::Serialization(_)
+            | SamplingError::EventStreamError(_)
+            | SamplingError::IdleTimeout { .. }
+            | SamplingError::EmptyResponse { .. }
+            | SamplingError::MaxTokensTruncation
+            | SamplingError::DoomLoopDetected { .. } => false,
+        }
+    }
+
+    /// Capacity / overload: HTTP 529, a 5xx whose message clearly says overloaded, or a stream error whose parsed `error_type` is a capacity type.
+    /// Proxies wrap stream overloads in a 500; the capacity types are `overloaded_error` and `service_unavailable_error`.
+    /// Never reachable from a 4xx or a request-shaped stream error, whatever the message text.
+    /// Transient: worth a short, bounded retry at the call site.
     pub fn is_overloaded(&self) -> bool {
         match self {
             SamplingError::Api {
@@ -689,18 +799,8 @@ pub fn try_parse_stream_error(data: &str) -> Option<SamplingError> {
     })
 }
 
-/// True when an error message indicates a context-window overflow. Backends report
-/// this inconsistently with no stable error code, so we match the message text; it's
-/// deterministic (re-sending the same payload always fails), so callers must not retry.
-pub fn is_context_length_error(message: &str) -> bool {
-    let m = message.to_ascii_lowercase();
-    m.contains("too long for this model")
-        || m.contains("prompt is too long")
-        || m.contains("maximum prompt length")
-        || m.contains("maximum context length")
-        || m.contains("context_length_exceeded")
-        || (m.contains("current message") && m.contains("exceeds budget"))
-}
+/// Shared size-overflow text detector: a single definition (in the compaction engine) so the turn path and compaction loops can't drift.
+pub use xai_grok_compaction::is_context_length_error;
 
 /// Whether an HTTP status is worth retrying: the same 429 + any 5xx rule CCP
 /// publishes in `x-should-retry`, minus Cloudflare's origin-TLS 525/526
@@ -899,31 +999,31 @@ mod tests {
     }
 
     #[test]
-    fn context_length_error_matches_backend_variants() {
-        for msg in [
-            "This model's maximum prompt length is 256000 but the request contains 1500000",
-            "The prompt is too long for this model's context window.",
-            "none: The prompt is too long for this model's context window.",
-            "This model's maximum context length is 200000 tokens",
-            "invalid_request_error: prompt is too long: 300000 tokens > 200000 maximum",
-            "error type: context_length_exceeded",
-            "Failed to start sampling: [conversation] Current message (1000000 tokens) exceeds budget (500000 tokens)",
-            "API error (status 400 Bad Request): invalid-argument: Failed to start sampling: [conversation] Current message (1000000 tokens) exceeds budget (500000 tokens)",
-            "compact failed: API error (status 400 Bad Request): invalid-argument: Failed to start sampling: [conversation] Current message (1000000 tokens) exceeds budget (500000 tokens)",
-            "Current message (600000) exceeds budget (500000)",
-        ] {
-            assert!(is_context_length_error(msg), "should match: {msg}");
-        }
-        for msg in [
-            "rate limited",
-            "internal server error",
-            "connection reset",
-            "Attached file content (300000 tokens) causes message to exceed budget",
-            "compact index estimate 2.0 GB exceeds budget 1.0 GB",
-        ] {
-            assert!(!is_context_length_error(msg), "should not match: {msg}");
-        }
-        // The method delegates for the Api/StreamError variants.
+    fn tpm_429_with_retry_after_escapes_the_size_text_veto() {
+        let tpm =
+            |retry_after_secs: Option<u64>, error_code: Option<ApiErrorCode>| SamplingError::Api {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "Request too large for model: Limit 30000, Requested 50000 \
+                          tokens per min"
+                    .into(),
+                model_metadata: None,
+                retry_after_secs,
+                should_retry: None,
+                error_code,
+            };
+        let backs_off = tpm(Some(7), None);
+        assert!(!backs_off.is_context_length_error());
+        assert!(!backs_off.is_retry_vetoed());
+        let no_retry_after = tpm(None, None);
+        assert!(no_retry_after.is_context_length_error());
+        assert!(no_retry_after.is_retry_vetoed());
+        let coded = tpm(Some(7), Some(ApiErrorCode::parse("request_too_large")));
+        assert!(coded.is_context_length_error());
+        assert!(coded.is_retry_vetoed());
+    }
+
+    #[test]
+    fn context_length_error_method_delegates_to_shared_detector() {
         let api = SamplingError::Api {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "none: The prompt is too long for this model's context window.".into(),
@@ -942,6 +1042,81 @@ mod tests {
             .is_context_length_error()
         );
         assert!(!SamplingError::auth_unknown("nope").is_context_length_error());
+    }
+
+    #[test]
+    fn size_overflow_error_codes_parse_structurally() {
+        for code in [
+            "413",
+            "payload_too_large",
+            "exceed_context_size_error",
+            "request_too_large",
+            "context_length_exceeded",
+        ] {
+            assert!(is_size_overflow_error_code(code), "should match: {code}");
+            let parsed = ApiErrorCode::parse(code);
+            assert!(parsed.is_size_overflow(), "should be overflow: {code}");
+            assert_eq!(parsed.as_str(), code);
+        }
+        for code in ["400", "429", "invalid_request_error", "overloaded_error"] {
+            assert!(
+                !is_size_overflow_error_code(code),
+                "should not match: {code}"
+            );
+            assert!(!ApiErrorCode::parse(code).is_size_overflow());
+        }
+        for code in ["413", "payload_too_large", "request_too_large"] {
+            assert!(is_byte_size_overflow_error_code(code), "byte-size: {code}");
+            assert!(ApiErrorCode::parse(code).is_byte_size_overflow());
+        }
+        for code in ["exceed_context_size_error", "context_length_exceeded"] {
+            assert!(
+                !is_byte_size_overflow_error_code(code),
+                "token slug must not be byte-size: {code}"
+            );
+            assert!(!ApiErrorCode::parse(code).is_byte_size_overflow());
+        }
+    }
+
+    #[test]
+    fn flat_envelope_size_slug_survives_semantic_code_filter() {
+        assert_eq!(
+            parse_error_code(
+                br#"{"code":"payload_too_large","error":"Chat history exceeds the limit"}"#
+            ),
+            Some(ApiErrorCode::ContextOverflow("payload_too_large".into())),
+        );
+        assert_eq!(
+            parse_error_code(br#"{"code":"invalid-argument","error":"boom"}"#),
+            None,
+        );
+    }
+
+    #[test]
+    fn structured_size_code_with_opaque_message_is_context_length_error() {
+        let stream = SamplingError::StreamError {
+            error_type: "BAD_REQUEST".into(),
+            message: "request rejected".into(),
+            code: Some(ApiErrorCode::parse("request_too_large")),
+        };
+        assert!(stream.is_context_length_error());
+
+        let api = SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "request rejected".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: Some(ApiErrorCode::parse("413")),
+        };
+        assert!(api.is_context_length_error());
+
+        let opaque = SamplingError::StreamError {
+            error_type: "server_error".into(),
+            message: "internal error".into(),
+            code: Some(ApiErrorCode::parse("overloaded_error")),
+        };
+        assert!(!opaque.is_context_length_error());
     }
 
     #[test]
@@ -1470,5 +1645,51 @@ mod tests {
                 "origin-TLS {code} must not be retried"
             );
         }
+    }
+
+    #[test]
+    fn context_length_error_matches_backend_variants() {
+        for msg in [
+            "This model's maximum prompt length is 256000 but the request contains 1500000",
+            "The prompt is too long for this model's context window.",
+            "none: The prompt is too long for this model's context window.",
+            "This model's maximum context length is 200000 tokens",
+            "invalid_request_error: prompt is too long: 300000 tokens > 200000 maximum",
+            "error type: context_length_exceeded",
+            "Failed to start sampling: [conversation] Current message (1000000 tokens) exceeds budget (500000 tokens)",
+            "API error (status 400 Bad Request): invalid-argument: Failed to start sampling: [conversation] Current message (1000000 tokens) exceeds budget (500000 tokens)",
+            "compact failed: API error (status 400 Bad Request): invalid-argument: Failed to start sampling: [conversation] Current message (1000000 tokens) exceeds budget (500000 tokens)",
+            "Current message (600000) exceeds budget (500000)",
+        ] {
+            assert!(is_context_length_error(msg), "should match: {msg}");
+        }
+        for msg in [
+            "rate limited",
+            "internal server error",
+            "connection reset",
+            "Attached file content (300000 tokens) causes message to exceed budget",
+            "compact index estimate 2.0 GB exceeds budget 1.0 GB",
+        ] {
+            assert!(!is_context_length_error(msg), "should not match: {msg}");
+        }
+        // The method delegates for the Api/StreamError variants.
+        let api = SamplingError::Api {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "none: The prompt is too long for this model's context window.".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(api.is_context_length_error());
+        assert!(
+            SamplingError::StreamError {
+                error_type: "overloaded_error".into(),
+                message: "prompt is too long".into(),
+                code: None,
+            }
+            .is_context_length_error()
+        );
+        assert!(!SamplingError::auth_unknown("nope").is_context_length_error());
     }
 }

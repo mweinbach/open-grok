@@ -481,7 +481,7 @@ fn compute_normalized_blocking(
             });
         }
     };
-    if buf.len() >= original_bytes {
+    if !exceeded_dimensions && buf.len() >= original_bytes {
         return Ok(NormalizedEntry::Unchanged {
             bytes: Bytes::from(raw_bytes),
             mime: Cow::Borrowed(orig_mime),
@@ -611,6 +611,34 @@ mod tests {
                 assert!(area <= MAX_ENCODE_PIXELS, "area {area} over v9 budget");
             }
             other => panic!("expected Compressed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dimension_limit_wins_when_png_reencoding_increases_bytes() {
+        let mut original = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(3000, 2000)
+            .write_to(&mut original, image::ImageFormat::WebP)
+            .unwrap();
+        let content = ImageContent::new(
+            base64::engine::general_purpose::STANDARD.encode(original.into_inner()),
+            "image/webp",
+        );
+        let cache = fresh_cache();
+        match normalize_one_in(content, 1, false, &cache).await {
+            Outcome::Compressed { info, .. } => {
+                assert!(info.exceeded_dimensions);
+                assert!(info.compressed_bytes >= info.original_bytes);
+                assert!(info.compressed_width <= MAX_ENCODE_SIDE_PX);
+                assert!(info.compressed_height <= MAX_ENCODE_SIDE_PX);
+                assert!(
+                    u64::from(info.compressed_width) * u64::from(info.compressed_height)
+                        <= MAX_ENCODE_PIXELS
+                );
+            }
+            other => {
+                panic!("oversized dimensions must never fall back to original bytes: {other:?}")
+            }
         }
     }
     /// A flat 1700x1700 attachment is under the 2000px side clamp but its

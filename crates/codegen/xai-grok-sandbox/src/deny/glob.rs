@@ -503,7 +503,7 @@ pub(crate) fn expand_deny_globs(
                              across their roots (stopped in {} at {}; gitignored and \
                              hidden files are included in the scan). Use narrower globs \
                              with a literal prefix, or deny exact paths; see the sandbox \
-                             guide (~/.grok/docs/user-guide/18-sandbox.md)",
+                             guide (~/.opengrok/docs/user-guide/18-sandbox.md)",
                             caps.entries,
                             root.display(),
                             entry.path().display(),
@@ -857,7 +857,7 @@ mod tests {
             let _workspace_guard = TmpTree(workspace.clone());
             std::fs::create_dir_all(workspace.join("sub/dir")).unwrap();
             std::fs::write(workspace.join("sub/dir/key.pem"), "x").unwrap();
-            std::fs::write(workspace.join(".env"), "x").unwrap(); // hidden + usually gitignored
+            std::fs::write(workspace.join(".env"), "x").unwrap(); // hidden and usually gitignored
             std::fs::write(workspace.join("readable.txt"), "x").unwrap();
             let globs = vec!["**/*.pem".to_string(), "**/.env".to_string()];
             let expanded =

@@ -50,7 +50,7 @@ async fn minimal_slash_switches_from_fullscreen() {
     inject_keys_paced(&mut harness, b"/minimal");
     harness
         .wait_for_text(
-            "Reopen this session in minimal (scrollback-native) mode",
+            "Switch this session to minimal (scrollback-native) mode",
             Duration::from_secs(5),
         )
         .expect("slash dropdown offers /minimal");
@@ -79,17 +79,13 @@ async fn minimal_slash_switches_from_fullscreen() {
             )
         });
 
-    // Main-screen clear on relaunch: "Reopening session…" was printed just
-    // before exec and must not remain above the resumed UI (the clear wipes
-    // residual main-buffer detritus so the welcome card sits at the top).
-    let screen = harness.screen_contents();
+    harness
+        .wait_for_full_text("Switched to minimal mode", Duration::from_secs(15))
+        .expect("switch marker committed to scrollback");
     assert!(
-        !screen.contains("Reopening session"),
-        "main screen should be cleared on /minimal relaunch; leftover reopen text:\n{screen}"
-    );
-    assert!(
-        screen.contains("Grok Build") || harness.full_text().contains("Grok Build"),
-        "welcome card should re-anchor at top after /minimal relaunch\nscreen:\n{screen}"
+        !harness.full_text().contains("Reopening session"),
+        "in-process /minimal must not re-exec; full text:\n{}",
+        harness.full_text()
     );
 
     assert!(

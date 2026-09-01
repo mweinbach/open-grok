@@ -1,5 +1,381 @@
 use super::*;
 
+fn supervisor_auth_fixture(mode: &str, issuer: Option<&str>) -> GrokAuth {
+    serde_json::from_value(serde_json::json!({
+        "key": "supervisor-fixture-token",
+        "auth_mode": mode,
+        "create_time": "2026-01-01T00:00:00Z",
+        "user_id": "supervisor-fixture-user",
+        "oidc_issuer": issuer,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn supervisor_admits_deployment_key_without_managed_mcp_auth() {
+    let api_key = supervisor_auth_fixture("api_key", None);
+    let session = supervisor_auth_fixture("oidc", Some(crate::auth::XAI_OAUTH2_ISSUER));
+    let foreign_session = supervisor_auth_fixture("oidc", Some("https://identity.example.test"));
+
+    assert!(should_start_refresh_supervisor(true, true, None));
+    assert!(should_start_refresh_supervisor(true, true, Some(&api_key)));
+    assert!(!should_start_refresh_supervisor(true, false, None));
+    assert!(!should_start_refresh_supervisor(
+        true,
+        false,
+        Some(&api_key)
+    ));
+    assert!(!should_start_refresh_supervisor(
+        true,
+        false,
+        Some(&foreign_session)
+    ));
+    assert!(should_start_refresh_supervisor(true, false, Some(&session)));
+
+    for auth in [None, Some(&api_key), Some(&session), Some(&foreign_session)] {
+        assert!(!should_start_refresh_supervisor(false, true, auth));
+        assert!(!should_start_refresh_supervisor(false, false, auth));
+    }
+}
+
+fn supervisor_model_fixture(
+    provider: xai_grok_sampling_types::ModelProvider,
+) -> crate::agent::config::Config {
+    let mut config = crate::agent::config::Config::default();
+    config.default_model_override = Some("managed-refresh-model".into());
+    config.endpoints.models_base_url = None;
+    config.endpoints.models_list_url = None;
+    config.config_models.insert(
+        "managed-refresh-model".into(),
+        crate::agent::config::ConfigModelOverride {
+            model: Some("same-routing-slug".into()),
+            provider: Some(provider),
+            base_url: Some("https://api.x.ai/v1".into()),
+            api_backend: Some(xai_grok_sampling_types::ApiBackend::Responses),
+            ..Default::default()
+        },
+    );
+    config
+}
+
+#[test]
+#[serial_test::serial]
+fn supervisor_deployment_key_never_overrides_provider_metadata() {
+    use xai_grok_sampling_types::ModelProvider;
+    let auth = supervisor_auth_fixture("oidc", Some(crate::auth::XAI_OAUTH2_ISSUER));
+    for provider in [
+        ModelProvider::Codex,
+        ModelProvider::Kimi,
+        ModelProvider::Fireworks,
+        ModelProvider::DeepSeek,
+        ModelProvider::Custom,
+    ] {
+        let config = supervisor_model_fixture(provider);
+        assert!(!should_start_refresh_supervisor(
+            crate::agent::models::startup_prefetch::uses_xai_session(&config),
+            true,
+            Some(&auth),
+        ));
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn supervisor_deployment_key_never_overrides_explicit_model_credentials() {
+    use crate::agent::config::EnvKeys;
+    use xai_grok_sampling_types::ModelProvider;
+    let auth = supervisor_auth_fixture("oidc", Some(crate::auth::XAI_OAUTH2_ISSUER));
+    for (api_key, env_key) in [
+        (Some("explicit-model-fixture-key".into()), None),
+        (
+            None,
+            Some(EnvKeys::single("UNSET_MANAGED_REFRESH_FIXTURE_KEY")),
+        ),
+    ] {
+        let mut config = supervisor_model_fixture(ModelProvider::Xai);
+        let model = config
+            .config_models
+            .get_mut("managed-refresh-model")
+            .unwrap();
+        model.api_key = api_key;
+        model.env_key = env_key;
+        assert!(!should_start_refresh_supervisor(
+            crate::agent::models::startup_prefetch::uses_xai_session(&config),
+            true,
+            Some(&auth),
+        ));
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn supervisor_deployment_key_never_overrides_custom_endpoint_or_unknown_model() {
+    use xai_grok_sampling_types::ModelProvider;
+    let mut config = supervisor_model_fixture(ModelProvider::Xai);
+    config.endpoints.models_base_url = Some("https://models.example.test".into());
+    assert!(!should_start_refresh_supervisor(
+        crate::agent::models::startup_prefetch::uses_xai_session(&config),
+        true,
+        None,
+    ));
+    config.endpoints.models_base_url = None;
+    config.default_model_override = Some("unknown-managed-refresh-model".into());
+    assert!(!should_start_refresh_supervisor(
+        crate::agent::models::startup_prefetch::uses_xai_session(&config),
+        true,
+        None,
+    ));
+}
+
+#[test]
+#[serial_test::serial]
+fn supervisor_deployment_key_admission_respects_ambient_api_keys() {
+    use xai_grok_test_support::EnvGuard;
+    let _current_key = EnvGuard::unset("XAI_API_KEY");
+    let _legacy_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let config = supervisor_model_fixture(xai_grok_sampling_types::ModelProvider::Xai);
+    let auth = supervisor_auth_fixture("oidc", Some(crate::auth::XAI_OAUTH2_ISSUER));
+    assert!(should_start_refresh_supervisor(
+        crate::agent::models::startup_prefetch::uses_xai_session(&config),
+        true,
+        None,
+    ));
+    for variable in ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"] {
+        let _ambient_key = EnvGuard::set(variable, "ambient-supervisor-fixture-key");
+        assert!(!should_start_refresh_supervisor(
+            crate::agent::models::startup_prefetch::uses_xai_session(&config),
+            true,
+            Some(&auth),
+        ));
+    }
+}
+
+#[test]
+fn gate_lock_refuses_busy_and_unavailable_without_reading_policy() {
+    let home = tempfile::tempdir().unwrap();
+    let held = try_lock_managed_config(home.path()).unwrap();
+    assert_eq!(
+        store::with_gate_lock(home.path(), std::time::Duration::ZERO, |_| -> () {
+            panic!("a contended lock must not read a policy snapshot")
+        }),
+        Err::<(), _>(ManagedPolicyRefusal::Busy)
+    );
+    drop(held);
+    assert_eq!(
+        store::with_gate_lock(home.path(), std::time::Duration::ZERO, |_| 42),
+        Ok(42)
+    );
+    let missing_home = home.path().join("missing");
+    assert_eq!(
+        store::with_gate_lock(&missing_home, std::time::Duration::ZERO, |_| ()),
+        Err(ManagedPolicyRefusal::LockUnavailable { home: missing_home })
+    );
+}
+
+#[test]
+fn gate_lock_wait_absorbs_transient_writer() {
+    let home = tempfile::tempdir().unwrap();
+    let held = try_lock_managed_config(home.path()).unwrap();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(held);
+    });
+    assert!(store::with_gate_lock(home.path(), std::time::Duration::from_secs(2), |_| ()).is_ok());
+    writer.join().unwrap();
+}
+
+#[tokio::test]
+async fn refresher_drop_and_precancel_stop_work_without_cancelling_parent() {
+    let parent = tokio_util::sync::CancellationToken::new();
+    let (sent, received) = tokio::sync::oneshot::channel::<()>();
+    drop(supervisor::ManagedConfigRefresher::spawn(
+        &parent,
+        async move {
+            let _ = sent.send(());
+        },
+    ));
+    assert!(received.await.is_err());
+    assert!(!parent.is_cancelled());
+
+    parent.cancel();
+    let (sent, received) = tokio::sync::oneshot::channel::<()>();
+    let refresher = supervisor::ManagedConfigRefresher::spawn(&parent, async move {
+        let _ = sent.send(());
+    });
+    assert!(received.await.is_err());
+    drop(refresher);
+}
+
+#[tokio::test]
+async fn supervisor_replaces_dead_tasks_and_keeps_live_owner() {
+    let parent = tokio_util::sync::CancellationToken::new();
+    let dead = supervisor::ManagedConfigRefresher::spawn(&parent, async {});
+    while !dead.handle.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let dead_cancel = dead.cancel.clone();
+    let mut slot = Some(dead);
+    supervisor::ensure_supervisor(&mut slot, || {
+        supervisor::ManagedConfigRefresher::spawn(&parent, std::future::pending())
+    });
+    assert!(dead_cancel.is_cancelled());
+    assert!(!slot.as_ref().unwrap().handle.is_finished());
+    supervisor::ensure_supervisor(&mut slot, || panic!("must preserve the live owner"));
+    assert!(!parent.is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounded_auth_wait_does_not_cancel_rotated_token_persistence() {
+    let (persisted, received) = tokio::sync::oneshot::channel();
+    let result = supervisor::refresh_with_deadline(std::time::Duration::from_secs(8), async move {
+        tokio::time::sleep(std::time::Duration::from_secs(9)).await;
+        persisted.send(()).unwrap();
+        42
+    })
+    .await;
+    assert!(result.is_none());
+    assert!(received.await.is_ok());
+}
+
+#[test]
+fn sync_budgets_bound_interactive_and_background_revalidation() {
+    assert_eq!(SyncBudget::Standard.max_attempts(), 5);
+    assert_eq!(SyncBudget::Revalidate.max_attempts(), 5);
+    assert_eq!(SyncBudget::Login.max_attempts(), 2);
+    assert_eq!(SyncBudget::SessionStart.max_attempts(), 2);
+    assert_eq!(
+        SyncBudget::Revalidate.deadline(),
+        Some(std::time::Duration::from_secs(120))
+    );
+    assert_eq!(
+        SyncBudget::Login.deadline(),
+        Some(std::time::Duration::from_secs(15))
+    );
+    assert_eq!(
+        SyncBudget::SessionStart.deadline(),
+        Some(std::time::Duration::from_secs(8))
+    );
+}
+
+#[test]
+fn managed_fetch_gate_ignores_overlay_but_obeys_requirements() {
+    let features =
+        |enabled| toml::from_str(&format!("[features]\nmanaged_config = {enabled}\n")).unwrap();
+    let mut layers = crate::config::ConfigLayers {
+        user: features(true),
+        env_overlay: Some(features(false)),
+        ..Default::default()
+    };
+    assert_eq!(
+        store::managed_config_enabled_from_layers(&layers),
+        Some(true)
+    );
+    layers.user = features(false);
+    layers.env_overlay = Some(features(true));
+    assert_eq!(
+        store::managed_config_enabled_from_layers(&layers),
+        Some(false)
+    );
+    layers.user_requirements = Some(features(true));
+    assert_eq!(
+        store::managed_config_enabled_from_layers(&layers),
+        Some(true)
+    );
+    layers.system_requirements = Some(features(false));
+    assert_eq!(
+        store::managed_config_enabled_from_layers(&layers),
+        Some(false)
+    );
+}
+
+#[test]
+fn staging_accepts_only_write_denials_and_current_timestamps() {
+    use std::io::{Error, ErrorKind};
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::ReadOnlyFilesystem,
+        ErrorKind::ResourceBusy,
+    ] {
+        assert!(store::write_failure_is_deny(&Error::from(kind)));
+    }
+    for kind in [
+        ErrorKind::StorageFull,
+        ErrorKind::NotFound,
+        ErrorKind::IsADirectory,
+        ErrorKind::Other,
+    ] {
+        assert!(!store::write_failure_is_deny(&Error::from(kind)));
+    }
+    assert!(!store::stage_is_current(0, None));
+    assert!(!store::stage_is_current(10, Some(11)));
+    assert!(store::stage_is_current(11, Some(11)));
+    assert!(store::stage_is_current(12, Some(11)));
+}
+
+#[test]
+fn staged_refresh_roundtrips_with_private_permissions_and_eviction() {
+    let home = tempfile::tempdir().unwrap();
+    let body = ManagedConfigResponse {
+        team_id: Some("team-staged".into()),
+        managed_config: Some("[features]\nmanaged_config = true\n".into()),
+        ..Default::default()
+    };
+    store::stage_refresh(
+        home.path(),
+        &body,
+        ManagedConfigSource::TeamOauth,
+        Some("team-staged"),
+        None,
+    )
+    .unwrap();
+    let path = store::staged_refresh_path(home.path());
+    let staged = store::read_staged_refresh(&path).unwrap();
+    assert_eq!(staged.principal.as_deref(), Some("team-staged"));
+    assert!(staged.key_fingerprint.is_none());
+    assert_eq!(staged.response.managed_config, body.managed_config);
+    assert!(staged.parked_at > 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    remove_managed_config_files(home.path());
+    assert!(!path.exists());
+}
+
+#[test]
+fn staged_refresh_rejects_oversized_or_invalid_input_without_echoing_content() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("stage.json");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(8 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(store::read_staged_refresh(&path).is_err());
+    std::fs::write(&path, "sensitive-input-sentinel").unwrap();
+    let error = store::read_staged_refresh(&path).err().unwrap();
+    assert!(!error.to_string().contains("sensitive-input-sentinel"));
+    let error = decode_managed_config(br#"{"signatures":"sensitive-input-sentinel"}"#)
+        .err()
+        .unwrap();
+    assert!(matches!(error, ManagedConfigError::InvalidResponse(_)));
+    assert!(!error.to_string().contains("sensitive-input-sentinel"));
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_refresh_never_follows_symlinks() {
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join("target.json");
+    let path = home.path().join("stage.json");
+    std::fs::write(&target, "{}").unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(store::read_staged_refresh(&path).is_err());
+}
+
 /// Fail closed only for a managed principal AND compromised policy; every other combination proceeds.
 #[test]
 fn gate_blocks_only_managed_principal_with_compromised_policy() {
@@ -235,6 +611,44 @@ fn transport_failure_maps_to_managed_config_error() {
         "a client-side defect is terminal and must not be retried"
     );
     assert!(!permanent.is_auth_rejection());
+
+    for kind in [
+        TransportFailureKind::CertificateUntrusted,
+        TransportFailureKind::CertificateInvalid,
+    ] {
+        let certificate = map_transport_failure(TransportFailure {
+            kind,
+            detail: "certificate verification failed".into(),
+        });
+        assert!(matches!(
+            certificate,
+            ManagedConfigError::CertificateUntrusted(_) | ManagedConfigError::CertificateInvalid(_)
+        ));
+        assert!(!certificate.is_retryable());
+        assert!(!certificate.is_auth_rejection());
+    }
+}
+
+#[test]
+fn certificate_diagnostics_distinguish_missing_roots_from_invalid_certificates() {
+    let missing_roots = certificate_detail("UnknownIssuer".into(), Some("GROK_EXTRA_CA_BUNDLE"), 0);
+    assert!(missing_roots.contains("no usable roots"));
+    let loaded_roots = certificate_detail("UnknownIssuer".into(), Some("GROK_EXTRA_CA_BUNDLE"), 2);
+    assert!(loaded_roots.contains("issuing root CA"));
+    assert_eq!(
+        certificate_detail("UnknownIssuer".into(), None, 0),
+        "UnknownIssuer"
+    );
+    let invalid = map_transport_failure(crate::http::TransportFailure {
+        kind: crate::http::TransportFailureKind::CertificateInvalid,
+        detail: "certificate expired".into(),
+    });
+    assert!(
+        invalid
+            .to_string()
+            .contains("Installing a root certificate won't fix this")
+    );
+    assert!(!invalid.is_retryable());
 }
 
 /// `send_with_retry_escaping_pool` combinator behavior with a counting op (no network):

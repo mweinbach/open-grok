@@ -692,6 +692,8 @@ impl ToolNameMapping {
 /// message that left the model stuck.
 #[derive(Debug, Clone, Default)]
 pub struct EnabledNativeToolNames(pub std::collections::HashSet<String>);
+#[derive(Debug, Clone, Default)]
+pub struct NativeToolClientNames(pub std::collections::HashMap<String, String>);
 impl EnabledNativeToolNames {
     /// Whether `name` is an enabled native (non-MCP) tool.
     pub fn contains(&self, name: &str) -> bool {

@@ -14,7 +14,7 @@ macro_rules! hook_events {
         $(#[$vmeta:meta])*
         $variant:ident {
             display: $display:literal,
-            aliases: [$($alias:literal),* $(,)?],
+            aliases: [$first_alias:literal $(, $alias:literal)* $(,)?],
             traits: ($gate:ident, $matcher:ident, $hub:literal $(,)?),
         }
     ),* $(,)?) => {
@@ -33,12 +33,15 @@ macro_rules! hook_events {
             /// Source of truth for known spellings, behind `Deserialize` and `parse_key`.
             fn from_key_str(s: &str) -> Option<Self> {
                 match s {
-                    $($($alias)|* => Some(Self::$variant),)*
+                    $($first_alias $(| $alias)* => Some(Self::$variant),)*
                     _ => None,
                 }
             }
 
-            /// The event's dispatch traits, generated exhaustively from the table.
+            pub fn pascal_case(self) -> &'static str {
+                match self { $(Self::$variant => $first_alias,)* }
+            }
+
             pub fn traits(self) -> EventTraits {
                 use GateKind::*;
                 use MatcherPolicy::*;
@@ -95,7 +98,7 @@ hook_events! {
     UserPromptSubmit {
         display: "user_prompt_submit",
         aliases: ["UserPromptSubmit", "user_prompt_submit", "beforeSubmitPrompt"],
-        traits: (Observe, Ignored, true),
+        traits: (Prompt, Ignored, true),
     },
     PreToolUse {
         display: "pre_tool_use",
@@ -121,7 +124,7 @@ hook_events! {
             "afterAgentResponse",
             "afterAgentThought",
         ],
-        traits: (Observe, Tested, true),
+        traits: (PostTool, Tested, true),
     },
     PostToolUseFailure {
         display: "post_tool_use_failure",
@@ -203,6 +206,8 @@ pub enum GateKind {
     Tool,
     /// Stop decision control (`block`, `continue: false`, `additionalContext`).
     Stop,
+    PostTool,
+    Prompt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +271,16 @@ pub fn clip_stop_entry_text(text: &str) -> String {
     clip_text(text, MAX_STOP_ENTRY_TEXT_CHARS)
 }
 
-/// `SubagentStop` fire phase: always `Gate` today, `Observe` reserved and not emitted.
+pub const MAX_REASON_CHARS: usize = 256;
+
+pub const MAX_HOOK_FEEDBACK_CHARS: usize = 10_000;
+
+pub const MAX_HOOK_OUTPUT_REPLACEMENT_CHARS: usize = 64 * 1024;
+
+pub fn clip_reason(reason: &str) -> String {
+    clip_text(reason, MAX_REASON_CHARS)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubagentStopPhase {
@@ -392,7 +406,37 @@ pub struct HookEventEnvelope {
     pub payload: HookPayload,
 }
 
-/// Event-specific payload, flattened into the envelope JSON.
+const SNAKE_CASE_ALIASES: &[(&str, &str)] = &[
+    ("hookEventName", "hook_event_name"),
+    ("sessionId", "session_id"),
+    ("transcriptPath", "transcript_path"),
+    ("permissionMode", "permission_mode"),
+    ("toolName", "tool_name"),
+    ("toolInput", "tool_input"),
+    ("toolResult", "tool_response"),
+    ("toolUseId", "tool_use_id"),
+    ("durationMs", "duration_ms"),
+    ("isInterrupt", "is_interrupt"),
+];
+
+impl HookEventEnvelope {
+    pub fn to_hook_json(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(map) = &mut value {
+            for (camel, snake) in SNAKE_CASE_ALIASES {
+                if let Some(aliased) = map.get(*camel).cloned() {
+                    map.entry(*snake).or_insert(aliased);
+                }
+            }
+            map.insert(
+                "hook_event_name".to_string(),
+                self.hook_event_name.pascal_case().into(),
+            );
+        }
+        value
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum HookPayload {
@@ -512,6 +556,10 @@ pub enum HookPayload {
         #[serde(rename = "toolInputTruncated")]
         tool_input_truncated: bool,
         error: String,
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(rename = "isInterrupt")]
+        is_interrupt: bool,
         #[serde(rename = "subagentType", skip_serializing_if = "Option::is_none")]
         subagent_type: Option<String>,
     },
@@ -688,31 +736,6 @@ mod tests {
     }
 
     #[test]
-    fn event_name_display_all_variants() {
-        let cases: &[(HookEventName, &str)] = &[
-            (HookEventName::SessionStart, "session_start"),
-            (HookEventName::PreToolUse, "pre_tool_use"),
-            (HookEventName::PostToolUse, "post_tool_use"),
-            (HookEventName::PostToolUseFailure, "post_tool_use_failure"),
-            (HookEventName::SessionEnd, "session_end"),
-            (HookEventName::Stop, "stop"),
-            (HookEventName::StopFailure, "stop_failure"),
-            (HookEventName::StopCancelled, "stop_cancelled"),
-            (HookEventName::Notification, "notification"),
-            (HookEventName::UserPromptSubmit, "user_prompt_submit"),
-            (HookEventName::PermissionDenied, "permission_denied"),
-            (HookEventName::SubagentStart, "subagent_start"),
-            (HookEventName::SubagentStop, "subagent_stop"),
-            (HookEventName::SubagentEnd, "subagent_stop"), // alias collapses
-            (HookEventName::PreCompact, "pre_compact"),
-            (HookEventName::PostCompact, "post_compact"),
-        ];
-        for (event, expected) in cases {
-            assert_eq!(&event.to_string(), expected, "Display wrong for {event:?}");
-        }
-    }
-
-    #[test]
     fn event_name_deser_camel_and_operation_aliases() {
         let cases: &[(&str, HookEventName)] = &[
             ("sessionStart", HookEventName::SessionStart),
@@ -746,18 +769,34 @@ mod tests {
     }
 
     #[test]
+    fn pascal_case_is_the_pascal_alias() {
+        for event in HookEventName::ALL {
+            let pascal = event.pascal_case();
+            let first = pascal.chars().next().expect("alias is non-empty");
+            assert!(
+                first.is_ascii_uppercase() && !pascal.contains('_'),
+                "{event}: pascal_case() must be the PascalCase alias, got {pascal:?}"
+            );
+        }
+    }
+
+    #[test]
     fn event_traits_report_gate_matcher_and_hub_forward() {
         use super::{GateKind, MatcherPolicy};
 
         assert_eq!(HookEventName::PreToolUse.traits().gate, GateKind::Tool);
         assert_eq!(HookEventName::Stop.traits().gate, GateKind::Stop);
+        assert_eq!(
+            HookEventName::UserPromptSubmit.traits().gate,
+            GateKind::Prompt
+        );
         assert_eq!(HookEventName::SubagentStop.traits().gate, GateKind::Stop);
         assert_eq!(
             HookEventName::SubagentEnd.traits().gate,
             GateKind::Stop,
             "alias resolves through canonical()"
         );
-        assert_eq!(HookEventName::PostToolUse.traits().gate, GateKind::Observe);
+        assert_eq!(HookEventName::PostToolUse.traits().gate, GateKind::PostTool);
 
         assert_eq!(HookEventName::Stop.traits().matcher, MatcherPolicy::Ignored);
         assert_eq!(
@@ -786,6 +825,207 @@ mod tests {
         let unicode = "€".repeat(MAX_STOP_ENTRY_TEXT_CHARS + 7);
         let clipped = clip_stop_entry_text(&unicode);
         assert!(clipped.ends_with("… [+7 chars]"));
+    }
+
+    #[test]
+    fn truncate_payload_respects_limit() {
+        let small = serde_json::json!({"key": "small"});
+        let (result, truncated) = truncate_payload(small.clone());
+        assert!(!truncated);
+        assert_eq!(result, small);
+
+        let (result, truncated) = truncate_payload(serde_json::Value::String(
+            "x".repeat(MAX_PAYLOAD_SIZE + 1000),
+        ));
+        assert!(truncated);
+        let s = result.as_str().unwrap();
+        assert!(s.ends_with("[truncated]"));
+        assert!(s.len() < MAX_PAYLOAD_SIZE + 100);
+
+        // '€' is 3 bytes, so the cut lands mid-codepoint and must fall back to a char boundary.
+        let (unicode, truncated) =
+            truncate_payload(serde_json::Value::String("€".repeat(MAX_PAYLOAD_SIZE)));
+        assert!(truncated);
+        assert!(unicode.as_str().unwrap().ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn to_hook_json_emits_camel_and_snake_tool_aliases() {
+        let base = |payload| HookEventEnvelope {
+            hook_event_name: HookEventName::PreToolUse,
+            session_id: "sess-1".into(),
+            cwd: "/repo".into(),
+            workspace_root: "/repo".into(),
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            transcript_path: Some("/tmp/transcript.jsonl".into()),
+            client_identifier: None,
+            prompt_id: None,
+            permission_mode: Some("default".into()),
+            payload,
+        };
+
+        let assert_base_aliases = |v: &serde_json::Value| {
+            for (camel, snake) in [
+                ("sessionId", "session_id"),
+                ("transcriptPath", "transcript_path"),
+                ("permissionMode", "permission_mode"),
+            ] {
+                assert_eq!(v[camel], v[snake], "{camel} != {snake}");
+                assert!(!v[camel].is_null(), "missing base key pair for {camel}");
+            }
+            assert_eq!(v["cwd"], "/repo");
+        };
+
+        let pre = base(HookPayload::PreToolUse {
+            tool_name: "run_terminal_command".into(),
+            tool_use_id: "tu-1".into(),
+            tool_input: serde_json::json!({ "command": "ls" }),
+            tool_input_truncated: false,
+            subagent_type: None,
+        })
+        .to_hook_json();
+        assert_base_aliases(&pre);
+        for (camel, snake) in [
+            ("toolName", "tool_name"),
+            ("toolInput", "tool_input"),
+            ("toolUseId", "tool_use_id"),
+        ] {
+            assert_eq!(pre[camel], pre[snake], "{camel} != {snake}");
+            assert!(!pre[camel].is_null(), "missing tool key pair for {camel}");
+        }
+        assert_eq!(pre["hookEventName"], "pre_tool_use");
+        assert_eq!(pre["hook_event_name"], "PreToolUse");
+        assert_eq!(pre["tool_name"], "run_terminal_command");
+
+        let post = HookEventEnvelope {
+            hook_event_name: HookEventName::PostToolUse,
+            payload: HookPayload::PostToolUse {
+                tool_name: "run_terminal_command".into(),
+                tool_use_id: "tu-1".into(),
+                tool_input: serde_json::json!({ "command": "ls" }),
+                tool_result: serde_json::json!({ "stdout": "a\nb\n" }),
+                tool_input_truncated: false,
+                tool_result_truncated: false,
+                duration_ms: Some(12),
+                is_backgrounded: false,
+                subagent_type: None,
+            },
+            ..base(HookPayload::PreToolUse {
+                tool_name: String::new(),
+                tool_use_id: String::new(),
+                tool_input: serde_json::Value::Null,
+                tool_input_truncated: false,
+                subagent_type: None,
+            })
+        }
+        .to_hook_json();
+        assert_base_aliases(&post);
+        for (camel, snake) in [
+            ("toolName", "tool_name"),
+            ("toolInput", "tool_input"),
+            ("toolUseId", "tool_use_id"),
+            ("toolResult", "tool_response"),
+        ] {
+            assert_eq!(post[camel], post[snake], "{camel} != {snake}");
+            assert!(!post[camel].is_null(), "missing tool key pair for {camel}");
+        }
+        assert_eq!(post["toolResult"], post["tool_response"]);
+        assert_eq!(
+            post["tool_response"],
+            serde_json::json!({ "stdout": "a\nb\n" })
+        );
+        assert_eq!(post["hookEventName"], "post_tool_use");
+        assert_eq!(post["hook_event_name"], "PostToolUse");
+        assert!(post.get("durationMs").is_some());
+    }
+
+    /// Additive: omitted in the main session, so those payloads stay byte-identical, and present
+    /// in a child so a host can filter one out of the busy half of a busy/idle signal.
+    #[test]
+    fn post_tool_use_failure_carries_duration_and_interrupt() {
+        let value = HookEventEnvelope {
+            hook_event_name: HookEventName::PostToolUseFailure,
+            session_id: "sess-1".into(),
+            cwd: "/repo".into(),
+            workspace_root: "/repo".into(),
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            transcript_path: None,
+            client_identifier: None,
+            prompt_id: None,
+            permission_mode: None,
+            payload: HookPayload::PostToolUseFailure {
+                tool_name: "run_terminal_command".into(),
+                tool_use_id: "tu-1".into(),
+                tool_input: serde_json::json!({ "command": "ls" }),
+                tool_input_truncated: false,
+                error: "boom".into(),
+                duration_ms: Some(42),
+                is_interrupt: true,
+                subagent_type: None,
+            },
+        }
+        .to_hook_json();
+        assert_eq!(value["hookEventName"], "post_tool_use_failure");
+        assert_eq!(value["hook_event_name"], "PostToolUseFailure");
+        assert_eq!(value["error"], "boom");
+        assert_eq!(value["durationMs"], 42);
+        assert_eq!(value["duration_ms"], 42);
+        assert_eq!(value["isInterrupt"], true);
+        assert_eq!(value["is_interrupt"], true);
+    }
+
+    /// Exhaustive, so a new reason has to name its wire value here.
+    #[test]
+    fn stop_cancelled_wire_shape() {
+        let wire_of = |reason: StopCancelledReason| match reason {
+            StopCancelledReason::UserInterrupt => ("user_interrupt", "user"),
+            StopCancelledReason::PermissionRejected => ("permission_rejected", "user"),
+            StopCancelledReason::PermissionCancelled => ("permission_cancelled", "user"),
+            StopCancelledReason::MaxTurns => ("max_turns", "runtime"),
+            StopCancelledReason::NoProgress => ("no_progress", "runtime"),
+            StopCancelledReason::Unknown => ("unknown", "unknown"),
+        };
+        for reason in <StopCancelledReason as strum::IntoEnumIterator>::iter() {
+            let (wire, cancelled_by) = wire_of(reason);
+            let payload = HookPayload::StopCancelled {
+                reason,
+                cancelled_by: reason.cancelled_by(),
+                cancel_trigger: None,
+                reason_details: None,
+                last_assistant_message: None,
+                subagent_type: None,
+            };
+            assert_eq!(payload.match_value(), Some(wire));
+            let value = serde_json::to_value(&payload).unwrap();
+            assert_eq!(value["reason"], wire);
+            assert_eq!(value["cancelledBy"], cancelled_by);
+            assert!(value.get("cancelTrigger").is_none());
+        }
+    }
+
+    #[test]
+    fn event_name_display_all_variants() {
+        let cases: &[(HookEventName, &str)] = &[
+            (HookEventName::SessionStart, "session_start"),
+            (HookEventName::PreToolUse, "pre_tool_use"),
+            (HookEventName::PostToolUse, "post_tool_use"),
+            (HookEventName::PostToolUseFailure, "post_tool_use_failure"),
+            (HookEventName::SessionEnd, "session_end"),
+            (HookEventName::Stop, "stop"),
+            (HookEventName::StopFailure, "stop_failure"),
+            (HookEventName::StopCancelled, "stop_cancelled"),
+            (HookEventName::Notification, "notification"),
+            (HookEventName::UserPromptSubmit, "user_prompt_submit"),
+            (HookEventName::PermissionDenied, "permission_denied"),
+            (HookEventName::SubagentStart, "subagent_start"),
+            (HookEventName::SubagentStop, "subagent_stop"),
+            (HookEventName::SubagentEnd, "subagent_stop"), // alias collapses
+            (HookEventName::PreCompact, "pre_compact"),
+            (HookEventName::PostCompact, "post_compact"),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(&event.to_string(), expected, "Display wrong for {event:?}");
+        }
     }
 
     #[test]
@@ -860,7 +1100,6 @@ mod tests {
         );
     }
 
-    /// Exhaustive, so renaming a variant is a deliberate wire change rather than a silent one.
     #[test]
     fn stop_failure_kind_wire_shape() {
         let wire_of = |kind: StopFailureKind| match kind {
@@ -933,8 +1172,6 @@ mod tests {
         }
     }
 
-    /// Additive: omitted in the main session, so those payloads stay byte-identical, and present
-    /// in a child so a host can filter one out of the busy half of a busy/idle signal.
     #[test]
     fn user_prompt_submit_names_a_subagent_only_inside_one() {
         let payload = |subagent_type| HookPayload::UserPromptSubmit {
@@ -949,34 +1186,5 @@ mod tests {
             serde_json::to_value(payload(Some("explore".to_string()))).unwrap()["subagentType"],
             "explore"
         );
-    }
-
-    /// Exhaustive, so a new reason has to name its wire value here.
-    #[test]
-    fn stop_cancelled_wire_shape() {
-        let wire_of = |reason: StopCancelledReason| match reason {
-            StopCancelledReason::UserInterrupt => ("user_interrupt", "user"),
-            StopCancelledReason::PermissionRejected => ("permission_rejected", "user"),
-            StopCancelledReason::PermissionCancelled => ("permission_cancelled", "user"),
-            StopCancelledReason::MaxTurns => ("max_turns", "runtime"),
-            StopCancelledReason::NoProgress => ("no_progress", "runtime"),
-            StopCancelledReason::Unknown => ("unknown", "unknown"),
-        };
-        for reason in <StopCancelledReason as strum::IntoEnumIterator>::iter() {
-            let (wire, cancelled_by) = wire_of(reason);
-            let payload = HookPayload::StopCancelled {
-                reason,
-                cancelled_by: reason.cancelled_by(),
-                cancel_trigger: None,
-                reason_details: None,
-                last_assistant_message: None,
-                subagent_type: None,
-            };
-            assert_eq!(payload.match_value(), Some(wire));
-            let value = serde_json::to_value(&payload).unwrap();
-            assert_eq!(value["reason"], wire);
-            assert_eq!(value["cancelledBy"], cancelled_by);
-            assert!(value.get("cancelTrigger").is_none());
-        }
     }
 }

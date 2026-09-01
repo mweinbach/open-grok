@@ -3,6 +3,7 @@ use crate::capability::CapabilityMode;
 use crate::handle::tests::{
     background_capable_cfg, make_confining_handle, make_handle, start_background_sleep,
 };
+use std::sync::Arc;
 use xai_grok_tools::implementations::grok_build::scheduler::types::{
     ScheduledTask, SchedulerState,
 };
@@ -109,6 +110,52 @@ async fn dispatch_unknown_method_returns_unknown_method_error() {
         }
         other => panic!("expected UnknownMethod, got {other:?}"),
     }
+}
+#[tokio::test]
+async fn handle_evict_unbind_does_not_unmount() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let handle = make_handle();
+    handle
+        .create_session_with_cwd("evict-conv", None)
+        .expect("create");
+    handle
+        .session("evict-conv")
+        .expect("session")
+        .set_path_virtualization(
+            crate::path_virtualization::PathVirtualization::try_from_session_root(
+                "/workspace/evict-conv",
+            )
+            .expect("valid"),
+        );
+    let mounts = Arc::new(AtomicUsize::new(0));
+    let unbinds = Arc::new(AtomicUsize::new(0));
+    let mounts_c = mounts.clone();
+    let unbinds_c = unbinds.clone();
+    handle.set_bind_mount_hook(
+        crate::path_virtualization::BindMountHook::probe_then_mount(
+            |_| false,
+            move |_| {
+                mounts_c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .with_on_unbind(move |_, _| {
+            unbinds_c.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    WorkspaceRpcHandler::new(handle)
+        .handle_evict(ToolServerEvictParams {
+            session_id: SessionId::new("evict-conv").unwrap(),
+            reason: "test".into(),
+            grace_period_ms: 50,
+        })
+        .await;
+    assert_eq!(
+        mounts.load(Ordering::SeqCst),
+        0,
+        "evict/prune must not mount or unmount"
+    );
+    assert_eq!(unbinds.load(Ordering::SeqCst), 1);
 }
 /// A hub evict runs the two-phase drain then settles into terminal
 /// ShuttingDown (not a lingering Draining) for an evicted workspace.
@@ -348,6 +395,68 @@ async fn tasks_snapshot_rpc_lists_outstanding_background_tasks() {
         "next_fire_at must be RFC3339: {}",
         loop_task.next_fire_at
     );
+}
+#[tokio::test]
+async fn delete_scheduled_task_rpc_reports_honestly() {
+    use xai_grok_workspace_types::rpc::workspace::DeleteScheduledTaskResponse;
+    let handle = make_handle();
+    let cfg = background_capable_cfg();
+    let session = handle
+        .create_session_with_config(
+            "del-rpc",
+            None,
+            Some(cfg.clone()),
+            CapabilityMode::All,
+            None,
+            false,
+        )
+        .expect("create background-capable session");
+    session.set_bind_tool_config_fingerprint(serde_json::to_value(&cfg).ok());
+    seed_scheduled_task(session.toolset().as_ref(), "loop-del-1").await;
+    let handler = WorkspaceRpcHandler::new(handle.clone());
+    async fn delete(
+        handler: &WorkspaceRpcHandler,
+        task_id: &str,
+    ) -> Result<DeleteScheduledTaskResponse, WorkspaceError> {
+        handler
+            .dispatch(
+                "workspace.delete_scheduled_task",
+                serde_json::json!({"session_id": "del-rpc", "task_id": task_id}),
+                Some("del-rpc"),
+            )
+            .await
+            .map(|value| serde_json::from_value(value).expect("decode delete response"))
+    }
+    let missing = delete(&handler, "no-such-loop").await.expect("unknown id");
+    assert_eq!(missing.task_id, "no-such-loop");
+    assert!(!missing.deleted, "an unknown id must report false");
+    let live = delete(&handler, "loop-del-1").await;
+    let err = live.expect_err("a live loop must error until the durable gate is satisfied");
+    assert!(
+        err.to_string().contains("durab"),
+        "expected the durability refusal, got: {err}"
+    );
+    let snap_value = handler
+        .dispatch(
+            "workspace.tasks_snapshot",
+            serde_json::json!({"session_id": "del-rpc"}),
+            Some("del-rpc"),
+        )
+        .await
+        .expect("tasks_snapshot after refusal");
+    let snap: TasksSnapshotResponse = serde_json::from_value(snap_value).expect("decode snapshot");
+    assert_eq!(
+        snap.scheduled_tasks.len(),
+        1,
+        "a refused delete must leave the loop scheduled"
+    );
+}
+async fn seed_scheduled_task(toolset: &FinalizedToolset, id: &str) {
+    let mut resources = toolset.resources.lock().await;
+    let state = resources.get_or_default::<State<SchedulerState>>();
+    let mut task = ScheduledTask::new(300, "check CI".into(), true, false);
+    task.id = id.into();
+    state.tasks.push(task);
 }
 /// `workspace.kill_task`: kills a running BG task and reports not_found for
 /// unknown ids; after kill the task leaves `tasks_snapshot`.
@@ -1345,36 +1454,6 @@ async fn handle_hook_before_turn_sets_turn_state() {
     );
 }
 #[tokio::test]
-async fn handle_hook_after_turn_does_not_panic() {
-    let handle = make_handle();
-    let handler = WorkspaceRpcHandler::new(handle.clone());
-    handle.activity_tracker().turn_started("main", 1);
-    let payload = turn_hook::AfterTurnPayload {
-        turn_number: 1,
-        outcome: turn_hook::TurnHookOutcome::Completed,
-        duration_ms: 500,
-        tool_call_count: 3,
-        model_id: "grok-3".to_string(),
-        written_repo_paths: Vec::new(),
-        cancellation_category: None,
-        cancellation_context: None,
-    };
-    let frame = HookFrame {
-        session_id: SessionId::new("main").unwrap(),
-        tool_id: None,
-        call_id: None,
-        hook_id: None,
-        event: HookEvent::Custom {
-            kind: turn_hook::AFTER_TURN_KIND.to_string(),
-            payload: serde_json::to_value(&payload).unwrap(),
-        },
-        trace_context: None,
-    };
-    handler
-        .handle_hook(SessionId::new("main").unwrap(), frame)
-        .await;
-}
-#[tokio::test]
 async fn handle_hook_malformed_payload_does_not_panic() {
     let handle = make_handle();
     let handler = WorkspaceRpcHandler::new(handle);
@@ -1659,24 +1738,6 @@ async fn dispatch_resolve_file_references_uses_bound_session_base() {
     let arr = result.as_array().expect("results array");
     assert_eq!(arr[0]["exists"], serde_json::Value::Bool(true));
     assert_eq!(arr[0]["content"], serde_json::json!("rebased"));
-}
-#[tokio::test]
-async fn handle_hook_pause_resume_are_noops() {
-    let handle = make_handle();
-    let handler = WorkspaceRpcHandler::new(handle);
-    for event in [HookEvent::Pause, HookEvent::Resume] {
-        let frame = HookFrame {
-            session_id: SessionId::new("main").unwrap(),
-            tool_id: None,
-            call_id: None,
-            hook_id: None,
-            event,
-            trace_context: None,
-        };
-        handler
-            .handle_hook(SessionId::new("main").unwrap(), frame)
-            .await;
-    }
 }
 #[tokio::test]
 async fn dispatch_put_files_rejects_absolute_outside_root() {
@@ -2204,6 +2265,9 @@ async fn dispatch_knows_every_typed_method() {
         <ApplyWorktreeRequest as WorkspaceRpc>::METHOD,
         <WorktreeListReq as WorkspaceRpc>::METHOD,
         <WorktreeShowReq as WorkspaceRpc>::METHOD,
+        <WorktreeDetachReq as WorkspaceRpc>::METHOD,
+        <WorktreeSalvageReq as WorkspaceRpc>::METHOD,
+        <WorktreeCleanArtifactsReq as WorkspaceRpc>::METHOD,
         <WorktreeDbPathReq as WorkspaceRpc>::METHOD,
         <WorktreeDbStatsReq as WorkspaceRpc>::METHOD,
         <PrepareWorktreeFromWorktreeReq as WorkspaceRpc>::METHOD,
@@ -2363,4 +2427,69 @@ async fn presence_note_is_inert_while_dark() {
         None,
         "dark default: the note must not withhold idle"
     );
+}
+#[tokio::test]
+async fn worktree_management_routes_reject_invalid_params_without_execution() {
+    use crate::workspace_ops::{WorktreeCleanArtifactsReq, WorktreeDetachReq, WorktreeSalvageReq};
+
+    let handler = WorkspaceRpcHandler::new(make_handle());
+    for method in [
+        WorktreeDetachReq::METHOD,
+        WorktreeSalvageReq::METHOD,
+        WorktreeCleanArtifactsReq::METHOD,
+    ] {
+        let result = handler.dispatch(method, serde_json::json!({}), None).await;
+        assert!(
+            matches!(&result, Err(WorkspaceError::HubError(message)) if message.contains("invalid params") && message.contains(method)),
+            "management method must reach typed validation: {result:?}"
+        );
+    }
+}
+#[tokio::test]
+async fn handle_hook_after_turn_does_not_panic() {
+    let handle = make_handle();
+    let handler = WorkspaceRpcHandler::new(handle.clone());
+    handle.activity_tracker().turn_started("main", 1);
+    let payload = turn_hook::AfterTurnPayload {
+        turn_number: 1,
+        outcome: turn_hook::TurnHookOutcome::Completed,
+        duration_ms: 500,
+        tool_call_count: 3,
+        model_id: "grok-3".to_string(),
+        written_repo_paths: Vec::new(),
+        cancellation_category: None,
+        cancellation_context: None,
+    };
+    let frame = HookFrame {
+        session_id: SessionId::new("main").unwrap(),
+        tool_id: None,
+        call_id: None,
+        hook_id: None,
+        event: HookEvent::Custom {
+            kind: turn_hook::AFTER_TURN_KIND.to_string(),
+            payload: serde_json::to_value(&payload).unwrap(),
+        },
+        trace_context: None,
+    };
+    handler
+        .handle_hook(SessionId::new("main").unwrap(), frame)
+        .await;
+}
+#[tokio::test]
+async fn handle_hook_pause_resume_are_noops() {
+    let handle = make_handle();
+    let handler = WorkspaceRpcHandler::new(handle);
+    for event in [HookEvent::Pause, HookEvent::Resume] {
+        let frame = HookFrame {
+            session_id: SessionId::new("main").unwrap(),
+            tool_id: None,
+            call_id: None,
+            hook_id: None,
+            event,
+            trace_context: None,
+        };
+        handler
+            .handle_hook(SessionId::new("main").unwrap(), frame)
+            .await;
+    }
 }

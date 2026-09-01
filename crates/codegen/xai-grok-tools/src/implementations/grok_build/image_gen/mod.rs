@@ -77,6 +77,8 @@ pub struct ImageGenClient {
     /// HTTP call and return the SuperGrok upsell prose instead. See
     /// [`ImageGenClient::is_tier_restricted`].
     tier_restricted: bool,
+    session_header: Option<HeaderValue>,
+    defaults_have_session_header: bool,
 }
 
 impl ImageGenClient {
@@ -154,13 +156,19 @@ impl ImageGenClient {
             Ok::<(), xai_tool_runtime::ToolError>(())
         })?;
 
-        let http = xai_grok_extra_ca::with_extra_root_certificates(
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(IMAGE_GEN_TIMEOUT_SECS))
-                .read_timeout(std::time::Duration::from_secs(IMAGE_GEN_READ_TIMEOUT_SECS))
-                .default_headers(headers),
-        )
-        .build()
+        let defaults_have_session_header = headers.contains_key(SESSION_ID_HEADER);
+        let key = crate::util::shared_http::cache_key(
+            &format!("image_gen:{provider:?}:{base_url}"),
+            &headers,
+        );
+        let http = crate::util::shared_http::cached_client(key, || {
+            xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder
+                    .timeout(std::time::Duration::from_secs(IMAGE_GEN_TIMEOUT_SECS))
+                    .read_timeout(std::time::Duration::from_secs(IMAGE_GEN_READ_TIMEOUT_SECS))
+                    .default_headers(headers.clone())
+            })
+        })
         .map_err(|e| {
             xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "Failed to build HTTP client: {e}"
@@ -186,7 +194,19 @@ impl ImageGenClient {
             require_live_bearer: *provider == ImageGenerationProvider::OpenAi,
             attribution_callback: None,
             tier_restricted: *provider == ImageGenerationProvider::Grok && *tier_restricted,
+            session_header: None,
+            defaults_have_session_header,
         })
+    }
+
+    pub fn with_session_id(mut self, session_id: &str) -> Self {
+        if self.provider == ImageGenerationProvider::Grok
+            && !self.defaults_have_session_header
+            && let Ok(value) = HeaderValue::from_str(session_id)
+        {
+            self.session_header = Some(value);
+        }
+        self
     }
 
     /// Whether the current user's tier (free / X Basic) is zero-limited on
@@ -217,6 +237,22 @@ impl ImageGenClient {
 
     pub fn provider(&self) -> ImageGenerationProvider {
         self.provider
+    }
+
+    fn post_json(
+        &self,
+        url: &str,
+        payload: &serde_json::Value,
+        sent_bearer: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self.http.post(url).json(payload);
+        if let Some(bearer) = sent_bearer {
+            request = request.header(AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        if let Some(session) = &self.session_header {
+            request = request.header(SESSION_ID_HEADER, session.clone());
+        }
+        request
     }
 
     pub(crate) fn writer(&self) -> &super::storage::SessionFileWriter {
@@ -319,10 +355,7 @@ impl ImageGenClient {
             )
             .with_details(serde_json::json!({"code": "auth_required", "status": 401})));
         }
-        let mut req = self.http.post(&url).json(&payload);
-        if let Some(ref key) = sent_bearer {
-            req = req.header(AUTHORIZATION, format!("Bearer {key}"));
-        }
+        let mut req = self.post_json(&url, &payload, sent_bearer.as_deref());
         if self.provider == ImageGenerationProvider::OpenAi {
             req = req.header(CODEX_IMAGE_TURN_ID_HEADER, turn_id);
         }
@@ -700,6 +733,42 @@ mod tests {
             edit_model_override: Some("must-not-cross-providers".into()),
             tier_restricted: true,
         }
+    }
+
+    #[test]
+    fn session_headers_remain_provider_local_and_live_bearers_win() {
+        let url = "https://example.test/images/generations";
+        let codex = ImageGenClient::new(&openai_config("https://example.test".into()), None)
+            .unwrap()
+            .with_session_id("xai-session");
+        let codex_request = codex
+            .post_json(url, &serde_json::json!({}), Some("live-codex"))
+            .build()
+            .unwrap();
+        assert!(!codex_request.headers().contains_key(SESSION_ID_HEADER));
+        assert_eq!(codex_request.headers()[AUTHORIZATION], "Bearer live-codex");
+
+        let config = ImageGenConfig::Enabled {
+            provider: ImageGenerationProvider::Grok,
+            api_key: "static-example".into(),
+            base_url: "https://example.test".into(),
+            extra_headers: indexmap::IndexMap::new(),
+            api_key_provider: None,
+            image_gen_enabled: true,
+            image_edit_enabled: true,
+            model_override: None,
+            edit_model_override: None,
+            tier_restricted: false,
+        };
+        let grok = ImageGenClient::new(&config, None)
+            .unwrap()
+            .with_session_id("xai-session");
+        let grok_request = grok
+            .post_json(url, &serde_json::json!({}), Some("live-grok"))
+            .build()
+            .unwrap();
+        assert_eq!(grok_request.headers()[SESSION_ID_HEADER], "xai-session");
+        assert_eq!(grok_request.headers()[AUTHORIZATION], "Bearer live-grok");
     }
 
     #[test]

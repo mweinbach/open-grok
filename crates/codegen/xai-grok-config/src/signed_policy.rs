@@ -556,6 +556,14 @@ fn managed_identity_claim_imposes_with_keys(
 /// True when signature verification is active AND a cloud-cache policy on disk is
 /// NOT covered by a valid, in-date, identity-bound, content-matching signature.
 /// Keyless build or no policy on disk → false.
+pub(crate) fn policy_file_has_content(home: &std::path::Path, filename: &str) -> bool {
+    match std::fs::read_to_string(home.join(filename)) {
+        Ok(contents) => !contents.trim().is_empty(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
 pub fn cloud_cache_signature_invalid(
     home: &std::path::Path,
     expected_principal: Option<&str>,
@@ -576,8 +584,8 @@ fn cloud_cache_signature_invalid_with_keys(
     expected_principal: Option<&str>,
     now_unix: u64,
 ) -> bool {
-    let has_policy =
-        home.join("requirements.toml").exists() || home.join("managed_config.toml").exists();
+    let has_policy = policy_file_has_content(home, crate::loader::REQUIREMENTS_FILENAME)
+        || policy_file_has_content(home, crate::loader::MANAGED_CONFIG_FILENAME);
     if !has_policy {
         return false;
     }

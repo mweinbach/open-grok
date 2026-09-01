@@ -60,6 +60,8 @@ pub struct MergedSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_turn_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_recap: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_kind: Option<String>,
 }
 /// Inputs to [`merge`]. The registry page is cwd-independent, so a widen reuses
@@ -68,6 +70,7 @@ pub(crate) struct SessionLanes {
     pub local: Vec<Summary>,
     pub remote: Vec<SessionRecord>,
     pub repo_urls: Vec<String>,
+    pub rows_dropped_by_policy: bool,
 }
 
 /// Which directories a cwd-scoped listing draws from.
@@ -115,6 +118,7 @@ pub async fn fetch_merged(
         local,
         remote,
         repo_urls,
+        ..
     } = fetch_lanes(client, cwd, scope, query, limit).await;
     merge(remote, local, query, &repo_urls, limit)
 }
@@ -144,6 +148,25 @@ pub(crate) async fn fetch_lanes(
     scope: CwdScope,
     query: Option<&str>,
     limit: usize,
+) -> SessionLanes {
+    fetch_lanes_with_policy(
+        client,
+        cwd,
+        scope,
+        query,
+        limit,
+        crate::session::visibility::HeadlessPolicy::Include,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_lanes_with_policy(
+    client: Option<&SessionRegistryClient>,
+    cwd: Option<&str>,
+    scope: CwdScope,
+    query: Option<&str>,
+    limit: usize,
+    headless: crate::session::visibility::HeadlessPolicy,
 ) -> SessionLanes {
     let cwd_owned = cwd.map(String::from);
     // `merge` truncates before any caller-side filter runs.
@@ -236,10 +259,13 @@ pub(crate) async fn fetch_lanes(
             local.push(summary);
         }
     }
+    let rows_dropped_by_policy =
+        crate::session::visibility::retain_session_lanes(&mut local, &mut remote, headless);
     SessionLanes {
         local,
         remote,
         repo_urls,
+        rows_dropped_by_policy,
     }
 }
 
@@ -300,6 +326,7 @@ pub fn merge(
                 git_remotes: s.git_remotes,
                 source_workspace_dir: s.source_workspace_dir,
                 last_turn_summary: s.last_turn_summary,
+                last_recap: s.last_recap,
                 session_kind: s.session_kind,
             },
         );
@@ -359,6 +386,7 @@ pub fn merge(
                 git_remotes: local.git_remotes,
                 source_workspace_dir: local.source_workspace_dir,
                 last_turn_summary: local.last_turn_summary,
+                last_recap: local.last_recap,
                 session_kind: local.session_kind,
             },
         );
@@ -448,6 +476,44 @@ mod tests {
     use agent_client_protocol as acp;
     use chrono::{TimeZone, Utc};
 
+    #[test]
+    fn headless_filter_precedes_limit_and_removes_remote_twins() {
+        let mut hidden = make_summary("hidden", "headless", "2026-03-03T00:00:00Z");
+        hidden.session_kind = Some("headless".to_owned());
+        let interactive = make_summary("interactive", "interactive", "2026-03-01T00:00:00Z");
+        let mut local = vec![hidden, interactive];
+        let mut remote = vec![make_remote(
+            "hidden",
+            "headless remote",
+            "2026-03-04T00:00:00Z",
+        )];
+        assert!(crate::session::visibility::retain_session_lanes(
+            &mut local,
+            &mut remote,
+            crate::session::visibility::HeadlessPolicy::Exclude
+        ));
+        let rows = merge(remote, local, None, &[], 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "interactive");
+    }
+
+    #[test]
+    fn last_recap_survives_remote_merge() {
+        let mut summary = make_summary("session", "local", "2026-03-01T00:00:00Z");
+        summary.last_recap = Some("Previous session recap".to_owned());
+        let rows = merge(
+            vec![make_remote("session", "remote", "2026-03-02T00:00:00Z")],
+            vec![summary],
+            None,
+            &[],
+            10,
+        );
+        assert_eq!(
+            rows[0].last_recap.as_deref(),
+            Some("Previous session recap")
+        );
+    }
+
     fn make_summary(id: &str, title: &str, updated: &str) -> Summary {
         Summary {
             info: Info {
@@ -493,6 +559,7 @@ mod tests {
             sandbox_profile: None,
             reasoning_effort: None,
             last_turn_summary: None,
+            last_recap: None,
             last_turn_summary_prompt_id: None,
             cache_affinity_id: None,
         }
@@ -1274,6 +1341,7 @@ mod tests {
             git_remotes: Vec::new(),
             source_workspace_dir: None,
             last_turn_summary: None,
+            last_recap: None,
             session_kind: None,
         }
     }

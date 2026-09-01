@@ -114,14 +114,9 @@ impl AgentView {
 
     /// Minimal's composer stays logically focused when Vim startup leaves the
     /// legacy pane field on Scrollback; overlays and dropdowns still own input.
-    pub(crate) fn external_prompt_editor_access(
-        &self,
-        minimal_logical_prompt: bool,
-    ) -> ExternalPromptEditorAccess {
-        let pane_owns_prompt = minimal_logical_prompt || self.active_pane == AgentPane::Prompt;
+    pub(crate) fn external_prompt_editor_access(&self) -> ExternalPromptEditorAccess {
         let owned_elsewhere = !matches!(self.prompt_mode, super::PromptMode::Normal)
             || self.active_subagent.is_some()
-            || !pane_owns_prompt
             || self.active_modal.is_some()
             || self.extensions_modal.is_some()
             || self.agents_modal.is_some()
@@ -136,6 +131,7 @@ impl AgentView {
             || self.btw_focused
             || !self.permission_queue.is_empty()
             || self.question_view.is_some()
+            || self.elicitation_view.is_some()
             || self.plan_approval_view.is_some()
             || self.casual_commenting_range.is_some()
             || self.cancel_turn_view.is_some()
@@ -1056,6 +1052,55 @@ impl AgentView {
                 _ => InputOutcome::Changed,
             };
         }
+        if self.focused_card() == Some(BlockingCard::McpElicitation) {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if key!('q', CONTROL).matches(key) {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_elicitation_key(key)
+                }
+                Event::Paste(text) => self.handle_elicitation_paste(text),
+                Event::Mouse(mouse) => self.handle_elicitation_mouse(mouse),
+                _ => InputOutcome::Changed,
+            };
+        }
+        if self.focused_card() == Some(BlockingCard::CancelTurn) {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if key!('q', CONTROL).matches(key) {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_cancel_turn_key(key)
+                }
+                Event::Mouse(mouse) => self.handle_cancel_turn_mouse(mouse),
+                _ => InputOutcome::Unchanged,
+            };
+        }
+        if self.focused_card() == Some(BlockingCard::Question) {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if key!('q', CONTROL).matches(key) {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_question_key(key)
+                }
+                Event::Mouse(mouse) => self.handle_question_mouse(mouse),
+                Event::Paste(text) => {
+                    let in_input = self
+                        .question_view
+                        .as_ref()
+                        .map(|qv| qv.focus == crate::views::question_view::QuestionFocus::InputMode)
+                        .unwrap_or(false);
+                    if in_input {
+                        self.route_popup_paste(text)
+                    } else {
+                        InputOutcome::Changed
+                    }
+                }
+                _ => InputOutcome::Changed,
+            };
+        }
         if self.rewind_state.is_some() {
             return match ev {
                 Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
@@ -1105,42 +1150,6 @@ impl AgentView {
                 _ => InputOutcome::Unchanged,
             };
         }
-        if self.focused_card() == Some(BlockingCard::CancelTurn) {
-            return match ev {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if key!('q', CONTROL).matches(key) {
-                        return InputOutcome::Unchanged;
-                    }
-                    self.handle_cancel_turn_key(key)
-                }
-                Event::Mouse(mouse) => self.handle_cancel_turn_mouse(mouse),
-                _ => InputOutcome::Unchanged,
-            };
-        }
-        if self.focused_card() == Some(BlockingCard::Question) {
-            return match ev {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if key!('q', CONTROL).matches(key) {
-                        return InputOutcome::Unchanged;
-                    }
-                    self.handle_question_key(key)
-                }
-                Event::Mouse(mouse) => self.handle_question_mouse(mouse),
-                Event::Paste(text) => {
-                    let in_input = self
-                        .question_view
-                        .as_ref()
-                        .map(|qv| qv.focus == crate::views::question_view::QuestionFocus::InputMode)
-                        .unwrap_or(false);
-                    if in_input {
-                        self.route_popup_paste(text)
-                    } else {
-                        InputOutcome::Changed
-                    }
-                }
-                _ => InputOutcome::Changed,
-            };
-        }
         if let Event::Key(key) = ev
             && key.kind != KeyEventKind::Release
             && registry.matches_id(ActionId::SendToBackground, key)
@@ -1165,6 +1174,7 @@ impl AgentView {
                 AgentPane::Queue => self.handle_queue_key(key, registry),
                 AgentPane::Tasks => self.handle_bg_tasks_key(key, registry),
                 AgentPane::Catalog => self.handle_catalog_key(key, registry),
+                AgentPane::Dock => self.handle_dock_key(key),
             },
             Event::Paste(text) => {
                 if self.active_pane == AgentPane::Scrollback
@@ -1212,7 +1222,7 @@ impl AgentView {
                         AgentPane::Tasks => self.tasks.handle_paste(text),
                         AgentPane::Catalog => self.catalog.handle_paste(text),
                         AgentPane::Queue => self.queue.handle_paste(text),
-                        AgentPane::Prompt | AgentPane::Scrollback => false,
+                        AgentPane::Prompt | AgentPane::Scrollback | AgentPane::Dock => false,
                     };
                     if consumed {
                         InputOutcome::Changed
@@ -1244,6 +1254,14 @@ impl AgentView {
             && key.kind != KeyEventKind::Release
             && registry.matches_id(ActionId::ToggleTasks, key)
         {
+            if self.active_pane == AgentPane::Dock {
+                self.set_active_pane(AgentPane::Scrollback, false);
+                return InputOutcome::Changed;
+            }
+            if self.dock_shown {
+                self.set_active_pane(AgentPane::Dock, false);
+                return InputOutcome::Changed;
+            }
             self.tasks.overlay.toggle();
             self.tasks.on_state_change();
             if self.tasks.overlay.focused {
@@ -1255,9 +1273,11 @@ impl AgentView {
         }
         if let Event::Key(key) = ev
             && key.kind != KeyEventKind::Release
-            && key!('s', CONTROL).matches(key)
+            && registry.matches_id(ActionId::OpenSessions, key)
         {
             self.active_modal = Some(ActiveModal::SessionPicker {
+                generation: 0,
+                detail_seq: 0,
                 state: crate::views::picker::PickerState::default(),
                 entries: None,
                 loading: true,
@@ -1278,7 +1298,11 @@ impl AgentView {
             && registry.matches_id(ActionId::ToggleQueue, key)
             && (self.queue.is_visible() || !self.visible_queue_is_empty())
         {
-            self.toggle_queue_pane();
+            if self.dock_shown {
+                self.dock_queued_expanded = !self.dock_queued_expanded;
+            } else {
+                self.toggle_queue_pane();
+            }
             return InputOutcome::Changed;
         }
         if let Event::Key(key) = ev
@@ -1452,7 +1476,7 @@ impl AgentView {
                 }
             }
             ActionId::EditPromptExternal => {
-                if self.external_prompt_editor_access(true)
+                if self.external_prompt_editor_access()
                     == ExternalPromptEditorAccess::OwnedElsewhere
                 {
                     InputOutcome::Changed

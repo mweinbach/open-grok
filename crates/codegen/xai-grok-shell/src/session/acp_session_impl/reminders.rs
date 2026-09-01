@@ -2,6 +2,27 @@
 //! the TodoGate, date/interrupt reminders, and between-turn completion
 //! reminders.
 use super::*;
+pub(super) fn escape_reminder_tags(content: &str, tag: &str) -> String {
+    content
+        .replace(&format!("</{tag}"), &format!("<\\/{tag}"))
+        .replace(&format!("<{tag}"), &format!("<\\{tag}"))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum HookNoteKind {
+    Context,
+    Feedback,
+}
+
+impl HookNoteKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Context => "Context",
+            Self::Feedback => "Feedback",
+        }
+    }
+}
+
 /// Owned snapshot returned by [`SessionActor::collect_todo_gate_input`].
 ///
 /// The borrowed `TodoGateInput<'_>` consumed by [`evaluate_todo_gate`]
@@ -174,7 +195,7 @@ pub(crate) fn date_rollover_reminder(
     ))
 }
 const WORKFLOW_RESULT_SUMMARY_REMINDER_CAP: usize = 4 * 1024;
-const WORKFLOW_OBJECTIVE_REMINDER_CAP: usize = 256;
+pub(super) const WORKFLOW_OBJECTIVE_REMINDER_CAP: usize = 256;
 fn workflow_completion_detail(detail: &str) -> std::borrow::Cow<'_, str> {
     let normalized = detail.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized == detail {
@@ -270,28 +291,11 @@ fn format_workflow_status_reminder(
                 xai_grok_tools::util::truncate_str(&objective, WORKFLOW_OBJECTIVE_REMINDER_CAP)
             );
         }
-        if let Some(cur) = run.current_phase.as_deref() {
-            match run.phases.iter().position(|p| p.title == cur) {
-                Some(pos) => {
-                    let _ = write!(buf, "\n  Phase: {} ({}/{})", cur, pos + 1, run.phases.len());
-                }
-                None => {
-                    let _ = write!(buf, "\n  Phase: {cur}");
-                }
-            }
+        if let Some(line) = workflow_phase_line(run) {
+            let _ = write!(buf, "\n  {line}");
         }
-        if !run.agents.is_empty() {
-            let done = run.agents.iter().filter(|a| a.state == "done").count();
-            let running = run.agents.iter().filter(|a| a.state == "running").count();
-            let failed = run.agents.iter().filter(|a| a.state == "failed").count();
-            let mut parts = vec![format!("{done} done")];
-            if running > 0 {
-                parts.push(format!("{running} running"));
-            }
-            if failed > 0 {
-                parts.push(format!("{failed} failed"));
-            }
-            let _ = write!(buf, "\n  Agents: {}", parts.join(", "));
+        if let Some(line) = workflow_agents_line(&run.agents) {
+            let _ = write!(buf, "\n  {line}");
         }
         match run.agent_budget {
             Some(budget) => {
@@ -350,7 +354,44 @@ fn format_workflow_status_reminder(
     );
     buf
 }
-fn format_workflow_elapsed(ms: u64) -> String {
+pub(super) fn workflow_phase_line(
+    run: &crate::session::workflow::tracker::WorkflowRunState,
+) -> Option<String> {
+    let current = run.current_phase.as_deref()?;
+    Some(
+        match run.phases.iter().position(|phase| phase.title == current) {
+            Some(position) => format!("Phase: {} ({}/{})", current, position + 1, run.phases.len()),
+            None => format!("Phase: {current}"),
+        },
+    )
+}
+
+pub(super) fn workflow_agents_line(
+    agents: &[crate::session::workflow::tracker::WorkflowAgentRow],
+) -> Option<String> {
+    if agents.is_empty() {
+        return None;
+    }
+    let done = agents.iter().filter(|agent| agent.state == "done").count();
+    let running = agents
+        .iter()
+        .filter(|agent| agent.state == "running")
+        .count();
+    let failed = agents
+        .iter()
+        .filter(|agent| agent.state == "failed")
+        .count();
+    let mut parts = vec![format!("{done} done")];
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    Some(format!("Agents: {}", parts.join(", ")))
+}
+
+pub(super) fn format_workflow_elapsed(ms: u64) -> String {
     let secs = ms / 1000;
     if secs < 60 {
         format!("{secs}s")
@@ -608,6 +649,25 @@ impl SessionActor {
     /// in `xai_grok_tools::reminders`.
     pub(super) fn reminder_wrapper_tag(&self) -> &'static str {
         xai_grok_tools::reminders::DEFAULT_REMINDER_TAG
+    }
+
+    pub(super) fn wrap_hook_note(
+        &self,
+        event: xai_grok_hooks::event::HookEventName,
+        kind: HookNoteKind,
+        hook_name: &str,
+        text: &str,
+    ) -> ConversationItem {
+        let tag = self.reminder_wrapper_tag();
+        let content = escape_reminder_tags(
+            &format!(
+                "{} from {} hook '{hook_name}':\n{text}",
+                kind.label(),
+                event.pascal_case()
+            ),
+            tag,
+        );
+        ConversationItem::system_reminder(format!("<{tag}>\n{content}\n</{tag}>"))
     }
     /// Push a `<{tag}>`-wrapped user message.
     pub(super) fn push_system_reminder_with_tag(&self, content: &str, tag: &str) {

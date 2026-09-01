@@ -48,6 +48,7 @@ pub(crate) struct CheckpointStore {
     /// Per-session store directory: `<cwd>/.grok/rewind-checkpoints/<session_id>`.
     dir: PathBuf,
     /// Max retained checkpoints; the oldest are evicted beyond this.
+    remounted_dir: std::sync::OnceLock<PathBuf>,
     cap: usize,
     /// In-memory cache fronting disk (the hot read path). A `BTreeMap` keeps keys
     /// ordered, so the oldest prompt (smallest key) is cheap to find for eviction.
@@ -85,6 +86,7 @@ impl CheckpointStore {
         };
         Self {
             dir,
+            remounted_dir: std::sync::OnceLock::new(),
             cap,
             cache: Mutex::new(cache),
             io_lock: Mutex::new(()),
@@ -92,8 +94,39 @@ impl CheckpointStore {
     }
 
     /// On-disk path for a single checkpoint.
+    fn store_dir(&self) -> &Path {
+        self.remounted_dir.get().unwrap_or(&self.dir)
+    }
+
+    pub(crate) async fn remount(&self, cwd: &Path, session_id: &str) -> bool {
+        let dest = cwd
+            .join(".opengrok")
+            .join(STORE_SUBDIR)
+            .join(session_store_dir_name(session_id));
+        let _io = self.io_lock.lock().await;
+        if let Some(existing) = self.remounted_dir.get() {
+            return existing == dest.as_path();
+        }
+        let src = self.store_dir().to_path_buf();
+        if src != dest.as_path() && src.exists() {
+            let dest_copy = dest.clone();
+            let copy_ok =
+                tokio::task::spawn_blocking(move || copy_checkpoint_blobs(&src, &dest_copy))
+                    .await
+                    .unwrap_or(false);
+            if !copy_ok {
+                tracing::warn!(
+                    src = %self.store_dir().display(),
+                    dest = %dest.display(),
+                    "rewind checkpoint remount copy failed; keeping source dir"
+                );
+                return false;
+            }
+        }
+        self.remounted_dir.set(dest).is_ok()
+    }
     fn checkpoint_path(&self, prompt_index: usize) -> PathBuf {
-        checkpoint_file_path(&self.dir, prompt_index)
+        checkpoint_file_path(self.store_dir(), prompt_index)
     }
 
     /// Write `checkpoint` through to disk and the cache (last-write-wins per
@@ -124,7 +157,7 @@ impl CheckpointStore {
         if let Err(e) = self.ensure_store_dir().await {
             tracing::warn!(
                 error = %e,
-                dir = %self.dir.display(),
+                dir = %self.store_dir().display(),
                 "rewind checkpoint store: mkdir failed; skipping persist"
             );
             return;
@@ -170,7 +203,7 @@ impl CheckpointStore {
         // Open the disk scan *before* pruning the cache so the two can't diverge:
         // if the dir can't be opened while it still holds `>= target` blobs, a pruned
         // cache would let a later rehydrate resurrect the just-rewound checkpoints.
-        let mut entries = match tokio::fs::read_dir(&self.dir).await {
+        let mut entries = match tokio::fs::read_dir(&self.store_dir()).await {
             Ok(entries) => entries,
             // Dir absent ⇒ no on-disk blobs to diverge from; safe to prune the cache.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -182,7 +215,7 @@ impl CheckpointStore {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    dir = %self.dir.display(),
+                    dir = %self.store_dir().display(),
                     "rewind checkpoint store: truncate scan failed; keeping cache to stay consistent with disk"
                 );
                 return;
@@ -214,7 +247,7 @@ impl CheckpointStore {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        dir = %self.dir.display(),
+                        dir = %self.store_dir().display(),
                         "rewind checkpoint store: truncate scan read_dir error; \
                          continuing to scan remaining entries"
                     );
@@ -227,8 +260,8 @@ impl CheckpointStore {
     /// Create the store dir and its `.gitignore` (idempotent). The `.gitignore`
     /// at the `rewind-checkpoints` root uses `*` so no blob is ever committed.
     async fn ensure_store_dir(&self) -> std::io::Result<()> {
-        tokio::fs::create_dir_all(&self.dir).await?;
-        if let Some(root) = self.dir.parent() {
+        tokio::fs::create_dir_all(&self.store_dir()).await?;
+        if let Some(root) = self.store_dir().parent() {
             let gitignore = root.join(".gitignore");
             // `Path::exists` is a blocking `stat` on the async runtime thread; use
             // the async probe to stay consistent with the surrounding tokio::fs I/O.
@@ -247,7 +280,7 @@ impl CheckpointStore {
         let json = serde_json::to_vec(checkpoint).map_err(std::io::Error::other)?;
         let final_path = self.checkpoint_path(checkpoint.prompt_index);
         let unique = TMP_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp_path = self.dir.join(format!(
+        let tmp_path = self.store_dir().join(format!(
             "checkpoint-{}.json.tmp.{}.{}",
             checkpoint.prompt_index,
             std::process::id(),
@@ -265,7 +298,7 @@ impl CheckpointStore {
         tokio::fs::rename(&tmp_path, &final_path).await?;
         // Best-effort dir fsync so the rename (the new dir entry) is itself durable;
         // async open keeps this off the blocking path. Ignored where unsupported.
-        if let Ok(dir) = tokio::fs::File::open(&self.dir).await {
+        if let Ok(dir) = tokio::fs::File::open(&self.store_dir()).await {
             let _ = dir.sync_all().await;
         }
         Ok(())
@@ -311,6 +344,30 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+fn copy_checkpoint_blobs(src: &Path, dest: &Path) -> bool {
+    if std::fs::create_dir_all(dest).is_err() {
+        return false;
+    }
+    let entries = match std::fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&from) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() || meta.is_dir() {
+            continue;
+        }
+        let to = dest.join(entry.file_name());
+        if std::fs::copy(&from, &to).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Run the blocking disk rehydrate without starving the async runtime.
@@ -419,7 +476,7 @@ fn is_orphan_checkpoint_tmp(file_name: &std::ffi::OsStr) -> bool {
 impl CheckpointStore {
     /// The per-session store directory.
     pub(crate) fn dir(&self) -> &Path {
-        &self.dir
+        self.store_dir()
     }
 
     /// Read a checkpoint, preferring the cache and falling back to a disk read

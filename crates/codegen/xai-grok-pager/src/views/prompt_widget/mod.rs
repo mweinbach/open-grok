@@ -413,6 +413,39 @@ pub struct StashedPrompt {
     pub(crate) image_undo_stash: Vec<PastedImage>,
 }
 
+#[derive(Debug, Default)]
+pub struct FeedbackImages(Vec<PastedImage>);
+
+impl From<Vec<PastedImage>> for FeedbackImages {
+    fn from(images: Vec<PastedImage>) -> Self {
+        Self(images)
+    }
+}
+
+impl Drop for FeedbackImages {
+    fn drop(&mut self) {
+        crate::prompt_images::drain_and_cleanup(&mut self.0);
+    }
+}
+
+impl FeedbackImages {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[PastedImage] {
+        &self.0
+    }
+
+    pub fn take(&mut self) -> Vec<PastedImage> {
+        std::mem::take(&mut self.0)
+    }
+}
+
 impl Drop for StashedPrompt {
     fn drop(&mut self) {
         crate::prompt_images::drain_and_cleanup(&mut self.images);
@@ -2776,6 +2809,34 @@ impl PromptWidget {
                 .iter()
                 .map(|e| (e.range.clone(), e.kind, e.display.clone())),
         );
+    }
+
+    pub fn adopt_images(&mut self, mut images: Vec<PastedImage>) {
+        let text = self.textarea.text().to_owned();
+        let mut chips = Vec::new();
+        let mut adopted = Vec::new();
+        for placeholder in chip_placeholder_regex().find_iter(&text) {
+            let Some(number) = parse_image_display_number(placeholder.as_str()) else {
+                continue;
+            };
+            let Some(position) = images
+                .iter()
+                .position(|image| image.display_number == number)
+            else {
+                continue;
+            };
+            chips.push(crate::app::agent::ChipElement {
+                range: placeholder.range(),
+                kind: KIND_IMAGE,
+                display: Some(chip_line(format!("Image #{number}"))),
+            });
+            adopted.push(images.remove(position));
+        }
+        crate::prompt_images::drain_and_cleanup(&mut images);
+        if !adopted.is_empty() {
+            self.restore_chip_elements(&chips);
+            self.set_images(adopted);
+        }
     }
 
     /// Expose the underlying textarea for element access.

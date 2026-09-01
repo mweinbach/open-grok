@@ -2497,7 +2497,8 @@ impl MvpAgent {
                 "trace_upload_status"
             );
         }
-        let (subagent_event_tx, subagent_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (subagent_coordinator_sender, subagent_event_rx) = subagent_coordinator::subagent_channels();
+        let subagent_event_tx = subagent_coordinator_sender.event_sender().0.clone();
         let activity = crate::agent::activity::AgentActivity::default();
         let instance = Self {
             activity,
@@ -2563,6 +2564,15 @@ impl MvpAgent {
                 ),
             ),
             subagent_event_tx,
+            subagent_coordinator_sender,
+            subagent_sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                crate::config::SubagentsConfig::resolve_sampling_limit(
+                    std::env::var(crate::config::SubagentsConfig::ENV_SAMPLING_LIMIT).ok().as_deref(),
+                    cfg.subagents.sampling_limit,
+                    cfg.remote_settings.as_ref().and_then(|settings| settings.subagents_sampling_limit),
+                    cfg.subagents_max_concurrent,
+                ),
+            )),
             subagent_event_rx: RefCell::new(Some(subagent_event_rx)),
             subagent_presentation: RefCell::new(
                 crate::agent::subagent::SubagentPresentation::new(),
@@ -2709,6 +2719,9 @@ impl MvpAgent {
                 continue;
             }
             if busy {
+                if let Some(handle) = self.resident_handle(&id) {
+                    handle.set_status_line_wanted(false);
+                }
                 self.set_session_live_state(&id, SessionLiveState::Working);
                 kept_resident += 1;
                 tracing::info!(
@@ -2968,8 +2981,8 @@ impl MvpAgent {
         &self,
         subagent_id: &str,
     ) -> xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .cancel(subagent_id)
             .await
@@ -2980,8 +2993,8 @@ impl MvpAgent {
     ) -> Vec<
         xai_grok_tools::implementations::grok_build::task::types::SubagentInspection,
     > {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .list_running(parent_session_id)
             .await
@@ -2992,8 +3005,8 @@ impl MvpAgent {
     ) -> Option<
         xai_grok_tools::implementations::grok_build::task::types::SubagentInspection,
     > {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .inspect(subagent_id)
             .await
@@ -3006,8 +3019,8 @@ impl MvpAgent {
     ) -> Option<
         xai_grok_tools::implementations::grok_build::task::types::SubagentSnapshot,
     > {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .query(subagent_id, block, timeout_ms)
             .await
@@ -3017,8 +3030,8 @@ impl MvpAgent {
         parent_session_id: &str,
         prompt_id: &str,
     ) -> Vec<crate::upload::trace::SubagentSpawnedRef> {
-        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::from_coordinator(
+                self.subagent_coordinator_sender.clone(),
             )
             .spawned_refs_for_prompt(parent_session_id, prompt_id)
             .await
@@ -4025,6 +4038,29 @@ impl MvpAgent {
     }
     /// Extract per-client terminal/fs capabilities from request `_meta`
     /// (injected by the leader). Falls back to the shared `init` OnceCell.
+    pub(super) fn resolve_status_line_capability(
+        meta: Option<&acp::Meta>,
+        init: &acp::InitializeRequest,
+    ) -> bool {
+        meta.and_then(|meta| meta.get(xai_grok_status_line::CLIENT_STATUS_LINE_META))
+            .or_else(|| init.client_capabilities.meta.as_ref()
+                .and_then(|meta| meta.get(xai_grok_status_line::STATUS_LINE_CAPABILITY)))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub(super) fn attach_status_line(
+        &self,
+        session_id: &acp::SessionId,
+        meta: Option<&acp::Meta>,
+        init: &acp::InitializeRequest,
+    ) {
+        if let Some(handle) = self.resident_handle(session_id) {
+            handle.set_status_line_wanted(Self::resolve_status_line_capability(meta, init));
+            handle.request_status_snapshot();
+        }
+    }
+
     pub(super) fn resolve_client_io_caps(
         meta: Option<&acp::Meta>,
         init: &acp::InitializeRequest,
@@ -4288,6 +4324,7 @@ impl MvpAgent {
                     )
             })?;
         tool_ctx.subagent_event_tx = Some(self.subagent_event_tx.clone());
+        tool_ctx.subagent_coordinator_sender = Some(self.subagent_coordinator_sender.clone());
         tool_ctx.synthetic_trace_tx = self
             .subagent_presentation
             .borrow()
@@ -4859,9 +4896,12 @@ impl MvpAgent {
                     None,
                     max_turns,
                     None,
+                    None,
                 )
                 .await?
         };
+        handle.set_status_line_wanted(Self::resolve_status_line_capability(session_meta, init));
+        handle.request_status_snapshot();
         self.session_registry.set_thread(&session_info.id, session_thread);
         tracing::debug!(session_id = %session_info.id.0, "spawn_session_on_thread complete");
         self.set_session_live_state(&session_info.id, SessionLiveState::IdleResident);

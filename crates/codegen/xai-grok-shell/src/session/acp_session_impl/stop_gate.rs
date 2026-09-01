@@ -100,11 +100,13 @@ pub(super) fn demote_ignored_blocks(
                 hook_name,
                 elapsed,
                 http_info,
+                system_message,
                 ..
             } => HookRunResult::Success {
                 hook_name,
                 elapsed,
                 http_info,
+                system_message,
             },
             other => other,
         })
@@ -380,6 +382,7 @@ impl SessionActor {
             .await;
             xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::HookBlocked {
                 hook_name: block.hook_name.clone(),
+                cause: xai_grok_telemetry::events::HookBlockCause::StopBlocked,
             });
         }
         if blocks.is_empty() {
@@ -508,12 +511,14 @@ mod stop_gate_snapshot_tests {
                 detail: "blocked stop: run the tests".into(),
                 elapsed: std::time::Duration::from_millis(5),
                 http_info: None,
+                system_message: Some("hook status".into()),
             },
             HookRunResult::Failed {
                 hook_name: "broken".into(),
                 error: "exit code 1".into(),
                 elapsed: std::time::Duration::from_millis(3),
                 http_info: None,
+                system_message: None,
             },
             HookRunResult::Skipped {
                 hook_name: "disabled".into(),
@@ -527,5 +532,9 @@ mod stop_gate_snapshot_tests {
         );
         assert!(matches!(&results[1], HookRunResult::Failed { .. }));
         assert!(matches!(&results[2], HookRunResult::Skipped { .. }));
+        assert!(matches!(
+            &results[0],
+            HookRunResult::Success { system_message: Some(message), .. } if message == "hook status"
+        ));
     }
 }

@@ -506,6 +506,8 @@
                 prompt_id: "task-completed-bg1".into(),
                 stop_reason: "rate_limit".into(),
                 agent_result: Some(rate_limit_copy.into()),
+                error_kind: None,
+                elapsed_ms: None,
                 usage: None,
             },
             meta: Some(serde_json::json!({ "isReplay": false })),

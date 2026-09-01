@@ -98,6 +98,8 @@ fn reconnect_attempt_budget(liveness_deadline: Duration) -> Duration {
 }
 /// Default WebSocket keepalive ping cadence when a connection does not
 /// override [`ConnectionTuning::ws_ping_interval`].
+const INITIAL_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const INITIAL_CONNECT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 const SERVE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVE_MAX_ATTEMPTS: u32 = 3;
@@ -337,6 +339,15 @@ fn resolve_ws_ping_interval(configured: Option<Duration>) -> Duration {
 /// without racing hub 4408. Explicit overrides are honored verbatim; keep
 /// them comfortably above the ping interval or a healthy-but-idle
 /// connection will be churned.
+fn resolve_initial_connect_attempt_timeout(configured: Option<Duration>) -> Duration {
+    match configured {
+        Some(timeout) if !timeout.is_zero() => timeout,
+        _ => INITIAL_CONNECT_ATTEMPT_TIMEOUT,
+    }
+}
+fn initial_connect_retryable(err: &ClientError) -> bool {
+    matches!(err, ClientError::NetworkError(_) | ClientError::Closed(_))
+}
 fn resolve_ws_liveness_deadline(configured: Option<Duration>, ping_interval: Duration) -> Duration {
     match configured {
         Some(deadline) if !deadline.is_zero() => deadline,
@@ -371,6 +382,8 @@ pub struct ConnectionTuning {
     /// default cap period). `Some`, including zero, is honored verbatim
     /// (`Some(ZERO)` resets on every outage; tests use this).
     pub reconnect_attempt_reset_after: Option<Duration>,
+    pub reconnect_after_terminal_close_codes: Vec<u16>,
+    pub initial_connect_attempt_timeout: Option<Duration>,
 }
 /// Pool dedup key. Two connections are pooled together iff their
 /// `(url, principal)` match.
@@ -539,6 +552,7 @@ struct HubConnectionInner {
     attempt_reset_after: Duration,
     /// Incremented at the start of each reconnect episode so jitter
     /// re-phases across outages of the same connection.
+    reconnect_after_terminal_close_codes: Vec<u16>,
     outage_seq: AtomicU32,
     /// Outbound frames waiting to be written. Filled by `send_*`
     /// helpers; drained by the writer half of the actor.
@@ -577,7 +591,6 @@ impl HubConnection {
     /// The pool is the canonical caller; outside callers MAY use this
     /// for tests or one-shot programs but lose pool dedup.
     pub async fn connect(config: ConnectionConfig) -> Result<Arc<Self>, ClientError> {
-        let initial_cred = config.credential.current();
         let key = ConnKey {
             url: config.url.as_str().to_owned(),
             principal: config.credential.principal_key(),
@@ -603,24 +616,58 @@ impl HubConnection {
         let bound_sessions = Arc::new(RefCountedSet::<SessionId>::new());
         let connection_id = Arc::new(Mutex::new(None));
         let shutdown = CancellationToken::new();
-        let ws = open_socket(
-            &config.url,
-            &initial_cred,
-            config.kind,
-            config.alpha_test_key.as_deref(),
-            config.allow_insecure_ws,
-        )
-        .await?;
-        let (sink, stream) = ws.split();
-        let (sink, stream, ack) = run_handshake(
-            sink,
-            stream,
-            config.kind,
-            config.server_id.clone(),
-            config.server_description.clone(),
-            config.server_metadata.clone(),
-        )
-        .await?;
+        let budget =
+            resolve_initial_connect_attempt_timeout(config.tuning.initial_connect_attempt_timeout);
+        let initial_jitter_seed = new_reconnect_jitter_seed();
+        let mut attempt: u32 = 0;
+        let (sink, stream, ack) = loop {
+            attempt += 1;
+            let cred = config.credential.current();
+            let attempt_result = match tokio::time::timeout(budget, async {
+                let ws = open_socket(
+                    &config.url,
+                    &cred,
+                    config.kind,
+                    config.alpha_test_key.as_deref(),
+                    config.allow_insecure_ws,
+                )
+                .await?;
+                let (sink, stream) = ws.split();
+                run_handshake(
+                    sink,
+                    stream,
+                    config.kind,
+                    config.server_id.clone(),
+                    config.server_description.clone(),
+                    config.server_metadata.clone(),
+                )
+                .await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(ClientError::NetworkError(format!(
+                    "initial connect attempt timed out after {budget:?}"
+                ))),
+            };
+            match attempt_result {
+                Ok(parts) => break parts,
+                Err(err) => {
+                    if attempt >= INITIAL_CONNECT_MAX_ATTEMPTS || !initial_connect_retryable(&err) {
+                        return Err(err);
+                    }
+                    let wait = backoff_for(attempt, &reconnect_backoff, initial_jitter_seed, 0);
+                    warn!(
+                        url = %config.url,
+                        attempt,
+                        ?wait,
+                        error = %err,
+                        "initial connect attempt failed; retrying"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        };
         *connection_id.lock().await = Some(ack.connection_id.clone());
         info!(
             url = %config.url,
@@ -648,6 +695,12 @@ impl HubConnection {
             reconnect_backoff,
             reconnect_jitter_seed: new_reconnect_jitter_seed(),
             attempt_reset_after,
+            reconnect_after_terminal_close_codes: {
+                let mut codes = config.tuning.reconnect_after_terminal_close_codes.clone();
+                codes.sort_unstable();
+                codes.dedup();
+                codes
+            },
             outage_seq: AtomicU32::new(0),
             outbound_tx,
             demux: demux.clone(),
@@ -994,10 +1047,7 @@ async fn open_socket(
         );
     }
     let mut connect_url = url.clone();
-    let expected_role = match kind {
-        ConnectionKind::Harness => "harness",
-        ConnectionKind::ToolServer => "tool_server",
-    };
+    let expected_role = kind.as_wire_str();
     if let Some(existing) = connect_url
         .query_pairs()
         .find(|(k, _)| k == "role")
@@ -1112,6 +1162,7 @@ fn rearm_liveness(deadline: &mut std::pin::Pin<&mut tokio::time::Sleep>, livenes
 /// connection: eviction, session expiry, admin disconnect, rate limit).
 /// The range is deliberately wide so new terminal codes added server-side
 /// are recognised without a client update.
+pub const CLOSE_CODE_SANDBOX_TERMINATED: u16 = 4103;
 fn exit_for_close_code(code: Option<u16>) -> ConnectedExit {
     match code {
         Some(code) if (4100..4200).contains(&code) => ConnectedExit::TerminalClose(code),
@@ -1481,7 +1532,12 @@ async fn run_reader_actor(
         .await
         {
             ConnectedExit::Stop => break,
-            ConnectedExit::TerminalClose(code) => {
+            ConnectedExit::TerminalClose(code)
+                if inner
+                    .reconnect_after_terminal_close_codes
+                    .binary_search(&code)
+                    .is_err() =>
+            {
                 info!(code, url = %url, "server sent terminal close; not reconnecting");
                 fire_on_terminal_close(inner.as_ref(), code);
                 fire_on_disconnect(inner.as_ref());
@@ -1491,7 +1547,27 @@ async fn run_reader_actor(
                 inner.demux.drain_progress();
                 break;
             }
-            ConnectedExit::SocketClosed(cause) => {
+            exit => {
+                let (cause, already_notified) = match exit {
+                    ConnectedExit::Stop => {
+                        unreachable!("Stop is handled by the arm above")
+                    }
+                    ConnectedExit::TerminalClose(code) => {
+                        info!(
+                            code,
+                            url = %url,
+                            "server sent terminal close; reconnecting (embedder opt-in)"
+                        );
+                        fire_on_terminal_close(inner.as_ref(), code);
+                        fire_on_disconnect(inner.as_ref());
+                        inner.demux.drain_waiters_with(|| {
+                            ClientError::Closed(format!("server terminal close (code {code})"))
+                        });
+                        inner.demux.drain_progress();
+                        (DisconnectCause::CloseFrame(Some(code)), true)
+                    }
+                    ConnectedExit::SocketClosed(cause) => (cause, false),
+                };
                 let detected_at = Instant::now();
                 let prev_conn_age = detected_at.duration_since(connected_at);
                 let health = inner.health.snapshot();
@@ -1519,7 +1595,9 @@ async fn run_reader_actor(
                     clock_jump_ms = outage.clock_jump_ms,
                     "server connection lost; scheduling reconnect"
                 );
-                fire_on_disconnect(inner.as_ref());
+                if !already_notified {
+                    fire_on_disconnect(inner.as_ref());
+                }
                 if matches!(outage.cause, DisconnectCause::LivenessDeadline)
                     && writer_ctl_tx
                         .send(WriterControl::Close {

@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use xai_grok_sampling_types::{ConversationRequest, ConversationResponse, SamplingError};
 
+use crate::actor::request_task::CompletionResult;
 use crate::commands::SamplerCommand;
 use crate::config::SamplerConfig;
 use crate::metrics::InferenceLatencyStats;
@@ -84,6 +85,24 @@ impl CodexTurnState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
     }
+}
+
+/// One doom-loop recovery action performed during a request.
+pub struct DoomLoopRecoveryAttempt {
+    pub triggers: Vec<String>,
+    pub aborted_at_chunk: Option<u64>,
+}
+
+/// Awaited sampling result plus request-level detector metadata.
+pub struct CollectedSamplingResult {
+    /// Terminal response and metrics, or the rich sampling error.
+    pub result: Result<(ConversationResponse, InferenceLatencyStats), SamplingError>,
+    /// Whether a terminal event was successfully queued on the event rail.
+    pub terminal_event_queued: bool,
+    /// Deduplicated raw labels observed across every attempt in the request.
+    pub doom_loop_signals: Vec<String>,
+    /// Doom-loop recovery actions performed for this request.
+    pub doom_loop_recovery_attempts: Vec<DoomLoopRecoveryAttempt>,
 }
 
 /// Cheaply-cloneable handle to the sampler actor.
@@ -218,10 +237,18 @@ impl SamplerHandle {
         &self,
         request_id: RequestId,
         request: ConversationRequest,
-    ) -> Result<(ConversationResponse, InferenceLatencyStats), SamplingError> {
-        // RAII guard: when this future is dropped (cancel, panic, or normal return),
-        // tell the sampler actor to cancel the in-flight request_id. No-op if the
-        // actor already finished and removed it from its active set.
+    ) -> CompletionResult {
+        self.submit_and_collect_with_metadata(request_id, request)
+            .await
+            .result
+    }
+
+    /// Submit and also return detector labels observed on discarded attempts.
+    pub async fn submit_and_collect_with_metadata(
+        &self,
+        request_id: RequestId,
+        request: ConversationRequest,
+    ) -> CollectedSamplingResult {
         struct CancelOnDrop {
             cmd_tx: mpsc::UnboundedSender<SamplerCommand>,
             request_id: RequestId,
@@ -253,10 +280,15 @@ impl SamplerHandle {
                 cmd_tx: self.cmd_tx.clone(),
                 request_id: cancel_id,
             });
-        completion_rx.await.unwrap_or_else(|_| {
-            Err(SamplingError::auth_unknown(
-                "sampler actor dropped before completion",
-            ))
-        })
+        completion_rx
+            .await
+            .unwrap_or_else(|_| CollectedSamplingResult {
+                result: Err(SamplingError::auth_unknown(
+                    "sampler actor dropped before completion",
+                )),
+                terminal_event_queued: false,
+                doom_loop_signals: Vec::new(),
+                doom_loop_recovery_attempts: Vec::new(),
+            })
     }
 }

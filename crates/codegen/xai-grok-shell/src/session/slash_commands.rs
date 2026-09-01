@@ -18,7 +18,14 @@ pub(crate) struct BuiltinCommand {
     /// Filtered by `CommandAvailability::allows()` at advertising time;
     /// commands that map to `BuiltinGate::AlwaysOn` are never gated.
     pub gate: BuiltinGate,
-    resolve: fn(args: &str) -> BuiltinAction,
+    pub(crate) model_authored_eligibility: ModelAuthoredEligibility,
+    pub(super) resolve: fn(args: &str) -> BuiltinAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelAuthoredEligibility {
+    Denied,
+    ExactCanonical,
 }
 
 /// Capability gate that decides whether a `BuiltinCommand` is advertised
@@ -52,6 +59,7 @@ pub(crate) enum BuiltinGate {
 pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "compact",
+        model_authored_eligibility: ModelAuthoredEligibility::ExactCanonical,
         description: "Compress conversation history to save context window",
         argument_hint: Some("optional context about what to preserve"),
         aliases: &[],
@@ -66,6 +74,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "always-approve",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Toggle always-approve mode (skip all permission prompts)",
         argument_hint: Some("on|off"),
         aliases: &["yolo"],
@@ -79,6 +88,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "flush",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Flush conversation memory to disk now",
         argument_hint: None,
         aliases: &[],
@@ -87,6 +97,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "dream",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Run memory consolidation (merge session logs into organized topics)",
         argument_hint: None,
         aliases: &[],
@@ -95,6 +106,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "memory",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Browse, view, and manage your memories",
         argument_hint: Some("on|off"),
         aliases: &["mem"],
@@ -110,6 +122,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "context",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Show context window usage and session stats",
         argument_hint: None,
         aliases: &[],
@@ -118,6 +131,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "hooks-trust",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Trust this project for hook execution",
         argument_hint: None,
         aliases: &[],
@@ -126,6 +140,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "hooks-list",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Show hooks loaded in this session",
         argument_hint: None,
         aliases: &[],
@@ -134,6 +149,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "hooks-add",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Add a custom hook file or directory",
         argument_hint: Some("path to hook file or directory"),
         aliases: &[],
@@ -144,6 +160,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "hooks-remove",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Remove a custom hook file or directory path",
         argument_hint: Some("path to hook file or directory"),
         aliases: &[],
@@ -154,6 +171,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "hooks-untrust",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Remove trust for the current project",
         argument_hint: None,
         aliases: &[],
@@ -162,6 +180,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "plugins",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Manage plugins (list, reload, trust, add, remove)",
         argument_hint: Some("list | reload | trust <path> | add <path> | remove <path>"),
         aliases: &["plugin"],
@@ -213,6 +232,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "reload-plugins",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Reload plugins from disk (alias for /plugins reload)",
         argument_hint: None,
         aliases: &[],
@@ -221,6 +241,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "session-info",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Show session details (model, turns, context usage)",
         argument_hint: None,
         aliases: &["status", "info"],
@@ -229,6 +250,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "feedback",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Send feedback about the current session",
         argument_hint: Some("feedback text"),
         aliases: &[],
@@ -239,6 +261,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "deep-research",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Research with bounded parallel agents, cross-check evidence, and write a cited report",
         argument_hint: Some("<query>"),
         aliases: &[],
@@ -249,8 +272,11 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "workflow",
-        description: "Launch a saved workflow, or manage a run (pause, resume, stop, save)",
-        argument_hint: Some("<name> [args] | pause|resume|stop|save [name]"),
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
+        description: "Launch a saved workflow, list runs, or manage a run (pause, resume, stop, save)",
+        argument_hint: Some(
+            "<name> [--agent-budget N] [--effort LEVEL] [args] | runs | pause|resume|stop|save [name]",
+        ),
         aliases: &[],
         gate: BuiltinGate::WorkflowManagement,
         resolve: |args| {
@@ -260,14 +286,17 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
             let first = parts.next().unwrap_or_default();
             let second = parts.next().unwrap_or_default();
             let first_is_op = OPS.contains(&first.to_lowercase().as_str());
+            let first_is_runs = first.eq_ignore_ascii_case("runs") && second.is_empty();
             let second_is_final_op =
                 OPS.contains(&second.to_lowercase().as_str()) && parts.next().is_none();
-            if first.is_empty() || first_is_op || second_is_final_op {
+            if first.is_empty() || first_is_op || first_is_runs || second_is_final_op {
                 let (op, run_id) = if first_is_op {
                     (
                         first.to_lowercase(),
                         trimmed[first.len()..].trim_start().to_string(),
                     )
+                } else if first_is_runs {
+                    ("runs".to_string(), String::new())
                 } else if second_is_final_op {
                     (second.to_lowercase(), first.to_string())
                 } else {
@@ -284,6 +313,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "goal",
+        model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Set, manage, or check an autonomous goal",
         argument_hint: Some("<objective> [--budget <tokens>] | status | pause | resume | clear"),
         aliases: &[],
@@ -335,6 +365,7 @@ fn parse_goal_budget(trimmed: &str) -> (String, Option<i64>) {
 
 const PROMPT_COMMANDS: &[BuiltinCommand] = &[BuiltinCommand {
     name: "loop",
+    model_authored_eligibility: ModelAuthoredEligibility::Denied,
     description: "Run a prompt on a recurring interval",
     argument_hint: Some("[interval] <prompt>"),
     aliases: &[],
@@ -440,12 +471,15 @@ pub(crate) fn build_tools_meta(tool_names: &[String]) -> acp::Meta {
 /// `pager_blocked_acp_names_are_reserved_in_shell`). Add names here when adding
 /// a pager builtin or a pager-blocked shell command.
 pub const PAGER_COMMAND_KEYS: &[&str] = &[
+    "add-dir",
     "agents",
     "agents-dashboard",
     "always-approve",
     "announcements",
     "auto",
     "btw",
+    "cache",
+    "cache-status",
     "cd",
     "changelog",
     "chat",
@@ -506,16 +540,19 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "personas",
     "plan",
     "plan-view",
+    "plugin",
     "plugins",
     "preferences",
     "prefs",
     "privacy",
+    "prompt-cache",
     "queue",
     "quit",
     "recap",
     "release-notes",
     "reload-plugins",
     "remember",
+    "remove-dir",
     "rename",
     "resume",
     "rewind",
@@ -547,6 +584,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "vim-mode",
     "voice",
     "welcome",
+    "workflow",
     "workflows",
     "yolo",
     "yolo-2",
@@ -585,17 +623,13 @@ struct SkillCommand<'a> {
     skill: &'a SkillInfo,
 }
 
-impl<'a> EffectiveCommandCatalog<'a> {
-    fn build(
-        skills: &'a [SkillInfo],
-        availability: CommandAvailability,
-        workflows: &'a [crate::session::workflow::registry::WorkflowListing],
-    ) -> Self {
-        let builtins: Vec<_> = BUILTIN_COMMANDS
-            .iter()
-            .chain(PROMPT_COMMANDS.iter())
-            .filter(|builtin| availability.allows(builtin.gate))
-            .collect();
+struct EffectiveSkillCatalog<'a> {
+    commands: Vec<SkillCommand<'a>>,
+    taken: HashSet<String>,
+}
+
+impl<'a> EffectiveSkillCatalog<'a> {
+    fn build(skills: &'a [SkillInfo], builtins: &[&BuiltinCommand]) -> Self {
         let mut taken: HashSet<String> = builtins
             .iter()
             .flat_map(|builtin| {
@@ -639,6 +673,33 @@ impl<'a> EffectiveCommandCatalog<'a> {
             effective_skills.push(SkillCommand { name, skill });
         }
         taken.extend(bare_counts.keys().cloned());
+        Self {
+            commands: effective_skills,
+            taken,
+        }
+    }
+
+    fn skill_exact(&self, name: &str) -> Option<&'a SkillInfo> {
+        self.commands
+            .iter()
+            .find(|command| command.name == name)
+            .map(|command| command.skill)
+    }
+}
+
+impl<'a> EffectiveCommandCatalog<'a> {
+    fn build(
+        skills: &'a [SkillInfo],
+        availability: CommandAvailability,
+        workflows: &'a [crate::session::workflow::registry::WorkflowListing],
+    ) -> Self {
+        let builtins: Vec<_> = BUILTIN_COMMANDS
+            .iter()
+            .chain(PROMPT_COMMANDS.iter())
+            .filter(|builtin| availability.allows(builtin.gate))
+            .collect();
+        let effective_skills = EffectiveSkillCatalog::build(skills, &builtins);
+        let taken = &effective_skills.taken;
         let effective_workflows = if availability.allows(BuiltinGate::WorkflowLaunches) {
             let mut counts: HashMap<String, usize> = HashMap::new();
             for workflow in workflows {
@@ -663,7 +724,7 @@ impl<'a> EffectiveCommandCatalog<'a> {
         };
         Self {
             builtins,
-            skills: effective_skills,
+            skills: effective_skills.commands,
             workflows: effective_workflows,
         }
     }
@@ -1211,9 +1272,64 @@ pub(super) async fn build_skill_information_for_refs(
     Some(build_skill_information(&skill_blocks, &refs))
 }
 
+/// Resolve one exact leading slash against only the child-visible skill catalog.
+///
+/// The caller must supply the same local availability snapshot used by child advertisement and prove the child can load skill content.
+/// No builtin, alias, workflow, or other dynamic command is dispatched here.
+pub(super) fn resolve_model_authored_skill(
+    prompt_blocks: Vec<acp::ContentBlock>,
+    command_name: &str,
+    args: &str,
+    skills: &[SkillInfo],
+    availability: CommandAvailability,
+    has_skill_loader: bool,
+) -> Result<Vec<acp::ContentBlock>, SlashCommandOutcome> {
+    let builtins: Vec<_> = BUILTIN_COMMANDS
+        .iter()
+        .chain(PROMPT_COMMANDS.iter())
+        .filter(|builtin| availability.allows(builtin.gate))
+        .collect();
+    let catalog = EffectiveSkillCatalog::build(skills, &builtins);
+    let Some(skill) = catalog.skill_exact(command_name) else {
+        return Ok(prompt_blocks);
+    };
+    if !has_skill_loader {
+        return Ok(prompt_blocks);
+    }
+    Err(SlashCommandOutcome::InvokeSkill {
+        blocks: prompt_blocks,
+        skills: vec![ParsedSkillRef {
+            name: command_name.to_string(),
+            args: args.to_string(),
+            skill_path: skill.path.clone(),
+            qualified_name: format_skill_name(skill),
+            plugin_name: skill.plugin_name.clone(),
+        }],
+    })
+}
+
+#[cfg(test)]
+pub(super) fn resolve(
+    prompt_blocks: Vec<acp::ContentBlock>,
+    skills: &[SkillInfo],
+    availability: CommandAvailability,
+    skill_rewrite: SkillSlashRewrite,
+    workflows: &[crate::session::workflow::registry::WorkflowListing],
+    loop_fire_mode: LoopFireMode,
+) -> Result<Vec<acp::ContentBlock>, SlashCommandOutcome> {
+    resolve_human_intent(
+        prompt_blocks,
+        skills,
+        availability,
+        skill_rewrite,
+        workflows,
+        loop_fire_mode,
+    )
+}
+
 /// Resolve prompt blocks as a slash command.
 /// `Ok(blocks)` = not a command, pass through. `Err(outcome)` = matched.
-pub(super) fn resolve(
+pub(super) fn resolve_human_intent(
     prompt_blocks: Vec<acp::ContentBlock>,
     skills: &[SkillInfo],
     availability: CommandAvailability,
@@ -1221,7 +1337,13 @@ pub(super) fn resolve(
     workflows: &[crate::session::workflow::registry::WorkflowListing],
     loop_fire_mode: LoopFireMode,
 ) -> Result<Vec<acp::ContentBlock>, SlashCommandOutcome> {
-    let Some((command_name, args)) = parse_slash_prefix(&prompt_blocks) else {
+    let crate::session::slash_authority::AuthorityResolution::HumanIntent { command_name, args } =
+        crate::session::slash_authority::resolve(
+            crate::session::InputAuthority::HumanIntent,
+            &prompt_blocks,
+            BUILTIN_COMMANDS,
+        )
+    else {
         return Ok(prompt_blocks);
     };
     let command_key = slash_key(command_name);
@@ -1389,6 +1511,86 @@ fn build_loop_prompt_blocks(args: &str, mode: LoopFireMode) -> Vec<acp::ContentB
 mod tests {
     use super::*;
     use xai_grok_tools::implementations::skills::types::SkillScope;
+
+    #[test]
+    fn resolve_model_authored_skill_requires_exact_child_catalog_name_and_loader() {
+        let skills = vec![make_skill("commit", true), make_skill("other", true)];
+
+        let outcome = super::resolve_model_authored_skill(
+            vec![text_block("/commit fix typo")],
+            "commit",
+            "fix typo",
+            &skills,
+            all_gated(),
+            true,
+        )
+        .unwrap_err();
+        let skill = first_skill(outcome);
+        assert_eq!(skill.name, "commit");
+        assert_eq!(skill.args, "fix typo");
+
+        for (name, has_skill_loader) in [
+            ("Commit", true),
+            ("local:commit", true),
+            ("missing", true),
+            ("commit", false),
+            ("always-approve", true),
+        ] {
+            assert!(
+                super::resolve_model_authored_skill(
+                    vec![text_block(&format!("/{name}"))],
+                    name,
+                    "",
+                    &skills,
+                    all_gated(),
+                    has_skill_loader,
+                )
+                .is_ok(),
+                "{name} with loader={has_skill_loader} must stay inert"
+            );
+        }
+
+        let colliding = vec![make_skill("compact", true)];
+        let outcome = super::resolve_model_authored_skill(
+            vec![text_block("/local:compact keep history")],
+            "local:compact",
+            "keep history",
+            &colliding,
+            all_gated(),
+            true,
+        )
+        .unwrap_err();
+        let skill = first_skill(outcome);
+        assert_eq!(skill.name, "local:compact");
+        assert_eq!(skill.args, "keep history");
+
+        let flush_skill = vec![make_skill("flush", true)];
+        let memory_off = CommandAvailability::default();
+        let advertised = available_commands(&flush_skill, memory_off, &[]);
+        assert!(advertised.iter().any(|command| command.name == "flush"));
+        assert!(
+            super::resolve_model_authored_skill(
+                vec![text_block("/flush")],
+                "flush",
+                "",
+                &flush_skill,
+                memory_off,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            super::resolve_model_authored_skill(
+                vec![text_block("/local:flush")],
+                "local:flush",
+                "",
+                &flush_skill,
+                memory_off,
+                true,
+            )
+            .is_ok()
+        );
+    }
 
     /// Shadows [`super::resolve`] for the cases that route something other
     /// than `/loop`: they are indifferent to the fire mode, and pinning it
@@ -2533,6 +2735,73 @@ mod tests {
         assert_eq!(skill.plugin_name.as_deref(), Some("acme"));
     }
     #[test]
+    fn fork_pager_collisions_preserve_qualified_skills_and_model_authority() {
+        for name in [
+            "plugin",
+            "cache",
+            "cache-status",
+            "prompt-cache",
+            "workflow",
+            "add-dir",
+            "remove-dir",
+        ] {
+            let skills = vec![make_plugin_skill(name, "acme")];
+            let qualified = format!("acme:{name}");
+            let commands = available_commands(&skills, all_gated(), &[]);
+            assert!(commands.iter().any(|command| command.name == qualified));
+            assert!(
+                commands
+                    .iter()
+                    .filter(|command| command.name == name)
+                    .all(|command| command.meta.is_none()),
+                "{name} must not advertise a bare colliding skill"
+            );
+            assert!(
+                !matches!(
+                    resolve(
+                        vec![text_block(&format!("/{name}"))],
+                        &skills,
+                        all_gated(),
+                        SkillSlashRewrite::default(),
+                        &[],
+                    ),
+                    Err(SlashCommandOutcome::InvokeSkill { .. })
+                ),
+                "{name} must not resolve to a bare colliding skill"
+            );
+            let outcome = resolve(
+                vec![text_block(&format!("/{qualified} now"))],
+                &skills,
+                all_gated(),
+                SkillSlashRewrite::default(),
+                &[],
+            )
+            .unwrap_err();
+            let skill = first_skill(outcome);
+            assert_eq!(skill.name, qualified);
+            assert_eq!(skill.args, "now");
+            for (command, has_skill_loader, should_resolve) in [
+                (name, true, false),
+                (qualified.as_str(), false, false),
+                (qualified.as_str(), true, true),
+            ] {
+                let outcome = super::resolve_model_authored_skill(
+                    vec![text_block(&format!("/{command} now"))],
+                    command,
+                    "now",
+                    &skills,
+                    all_gated(),
+                    has_skill_loader,
+                );
+                assert_eq!(
+                    matches!(outcome, Err(SlashCommandOutcome::InvokeSkill { .. })),
+                    should_resolve,
+                    "{command} with loader={has_skill_loader} must respect the child catalog"
+                );
+            }
+        }
+    }
+    #[test]
     fn inspect_reserved_names_exclude_gated_shell_builtins() {
         assert!(super::is_reserved_slash_name("login"));
         assert!(super::is_reserved_slash_name("Login"));
@@ -3170,6 +3439,9 @@ mod tests {
         for (args, want_id, want_op) in [
             ("resume", "", "resume"),
             ("pause", "", "pause"),
+            ("runs", "", "runs"),
+            ("RUNS", "", "runs"),
+            ("  runs  ", "", "runs"),
             ("wf_12ab pause", "wf_12ab", "pause"),
             ("pause wf_12ab", "wf_12ab", "pause"),
             ("SAVE wf_12ab", "wf_12ab", "save"),
@@ -3192,6 +3464,7 @@ mod tests {
                 r#"{"pr": 243776}"#,
             ),
             ("pr-review", "pr-review", ""),
+            ("runs audit this", "runs", "audit this"),
             (
                 "deep-research rust pitfalls",
                 "deep-research",

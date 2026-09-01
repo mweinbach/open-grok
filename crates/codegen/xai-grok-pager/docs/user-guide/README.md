@@ -53,3 +53,5 @@ Automate, script, and integrate Grok Build with other systems.
 | 23 | [Agent Dashboard](23-dashboard.md) | Central overview of local sessions and forks |
 | 24 | [Monitoring Usage (External OpenTelemetry)](24-monitoring-usage.md) | Customer OTEL export |
 | 25 | [Session Collaboration Across Terminals](25-session-collaboration.md) | Session bus: list, read, and message other live Open Grok sessions |
+| 26 | [Status Line](25-status-line.md) | Built-in items and custom command-driven status output |
+| 27 | [Clone a Repository](27-clone.md) | Git-backed shallow clones, sparse checkout, and optional Grove integration |

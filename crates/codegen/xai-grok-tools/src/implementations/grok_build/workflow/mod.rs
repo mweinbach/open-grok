@@ -5,7 +5,56 @@ use super::task::types::SubagentDepthCounter;
 
 pub use xai_grok_tools_api::slash_commands::WORKFLOW_TOOL_NAME;
 
+pub fn workflow_tool_short_name(id: &str) -> &str {
+    id.rsplit(':').next().unwrap_or(id)
+}
+
+pub fn is_workflow_tool_id(id: &str) -> bool {
+    workflow_tool_short_name(id) == WORKFLOW_TOOL_NAME
+}
+
+pub fn is_workflow_tool(kind: Option<ToolKind>, id: &str) -> bool {
+    kind == Some(ToolKind::Workflow) || is_workflow_tool_id(id)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowSource {
+    Name { name: String },
+    Script { script: String },
+    ScriptPath { script_path: String },
+    Resume { resume_from_run_id: String },
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct WorkflowToolInputWire {
+    #[schemars(required)]
+    source: Option<WorkflowSource>,
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 1024))]
+    agent_budget: Option<u64>,
+    #[serde(default)]
+    args: Option<serde_json::Value>,
+    #[serde(default)]
+    validate_only: bool,
+    #[serde(default)]
+    resume_note: Option<String>,
+    #[serde(default)]
+    #[schemars(skip)]
+    name: Option<String>,
+    #[serde(default)]
+    #[schemars(skip)]
+    script: Option<String>,
+    #[serde(default)]
+    #[schemars(skip)]
+    script_path: Option<String>,
+    #[serde(default)]
+    #[schemars(skip)]
+    resume_from_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(try_from = "WorkflowToolInputWire")]
 pub struct WorkflowToolInput {
     #[serde(default)]
     #[schemars(
@@ -53,6 +102,45 @@ pub struct WorkflowToolInput {
         description = "Run a path-specific smoke check without launching: validate metadata, compile the full script, and execute the single path selected by the supplied args and canned host results. It does not exercise every branch or prove live tools and agent outputs work."
     )]
     pub validate_only: bool,
+}
+
+impl TryFrom<WorkflowToolInputWire> for WorkflowToolInput {
+    type Error = String;
+
+    fn try_from(wire: WorkflowToolInputWire) -> Result<Self, Self::Error> {
+        let mut input = Self {
+            agent_budget: wire.agent_budget,
+            name: wire.name,
+            script: wire.script,
+            script_path: wire.script_path,
+            args: wire.args,
+            resume_from_run_id: wire.resume_from_run_id,
+            resume_note: wire.resume_note,
+            validate_only: wire.validate_only,
+        };
+        input.normalize();
+        if let Some(source) = wire.source {
+            if input.name.is_some()
+                || input.script.is_some()
+                || input.script_path.is_some()
+                || input.resume_from_run_id.is_some()
+            {
+                return Err(
+                    "`source` cannot be combined with legacy workflow source fields".into(),
+                );
+            }
+            match source {
+                WorkflowSource::Name { name } => input.name = Some(name),
+                WorkflowSource::Script { script } => input.script = Some(script),
+                WorkflowSource::ScriptPath { script_path } => input.script_path = Some(script_path),
+                WorkflowSource::Resume { resume_from_run_id } => {
+                    input.resume_from_run_id = Some(resume_from_run_id);
+                }
+            }
+        }
+        input.validate()?;
+        Ok(input)
+    }
 }
 
 impl WorkflowToolInput {
@@ -120,6 +208,14 @@ impl WorkflowToolInput {
         .filter(|v| **v)
         .count();
         if present(&self.resume_from_run_id) {
+            if self.args.is_some() {
+                return Err(
+                    "resume uses immutable source and arguments; do not provide `args`".into(),
+                );
+            }
+            if self.validate_only {
+                return Err("`validate_only` cannot be used when resuming a run".into());
+            }
             return match sources {
                 0 => Ok(()),
                 _ => Err(
@@ -208,7 +304,7 @@ impl crate::types::tool_metadata::ToolMetadata for WorkflowTool {
     }
 
     fn description_template(&self) -> &str {
-        r##"Launch a workflow: a Rhai script that orchestrates subagents as one background run. Provide exactly one source: `name` (a registered workflow — built-in, or from the project `.opengrok/workflows/` or user `~/.opengrok/workflows/`), an inline `script`, or a `script_path`. Optionally pass `args` (bound to the script's `args`) and `agent_budget`, an absolute cap on cumulative child-agent calls: every agent() and parallel() item consumes one slot (schema retries do not); default 128. The host also caps live children per run (32 by default, host-configured) — larger parallel() panels are queued and still act as a barrier. The call returns immediately; progress appears in `/workflows`${%- if system_reminders_enabled %} and completion is reported automatically — do not poll or sleep-wait${%- endif %}.
+        r##"Launch a workflow: a Rhai script that orchestrates subagents as one background run. Provide exactly one tagged `source`: `type: "name"` with a registered `name`, `type: "script"` with an inline `script`, `type: "script_path"` with a `script_path`, or `type: "resume"` with `resume_from_run_id`. Registered workflows come from built-ins, project `.opengrok/workflows/`, or user `~/.opengrok/workflows/`. Optionally pass `args` (bound to the script's `args`) and `agent_budget`, an absolute cap on cumulative child-agent calls: every agent() and parallel() item consumes one slot (schema retries do not); default 128. The host also caps live children per run (32 by default, host-configured) — larger parallel() panels are queued and still act as a barrier. The call returns immediately; progress appears in `/workflow runs`${%- if system_reminders_enabled %} and completion is reported automatically — do not poll or sleep-wait${%- endif %}.
 
 
 Prefer a registered workflow when one fits; author a script for bounded fan-out over a known work list, staged research and verification, or several independent perspectives. Before writing or editing a script, read the `create-workflow` skill's SKILL.md. `validate_only: true` runs a path-specific smoke check (metadata, compile, one canned-host path) — not proof that every branch or live tool works.
@@ -323,7 +419,7 @@ impl xai_tool_runtime::Tool for WorkflowTool {
                         .unwrap_or_default();
                     format!(
                         "Workflow '{name}' started in the background. Progress appears in \
-                         /workflows and completion is reported automatically. '{name}' is the \
+                         /workflow runs and completion is reported automatically. '{name}' is the \
                          session-unique display handle for user-facing status and /workflow \
                          management; keep the structured run id internal.{iterate}"
                     )
@@ -363,6 +459,96 @@ impl xai_tool_runtime::Tool for WorkflowTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tagged_source_keeps_legacy_launch_and_escalation_compatibility() {
+        let named: WorkflowToolInput = serde_json::from_value(serde_json::json!({
+            "source": {"type": "name", "name": "deep-research"},
+            "agent_budget": 32,
+        }))
+        .unwrap();
+        assert_eq!(named.name.as_deref(), Some("deep-research"));
+        let legacy: WorkflowToolInput = serde_json::from_value(serde_json::json!({
+            "name": "deep-research",
+        }))
+        .unwrap();
+        assert_eq!(legacy.name, named.name);
+        let resume: WorkflowToolInput = serde_json::from_value(serde_json::json!({
+            "source": {"type": "resume", "resume_from_run_id": "wf_resume"},
+            "resume_note": "The blocked dependency is available.",
+        }))
+        .unwrap();
+        assert_eq!(resume.resume_from_run_id.as_deref(), Some("wf_resume"));
+        assert!(resume.resume_note.is_some());
+        for invalid in [
+            serde_json::json!({"source": {"type": "name", "name": "deep-research"}, "script": "complete(1);"}),
+            serde_json::json!({"source": {"type": "name", "name": ""}}),
+            serde_json::json!({"source": {"type": "resume", "resume_from_run_id": "wf_resume"}, "args": {}}),
+            serde_json::json!({"source": {"type": "resume", "resume_from_run_id": "wf_resume"}, "validate_only": true}),
+            serde_json::json!({"name": "deep-research", "script": "complete(1);"}),
+        ] {
+            assert!(serde_json::from_value::<WorkflowToolInput>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn workflow_schema_requires_tagged_source_and_keeps_resume_note() {
+        let schema = crate::registry::types::generate_schema::<WorkflowToolInput>();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("source"));
+        assert!(properties.contains_key("resume_note"));
+        for legacy_field in ["name", "script", "script_path", "resume_from_run_id"] {
+            assert!(!properties.contains_key(legacy_field));
+        }
+        assert_eq!(schema["required"], serde_json::json!(["source"]));
+        let source = &properties["source"];
+        let variants = source["oneOf"]
+            .as_array()
+            .expect("source must be a tagged union");
+        assert_eq!(variants.len(), 4);
+        for (tag, field) in [
+            ("name", "name"),
+            ("script", "script"),
+            ("script_path", "script_path"),
+            ("resume", "resume_from_run_id"),
+        ] {
+            let variant = variants
+                .iter()
+                .find(|variant| {
+                    let discriminator = &variant["properties"]["type"];
+                    discriminator["const"] == tag
+                        || discriminator["enum"] == serde_json::json!([tag])
+                })
+                .unwrap_or_else(|| panic!("missing source variant {tag}: {source}"));
+            assert_eq!(variant["type"], "object");
+            assert_eq!(variant["additionalProperties"], false);
+            let required = variant["required"].as_array().unwrap();
+            assert_eq!(required.len(), 2);
+            assert!(required.iter().any(|value| value == "type"));
+            assert!(required.iter().any(|value| value == field));
+            assert_eq!(variant["properties"][field]["type"], "string");
+        }
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"source": null}),
+            serde_json::json!({"source": {"name": "deep-research"}}),
+            serde_json::json!({"source": {"type": "unknown", "name": "deep-research"}}),
+            serde_json::json!({"source": {"type": "name"}}),
+            serde_json::json!({"source": {"type": "name", "name": "deep-research", "script": "complete(1);"}}),
+        ] {
+            assert!(
+                serde_json::from_value::<WorkflowToolInput>(invalid.clone()).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_detection_includes_kindless_ids() {
+        assert!(is_workflow_tool(None, "GrokBuild:workflow"));
+        assert!(is_workflow_tool(Some(ToolKind::Workflow), "custom-name"));
+        assert!(!is_workflow_tool(None, "workflow_other"));
+    }
 
     #[test]
     fn validation_requires_exactly_one_source_and_bounded_positive_budget() {

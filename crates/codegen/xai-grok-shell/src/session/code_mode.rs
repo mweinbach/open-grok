@@ -90,6 +90,7 @@ pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
             | "kill_command_or_subagent"
             | "list_agents"
             | "send_message"
+            | "send_subagent_message"
             | "followup_task"
             | "wait_agent"
             | "list_sessions"
@@ -1930,6 +1931,7 @@ mod tests {
             "kill_command_or_subagent",
             "list_agents",
             "send_message",
+            "send_subagent_message",
             "followup_task",
             "wait_agent",
         ] {

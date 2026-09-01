@@ -6,6 +6,7 @@ license = "Apache-2.0"
 authors = ["xAI"]
 
 [dependencies]
+xai-dirs = { path = "../xai-dirs" }
 # TTY safety — detach subprocesses from the controlling terminal
 dunce = { workspace = true }
 xai-tty-utils = { workspace = true }
@@ -16,6 +17,7 @@ xai-prompt-queue = { workspace = true }
 
 # Presentation-primitives layer (extracted)
 xai-grok-pager-render = { path = "../xai-grok-pager-render" }
+xai-grok-dashboard-store = { path = "../xai-grok-dashboard-store" }
 
 # Rendering
 ratatui = { workspace = true, features = ["crossterm", "unstable-widget-ref"] }
@@ -100,7 +102,9 @@ xai-grok-config = { workspace = true }
 # (cpal is target-gated to non-Linux inside xai-grok-voice).
 xai-grok-voice = { path = "../xai-grok-voice", default-features = false, features = ["audio"] }
 xai-grok-shell = { workspace = true }
+xai-grok-status-line = { path = "../xai-grok-status-line" }
 xai-grok-workspace = { workspace = true }
+xai-grok-hooks = { path = "../xai-grok-hooks" }
 # Foreign coding-agent session discovery.
 xai-grok-foreign-sessions = { workspace = true }
 xai-token-estimation = { workspace = true }
@@ -166,6 +170,7 @@ core-foundation = { workspace = true }
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
+xai-grok-status-line = { path = "../xai-grok-status-line", features = ["test-support"] }
 xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }
 xai-grok-shell = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }

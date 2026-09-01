@@ -6,6 +6,7 @@ version = "0.1.220-alpha.4"
 description = "Grok tools library"
 
 [dependencies]
+zstd = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 dirs = { workspace = true }
@@ -117,6 +118,7 @@ xai-grok-test-support = { workspace = true }
 xai-test-utils = { workspace = true }
 
 [build-dependencies]
+zstd = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 flate2 = { workspace = true }
 sha2 = { workspace = true }

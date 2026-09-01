@@ -7,6 +7,11 @@ use crate::app::app_view::InputOutcome;
 use crate::key;
 use crate::scrollback::ScrollbackSearchState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+pub(crate) enum DockWatcherId {
+    Monitor(String),
+    Loop(String),
+}
+
 impl AgentView {
     /// Scrollback-focused key handling.
     ///
@@ -306,6 +311,228 @@ impl AgentView {
             InputOutcome::Changed
         } else {
             InputOutcome::Unchanged
+        }
+    }
+    pub(crate) fn dock_subagent_rows(&self) -> Vec<(String, String, crate::views::dock::DockRow)> {
+        let mut infos: Vec<&crate::app::subagent::SubagentInfo> = self
+            .subagent_sessions
+            .values()
+            .filter(|info| info.is_running() && info.workflow_run_id.is_none())
+            .collect();
+        infos.sort_by_key(|info| info.started_at);
+        infos
+            .into_iter()
+            .map(|info| {
+                let (kind, description) = crate::app::subagent::format_subagent_label(info);
+                let mut meta = String::new();
+                if let Some(model) = info.model.as_deref().filter(|text| !text.is_empty()) {
+                    meta.push_str(model);
+                    meta.push(' ');
+                }
+                meta.push_str(&crate::views::dock::fmt_elapsed(info.elapsed().as_secs()));
+                (
+                    info.child_session_id.to_string(),
+                    info.subagent_id.to_string(),
+                    crate::views::dock::DockRow {
+                        kind,
+                        description,
+                        activity: info.activity_label.clone(),
+                        meta,
+                        killable: !info.pending_kill,
+                    },
+                )
+            })
+            .collect()
+    }
+    pub(crate) fn dock_task_rows(&self) -> Vec<(String, crate::views::dock::DockRow)> {
+        let mut tasks: Vec<&crate::app::agent::BgTaskState> = self
+            .session
+            .bg_tasks
+            .values()
+            .filter(|task| {
+                task.status == crate::app::agent::BgTaskStatus::Running && !task.is_monitor
+            })
+            .collect();
+        tasks.sort_by_key(|task| task.start_time);
+        tasks
+            .into_iter()
+            .map(|task| {
+                let description = task
+                    .description
+                    .clone()
+                    .filter(|description| !description.is_empty())
+                    .unwrap_or_else(|| task.command.clone());
+                let elapsed = task.start_time.elapsed().unwrap_or_default().as_secs();
+                (
+                    task.task_id.clone(),
+                    crate::views::dock::DockRow {
+                        kind: "Run".into(),
+                        description,
+                        activity: None,
+                        meta: crate::views::dock::fmt_elapsed(elapsed),
+                        killable: !task.pending_kill,
+                    },
+                )
+            })
+            .collect()
+    }
+    pub(crate) fn dock_watcher_rows(&self) -> Vec<(DockWatcherId, crate::views::dock::DockRow)> {
+        let mut monitors: Vec<&crate::app::agent::BgTaskState> = self
+            .session
+            .bg_tasks
+            .values()
+            .filter(|task| {
+                task.status == crate::app::agent::BgTaskStatus::Running && task.is_monitor
+            })
+            .collect();
+        monitors.sort_by_key(|task| task.start_time);
+        let mut rows: Vec<(DockWatcherId, crate::views::dock::DockRow)> = monitors
+            .into_iter()
+            .map(|task| {
+                let description = task
+                    .description
+                    .clone()
+                    .filter(|description| !description.is_empty())
+                    .unwrap_or_else(|| task.command.clone());
+                let elapsed = task.start_time.elapsed().unwrap_or_default().as_secs();
+                (
+                    DockWatcherId::Monitor(task.task_id.clone()),
+                    crate::views::dock::DockRow {
+                        kind: "Monitor".into(),
+                        description,
+                        activity: None,
+                        meta: crate::views::dock::fmt_elapsed(elapsed),
+                        killable: !task.pending_kill,
+                    },
+                )
+            })
+            .collect();
+        let mut loops: Vec<&crate::app::agent::ScheduledTaskInfo> =
+            self.session.scheduled_tasks.values().collect();
+        loops.sort_by_key(|text| text.created_at);
+        rows.extend(loops.into_iter().map(|text| {
+            (
+                DockWatcherId::Loop(text.task_id.clone()),
+                crate::views::dock::DockRow {
+                    kind: "Loop".into(),
+                    description: text.prompt.clone(),
+                    activity: None,
+                    meta: text.human_schedule.clone(),
+                    killable: true,
+                },
+            )
+        }));
+        rows
+    }
+    pub(crate) fn dock_counts(&self) -> crate::views::dock::DockCounts {
+        use crate::app::agent::BgTaskStatus;
+        let running_bg = |monitor: bool| {
+            self.session
+                .bg_tasks
+                .values()
+                .filter(move |task| {
+                    task.status == BgTaskStatus::Running && task.is_monitor == monitor
+                })
+                .count()
+        };
+        crate::views::dock::DockCounts {
+            subagents: self
+                .subagent_sessions
+                .values()
+                .filter(|text| text.is_running() && text.workflow_run_id.is_none())
+                .count(),
+            tasks: running_bg(false),
+            watchers: running_bg(true) + self.session.scheduled_tasks.len(),
+            queued: self.visible_held_queue_len(),
+            subagents_expanded: self.dock_subagents_expanded,
+            tasks_expanded: self.dock_tasks_expanded,
+            watchers_expanded: self.dock_watchers_expanded,
+        }
+    }
+    pub(crate) fn dock_items(&self) -> Vec<crate::views::dock::DockItem> {
+        crate::views::dock::items(&self.dock_counts())
+    }
+    pub(crate) fn dock_activate(&mut self, item: crate::views::dock::DockItem) -> InputOutcome {
+        use crate::views::dock::{DockItem, Section};
+        match item {
+            DockItem::Header(Section::Subagents) => {
+                self.dock_subagents_expanded = !self.dock_subagents_expanded;
+                InputOutcome::Changed
+            }
+            DockItem::Header(Section::Tasks) => {
+                self.dock_tasks_expanded = !self.dock_tasks_expanded;
+                InputOutcome::Changed
+            }
+            DockItem::Header(Section::Watchers) => {
+                self.dock_watchers_expanded = !self.dock_watchers_expanded;
+                InputOutcome::Changed
+            }
+            DockItem::Header(Section::Queued) => {
+                self.dock_queued_expanded = !self.dock_queued_expanded;
+                InputOutcome::Changed
+            }
+            DockItem::Row(Section::Subagents, index) => {
+                if let Some((child_sid, _, _)) = self.dock_subagent_rows().get(index) {
+                    let sid = child_sid.clone();
+                    self.open_subagent_fullscreen(sid);
+                    InputOutcome::Changed
+                } else {
+                    InputOutcome::Unchanged
+                }
+            }
+            DockItem::Row(..) => InputOutcome::Unchanged,
+        }
+    }
+    pub(super) fn handle_dock_key(&mut self, key: &KeyEvent) -> InputOutcome {
+        use crate::views::dock::{DockItem, Section};
+        use crossterm::event::KeyCode;
+        let items = self.dock_items();
+        if items.is_empty() {
+            self.set_active_pane(AgentPane::Scrollback, false);
+            return InputOutcome::Changed;
+        }
+        self.dock_cursor = self.dock_cursor.min(items.len() - 1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.dock_cursor = self.dock_cursor.saturating_sub(1);
+                InputOutcome::Changed
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.dock_cursor = (self.dock_cursor + 1).min(items.len() - 1);
+                InputOutcome::Changed
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.dock_activate(items[self.dock_cursor]),
+            KeyCode::Char('x') => match items[self.dock_cursor] {
+                DockItem::Row(Section::Subagents, index) => self
+                    .dock_subagent_rows()
+                    .get(index)
+                    .map_or(InputOutcome::Unchanged, |(_, subagent_id, _)| {
+                        InputOutcome::Action(Action::KillSubagent(subagent_id.clone()))
+                    }),
+                DockItem::Row(Section::Tasks, index) => self
+                    .dock_task_rows()
+                    .get(index)
+                    .map_or(InputOutcome::Unchanged, |(task_id, _)| {
+                        InputOutcome::Action(Action::KillBgTask(task_id.clone()))
+                    }),
+                DockItem::Row(Section::Watchers, index) => {
+                    match self.dock_watcher_rows().get(index) {
+                        Some((DockWatcherId::Monitor(task_id), _)) => {
+                            InputOutcome::Action(Action::KillBgTask(task_id.clone()))
+                        }
+                        Some((DockWatcherId::Loop(task_id), _)) => {
+                            InputOutcome::Action(Action::CancelScheduledTask(task_id.clone()))
+                        }
+                        None => InputOutcome::Unchanged,
+                    }
+                }
+                DockItem::Row(Section::Queued, _) | DockItem::Header(_) => InputOutcome::Unchanged,
+            },
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.set_active_pane(AgentPane::Scrollback, false);
+                InputOutcome::Changed
+            }
+            _ => InputOutcome::Unchanged,
         }
     }
     /// Bg-task-pane-focused key handling.
@@ -666,6 +893,7 @@ impl AgentView {
             ActivePane::Catalog => {
                 self.catalog.handle_scroll(lines, col, row);
             }
+            ActivePane::Dock => {}
             ActivePane::Prompt => {
                 if self.question_view.is_some() {
                     return;
@@ -686,6 +914,76 @@ impl AgentView {
         }
     }
 }
+#[cfg(test)]
+mod dock_tests {
+    use super::super::test_fixtures::{make_agent, running_subagent_info};
+    use super::*;
+    use crate::views::dock::{DockItem, Section};
+
+    #[test]
+    fn dock_loop_delete_uses_full_id_and_preserves_draft() {
+        let mut agent = make_agent();
+        let task_id = "01a05a72-5119-74f3-bc9e-d2607cdb8235";
+        agent.prompt.set_text("unfinished native-agent request");
+        agent.session.scheduled_tasks.insert(
+            task_id.to_string(),
+            crate::app::agent::ScheduledTaskInfo {
+                task_id: task_id.to_string(),
+                prompt: "check CI".to_string(),
+                human_schedule: "every 5m".to_string(),
+                created_at: std::time::Instant::now(),
+                next_fire_at: None,
+                tag: "loop".to_string(),
+                last_subagent_id: None,
+            },
+        );
+        agent.dock_watchers_expanded = true;
+        let items = agent.dock_items();
+        agent.dock_cursor = items
+            .iter()
+            .position(|item| *item == DockItem::Row(Section::Watchers, 0))
+            .unwrap();
+        let outcome = agent.handle_dock_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::CancelScheduledTask(id)) if id == task_id)
+        );
+        assert_eq!(agent.prompt.text(), "unfinished native-agent request");
+    }
+
+    #[test]
+    fn dock_headers_toggle_without_cancelling_and_rows_keep_native_agents() {
+        let mut agent = make_agent();
+        let standalone = running_subagent_info("native-child");
+        let mut workflow_child = running_subagent_info("workflow-child");
+        workflow_child.workflow_run_id = Some("workflow-run".into());
+        agent
+            .subagent_sessions
+            .insert("native-child".to_string(), standalone);
+        agent
+            .subagent_sessions
+            .insert("workflow-child".to_string(), workflow_child);
+        let rows = agent.dock_subagent_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "native-child");
+        assert_eq!(agent.dock_counts().subagents, rows.len());
+        agent.dock_subagents_expanded = true;
+        assert!(matches!(
+            agent.dock_activate(DockItem::Header(Section::Subagents)),
+            InputOutcome::Changed
+        ));
+        assert!(!agent.dock_subagents_expanded);
+        assert_eq!(
+            agent.dock_items(),
+            vec![DockItem::Header(Section::Subagents)]
+        );
+        agent.dock_cursor = 0;
+        assert!(matches!(
+            agent.handle_dock_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            InputOutcome::Unchanged
+        ));
+    }
+}
+
 #[cfg(test)]
 mod scroll_granularity_tests {
     use super::super::test_fixtures::make_agent;

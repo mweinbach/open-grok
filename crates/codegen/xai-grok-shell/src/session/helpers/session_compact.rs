@@ -20,8 +20,7 @@ use xai_grok_sampler::SamplerConfig as SamplingConfig;
 /// `<summary_request>` only -- the surrounding `<user_query>` is implicit
 /// because we push this as a `ConversationItem::user`.
 ///
-/// All other agents (grok-build, etc.) continue to use the detailed
-/// structured prompt built inline in `generate_session_compact`.
+/// All other agents (grok-build, etc.) continue to use the detailed structured prompt built inline in `generate_session_compact`.
 pub(crate) const SELF_SUMMARIZATION_PROMPT: &str = r#"<summary_request>
 Please summarize the conversation so far. This summary (everything after your
 thinking) will be provided to another AI assistant to continue working on the
@@ -39,45 +38,106 @@ your response.
 /// retries without re-parsing free-form error strings.
 #[derive(Debug)]
 pub(crate) enum CompactFailure {
-    /// Retrying the same payload will hit the same failure. The retry loop
-    /// in `run_compact_inner` should bail without sleeping or re-issuing.
+    /// Retrying the same payload will hit the same failure.
+    /// The retry loop in `run_compact_inner` should bail without sleeping or re-issuing.
     Deterministic(acp::Error),
+    /// Deterministic size overflow: the same payload cannot help, but a
+    /// smaller one can — the caller steps down its input ladder.
+    Overflow(acp::Error),
     /// Failure may resolve on retry. The caller follows its existing
     /// N-attempt + backoff loop.
     Transient(acp::Error),
     /// User/stop cancelled the in-flight compact. Do not retry or suppress AUTO.
     Cancelled,
 }
-/// Stable error payload for a user-cancelled compact (pager + retry loop).
-pub(crate) const COMPACT_CANCELLED_MSG: &str = "compact cancelled";
+
+/// Stable cancel payload; the pager matches it to route manual `/compact` to "Compaction cancelled." instead of a failure.
+pub const COMPACT_CANCELLED_MSG: &str = "compact cancelled";
+
+/// Stamped on every compaction failure payload; the user-facing normalizer strips it.
+pub(crate) const COMPACT_FAILED_PREFIX: &str = "compact failed: ";
+
+/// Cancel-vs-failure discriminator in the compact RPC error's `data` (`{"kind": …, "message": …}`).
+/// The pager routes on this, never the message text (upstream bodies can echo the cancel phrase).
+/// The protocol's `RequestCancelled` code is feature-gated unstable and cancel-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactErrorKind {
+    Cancelled,
+    Failed,
+}
+
+impl CompactErrorKind {
+    fn wire(self) -> &'static str {
+        match self {
+            CompactErrorKind::Cancelled => "compact_cancelled",
+            CompactErrorKind::Failed => "compact_failed",
+        }
+    }
+
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "compact_cancelled" => Some(Self::Cancelled),
+            "compact_failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Byte cap (truncation marker included) on the user-facing compaction error detail.
+pub(crate) const COMPACT_ERROR_DETAIL_MAX_BYTES: usize = 300;
+
+/// The one normalize sequence for user-facing compaction error details: single-line, scrub service names, cap.
+/// Idempotent, so the wire chokepoint below can re-run it on pre-normalized text.
+/// URLs stay: for custom-endpoint users the URL is the diagnosis.
+pub(crate) fn normalize_compact_detail(raw: &str) -> String {
+    let single_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let scrubbed = crate::sampling::error::rewrite_service_names(&single_line);
+    xai_grok_tools::util::truncate_str_with_marker(&scrubbed, COMPACT_ERROR_DETAIL_MAX_BYTES)
+        .into_owned()
+}
+
+/// Typed compact-error `data` payload.
+/// `message` is the key [`crate::sampling::error::error_detail_from_data`] reads first, so text-only consumers see the plain detail.
+/// Normalized here at the wire boundary: typed-kind pagers render it verbatim, so no producer can ship raw upstream text.
+/// Prefix-stripping stays producer-side.
+pub fn compact_error_data(kind: CompactErrorKind, message: &str) -> serde_json::Value {
+    serde_json::json!({ "kind": kind.wire(), "message": normalize_compact_detail(message) })
+}
+
+/// Read the typed discriminator back.
+/// `None` for payloads from shells that predate it (bare strings) or for foreign shapes.
+pub fn compact_error_kind(err: &acp::Error) -> Option<CompactErrorKind> {
+    CompactErrorKind::from_wire(err.data.as_ref()?.get("kind")?.as_str()?)
+}
+
 impl CompactFailure {
     pub(crate) fn cancelled_error() -> acp::Error {
-        acp::Error::internal_error().data(COMPACT_CANCELLED_MSG)
+        acp::Error::internal_error().data(compact_error_data(
+            CompactErrorKind::Cancelled,
+            COMPACT_CANCELLED_MSG,
+        ))
     }
 }
 pub(crate) use xai_grok_sampling_types::is_context_length_error;
 /// Classify an upstream `SamplingError` for the compaction retry loop.
 ///
-/// `Auth`, `InvalidConfiguration`, `Serialization` and
-/// `IdleTimeout` are all deterministic by construction (re-issuing the same
-/// request cannot change the outcome — auth state, config, payload shape,
-/// and stuck-model conditions all persist). 4xx API responses other than
-/// 408 (timeout) and 429 (rate limit) are likewise deterministic. Network
-/// transport errors, stream-level blips, and 5xx responses are transient.
+/// Size overflows (HTTP 413 by status, or size-worded error text) classify as [`CompactFailure::Overflow`] so the caller's input ladder engages.
+/// `Auth`, `InvalidConfiguration`, `Serialization` and `IdleTimeout` are all deterministic by construction.
+/// Re-issuing the same request cannot change the outcome: auth state, config, payload shape, and stuck-model conditions all persist.
 fn classify_sampling_error(err: SamplingError) -> CompactFailure {
-    let acp_err = acp::Error::internal_error().data(format!("compact failed: {err}"));
+    let acp_err = acp::Error::internal_error().data(format!("{COMPACT_FAILED_PREFIX}{err}"));
+    if err.is_payload_too_large() || err.is_context_length_error() {
+        return CompactFailure::Overflow(acp_err);
+    }
     let deterministic = match &err {
         SamplingError::Auth { .. }
         | SamplingError::InvalidConfiguration(_)
         | SamplingError::Serialization(_)
         | SamplingError::IdleTimeout { .. } => true,
-        SamplingError::Api {
-            status, message, ..
-        } => {
-            is_context_length_error(message)
-                || (status.is_client_error()
-                    && *status != StatusCode::REQUEST_TIMEOUT
-                    && *status != StatusCode::TOO_MANY_REQUESTS)
+        SamplingError::Api { status, .. } => {
+            status.is_client_error()
+                && *status != StatusCode::REQUEST_TIMEOUT
+                && *status != StatusCode::TOO_MANY_REQUESTS
         }
         SamplingError::MaxTokensTruncation => true,
         SamplingError::Http(_)
@@ -98,16 +158,18 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
 /// `code` is the structured `code` field on the event (typically a numeric
 /// HTTP status as a string, but Anthropic also uses error-type strings like
 /// `"invalid_request_error"`). `message` is the human-readable detail.
-///
-/// Numeric codes are classified by HTTP-status range. The Anthropic
-/// `invalid_request_error` marker, which can appear in either field, always
-/// maps to `Deterministic` (schema violations cannot be fixed by re-sending
-/// the same payload).
 fn classify_response_event_error(code: Option<&str>, message: &str) -> CompactFailure {
     let acp_err = acp::Error::internal_error().data(match code {
-        Some(c) => format!("compact failed: {c}: {message}"),
-        None => format!("compact failed: {message}"),
+        Some(c) => format!("{COMPACT_FAILED_PREFIX}{c}: {message}"),
+        None => format!("{COMPACT_FAILED_PREFIX}{message}"),
     });
+
+    if code.is_some_and(xai_grok_sampling_types::is_size_overflow_error_code)
+        || is_context_length_error(message)
+    {
+        return CompactFailure::Overflow(acp_err);
+    }
+
     if matches!(code, Some("invalid_request_error")) || message.contains("invalid_request_error") {
         return CompactFailure::Deterministic(acp_err);
     }
@@ -118,9 +180,7 @@ fn classify_response_event_error(code: Option<&str>, message: &str) -> CompactFa
     {
         return CompactFailure::Deterministic(acp_err);
     }
-    if is_context_length_error(message) {
-        return CompactFailure::Deterministic(acp_err);
-    }
+
     CompactFailure::Transient(acp_err)
 }
 /// Build the chat history that will be sent to the compaction model.
@@ -239,8 +299,17 @@ pub(crate) struct CompactOutput {
     pub delta_count: u64,
     pub itl_max_ms: Option<u64>,
 }
-/// Structured compaction outcome. Converted to a stable string only at the
-/// tracing boundary (tracing can't record a custom type directly).
+
+impl CompactOutput {
+    pub(crate) fn model_wait_ms(&self) -> Option<u64> {
+        match (self.ttft_ms, self.stream_ms) {
+            (None, None) => None,
+            (ttft, stream) => Some(ttft.unwrap_or(0).saturating_add(stream.unwrap_or(0))),
+        }
+    }
+}
+
+/// Converted to a stable string only at the tracing boundary (tracing can't record a custom type directly).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactionOutcome {
     Success,
@@ -403,18 +472,15 @@ mod compact_cancel_await_tests {
 /// user message — use [`build_compaction_chat_history`] to construct it. The
 /// split lets callers persist the exact request payload before issuing it.
 ///
-/// `tools` / `hosted_tools` are the SAME effective definitions the turn loop
-/// attaches to normal requests. Tool definitions are serialized into the
-/// prompt prefix by every backend, so omitting them would shift the entire
-/// prefix and force a full prefill on the summarizer call — attaching them
-/// keeps the request prefix byte-identical to the turn requests so the
-/// engine reuses the session's KV cache (the whole point of the verbatim
-/// input path).
+/// `tools` / `hosted_tools` are the SAME effective definitions the turn loop attaches to normal requests.
+/// Tool definitions are serialized into the prompt prefix by every backend.
+/// Omitting them would shift the entire prefix and force a full prefill on the summarizer call.
+/// Attaching them keeps the request prefix byte-identical to the turn requests so the engine reuses the session's KV cache.
+/// That reuse is the whole point of the verbatim input path.
 ///
-/// Errors carry a [`CompactFailure`] classification so the caller can
-/// short-circuit retries on deterministic failures (4xx schema violations,
-/// auth errors) while still retrying transient ones (5xx,
-/// network blips, rate limits).
+/// Errors carry a [`CompactFailure`] classification.
+/// The caller can short-circuit retries on deterministic failures (4xx schema violations, auth errors).
+/// Transient ones (5xx, network blips, rate limits) still go through the retry loop.
 pub(crate) async fn generate_session_compact(
     chat_history: Vec<ConversationItem>,
     tools: Vec<ToolSpec>,
@@ -485,12 +551,9 @@ pub(crate) async fn generate_session_compact(
                     StreamStep::Item(item) => item,
                     StreamStep::Ended => break,
                     StreamStep::IdleTimeout => {
-                        return Err(
-                            CompactFailure::Transient(
-                                acp::Error::internal_error()
-                                    .data(
-                                        format!(
-                                "compact failed: stream idle timeout after {idle_timeout:?} ({} chars received)",
+                        return Err(CompactFailure::Transient(
+                            acp::Error::internal_error().data(format!(
+                                "{COMPACT_FAILED_PREFIX}stream idle timeout after {idle_timeout:?} ({} chars received)",
                                 content.chars().count()
                             ),
                                     ),
@@ -499,16 +562,11 @@ pub(crate) async fn generate_session_compact(
                     }
                 };
                 if wall_clock_budget_secs > 0 && timing.elapsed_secs() >= wall_clock_budget_secs {
-                    return Err(
-                        CompactFailure::Transient(
-                            acp::Error::internal_error()
-                                .data(
-                                    format!(
-                            "compact failed: exceeded wall-clock budget {wall_clock_budget_secs}s (runaway generation)"
-                        ),
-                                ),
-                        ),
-                    );
+                    return Err(CompactFailure::Transient(
+                        acp::Error::internal_error().data(format!(
+                            "{COMPACT_FAILED_PREFIX}exceeded wall-clock budget {wall_clock_budget_secs}s (runaway generation)"
+                        )),
+                    ));
                 }
                 match chunk_result {
                     Ok(chunk) => {
@@ -583,12 +641,9 @@ pub(crate) async fn generate_session_compact(
                     StreamStep::Item(item) => item,
                     StreamStep::Ended => break,
                     StreamStep::IdleTimeout => {
-                        return Err(
-                            CompactFailure::Transient(
-                                acp::Error::internal_error()
-                                    .data(
-                                        format!(
-                                "compact failed: stream idle timeout after {idle_timeout:?} ({} chars received)",
+                        return Err(CompactFailure::Transient(
+                            acp::Error::internal_error().data(format!(
+                                "{COMPACT_FAILED_PREFIX}stream idle timeout after {idle_timeout:?} ({} chars received)",
                                 content.chars().count()
                             ),
                                     ),
@@ -597,16 +652,11 @@ pub(crate) async fn generate_session_compact(
                     }
                 };
                 if wall_clock_budget_secs > 0 && timing.elapsed_secs() >= wall_clock_budget_secs {
-                    return Err(
-                        CompactFailure::Transient(
-                            acp::Error::internal_error()
-                                .data(
-                                    format!(
-                            "compact failed: exceeded wall-clock budget {wall_clock_budget_secs}s (runaway generation)"
-                        ),
-                                ),
-                        ),
-                    );
+                    return Err(CompactFailure::Transient(
+                        acp::Error::internal_error().data(format!(
+                            "{COMPACT_FAILED_PREFIX}exceeded wall-clock budget {wall_clock_budget_secs}s (runaway generation)"
+                        )),
+                    ));
                 }
                 match chunk_result {
                     Ok(chunk) => {
@@ -712,12 +762,9 @@ pub(crate) async fn generate_session_compact(
                     StreamStep::Item(item) => item,
                     StreamStep::Ended => break,
                     StreamStep::IdleTimeout => {
-                        return Err(
-                            CompactFailure::Transient(
-                                acp::Error::internal_error()
-                                    .data(
-                                        format!(
-                                "compact failed: stream idle timeout after {idle_timeout:?} ({} chars received)",
+                        return Err(CompactFailure::Transient(
+                            acp::Error::internal_error().data(format!(
+                                "{COMPACT_FAILED_PREFIX}stream idle timeout after {idle_timeout:?} ({} chars received)",
                                 content.chars().count()
                             ),
                                     ),
@@ -726,16 +773,11 @@ pub(crate) async fn generate_session_compact(
                     }
                 };
                 if wall_clock_budget_secs > 0 && timing.elapsed_secs() >= wall_clock_budget_secs {
-                    return Err(
-                        CompactFailure::Transient(
-                            acp::Error::internal_error()
-                                .data(
-                                    format!(
-                            "compact failed: exceeded wall-clock budget {wall_clock_budget_secs}s (runaway generation)"
-                        ),
-                                ),
-                        ),
-                    );
+                    return Err(CompactFailure::Transient(
+                        acp::Error::internal_error().data(format!(
+                            "{COMPACT_FAILED_PREFIX}exceeded wall-clock budget {wall_clock_budget_secs}s (runaway generation)"
+                        )),
+                    ));
                 }
                 match chunk_result {
                     Ok(event) => {
@@ -761,38 +803,11 @@ pub(crate) async fn generate_session_compact(
                             } => {
                                 if let Some(sr) = delta.stop_reason {
                                     truncated = matches!(
-                                    sr,
-                                    xai_grok_sampling_types::messages::StopReason::MaxTokens
-                                        | xai_grok_sampling_types::messages::StopReason::ModelContextWindowExceeded
-                                );
-                                    stop_reason = Some(
-                                        match sr {
-                                            xai_grok_sampling_types::messages::StopReason::EndTurn => {
-                                                "end_turn".to_string()
-                                            }
-                                            xai_grok_sampling_types::messages::StopReason::MaxTokens => {
-                                                "max_tokens".to_string()
-                                            }
-                                            xai_grok_sampling_types::messages::StopReason::ToolUse => {
-                                                "tool_use".to_string()
-                                            }
-                                            xai_grok_sampling_types::messages::StopReason::StopSequence => {
-                                                "stop_sequence".to_string()
-                                            }
-                                            xai_grok_sampling_types::messages::StopReason::Refusal => {
-                                                "refusal".to_string()
-                                            }
-                                            xai_grok_sampling_types::messages::StopReason::PauseTurn => {
-                                                "pause_turn".to_string()
-                                            }
-                                            xai_grok_sampling_types::messages::StopReason::ModelContextWindowExceeded => {
-                                                "model_context_window_exceeded".to_string()
-                                            }
-                                            xai_grok_sampling_types::messages::StopReason::Unknown(
-                                                s,
-                                            ) => s,
-                                        },
+                                        sr,
+                                        xai_grok_sampling_types::messages::StopReason::MaxTokens
+                                            | xai_grok_sampling_types::messages::StopReason::ModelContextWindowExceeded
                                     );
+                                    stop_reason = Some(sr.wire_str());
                                 }
                             }
                             _ => {}
@@ -814,26 +829,209 @@ pub(crate) async fn generate_session_compact(
     };
     if output.content.is_empty() {
         Err(CompactFailure::Transient(
-            acp::Error::internal_error().data("compact failed: model returned empty response"),
+            acp::Error::internal_error().data(format!(
+                "{COMPACT_FAILED_PREFIX}model returned empty response"
+            )),
         ))
     } else {
         Ok(output)
     }
 }
 /// Tests for `classify_sampling_error` and `classify_response_event_error`.
-/// Pin the deterministic-vs-transient mapping for every `SamplingError`
-/// variant and for the meaningful branches of the response-event classifier
-/// (numeric code, `invalid_request_error` marker in code or message, and
-/// the default-to-transient fallback for unknown / missing codes).
+/// Pin the deterministic-vs-transient mapping for every `SamplingError` variant and for the meaningful branches of the response-event classifier.
 /// Also covers `StreamTiming` boundaries and `CompactionOutcome::as_str`.
 #[cfg(test)]
 mod classify_tests {
     use super::*;
+
+    #[test]
+    fn compact_cancel_kind_never_comes_from_upstream_text() {
+        let failure = acp::Error::internal_error().data(compact_error_data(
+            CompactErrorKind::Failed,
+            COMPACT_CANCELLED_MSG,
+        ));
+        assert_eq!(compact_error_kind(&failure), Some(CompactErrorKind::Failed));
+        assert_eq!(
+            compact_error_kind(&CompactFailure::cancelled_error()),
+            Some(CompactErrorKind::Cancelled)
+        );
+        assert_eq!(
+            compact_error_kind(&acp::Error::internal_error().data(COMPACT_CANCELLED_MSG)),
+            None
+        );
+    }
+
+    #[test]
+    fn compact_detail_normalization_is_bounded_and_idempotent() {
+        let raw = format!("  upstream\n\t{}  ", "🦀".repeat(200));
+        let detail = normalize_compact_detail(&raw);
+        assert!(detail.len() <= COMPACT_ERROR_DETAIL_MAX_BYTES);
+        assert!(!detail.contains(['\n', '\t']));
+        assert_eq!(normalize_compact_detail(&detail), detail);
+    }
+
+    #[test]
+    fn model_wait_combines_observed_phases_without_overflow() {
+        for (ttft_ms, stream_ms, expected) in [
+            (None, None, None),
+            (Some(12), None, Some(12)),
+            (None, Some(30), Some(30)),
+            (Some(12), Some(30), Some(42)),
+            (Some(u64::MAX), Some(1), Some(u64::MAX)),
+        ] {
+            let output = CompactOutput {
+                content: String::new(),
+                stop_reason: None,
+                truncated: false,
+                ttft_ms,
+                stream_ms,
+                delta_count: 0,
+                itl_max_ms: None,
+            };
+            assert_eq!(output.model_wait_ms(), expected);
+        }
+    }
+
+    fn is_overflow(failure: &CompactFailure) -> bool {
+        matches!(failure, CompactFailure::Overflow(_))
+    }
+
+    fn api_error(status: StatusCode, message: &str) -> SamplingError {
+        SamplingError::Api {
+            status,
+            message: message.into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        }
+    }
+
+    #[test]
+    fn sampling_api_413_is_overflow_by_status_alone() {
+        assert!(is_overflow(&classify_sampling_error(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request failed (HTTP 413)."
+        ))));
+    }
+
+    #[test]
+    fn sampling_api_drifted_size_wordings_are_overflow() {
+        for msg in [
+            "exceed_context_size_error: request (300000 tokens) exceeds the model context size",
+            "payload_too_large: Chat history exceeds the 800-message limit",
+            "Input length (300000 tokens) exceeds the maximum allowed length (200000 tokens)",
+        ] {
+            assert!(
+                is_overflow(&classify_sampling_error(api_error(
+                    StatusCode::BAD_REQUEST,
+                    msg
+                ))),
+                "should be overflow: {msg}"
+            );
+        }
+        assert!(is_det(&classify_sampling_error(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid tool schema"
+        ))));
+    }
+
+    #[test]
+    fn sampling_tpm_429_with_retry_after_stays_transient() {
+        let size_text = "Request too large for model: Limit 30000, Requested 50000 tokens per min";
+        let mut with_retry_after = api_error(StatusCode::TOO_MANY_REQUESTS, size_text);
+        if let SamplingError::Api {
+            retry_after_secs, ..
+        } = &mut with_retry_after
+        {
+            *retry_after_secs = Some(7);
+        }
+        assert!(matches!(
+            classify_sampling_error(with_retry_after),
+            CompactFailure::Transient(_)
+        ));
+        assert!(is_overflow(&classify_sampling_error(api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            size_text
+        ))));
+    }
+
+    #[test]
+    fn sampling_stream_error_with_size_message_is_overflow() {
+        assert!(is_overflow(&classify_sampling_error(
+            SamplingError::StreamError {
+                error_type: "BAD_REQUEST".into(),
+                message: "Input length (300000 tokens) exceeds the maximum allowed length \
+                          (200000 tokens)"
+                    .into(),
+                code: None,
+            }
+        )));
+    }
+
+    #[test]
+    fn sampling_stream_error_with_structured_size_code_is_overflow() {
+        for code in ["413", "payload_too_large", "request_too_large"] {
+            assert!(
+                is_overflow(&classify_sampling_error(SamplingError::StreamError {
+                    error_type: "BAD_REQUEST".into(),
+                    message: "request rejected".into(),
+                    code: Some(xai_grok_sampling_types::ApiErrorCode::parse(code)),
+                })),
+                "should be overflow for code: {code}"
+            );
+        }
+        assert!(!is_det(&classify_sampling_error(
+            SamplingError::StreamError {
+                error_type: "server_error".into(),
+                message: "internal error".into(),
+                code: Some(xai_grok_sampling_types::ApiErrorCode::parse(
+                    "overloaded_error"
+                )),
+            }
+        )));
+    }
+
+    #[test]
+    fn response_event_invalid_request_marker_with_size_text_is_overflow() {
+        assert!(is_overflow(&classify_response_event_error(
+            Some("invalid_request_error"),
+            "prompt is too long: 300000 tokens > 200000 maximum"
+        )));
+    }
+
+    #[test]
+    fn response_event_size_codes_are_overflow() {
+        for code in ["413", "payload_too_large", "request_too_large"] {
+            assert!(
+                is_overflow(&classify_response_event_error(Some(code), "msg")),
+                "should be overflow for code: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_event_context_length_message_is_overflow() {
+        assert!(is_overflow(&classify_response_event_error(
+            None,
+            "The prompt is too long for this model's context window."
+        )));
+    }
+
+    #[test]
+    fn sampling_api_500_with_context_length_message_is_overflow() {
+        assert!(is_overflow(&classify_sampling_error(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "API error (status 500 Internal Server Error): \
+             The prompt is too long for this model's context window."
+        ))));
+    }
+
     fn is_det(failure: &CompactFailure) -> bool {
         matches!(failure, CompactFailure::Deterministic(_))
     }
     #[test]
-    fn sampling_api_4xx_is_deterministic_except_408_and_429() {
+    fn sampling_api_4xx_is_deterministic_except_408_413_and_429() {
         let det = |s: StatusCode| {
             is_det(&classify_sampling_error(SamplingError::Api {
                 status: s,
@@ -848,7 +1046,10 @@ mod classify_tests {
         assert!(det(StatusCode::UNAUTHORIZED));
         assert!(det(StatusCode::FORBIDDEN));
         assert!(det(StatusCode::NOT_FOUND));
-        assert!(det(StatusCode::PAYLOAD_TOO_LARGE));
+        assert!(is_overflow(&classify_sampling_error(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "test"
+        ))));
         assert!(!det(StatusCode::REQUEST_TIMEOUT));
         assert!(!det(StatusCode::TOO_MANY_REQUESTS));
         assert!(!det(StatusCode::INTERNAL_SERVER_ERROR));
@@ -921,14 +1122,14 @@ mod classify_tests {
     }
     #[test]
     fn response_event_context_length_message_is_deterministic() {
-        assert!(is_det(&classify_response_event_error(
+        assert!(is_overflow(&classify_response_event_error(
             None,
             "The prompt is too long for this model's context window."
         )));
     }
     #[test]
     fn sampling_api_500_with_context_length_message_is_deterministic() {
-        assert!(is_det(&classify_sampling_error(SamplingError::Api {
+        assert!(is_overflow(&classify_sampling_error(SamplingError::Api {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "API error (status 500 Internal Server Error): \
                       The prompt is too long for this model's context window."
@@ -1017,9 +1218,8 @@ mod classify_tests {
 /// `run_compact` in `acp_session.rs` assembles it, so we can inspect the
 /// raw strings of every user message and verify the formatting.
 ///
-/// The compaction summary is wrapped in `<user_query>` tags (consistent with
-/// normal user messages), and `<system-reminder>` state context is placed
-/// outside, matching the standard format:
+/// The compaction summary is wrapped in `<user_query>` tags (consistent with normal user messages).
+/// `<system-reminder>` state context is placed outside, matching the standard format:
 ///   `<user_query>...summary...</user_query>\n\n<system-reminder>...</system-reminder>`
 #[cfg(test)]
 mod compacted_history_shape_tests {
@@ -1044,7 +1244,7 @@ mod compacted_history_shape_tests {
         discovered_agents_md: &[std::path::PathBuf],
     ) -> Vec<ConversationItem> {
         let system_reminder =
-            to_system_reminder_sync(state_context, discovered_agents_md, &[], None, None);
+            to_system_reminder_sync(state_context, discovered_agents_md, &[], None, None, None);
         build_compacted_history_shared(CompactedHistoryInput {
             system_message: ConversationItem::system(system_prompt),
             user_message_prefix: user_message_prefix.to_string(),
@@ -1342,6 +1542,7 @@ mod compacted_history_shape_tests {
             destination_project_instructions: None,
             recent_messages: vec![],
             last_user_query: Some("fix the bug".to_string()),
+            agent_message_anchor: None,
             agent_edited_paths: vec!["src/main.rs".to_string()],
             running_tasks: vec![],
             running_subagents: vec![],
@@ -1411,7 +1612,7 @@ mod compacted_history_shape_tests {
             cancel: "kill_command_or_subagent".into(),
         };
         let system_reminder =
-            to_system_reminder_sync(&state_context, &[], &[], Some(&tool_names), None);
+            to_system_reminder_sync(&state_context, &[], &[], Some(&tool_names), None, None);
         let reminder = system_reminder.expect("should produce a system-reminder");
         assert!(
             reminder.contains("## Running Subagents"),
@@ -1495,7 +1696,7 @@ mod compacted_history_shape_tests {
             },
         )
         .await;
-        let reminder = to_system_reminder_sync(&state_context, &[], &[], None, None)
+        let reminder = to_system_reminder_sync(&state_context, &[], &[], None, None, None)
             .expect("should produce a system-reminder");
         assert!(
             reminder.contains("## Running Background Tasks"),
@@ -1534,7 +1735,7 @@ mod compacted_history_shape_tests {
             },
         )
         .await;
-        let system_reminder = to_system_reminder_sync(&state_context, &[], &[], None, None);
+        let system_reminder = to_system_reminder_sync(&state_context, &[], &[], None, None, None);
         let reminder = system_reminder.expect("should produce a system-reminder for edited files");
         assert!(
             !reminder.contains("## Running Subagents"),
@@ -1554,6 +1755,7 @@ mod compacted_history_shape_tests {
             destination_project_instructions: None,
             recent_messages: vec![ConversationItem::assistant("working")],
             last_user_query: Some("fix the bug".to_string()),
+            agent_message_anchor: None,
             agent_edited_paths: vec!["src/main.rs".to_string()],
             running_tasks: vec![BackgroundTaskSummary {
                 task_id: "t1".into(),
@@ -1583,6 +1785,7 @@ mod compacted_history_shape_tests {
             destination_project_instructions: original.destination_project_instructions.clone(),
             recent_messages: vec![],
             last_user_query: original.last_user_query.clone(),
+            agent_message_anchor: original.agent_message_anchor.clone(),
             agent_edited_paths: original.agent_edited_paths.clone(),
             running_tasks: vec![],
             running_subagents: original.running_subagents.clone(),
@@ -2136,6 +2339,9 @@ mod reasoning_compaction_regression_tests {
                     "a stalled stream must be retryable (Transient), not Deterministic/Cancelled"
                 )
             }
+            Err(CompactFailure::Overflow(_)) => {
+                panic!("a stalled stream must be retryable (Transient), not Overflow")
+            }
             Ok(_) => panic!("a stalled stream must not produce a summary"),
         }
         let _ = shutdown_tx.send(());
@@ -2216,6 +2422,9 @@ mod reasoning_compaction_regression_tests {
             Err(CompactFailure::Deterministic(_) | CompactFailure::Cancelled) => {
                 panic!("a stalled stream must be retryable (Transient), not Deterministic")
             }
+            Err(CompactFailure::Overflow(_)) => {
+                panic!("a stalled stream must be retryable (Transient), not Overflow")
+            }
             Ok(_) => {
                 panic!(
                     "salvage removed: a completed-but-unterminated stream must error, not return a summary"
@@ -2294,6 +2503,9 @@ mod reasoning_compaction_regression_tests {
             }
             Err(CompactFailure::Deterministic(_) | CompactFailure::Cancelled) => {
                 panic!("a stalled stream must be retryable (Transient), not Deterministic")
+            }
+            Err(CompactFailure::Overflow(_)) => {
+                panic!("a stalled stream must be retryable (Transient), not Overflow")
             }
             Ok(_) => {
                 panic!("salvage removed: a substantial partial must error, not be returned")

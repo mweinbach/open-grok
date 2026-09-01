@@ -34,6 +34,10 @@ mod logging;
 mod network_policy;
 mod paths;
 mod profiles;
+mod read_deny_verify;
+mod runtime_sockets;
+#[cfg(test)]
+mod test_util;
 mod types;
 pub use hook_write_deny::{profile_enforces_hook_write_deny, verify_hook_write_deny_enforced};
 pub use logging::SandboxLogger;
@@ -44,6 +48,7 @@ pub use network_policy::{
 pub use profiles::{
     ProfileName, SandboxConfig, SandboxProfile, load_sandbox_config, sandbox_profile_conflicts,
 };
+pub use read_deny_verify::{verify_data_write_deny_enforced, verify_read_deny_enforced};
 pub use types::{SandboxEvent, SandboxEventType, SandboxMetrics};
 /// Whether this profile requires direct-hook write protection (non-devbox
 /// enforcing profiles). Shell fails closed when protection cannot be applied.
@@ -83,8 +88,8 @@ struct GlobalSandboxState {
     applied: bool,
     restrict_network_at_known_linux_launches: bool,
 }
-fn restrict_network_at_known_linux_launches(applied: bool, configured: bool) -> bool {
-    applied && configured && cfg!(target_os = "linux")
+fn restrict_network_at_known_linux_launches(configured: bool) -> bool {
+    configured && cfg!(target_os = "linux")
 }
 /// Whether known Linux child launch paths should install the seccomp network filter.
 pub fn should_restrict_child_network() -> bool {
@@ -184,9 +189,9 @@ impl SandboxManager {
         if requires_hook_write_deny(&self.profile, workspace) {
             xai_grok_config::ensure_grok_hook_slots(paths::grok_home().as_path())
                 .map_err(|e| anyhow::anyhow!("hook write-deny ensure failed: {e}"))?;
-            hook_write_deny::maybe_install_namespace_lockdown_inside_bwrap(&self.profile)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
+        hook_write_deny::maybe_install_namespace_lockdown_inside_bwrap(&self.profile, workspace)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let config = profiles::load_sandbox_config(workspace);
         let mut resolved = self.profile.resolve_profile(workspace, &config)?;
         self.net_restricted = resolved.restrict_network;
@@ -253,7 +258,6 @@ impl SandboxManager {
             logger: self.logger,
             applied: self.applied,
             restrict_network_at_known_linux_launches: restrict_network_at_known_linux_launches(
-                self.applied,
                 self.net_restricted,
             ),
         });
@@ -269,7 +273,7 @@ impl SandboxManager {
     }
     /// Whether known Linux child launch paths should install the seccomp network filter.
     pub fn restrict_child_network(&self) -> bool {
-        restrict_network_at_known_linux_launches(self.applied, self.net_restricted)
+        restrict_network_at_known_linux_launches(self.net_restricted)
     }
     /// The active profile name.
     pub fn profile(&self) -> &ProfileName {
@@ -291,7 +295,7 @@ pub fn bwrap_reexec_command(
 ) -> Option<std::process::Command> {
     #[cfg(target_os = "linux")]
     {
-        bwrap_reexec_command_ex(deny_write, None, deny_read)
+        bwrap_reexec_command_ex(deny_write, None, deny_read, &[])
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -305,6 +309,7 @@ pub(crate) fn bwrap_reexec_command_ex(
     deny_write_optional: &[&str],
     hook_plan: Option<&hook_write_deny::HookWriteDenyBwrapPlan>,
     deny_read: &[&str],
+    runtime_socket_denies: &[PathBuf],
 ) -> Option<std::process::Command> {
     if is_inside_bwrap() {
         return None;
@@ -343,9 +348,29 @@ pub(crate) fn bwrap_reexec_command_ex(
             cmd.arg("--ro-bind").arg(&blocked).arg(path);
         }
     }
+    let sentinel = match read_deny_verify::ensure_bwrap_sentinel_dir() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("error: could not prepare the bwrap containment sentinel: {e}");
+            return None;
+        }
+    };
+    cmd.arg("--ro-bind").arg(&sentinel).arg(&sentinel);
     cmd.arg("--dev-bind").arg("/dev").arg("/dev");
     cmd.arg("--proc").arg("/proc");
+    let encoded_runtime_socket_denies =
+        match runtime_sockets::encode_bwrap_runtime_socket_denies(runtime_socket_denies) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                eprintln!("error: runtime-socket deny handoff encoding failed: {error}");
+                return None;
+            }
+        };
     cmd.env(BWRAP_ENV_VAR, "1");
+    cmd.env(
+        runtime_sockets::BWRAP_RUNTIME_SOCKET_DENY_ENV_VAR,
+        encoded_runtime_socket_denies,
+    );
     cmd.arg("--").arg(self_exe).args(args);
     Some(cmd)
 }
@@ -426,7 +451,7 @@ fn is_devbox_based(profile: &ProfileName, config: &SandboxConfig) -> bool {
 /// cannot drift and silently fail open.
 ///
 /// Decided directly from the profile config (a `Custom` profile with a non-empty
-/// `deny`) — NOT from the resolved/expanded deny set, which returns empty on
+/// `deny` or effective network restriction) — NOT from the resolved/expanded deny set, which returns empty on
 /// failure. Keying "requires" on that empty-on-error result would silently
 /// downgrade to fail-open (Linux) when resolution hiccups; this intrinsic check
 /// stays fail-closed.
@@ -435,10 +460,19 @@ pub fn requires_read_deny(profile: &ProfileName, workspace: &Path) -> bool {
     match profile {
         ProfileName::Custom(name) => {
             let config = profiles::load_sandbox_config(workspace);
-            config
-                .profiles
-                .get(name)
-                .is_some_and(|p| !p.deny.is_empty())
+            config.profiles.get(name).is_some_and(|p| {
+                if !p.deny.is_empty() {
+                    return true;
+                }
+                match p.restrict_network {
+                    Some(explicit) => explicit,
+                    None => p
+                        .extends
+                        .as_deref()
+                        .and_then(|base| base.parse::<ProfileName>().ok())
+                        .is_some_and(|base| base.restricts_network()),
+                }
+            })
         }
         _ => false,
     }
@@ -453,9 +487,31 @@ pub fn requires_read_deny(_profile: &ProfileName, _workspace: &Path) -> bool {
 /// plan. The read-deny arm covers deny-carrying `extends = "devbox"` profiles,
 /// which the hook arm does not; devbox resolution is infallible today, so that
 /// arm is defense in depth against a future fallible resolve step.
+#[cfg(target_os = "linux")]
+pub fn requires_data_write_deny(profile: &ProfileName, workspace: &Path) -> bool {
+    requires_data_write_deny_for(
+        profile,
+        &profiles::load_sandbox_config(workspace),
+        data_path_requires_bind(Path::new("/data")),
+    )
+}
+#[cfg(target_os = "linux")]
+fn requires_data_write_deny_for(
+    profile: &ProfileName,
+    config: &SandboxConfig,
+    is_data_present: bool,
+) -> bool {
+    is_devbox_based(profile, config) && is_data_present
+}
+#[cfg(target_os = "linux")]
+fn data_path_requires_bind(path: &Path) -> bool {
+    path.try_exists().unwrap_or(true)
+}
 #[cfg(all(feature = "enforce", target_os = "linux"))]
 fn resolve_failure_must_refuse(profile: &ProfileName, workspace: &Path) -> bool {
-    requires_hook_write_deny(profile, workspace) || requires_read_deny(profile, workspace)
+    requires_hook_write_deny(profile, workspace)
+        || requires_read_deny(profile, workspace)
+        || requires_data_write_deny(profile, workspace)
 }
 /// A profile's resolved bwrap deny plan.
 #[cfg(target_os = "linux")]
@@ -463,12 +519,14 @@ struct BwrapDenyPlan {
     deny_write_optional: Vec<String>,
     hook_plan: Option<hook_write_deny::HookWriteDenyBwrapPlan>,
     deny_read: Vec<String>,
-    has_globs: bool,
+    runtime_socket_denies: Vec<PathBuf>,
+    requires_read_deny: bool,
 }
 #[cfg(all(feature = "enforce", target_os = "linux"))]
 fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyPlan> {
     let config = profiles::load_sandbox_config(workspace);
-    let deny_write_optional: Vec<String> = if is_devbox_based(profile, &config) {
+    let requires_read_deny = requires_read_deny(profile, workspace);
+    let deny_write_optional: Vec<String> = if requires_data_write_deny(profile, workspace) {
         vec!["/data".to_string()]
     } else {
         Vec::new()
@@ -476,8 +534,8 @@ fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyP
     let resolved = if *profile == ProfileName::Off {
         None
     } else {
-        match profile.resolve_profile(workspace, &config) {
-            Ok(r) => Some(r),
+        match profile.resolve_profile_with_runtime_sockets(workspace, &config) {
+            Ok(resolved) => Some(resolved),
             Err(e) => {
                 if resolve_failure_must_refuse(profile, workspace) {
                     eprintln!("error: sandbox profile resolve failed: {e}");
@@ -489,7 +547,11 @@ fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyP
     };
     let entries = resolved
         .as_ref()
-        .map(|r| r.deny.clone())
+        .map(|(profile, _)| profile.deny.clone())
+        .unwrap_or_default();
+    let runtime_socket_denies = resolved
+        .as_ref()
+        .map(|(_, sockets)| sockets.clone())
         .unwrap_or_default();
     let needs_hooks = requires_hook_write_deny(profile, workspace);
     let hook_plan = if needs_hooks {
@@ -530,15 +592,15 @@ fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyP
         deny_write_optional,
         hook_plan,
         deny_read,
-        has_globs,
+        runtime_socket_denies,
+        requires_read_deny,
     })
 }
 /// Without kernel enforcement there is no read-deny; the devbox `/data`
 /// write-deny and the hook write-deny plan still apply.
 #[cfg(all(not(feature = "enforce"), target_os = "linux"))]
 fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyPlan> {
-    let config = profiles::load_sandbox_config(workspace);
-    let deny_write_optional: Vec<String> = if is_devbox_based(profile, &config) {
+    let deny_write_optional: Vec<String> = if requires_data_write_deny(profile, workspace) {
         vec!["/data".to_string()]
     } else {
         Vec::new()
@@ -559,7 +621,8 @@ fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyP
         deny_write_optional,
         hook_plan,
         deny_read: Vec::new(),
-        has_globs: false,
+        runtime_socket_denies: Vec::new(),
+        requires_read_deny: false,
     })
 }
 /// Build the bwrap re-exec command a profile needs on Linux. Returns `None`
@@ -577,14 +640,24 @@ pub fn bwrap_reexec_for_profile(
         deny_write_optional,
         hook_plan,
         deny_read,
-        has_globs,
+        runtime_socket_denies,
+        requires_read_deny,
     } = bwrap_deny_plan(profile, workspace)?;
-    if deny_write_optional.is_empty() && hook_plan.is_none() && deny_read.is_empty() && !has_globs {
+    if deny_write_optional.is_empty()
+        && hook_plan.is_none()
+        && deny_read.is_empty()
+        && !requires_read_deny
+    {
         return None;
     }
     let write_opt: Vec<&str> = deny_write_optional.iter().map(String::as_str).collect();
     let read_refs: Vec<&str> = deny_read.iter().map(String::as_str).collect();
-    bwrap_reexec_command_ex(&write_opt, hook_plan.as_ref(), &read_refs)
+    bwrap_reexec_command_ex(
+        &write_opt,
+        hook_plan.as_ref(),
+        &read_refs,
+        &runtime_socket_denies,
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -637,11 +710,34 @@ mod tests {
     }
     #[test]
     #[serial(bwrap_env)]
-    fn trust_bwrap_marker_for_devbox_tracks_env_when_feature_on() {
+    #[cfg(target_os = "linux")]
+    fn bwrap_reexec_hands_outer_runtime_socket_set_to_inner_process() {
+        let _g = EnvGuard::remove(BWRAP_ENV_VAR);
+        let sockets = vec![PathBuf::from("/run/docker.sock")];
+        let cmd = bwrap_reexec_command_ex(&[], None, &[], &sockets).expect("bwrap command");
+        let handed = cmd
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == runtime_sockets::BWRAP_RUNTIME_SOCKET_DENY_ENV_VAR).then(|| {
+                    value
+                        .expect("handoff env has a value")
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            })
+            .expect("runtime-socket handoff env");
+        assert_eq!(
+            serde_json::from_str::<Vec<PathBuf>>(&handed).unwrap(),
+            sockets
+        );
+    }
+    #[test]
+    #[serial(bwrap_env)]
+    fn trust_bwrap_marker_for_devbox_requires_sentinel_mount() {
         let _g = EnvGuard::set(BWRAP_ENV_VAR, "1");
         assert!(
             !trust_bwrap_marker_for_devbox(),
-            "without bwrap-marker the hatch must stay closed"
+            "env marker without the sentinel mount must not be trusted"
         );
     }
     #[test]
@@ -753,7 +849,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&leaf);
         std::fs::rename(&moved, &leaf).unwrap();
         let plan = hook_write_deny::build_bwrap_plan(&sources).expect("plan2");
-        let cmd = bwrap_reexec_command_ex(&[], Some(&plan), &[]).expect("bwrap command");
+        let cmd = bwrap_reexec_command_ex(&[], Some(&plan), &[], &[]).expect("bwrap command");
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -808,11 +904,6 @@ mod tests {
         );
     }
     #[test]
-    fn configured_profile_is_recorded() {
-        set_configured_profile("read-only");
-        assert_eq!(configured_profile_name(), Some("read-only"));
-    }
-    #[test]
     fn profile_confines_only_for_non_off_profiles() {
         assert!(!super::profile_confines("off"));
         assert!(!super::profile_confines("none"));
@@ -822,13 +913,19 @@ mod tests {
         assert!(super::profile_confines("my-custom-profile"));
     }
     #[test]
-    fn known_launch_guard_is_linux_only() {
+    fn known_launch_guard_keys_on_config_not_apply_state() {
         assert_eq!(
-            restrict_network_at_known_linux_launches(true, true),
+            restrict_network_at_known_linux_launches(true),
             cfg!(target_os = "linux")
         );
-        assert!(!restrict_network_at_known_linux_launches(false, true));
-        assert!(!restrict_network_at_known_linux_launches(true, false));
+        assert!(!restrict_network_at_known_linux_launches(false));
+        let manager = SandboxManager::new(ProfileName::ReadOnly, Path::new("/tmp"));
+        assert!(!manager.is_applied());
+        assert_eq!(
+            manager.restrict_child_network(),
+            cfg!(target_os = "linux"),
+            "arming must not require applied=true"
+        );
     }
     /// Create a temp workspace whose `.opengrok/sandbox.toml` contains `toml_body`.
     /// Returns the workspace path (caller removes it).
@@ -841,7 +938,11 @@ mod tests {
         let ws = std::env::temp_dir().join(format!("grok-{tag}-{}-{nanos}", std::process::id()));
         let grok = ws.join(".opengrok");
         std::fs::create_dir_all(&grok).unwrap();
-        std::fs::write(grok.join("sandbox.toml"), toml_body).unwrap();
+        std::fs::write(
+            grok.join(xai_grok_config::SANDBOX_CONFIG_FILENAME),
+            toml_body,
+        )
+        .unwrap();
         ws
     }
     /// Create a temp workspace defining a `denytest` profile (extends `workspace`)
@@ -871,6 +972,108 @@ mod tests {
         assert!(!requires_read_deny(&ProfileName::Devbox, &ws));
         assert!(!requires_read_deny(&ProfileName::Off, &ws));
         let _ = std::fs::remove_dir_all(&ws);
+    }
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn requires_read_deny_for_custom_profile_with_effective_restrict_network() {
+        let ws = temp_workspace_with_sandbox_toml(
+            "requires-net-true",
+            "[profiles.netdeny]\nextends = \"devbox\"\nrestrict_network = true\n",
+        );
+        assert!(requires_read_deny(
+            &ProfileName::Custom("netdeny".to_string()),
+            &ws
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        let ws = temp_workspace_with_sandbox_toml(
+            "requires-net-false",
+            "[profiles.netoff]\nextends = \"workspace\"\nrestrict_network = false\n",
+        );
+        assert!(!requires_read_deny(
+            &ProfileName::Custom("netoff".to_string()),
+            &ws
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        let ws = temp_workspace_with_sandbox_toml(
+            "requires-net-none",
+            "[profiles.netnone]\nextends = \"workspace\"\n",
+        );
+        assert!(!requires_read_deny(
+            &ProfileName::Custom("netnone".to_string()),
+            &ws
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        let ws = temp_workspace_with_sandbox_toml(
+            "requires-net-inherit",
+            "[profiles.netinherit]\nextends = \"read-only\"\n",
+        );
+        assert!(requires_read_deny(
+            &ProfileName::Custom("netinherit".to_string()),
+            &ws
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+    #[test]
+    #[cfg(all(feature = "enforce", target_os = "linux"))]
+    fn requires_data_write_deny_for_devbox_based_profiles_when_data_exists() {
+        let mut config = SandboxConfig::default();
+        config.profiles.insert(
+            "devext".to_string(),
+            profiles::ProfileConfig {
+                extends: Some("devbox".to_string()),
+                restrict_network: None,
+                read_only: Vec::new(),
+                read_write: Vec::new(),
+                deny: Vec::new(),
+            },
+        );
+        config.profiles.insert(
+            "wsext".to_string(),
+            profiles::ProfileConfig {
+                extends: Some("workspace".to_string()),
+                restrict_network: None,
+                read_only: Vec::new(),
+                read_write: Vec::new(),
+                deny: Vec::new(),
+            },
+        );
+        let data_root = temp_workspace_with_sandbox_toml("requires-data-root", "");
+        let existing_data = data_root.join("data");
+        std::fs::create_dir(&existing_data).unwrap();
+        let missing_data = data_root.join("missing-data");
+        assert!(data_path_requires_bind(&existing_data));
+        assert!(!data_path_requires_bind(&missing_data));
+        assert!(requires_data_write_deny_for(
+            &ProfileName::Devbox,
+            &config,
+            true
+        ));
+        assert!(requires_data_write_deny_for(
+            &ProfileName::Custom("devext".to_string()),
+            &config,
+            true
+        ));
+        assert!(!requires_data_write_deny_for(
+            &ProfileName::Custom("wsext".to_string()),
+            &config,
+            true
+        ));
+        assert!(!requires_data_write_deny_for(
+            &ProfileName::Workspace,
+            &config,
+            true
+        ));
+        assert!(!requires_data_write_deny_for(
+            &ProfileName::Off,
+            &config,
+            true
+        ));
+        assert!(!requires_data_write_deny_for(
+            &ProfileName::Devbox,
+            &config,
+            false
+        ));
+        let _ = std::fs::remove_dir_all(&data_root);
     }
     #[test]
     #[serial(bwrap_env)]
@@ -928,16 +1131,6 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&ws);
-        let ws_empty = temp_workspace_with_sandbox_toml(
-            "devbox-empty",
-            "[profiles.devempty]\nextends = \"devbox\"\n",
-        );
-        assert!(
-            bwrap_reexec_for_profile(&ProfileName::Custom("devempty".to_string()), &ws_empty)
-                .is_some(),
-            "devbox-extending custom must compose the /data write-deny re-exec"
-        );
-        let _ = std::fs::remove_dir_all(&ws_empty);
         let ws_ws = temp_workspace_with_sandbox_toml(
             "ws-empty",
             "[profiles.wsempty]\nextends = \"workspace\"\n",
@@ -974,5 +1167,27 @@ mod tests {
                 .is_none()
         );
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+    #[test]
+    #[serial(bwrap_env)]
+    fn trust_bwrap_marker_for_devbox_tracks_env_when_feature_on() {
+        let _g = EnvGuard::set(BWRAP_ENV_VAR, "1");
+        assert!(
+            !trust_bwrap_marker_for_devbox(),
+            "without bwrap-marker the hatch must stay closed"
+        );
+    }
+    #[test]
+    fn configured_profile_is_recorded() {
+        set_configured_profile("read-only");
+        assert_eq!(configured_profile_name(), Some("read-only"));
+    }
+    #[test]
+    fn known_launch_guard_is_linux_only() {
+        assert_eq!(
+            restrict_network_at_known_linux_launches(true),
+            cfg!(target_os = "linux")
+        );
+        assert!(!restrict_network_at_known_linux_launches(false));
     }
 }

@@ -103,6 +103,74 @@ pub fn worktree_type() -> WorktreeType {
     worktree_type_from_toml(&root)
 }
 
+pub const ENV_WORKTREE_TYPE: &str = "OPENGROK_WORKTREE_TYPE";
+
+fn grove_from_str(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "grove" | "grove-fuse" | "grove-nfs" | "nfs" | "true" | "1" | "on" => Some(true),
+        "copy" | "false" | "0" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn grove_worktree_from_toml_opt(root: &TomlValue) -> Option<bool> {
+    let cli = root.get("cli")?;
+    for key in ["grove_worktree", "nfs_worktree"] {
+        if let Some(value) = cli.get(key) {
+            if let Some(enabled) = value.as_bool() {
+                return Some(enabled);
+            }
+            if let Some(value) = value.as_str() {
+                return grove_from_str(value);
+            }
+            tracing::warn!("Invalid [cli].{key} value: {value:?}, ignoring");
+        }
+    }
+    match cli.get("worktree_type").and_then(TomlValue::as_str) {
+        Some("grove" | "grove-fuse" | "grove-nfs" | "nfs") => Some(true),
+        Some("copy") => Some(false),
+        _ => None,
+    }
+}
+
+pub fn grove_worktree_env() -> Option<bool> {
+    std::env::var(ENV_WORKTREE_TYPE)
+        .ok()
+        .and_then(|value| grove_from_str(&value))
+}
+
+pub fn gate_grove_worktree_layers(
+    desired: Option<bool>,
+    environment: Option<bool>,
+    raw_config: &TomlValue,
+    remote: Option<&RemoteSettings>,
+) -> (bool, &'static str) {
+    let (enabled, source) = if let Some(enabled) = desired {
+        (enabled, "request")
+    } else if let Some(enabled) = environment {
+        (enabled, "env")
+    } else if let Some(enabled) = grove_worktree_from_toml_opt(raw_config) {
+        (enabled, "local")
+    } else if remote.and_then(|settings| settings.grove_worktree) == Some(true) {
+        (true, "remote")
+    } else {
+        (false, "default")
+    };
+    match remote {
+        None => (false, "remote_unavailable"),
+        Some(settings) if settings.grove_worktree == Some(false) => (false, "remote_kill"),
+        _ => (enabled, source),
+    }
+}
+
+pub fn gate_grove_worktree(
+    desired: Option<bool>,
+    raw_config: &TomlValue,
+    remote: Option<&RemoteSettings>,
+) -> (bool, &'static str) {
+    gate_grove_worktree_layers(desired, grove_worktree_env(), raw_config, remote)
+}
+
 /// Returns `Some(value)` when `[cli] restore_code` is set as a boolean in config.toml.
 pub(crate) fn restore_code_from_toml(root: &TomlValue) -> Option<bool> {
     root.get("cli")
@@ -162,6 +230,93 @@ mod tests {
     use super::RemoteSettings;
     use super::*;
     use toml::Value as TomlValue;
+
+    #[test]
+    fn grove_gate_uses_isolated_environment_name() {
+        assert_eq!(ENV_WORKTREE_TYPE, "OPENGROK_WORKTREE_TYPE");
+    }
+
+    #[test]
+    fn grove_gate_respects_request_environment_local_remote_precedence() {
+        let local: TomlValue = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let disabled: TomlValue = toml::from_str("[cli]\ngrove_worktree = false").unwrap();
+        let empty = TomlValue::Table(toml::map::Map::new());
+        let remote = RemoteSettings {
+            grove_worktree: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            gate_grove_worktree_layers(Some(false), Some(true), &local, Some(&remote)),
+            (false, "request")
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(None, Some(false), &local, Some(&remote)),
+            (false, "env")
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(None, None, &disabled, Some(&remote)),
+            (false, "local")
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(None, None, &empty, Some(&remote)),
+            (true, "remote")
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(None, None, &empty, Some(&RemoteSettings::default())),
+            (false, "default")
+        );
+    }
+
+    #[test]
+    fn grove_gate_resume_honors_local_and_environment_enablement() {
+        let local: TomlValue = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let empty = TomlValue::Table(toml::map::Map::new());
+        let remote = RemoteSettings::default();
+        assert_eq!(
+            gate_grove_worktree_layers(None, None, &local, Some(&remote)),
+            (true, "local")
+        );
+        assert_eq!(
+            gate_grove_worktree_layers(None, Some(true), &empty, Some(&remote)),
+            (true, "env")
+        );
+    }
+
+    #[test]
+    fn grove_gate_kill_switch_and_unavailable_remote_fail_closed() {
+        let local: TomlValue = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let remote = RemoteSettings {
+            grove_worktree: Some(false),
+            ..Default::default()
+        };
+        for desired in [None, Some(true), Some(false)] {
+            assert_eq!(
+                gate_grove_worktree_layers(desired, Some(true), &local, None),
+                (false, "remote_unavailable")
+            );
+            assert_eq!(
+                gate_grove_worktree_layers(desired, Some(true), &local, Some(&remote)),
+                (false, "remote_kill")
+            );
+        }
+    }
+
+    #[test]
+    fn grove_gate_parses_config_aliases_without_changing_creation_type() {
+        for config in [
+            "[cli]\ngrove_worktree = true",
+            "[cli]\nnfs_worktree = true",
+            "[cli]\ngrove_worktree = 'grove-nfs'",
+            "[cli]\nworktree_type = 'grove-fuse'",
+        ] {
+            let root: TomlValue = toml::from_str(config).unwrap();
+            assert_eq!(grove_worktree_from_toml_opt(&root), Some(true));
+        }
+        let root: TomlValue = toml::from_str("[cli]\nworktree_type = 'linked'").unwrap();
+        assert_eq!(grove_worktree_from_toml_opt(&root), None);
+        assert_eq!(grove_from_str("unknown"), None);
+        assert_eq!(grove_from_str(" COPY "), Some(false));
+    }
 
     #[test]
     fn test_worktree_type_linked() {

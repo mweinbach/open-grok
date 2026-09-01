@@ -698,6 +698,68 @@ fn model_show_model_fingerprint_reads_catalog_flag() {
 }
 
 #[test]
+fn subagent_rate_limit_model_lookup_resolves_key_slug_and_unset() {
+    let manager = test_manager();
+    let mut entry = ModelEntry::fallback("retry-slug", &config::EndpointsConfig::default());
+    entry.info.provider = xai_grok_sampling_types::ModelProvider::Custom;
+    entry.info.subagent_rate_limit_max_attempts = Some(8);
+    manager.insert_test_entry("retry-key", entry.clone());
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("retry-key"),
+        Some(8)
+    );
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("retry-slug"),
+        Some(8)
+    );
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("missing"),
+        None
+    );
+    entry.info.subagent_rate_limit_max_attempts = Some(0);
+    manager.insert_test_entry("retry-key", entry.clone());
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("retry-slug"),
+        Some(0)
+    );
+    entry.info.subagent_rate_limit_max_attempts = None;
+    manager.insert_test_entry("retry-key", entry);
+    assert_eq!(
+        manager.model_subagent_rate_limit_max_attempts("retry-key"),
+        None
+    );
+}
+
+#[test]
+fn subagent_rate_limit_model_lookup_tracks_config_reload() {
+    let manager = test_manager();
+    for attempts in [8, 0, 12] {
+        let config = config_from_toml(&format!(
+            r#"
+            [model.retry-key]
+            provider = "custom"
+            model = "retry-slug"
+            base_url = "https://model.invalid/v1"
+            subagent_rate_limit_max_attempts = {attempts}
+        "#
+        ));
+        manager.apply_config(config);
+        assert_eq!(
+            manager.model_subagent_rate_limit_max_attempts("retry-key"),
+            Some(attempts)
+        );
+        assert_eq!(
+            manager.model_subagent_rate_limit_max_attempts("retry-slug"),
+            Some(attempts)
+        );
+        assert_eq!(
+            manager.models()["retry-key"].info.provider,
+            xai_grok_sampling_types::ModelProvider::Custom
+        );
+    }
+}
+
+#[test]
 fn default_model_honors_allowlist_when_no_default_set() {
     let cfg = config_from_toml(
         r#"
@@ -2119,6 +2181,7 @@ fn make_entry_config_with_id(
         agent_type: config::default_agent_type(),
         inference_idle_timeout_secs: None,
         max_retries: None,
+        subagent_rate_limit_max_attempts: None,
         hidden: false,
         supported_in_api: true,
         auth_scheme: None,

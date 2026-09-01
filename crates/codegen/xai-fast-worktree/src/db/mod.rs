@@ -378,7 +378,15 @@ impl WorktreeDb {
     pub fn get(&self, id_or_path: &str) -> Result<Option<WorktreeRecord>> {
         if id_or_path.contains('/') {
             let canon = PathBuf::from(id_or_path);
-            let canon = dunce::canonicalize(&canon).unwrap_or(canon);
+            let lexical = crate::worktree::plan::canonicalize_for_id(&canon);
+            if let Some(record) = queries::get_by_path(&self.conn, &lexical)? {
+                return Ok(Some(record));
+            }
+            let canon = if crate::nfs::dest_is_known_unmounted(&canon) {
+                dunce::canonicalize(&canon).unwrap_or(canon)
+            } else {
+                lexical
+            };
             queries::get_by_path(&self.conn, &canon)
         } else {
             let by_id = queries::get_by_id(&self.conn, id_or_path)?;
@@ -444,12 +452,7 @@ impl WorktreeDb {
 /// The basename alone collides across repos, and `INSERT OR REPLACE` would then evict
 /// the other repo's record; hashing the full path keeps distinct worktrees distinct.
 pub fn id_from_path(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
-    let base = name.strip_prefix("worktree-").unwrap_or(&name);
-    format!("{base}-{}", crate::copy::shard::short_path_hash(path))
+    crate::worktree::plan::worktree_id_from_path(path)
 }
 
 /// Extract the repo name (last component) from a source repo path.
@@ -501,6 +504,10 @@ static OPENGROK_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) struct GrokHomeFixture {
     _lock: std::sync::MutexGuard<'static, ()>,
     prev: Option<std::ffi::OsString>,
+    prev_xdg_data_home: Option<std::ffi::OsString>,
+    prev_grove_data_dir: Option<std::ffi::OsString>,
+    prev_home: Option<std::ffi::OsString>,
+    touched_grove_env: bool,
     /// The isolated grok home; pass to `WorktreeDb::open` to read the same DB
     /// `open_default()` writes to.
     pub home: PathBuf,
@@ -527,9 +534,33 @@ impl GrokHomeFixture {
         Self {
             _lock: lock,
             prev,
+            prev_xdg_data_home: None,
+            prev_grove_data_dir: None,
+            prev_home: None,
+            touched_grove_env: false,
             home,
             _tmp: tmp,
         }
+    }
+
+    /// Point grove lookup at `$XDG_DATA_HOME/grove` with `GROVE_DATA_DIR` unset
+    /// and `HOME` confined to this fixture so pin-GC cannot touch the host.
+    pub(crate) fn isolate_xdg_grove_data(&mut self) -> PathBuf {
+        if !self.touched_grove_env {
+            self.prev_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+            self.prev_grove_data_dir = std::env::var_os("GROVE_DATA_DIR");
+            self.prev_home = std::env::var_os("HOME");
+            self.touched_grove_env = true;
+        }
+        let xdg = self._tmp.path().join("xdg-data");
+        let grove = xdg.join("grove");
+        std::fs::create_dir_all(&grove).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &xdg);
+            std::env::remove_var("GROVE_DATA_DIR");
+            std::env::set_var("HOME", self._tmp.path());
+        }
+        grove
     }
 }
 
@@ -537,6 +568,18 @@ impl GrokHomeFixture {
 impl Drop for GrokHomeFixture {
     fn drop(&mut self) {
         unsafe {
+            if self.touched_grove_env {
+                for (name, value) in [
+                    ("XDG_DATA_HOME", self.prev_xdg_data_home.take()),
+                    ("GROVE_DATA_DIR", self.prev_grove_data_dir.take()),
+                    ("HOME", self.prev_home.take()),
+                ] {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
             match self.prev.take() {
                 Some(p) => std::env::set_var("OPENGROK_HOME", p),
                 None => std::env::remove_var("OPENGROK_HOME"),

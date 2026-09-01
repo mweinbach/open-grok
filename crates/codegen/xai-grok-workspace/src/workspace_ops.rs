@@ -70,8 +70,9 @@ pub use xai_grok_workspace_types::rpc::skills::DiscoverSkillsReq;
 pub use xai_grok_workspace_types::rpc::workspace::WorkspaceInfoReq;
 pub use xai_grok_workspace_types::rpc::worktree::{
     CreateWorktreeFromWorktreeRequestWire, CreateWorktreeFromWorktreeSyncReq,
-    PrepareWorktreeFromWorktreeResponse, WorktreeDbPathReq, WorktreeDbPathResponse,
-    WorktreeDbRebuildReq, WorktreeDbStatsReq, WorktreeGcReq, WorktreeListReq, WorktreeShowReq,
+    PrepareWorktreeFromWorktreeResponse, WorktreeCleanArtifactsReq, WorktreeDbPathReq,
+    WorktreeDbPathResponse, WorktreeDbRebuildReq, WorktreeDbStatsReq, WorktreeDetachReq,
+    WorktreeGcReq, WorktreeListReq, WorktreeSalvageReq, WorktreeShowReq,
 };
 pub use xai_grok_workspace_types::rpc::{RpcActivityClass, WorkspaceRpc};
 /// Implements [`WorkspaceRpc`] for request types whose responses
@@ -99,6 +100,12 @@ pub trait WorkspaceOp: WorkspaceRpc + DeserializeOwned + Send + Sync {
         ws: &WorkspaceHandle,
         session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response>;
+}
+fn hub_transfer_client() -> WorkspaceResult<reqwest::Client> {
+    xai_grok_extra_ca::build_reqwest_client(|builder| {
+        builder.timeout(std::time::Duration::from_secs(600))
+    })
+    .map_err(|e| WorkspaceError::HubError(format!("failed to create HTTP client: {e}")))
 }
 /// Prepare a worktree fork from an existing worktree (validation + path resolution).
 /// Returns a serialized result with `spawn_task` flag and the response.
@@ -269,12 +276,11 @@ const REPOS_MANIFEST_MAX_ANCESTOR_HOPS: usize = 16;
 /// Directories to probe for [`REPOS_MANIFEST_RELATIVE_PATH`], starting at
 /// `root_cwd` (post-grove-rewrite agent cwd) and walking up.
 ///
-/// Does not escape the sandbox workspace or load `~/.grok/repos.json` /
+/// Does not escape the sandbox workspace or load `~/.opengrok/repos.json` /
 /// `$GROK_HOME/repos.json` (user-global, not a provisioned workspace).
 fn repos_manifest_search_dirs(start: &std::path::Path) -> Vec<std::path::PathBuf> {
     let rel = xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH;
-    #[allow(deprecated)]
-    let home = std::env::home_dir();
+    let home = dirs::home_dir();
     let mut global_manifests = Vec::with_capacity(2);
     if let Some(v) = std::env::var_os("GROK_HOME")
         && !v.is_empty()
@@ -1369,6 +1375,60 @@ impl WorkspaceOp for WorktreeGcReq {
     }
 }
 #[async_trait]
+impl WorkspaceOp for WorktreeDetachReq {
+    async fn execute(
+        &self,
+        _workspace: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let id = self.id_or_path.clone();
+        let allow_copy = self.allow_copy;
+        let report = tokio::task::spawn_blocking(move || {
+            crate::worktree::detach_worktree_mgmt(&id, allow_copy)
+        })
+        .await
+        .map_err(|error| WorkspaceError::HubError(error.to_string()))?
+        .map_err(|error| WorkspaceError::HubError(error.to_string()))?;
+        serde_json::to_value(report).map_err(|error| WorkspaceError::HubError(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl WorkspaceOp for WorktreeSalvageReq {
+    async fn execute(
+        &self,
+        _workspace: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let id = self.id_or_path.clone();
+        let out = self.out.clone();
+        let report =
+            tokio::task::spawn_blocking(move || crate::worktree::salvage_worktree_mgmt(&id, &out))
+                .await
+                .map_err(|error| WorkspaceError::HubError(error.to_string()))?
+                .map_err(|error| WorkspaceError::HubError(error.to_string()))?;
+        serde_json::to_value(report).map_err(|error| WorkspaceError::HubError(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl WorkspaceOp for WorktreeCleanArtifactsReq {
+    async fn execute(
+        &self,
+        _workspace: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let id = self.id_or_path.clone();
+        let report =
+            tokio::task::spawn_blocking(move || crate::worktree::clean_artifacts_mgmt(&id))
+                .await
+                .map_err(|error| WorkspaceError::HubError(error.to_string()))?
+                .map_err(|error| WorkspaceError::HubError(error.to_string()))?;
+        serde_json::to_value(report).map_err(|error| WorkspaceError::HubError(error.to_string()))
+    }
+}
+
+#[async_trait]
 impl WorkspaceOp for WorktreeDbStatsReq {
     async fn execute(
         &self,
@@ -1761,6 +1821,18 @@ mod tests {
             CreateWorktreeFromWorktreeSyncReq::METHOD,
             "workspace.worktree_create_from_worktree_sync"
         );
+        assert_eq!(WorktreeDetachReq::METHOD, "workspace.worktree_detach");
+        assert_eq!(WorktreeSalvageReq::METHOD, "workspace.worktree_salvage");
+        assert_eq!(
+            WorktreeCleanArtifactsReq::METHOD,
+            "workspace.worktree_clean_artifacts"
+        );
+        assert_eq!(WorktreeDetachReq::ACTIVITY, RpcActivityClass::Mutation);
+        assert_eq!(WorktreeSalvageReq::ACTIVITY, RpcActivityClass::Mutation);
+        assert_eq!(
+            WorktreeCleanArtifactsReq::ACTIVITY,
+            RpcActivityClass::Mutation
+        );
     }
     /// The reported bug: every window's git queries ran against the workspace
     /// launch directory. `git_op_cwd` must return the per-session repo the
@@ -1945,7 +2017,7 @@ mod tests {
         let listed = rt.block_on(ops.repos_list()).expect("list");
         assert!(
             listed.repos.is_empty(),
-            "missing workspace manifest must not fall back to ~/.grok/repos.json: {:?}",
+            "missing workspace manifest must not fall back to ~/.opengrok/repos.json: {:?}",
             listed.repos
         );
     }
@@ -2276,6 +2348,7 @@ mod tests {
             git_ref: Some("main".to_string()),
             worktree_type: Some(crate::worktree::WorktreeType::Linked),
             label: None,
+            grove_worktree: None,
             cancellation_token: None,
             resolved_dest_path: None,
         };
@@ -2287,6 +2360,31 @@ mod tests {
         assert_eq!(back.source_worktree_path, "/src");
         assert!(back.cancellation_token.is_none());
         assert!(back.resolved_dest_path.is_none());
+    }
+
+    #[test]
+    fn worktree_fork_rpc_preserves_explicit_grove_flags() {
+        for grove_worktree in [None, Some(false), Some(true)] {
+            let request = crate::worktree::CreateWorktreeFromWorktreeRequest {
+                source_worktree_path: "/src".to_owned(),
+                new_session_id: "s2".to_owned(),
+                copy_mode: crate::worktree::WorktreeCopyMode::Dirty,
+                git_ref: None,
+                worktree_type: Some(crate::worktree::WorktreeType::Linked),
+                label: None,
+                grove_worktree,
+                cancellation_token: None,
+                resolved_dest_path: None,
+            };
+            let operation = CreateWorktreeFromWorktreeSyncReq {
+                inner: request.into_wire(),
+            };
+            let encoded = serde_json::to_value(&operation).unwrap();
+            let decoded: CreateWorktreeFromWorktreeSyncReq =
+                serde_json::from_value(encoded).unwrap();
+            let restored = crate::worktree::CreateWorktreeFromWorktreeRequest::from(decoded.inner);
+            assert_eq!(restored.grove_worktree, grove_worktree);
+        }
     }
     use crate::handle::tests::make_handle;
     #[tokio::test]

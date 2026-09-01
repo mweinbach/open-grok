@@ -251,6 +251,18 @@ pub fn minimal_transcript_progress(app: &AppView) -> Option<(usize, usize)> {
         .map(|b| (b.next, b.ids.len()))
 }
 
+pub fn status_line_frame(app: &AppView) -> crate::views::status_line::StatusLineFrame {
+    app.status_line_frame()
+}
+
+pub fn status_line_inner_width(width: u16, padding: u16) -> Option<u16> {
+    crate::views::status_line::inner_width(width, padding)
+}
+
+pub fn is_turn_or_wake_running(agent: &AgentView) -> bool {
+    agent.session.state.is_turn_running() || agent.wake_turn_active()
+}
+
 /// `AppView::minimal_state.committed_plan_tool_call_id` (read).
 pub fn minimal_committed_plan_id(app: &AppView) -> Option<&str> {
     app.minimal_state.committed_plan_tool_call_id.as_deref()
@@ -387,6 +399,26 @@ pub fn mcp_init_progress(v: &AgentView) -> Option<&McpInitProgress> {
 /// `AgentView::plan_approval_view`.
 pub fn plan_approval_view(v: &AgentView) -> Option<&PlanApprovalViewState> {
     v.plan_approval_view.as_ref()
+}
+
+pub fn elicitation_view(
+    agent: &AgentView,
+) -> Option<&crate::views::elicitation_view::ElicitationViewState> {
+    agent.elicitation_view.as_ref()
+}
+
+pub fn render_elicitation(agent: &mut AgentView, buffer: &mut Buffer, area: Rect, theme: &Theme) {
+    agent.elicit_hits.clear();
+    if let Some(state) = agent.elicitation_view.as_mut() {
+        crate::views::elicitation_view::render_elicitation_view(
+            buffer,
+            area,
+            state,
+            theme,
+            true,
+            Some(&mut agent.elicit_hits),
+        );
+    }
 }
 
 /// Whether the minimal `/btw` panel is the painted input owner.
@@ -887,4 +919,53 @@ pub fn set_auto_mode_for_test(session: &mut AgentSession, on: bool) {
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_show_thinking_blocks(enabled: bool) {
     crate::appearance::cache::set_show_thinking_blocks(enabled);
+}
+
+#[cfg(test)]
+mod status_and_modal_tests {
+    use super::*;
+    use xai_grok_tools::mcp_elicitation::{McpElicitExtRequest, McpElicitModeFields};
+
+    #[test]
+    fn idle_wake_stream_is_running_until_its_terminal_arrives() {
+        let mut agent = test_agent_view(Some("session"), "/tmp".into());
+        agent.session.state = crate::app::agent::AgentState::Idle;
+        assert!(!is_turn_or_wake_running(&agent));
+        agent.note_streaming_wake_turn("wake-1");
+        assert!(is_turn_or_wake_running(&agent));
+        agent.mark_wake_cancel_sent();
+        assert!(is_turn_or_wake_running(&agent));
+        agent.running_wake_turn = None;
+        assert!(!is_turn_or_wake_running(&agent));
+    }
+
+    #[test]
+    fn elicitation_paints_in_minimal_and_keeps_action_hit_regions() {
+        let mut agent = test_agent_view(Some("session"), "/tmp".into());
+        agent.elicitation_view = Some(
+            crate::views::elicitation_view::ElicitationViewState::from_request(
+                McpElicitExtRequest {
+                    session_id: "session".into(),
+                    tool_call_id: "elicit-1".into(),
+                    server_name: "demo".into(),
+                    message: "Confirm this request".into(),
+                    mode: McpElicitModeFields::Form {
+                        requested_schema: None,
+                    },
+                },
+                None,
+                None,
+            ),
+        );
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buffer = Buffer::empty(area);
+        assert!(elicitation_view(&agent).is_some());
+        render_elicitation(&mut agent, &mut buffer, area, &Theme::terminal_default());
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Confirm this request"));
+        assert!(!agent.elicit_hits.is_empty());
+        agent.elicitation_view = None;
+        render_elicitation(&mut agent, &mut buffer, area, &Theme::terminal_default());
+        assert!(agent.elicit_hits.is_empty());
+    }
 }

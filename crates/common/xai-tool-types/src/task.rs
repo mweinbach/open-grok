@@ -581,25 +581,99 @@ fn blob_is_delegate(text: &str) -> bool {
 /// background and is still running.
 ///
 /// When `continue_parent_work` is true, append the continue-parent CTA.
-pub fn format_subagent_started_background(
+
+#[derive(Clone, Copy, Debug)]
+pub struct BackgroundNoticeNaming<'a> {
+    pub task_output_tool: &'a str,
+    pub task_ids_param: &'a str,
+    pub timeout_ms_param: &'a str,
+}
+impl BackgroundNoticeNaming<'static> {
+    pub const CANONICAL: Self = Self {
+        task_output_tool: "get_task_output",
+        task_ids_param: "task_ids",
+        timeout_ms_param: "timeout_ms",
+    };
+}
+fn background_result_line(subagent_id: &str, naming: &BackgroundNoticeNaming) -> String {
+    let BackgroundNoticeNaming {
+        task_output_tool,
+        task_ids_param,
+        timeout_ms_param,
+    } = *naming;
+    format!(
+        "When you need its result, use {task_output_tool} with {task_ids_param}=[\"{subagent_id}\"] and a positive {timeout_ms_param}."
+    )
+}
+pub fn format_subagent_started_background<'a>(
     subagent_id: &str,
     subagent_type: &str,
     description: &str,
-    task_output_tool_name: &str,
+    naming: impl Into<BackgroundNoticeNaming<'a>>,
     continue_parent_work: bool,
 ) -> String {
+    let naming = naming.into();
+    let result_line = background_result_line(subagent_id, &naming);
     let mut text = format!(
         "Subagent started in background.\n\
          subagent_id: {subagent_id}\n\
          type: {subagent_type}\n\
          description: {description}\n\n\
-         Use {task_output_tool_name} with task_ids=[\"{subagent_id}\"] and timeout_ms to wait for results."
+         {result_line}"
     );
     if continue_parent_work {
         text.push_str("\n\n");
         text.push_str(BACKGROUND_SUBAGENT_CONTINUE_PARENT_WORK);
     }
     text
+}
+pub fn format_subagent_auto_backgrounded(
+    subagent_id: &str,
+    subagent_type: &str,
+    description: &str,
+    naming: &BackgroundNoticeNaming,
+    notified_on_completion: bool,
+    continue_parent_work: bool,
+) -> String {
+    let notify_clause = if notified_on_completion {
+        " — you will be notified when it completes"
+    } else {
+        ""
+    };
+    let result_line = background_result_line(subagent_id, naming);
+    let mut text = format!(
+        "Subagent took longer than the foreground budget and was moved to the \
+         background to keep the conversation responsive. It is still running{notify_clause}.\n\
+         subagent_id: {subagent_id}\n\
+         type: {subagent_type}\n\
+         description: {description}\n\n\
+         {result_line}"
+    );
+    if continue_parent_work {
+        text.push_str("\n\n");
+        text.push_str(BACKGROUND_SUBAGENT_CONTINUE_PARENT_WORK);
+    }
+    text
+}
+
+impl<'a> From<&'a str> for BackgroundNoticeNaming<'a> {
+    fn from(task_output_tool: &'a str) -> Self {
+        Self {
+            task_output_tool,
+            task_ids_param: "task_ids",
+            timeout_ms_param: "timeout_ms",
+        }
+    }
+}
+impl<'a> From<&'a String> for BackgroundNoticeNaming<'a> {
+    fn from(task_output_tool: &'a String) -> Self {
+        Self::from(task_output_tool.as_str())
+    }
+}
+impl<'a> From<&BackgroundNoticeNaming<'a>> for BackgroundNoticeNaming<'a> {
+    fn from(naming: &BackgroundNoticeNaming<'a>) -> Self {
+        *naming
+    }
 }
 
 /// Render the full model-facing completion block for a finished subagent:
@@ -1452,6 +1526,44 @@ pub fn build_wait_tasks_description(naming: &WaitTasksToolNaming) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_notices_track_renamed_tool_and_params() {
+        let naming = BackgroundNoticeNaming {
+            task_output_tool: "FetchJobResult",
+            task_ids_param: "job_ids",
+            timeout_ms_param: "max_wait",
+        };
+        let spawn = format_subagent_started_background("sa-9", "explore", "scan", &naming, false);
+        assert!(
+            spawn.contains("use FetchJobResult with job_ids=[\"sa-9\"]")
+                && spawn.contains("a positive max_wait"),
+            "renamed tool/params must appear: {spawn}"
+        );
+        assert!(
+            !spawn.contains("task_ids") && !spawn.contains("timeout_ms"),
+            "canonical param names must not remain after rename: {spawn}"
+        );
+        let auto =
+            format_subagent_auto_backgrounded("sa-9", "explore", "scan", &naming, true, true);
+        assert!(
+            auto.contains("moved to the background")
+                && auto.contains("you will be notified when it completes")
+                && auto.contains("use FetchJobResult with job_ids=[\"sa-9\"]")
+                && auto.contains("a positive max_wait"),
+            "auto-bg notice must share the renamed retrieval line: {auto}"
+        );
+        assert!(
+            auto.contains(BACKGROUND_SUBAGENT_CONTINUE_PARENT_WORK),
+            "auto-bg notice must carry the CTA when parent work remains: {auto}"
+        );
+        let quiet =
+            format_subagent_auto_backgrounded("sa-9", "explore", "scan", &naming, false, false);
+        assert!(
+            !quiet.contains("you will be notified"),
+            "no notification promise without system reminders: {quiet}"
+        );
+    }
+
     use super::*;
 
     fn result_with_status(status: &str) -> TaskOutputOutput {

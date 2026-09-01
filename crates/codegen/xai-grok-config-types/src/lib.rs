@@ -13,6 +13,8 @@ mod mcp;
 pub use mcp::*;
 mod permission;
 pub use permission::*;
+mod registry;
+pub use registry::*;
 mod pool;
 pub use pool::*;
 use serde::{Deserialize, Serialize};
@@ -441,6 +443,41 @@ where
         },
     }
 }
+pub fn deserialize_tolerant<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let Some(value) =
+        Option::<serde_json::Value>::deserialize(deserializer)?.filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    match serde_json::from_value::<T>(value) {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                setting = std::any::type_name::<T>(),
+                "ignoring malformed remote setting; falling through to local defaults"
+            );
+            Ok(None)
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConsentGate {
+    pub id: String,
+    #[serde(default)]
+    pub version: Option<i32>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub accept_label: Option<String>,
+}
+
 /// Remote settings fetched from cli-chat-proxy `GET /v1/settings`.
 ///
 /// All fields are `Option` with `#[serde(default)]` so that:
@@ -1080,6 +1117,32 @@ pub struct RemoteSettings {
     /// Stats poll interval in seconds when set.
     #[serde(default)]
     pub jemalloc_heap_profile_poll_interval_secs: Option<u64>,
+    #[serde(default, deserialize_with = "de_opt_bool_tolerant")]
+    pub turn_transient_retry: Option<bool>,
+    #[serde(default)]
+    pub active_agent_messages_enabled: Option<bool>,
+    #[serde(default)]
+    pub subagent_rate_limit_max_attempts: Option<u32>,
+    #[serde(default)]
+    pub repo_status_in_system_prompt: Option<bool>,
+    #[serde(default)]
+    pub feedback_trace_card_enabled: Option<bool>,
+    #[serde(default, alias = "nfs_worktree")]
+    pub grove_worktree: Option<bool>,
+    #[serde(default)]
+    pub title_refresh: Option<bool>,
+    #[serde(default)]
+    pub prompt_suggestions: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_tolerant")]
+    pub consent_gate: Option<ConsentGate>,
+    #[serde(default)]
+    pub subagents_sampling_limit: Option<u32>,
+    #[serde(default)]
+    pub max_parallel_image_gen_calls: Option<u32>,
+    #[serde(default)]
+    pub max_parallel_video_gen_calls: Option<u32>,
+    #[serde(default)]
+    pub workspace_dashboard_enabled: Option<bool>,
 }
 impl RemoteSettings {
     /// Denylist check for an optional imagine tool. Returns `true` when the
@@ -1229,6 +1292,50 @@ pub struct GoalRoleModel {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_settings_turn_transient_retry_malformed_value_does_not_poison_siblings() {
+        let text: RemoteSettings =
+            serde_json::from_str(r#"{"turn_transient_retry": "false", "leader_mode": true}"#)
+                .unwrap();
+        assert_eq!(
+            text.turn_transient_retry, None,
+            "malformed value drops to None"
+        );
+        assert_eq!(text.leader_mode, Some(true), "siblings survive");
+    }
+    #[test]
+    fn remote_settings_turn_transient_retry_round_trip_and_default_absent() {
+        let text: RemoteSettings =
+            serde_json::from_str(r#"{"turn_transient_retry": false}"#).unwrap();
+        assert_eq!(text.turn_transient_retry, Some(false));
+        let round_trip: RemoteSettings =
+            serde_json::from_str(&serde_json::to_string(&text).unwrap()).unwrap();
+        assert_eq!(round_trip.turn_transient_retry, Some(false));
+        let absent: RemoteSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.turn_transient_retry, None);
+    }
+    #[test]
+    fn remote_settings_consent_gate_round_trip() {
+        let json = r#"{
+            "consent_gate": {
+                "id": "tos-2026-08",
+                "version": 3,
+                "title": "Updated terms",
+                "body": "Review our [Terms of Service](https://x.ai/legal/tos) before continuing.",
+                "accept_label": "Accept and continue"
+            }
+        }"#;
+        let settings: RemoteSettings = serde_json::from_str(json).unwrap();
+        let gate = settings.consent_gate.expect("gate present");
+        assert_eq!(gate.id, "tos-2026-08");
+        assert_eq!(gate.version, Some(3));
+        assert!(
+            gate.body
+                .as_deref()
+                .is_some_and(|bytes| bytes.contains("https://x.ai/legal/tos"))
+        );
+    }
+
     use super::*;
     #[test]
     fn worktree_auto_gc_partial_object_and_round_trip() {

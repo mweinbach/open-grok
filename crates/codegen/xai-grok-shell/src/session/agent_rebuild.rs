@@ -187,6 +187,7 @@ pub(crate) struct AgentRebuildSpec {
     pub web_fetch_config: WebFetchConfig,
     pub image_gen_config: ImageGenConfig,
     pub video_gen_config: VideoGenConfig,
+    pub media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits,
     pub app_builder_deployer_config: AppBuilderDeployerConfig,
     pub write_file_enabled: bool,
     pub subagents_enabled: bool,
@@ -209,6 +210,10 @@ pub(crate) struct AgentRebuildSpec {
     pub attribution_callback: Option<xai_grok_tools::SharedAttributionCallback>,
     pub tool_params_json: ResolvedToolParamsJson,
     pub subagent_event_tx: Option<UnboundedSender<SubagentEvent>>,
+    pub subagent_coordinator_sender: Option<
+        xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+    >,
+    pub active_agent_messages_enabled: bool,
     pub monitor_event_buffer: Option<MonitorEventBuffer>,
     pub user_question_tx: UnboundedSender<UserQuestionRequest>,
     pub subagent_depth: u32,
@@ -327,6 +332,7 @@ impl AgentRebuildSpec {
             web_fetch_config,
             image_gen_config,
             video_gen_config,
+            media_gen_batch_limits: _,
             app_builder_deployer_config,
             write_file_enabled,
             subagents_enabled,
@@ -347,6 +353,8 @@ impl AgentRebuildSpec {
             attribution_callback,
             tool_params_json,
             subagent_event_tx,
+            subagent_coordinator_sender,
+            active_agent_messages_enabled,
             monitor_event_buffer,
             user_question_tx,
             subagent_depth,
@@ -410,6 +418,7 @@ impl AgentRebuildSpec {
         .with_write_file_enabled(*write_file_enabled)
         .with_fs(fs_backend.clone())
         .with_subagents_enabled(*subagents_enabled)
+        .with_active_agent_messages_enabled(*active_agent_messages_enabled && *subagent_depth == 0)
         .with_subagent_toggle(subagent_toggle.clone())
         .with_background_workflows_enabled(*background_workflows_enabled)
         .with_task_model_slugs({
@@ -524,10 +533,12 @@ impl AgentRebuildSpec {
                 AgentMailboxIdentity, MaxSubagentDepth, SessionIdResource, SubagentDepthCounter,
                 SubagentEventSender,
             };
-            let backend = SubagentBackendResource(Arc::new(ChannelBackend::for_session(
-                event_tx.clone(),
-                session_id_str.clone(),
-            )));
+            let backend = SubagentBackendResource(Arc::new(match subagent_coordinator_sender {
+                Some(sender) => {
+                    ChannelBackend::for_coordinator_session(sender.clone(), session_id_str.clone())
+                }
+                None => ChannelBackend::for_session(event_tx.clone(), session_id_str.clone()),
+            }));
             agent.tool_bridge().update_resource(backend).await;
             agent
                 .tool_bridge()
@@ -688,6 +699,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         web_fetch_config: WebFetchConfig::Disabled,
         image_gen_config: ImageGenConfig::default(),
         video_gen_config: VideoGenConfig::default(),
+        media_gen_batch_limits: Default::default(),
         app_builder_deployer_config: AppBuilderDeployerConfig::default(),
         write_file_enabled: true,
         subagents_enabled: false,
@@ -708,6 +720,8 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         attribution_callback: None,
         tool_params_json: ResolvedToolParamsJson::default(),
         subagent_event_tx: None,
+        subagent_coordinator_sender: None,
+        active_agent_messages_enabled: false,
         monitor_event_buffer: None,
         user_question_tx: uq_tx,
         subagent_depth: 0,

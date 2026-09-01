@@ -314,6 +314,11 @@ impl KillSource {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BackgroundedForeground {
+    pub tool_call_id: String,
+}
+
 // ============================================================================
 // TerminalBackend trait
 // ============================================================================
@@ -395,6 +400,13 @@ pub trait TerminalBackend: Send + Sync {
     /// Returns `true` if a matching foreground process was found.
     async fn background_foreground_command(&self, _tool_call_id: &str) -> bool {
         false
+    }
+
+    async fn background_foreground_commands(
+        &self,
+        _owner_session_id: Option<&str>,
+    ) -> Vec<BackgroundedForeground> {
+        Vec::new()
     }
 
     /// Wait for a background task to complete, with optional timeout.

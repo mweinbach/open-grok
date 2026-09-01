@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use xai_grok_paths::ToAbsPath;
 
@@ -19,6 +19,7 @@ pub trait AsyncFileSystem: Send + Sync {
     /// This is used to resolve relative paths via `ToAbsPath::to_abs_path(fs.root())`.
     fn root(&self) -> &Path;
 
+    fn remount_root(&self, _root: PathBuf) {}
     async fn exists(&self, path: &Path) -> Result<bool, FsError>;
 
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, FsError>;
@@ -85,6 +86,10 @@ impl AsyncFsWrapper {
     /// Get the root directory for this filesystem.
     pub fn root(&self) -> &Path {
         self.inner.root()
+    }
+
+    pub fn remount_root(&self, root: PathBuf) {
+        self.inner.remount_root(root);
     }
 
     /// Check if a file exists.

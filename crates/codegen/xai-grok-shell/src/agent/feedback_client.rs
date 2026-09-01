@@ -637,14 +637,34 @@ impl FeedbackClient {
         self.send_json(request, "Event recording").await
     }
 
+    fn validate_submission_images(&self, submission: &FeedbackSubmission) -> Result<()> {
+        if submission.images.is_empty() {
+            return Ok(());
+        }
+        if !self
+            .provider_boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.allows_xai_export())
+        {
+            anyhow::bail!("feedback image upload blocked by provider boundary");
+        }
+        crate::session::feedback::validate_feedback_image_payloads(&submission.images)
+    }
+
     /// Submit feedback.
     /// POST /v1/feedback
     pub async fn submit_feedback(
         &self,
         submission: &FeedbackSubmission,
     ) -> Result<FeedbackResponse> {
+        self.validate_submission_images(submission)?;
         let url = format!("{}/feedback", self.base_url);
         let request = self.post(&url).json(submission);
+        let request = if submission.images.is_empty() {
+            request
+        } else {
+            request.timeout(std::time::Duration::from_secs(60))
+        };
         self.send_json(request, "Feedback submission").await
     }
 
@@ -655,11 +675,17 @@ impl FeedbackClient {
         request_id: &str,
         submission: &FeedbackSubmission,
     ) -> Result<()> {
+        self.validate_submission_images(submission)?;
         let url = format!(
             "{}/feedback/requests/{}/complete",
             self.base_url, request_id
         );
         let request = self.post(&url).json(submission);
+        let request = if submission.images.is_empty() {
+            request
+        } else {
+            request.timeout(std::time::Duration::from_secs(60))
+        };
         self.send_empty(request, "Completing feedback request")
             .await
     }
@@ -1181,6 +1207,70 @@ mod forbidden_tests {
         let err = client.get_feedback_config().await.unwrap_err();
         assert!(err.to_string().contains("provider boundary"));
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn image_submissions_require_valid_payload_and_an_explicit_live_boundary() {
+        use base64::Engine;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let router = Router::new().fallback(move || {
+            handler_requests.fetch_add(1, Ordering::SeqCst);
+            async { axum::http::StatusCode::NO_CONTENT }
+        });
+        let (address, server) = start_server(router).await;
+        let unscoped = FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{address}/v1"),
+            None,
+        );
+        let mut submission = FeedbackSubmission::with_content(
+            "session".into(),
+            ClientType::Tui,
+            prod_mc_cli_chat_proxy_types::feedback_types::FeedbackContent::Text("feedback".into()),
+        );
+        let mut image_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut image_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let payload = base64::engine::general_purpose::STANDARD.encode(image_bytes.into_inner());
+        submission
+            .images
+            .push(crate::session::feedback::FeedbackImage {
+                data: payload.clone(),
+                mime_type: "image/png".into(),
+                file_name: None,
+            });
+        assert!(unscoped.submit_feedback(&submission).await.is_err());
+        assert!(
+            unscoped
+                .complete_request("request", &submission)
+                .await
+                .is_err()
+        );
+        let boundary = crate::session::persistence::ProviderBoundary::default();
+        let client = unscoped.with_provider_boundary(boundary.clone());
+        submission.images[0].data = "invalid base64".into();
+        assert!(client.submit_feedback(&submission).await.is_err());
+        assert!(
+            client
+                .complete_request("request", &submission)
+                .await
+                .is_err()
+        );
+        submission.images[0].data = payload;
+        let cloned = client.clone();
+        boundary.observe(xai_grok_sampling_types::ModelProvider::Codex);
+        boundary.observe(xai_grok_sampling_types::ModelProvider::Xai);
+        assert!(cloned.submit_feedback(&submission).await.is_err());
+        assert!(
+            cloned
+                .complete_request("request", &submission)
+                .await
+                .is_err()
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 }
 

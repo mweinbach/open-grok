@@ -1,9 +1,4 @@
-//! `x.ai/hooks/*` extension handlers.
-//!
-//! The file-hook list/action endpoints for the pager's hooks modal, plus the
-//! client-registered hook wire types and `parse_client_hooks`.
-
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use agent_client_protocol as acp;
 use serde::Deserialize;
@@ -21,7 +16,39 @@ struct ListRequest {
     session_id: String,
 }
 
-pub(crate) fn hook_spec_to_info(spec: &xai_grok_hooks::config::HookSpec) -> HookInfo {
+pub(crate) fn current_hook_infos(
+    registry: Option<&xai_grok_hooks::discovery::HookRegistry>,
+) -> Vec<HookInfo> {
+    let Some(registry) = registry else {
+        return Vec::new();
+    };
+    let disabled = xai_grok_hooks::trust::DisabledHooks::load();
+    let registered = crate::config::registered_hook_paths();
+    hook_specs_to_infos(&registry.all_hooks(), &disabled, &registered)
+}
+
+fn hook_specs_to_infos(
+    specs: &[&xai_grok_hooks::config::HookSpec],
+    disabled: &xai_grok_hooks::trust::DisabledHooks,
+    registered_dirs: &HashSet<String>,
+) -> Vec<HookInfo> {
+    let pinned_dirs: HashSet<String> = specs
+        .iter()
+        .filter(|s| s.is_managed_policy())
+        .map(|s| s.source_dir.display().to_string())
+        .collect();
+    specs
+        .iter()
+        .map(|spec| hook_spec_to_info_with(spec, disabled, registered_dirs, &pinned_dirs))
+        .collect()
+}
+
+fn hook_spec_to_info_with(
+    spec: &xai_grok_hooks::config::HookSpec,
+    disabled: &xai_grok_hooks::trust::DisabledHooks,
+    registered_dirs: &HashSet<String>,
+    pinned_source_dirs: &HashSet<String>,
+) -> HookInfo {
     use xai_grok_hooks::event::HookEventName;
 
     let event = match spec.event {
@@ -64,6 +91,9 @@ pub(crate) fn hook_spec_to_info(spec: &xai_grok_hooks::config::HookSpec) -> Hook
         .or_else(|| spec.command.as_ref().map(|p| p.display().to_string()));
     let url_display = spec.url_raw.clone().or_else(|| spec.url.clone());
 
+    let source_dir = spec.source_dir.display().to_string();
+    let removable =
+        registered_dirs.contains(&source_dir) && !pinned_source_dirs.contains(&source_dir);
     HookInfo {
         name: spec.name.clone(),
         event,
@@ -72,8 +102,10 @@ pub(crate) fn hook_spec_to_info(spec: &xai_grok_hooks::config::HookSpec) -> Hook
         command: command_display,
         url: url_display,
         timeout_ms: spec.timeout_ms,
-        source_dir: spec.source_dir.display().to_string(),
-        disabled: xai_grok_hooks::trust::is_hook_disabled(&spec.name),
+        source_dir,
+        disabled: xai_grok_hooks::trust::hook_disabled_for_display_with(spec, disabled),
+        pinned: spec.is_managed_policy(),
+        removable,
     }
 }
 
@@ -126,6 +158,7 @@ pub(crate) enum ClientHookDecision {
     Continue,
     #[serde(alias = "block")]
     Deny,
+    Ask,
     #[serde(other)]
     Other,
 }
@@ -277,7 +310,6 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::path::PathBuf;
     use xai_grok_hooks::config::HookSpec;
     use xai_grok_hooks::event::HookEventName;
@@ -311,9 +343,18 @@ mod tests {
     /// `*_raw` (pre-expansion) wins over the resolved value so secrets never reach
     /// the DTO; then the resolved value, else `None`. Same for `command` and `url`.
     #[test]
-    fn hook_spec_to_info_display_precedence() {
-        let command =
-            |raw, resolved| hook_spec_to_info(&make_spec(raw, resolved, None, None)).command;
+    fn hook_spec_to_info_raw_display_wins_so_secrets_never_reach_dto() {
+        let no_disabled = xai_grok_hooks::trust::DisabledHooks::from_names([]);
+        let no_dirs = HashSet::new();
+        let command = |raw, resolved| {
+            hook_specs_to_infos(
+                &[&make_spec(raw, resolved, None, None)],
+                &no_disabled,
+                &no_dirs,
+            )
+            .remove(0)
+            .command
+        };
         assert_eq!(
             command(Some("${VAR}/x"), Some("/resolved/x")).as_deref(),
             Some("${VAR}/x")
@@ -324,7 +365,15 @@ mod tests {
         );
         assert!(command(None, None).is_none());
 
-        let url = |raw, resolved| hook_spec_to_info(&make_spec(None, None, raw, resolved)).url;
+        let url = |raw, resolved| {
+            hook_specs_to_infos(
+                &[&make_spec(None, None, raw, resolved)],
+                &no_disabled,
+                &no_dirs,
+            )
+            .remove(0)
+            .url
+        };
         assert_eq!(
             url(
                 Some("https://${HOST}/p?token=${TOKEN}"),
@@ -338,6 +387,52 @@ mod tests {
             Some("https://h/c")
         );
         assert!(url(None, None).is_none());
+    }
+
+    #[test]
+    fn hook_specs_to_infos_pins_removable_at_source_level() {
+        let no_disabled = xai_grok_hooks::trust::DisabledHooks::from_names([]);
+        let registered: HashSet<String> = [
+            "/reg/policy".to_string(),
+            "/reg/req".to_string(),
+            "/reg/user".to_string(),
+        ]
+        .into();
+
+        let mut policy = make_spec(Some("a"), None, None, None);
+        policy.source_dir = PathBuf::from("/reg/policy");
+        policy.layer = xai_grok_hooks::config::HookProvenance::SystemManaged;
+        let mut sibling = make_spec(Some("b"), None, None, None);
+        sibling.source_dir = PathBuf::from("/reg/policy");
+        let mut req = make_spec(Some("r"), None, None, None);
+        req.source_dir = PathBuf::from("/reg/req");
+        req.layer = xai_grok_hooks::config::HookProvenance::Requirements;
+        let mut req_sibling = make_spec(Some("s"), None, None, None);
+        req_sibling.source_dir = PathBuf::from("/reg/req");
+        let mut user = make_spec(Some("c"), None, None, None);
+        user.source_dir = PathBuf::from("/reg/user");
+        let unregistered = make_spec(Some("d"), None, None, None); // stays at /tmp
+
+        let infos = hook_specs_to_infos(
+            &[&policy, &sibling, &req, &req_sibling, &user, &unregistered],
+            &no_disabled,
+            &registered,
+        );
+        assert!(infos[0].pinned && !infos[0].removable);
+        assert!(
+            !infos[1].pinned && !infos[1].removable,
+            "unpinned sibling of a managed-policy hook must not be removable"
+        );
+        assert!(
+            infos[2].pinned && !infos[2].removable,
+            "Requirements tier must pin its source like SystemManaged"
+        );
+        assert!(
+            !infos[3].pinned && !infos[3].removable,
+            "unpinned sibling of a Requirements hook must not be removable"
+        );
+        assert!(infos[4].removable);
+        assert!(!infos[5].removable, "unregistered dirs are never removable");
     }
 
     #[test]
@@ -360,9 +455,9 @@ mod tests {
         let matcher = pre[0].matcher.as_ref().unwrap();
         assert!(matcher.is_match("run_terminal_command"));
         assert!(!matcher.is_match("read_file"));
-        assert!(pre[1].matcher.is_none()); // null / "*" = match-all
+        assert!(pre[1].matcher.is_none());
         assert!(pre[2].matcher.is_none());
-        assert!(hooks.contains_key(&HookEventName::PostToolUse)); // snake_case resolves
+        assert!(hooks.contains_key(&HookEventName::PostToolUse));
     }
 
     #[test]
@@ -404,9 +499,9 @@ mod tests {
         });
         let groups = &parse_client_hooks(meta.as_object())[&HookEventName::PreToolUse];
         assert_eq!(groups[0].timeout, Some(std::time::Duration::from_secs(5)));
-        assert_eq!(groups[1].timeout, None); // non-positive -> default
-        assert_eq!(groups[2].timeout, None); // absent -> default
-        assert_eq!(groups[3].timeout, Some(std::time::Duration::from_secs(600))); // capped
+        assert_eq!(groups[1].timeout, None);
+        assert_eq!(groups[2].timeout, None);
+        assert_eq!(groups[3].timeout, Some(std::time::Duration::from_secs(600)));
     }
 
     /// A registration under the `SubagentEnd` alias must land on the canonical
@@ -561,5 +656,43 @@ mod tests {
         assert_eq!(value["toolInput"]["command"], "ls");
         assert_eq!(value["toolInputTruncated"], true);
         assert_eq!(value["permissionMode"], "default");
+    }
+
+    #[test]
+    fn hook_spec_to_info_display_precedence() {
+        let hook_spec_to_info = |spec: &xai_grok_hooks::config::HookSpec| {
+            hook_spec_to_info_with(
+                spec,
+                &xai_grok_hooks::trust::DisabledHooks::from_names([]),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+        };
+        let command =
+            |raw, resolved| hook_spec_to_info(&make_spec(raw, resolved, None, None)).command;
+        assert_eq!(
+            command(Some("${VAR}/x"), Some("/resolved/x")).as_deref(),
+            Some("${VAR}/x")
+        );
+        assert_eq!(
+            command(None, Some("/legacy/x")).as_deref(),
+            Some("/legacy/x")
+        );
+        assert!(command(None, None).is_none());
+
+        let url = |raw, resolved| hook_spec_to_info(&make_spec(None, None, raw, resolved)).url;
+        assert_eq!(
+            url(
+                Some("https://${HOST}/p?token=${TOKEN}"),
+                Some("https://api/p?token=ghp_X")
+            )
+            .as_deref(),
+            Some("https://${HOST}/p?token=${TOKEN}"),
+        );
+        assert_eq!(
+            url(None, Some("https://h/c")).as_deref(),
+            Some("https://h/c")
+        );
+        assert!(url(None, None).is_none());
     }
 }

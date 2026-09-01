@@ -5,9 +5,58 @@
 
 use serde::Serialize;
 
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStartKind {
+    New,
+    Load,
+    Resume,
+}
+
 #[derive(Serialize)]
 pub struct SessionStarted {
     pub session_id: String,
+    pub kind: SessionStartKind,
+    pub setup_duration_ms: u64,
+    pub restored_from_disk: bool,
+}
+
+impl SessionStarted {
+    pub fn new(
+        session_id: String,
+        kind: SessionStartKind,
+        setup_duration: std::time::Duration,
+        restored_from_disk: bool,
+    ) -> Self {
+        Self {
+            session_id,
+            kind,
+            setup_duration_ms: setup_duration.as_millis() as u64,
+            restored_from_disk,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct SessionContextSnapshot {
+    pub session_id: String,
+    pub model_id: String,
+    pub context_window: u64,
+    pub used_tokens: u64,
+    pub usage_pct: u8,
+    pub free_tokens: u64,
+    pub system_prompt_tokens: u64,
+    pub tool_definitions_tokens: u64,
+    pub tool_definitions_count: u64,
+    pub message_tokens: u64,
+    pub skills_tokens: u64,
+    pub skills_count: u64,
+    pub mcp_tokens: u64,
+    pub mcp_server_count: u64,
+    pub agents_md_tokens: u64,
+    pub agents_md_file_count: u64,
+    pub workflows_tokens: u64,
+    pub workflows_count: u64,
 }
 
 #[derive(Serialize)]
@@ -25,6 +74,23 @@ pub struct TurnCompletedLifecycle {
 /// Doom-loop recovery acted this turn: poisoned attempts were resampled
 /// and/or a response was accepted with confident signals after the budget
 /// was spent. Trigger labels only — never generation content.
+#[derive(Serialize)]
+pub struct DoomLoopDetected {
+    pub session_id: String,
+    pub turn_number: u64,
+    pub trigger_count: u32,
+    pub detector_kinds: Vec<String>,
+    pub channels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tightest_tail_threshold: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_exact_sequence_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_exact_repeat_count: Option<u32>,
+    pub recovery_attempts: u32,
+    pub model: String,
+}
+
 #[derive(Serialize)]
 pub struct DoomLoopRecovery {
     pub session_id: String,
@@ -126,6 +192,96 @@ mod tests {
 
     /// The `grok-shell-doom_loop_recovery` Mixpanel event's name and
     /// property keys are dashboard contracts — pin them.
+    #[test]
+    fn doom_loop_detected_event_shape_is_stable() {
+        use crate::events::TelemetryEvent;
+        assert_eq!(super::DoomLoopDetected::NAME, "doom_loop_detected");
+        let event = serde_json::to_value(super::DoomLoopDetected {
+            session_id: "s1".to_string(),
+            turn_number: 7,
+            trigger_count: 3,
+            detector_kinds: vec![
+                "tail_repetition".to_string(),
+                "exact_repetition".to_string(),
+            ],
+            channels: vec!["thinking".to_string(), "response".to_string()],
+            tightest_tail_threshold: Some(32),
+            max_exact_sequence_tokens: Some(42),
+            max_exact_repeat_count: Some(3),
+            recovery_attempts: 1,
+            model: "grok-4.6".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "session_id": "s1",
+                "turn_number": 7,
+                "trigger_count": 3,
+                "detector_kinds": ["tail_repetition", "exact_repetition"],
+                "channels": ["thinking", "response"],
+                "tightest_tail_threshold": 32,
+                "max_exact_sequence_tokens": 42,
+                "max_exact_repeat_count": 3,
+                "recovery_attempts": 1,
+                "model": "grok-4.6",
+            })
+        );
+    }
+
+    #[test]
+    fn session_context_snapshot_event_shape_is_stable() {
+        use crate::events::TelemetryEvent;
+        assert_eq!(
+            super::SessionContextSnapshot::NAME,
+            "session_context_snapshot"
+        );
+        let value = serde_json::to_value(super::SessionContextSnapshot {
+            session_id: "s1".to_string(),
+            model_id: "grok-4".to_string(),
+            context_window: 1_000_000,
+            used_tokens: 40_000,
+            usage_pct: 4,
+            free_tokens: 960_000,
+            system_prompt_tokens: 8_000,
+            tool_definitions_tokens: 5_000,
+            tool_definitions_count: 12,
+            message_tokens: 2_000,
+            skills_tokens: 27_000,
+            skills_count: 282,
+            mcp_tokens: 1_200,
+            mcp_server_count: 4,
+            agents_md_tokens: 3_400,
+            agents_md_file_count: 2,
+            workflows_tokens: 800,
+            workflows_count: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "session_id": "s1",
+                "model_id": "grok-4",
+                "context_window": 1_000_000,
+                "used_tokens": 40_000,
+                "usage_pct": 4,
+                "free_tokens": 960_000,
+                "system_prompt_tokens": 8_000,
+                "tool_definitions_tokens": 5_000,
+                "tool_definitions_count": 12,
+                "message_tokens": 2_000,
+                "skills_tokens": 27_000,
+                "skills_count": 282,
+                "mcp_tokens": 1_200,
+                "mcp_server_count": 4,
+                "agents_md_tokens": 3_400,
+                "agents_md_file_count": 2,
+                "workflows_tokens": 800,
+                "workflows_count": 3,
+            })
+        );
+    }
+
     #[test]
     fn doom_loop_recovery_event_shape_is_stable() {
         use crate::events::TelemetryEvent;

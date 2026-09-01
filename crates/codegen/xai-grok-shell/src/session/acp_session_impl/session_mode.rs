@@ -43,6 +43,7 @@ impl SessionActor {
         use xai_grok_tools::types::SessionMode;
         let prompt_mode = prompt_mode_from_session_mode_id(&session_mode_id);
         *self.current_prompt_mode.lock() = prompt_mode;
+        self.emit_status_snapshot_detached();
         let mode = SessionMode::from_id(session_mode_id.0.as_ref());
         if mode.is_plan() {
             let entered = self.plan_mode.lock().enter_pending();

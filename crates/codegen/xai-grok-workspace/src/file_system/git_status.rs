@@ -5,6 +5,7 @@
 //! Output is prioritized by change type and limited to ~1k characters.
 
 use crate::file_system::FsError;
+use crate::file_system::fsmonitor::FsmonitorOverride;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 /// 3. Staged files (if any)
 ///
 /// Total output is capped at ~1k characters.
+#[tracing::instrument(skip_all)]
 pub async fn git_status(working_directory: impl Into<PathBuf>) -> Result<String, FsError> {
     let working_directory = working_directory.into();
     let permit = crate::git_odb::try_acquire_odb();
@@ -68,60 +70,56 @@ fn collapse_status_spaces(s: &str) -> String {
     out
 }
 
-pub async fn git_status_short(working_directory: impl Into<PathBuf>) -> Result<String, FsError> {
+#[tracing::instrument(skip_all)]
+pub async fn git_status_short_pinned(
+    working_directory: impl Into<PathBuf>,
+    fsmonitor: FsmonitorOverride,
+) -> Result<String, FsError> {
     let working_directory = working_directory.into();
-    let permit = crate::git_odb::try_acquire_odb();
+    let _permit = crate::git_odb::try_acquire_odb();
 
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let output = xai_tty_utils::git_command()
-            .args(["status", "--short", "--branch", "--untracked-files=normal"])
-            .current_dir(&working_directory)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map_err(|e| {
-                FsError::Other(format!(
-                    "git status --short --branch --untracked-files=normal failed: {}",
-                    e
-                ))
-            })?;
+    let mut cmd = xai_tty_utils::git_command();
+    cmd.args(["-c", fsmonitor.git_config_arg()]);
+    cmd.args(["status", "--short", "--branch", "--untracked-files=normal"])
+        .current_dir(&working_directory)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
 
-        if !output.status.success() {
-            return Err(FsError::Other(format!(
-                "git status --short --branch exited with code {:?}",
-                output.status.code()
-            )));
-        }
+    let output = super::process::output_killing_group_on_drop(cmd)
+        .await
+        .map_err(|e| {
+            FsError::Other(format!(
+                "git status --short --branch --untracked-files=normal failed: {}",
+                e
+            ))
+        })?;
 
-        // Output >= 1 MiB is dropped entirely, not truncated. Render-time
-        // truncation handles the < 1 MiB case.
-        if git_status_exceeds_buffer(output.stdout.len()) {
-            return Err(FsError::Other(
-                "git status --short --branch output exceeded 1 MiB buffer".to_string(),
-            ));
-        }
+    if !output.status.success() {
+        return Err(FsError::Other(format!(
+            "git status --short --branch exited with code {:?}",
+            output.status.code()
+        )));
+    }
 
-        // Consecutive spaces in the status body are collapsed so staged
-        // entries (`A  file` -> `A file`) match the wire format.
-        Ok(collapse_status_spaces(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
-    })
-    .await
-    .map_err(|e| FsError::Other(format!("git status --short --branch task failed: {}", e)))?
+    if git_status_exceeds_buffer(output.stdout.len()) {
+        return Err(FsError::Other(
+            "git status --short --branch output exceeded 1 MiB buffer".to_string(),
+        ));
+    }
+
+    Ok(collapse_status_spaces(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
+#[tracing::instrument(skip_all)]
 fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
-    let _timer = /* instrumentation_timer */ () ; // dev macro; noop stub ("git_status.impl")
     let max_status_chars = 1000;
     let mut output = String::with_capacity(max_status_chars);
 
     // Get branch name
-    let branch_name = {
-        let _timer = /* instrumentation_timer */ () ; // dev macro; noop stub ("git_status.branch_info")
-        run_git(working_directory, &["rev-parse", "--abbrev-ref", "HEAD"])
-    };
+    let branch_name = { run_git(working_directory, &["rev-parse", "--abbrev-ref", "HEAD"]) };
 
     match &branch_name {
         Some(branch) if branch == "HEAD" => {
@@ -140,7 +138,6 @@ fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
 
     // Get upstream ahead/behind
     {
-        let _timer = (); // instrumentation_timer noop stub
         if let Some(upstream_name) = run_git(
             working_directory,
             &["rev-parse", "--abbrev-ref", "@{upstream}"],
@@ -181,7 +178,6 @@ fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
 
     // Get staged changes (index vs HEAD) — fast, no workdir scan
     let staged_output = {
-        let _timer = /* instrumentation_timer */ () ; // dev macro; noop stub ("git_status.staged")
         run_git(
             working_directory,
             &["diff", "--cached", "--name-status", "HEAD"],
@@ -242,6 +238,7 @@ fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
 /// Uses `--no-optional-locks` to avoid creating `index.lock` for stat-cache
 /// refreshes.  This function is called from background tasks (system prompt
 /// generation) and must never contend with foreground git operations.
+#[tracing::instrument(level = "debug", skip(cwd))]
 fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = xai_tty_utils::git_command()
         .args(args)
@@ -283,6 +280,8 @@ mod tests {
         let raw = "## main...origin/main\n M committed.txt\nA  staged.txt\nM  mod.txt\nR  old.txt -> new.txt\n?? untracked.txt\n";
         let want = "## main...origin/main\n M committed.txt\nA staged.txt\nM mod.txt\nR old.txt -> new.txt\n?? untracked.txt\n";
         assert_eq!(collapse_status_spaces(raw), want);
+        assert_eq!(collapse_status_spaces(""), "");
+        assert_eq!(collapse_status_spaces("a\n\n\nb"), "a\n\n\nb");
     }
 
     /// Newlines are never collapsed (blank lines preserved).

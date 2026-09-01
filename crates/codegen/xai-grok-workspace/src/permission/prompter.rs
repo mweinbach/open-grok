@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use crate::permission::{
     bash_command_splitting::{BashCommandHighlights, primary_command_from_script},
-    types::{AccessKind, ClientType},
+    manager::web_fetch_deny_key_from_url,
+    types::{AccessKind, ClientType, HOOK_ASK_META_KEY, HookAsk},
 };
 use agent_client_protocol::{self as acp, Client as _};
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
@@ -302,6 +303,8 @@ pub enum PromptOutcome {
     AllowAlwaysMcpServer(String),
     RejectOnce,
     RejectAlwaysBashCommand(String),
+    RejectAlwaysMcpTool(String),
+    RejectAlwaysDomain(String),
     Cancelled,
     // If the user provided a followup message instead of an action, the string here will
     // have it
@@ -329,6 +332,8 @@ crate::permission::wire_enum! {
         AllowAlwaysMcpServer => "allow_always_mcp_server",
         RejectOnce => "reject_once",
         RejectAlwaysBash => "reject_always_bash",
+        RejectAlwaysMcpTool => "reject_always_mcp_tool",
+        RejectAlwaysDomain => "reject_always_domain",
         Cancelled => "cancelled",
         Followup => "followup",
         Error => "error",
@@ -352,6 +357,8 @@ impl PromptOutcome {
             Self::AllowAlwaysMcpServer(_) => PromptOutcomeKind::AllowAlwaysMcpServer,
             Self::RejectOnce => PromptOutcomeKind::RejectOnce,
             Self::RejectAlwaysBashCommand(_) => PromptOutcomeKind::RejectAlwaysBash,
+            Self::RejectAlwaysMcpTool(_) => PromptOutcomeKind::RejectAlwaysMcpTool,
+            Self::RejectAlwaysDomain(_) => PromptOutcomeKind::RejectAlwaysDomain,
             Self::Cancelled => PromptOutcomeKind::Cancelled,
             Self::FollowupMessage(_) => PromptOutcomeKind::Followup,
             Self::Error(_) => PromptOutcomeKind::Error,
@@ -372,6 +379,7 @@ pub struct AcpPrompter {
     /// `PermissionRequested` at prompt-start and a paired `PermissionResolved`
     /// at decision-time through it. `EventWriter::noop()` when events recording
     /// is disabled (the default for the permission scaffolding's own tests).
+    agent_message_options: IndexMap<acp::PermissionOptionId, acp::PermissionOption>,
     event_writer: EventWriter,
     /// Server permission transport: when set, [`request`](Self::request) asks chat for the
     /// decision over the server; `None` keeps the local prompt.
@@ -388,7 +396,9 @@ const REMEMBER_TOOL_APPROVALS_GATED_IDS: &[&str] = &[
     "allow-always-command",
     "reject-always-command",
     "allow-always-mcp",
+    "reject-always-mcp",
     "allow-always-domain",
+    "reject-always-domain",
     "always-allow",
     "reject-always",
 ];
@@ -537,6 +547,24 @@ impl AcpPrompter {
             ),
         );
 
+        let agent_message_options = IndexMap::from([
+            (
+                acp::PermissionOptionId::new("allow-once"),
+                acp::PermissionOption::new(
+                    "allow-once",
+                    "Yes, send once".to_owned(),
+                    acp::PermissionOptionKind::AllowOnce,
+                ),
+            ),
+            (
+                acp::PermissionOptionId::new("reject-once"),
+                acp::PermissionOption::new(
+                    "reject-once",
+                    REJECT_ONCE_LABEL.to_owned(),
+                    acp::PermissionOptionKind::RejectOnce,
+                ),
+            ),
+        ]);
         Self {
             session_id,
             gateway,
@@ -549,6 +577,7 @@ impl AcpPrompter {
             // own `EventTracker` already emits Permission* events, so the prompter
             // must NOT double-emit. A workspace-server-side caller that owns the
             // per-session `events.jsonl` opts in via [`with_event_writer`].
+            agent_message_options,
             event_writer: EventWriter::noop(),
             hub_permission: None,
             // Fail-safe default; opt in via `with_remember_tool_approvals`.
@@ -627,15 +656,16 @@ impl AcpPrompter {
         &self,
         access: &AccessKind,
         protected_edit: Option<crate::permission::ProtectedEditReason>,
+        hook_ask: Option<&HookAsk>,
     ) -> Option<acp::Meta> {
-        if let Some(bash) = self.bash_selection_meta(access) {
-            return Some(bash);
+        let mut meta = self
+            .bash_selection_meta(access)
+            .or_else(|| protected_edit.and_then(protected_edit_meta))
+            .unwrap_or_default();
+        if let Some(value) = hook_ask.and_then(|ask| serde_json::to_value(ask).ok()) {
+            meta.insert(HOOK_ASK_META_KEY.to_owned(), value);
         }
-        let reason = protected_edit?;
-        let payload = crate::permission::ProtectedEditPermission::from_reason(reason);
-        serde_json::to_value(payload)
-            .ok()
-            .and_then(|v| v.as_object().cloned())
+        (!meta.is_empty()).then_some(meta)
     }
 
     /// Build the per-access-kind option map WITHOUT the
@@ -648,6 +678,7 @@ impl AcpPrompter {
     ) -> IndexMap<acp::PermissionOptionId, acp::PermissionOption> {
         match access {
             AccessKind::Edit(_) => self.edit_options.clone(),
+            AccessKind::AgentMessage { .. } => self.agent_message_options.clone(),
             AccessKind::Bash(bash_command) => {
                 // For GrokTUI clients, use the fancy interactive options with term selection
                 // For generic clients (web, etc.), use simpler options that work without
@@ -737,6 +768,16 @@ impl AcpPrompter {
                         acp::PermissionOptionKind::RejectOnce,
                     ),
                 );
+                let deny_domain =
+                    web_fetch_deny_key_from_url(url).unwrap_or_else(|| domain.clone());
+                options.insert(
+                    acp::PermissionOptionId::new("reject-always-domain"),
+                    acp::PermissionOption::new(
+                        "reject-always-domain",
+                        format!("No, never allow {deny_domain} for this project"),
+                        acp::PermissionOptionKind::RejectAlways,
+                    ),
+                );
                 options
             }
             AccessKind::MCPTool {
@@ -766,7 +807,7 @@ impl AcpPrompter {
                                 serde_json::to_value(McpToolPermission {
                                     prompt_prefix: "Always allow:".to_owned(),
                                     tool_name: tool_name.clone(),
-                                    server_prefix,
+                                    server_prefix: server_prefix.clone(),
                                 })
                                 .ok()
                                 .and_then(|v| v.as_object().cloned()),
@@ -788,6 +829,17 @@ impl AcpPrompter {
                                 acp::PermissionOptionKind::RejectOnce,
                             ),
                         );
+                        options.insert(
+                            acp::PermissionOptionId::new("reject-always-mcp"),
+                            acp::PermissionOption::new(
+                                "reject-always-mcp",
+                                format!(
+                                    "Never allow: {}",
+                                    mcp_tool_display_name(tool_name, server_prefix.as_deref())
+                                ),
+                                acp::PermissionOptionKind::RejectAlways,
+                            ),
+                        );
                         options
                     }
                     ClientType::Generic
@@ -805,6 +857,7 @@ impl AcpPrompter {
         access: &AccessKind,
         tool_call_update: &acp::ToolCallUpdate,
         protected_edit: Option<crate::permission::ProtectedEditReason>,
+        hook_ask: Option<&HookAsk>,
     ) -> PromptOutcome {
         let tool_name = tool_name_for_access(access);
         // events.jsonl: `PermissionRequested` at prompt-start. The `Instant`
@@ -817,7 +870,7 @@ impl AcpPrompter {
         let prompt_start = Instant::now();
         let mut resolved_guard = ResolvedOnDrop {
             event_writer: &self.event_writer,
-            tool_name: Some(tool_name),
+            tool_name: Some(tool_name.clone()),
             prompt_start,
         };
 
@@ -829,6 +882,7 @@ impl AcpPrompter {
                     transport.as_ref(),
                     access,
                     tool_call_update.tool_call_id.0.as_ref(),
+                    hook_ask,
                 )
                 .await
             }
@@ -836,10 +890,14 @@ impl AcpPrompter {
                 let permission_options = self.build_options(access);
                 let req = acp::RequestPermissionRequest::new(
                     self.session_id.clone(),
-                    tool_call_update.clone(),
+                    with_hook_ask_header(tool_call_update, hook_ask, &tool_name),
                     permission_options.values().cloned().collect(),
                 )
-                .meta(self.permission_request_meta(access, protected_edit));
+                .meta(self.permission_request_meta(
+                    access,
+                    protected_edit,
+                    hook_ask,
+                ));
                 match self.gateway.request_permission(req).await {
                     Ok(resp) => match resp.outcome {
                         acp::RequestPermissionOutcome::Cancelled => PromptOutcome::Cancelled,
@@ -899,7 +957,34 @@ impl Drop for ResolvedOnDrop<'_> {
 /// permission manager calls this for the `tool_name` component of its
 /// `(tool_name, access_kind, access_detail)` derivation, so the two cannot
 /// drift.
-pub(crate) fn tool_name_for_access(access: &AccessKind) -> String {
+fn protected_edit_meta(reason: crate::permission::ProtectedEditReason) -> Option<acp::Meta> {
+    let payload = crate::permission::ProtectedEditPermission::from_reason(reason);
+    serde_json::to_value(payload)
+        .expect("ProtectedEditPermission serializes infallibly")
+        .as_object()
+        .cloned()
+}
+
+fn with_hook_ask_header(
+    tool_call_update: &acp::ToolCallUpdate,
+    hook_ask: Option<&HookAsk>,
+    tool_name: &str,
+) -> acp::ToolCallUpdate {
+    let mut update = tool_call_update.clone();
+    if let Some(ask) = hook_ask {
+        let action = update
+            .fields
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(tool_name);
+        update.fields.title = Some(ask.prompt_header(action));
+    }
+    update
+}
+
+pub fn tool_name_for_access(access: &AccessKind) -> String {
     match access {
         AccessKind::Read(_) => "read_file".to_owned(),
         AccessKind::Grep { .. } => "grep".to_owned(),
@@ -908,6 +993,9 @@ pub(crate) fn tool_name_for_access(access: &AccessKind) -> String {
         AccessKind::MCPTool { name, .. } => format!("mcp:{name}"),
         AccessKind::WebFetch(_) => "web_fetch".to_owned(),
         AccessKind::WebSearch(_) => "web_search".to_owned(),
+        AccessKind::AgentMessage { .. } => {
+            xai_grok_tools::implementations::grok_build::SEND_SUBAGENT_MESSAGE_TOOL_NAME.to_owned()
+        }
     }
 }
 
@@ -926,6 +1014,8 @@ fn permission_decision_for_outcome(outcome: &PromptOutcome) -> PermissionDecisio
         | PromptOutcome::AllowAlwaysMcpServer(_) => PermissionDecision::Allow,
         PromptOutcome::RejectOnce
         | PromptOutcome::RejectAlwaysBashCommand(_)
+        | PromptOutcome::RejectAlwaysMcpTool(_)
+        | PromptOutcome::RejectAlwaysDomain(_)
         | PromptOutcome::Error(_) => PermissionDecision::Deny,
         PromptOutcome::Cancelled => PermissionDecision::Cancelled,
         PromptOutcome::FollowupMessage(_) => PermissionDecision::Followup,
@@ -1023,7 +1113,9 @@ fn map_selected_outcome(
                     } else {
                         PromptOutcome::AllowAlways
                     }
-                } else if option_id.0.as_ref() == ALLOW_EDITS_SESSION_OPTION_ID {
+                } else if option_id.0.as_ref() == ALLOW_EDITS_SESSION_OPTION_ID
+                    && matches!(access, AccessKind::Edit(_))
+                {
                     // The edit prompt's "Yes, allow all edits during this session".
                     // Treat as session-scoped only (in-memory). Do not persist.
                     PromptOutcome::AllowEditsForSession
@@ -1071,6 +1163,20 @@ fn map_selected_outcome(
                     } else {
                         PromptOutcome::RejectOnce
                     }
+                } else if id == "reject-always-mcp" {
+                    if let AccessKind::MCPTool { name, .. } = access {
+                        PromptOutcome::RejectAlwaysMcpTool(name.clone())
+                    } else {
+                        PromptOutcome::RejectOnce
+                    }
+                } else if id == "reject-always-domain" {
+                    if let AccessKind::WebFetch(url) = access
+                        && let Some(domain) = web_fetch_deny_key_from_url(url)
+                    {
+                        PromptOutcome::RejectAlwaysDomain(domain)
+                    } else {
+                        PromptOutcome::RejectOnce
+                    }
                 } else {
                     PromptOutcome::RejectOnce
                 }
@@ -1093,6 +1199,81 @@ mod tests {
     /// `kind()` is enforced by the compiler (exhaustive match); completeness of
     /// `PromptOutcomeKind::{ALL, wire_str}` is enforced structurally by
     /// `wire_enum!`.
+    #[test]
+    fn hook_ask_reaches_both_the_title_and_the_request_meta() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let prompter = AcpPrompter::new(
+            acp::SessionId::new(Arc::from("sess-ask")),
+            GatewaySender::new(tx),
+            ClientType::Generic,
+        );
+        let ask = HookAsk {
+            hook_name: "guard".to_owned(),
+            reason: Some("confirm this".to_owned()),
+        };
+        let access = AccessKind::Edit("a.rs".to_owned());
+
+        let meta = prompter
+            .permission_request_meta(&access, /*protected_edit=*/ None, Some(&ask))
+            .expect("a hook ask always produces meta");
+        assert_eq!(
+            serde_json::Value::Object(meta),
+            serde_json::json!({
+                "hookAsk": { "hookName": "guard", "reason": "confirm this" },
+            })
+        );
+        let merged = prompter
+            .permission_request_meta(
+                &access,
+                Some(crate::permission::ProtectedEditReason::Sensitive),
+                Some(&ask),
+            )
+            .expect("an ask plus a protected edit always produces meta");
+        assert_eq!(
+            serde_json::Value::Object(merged),
+            serde_json::json!({
+                "kind": "sensitive",
+                "hookAsk": { "hookName": "guard", "reason": "confirm this" },
+            }),
+            "an ask and a protected edit must both survive the merge"
+        );
+        assert!(
+            prompter
+                .permission_request_meta(
+                    &access, /*protected_edit=*/ None, /*hook_ask=*/ None
+                )
+                .is_none(),
+            "no ask and no protected edit leaves the meta absent"
+        );
+
+        let untitled = acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(Arc::from("tc-ask")),
+            acp::ToolCallUpdateFields::default(),
+        );
+        let titled = acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(Arc::from("tc-ask")),
+            acp::ToolCallUpdateFields::new().title(Some("Edit a.rs".to_owned())),
+        );
+        assert_eq!(
+            with_hook_ask_header(&untitled, Some(&ask), "search_replace")
+                .fields
+                .title,
+            Some("search_replace — hook 'guard' asks: confirm this".to_owned())
+        );
+        assert_eq!(
+            with_hook_ask_header(&titled, Some(&ask), "search_replace")
+                .fields
+                .title,
+            Some("Edit a.rs — hook 'guard' asks: confirm this".to_owned())
+        );
+        assert_eq!(
+            with_hook_ask_header(&titled, None, "search_replace")
+                .fields
+                .title,
+            titled.fields.title,
+            "no ask leaves the title untouched"
+        );
+    }
     #[test]
     fn prompt_outcome_kind_pins_wire_strings() {
         let cases = [
@@ -1126,6 +1307,14 @@ mod tests {
             (
                 PromptOutcome::RejectAlwaysBashCommand(String::new()),
                 "reject_always_bash",
+            ),
+            (
+                PromptOutcome::RejectAlwaysMcpTool(String::new()),
+                "reject_always_mcp_tool",
+            ),
+            (
+                PromptOutcome::RejectAlwaysDomain(String::new()),
+                "reject_always_domain",
             ),
             (PromptOutcome::Cancelled, "cancelled"),
             (PromptOutcome::FollowupMessage(String::new()), "followup"),
@@ -1207,8 +1396,29 @@ mod tests {
         };
         let opts = p.build_options(&access);
         assert!(!has_option(&opts, "allow-always-mcp"));
+        assert!(!has_option(&opts, "reject-always-mcp"));
         assert!(has_option(&opts, "allow-once"));
         assert!(has_option(&opts, "reject-once"));
+    }
+
+    #[test]
+    fn gate_on_includes_mcp_never_allow() {
+        let p = prompter_with_gate(ClientType::GrokPager, true);
+        let access = AccessKind::MCPTool {
+            name: "linear__list".to_owned(),
+            input: serde_json::Value::Null,
+        };
+        let opts = p.build_options(&access);
+        assert!(has_option(&opts, "allow-always-mcp"));
+        assert!(has_option(&opts, "reject-always-mcp"));
+        let reject = opts
+            .get(&acp::PermissionOptionId::new("reject-always-mcp"))
+            .unwrap();
+        assert_eq!(reject.kind, acp::PermissionOptionKind::RejectAlways);
+        assert!(
+            reject.meta.is_none(),
+            "reject row must not carry scope-toggle meta (always exact tool)"
+        );
     }
 
     #[test]
@@ -1228,8 +1438,22 @@ mod tests {
         let access = AccessKind::WebFetch("https://example.com/x".to_owned());
         let opts = p.build_options(&access);
         assert!(!has_option(&opts, "allow-always-domain"));
+        assert!(!has_option(&opts, "reject-always-domain"));
         assert!(has_option(&opts, "allow-once"));
         assert!(has_option(&opts, "reject-once"));
+    }
+
+    #[test]
+    fn gate_on_includes_web_fetch_never_allow_domain() {
+        let p = prompter_with_gate(ClientType::GrokPager, true);
+        let access = AccessKind::WebFetch("https://example.com/x".to_owned());
+        let opts = p.build_options(&access);
+        assert!(has_option(&opts, "allow-always-domain"));
+        assert!(has_option(&opts, "reject-always-domain"));
+        let reject = opts
+            .get(&acp::PermissionOptionId::new("reject-always-domain"))
+            .unwrap();
+        assert_eq!(reject.kind, acp::PermissionOptionKind::RejectAlways);
     }
 
     #[test]
@@ -1461,6 +1685,39 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_options_are_one_call_only() {
+        let p = prompter_with_gate(ClientType::GrokPager, true);
+        let access = AccessKind::AgentMessage {
+            subagent_id: "sub-1".to_owned(),
+        };
+        let opts = p.build_options(&access);
+        let ids: Vec<&str> = opts.keys().map(|id| id.0.as_ref()).collect();
+
+        assert!(ids.contains(&ENABLE_ALWAYS_APPROVE_OPTION_ID));
+        assert!(ids.contains(&"allow-once"));
+        assert!(ids.contains(&"reject-once"));
+        assert!(!ids.contains(&ALLOW_EDITS_SESSION_OPTION_ID));
+        assert!(
+            !ids.iter()
+                .any(|id| id.contains("always") && *id != ENABLE_ALWAYS_APPROVE_OPTION_ID)
+        );
+    }
+
+    #[test]
+    fn agent_message_approval_maps_to_one_call() {
+        let p = prompter_with_gate(ClientType::GrokPager, true);
+        let access = AccessKind::AgentMessage {
+            subagent_id: "sub-1".to_owned(),
+        };
+        let opts = p.build_options(&access);
+
+        assert!(matches!(
+            outcome_for(&opts, "allow-once", None, &access),
+            PromptOutcome::AllowOnce
+        ));
+    }
+
+    #[test]
     fn gate_off_keeps_edit_session_allow() {
         // The edit session allow is governed separately, not by this gate.
         let p = prompter_with_gate(ClientType::GrokPager, false);
@@ -1480,6 +1737,54 @@ mod tests {
     ) -> PromptOutcome {
         let id = acp::PermissionOptionId::new(option_id);
         super::map_selected_outcome(options, &id, meta.as_ref(), access)
+    }
+
+    #[test]
+    fn mcp_reject_always_maps_exact_access_tool() {
+        let p = prompter(ClientType::GrokPager);
+        let access = AccessKind::MCPTool {
+            name: "linear__list".to_owned(),
+            input: serde_json::Value::Null,
+        };
+        let opts = p.build_options(&access);
+        let outcome = outcome_for(&opts, "reject-always-mcp", None, &access);
+        assert!(
+            matches!(
+                outcome,
+                PromptOutcome::RejectAlwaysMcpTool(ref n) if n == "linear__list"
+            ),
+            "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn web_fetch_reject_always_maps_deny_key_not_stripped_domain() {
+        let p = prompter(ClientType::GrokPager);
+        for (url, expected) in [
+            ("https://www.Example.COM/docs", "www.example.com"),
+            ("https://Example.COM/docs", "example.com"),
+            ("https://www.com/x", "www.com"),
+        ] {
+            let access = AccessKind::WebFetch(url.to_owned());
+            let opts = p.build_options(&access);
+            let label = &opts
+                .get(&acp::PermissionOptionId::new("reject-always-domain"))
+                .expect("reject-always-domain option missing")
+                .name;
+            assert_eq!(
+                label,
+                &format!("No, never allow {expected} for this project"),
+                "{url}"
+            );
+            let outcome = outcome_for(&opts, "reject-always-domain", None, &access);
+            assert!(
+                matches!(
+                    outcome,
+                    PromptOutcome::RejectAlwaysDomain(ref d) if d == expected
+                ),
+                "{url}: got {outcome:?}"
+            );
+        }
     }
 
     #[test]
@@ -1769,6 +2074,12 @@ mod tests {
         let p = prompter(ClientType::GrokPager);
         let cases: Vec<(&str, AccessKind)> = vec![
             ("edit", AccessKind::Edit("write".to_owned())),
+            (
+                "agent_message",
+                AccessKind::AgentMessage {
+                    subagent_id: "sub-1".to_owned(),
+                },
+            ),
             ("bash", AccessKind::Bash("ls".to_owned())),
             (
                 "mcp",
@@ -1869,6 +2180,12 @@ mod tests {
             "run_terminal_command"
         );
         assert_eq!(
+            tool_name_for_access(&AccessKind::AgentMessage {
+                subagent_id: "sub-1".into(),
+            }),
+            "send_subagent_message"
+        );
+        assert_eq!(
             tool_name_for_access(&AccessKind::MCPTool {
                 name: "linear__list".into(),
                 input: serde_json::Value::Null,
@@ -1927,7 +2244,7 @@ mod tests {
         let writer = EventWriter::open(dir.path());
 
         let (tx, rx) = mpsc::unbounded_channel();
-        drop(rx); // channel closed → request_permission errors immediately
+        drop(rx); // channel closed, so request_permission errors immediately
         let gateway = GatewaySender::new(tx);
 
         let prompter = AcpPrompter::new(
@@ -1943,7 +2260,14 @@ mod tests {
             acp::ToolCallUpdateFields::default(),
         );
 
-        let outcome = prompter.request(&access, &tool_call_update, None).await;
+        let outcome = prompter
+            .request(
+                &access,
+                &tool_call_update,
+                /*protected_edit=*/ None,
+                /*hook_ask=*/ None,
+            )
+            .await;
         assert!(
             matches!(outcome, PromptOutcome::Error(_)),
             "dropped gateway receiver should yield PromptOutcome::Error"
@@ -1993,7 +2317,14 @@ mod tests {
             acp::ToolCallId::new(Arc::from("tc-2")),
             acp::ToolCallUpdateFields::default(),
         );
-        let outcome = prompter.request(&access, &tool_call_update, None).await;
+        let outcome = prompter
+            .request(
+                &access,
+                &tool_call_update,
+                /*protected_edit=*/ None,
+                /*hook_ask=*/ None,
+            )
+            .await;
         assert!(matches!(outcome, PromptOutcome::Error(_)));
     }
 }

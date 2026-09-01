@@ -488,22 +488,18 @@ pub fn set_collapsed_edit_blocks(enabled: bool) {
 // -- Prompt suggestions (tab autocomplete) -----------------------------------
 
 thread_local! {
-    static PROMPT_SUGGESTIONS_CURRENT: Cell<bool> =
-        const { Cell::new(PROMPT_SUGGESTIONS_DEFAULT) };
+    static PROMPT_SUGGESTIONS_CURRENT: Cell<Option<bool>> = const { Cell::new(None) };
     static PROMPT_SUGGESTIONS_LOADED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Read cached `prompt_suggestions`, seeding from `[ui]` on first call.
 /// Default ON when unset. The `GROK_PROMPT_SUGGESTIONS` env var overrides
 /// this at the feature gate (see the pager's `prompt_suggestion` module).
-pub fn load_prompt_suggestions() -> bool {
+pub fn load_prompt_suggestions_config() -> Option<bool> {
     PROMPT_SUGGESTIONS_LOADED.with(|loaded| {
         if !loaded.get() {
-            PROMPT_SUGGESTIONS_CURRENT.with(|c| {
-                c.set(load_bool_from_effective_config(
-                    "prompt_suggestions",
-                    PROMPT_SUGGESTIONS_DEFAULT,
-                ))
+            PROMPT_SUGGESTIONS_CURRENT.with(|current| {
+                current.set(load_bool_option_from_effective_config("prompt_suggestions"))
             });
             loaded.set(true);
         }
@@ -511,9 +507,13 @@ pub fn load_prompt_suggestions() -> bool {
     PROMPT_SUGGESTIONS_CURRENT.with(|c| c.get())
 }
 
+pub fn load_prompt_suggestions() -> bool {
+    load_prompt_suggestions_config().unwrap_or(PROMPT_SUGGESTIONS_DEFAULT)
+}
+
 /// Replace cached `prompt_suggestions`.
 pub fn set_prompt_suggestions(enabled: bool) {
-    PROMPT_SUGGESTIONS_CURRENT.with(|c| c.set(enabled));
+    PROMPT_SUGGESTIONS_CURRENT.with(|current| current.set(Some(enabled)));
     PROMPT_SUGGESTIONS_LOADED.with(|l| l.set(true));
 }
 
@@ -797,14 +797,14 @@ pub fn prime(ui: &UiConfig) {
 /// Read a `[ui].<key>` boolean from the shell's layered effective config
 /// (managed → user → defaults). Falls back to `default` on any error.
 fn load_bool_from_effective_config(key: &str, default: bool) -> bool {
-    let root = match xai_grok_config::load_effective_config_disk_only() {
-        Ok(r) => r,
-        Err(_) => return default,
-    };
+    load_bool_option_from_effective_config(key).unwrap_or(default)
+}
+
+fn load_bool_option_from_effective_config(key: &str) -> Option<bool> {
+    let root = xai_grok_config::load_effective_config_disk_only().ok()?;
     root.get("ui")
         .and_then(|ui| ui.get(key))
         .and_then(|v| v.as_bool())
-        .unwrap_or(default)
 }
 
 /// Resolve the unified text-selection mode from a parsed `UiConfig`.

@@ -79,6 +79,7 @@ struct BlockingWaitInner {
     depth: usize,
     orchestration_depth: usize,
     generation: u64,
+    interrupted_wait: Option<Vec<String>>,
 }
 impl BlockingWaitState {
     pub(crate) fn new() -> Self {
@@ -113,6 +114,43 @@ impl BlockingWaitState {
         state.generation = state.generation.wrapping_add(1);
         state.depth = 0;
         state.orchestration_depth = 0;
+        state.interrupted_wait = None;
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.0
+            .lock()
+            .expect("blocking wait state mutex poisoned")
+            .generation
+    }
+    pub(crate) fn update_interrupted_wait<Result>(
+        &self,
+        generation: u64,
+        update: impl FnOnce(&mut Option<Vec<String>>) -> Result,
+    ) -> Option<Result> {
+        let mut state = self.0.lock().expect("blocking wait state mutex poisoned");
+        (state.generation == generation).then(|| update(&mut state.interrupted_wait))
+    }
+    #[cfg(test)]
+    pub(crate) fn note_interrupted_wait(&self, ids: Vec<String>) {
+        self.update_interrupted_wait(self.generation(), |remembered| {
+            if ids.is_empty() {
+                return;
+            }
+            let existing = remembered.get_or_insert_with(Vec::new);
+            for id in ids {
+                if !existing.contains(&id) {
+                    existing.push(id);
+                }
+            }
+        });
+    }
+    #[cfg(test)]
+    pub(crate) fn interrupted_wait_ids(&self) -> Option<Vec<String>> {
+        self.0
+            .lock()
+            .expect("blocking wait state mutex poisoned")
+            .interrupted_wait
+            .clone()
     }
 }
 pub(crate) struct BlockingWaitGuard {
@@ -121,6 +159,9 @@ pub(crate) struct BlockingWaitGuard {
     generation: u64,
 }
 impl BlockingWaitGuard {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
     pub(crate) fn enter(state: Arc<BlockingWaitState>) -> Self {
         Self::enter_kind(state, ForegroundWaitKind::Interruptible)
     }
@@ -181,6 +222,7 @@ pub struct ToolContext {
     /// `noop()` and the fs-notify loop skips forwarding to avoid per-event cost.
     pub hunk_tracking_enabled: bool,
     pub prompt_index: Arc<tokio::sync::Mutex<usize>>,
+    pub(crate) active_message_parent_prompt_index: Arc<std::sync::atomic::AtomicUsize>,
     /// Current subagent nesting depth for this session.
     /// Top-level sessions start at 0; child sessions are parent_depth + 1.
     pub subagent_depth: u32,
@@ -191,6 +233,9 @@ pub struct ToolContext {
         tokio::sync::mpsc::UnboundedSender<
             xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
         >,
+    >,
+    pub subagent_coordinator_sender: Option<
+        xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
     >,
     /// Shared LSP runtime — cloned cheaply (Arc) from parent to child.
     /// Same pattern as `fs` and `terminal`.
@@ -319,8 +364,10 @@ impl ToolContext {
             hunk_tracker_handle,
             hunk_tracking_enabled: true,
             prompt_index: Arc::new(tokio::sync::Mutex::new(0)),
+            active_message_parent_prompt_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             subagent_depth: 0,
             subagent_event_tx: None,
+            subagent_coordinator_sender: None,
             lsp: None,
             lsp_server_names: Vec::new(),
             is_turn_active: None,
@@ -411,8 +458,10 @@ mod tests {
                 hunk_tracker_handle: HunkTrackerHandle::noop(),
                 hunk_tracking_enabled: true,
                 prompt_index: Arc::new(tokio::sync::Mutex::new(0)),
+                active_message_parent_prompt_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 subagent_depth: 0,
                 subagent_event_tx: None,
+                subagent_coordinator_sender: None,
                 lsp: None,
                 lsp_server_names: Vec::new(),
                 is_turn_active: None,

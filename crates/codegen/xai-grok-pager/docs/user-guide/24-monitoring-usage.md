@@ -9,6 +9,21 @@ own OpenTelemetry collector, so platform teams can monitor adoption, token
 consumption, tool-permission decisions, and errors across the fleet — without
 any data flowing through SpaceXAI.
 
+## Local usage reports
+
+Read persisted usage without contacting a provider or enabling telemetry:
+
+```sh
+open-grok usage <session-id>
+open-grok usage <session-id> 3
+```
+
+The command prints JSON containing session totals and either all recorded
+turns or the selected turn. Records include per-model token usage and costs
+when the provider reports them. Missing sessions, missing turns, and older
+sessions without usage records produce an error rather than fabricated zeroes.
+This command reads Open Grok's namespaced local session storage only.
+
 ## Related settings
 
 These knobs are independent of each other (and of this guide's external OTEL stream):

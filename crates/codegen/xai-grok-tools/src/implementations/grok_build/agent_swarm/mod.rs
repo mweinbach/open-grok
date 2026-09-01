@@ -371,6 +371,12 @@ impl xai_tool_runtime::Tool for AgentSwarmTool {
                         input.subagent_type
                     )));
                 }
+                SubagentValidateTypeOutcome::CoordinatorGone => {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "validation_unavailable",
+                        "Cannot validate subagent type: the subagent coordinator has shut down. Retrying will not help.",
+                    ));
+                }
                 SubagentValidateTypeOutcome::ValidationUnavailable => {
                     return Err(xai_tool_runtime::ToolError::custom(
                         "validation_unavailable",
@@ -1387,6 +1393,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stopped_coordinator_rejects_swarm_without_spawning() {
+        let backend = Arc::new(ImmediateBackend {
+            validation: Some(SubagentValidateTypeOutcome::CoordinatorGone),
+            ..Default::default()
+        });
+        let mut resources = Resources::new();
+        resources.insert(SubagentBackendResource(backend.clone()));
+        resources.insert(SessionIdResource("parent".to_string()));
+        let error = xai_tool_runtime::Tool::run(
+            &AgentSwarmTool,
+            test_ctx(resources.into_shared()),
+            input(
+                Some(vec!["first", "second"]),
+                None,
+                Some("Process {{item}}"),
+            ),
+        )
+        .await
+        .expect_err("stopped coordinator must fail validation");
+        assert!(error.to_string().contains("coordinator has shut down"));
+        assert!(error.to_string().contains("Retrying will not help"));
+        assert!(backend.requests.lock().unwrap().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn resume_only_swarm_ignores_unused_model_override() {
         let backend = Arc::new(ImmediateBackend::default());
@@ -1472,6 +1503,7 @@ mod tests {
     #[derive(Default)]
     struct ImmediateBackend {
         requests: Mutex<Vec<SubagentRequest>>,
+        validation: Option<SubagentValidateTypeOutcome>,
     }
 
     #[async_trait::async_trait]
@@ -1497,7 +1529,9 @@ mod tests {
             SubagentCancelOutcome::NotFound
         }
         async fn validate_type(&self, _: &str, _: &str) -> SubagentValidateTypeOutcome {
-            SubagentValidateTypeOutcome::Ok
+            self.validation
+                .clone()
+                .unwrap_or(SubagentValidateTypeOutcome::Ok)
         }
         async fn describe_subagent_type(
             &self,

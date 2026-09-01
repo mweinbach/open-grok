@@ -149,6 +149,8 @@ async fn test_turn_completed_round_trips_through_storage() {
             stop_reason: "end_turn".to_string(),
             agent_result: Some("all done".to_string()),
             usage: None,
+            elapsed_ms: None,
+            error_kind: None,
         },
         meta: None,
     };

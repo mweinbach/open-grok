@@ -221,6 +221,14 @@ pub enum ActiveView {
     /// The top-level Agent Dashboard. State lives in `AppView::dashboard`.
     AgentDashboard,
 }
+impl ActiveView {
+    pub(crate) fn agent_id(self) -> Option<AgentId> {
+        match self {
+            Self::Agent(agent_id) => Some(agent_id),
+            _ => None,
+        }
+    }
+}
 /// Target restored when leaving the dashboard (Ctrl+\ / Esc).
 /// Consumed by `dispatch_exit_dashboard`; dead agents fall back to
 /// insertion-order first / Welcome.
@@ -350,6 +358,8 @@ impl VoiceState {
 /// dashboard roster fallback (`session_picker_entry_to_roster`).
 #[derive(Debug, Clone)]
 pub struct SessionPickerEntry {
+    pub session_kind: Option<String>,
+    pub last_recap: Option<String>,
     pub id: String,
     pub summary: String,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -851,10 +861,7 @@ pub struct AppView {
     pub appearance: AppearanceConfig,
     /// Notification service (terminal bell, OSC sequences, title updates).
     pub notification_service: NotificationService,
-    /// Escape sequences (title, progress bar) accumulated by the last
-    /// `update_notifications()` tick. Consumed by `draw()` and appended
-    /// to the frame's `post_flush_escapes` so they are written inside the
-    /// synchronized output block.
+    pub(crate) status_line: crate::app::status_line::StatusLineState,
     pub(crate) pending_notification_escapes: Option<String>,
     /// Notification deferred by several ticks so the terminal has time to
     /// process the idle title escape before the notification fires.
@@ -904,6 +911,7 @@ pub struct AppView {
     /// Whether the plugin marketplace CTA is enabled. Env `GROK_PLUGIN_CTA`
     /// overrides `RemoteSettings.plugin_cta` (remote settings); defaults to `false`.
     pub plugin_cta_enabled: bool,
+    pub workspace_dashboard_enabled: bool,
     /// Consumer billing surface (credit fetches / warnings). False for team
     /// and API-key auth. `/usage` itself stays available for session token/cost.
     pub usage_visible: bool,
@@ -943,6 +951,20 @@ pub struct AppView {
     pub dashboard_local_sessions: Vec<crate::app::roster::RosterEntry>,
     /// Whether the dashboard is currently loading local sessions (non-leader mode).
     pub dashboard_sessions_loading: bool,
+    pub workspace_store: Option<xai_grok_dashboard_store::WorkspaceStore>,
+    pub workspace_snapshot: Option<xai_grok_dashboard_store::WorkspaceSnapshot>,
+    pub workspace_store_loading: bool,
+    pub workspace_sync_requested: bool,
+    pub workspace_write_in_flight: bool,
+    pub workspace_writes_disabled: bool,
+    pub workspace_retry_metadata: std::collections::HashMap<
+        xai_grok_dashboard_store::SessionId,
+        xai_grok_dashboard_store::MemberMetadata,
+    >,
+    pub workspace_failed_metadata: std::collections::HashMap<
+        xai_grok_dashboard_store::SessionId,
+        xai_grok_dashboard_store::MemberMetadata,
+    >,
     /// Server-authoritative shared prompt queues, keyed by `sessionId`
     /// Reconciled from `x.ai/queue/changed` broadcasts so
     /// every client renders the same ordered queue (including prompts queued
@@ -1127,7 +1149,11 @@ pub struct AppView {
     /// Foreign lane completion and deferred native-lane notice.
     pub(crate) session_picker_lanes: crate::views::session_picker::SessionPickerLanes,
     /// Invalidates detail reads when picker rows or filters change.
-    pub(crate) session_picker_detail_generation: u64,
+    pub(crate) session_picker_detail_seq: u64,
+    pub(crate) picker_generation_counter: u64,
+    pub(crate) session_picker_generation: u64,
+    pub(crate) dashboard_session_picker:
+        Option<crate::views::session_picker_surface::SessionPickerSurface>,
     /// The search query `session_picker_entries` were server-fetched with
     /// (`None` = unfiltered fetch). Via
     /// [`crate::views::session_picker::effective_filter_query`], skips the
@@ -1396,6 +1422,7 @@ pub struct AppView {
     /// other screen mode. Driven by `/minimal` and `/fullscreen`. Captures the
     /// session id at action time so a later teardown cannot drop `--resume`.
     pub relaunch: Option<ScreenModeRelaunch>,
+    pub(crate) pending_screen_mode_switch: Option<ScreenMode>,
     /// Whether importable `.claude/` settings were detected at startup.
     pub has_claude_import: bool,
     /// When set, the welcome screen renders an interactive import modal instead of normal content.
@@ -1509,6 +1536,11 @@ pub(crate) fn detect_external_auth_provider(
 }
 
 impl AppView {
+    pub(crate) fn alloc_picker_generation(&mut self) -> u64 {
+        self.picker_generation_counter += 1;
+        self.picker_generation_counter
+    }
+
     /// Cancel an automatic Kimi sampler refresh after an authoritative user or
     /// remote switch moved the tab to a different provider.
     pub(crate) fn cancel_pending_kimi_rebind(&mut self, agent_id: AgentId) -> bool {
@@ -2034,6 +2066,7 @@ impl AppView {
             scroll_config: ScrollConfig::from_settings(),
             appearance: AppearanceConfig::default(),
             notification_service: NotificationService::new(Default::default()),
+            status_line: Default::default(),
             pending_notification_escapes: None,
             deferred_notification: None,
             tracing_rx: None,
@@ -2102,7 +2135,10 @@ impl AppView {
             foreign_session_scan_seq: 0,
             foreign_scan_coordinator: Default::default(),
             session_picker_lanes: Default::default(),
-            session_picker_detail_generation: 0,
+            session_picker_detail_seq: 0,
+            picker_generation_counter: 0,
+            session_picker_generation: 0,
+            dashboard_session_picker: None,
             session_picker_entries_query: None,
             session_picker_pending_delete: None,
             welcome_tick: 0,
@@ -2198,6 +2234,7 @@ impl AppView {
             foreign_resume_launch: None,
             quit_for_update: false,
             relaunch: None,
+            pending_screen_mode_switch: None,
             has_claude_import: false,
             import_claude_modal: None,
             welcome_doc_viewer: None,
@@ -2205,6 +2242,7 @@ impl AppView {
             show_resolved_model: true,
             sharing_enabled: false,
             plugin_cta_enabled: false,
+            workspace_dashboard_enabled: false,
             usage_visible: true,
             has_external_auth_provider: false,
             tier_restricted_commands: Vec::new(),
@@ -2215,6 +2253,14 @@ impl AppView {
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
             dashboard_sessions_loading: false,
+            workspace_store: None,
+            workspace_snapshot: None,
+            workspace_store_loading: false,
+            workspace_sync_requested: false,
+            workspace_write_in_flight: false,
+            workspace_writes_disabled: false,
+            workspace_retry_metadata: Default::default(),
+            workspace_failed_metadata: Default::default(),
             shared_prompt_queues: std::collections::HashMap::new(),
             optimistic_prompt_echoes: std::collections::HashMap::new(),
             pending_running_adoptions: std::collections::HashMap::new(),
@@ -2827,6 +2873,7 @@ impl AppView {
     }
     /// Apply a (possibly hot-reloaded) appearance config to all agents.
     pub fn set_appearance(&mut self, config: AppearanceConfig) {
+        crate::render::bidi::set_enabled(config.scrollback.display.rtl_bidi);
         for agent in self.agents.values_mut() {
             agent.scrollback.set_appearance(config.clone());
             for child in agent.subagent_views.values_mut() {
@@ -4845,7 +4892,7 @@ impl AppView {
         agents: &mut IndexMap<AgentId, AgentView>,
         drawn_agent: Option<AgentId>,
     ) -> Option<crate::terminal::overlay::PostFlush> {
-        if crate::terminal::image::detect_graphics_protocol()
+        if crate::terminal::image::prompt_preview_graphics_protocol()
             == crate::terminal::image::GraphicsProtocol::None
         {
             return None;
@@ -4861,8 +4908,11 @@ impl AppView {
                 has_escapes = true;
             }
         }
-        if drawn_agent.is_none() {
-            clears.append(crate::terminal::overlay::clear_kitty().into());
+        if drawn_agent.is_none()
+            && let Some(clear) = crate::terminal::overlay::clear()
+            && (!clear.as_str().is_empty() || crate::terminal::overlay::has_committed_owner())
+        {
+            clears.append(clear.into());
             has_escapes = true;
         }
         has_escapes.then_some(clears)
@@ -5048,6 +5098,7 @@ impl AppView {
                 &self.hidden_announcement_ids,
             );
         let agent_mouse_pos = self.last_mouse_pos;
+        let status_line_frame = self.status_line_frame();
         let Self {
             active_view,
             agents,
@@ -5454,6 +5505,7 @@ impl AppView {
                                     voice_listening,
                                     voice_interim: voice_interim.as_deref(),
                                     esc_owned_before_agent,
+                                    status_line: status_line_frame.clone(),
                                 },
                             );
                             if let Some(modal) = self.import_claude_modal.as_mut() {
@@ -5536,6 +5588,8 @@ impl AppView {
                                 registry,
                                 pending_hint,
                                 dashboard_roster,
+                                self.workspace_dashboard_enabled,
+                                self.workspace_snapshot.as_ref(),
                                 self.dashboard_sessions_loading,
                                 dash_upgrade_cta,
                             );
@@ -5572,6 +5626,7 @@ impl AppView {
                                                     link_spans,
                                                     AppRenderParams {
                                                         esc_owned_before_agent,
+                                                        status_line: status_line_frame.clone(),
                                                         ..Default::default()
                                                     },
                                                 )
@@ -6055,6 +6110,7 @@ impl AppView {
                 )
             ) && spinner_frame_tick;
             needs_redraw |= agent.drain_blocked();
+            needs_redraw |= agent.resize_preview_needs_tick();
             agent.prompt.slash_controller.set_workflows_available(
                 agent
                     .session
@@ -6062,6 +6118,17 @@ impl AppView {
                     .iter()
                     .any(|c| c.name == "workflow")
                     || !agent.workflow_runs.is_empty(),
+            );
+            agent.prompt.slash_controller.set_workflow_runs(
+                agent
+                    .workflow_runs
+                    .iter()
+                    .map(|run| crate::slash::command::WorkflowRunChoice {
+                        name: run.name.clone(),
+                        status: run.status.clone(),
+                        builtin: run.builtin,
+                    })
+                    .collect(),
             );
             if agent.acp_synced_generation != agent.session.available_commands_generation {
                 agent.prompt.sync_acp_commands(
@@ -6143,6 +6210,8 @@ impl AppView {
             }
         }
         needs_redraw |= self.tick_scroll();
+        self.update_status_line();
+        needs_redraw |= self.status_line.take_changed();
         needs_redraw
     }
     /// Flush pending scroll lines (stream gap detection, redraw cadence).
@@ -6289,6 +6358,9 @@ impl AppView {
     /// the ~12fps welcome logo shimmer and the macOS Cmd link-hover poll —
     /// so an app that *looks* idle doesn't spin a 30fps loop for them.
     pub fn tick_demand(&self) -> TickDemand {
+        self.view_tick_demand().max(self.status_line_tick_demand())
+    }
+    fn view_tick_demand(&self) -> TickDemand {
         if self.pending_action.is_some() {
             return TickDemand::Fast;
         }
@@ -6339,6 +6411,7 @@ impl AppView {
                     || agent.acp_synced_generation != agent.session.available_commands_generation
                     || !agent.session.state.is_idle()
                     || agent.wake_turn_active()
+                    || agent.resize_preview_needs_tick()
                     || agent.session.loading_replay
                     || agent
                         .mcp_init_progress
@@ -6694,6 +6767,7 @@ pub(crate) mod tests {
             appearance: AppearanceConfig::default(),
             notification_service: NotificationService::new(Default::default()),
             pending_notification_escapes: None,
+            status_line: Default::default(),
             deferred_notification: None,
             tracing_rx: None,
             active_announcements: vec![],
@@ -6844,7 +6918,10 @@ pub(crate) mod tests {
             foreign_session_scan_seq: 0,
             foreign_scan_coordinator: Default::default(),
             session_picker_lanes: Default::default(),
-            session_picker_detail_generation: 0,
+            session_picker_detail_seq: 0,
+            picker_generation_counter: 0,
+            session_picker_generation: 0,
+            dashboard_session_picker: None,
             session_picker_entries_query: None,
             session_picker_pending_delete: None,
             welcome_tick: 0,
@@ -6856,6 +6933,7 @@ pub(crate) mod tests {
             foreign_resume_launch: None,
             quit_for_update: false,
             relaunch: None,
+            pending_screen_mode_switch: None,
             has_claude_import: false,
             import_claude_modal: None,
             welcome_doc_viewer: None,
@@ -6869,6 +6947,7 @@ pub(crate) mod tests {
             show_resolved_model: true,
             sharing_enabled: false,
             plugin_cta_enabled: false,
+            workspace_dashboard_enabled: false,
             usage_visible: true,
             has_external_auth_provider: false,
             tier_restricted_commands: Vec::new(),
@@ -6879,6 +6958,14 @@ pub(crate) mod tests {
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
             dashboard_sessions_loading: false,
+            workspace_store: None,
+            workspace_snapshot: None,
+            workspace_store_loading: false,
+            workspace_sync_requested: false,
+            workspace_write_in_flight: false,
+            workspace_writes_disabled: false,
+            workspace_retry_metadata: Default::default(),
+            workspace_failed_metadata: Default::default(),
             shared_prompt_queues: std::collections::HashMap::new(),
             optimistic_prompt_echoes: std::collections::HashMap::new(),
             pending_running_adoptions: std::collections::HashMap::new(),
@@ -6929,6 +7016,8 @@ pub(crate) mod tests {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                hook_block_hold: false,
+                blocked_prompt: None,
                 provider_rebind_pending: false,
                 user_model_preference: None,
                 deferred_model_switch: None,
@@ -7201,6 +7290,8 @@ pub(crate) mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,
@@ -7404,6 +7495,8 @@ pub(crate) mod tests {
         assert_eq!(app.tick_demand(), TickDemand::None, "idle agent parks");
         app.agents.get_mut(&id).unwrap().active_modal =
             Some(crate::views::modal::ActiveModal::SessionPicker {
+                generation: 0,
+                detail_seq: 0,
                 state: crate::views::picker::PickerState::default(),
                 entries: None,
                 loading: true,
@@ -7423,6 +7516,8 @@ pub(crate) mod tests {
             "loading modal picker must keep the spinner animating"
         );
         let foreign_entry = SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "claude-1".into(),
             summary: "claude".into(),
             updated_at: chrono::Utc::now(),
@@ -7997,6 +8092,9 @@ pub(crate) mod tests {
                 prompt_id: "pid-stuck".into(),
                 stop_reason: Some("end_turn".into()),
                 agent_result: None,
+                cancellation_category: None,
+                cancellation_context: None,
+                error_kind: None,
                 cancel_trigger: None,
                 received_at: std::time::Instant::now()
                     - (TURN_END_RECONCILE_GRACE + std::time::Duration::from_secs(1)),
@@ -8815,6 +8913,8 @@ pub(crate) mod tests {
     }
     fn welcome_session_entry(id: &str) -> SessionPickerEntry {
         SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: id.into(),
             summary: id.into(),
             updated_at: chrono::Utc::now(),
@@ -9750,14 +9850,16 @@ pub(crate) mod tests {
         let effects = crate::app::dispatch::dispatch(Action::ClearPrompt, &mut app);
         assert!(effects.is_empty());
         assert!(app.agents[&id].prompt.textarea.text().is_empty());
+        let stash = app.agents[&id]
+            .prompt_stash
+            .as_ref()
+            .expect("the cleared draft remains recoverable");
+        assert_eq!(stash.prompt.text, "draft to clear");
         assert_eq!(
-            app.agents[&id]
-                .session
-                .prompt_history
-                .first()
-                .map(String::as_str),
-            Some("draft to clear")
+            stash.cause,
+            crate::app::agent_view::StashCause::ClearedDraft
         );
+        assert!(app.agents[&id].session.prompt_history.is_empty());
     }
     #[test]
     fn idle_empty_with_messages_double_esc_opens_rewind_silent() {
@@ -11163,14 +11265,14 @@ pub(crate) mod tests {
             !crate::terminal::overlay::static_image(&png, 20, 10, 0, 0, 8)
                 .unwrap()
                 .as_str()
-                .contains("a=t")
+                .contains("a=T")
         );
         clear.write_to(&mut Vec::new()).unwrap();
         assert!(
             crate::terminal::overlay::static_image(&png, 20, 10, 0, 0, 8)
                 .unwrap()
                 .as_str()
-                .contains("a=t")
+                .contains("a=T")
         );
     }
     #[test]
@@ -13051,6 +13153,8 @@ pub(crate) mod tests {
     #[test]
     fn welcome_picker_f_cycle_disabled_under_chat_mode() {
         let conversation_entry = SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "conv-welcome-f".into(),
             summary: "chat".into(),
             updated_at: chrono::Utc::now(),

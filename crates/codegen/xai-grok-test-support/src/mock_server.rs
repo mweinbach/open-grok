@@ -420,6 +420,11 @@ impl MockInferenceServer {
         self.overrides.enqueue_response(path, response);
     }
 
+    pub fn set_inference_concurrency_cap(&self, cap: usize, hold: Duration, retry_after_secs: u64) {
+        self.overrides
+            .set_concurrency_cap(cap, hold, retry_after_secs);
+    }
+
     /// Queue a [`ScriptedResponse`] for the next tool-bearing agent turn on
     /// any inference endpoint. Consumed FIFO and only by requests that carry
     /// 2+ tools, so auxiliary requests such as title generation never consume
@@ -1328,8 +1333,16 @@ mod tests {
         format!("{}/{suffix}", server.url())
     }
 
+    fn local_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .tls_built_in_root_certs(false)
+            .build()
+            .expect("build loopback HTTP test client")
+    }
+
     async fn post_chat(server: &MockInferenceServer, content: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        local_http_client()
             .post(format!("{}/chat/completions", server.url()))
             .json(&json!({
                 "model": "test-model",
@@ -1346,7 +1359,7 @@ mod tests {
         request_id: &str,
         content: &str,
     ) -> reqwest::Response {
-        reqwest::Client::new()
+        local_http_client()
             .post(endpoint_url(server, endpoint))
             .header("x-grok-req-id", request_id)
             .header("x-grok-turn-idx", "1")
@@ -1377,7 +1390,7 @@ mod tests {
         request_id: &str,
         body: Value,
     ) -> (reqwest::StatusCode, String) {
-        let response = reqwest::Client::new()
+        let response = local_http_client()
             .post(endpoint_url(server, endpoint))
             .header("x-grok-req-id", request_id)
             .header("x-grok-turn-idx", "1")
@@ -2118,6 +2131,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrency_cap_preserves_auth_and_script_precedence_on_all_endpoints() {
+        let server = MockInferenceServer::start_with_required_auth(
+            vec![MockModelEntry::new("test-model")],
+            "secret-token",
+        )
+        .await
+        .unwrap();
+        server.set_inference_concurrency_cap(0, Duration::from_secs(30), 7);
+
+        for endpoint in [
+            InferenceEndpoint::ChatCompletions,
+            InferenceEndpoint::Responses,
+            InferenceEndpoint::Messages,
+        ] {
+            server.enqueue_response(endpoint.path(), ScriptedResponse::text(218, "scripted"));
+            let mut expected = server.expect_response(
+                format!("cap bypass {endpoint:?}"),
+                InferenceRequestMatcher::foreground(endpoint),
+                ScriptedResponse::text(219, "expected"),
+            );
+
+            let (status, body) =
+                read_foreground(&server, endpoint, "cap-expectation", "first").await;
+            assert_eq!(status.as_u16(), 219);
+            assert_eq!(body, "expected");
+            expected.wait_satisfied().await;
+            expected.assert_satisfied();
+
+            let (status, body) = read_foreground(&server, endpoint, "cap-script", "second").await;
+            assert_eq!(status.as_u16(), 218);
+            assert_eq!(body, "scripted");
+
+            let response = post_foreground(&server, endpoint, "cap-auth", "third").await;
+            assert_eq!(response.status(), 401);
+
+            let response = reqwest::Client::new()
+                .post(endpoint_url(&server, endpoint))
+                .header("authorization", "Bearer secret-token")
+                .json(&foreground_body(endpoint, "fourth"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 429);
+            assert_eq!(response.headers()["retry-after"], "7");
+            assert_eq!(
+                response.text().await.unwrap(),
+                "concurrent request cap exceeded"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn matched_expectation_precedes_auth_then_auth_resumes() {
         let server = MockInferenceServer::start_with_required_auth(
             vec![MockModelEntry::new("test-model")],
@@ -2162,7 +2227,14 @@ mod tests {
             let server = MockInferenceServer::start().await.unwrap();
             server.hold_agent_completions();
             server.set_agent_turns([format!("{endpoint:?} turn")]);
-            let request = read_foreground(&server, endpoint, "global-gate", "hello");
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                post_foreground(&server, endpoint, "global-gate", "hello"),
+            )
+            .await
+            .expect("fallback SSE headers must arrive before completion is released");
+            assert_eq!(response.status(), 200);
+            let request = response.text();
             tokio::pin!(request);
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), &mut request)
@@ -2173,7 +2245,8 @@ mod tests {
             server.release_agent_completions();
             tokio::time::timeout(Duration::from_secs(1), request)
                 .await
-                .unwrap_or_else(|_| panic!("{endpoint:?} did not complete after release"));
+                .unwrap_or_else(|_| panic!("{endpoint:?} did not complete after release"))
+                .expect("read fallback SSE body");
         }
 
         let server = MockInferenceServer::start().await.unwrap();
@@ -2182,12 +2255,19 @@ mod tests {
             "/v1/responses",
             ScriptedResponse::sse(vec![SseEvent::data("chunk"), SseEvent::data("terminal")]),
         );
-        let request = read_foreground(
-            &server,
-            InferenceEndpoint::Responses,
-            "scripted-global-gate",
-            "hello",
-        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            post_foreground(
+                &server,
+                InferenceEndpoint::Responses,
+                "scripted-global-gate",
+                "hello",
+            ),
+        )
+        .await
+        .expect("scripted SSE headers must arrive before completion is released");
+        assert_eq!(response.status(), 200);
+        let request = response.text();
         tokio::pin!(request);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut request)
@@ -2198,30 +2278,39 @@ mod tests {
         server.release_agent_completions();
         tokio::time::timeout(Duration::from_secs(1), request)
             .await
-            .expect("scripted SSE completes after release");
+            .expect("scripted SSE completes after release")
+            .expect("read scripted SSE body");
     }
 
     #[tokio::test]
     async fn compatibility_completion_gate_does_not_hold_json_or_raw() {
-        for response in [
-            ScriptedResponse::json(219, json!({ "ok": true })),
-            ScriptedResponse::text(220, "raw body"),
+        for endpoint in [
+            InferenceEndpoint::ChatCompletions,
+            InferenceEndpoint::Responses,
+            InferenceEndpoint::Messages,
         ] {
-            let server = MockInferenceServer::start().await.unwrap();
-            server.hold_agent_completions();
-            server.enqueue_response("/v1/responses", response);
-            let (status, _) = tokio::time::timeout(
-                Duration::from_secs(1),
-                read_foreground(
-                    &server,
-                    InferenceEndpoint::Responses,
-                    "compat-non-sse",
-                    "hello",
+            for (response, expected_status, expected_body) in [
+                (
+                    ScriptedResponse::json(219, json!({ "ok": true })),
+                    219,
+                    r#"{"ok":true}"#,
                 ),
-            )
-            .await
-            .expect("compatibility JSON/raw must not wait for the SSE gate");
-            assert!(matches!(status.as_u16(), 219 | 220));
+                (ScriptedResponse::text(220, "raw body"), 220, "raw body"),
+            ] {
+                let server = MockInferenceServer::start().await.unwrap();
+                server.hold_agent_completions();
+                server.enqueue_response(endpoint.path(), response);
+                let (status, body) = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    read_foreground(&server, endpoint, "compat-non-sse", "hello"),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{endpoint:?}/{expected_status} JSON/raw must not wait for the SSE gate")
+                });
+                assert_eq!(status.as_u16(), expected_status);
+                assert_eq!(body, expected_body);
+            }
         }
     }
 

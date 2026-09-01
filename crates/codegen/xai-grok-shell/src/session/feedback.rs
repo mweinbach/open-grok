@@ -11,8 +11,29 @@ use crate::util::probabilistic_sample;
 
 // Re-export shared feedback API wire types to avoid duplication
 pub use prod_mc_cli_chat_proxy_types::feedback_types::{
-    FeedbackHeuristicsConfig, FeedbackMode, TierConfig,
+    FeedbackHeuristicsConfig, FeedbackImage, FeedbackImageError, FeedbackMode,
+    MAX_FEEDBACK_IMAGE_BYTES, MAX_FEEDBACK_IMAGE_TOTAL_BYTES, MAX_FEEDBACK_IMAGES, TierConfig,
+    feedback_image_extension, validate_feedback_images,
 };
+
+pub(crate) fn validate_feedback_image_payloads(images: &[FeedbackImage]) -> anyhow::Result<()> {
+    use base64::Engine;
+    validate_feedback_images(images)?;
+    for (index, image) in images.iter().enumerate() {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .map_err(|_| anyhow::anyhow!("feedback image {index} is not valid standard base64"))?;
+        if bytes.is_empty() || bytes.len() > MAX_FEEDBACK_IMAGE_BYTES {
+            anyhow::bail!("feedback image {index} is empty or too large");
+        }
+        let format = image::guess_format(&bytes)
+            .map_err(|_| anyhow::anyhow!("feedback image {index} is not a supported image"))?;
+        if format.to_mime_type() != image.mime_type {
+            anyhow::bail!("feedback image {index} content does not match its media type");
+        }
+    }
+    Ok(())
+}
 
 /// Feedback request tier with associated probability and criteria.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -758,6 +779,38 @@ impl FeedbackRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feedback_image_payloads_reject_invalid_base64_and_mime_mismatches() {
+        use base64::Engine;
+        let png_data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n");
+        let valid = FeedbackImage {
+            data: png_data,
+            mime_type: "image/png".into(),
+            file_name: Some("shot.png".into()),
+        };
+        assert!(validate_feedback_image_payloads(std::slice::from_ref(&valid)).is_ok());
+        for image in [
+            FeedbackImage {
+                data: "not base64!".into(),
+                ..valid.clone()
+            },
+            FeedbackImage {
+                data: String::new(),
+                ..valid.clone()
+            },
+            FeedbackImage {
+                mime_type: "image/jpeg".into(),
+                ..valid.clone()
+            },
+            FeedbackImage {
+                data: base64::engine::general_purpose::STANDARD.encode(b"plain text"),
+                ..valid.clone()
+            },
+        ] {
+            assert!(validate_feedback_image_payloads(&[image]).is_err());
+        }
+    }
 
     fn make_signals(
         turns: u32,

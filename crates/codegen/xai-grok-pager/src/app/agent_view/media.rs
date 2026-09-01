@@ -11,6 +11,57 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MediaFileStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: (i64, i64),
+}
+
+impl MediaFileStamp {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        let modified = metadata.modified().ok()?;
+        #[cfg(unix)]
+        let (ino, ctime) = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.ino(), (metadata.ctime(), metadata.ctime_nsec()))
+        };
+        Some(Self {
+            len: metadata.len(),
+            modified,
+            #[cfg(unix)]
+            ino,
+            #[cfg(unix)]
+            ctime,
+        })
+    }
+}
+
+fn cache_inline_media_bytes(
+    cache: &mut std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
+    path: &std::path::Path,
+    bytes: Vec<u8>,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    if bytes.len() >= max_bytes {
+        return Some(bytes);
+    }
+    let mut total = cache.values().map(Vec::len).sum::<usize>() + bytes.len();
+    while total > max_bytes {
+        let Some(victim) = cache.keys().next().cloned() else {
+            break;
+        };
+        if let Some(evicted) = cache.remove(&victim) {
+            total -= evicted.len();
+        }
+    }
+    cache.insert(path.to_path_buf(), bytes);
+    None
+}
+
 impl AgentView {
     // -- Image viewer input --------------------------------------------------
 
@@ -82,51 +133,53 @@ impl AgentView {
         // the next time the path is seen `needs_transmit` would be false and only
         // `place` (no `transmit`) would emit — leaving a blank image.
         let needs_transmit = !self.inline_media_ids.contains_key(path);
-        let mut transmit_esc = String::new();
-
-        if needs_transmit {
-            // Load bytes from disk (or use cached bytes if available).
-            if !self.inline_media_cache.contains_key(path) {
-                let bytes = if placement.info.is_video {
-                    let (frame_bytes, _, _) = crate::prompt_images::extract_poster_frame(path)?;
-                    crate::terminal::image::prepare_overlay_image_bytes(&frame_bytes)?
-                } else {
-                    let raw = std::fs::read(path).ok()?;
-                    crate::terminal::image::prepare_overlay_image_bytes(&raw)?
-                };
-                // Bound the cache: a long image-heavy session must not pin
-                // every encoded image for its lifetime. Evicting drops only
-                // CPU-side bytes — Kitty placements already transmitted stay
-                // valid on the GPU (`inline_media_ids` is kept); an evicted
-                // path re-reads from disk if it needs a re-transmit.
-                const INLINE_MEDIA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-                let incoming = bytes.len();
-                if incoming < INLINE_MEDIA_CACHE_MAX_BYTES {
-                    let mut total: usize = self
-                        .inline_media_cache
-                        .values()
-                        .map(Vec::len)
-                        .sum::<usize>()
-                        + incoming;
-                    while total > INLINE_MEDIA_CACHE_MAX_BYTES {
-                        // HashMap iteration order is arbitrary — treat as random eviction.
-                        let Some(victim) = self.inline_media_cache.keys().next().cloned() else {
-                            break;
-                        };
-                        if let Some(evicted) = self.inline_media_cache.remove(&victim) {
-                            total -= evicted.len();
-                        }
+        let mut oversized = None;
+        if !self.inline_media_cache.contains_key(path) {
+            let metadata = std::fs::metadata(path).ok()?;
+            let stamp = MediaFileStamp::from_metadata(&metadata);
+            if let Some(stamp) = stamp
+                && self.inline_media_load_failed.get(path) == Some(&stamp)
+            {
+                return None;
+            }
+            let loaded = if placement.info.is_video {
+                crate::prompt_images::extract_poster_frame(path).and_then(|(frame_bytes, _, _)| {
+                    crate::terminal::image::prepare_overlay_image_bytes(&frame_bytes)
+                })
+            } else {
+                std::fs::read(path)
+                    .ok()
+                    .and_then(|raw| crate::terminal::image::prepare_overlay_image_bytes(&raw))
+            };
+            let Some(bytes) = loaded else {
+                match stamp {
+                    Some(stamp) => {
+                        self.inline_media_load_failed.insert(path.clone(), stamp);
+                    }
+                    None => {
+                        self.inline_media_load_failed.remove(path);
                     }
                 }
-                self.inline_media_cache.insert(path.clone(), bytes);
-            }
-            let image_id = self.get_or_alloc_media_id(path);
-            let bytes = self.inline_media_cache.get(path)?;
-            transmit_esc = crate::terminal::image::transmit_inline_image(bytes, image_id)?;
+                return None;
+            };
+            self.inline_media_load_failed.remove(path);
+            const INLINE_MEDIA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+            oversized = cache_inline_media_bytes(
+                &mut self.inline_media_cache,
+                path,
+                bytes,
+                INLINE_MEDIA_CACHE_MAX_BYTES,
+            );
         }
-
         let image_id = self.get_or_alloc_media_id(path);
-        let image_data = self.inline_media_cache.get(path)?;
+        let image_data: &[u8] = match &oversized {
+            Some(bytes) => bytes,
+            None => self.inline_media_cache.get(path)?,
+        };
+        let mut transmit_esc = String::new();
+        if needs_transmit {
+            transmit_esc = crate::terminal::image::transmit_inline_image(image_data, image_id)?;
+        }
         let (w, h) = decode_image_dimensions(image_data)
             .unwrap_or((placement.info.width, placement.info.height));
 
@@ -632,6 +685,138 @@ mod tests {
 
     fn make_agent() -> crate::app::agent_view::AgentView {
         crate::test_util::make_agent_view(None, "/tmp")
+    }
+
+    fn make_test_png() -> Vec<u8> {
+        let image = image::ImageBuffer::from_pixel(40, 20, image::Rgba([128u8, 64, 32, 255]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn tool_media_placement(
+        path: std::path::PathBuf,
+    ) -> crate::scrollback::render::InlineMediaPlacement {
+        crate::scrollback::render::InlineMediaPlacement {
+            info: crate::prompt_images::InlineMediaInfo {
+                path,
+                width: 40,
+                height: 20,
+                is_video: false,
+                alt_text: String::new(),
+            },
+            screen_rect: ratatui::layout::Rect::new(0, 0, 20, 6),
+            full_rows: 6,
+            top_crop_rows: 0,
+            filepath_screen_rect: None,
+            open_button_screen_rect: None,
+            has_button_row: true,
+        }
+    }
+
+    #[test]
+    fn tool_media_place_only_frame_reloads_bytes_after_cache_drop() {
+        use crate::terminal::image::{GraphicsProtocol, set_protocol_for_test};
+        let _protocol = set_protocol_for_test(GraphicsProtocol::Kitty);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("evicted.png");
+        std::fs::write(&path, make_test_png()).unwrap();
+        let mut agent = make_agent();
+        let placement = tool_media_placement(path.clone());
+        let first = agent
+            .build_inline_media_escapes(&placement)
+            .expect("first frame loads from disk and emits escapes");
+        assert!(first.contains("a=t"));
+        agent.inline_media_cache.clear();
+        let second = agent
+            .build_inline_media_escapes(&placement)
+            .expect("place-only frame reloads the bytes");
+        assert!(second.contains("a=p"));
+        assert!(!second.contains("a=t"));
+        assert!(agent.inline_media_cache.contains_key(&path));
+    }
+
+    #[test]
+    fn tool_media_load_failure_negative_cached_until_file_changes() {
+        use crate::terminal::image::{GraphicsProtocol, set_protocol_for_test};
+        let _protocol = set_protocol_for_test(GraphicsProtocol::Kitty);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken.png");
+        let mut agent = make_agent();
+        let placement = tool_media_placement(path.clone());
+        assert!(agent.build_inline_media_escapes(&placement).is_none());
+        assert!(!agent.inline_media_load_failed.contains_key(&path));
+        assert!(!agent.inline_media_ids.contains_key(&path));
+        std::fs::write(&path, b"not a png").unwrap();
+        assert!(agent.build_inline_media_escapes(&placement).is_none());
+        assert!(agent.inline_media_load_failed.contains_key(&path));
+        assert!(!agent.inline_media_ids.contains_key(&path));
+        assert!(agent.build_inline_media_escapes(&placement).is_none());
+        std::fs::write(&path, make_test_png()).unwrap();
+        let recovered = agent
+            .build_inline_media_escapes(&placement)
+            .expect("a changed file retries and recovers");
+        assert!(recovered.contains("a=t"));
+        assert!(!agent.inline_media_load_failed.contains_key(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_media_same_length_same_mtime_rewrite_retries_failed_load() {
+        use crate::terminal::image::{GraphicsProtocol, set_protocol_for_test};
+        let _protocol = set_protocol_for_test(GraphicsProtocol::Kitty);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("slow-write.png");
+        let png = make_test_png();
+        let modified =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let pin_modified = |path: &std::path::Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        };
+        std::fs::write(&path, vec![0u8; png.len()]).unwrap();
+        pin_modified(&path);
+        let mut agent = make_agent();
+        let placement = tool_media_placement(path.clone());
+        assert!(agent.build_inline_media_escapes(&placement).is_none());
+        assert!(agent.inline_media_load_failed.contains_key(&path));
+        std::fs::write(&path, &png).unwrap();
+        pin_modified(&path);
+        assert!(agent.build_inline_media_escapes(&placement).is_some());
+        assert!(!agent.inline_media_load_failed.contains_key(&path));
+    }
+
+    #[test]
+    fn oversized_media_bytes_stay_transient_and_never_accumulate() {
+        let mut cache = std::collections::HashMap::new();
+        let path = std::path::Path::new;
+
+        assert!(
+            super::cache_inline_media_bytes(&mut cache, path("/small"), vec![0; 4], 16).is_none()
+        );
+        let oversized =
+            super::cache_inline_media_bytes(&mut cache, path("/big-1"), vec![0; 16], 16);
+        assert_eq!(oversized.as_ref().map(Vec::len), Some(16));
+        assert!(!cache.contains_key(path("/big-1")));
+        for _ in 0..2 {
+            let _ = super::cache_inline_media_bytes(&mut cache, path("/big-2"), vec![0; 64], 16);
+        }
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(path("/small")));
+        assert!(
+            super::cache_inline_media_bytes(&mut cache, path("/small-2"), vec![0; 15], 16)
+                .is_none()
+        );
+        assert!(cache.values().map(Vec::len).sum::<usize>() <= 16);
     }
 
     fn stub_inline_video() -> crate::app::agent_view::InlineVideoState {

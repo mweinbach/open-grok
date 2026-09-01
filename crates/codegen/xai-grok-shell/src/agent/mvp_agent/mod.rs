@@ -524,6 +524,8 @@ pub(crate) struct PromptResponseMeta {
     /// (e.g. doom loop). `None` for normal completions and user cancels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancellation_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_context: Option<serde_json::Value>,
     /// What triggered a cancelled turn's cancel (`"send_now"`, `"ctrl_c"`,
     /// `"esc"`); surfaced as `cancelTrigger`. `None` for non-cancel completions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -550,6 +552,7 @@ pub(crate) struct PromptResponseMetaArgs<'a> {
     pub last_turn_usage: Option<&'a xai_grok_sampling_types::TokenUsage>,
     pub prompt_usage: Option<crate::extensions::notification::PromptUsage>,
     pub cancellation_category: Option<String>,
+    pub cancellation_context: Option<serde_json::Value>,
     pub cancel_trigger: Option<String>,
     pub structured_output: Option<Result<serde_json::Value, String>>,
     pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
@@ -568,6 +571,7 @@ pub(crate) fn build_prompt_response_meta(
         last_turn_usage,
         prompt_usage,
         cancellation_category,
+        cancellation_context,
         cancel_trigger,
         structured_output,
         tool_overrides,
@@ -589,6 +593,7 @@ pub(crate) fn build_prompt_response_meta(
         reasoning_tokens: last_turn_usage.map(|u| u.reasoning_tokens),
         usage: prompt_usage,
         cancellation_category,
+        cancellation_context,
         cancel_trigger,
         structured_output,
         structured_output_error,
@@ -897,13 +902,14 @@ pub struct MvpAgent {
     subagent_event_tx: tokio::sync::mpsc::UnboundedSender<
         xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
     >,
+    subagent_coordinator_sender:
+        xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+    subagent_sampling_semaphore: Arc<tokio::sync::Semaphore>,
     /// Receiver for subagent events. Taken once by `start_subagent_coordinator()`.
     /// `None` after the coordinator drain task has been spawned.
     subagent_event_rx: RefCell<
         Option<
-            tokio::sync::mpsc::UnboundedReceiver<
-                xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
-            >,
+            xai_grok_tools::implementations::grok_build::task::coordinator::SubagentCoordinatorReceiver,
         >,
     >,
     /// Shell-only presentation state; lifecycle lives in the channel actor.

@@ -53,7 +53,9 @@ mod subagent_lifecycle;
 mod workflow_ingest;
 
 #[cfg(test)]
-use permissions::{MCP_ARGS_MAX_LINE_CHARS, MCP_ARGS_MAX_LINES, mcp_args_lines};
+use permissions::{
+    MCP_ARGS_MAX_LINE_CHARS, MCP_ARGS_MAX_LINES, build_permission_display, mcp_args_lines,
+};
 use permissions::{
     apply_recap_block, handle_permission_request, should_drop_duplicate_auto_recap,
     should_drop_late_auto_recap,
@@ -80,6 +82,7 @@ use subagent_lifecycle::{
 
 use workflow_ingest::ingest_workflow_update;
 
+pub(crate) use session_notification::apply_child_view_session_event;
 #[cfg(test)]
 pub(crate) use session_notification::apply_session_event_for_test;
 pub(crate) use session_notification::drop_unexpected_replay;
@@ -99,10 +102,10 @@ use background::{
 };
 use follow_ups::handle_follow_ups;
 pub(crate) use interactions::handle_ask_user_question;
-use interactions::handle_exit_plan_mode;
+use interactions::{handle_exit_plan_mode, handle_mcp_elicit};
 use mcp::{
-    handle_mcp_init_progress, handle_mcp_server_status, handle_mcp_servers_updated,
-    handle_mcp_tools_changed, push_server_status_enabled,
+    handle_mcp_elicit_complete, handle_mcp_init_progress, handle_mcp_server_status,
+    handle_mcp_servers_updated, handle_mcp_tools_changed, push_server_status_enabled,
 };
 use settings::{
     handle_announcements_update, handle_models_update, handle_sessions_changed,
@@ -285,14 +288,14 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         agent.todo.update_todos(items);
                         agent.mark_reload_todo_update();
                         advance_reconnect_cursor(agent, &mut meta);
-                        !meta.is_replay && !agent.session.loading_replay
+                        !agent.session.loading_replay
                     } else if let acp::SessionUpdate::ToolCallUpdate(ref tcu) = notif.request.update
                         && route_bg_task_stdout(tcu, &mut agent.session)
                     {
                         // Stdout chunk for a bg task — routed to central store,
                         // not to the scrollback tracker.
                         advance_reconnect_cursor(agent, &mut meta);
-                        !meta.is_replay && !agent.session.loading_replay
+                        !agent.session.loading_replay
                     } else if !meta.is_replay
                         && let Some(notif_pid) = meta.prompt_id.as_ref()
                         && agent.session.current_prompt_id.as_ref() != Some(notif_pid)
@@ -415,10 +418,28 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         let had_activity_before = agent.session.tracker.activity().is_some();
                         let update = notif.request.update;
                         maybe_mark_swarm_detached(agent, &update);
+                        let replayed_visible =
+                            meta.is_replay && crate::acp::tracker::is_agent_output_update(&update);
+                        let replayed_bash = meta.is_replay
+                            && matches!(&update, acp::SessionUpdate::ToolCall(tool)
+                                if tool.meta.as_ref()
+                                    .and_then(|metadata| metadata.get("bash_mode"))
+                                    .and_then(serde_json::Value::as_bool) == Some(true));
                         let user_echo = matches!(update, acp::SessionUpdate::UserMessageChunk(_));
-                        agent
-                            .session
-                            .handle_update(update, &meta, &mut agent.scrollback);
+                        let applied =
+                            agent
+                                .session
+                                .handle_update(update, &meta, &mut agent.scrollback);
+                        if meta.is_replay
+                            && let Some(prompt_id) = meta.prompt_id.as_ref()
+                        {
+                            if replayed_visible && applied {
+                                agent.replayed_visible_prompts.insert(prompt_id.clone());
+                            }
+                            if replayed_bash {
+                                agent.replayed_bash_prompts.insert(prompt_id.clone());
+                            }
+                        }
                         // Skip user echo: shell broadcasts it before history commit.
                         if !user_echo
                             && !meta.is_replay
@@ -535,7 +556,7 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
 
                         advance_reconnect_cursor(agent, &mut meta);
 
-                        !meta.is_replay && !agent.session.loading_replay
+                        !agent.session.loading_replay
                     };
 
                     if plan_mode_modal_refresh_needed {
@@ -561,8 +582,7 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
 
                     let activity_label = {
                         let child_view = parent
-                            .subagent_views
-                            .get_mut(child_key)
+                            .child_view_for_live_update_mut(child_key)
                             .expect("find_session_match returned an existing subagent_views key");
                         if let Some(tokens) = meta.total_tokens {
                             confirm_context_used(child_view, tokens);
@@ -722,6 +742,7 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/mcp/server_status" if push_server_status_enabled() => {
             handle_mcp_server_status(notif, app)
         }
+        "x.ai/mcp/elicit_complete" => handle_mcp_elicit_complete(notif, app),
         "x.ai/mcp/servers_updated" => handle_mcp_servers_updated(notif, app),
         _ => false,
     }
@@ -862,6 +883,7 @@ fn handle_ext_method(ext: xai_acp_lib::AcpArgs<acp::ExtRequest>, app: &mut AppVi
     match ext.request.method.as_ref() {
         "x.ai/ask_user_question" => handle_ask_user_question(ext, app),
         "x.ai/exit_plan_mode" => handle_exit_plan_mode(ext, app),
+        "x.ai/mcp/elicit" => handle_mcp_elicit(ext, app),
         unknown => {
             tracing::warn!("Unknown ext_method: {unknown}");
             ext.response_tx

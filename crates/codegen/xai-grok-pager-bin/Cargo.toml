@@ -49,6 +49,7 @@ dunce = { workspace = true }
 semver = { workspace = true }
 xai-tty-utils = { workspace = true }
 xai-grok-config = { workspace = true }
+xai-grok-extra-ca = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",

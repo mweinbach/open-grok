@@ -840,7 +840,6 @@ impl ScrollbackPane {
         let block_has_vpad = entry.block.has_vpad(ctx);
 
         // Get accent background preference and block background
-        let accent_has_bg = entry.block.accent_background(ctx);
         let block_bg = entry.block.background(ctx);
 
         // Resolve the background color from block_bg
@@ -900,7 +899,7 @@ impl ScrollbackPane {
                 break;
             }
             // Render line in the content area (not overlapping with accent)
-            buf.set_line_safe(content_area.x, y, &line.content, content_area.width);
+            buf.set_line_safe_bidi(content_area.x, y, &line.content, content_area.width);
             if let (Some(range_id), Some(cols)) = (
                 line.selection_range,
                 selectable_cols(&line.content, &line.selectable),
@@ -911,8 +910,10 @@ impl ScrollbackPane {
                     block_line_idx,
                     screen_y: y,
                     screen_x: content_area.x,
-                    selectable_cols: cols,
+                    selectable_cols: crate::scrollback::types::visual_selectable_cols(line)
+                        .unwrap_or(cols),
                     text: derive_selection_text(line),
+                    painted_region: Some(crate::scrollback::types::painted_selectable_region(line)),
                     joiner_to_previous: line.joiner.clone(),
                 });
             }
@@ -957,37 +958,14 @@ impl ScrollbackPane {
 
         // Draw accent line if entry has one, otherwise clear the accent column
         // so stale content from previous frames doesn't bleed through.
-        if let Some(accent) = entry.block.accent(ctx) {
-            let color = accent.color;
-            let accent_area = layout.accent;
+        let accent_area = layout.accent;
 
-            // Determine accent background color based on accent_has_bg and block_bg
-            let accent_bg = if accent_has_bg {
-                match block_bg {
-                    BlockBackground::None => theme.bg_base,
-                    BlockBackground::Light => theme.bg_light,
-                    BlockBackground::Dark => theme.bg_dark,
-                }
-            } else {
-                theme.bg_base
-            };
-
-            for y in accent_area.y..accent_area.y + total_height.min(area.height) {
-                if let Some(cell) = buf.cell_mut((accent_area.x, y)) {
-                    cell.set_char('┃');
-                    cell.set_style(ratatui::style::Style::default().fg(color).bg(accent_bg));
-                }
-            }
-        } else {
-            // No accent: clear the column with the block's bg so it matches.
-            let accent_area = layout.accent;
-            let clear_bg = bg_color.unwrap_or(theme.bg_base);
-            let clear_style = ratatui::style::Style::default().bg(clear_bg);
-            for y in accent_area.y..accent_area.y + total_height.min(area.height) {
-                if let Some(cell) = buf.cell_mut((accent_area.x, y)) {
-                    cell.set_char(' ');
-                    cell.set_style(clear_style);
-                }
+        // Determine accent background color based on accent_has_bg and block_bg
+        let clear_style = ratatui::style::Style::default().bg(bg_color.unwrap_or(theme.bg_base));
+        for row in accent_area.y..accent_area.y + total_height.min(area.height) {
+            if let Some(cell) = buf.cell_mut((accent_area.x, row)) {
+                cell.set_char(' ');
+                cell.set_style(clear_style);
             }
         }
 

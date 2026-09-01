@@ -4,6 +4,7 @@ mod facets;
 mod row;
 use crate::agent::session_registry_client::SessionRegistryClient;
 use crate::remote::{ConvError, ConvQuery, ConversationsClient};
+pub use crate::session::visibility::HeadlessPolicy;
 use cursor::{CompositeCursor, ConvLane, Paginated, merge_and_paginate};
 pub use envelope::{FacetMap, FacetValue, SessionKind, SessionMetaEnvelope};
 pub use facets::{
@@ -111,6 +112,8 @@ pub struct ListReq {
     /// Re-evaluated per page.
     #[serde(default)]
     pub allow_relax: bool,
+    #[serde(default)]
+    pub headless: Option<String>,
     #[serde(default, rename = "_meta")]
     pub meta: Option<serde_json::Value>,
 }
@@ -230,7 +233,9 @@ pub async fn build_unified_list(
     let cursor = CompositeCursor::decode(req.cursor.as_deref());
     let mut source_query = SourceQuery::default();
     reg.apply_pushdown(&facet_filters, &mut source_query);
-    let exclude_conversations = excludes_conversations(&facet_filters);
+    let headless = HeadlessPolicy::from_wire(req.headless.as_deref());
+    let exclude_conversations =
+        headless == HeadlessPolicy::Only || excludes_conversations(&facet_filters);
     let exclude_build = excludes_build(&facet_filters);
     let over = crate::session::merge::over_fetch(limit);
     let cwd_scope = if req.allow_relax {
@@ -250,9 +255,15 @@ pub async fn build_unified_list(
         }
         let cwd = req.cwd.as_deref();
         if can_relax {
-            let lanes =
-                crate::session::merge::fetch_lanes(registry_client, cwd, cwd_scope, None, over)
-                    .await;
+            let lanes = crate::session::merge::fetch_lanes_with_policy(
+                registry_client,
+                cwd,
+                cwd_scope,
+                None,
+                over,
+                headless,
+            )
+            .await;
             let rows = to_rows(
                 crate::session::merge::merge(
                     lanes.remote.clone(),
@@ -268,17 +279,26 @@ pub async fn build_unified_list(
                 relax: Some(RelaxInputs {
                     remote: lanes.remote,
                     repo_urls: lanes.repo_urls,
+                    cwd_rows_dropped_by_policy: lanes.rows_dropped_by_policy,
                 }),
             }
         } else {
-            let merged = crate::session::merge::fetch_merged(
+            let lanes = crate::session::merge::fetch_lanes_with_policy(
                 registry_client,
                 cwd,
                 cwd_scope,
                 query.as_deref(),
                 over,
+                headless,
             )
             .await;
+            let merged = crate::session::merge::merge(
+                lanes.remote,
+                lanes.local,
+                query.as_deref(),
+                &lanes.repo_urls,
+                over,
+            );
             LocalLane {
                 rows: to_rows(merged, reg),
                 relax: None,
@@ -336,7 +356,7 @@ pub async fn build_unified_list(
         },
         conv_lane,
     ) = tokio::join!(local_fut, conv_fut);
-    let (local_rows, scope) = maybe_relax(local_rows, relax, over, reg).await;
+    let (local_rows, scope) = maybe_relax(local_rows, relax, over, reg, headless).await;
     {
         let (conv_lane_status, conv_rows) = match &conv_lane {
             ConvLane::Skipped => ("skipped", 0),
@@ -389,6 +409,7 @@ struct LocalLane {
 struct RelaxInputs {
     remote: Vec<crate::agent::session_registry_client::SessionRecord>,
     repo_urls: Vec<String>,
+    cwd_rows_dropped_by_policy: bool,
 }
 fn to_rows(
     merged: Vec<crate::session::merge::MergedSession>,
@@ -418,8 +439,12 @@ async fn maybe_relax(
     relax: Option<RelaxInputs>,
     over: usize,
     reg: &FacetRegistry,
+    headless: HeadlessPolicy,
 ) -> (Vec<UnifiedRow>, ListScope) {
-    let Some(relax) = relax.filter(|_| lane_has_no_messages(&local_rows)) else {
+    let Some(relax) = relax.filter(|relax| {
+        !(relax.cwd_rows_dropped_by_policy && local_rows.is_empty())
+            && lane_has_no_messages(&local_rows)
+    }) else {
         return (local_rows, ListScope::Cwd);
     };
     let scope = if relax.repo_urls.is_empty() {
@@ -433,7 +458,7 @@ async fn maybe_relax(
             tracing::debug!("cwd scan failed: {e}");
             Vec::new()
         });
-    match relax_rows(relax, all_local, over, reg) {
+    match relax_rows_with_policy(relax, all_local, over, reg, headless) {
         Some(relaxed) => {
             tracing::debug!(
                 rows = relaxed.len(),
@@ -453,6 +478,17 @@ fn relax_rows(
     over: usize,
     reg: &FacetRegistry,
 ) -> Option<Vec<UnifiedRow>> {
+    relax_rows_with_policy(relax, all_local, over, reg, HeadlessPolicy::Include)
+}
+
+fn relax_rows_with_policy(
+    mut relax: RelaxInputs,
+    mut all_local: Vec<crate::session::persistence::Summary>,
+    over: usize,
+    reg: &FacetRegistry,
+    headless: HeadlessPolicy,
+) -> Option<Vec<UnifiedRow>> {
+    crate::session::visibility::retain_session_lanes(&mut all_local, &mut relax.remote, headless);
     let scoped = crate::session::merge::filter_summaries_by_repo(all_local, &relax.repo_urls);
     let rows = to_rows(
         crate::session::merge::merge(relax.remote, scoped, None, &relax.repo_urls, over),
@@ -550,6 +586,7 @@ mod tests {
             git_remotes: vec!["git@github.com:example/repo.git".into()],
             source_workspace_dir: Some("/Users/me/xai-src".into()),
             last_turn_summary: None,
+            last_recap: None,
             session_kind: Some("worktree".into()),
         }
     }
@@ -1038,6 +1075,7 @@ mod tests {
         let relax = || RelaxInputs {
             remote: Vec::new(),
             repo_urls: vec![repo_url.clone()],
+            cwd_rows_dropped_by_policy: false,
         };
         let rows = relax_rows(
             relax(),

@@ -37,6 +37,18 @@ pub fn bootstrap(
         cfg.remote_settings = None;
     }
     crate::managed_config::managed_policy_gate()?;
+    let _ = crate::agent::models::startup_prefetch::accept_for_config(&cfg);
+    if !cfg!(test) {
+        if crate::managed_config::should_start_refresh_supervisor(
+            crate::agent::models::startup_prefetch::uses_xai_session(&cfg),
+            crate::managed_config::resolve_deployment_key().is_some(),
+            auth_manager.current_or_expired().as_ref(),
+        ) {
+            crate::managed_config::start_refresh_supervisor(auth_manager);
+        } else {
+            drop(crate::managed_config::take_refresh_supervisor());
+        }
+    }
     let cfg = {
         let _timer = crate::instrumentation_timer!("startup.bootstrap.resolve_config");
         let cfg = resolve_config(&cfg, auth_manager);
@@ -141,12 +153,6 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
         xai_grok_telemetry::unified_log::set_version(xai_grok_version::version());
         let limits = crate::util::limits::ProcessLimits::read();
         limits.log();
-
-        if !cfg!(test) {
-            // Clear a logged-out team's files before the background sync runs.
-            crate::managed_config::clear_orphan();
-            crate::managed_config::spawn_sync(tokio_util::sync::CancellationToken::new());
-        }
 
         let grok_home = crate::util::grok_home::grok_home();
         crate::builtin::extract_builtin_files(&grok_home);

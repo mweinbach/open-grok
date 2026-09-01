@@ -511,6 +511,7 @@ mod tests {
         let cfg = config_with_items(vec![TitleItem::Activity]);
         let mut mgr = TitleManager::new(&cfg);
         let activity = TurnActivity::Retrying {
+            error_type: None,
             attempt: 2,
             max_retries: 5,
             reason: "timeout".to_owned(),

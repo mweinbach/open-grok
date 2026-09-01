@@ -8,10 +8,10 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::sync::oneshot;
 
-use xai_grok_sampling_types::{ConversationRequest, ConversationResponse, SamplingError};
+use xai_grok_sampling_types::ConversationRequest;
 
 use crate::config::SamplerConfig;
-use crate::metrics::InferenceLatencyStats;
+use crate::handle::CollectedSamplingResult;
 use crate::types::RequestId;
 
 /// Commands sent from a [`SamplerHandle`](crate::handle::SamplerHandle)
@@ -27,18 +27,18 @@ pub(crate) enum SamplerCommand {
         request_id: RequestId,
         request: Box<ConversationRequest>,
         config: Option<Box<SamplerConfig>>,
-        /// Turn generation captured synchronously before actor enqueue.
         codex_turn_state: Arc<OnceLock<String>>,
-        completion_tx: Option<
-            oneshot::Sender<Result<(ConversationResponse, InferenceLatencyStats), SamplingError>>,
-        >,
+        completion_tx: Option<oneshot::Sender<CollectedSamplingResult>>,
     },
 
-    /// Cancel an in-flight request.
-    Cancel { request_id: RequestId },
+    Cancel {
+        request_id: RequestId,
+    },
 
     /// Update the default sampling config (model switch, auth refresh).
-    UpdateConfig { config: Box<SamplerConfig> },
+    UpdateConfig {
+        config: Box<SamplerConfig>,
+    },
 
     /// Query: is a specific request still in flight?
     IsActive {
@@ -47,5 +47,7 @@ pub(crate) enum SamplerCommand {
     },
 
     /// Query: how many requests are in flight?
-    ActiveCount { reply: oneshot::Sender<usize> },
+    ActiveCount {
+        reply: oneshot::Sender<usize>,
+    },
 }

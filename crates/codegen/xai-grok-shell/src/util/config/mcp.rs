@@ -1765,16 +1765,11 @@ pub fn cli_known_mcp_server_names(cwd: &std::path::Path) -> std::collections::Ha
 }
 
 /// Plugin registry for one-shot CLI discovery (matches mcp doctor gating).
-fn load_cli_plugin_registry(cwd: &std::path::Path) -> xai_grok_agent::plugins::PluginRegistry {
+pub fn load_cli_plugin_registry(cwd: &std::path::Path) -> xai_grok_agent::plugins::PluginRegistry {
     let trust_store = xai_grok_agent::plugins::TrustStore::load();
-    let mut plugins_cfg: crate::agent::config::PluginsConfig =
-        crate::config::load_effective_config()
-            .ok()
-            .and_then(|t| t.get("plugins").and_then(|v| v.clone().try_into().ok()))
-            .unwrap_or_default();
-    plugins_cfg.merge_claude_enabled_plugins(Some(cwd));
-    let mut plugin_config = plugins_cfg.to_discovery_config();
     let project_trusted = crate::agent::folder_trust::resolve_and_record(cwd, None, false);
+    let plugins_cfg = crate::config::resolve_effective_plugins_config(cwd);
+    let mut plugin_config = plugins_cfg.to_discovery_config();
     let discovered = xai_grok_agent::plugins::discover_plugins(
         Some(cwd),
         &plugin_config,
@@ -1951,6 +1946,61 @@ mod tests {
             let _g = xai_grok_test_support::EnvGuard::unset(SESSION_REGISTRY_ENV_VAR);
             assert_eq!(session_registry_local_override_sourced(None), None);
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_cli_plugin_registry_includes_project_config_path_plugins() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = xai_grok_test_support::EnvGuard::set("OPENGROK_HOME", home.path());
+        let _trust = xai_grok_test_support::EnvGuard::set("GROK_FOLDER_TRUST", "true");
+        let _release =
+            xai_grok_test_support::EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0.0-sim");
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let plugin_dir = repo.path().join("proj-plugin");
+        let agents_dir = plugin_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name": "proj-plugin", "agents": "./agents"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agents_dir.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: Project reviewer\n---\nBody.\n",
+        )
+        .unwrap();
+        let config_path = project_config_path(repo.path());
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let plugin_path = toml::Value::String(plugin_dir.to_string_lossy().into_owned());
+        let config = format!("[plugins]\npaths = [{plugin_path}]\n");
+        std::fs::write(&config_path, &config).unwrap();
+
+        let untrusted = load_cli_plugin_registry(repo.path());
+        assert!(untrusted.get("proj-plugin").is_none());
+
+        crate::agent::folder_trust::grant_folder_trust(repo.path());
+        let registry = load_cli_plugin_registry(repo.path());
+        assert!(registry.get("proj-plugin").is_some());
+        assert!(
+            xai_grok_agent::discovery::plugin_agents(&registry)
+                .iter()
+                .any(|agent| agent.qualified_name == "proj-plugin:reviewer")
+        );
+
+        std::fs::write(
+            &config_path,
+            format!("{config}disabled = [\"proj-plugin\"]\n"),
+        )
+        .unwrap();
+        let disabled = load_cli_plugin_registry(repo.path());
+        assert!(!disabled.get("proj-plugin").unwrap().enabled);
+        assert!(
+            !xai_grok_agent::discovery::plugin_agents(&disabled)
+                .iter()
+                .any(|agent| agent.qualified_name == "proj-plugin:reviewer")
+        );
     }
 
     #[test]

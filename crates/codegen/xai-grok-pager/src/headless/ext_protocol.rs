@@ -1,36 +1,32 @@
-//! Decoding of the shell's `x.ai/*` extension notifications into the headless
-//! [`ExtEvent`] the orchestrator dispatches, plus the policy replies for
-//! reverse `ext_method` requests. Owns the wire envelope shapes and the
-//! method to event mapping, kept out of `headless.rs`.
+//! Decodes the shell's `x.ai/*` extension notifications into the headless [`ExtEvent`] the orchestrator dispatches.
+//! Also answers reverse `ext_method` requests with policy replies.
+//! This module owns the wire envelope shapes and the method-to-event mapping, kept out of `headless.rs`.
 
 use agent_client_protocol as acp;
 use xai_acp_lib::{AcpArgsBox, AcpResult};
 
 use crate::headless::reducer::{Lifecycle, StreamEvent};
 
-/// Serialize a typed ext-method reply; a serialize failure becomes an
-/// explicit ACP error so the oneshot is always answered.
+/// Serialize a typed ext-method reply; a serialize failure becomes an explicit ACP error so the oneshot is always answered.
 fn ext_response_from<T: serde::Serialize>(value: &T) -> AcpResult<acp::ExtResponse> {
     serde_json::value::to_raw_value(value)
         .map(|raw| acp::ExtResponse::new(raw.into()))
         .map_err(|e| acp::Error::new(-32603, format!("serialize ext response: {e}")))
 }
 
-/// Answer a reverse `ext_method` request without a UI. Known interaction
-/// methods get a policy reply; dropping `response_tx` instead would fail the
-/// whole turn with a channel `recv_failed` (GB-4969).
+/// Answer a reverse `ext_method` request without a UI.
+/// Known interaction methods get a policy reply; dropping `response_tx` instead would fail the whole turn with a channel `recv_failed`.
 pub(crate) fn reply_headless_ext_method(args: AcpArgsBox<acp::ExtRequest>) {
     use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionExtResponse;
     use xai_grok_tools::implementations::grok_build::exit_plan_mode::ExitPlanModeExtResponse;
 
     let method = args.request.method.as_ref();
-    // Known methods are answered without parsing params: even a malformed
-    // request gets the policy reply rather than a dropped channel.
     let response = match method {
-        // Model sees the tool's NO_OPERATOR_TEXT (headless sessions are
-        // non-interactive), not the interactive "user declined" cancel text.
         "x.ai/ask_user_question" => ext_response_from(&AskUserQuestionExtResponse::Cancelled),
-        // Model sees "Your plan has been approved. You can now start coding.".
+        "x.ai/mcp/elicit" => {
+            use xai_grok_tools::mcp_elicitation::McpElicitExtResponse;
+            ext_response_from(&McpElicitExtResponse::Cancel)
+        }
         "x.ai/exit_plan_mode" => ext_response_from(&ExitPlanModeExtResponse {
             outcome: "approved".to_string(),
             feedback: None,
@@ -43,8 +39,7 @@ pub(crate) fn reply_headless_ext_method(args: AcpArgsBox<acp::ExtRequest>) {
     args.response_tx.send(response).ok();
 }
 
-/// Tolerate a numeric `task_id` (version skew) by coercing it to a string, so a
-/// numeric id does not fail the decode and leak an untracked background task.
+/// Coerce a numeric `task_id` (version skew) to a string so it does not fail the decode and leak an untracked background task.
 fn de_task_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -130,7 +125,6 @@ fn decode_task_backgrounded(method: &str, params: &str) -> ExtEvent {
                 task_id,
                 is_monitor: monitor_description.is_some(),
             },
-            // Known-tag-on-wrong-carrier: log loudly instead of silently dropping.
             TaskBgUpdate::Other => {
                 tracing::error!(
                     method,
@@ -178,7 +172,6 @@ fn decode_task_completed(method: &str, params: &str) -> ExtEvent {
             TaskDoneUpdate::TaskCompleted { task_snapshot } => ExtEvent::TaskCompleted {
                 task_id: task_snapshot.task_id,
             },
-            // Known-tag-on-wrong-carrier: log loudly instead of silently dropping.
             TaskDoneUpdate::Other => {
                 tracing::error!(
                     method,
@@ -222,6 +215,12 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
         },
         ImageCompressed {
             message: String,
+        },
+        MemoryFlushStarted {},
+        MemoryFlushCompleted {
+            result: String,
+            #[serde(default)]
+            path: Option<String>,
         },
         SubagentSpawned {
             subagent_id: String,
@@ -296,6 +295,10 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
         XaiUpdate::ImageCompressed { message } => {
             ExtEvent::Lifecycle(Lifecycle::ImageCompressed { message })
         }
+        XaiUpdate::MemoryFlushStarted {} => ExtEvent::Lifecycle(Lifecycle::MemoryFlushStarted),
+        XaiUpdate::MemoryFlushCompleted { result, path } => {
+            ExtEvent::Lifecycle(Lifecycle::MemoryFlushCompleted { result, path })
+        }
         XaiUpdate::SubagentSpawned { subagent_id } => ExtEvent::SubagentSpawned { subagent_id },
         XaiUpdate::SubagentFinished { subagent_id, .. } => {
             ExtEvent::SubagentFinished { subagent_id }
@@ -329,8 +332,6 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
             signature,
             stop_sequence,
         })),
-        // Background lifecycle tag on the wrong carrier: log loudly, but a
-        // genuinely unknown display tag stays a clean ignore.
         XaiUpdate::Other => {
             if let Some(tag) = session_update_tag(params)
                 && matches!(tag.as_str(), "task_backgrounded" | "task_completed")

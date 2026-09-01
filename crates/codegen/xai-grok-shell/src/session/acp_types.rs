@@ -107,6 +107,9 @@ pub struct ClientFeedbackInput {
     #[serde(default)]
     pub feedback_text: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<prod_mc_cli_chat_proxy_types::feedback_types::FeedbackImage>,
+
     /// Feedback categories (e.g., ["accuracy", "speed", "helpfulness"])
     #[serde(default)]
     pub feedback_categories: Vec<String>,
@@ -206,6 +209,7 @@ impl ClientFeedbackInput {
         );
         s.turn_number = turn_number;
         s.feedback_categories = self.feedback_categories.clone();
+        s.images = self.images.clone();
         s.model_id = model_id;
         s.resolved_model_id = resolved_model_id;
         s.model_fingerprint = model_fingerprint;
@@ -225,6 +229,36 @@ impl ClientFeedbackInput {
     /// Get the request_id if this is solicited feedback
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod feedback_image_tests {
+    use super::*;
+
+    #[test]
+    fn feedback_images_default_empty_and_forward_to_submission() {
+        let mut input: ClientFeedbackInput = serde_json::from_value(serde_json::json!({
+            "session_id": "session", "client_type": "tui", "feedback_text": "feedback",
+        }))
+        .unwrap();
+        assert!(input.images.is_empty());
+        assert!(
+            serde_json::to_value(&input)
+                .unwrap()
+                .get("images")
+                .is_none()
+        );
+        input.images.push(
+            prod_mc_cli_chat_proxy_types::feedback_types::FeedbackImage {
+                data: "aGk=".into(),
+                mime_type: "image/png".into(),
+                file_name: Some("shot.png".into()),
+            },
+        );
+        let submission = input.to_submission(None, None, None, None);
+        assert_eq!(submission.images[0].data, "aGk=");
+        assert_eq!(submission.images[0].file_name.as_deref(), Some("shot.png"));
     }
 }
 

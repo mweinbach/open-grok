@@ -738,6 +738,7 @@ fn diff_watches(
 /// Only structural events trigger this, not ignore-rule edits, and it runs after
 /// the debounce window — so a freshly-ignored dir stays watched (still
 /// event-filtered) and a brand-new dir's pre-watch files aren't backfilled.
+#[tracing::instrument(name = "fsnotify.reconcile_watches", skip_all)]
 fn reconcile_top_level_watches(
     debouncer: &mut Debouncer<notify::RecommendedWatcher, NoCache>,
     watched: &mut HashSet<PathBuf>,
@@ -834,6 +835,7 @@ fn arm_pending_chunk(
 /// behind the `mkdir`.
 ///
 /// Budget-aware: stops adding once `budget` is reached (warned upstream).
+#[tracing::instrument(name = "fsnotify.add_subtree_watches", level = "debug", skip_all)]
 fn add_subtree_watches(
     debouncer: &mut Debouncer<notify::RecommendedWatcher, NoCache>,
     watched: &mut HashSet<PathBuf>,
@@ -907,6 +909,7 @@ fn add_subtree_watches(
 /// path-keyed bookkeeping clean and — crucially for renames — frees the watch
 /// descriptor *before* the destination path is re-watched (see
 /// [`WatchCommand::Update`] ordering).
+#[tracing::instrument(name = "fsnotify.prune_subtree_watches", level = "debug", skip_all)]
 fn prune_subtree_watches(
     debouncer: &mut Debouncer<notify::RecommendedWatcher, NoCache>,
     watched: &mut HashSet<PathBuf>,

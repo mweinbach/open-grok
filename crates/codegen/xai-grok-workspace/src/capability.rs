@@ -91,6 +91,7 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::MemorySearch,
     ToolKind::MemoryGet,
     ToolKind::Task,
+    ToolKind::ActiveAgentMessage,
     ToolKind::EnterPlan,
     ToolKind::ExitPlan,
     ToolKind::AskUser,
@@ -99,6 +100,7 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::ImageToVideo,
     ToolKind::ReferenceToVideo,
     ToolKind::DeployApp,
+    ToolKind::InitOrUpdateApp,
     ToolKind::SearchTool,
     ToolKind::UseTool,
     ToolKind::Monitor,
@@ -147,15 +149,13 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
 
         // Edit class.
         Edit | Write | Delete | Move | ImageGen | VideoGen | ImageToVideo | ReferenceToVideo
-        | DeployApp => matches!(mode, M::ReadWrite),
+        | DeployApp | InitOrUpdateApp => matches!(mode, M::ReadWrite),
 
         // Bash / shell.
         Execute => matches!(mode, M::Execute),
 
-        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | Monitor | Workflow
-        | AgentSwarm | AgentCollaboration => {
-            matches!(mode, M::Execute)
-        }
+        BackgroundTaskAction | WaitTasksAction | KillTaskAction | Task | ActiveAgentMessage
+        | Monitor | Workflow | AgentSwarm | AgentCollaboration => matches!(mode, M::Execute),
 
         // Integration dispatch.
         UseTool => matches!(mode, M::ReadWrite | M::Execute),
@@ -245,6 +245,26 @@ mod tests {
                 "read", "search", "inspect", "edit", "write", "bash", "bg", "plan", "ask", "other"
             ]
         );
+    }
+
+    #[test]
+    fn capability_mode_only_keeps_active_agent_message_with_execution() {
+        let cfg = make_cfg(vec![test_support::tc(
+            "send_subagent_message",
+            Some(ToolKind::ActiveAgentMessage),
+        )]);
+
+        assert!(CapabilityMode::ReadOnly.filter(&cfg).tools.is_empty());
+        assert!(CapabilityMode::ReadWrite.filter(&cfg).tools.is_empty());
+
+        let kept_ids = |mode: CapabilityMode| -> Vec<String> {
+            mode.filter(&cfg).tools.into_iter().map(|t| t.id).collect()
+        };
+        assert_eq!(
+            kept_ids(CapabilityMode::Execute),
+            vec!["send_subagent_message"]
+        );
+        assert_eq!(kept_ids(CapabilityMode::All), vec!["send_subagent_message"]);
     }
 
     #[test]

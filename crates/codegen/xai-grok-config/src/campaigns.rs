@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config_override::{
-    ConfigOverrideEntry, PATCH_STRIP_KEYS, PatchPath, apply_patches, patch_touches_any,
+    CAMPAIGN_STRIP_KEYS, ConfigOverrideEntry, PatchPath, apply_patches, patch_touches_any,
     take_patch_array,
 };
 
@@ -113,7 +113,7 @@ pub fn apply_active_campaign_patches(effective: &mut toml::Value, active: &[Camp
     apply_patches(
         effective,
         active.iter().rev().map(|e| e.patch.clone()),
-        PATCH_STRIP_KEYS,
+        CAMPAIGN_STRIP_KEYS,
     );
 }
 

@@ -14,7 +14,7 @@ use crate::session::file_state::FileStateTracker;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use xai_computer_hub_mcp_adapter::McpBridgeHandle;
 use xai_grok_mcp::servers::McpState;
 use xai_grok_tools::notification::types::{ToolNotification, ToolNotificationHandle};
@@ -134,6 +134,8 @@ pub struct WorkspaceSession {
     /// Spawned system-notify producers (forwarder, preview-state watcher).
     /// Sync mutex so the sync teardown path can abort without an await.
     system_notify_producers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    path_virtualization: OnceLock<crate::path_virtualization::PathVirtualization>,
+    cwd_override: OnceLock<PathBuf>,
 }
 struct WorkspaceSessionInner {
     effective_tool_config: Arc<ToolServerConfig>,
@@ -143,12 +145,64 @@ impl std::fmt::Debug for WorkspaceSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkspaceSession")
             .field("session_id", &self.session_id)
-            .field("cwd", &self.cwd)
+            .field("cwd", &self.cwd())
             .field("capability_mode", &self.capability_mode)
             .field("depth", &self.depth)
             .field("fork_budget", &self.fork_budget)
             .finish_non_exhaustive()
     }
+}
+fn relocate_pre_virt_files(old: &Path, new: &Path) {
+    if std::fs::create_dir_all(new).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(old) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src = entry.path();
+        if src == new {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&src) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() && uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
+            continue;
+        }
+        let dest = new.join(entry.file_name());
+        if dest.symlink_metadata().is_ok() {
+            continue;
+        }
+        if meta.is_dir() {
+            let _ = copy_dir_all(&src, &dest);
+        } else {
+            let _ = std::fs::copy(&src, &dest);
+        }
+    }
+}
+fn copy_dir_all(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&from) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let to = dest.join(entry.file_name());
+        if meta.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 impl WorkspaceSession {
     pub(crate) fn new(
@@ -210,7 +264,60 @@ impl WorkspaceSession {
             #[allow(dead_code)]
             pending_notif_rx: tokio::sync::Mutex::new(pending_notif_rx),
             system_notify_producers: std::sync::Mutex::new(Vec::new()),
+            path_virtualization: OnceLock::new(),
+            cwd_override: OnceLock::new(),
         }
+    }
+    pub(crate) fn set_path_virtualization(
+        &self,
+        mapping: crate::path_virtualization::PathVirtualization,
+    ) {
+        let _ = self.path_virtualization.set(mapping);
+    }
+    pub(crate) async fn set_cwd_for_virtualization(&self, cwd: PathBuf) -> Result<(), String> {
+        if self.cwd() == cwd.as_path() {
+            return Ok(());
+        }
+        if self.cwd_override.get().is_some() {
+            return Err("session cwd is already remounted".into());
+        }
+        let old = self.cwd().to_path_buf();
+        if old != cwd {
+            let dest = cwd.clone();
+            let _ = tokio::task::spawn_blocking(move || relocate_pre_virt_files(&old, &dest)).await;
+        }
+        if !self.checkpoint_store.remount(&cwd, &self.session_id).await {
+            return Err("checkpoint remount failed".into());
+        }
+        let _ = self.cwd_override.set(cwd.clone());
+        self.async_fs.remount_root(cwd.clone());
+        self.hunk_tracker.set_working_dir(cwd.clone()).await;
+        let toolset = self.toolset();
+        let mut res = toolset.resources.lock().await;
+        res.insert(xai_grok_tools::types::resources::Cwd(cwd));
+        Ok(())
+    }
+    pub(crate) async fn apply_path_virtualization(
+        &self,
+        mapping: crate::path_virtualization::PathVirtualization,
+        cwd: Option<PathBuf>,
+    ) -> Result<(), String> {
+        let _guard = self.update_lock.lock().await;
+        if let Some(existing) = self.path_virtualization.get()
+            && existing.real_root() != mapping.real_root()
+        {
+            return Err("session root cannot change after binding".into());
+        }
+        if let Some(cwd) = cwd {
+            self.set_cwd_for_virtualization(cwd).await?;
+        }
+        self.set_path_virtualization(mapping);
+        Ok(())
+    }
+    pub(crate) fn path_virtualization(
+        &self,
+    ) -> Option<&crate::path_virtualization::PathVirtualization> {
+        self.path_virtualization.get()
     }
     /// Whether this session opted into `BackgroundTaskCompleted` system
     /// notifications.
@@ -268,7 +375,7 @@ impl WorkspaceSession {
         &self.session_id
     }
     pub fn cwd(&self) -> &Path {
-        &self.cwd
+        self.cwd_override.get().map_or(&self.cwd, PathBuf::as_path)
     }
     pub fn session_env(&self) -> &Arc<HashMap<String, String>> {
         &self.session_env
@@ -521,6 +628,7 @@ pub struct WorkspaceShared {
     pub(crate) client_ext_sink: arc_swap::ArcSwap<Option<ClientExtSink>>,
     pub(crate) local_registry: xai_computer_hub_sdk::LocalRegistry,
     pub(crate) activity_tracker: std::sync::Arc<crate::activity::ActivityTracker>,
+    pub(crate) scheduler_poll_started: std::sync::atomic::AtomicBool,
     /// Runtime-tunable timing/threshold config for the tool server.
     /// Read by the status publisher task and at shutdown.
     pub(crate) status_config: crate::status_config::StatusConfig,
@@ -588,6 +696,7 @@ pub struct WorkspaceShared {
     /// the post-resolve turn re-check / install in
     /// `resolve_and_swap_session_toolset_locked`, so tests can interleave a
     /// turn start inside the check→install window deterministically.
+    pub(crate) bind_mount_hook: arc_swap::ArcSwap<crate::path_virtualization::BindMountHook>,
     #[cfg(test)]
     pub(crate) post_resolve_test_hook: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     pub(crate) client_fs_hash_memo: crate::file_system::client_fs::FileHashMemo,
@@ -659,25 +768,10 @@ impl WorkspaceShared {
     /// logged and salvaged field-by-field (a bad sibling field must not
     /// silently drop `sandbox_id` from every environment artifact).
     pub(crate) fn server_metadata_typed(&self) -> crate::config::WorkspaceServerMetadata {
-        let Some(v) = self.server_metadata.as_ref() else {
-            return Default::default();
-        };
-        match serde_json::from_value(v.clone()) {
-            Ok(typed) => typed,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "workspace: malformed server_metadata; salvaging sandbox_id field-wise"
-                );
-                crate::config::WorkspaceServerMetadata {
-                    sandbox_id: v
-                        .get("sandbox_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                    ..Default::default()
-                }
-            }
-        }
+        self.server_metadata
+            .as_ref()
+            .map(crate::config::WorkspaceServerMetadata::from_metadata)
+            .unwrap_or_default()
     }
     pub fn default_tool_config(&self) -> &ToolServerConfig {
         &self.default_tool_config
@@ -970,7 +1064,7 @@ mod tests {
             "flag-off must not create the session dir or events.jsonl"
         );
     }
-    /// Session-derived content outside ~/.grok/sessions: same owner-only rule,
+    /// Session-derived content outside ~/.opengrok/sessions: same owner-only rule,
     /// including healing a loose pre-existing root from older builds.
     #[cfg(unix)]
     #[test]

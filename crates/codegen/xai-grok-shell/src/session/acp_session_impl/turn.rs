@@ -1,10 +1,16 @@
 //! Turn-execution concern for `SessionActor` (`handle_prompt`, turn-end,
 //! sampling loop).
 use super::*;
+use crate::session::InputAuthority;
 use crate::util::dual_clock::DualClock;
+use tracing::Instrument;
+use xai_grok_tools::implementations::grok_build::task::types::{
+    SubagentEvent, SubagentMarkUsageNotAppliedRequest, SubagentWaitPromptDrainedRequest,
+};
 use xai_grok_tools::implementations::grok_build::task::types::{
     SubagentRateLimitDecision, SubagentStatusEvent,
 };
+use xai_grok_tools::types::tool::ToolKind;
 /// Synthetic tool the model calls to return its schema-constrained final answer
 /// on backends that can't constrain output natively (Messages API). Intercepted
 /// in the loop, never executed as a real tool.
@@ -12,6 +18,7 @@ const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
 /// Max times the model may re-call `StructuredOutput` with non-conforming args
 /// before the turn ends with the last validation error.
 const STRUCTURED_OUTPUT_MAX_RETRIES: u32 = 3;
+const MAX_MEDIA_GEN_OVER_CAP_RESAMPLES: u32 = 1;
 fn is_rate_limited_turn_result(result: &Result<TurnOutcome, acp::Error>) -> bool {
     matches!(
         result,
@@ -37,6 +44,11 @@ mod swarm_rate_limit_tests {
         assert!(!is_rate_limited_turn_result(&other));
     }
 }
+/// Turn-freeze usage drain: bounds a wedged foreground child at turn end;
+/// folds normally land in one or two polls because they run before worktree
+/// dispose. The child completion path's bounded parent awaits are sized to
+/// fit inside this (compile-time asserted at `PARENT_ACK_TIMEOUT`).
+pub(crate) const SUBAGENT_USAGE_DRAIN: std::time::Duration = std::time::Duration::from_secs(120);
 /// What a `StructuredOutput` tool call means for the turn (see
 /// `handle_structured_output_tool_call`).
 enum StructuredOutputStep {
@@ -165,10 +177,53 @@ impl TurnSpanTotals {
         }
         self.has_tool_call |= !response.tool_calls().is_empty();
         span.record("response.has_tool_call", self.has_tool_call);
+        record_last_sample(
+            span,
+            response
+                .stop_reason
+                .map_or(LAST_SAMPLE_STOP_REASON_UNREPORTED, |sr| sr.as_str()),
+            !response.tool_calls().is_empty(),
+            response
+                .usage
+                .as_ref()
+                .map_or(0, |usage| i64::from(usage.completion_tokens)),
+        );
     }
 }
-/// How the turn's per-block user-message echo is published to clients /
-/// `updates.jsonl`.
+/// Single writer for the `last_sample.*` fields, shared by the delivered and failed paths so the field set cannot drift between them.
+fn record_last_sample(
+    span: &tracing::Span,
+    stop_reason: &str,
+    has_tool_call: bool,
+    output_tokens: i64,
+) {
+    debug_assert!(
+        span.is_disabled() || span.has_field("last_sample.stop_reason"),
+        "current span does not declare last_sample.* fields"
+    );
+    span.record("last_sample.stop_reason", stop_reason);
+    span.record("last_sample.has_tool_call", has_tool_call);
+    span.record("last_sample.output_tokens", output_tokens);
+}
+/// Recorded when a response reports no stop reason, so no stale previous-sample value survives.
+const LAST_SAMPLE_STOP_REASON_UNREPORTED: &str = "unreported";
+/// `last_sample.stop_reason` for a failed call with no reported stop reason.
+const LAST_SAMPLE_STOP_REASON_ERROR: &str = "error";
+/// Record `last_sample.*` for a failed call `TurnSpanTotals::record` never sees; otherwise the span keeps describing the previous sample.
+/// A resubmit's next response overwrites these fields.
+pub(super) fn record_failed_sample_on_turn_span(
+    span: &tracing::Span,
+    kind: xai_grok_sampler::SamplingErrorKind,
+) {
+    let stop_reason = match kind {
+        xai_grok_sampler::SamplingErrorKind::MaxTokensTruncation => {
+            xai_grok_sampling_types::StopReason::Length.as_str()
+        }
+        _ => LAST_SAMPLE_STOP_REASON_ERROR,
+    };
+    record_last_sample(span, stop_reason, false, 0);
+}
+/// How the turn's per-block user-message echo is published to clients / `updates.jsonl`.
 ///
 /// Every turn consumes a `prompt_index`, and rewind / fork truncation
 /// (`replay_to_prompt`, `truncate_for_prompt_by`) recover turn
@@ -186,16 +241,34 @@ enum UserEchoMode {
     /// monitor gutter, task pane) that no pane should render live.
     PersistOnly,
 }
+#[cfg(test)]
 fn user_echo_mode(prompt_id: &str) -> UserEchoMode {
+    user_echo_mode_for_origin(prompt_id, &InputOrigin::from_prompt_id(prompt_id))
+}
+
+fn user_echo_mode_for_origin(prompt_id: &str, input_origin: &InputOrigin) -> UserEchoMode {
     if super::interjection::is_interject_fallback(prompt_id) {
         return UserEchoMode::PersistOnly;
     }
-    match super::super::PromptOrigin::from_prompt_id(prompt_id) {
+    match input_origin.as_prompt_origin() {
         super::super::PromptOrigin::NotificationDrain => UserEchoMode::PersistOnly,
         _ => UserEchoMode::Broadcast,
     }
 }
 impl SessionActor {
+    fn media_gen_over_cap(
+        &self,
+        calls: &[xai_grok_sampling_types::ToolCall],
+    ) -> Vec<xai_grok_tools::media_gen_limits::MediaGenOverCap> {
+        let bridge = self.tool_bridge_handle();
+        xai_grok_tools::media_gen_limits::over_cap_by_name(
+            calls
+                .iter()
+                .map(|call| (call.name.as_str(), bridge.tool_kind(&call.name))),
+            &self.rebuild_spec.media_gen_batch_limits,
+        )
+    }
+
     /// Exactly once per turn: the cancel path and the turn's own post-loop both announce.
     pub(super) async fn notify_turn_abort(
         &self,
@@ -324,6 +397,66 @@ impl SessionActor {
         persist_ack: Option<oneshot::Sender<()>>,
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
     ) -> PromptTurnResult {
+        self.handle_turn_input(TurnInputRequest {
+            prompt_id: prompt_id.to_string(),
+            input_origin: InputOrigin::from_prompt_id(prompt_id),
+            prompt_blocks,
+            prompt_mode,
+            trace_gcs_config,
+            artifact_tracker,
+            client_identifier: prompt_client_identifier,
+            screen_mode: prompt_screen_mode,
+            verbatim,
+            send_now,
+            json_schema,
+            persist_ack,
+            parsed_prompt_tx,
+            traceparent: None,
+        })
+        .await
+    }
+    pub(super) async fn handle_turn_input(
+        self: &Arc<Self>,
+        request: TurnInputRequest,
+    ) -> PromptTurnResult {
+        let span = tracing::info_span!(
+            "session.handle_prompt",
+            session_id = %self.session_info.id.0,
+            prompt_id = %request.prompt_id,
+            prompt_length = tracing::field::Empty,
+            command_name = tracing::field::Empty,
+            command_source = tracing::field::Empty,
+        );
+        if let Some(ref tp) = request.traceparent {
+            xai_file_utils::trace_context::link_span_to_meta(
+                &span,
+                &serde_json::json!({ "traceparent": tp }),
+            );
+        }
+        self.handle_turn_input_inner(request).instrument(span).await
+    }
+    async fn handle_turn_input_inner(
+        self: &Arc<Self>,
+        request: TurnInputRequest,
+    ) -> PromptTurnResult {
+        let _active = xai_grok_telemetry::activity::TURNS_ACTIVE.enter();
+        let TurnInputRequest {
+            prompt_id,
+            input_origin,
+            prompt_blocks,
+            prompt_mode,
+            trace_gcs_config,
+            artifact_tracker,
+            client_identifier: prompt_client_identifier,
+            screen_mode: prompt_screen_mode,
+            verbatim,
+            send_now,
+            json_schema,
+            mut persist_ack,
+            parsed_prompt_tx,
+            traceparent: _,
+        } = request;
+        let prompt_id = prompt_id.as_str();
         let handle_prompt_start = std::time::Instant::now();
         // Allocate Codex's sticky-routing cell at the outer prompt boundary,
         // including manual `/compact` prompts that return before inference.
@@ -347,11 +480,15 @@ impl SessionActor {
                 "block_count": prompt_blocks.len(),
             })),
         );
-        let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
+        let origin = input_origin.as_prompt_origin();
+        let policy = input_origin.policy();
         if let Some(completion_id) = origin.completion_id() {
             self.mark_completions_reported(&[completion_id]).await;
+            if let Some(reservations) = &self.tool_context.task_completion_reservations {
+                reservations.release(completion_id);
+            }
         }
-        if !origin.is_synthetic() {
+        if policy.authority.is_human_intent() {
             self.invalidate_side_calls_for_new_prompt();
         }
         self.ensure_session_disk_writable().await?;
@@ -362,11 +499,12 @@ impl SessionActor {
         let _turn_active_guard =
             TurnActiveGuard::activate(self.tool_context.is_turn_active.as_ref());
         let _session_turn_active_guard = TurnActiveGuard::activate(Some(&self.session_turn_active));
-        let turn_start_input = xai_agent_lifecycle::TurnStartInput::new(
-            super::super::PromptOrigin::from_prompt_id(prompt_id).is_synthetic(),
-        );
+        let turn_start_input =
+            xai_agent_lifecycle::TurnStartInput::new(input_origin.is_synthetic());
         for contributor in self.extension_registry.turn_lifecycle_contributors() {
-            contributor.on_turn_start(&turn_start_input).await;
+            contributor
+                .on_turn_start_with_policy(&turn_start_input, policy)
+                .await;
         }
         if let Ok(mut pending) = self.rewind_pending_prompt.lock()
             && let Some(prev_text) = pending.take()
@@ -383,28 +521,14 @@ impl SessionActor {
                 self.signals_handle().record_edit_and_retry();
             }
         }
-        if let Some(bash_command) = Self::extract_bash_command(&prompt_blocks) {
+        if policy.authority != InputAuthority::ModelAuthoredUntrusted
+            && let Some(bash_command) = Self::extract_bash_command(&prompt_blocks)
+        {
             return self
                 .handle_direct_bash_command(prompt_id, bash_command, &prompt_blocks)
                 .await;
         }
-        let slash_skills = self
-            .agent
-            .borrow()
-            .tool_bridge()
-            .clone()
-            .slash_skills()
-            .await;
-        let skill_rewrite = if crate::session::is_cursor_user_template(
-            &self.agent.borrow().definition().user_message_template,
-        ) {
-            slash_commands::SkillSlashRewrite::Passthrough
-        } else {
-            slash_commands::SkillSlashRewrite::RewriteToRun
-        };
-        let availability = self.command_availability().await;
         let mut pending_skill_information: Option<String> = None;
-        let (workflow_registry, named_workflows) = self.named_workflow_snapshot();
         let original_prompt_text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
             if let acp::ContentBlock::Text(t) = b {
                 acc.push_str(&t.text);
@@ -416,14 +540,85 @@ impl SessionActor {
         } else {
             xai_grok_tools::implementations::grok_build::scheduler::create::LoopFireMode::InSession
         };
-        let prompt_blocks = match slash_commands::resolve(
-            prompt_blocks,
-            &slash_skills,
-            availability,
-            skill_rewrite,
-            &named_workflows,
-            loop_fire_mode,
-        ) {
+        let (resolved, slash_skills, workflow_registry) = match policy.authority {
+            InputAuthority::HumanIntent => {
+                let slash_skills = self.slash_skills_for_resolve().await;
+                let skill_rewrite = if crate::session::is_cursor_user_template(
+                    &self.agent.borrow().definition().user_message_template,
+                ) {
+                    slash_commands::SkillSlashRewrite::Passthrough
+                } else {
+                    slash_commands::SkillSlashRewrite::RewriteToRun
+                };
+                let availability = self.command_availability().await;
+                let (workflow_registry, named_workflows) = self
+                    .named_workflow_snapshot();
+                let resolved = slash_commands::resolve_human_intent(
+                    prompt_blocks,
+                    &slash_skills,
+                    availability,
+                    skill_rewrite,
+                    &named_workflows,
+                    loop_fire_mode,
+                );
+                (resolved, slash_skills, Some(workflow_registry))
+            }
+            InputAuthority::ModelAuthoredUntrusted | InputAuthority::RuntimeControl => {
+                match crate::session::slash_authority::resolve(
+                    policy.authority,
+                    &prompt_blocks,
+                    slash_commands::BUILTIN_COMMANDS,
+                ) {
+                    crate::session::slash_authority::AuthorityResolution::StaticBuiltin(
+                        action,
+                    ) => (Err(SlashCommandOutcome::Builtin(action)), Vec::new(), None),
+                    crate::session::slash_authority::AuthorityResolution::ModelAuthoredSkillCandidate {
+                        command_name,
+                        args,
+                    } if policy.authority == InputAuthority::ModelAuthoredUntrusted => {
+                        let command_name = command_name.to_string();
+                        let args = args.to_string();
+                        let slash_skills = self.slash_skills_for_resolve().await;
+                        let availability = self
+                            .command_availability_for_skill_projection()
+                            .await;
+                        let bridge = self.tool_bridge_handle();
+                        let has_skill_loader = bridge
+                            .tool_for_kind(xai_grok_tools::types::tool::ToolKind::Read)
+                            .await
+                            .is_some()
+                            || bridge
+                                .tool_for_kind(xai_grok_tools::types::tool::ToolKind::Skill)
+                                .await
+                                .is_some();
+                        let resolved = slash_commands::resolve_model_authored_skill(
+                            prompt_blocks,
+                            &command_name,
+                            &args,
+                            &slash_skills,
+                            availability,
+                            has_skill_loader,
+                        );
+                        (resolved, slash_skills, None)
+                    }
+                    crate::session::slash_authority::AuthorityResolution::ModelAuthoredSkillCandidate {
+                        ..
+                    } => {
+                        unreachable!("runtime control cannot produce a model-authored candidate")
+                    }
+                    crate::session::slash_authority::AuthorityResolution::NotSlash
+                    | crate::session::slash_authority::AuthorityResolution::Inert => {
+                        (Ok(prompt_blocks), Vec::new(), None)
+                    }
+                    crate::session::slash_authority::AuthorityResolution::HumanIntent {
+                        ..
+                    } => {
+                        unreachable!("non-human authority cannot resolve as HumanIntent")
+                    }
+                }
+            }
+        };
+        let prompt_blocks = match resolved {
             Ok(blocks) => blocks,
             Err(SlashCommandOutcome::Builtin(action)) => {
                 let text_block =
@@ -462,16 +657,21 @@ impl SessionActor {
                         }
                     }
                     BuiltinAction::WorkflowLaunch { name, input } => {
+                        let Some(workflow_registry) = workflow_registry.as_ref() else {
+                            unreachable!("workflow slash commands require human authority")
+                        };
                         self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
                         self.mark_front_message_committed().await;
                         let msg = self
-                            .launch_named_workflow(&workflow_registry, &name, &input)
+                            .launch_named_workflow(workflow_registry, &name, &input)
                             .await;
                         self.send_host_turn_slash_command_output(&msg).await;
                         return ok_end_turn(0, None);
                     }
                     _ => {
-                        self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                        if policy.authority.is_human_intent() {
+                            self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                        }
                         return self.execute_builtin_slash_command(action).await;
                     }
                 }
@@ -554,16 +754,18 @@ impl SessionActor {
                 original_blocks
             }
         };
+        *self.doom_loop_turn_tally.lock() = Default::default();
+        self.retain_timed_out_image_strips_for_new_turn();
+        self.turn_stream_drained.lock().clear();
         self.events.begin_turn();
         let model_id = self.current_model_id().await;
         let turn_number = self.chat_state_handle.get_prompt_index().await as u64;
         self.current_turn_number.set(turn_number);
+        self.transient_retries_prompt_total.set(0);
+        self.transient_episode_start.set(None);
         let yolo_mode = self.permissions.is_yolo_mode();
         let msg_count = self.chat_state_handle.get_conversation_len().await;
-        let redirect_kind = if matches!(
-            super::super::PromptOrigin::from_prompt_id(prompt_id),
-            super::super::PromptOrigin::User
-        ) {
+        let redirect_kind = if policy.authority.is_human_intent() {
             self.events.take_prior_redirect_kind()
         } else {
             None
@@ -604,7 +806,6 @@ impl SessionActor {
         });
         let current_prompt_index = self.chat_state_handle.get_prompt_index().await;
         xai_grok_telemetry::session_ctx::begin_prompt_id();
-        let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
         let mut chunk_meta = serde_json::Map::new();
         chunk_meta.insert("modelId".into(), serde_json::json!(model_id));
         chunk_meta.insert(
@@ -615,315 +816,373 @@ impl SessionActor {
             chunk_meta.insert("hideFromScrollback".into(), serde_json::json!(true));
         }
         let user_chunk_meta = Some(chunk_meta);
-        self.chat_state_handle.increment_prompt_index();
         let text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
             if let acp::ContentBlock::Text(t) = b {
                 acc.push_str(&t.text);
             }
             acc
         });
-        let trimmed = text.trim().to_string();
-        if !trimmed.is_empty() {
-            self.chat_state_handle.cache_prompt_text(trimmed);
-        }
-        *self.tool_context.prompt_index.lock().await = current_prompt_index;
-        self.file_state_tracker
-            .begin_prompt(current_prompt_index)
-            .await;
-        let echo_mode = user_echo_mode(prompt_id);
-        for block in prompt_blocks.iter() {
-            let update = acp::SessionUpdate::UserMessageChunk(
-                acp::ContentChunk::new(block.clone()).meta(user_chunk_meta.clone()),
-            );
-            let notification_meta = self.build_notification_meta();
-            let notification = acp::SessionNotification::new(self.session_info.id.clone(), update)
-                .meta(notification_meta.as_object().cloned());
-            if echo_mode == UserEchoMode::PersistOnly {
-                let _ = self
-                    .notifications
-                    .persistence_tx
-                    .send(PersistenceMsg::Update(
-                        crate::session::storage::SessionUpdate::Acp(Box::new(notification)),
-                    ));
-            } else {
-                self.emit_notification_direct(notification).await;
+        let prompt_block = if policy.authority != InputAuthority::ModelAuthoredUntrusted {
+            let prompt_gate_verdict = self
+                .dispatch_prompt_submit_hook(
+                    xai_grok_hooks::event::HookPayload::UserPromptSubmit {
+                        prompt: Some(text.clone()),
+                        subagent_type: self.subagent_type_label(),
+                    },
+                    Some(prompt_id),
+                )
+                .await;
+            match (
+                self.should_enforce_prompt_block(&policy),
+                prompt_gate_verdict,
+            ) {
+                (true, xai_grok_hooks::result::PromptDecision::Block { reason, hook_name }) => {
+                    Some((hook_name, reason))
+                }
+                (false, xai_grok_hooks::result::PromptDecision::Block { reason, hook_name }) => {
+                    tracing::info!(%hook_name, %reason, "user_prompt_submit block ignored for non-user origin");
+                    self.send_hook_annotation(
+                            &format!(
+                        "\u{26a0} Prompt block requested by {} (not enforced for this origin): {reason}",
+                        xai_grok_hooks::config::hook_display_name(&hook_name)
+                    ),
+                        )
+                        .await;
+                    None
+                }
+                (_, xai_grok_hooks::result::PromptDecision::Allow) => None,
             }
-        }
-        let crate::session::prompt_parser::ParsedPrompt {
-            mut context,
-            query,
-            skill_information: skill_info,
-            images: mut raw_images,
-            is_cursor,
-        } = match parse_prompt_with_skills(
-            &prompt_blocks,
-            self.tool_context.cwd.to_path_buf(),
-            &self.session_info,
-            verbatim,
-            self.is_cursor_harness(),
-            pending_skill_information.take().unwrap_or_default(),
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                tracing::warn!("Invalid prompt: {}", err.message);
-                return Err(err);
-            }
-        };
-        let recovered = crate::session::placeholder_images::recover_orphan_placeholders(
-            &query,
-            &mut raw_images,
-            std::path::Path::new(&self.session_info.cwd),
-        );
-        if recovered > 0 {
-            tracing::info!(
-                session_id = %self.session_info.id,
-                recovered,
-                "server-side placeholder fallback: loaded orphan image(s) from disk",
-            );
-        }
-        let query = crate::session::placeholder_images::strip_paths_from_image_placeholders(query);
-        let query = if send_now && !verbatim {
-            xai_interjection_core::frame_user_turn(xai_interjection_core::INTERJECTION_NOTE, &query)
         } else {
-            query
+            None
         };
-        let user_images = self
-            .normalize_images_with_notices(&mut context, raw_images, is_cursor)
-            .await;
-        let (query, extra_images) = if !self.is_cursor_harness() {
-            let extraction = xai_grok_tools::util::base64_images::extract_base64_images(query);
-            if extraction.images.is_empty() {
-                (extraction.text, Vec::new())
+        if prompt_block.is_some() {
+            if let Some(ack) = persist_ack.take() {
+                let _ = ack.send(());
+            }
+        } else {
+            self.chat_state_handle.increment_prompt_index();
+            let trimmed = text.trim().to_string();
+            if !trimmed.is_empty() {
+                self.chat_state_handle.cache_prompt_text(trimmed);
+            }
+            *self.tool_context.prompt_index.lock().await = current_prompt_index;
+            self.tool_context
+                .active_message_parent_prompt_index
+                .store(current_prompt_index, std::sync::atomic::Ordering::Release);
+            self.file_state_tracker
+                .begin_prompt(current_prompt_index)
+                .await;
+            let echo_mode = user_echo_mode_for_origin(prompt_id, &input_origin);
+            for block in prompt_blocks.iter() {
+                let update = acp::SessionUpdate::UserMessageChunk(
+                    acp::ContentChunk::new(block.clone()).meta(user_chunk_meta.clone()),
+                );
+                let notification_meta = self.build_notification_meta();
+                let notification =
+                    acp::SessionNotification::new(self.session_info.id.clone(), update)
+                        .meta(notification_meta.as_object().cloned());
+                if echo_mode == UserEchoMode::PersistOnly {
+                    let _ = self
+                        .notifications
+                        .persistence_tx
+                        .send(PersistenceMsg::Update(
+                            crate::session::storage::SessionUpdate::Acp(Box::new(notification)),
+                        ));
+                } else {
+                    self.emit_notification_direct(notification).await;
+                }
+            }
+            let crate::session::prompt_parser::ParsedPrompt {
+                mut context,
+                query,
+                skill_information: skill_info,
+                images: mut raw_images,
+                is_cursor,
+            } = match parse_prompt_with_skills(
+                &prompt_blocks,
+                self.tool_context.cwd.to_path_buf(),
+                &self.session_info,
+                verbatim,
+                self.is_cursor_harness(),
+                pending_skill_information.take().unwrap_or_default(),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!("Invalid prompt: {}", err.message);
+                    return Err(err);
+                }
+            };
+            let recovered = if policy.authority == InputAuthority::ModelAuthoredUntrusted {
+                0
             } else {
-                let cleaned_text = extraction.text;
-                let count = extraction.images.len();
+                crate::session::placeholder_images::recover_orphan_placeholders(
+                    &query,
+                    &mut raw_images,
+                    std::path::Path::new(&self.session_info.cwd),
+                )
+            };
+            if recovered > 0 {
                 tracing::info!(
                     session_id = %self.session_info.id,
-                    count,
-                    "base64 images extracted from user query",
+                    recovered,
+                    "server-side placeholder fallback: loaded orphan image(s) from disk",
                 );
-                let acp_imgs: Vec<agent_client_protocol::ImageContent> = extraction
-                    .images
-                    .into_iter()
-                    .map(|img| agent_client_protocol::ImageContent::new(img.data, img.mime_type))
-                    .collect();
-                let nr = crate::session::image_normalize::normalize_images(acp_imgs, false).await;
-                if !nr.re_encode_fallbacks.is_empty() {
-                    tracing::warn!(
-                        session_id = %self.session_info.id,
-                        notes = %nr.re_encode_fallbacks.join(" "),
-                        "Extracted user query image kept original after re-encode failure",
-                    );
-                }
-                (cleaned_text, nr.images)
             }
-        } else {
-            (query, Vec::new())
-        };
-        let assembled = crate::session::prompt_parser::ParsedPrompt::assemble_parts_with_skills(
-            &context,
-            &query,
-            &skill_info,
-            is_cursor,
-        );
-        let pre_truncation_text = assembled.clone();
-        let (user_message, truncated_local_path) = if verbatim {
-            (assembled, None)
-        } else {
-            self.maybe_truncate_large_prompt_with_skills(
-                context,
-                query,
-                skill_info,
-                is_cursor,
-                current_prompt_index,
-            )
-            .await
-        };
-        let was_truncated = truncated_local_path.is_some();
-        if let Some(tx) = parsed_prompt_tx {
-            let _ = tx.send(ParsedPromptInfo {
-                text: user_message.clone(),
-                full_text: if was_truncated {
-                    Some(pre_truncation_text)
+            let query =
+                crate::session::placeholder_images::strip_paths_from_image_placeholders(query);
+            let query = if send_now && !verbatim {
+                xai_interjection_core::frame_user_turn(
+                    xai_interjection_core::INTERJECTION_NOTE,
+                    &query,
+                )
+            } else {
+                query
+            };
+            let user_images = self
+                .normalize_images_with_notices(&mut context, raw_images, is_cursor)
+                .await;
+            let (query, extra_images) = if !self.is_cursor_harness() {
+                let extraction = xai_grok_tools::util::base64_images::extract_base64_images(query);
+                if extraction.images.is_empty() {
+                    (extraction.text, Vec::new())
                 } else {
-                    None
-                },
-                local_path: truncated_local_path,
-            });
-        }
-        // A session created before Codex login may still have an unbound,
-        // fail-closed title client. Adopt isolated Codex OAuth before queuing
-        // the first content chunk so the resolver-refresh message reaches the
-        // persistence actor ahead of title generation on the same FIFO.
-        let summary_auth_provider = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|config| config.provider)
-            .unwrap_or_default();
-        let summary_auth_type = self.chat_state_handle.get_credentials().await.auth_type;
-        if turn_auth_refresh_route(summary_auth_provider, summary_auth_type, false)
-            == TurnAuthRefreshRoute::CodexOAuth
-        {
-            self.refresh_token_if_expired().await;
-        }
-        let _ = self
-            .notifications
-            .persistence_tx
-            .send(PersistenceMsg::ContentChunk(PersistenceContentChunk::new(
-                prompt_blocks.to_vec(),
-            )));
-        let model_id = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
-            .unwrap_or_default();
-        let accepts_images = crate::model_image_input::model_accepts_images(&model_id);
-        if self.telemetry_enabled || xai_grok_telemetry::external::is_active() {
-            let effective_client_identifier =
-                prompt_client_identifier.or_else(|| self.client_identifier.clone());
-            let ev = xai_grok_telemetry::events::PromptSubmitted {
-                prompt_length: user_message.len(),
-                model_id,
-                client_identifier: effective_client_identifier,
-                screen_mode: prompt_screen_mode,
-                prompt_text: None,
-            };
-            xai_grok_telemetry::session_ctx::log_event_dual(self.telemetry_enabled, ev);
-        }
-        self.maybe_inject_mcp_reminder().await;
-        self.maybe_inject_mcp_connecting_reminder().await;
-        self.maybe_inject_date_rollover_reminder().await;
-        if matches!(&origin, super::super::PromptOrigin::User) {
-            self.maybe_inject_user_info_update_reminder().await;
-            self.maybe_inject_project_rules_update_reminder().await;
-        }
-        self.inject_plan_mode_reminders().await;
-        self.inject_resumed_tasks_reminder();
-        if matches!(&origin, super::super::PromptOrigin::User) {
-            if let Some(gate) = &self.tool_context.task_wake_suppressed {
-                gate.set(false);
-            }
-            xai_grok_telemetry::unified_log::info(
-                "shell.task_wake.gate_cleared",
-                Some(self.session_info.id.0.as_ref()),
-                Some(serde_json::json!({ "reason": "handle_prompt_user_start" })),
-            );
-            self.consume_deferred_completions_for_user_turn().await;
-        }
-        self.drain_between_turn_completions().await;
-        self.inject_workflow_status_reminder().await;
-        let user_message = if user_images.is_empty() && extra_images.is_empty() {
-            user_message
-        } else if self.is_cursor_harness() {
-            self.transcribe_user_images(user_message, &user_images)
-                .await?
-        } else if !accepts_images {
-            let mut message = user_message;
-            if !message.is_empty() {
-                message.push_str("\n\n");
-            }
-            message.push_str(crate::model_image_input::TEXT_ONLY_MODEL_IMAGE_ERROR);
-            message
-        } else {
-            let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
-                &crate::session::info::Info {
-                    id: self.session_info.id.clone(),
-                    cwd: self.session_info.cwd.clone(),
-                },
-            )
-            .map_err(|e| {
-                acp::Error::internal_error().data(format!("failed to create session dir: {e}"))
-            })?;
-            crate::session::image_describe::persist_and_prepend_image_files(
-                &session_dir,
-                &user_images,
-                &user_message,
-            )
-            .map_err(|e| {
-                acp::Error::internal_error()
-                    .data(format!("failed to save user images to assets dir: {e}"))
-            })?
-        };
-        let attached_image_refs = if self.is_cursor_harness() || !accepts_images {
-            Vec::new()
-        } else {
-            crate::session::placeholder_images::attached_image_references(&user_images)
-        };
-        self.tool_bridge_handle()
-            .update_resource(xai_grok_tools::types::resources::ImageGenerationTurnId(
-                uuid::Uuid::now_v7().to_string(),
-            ))
-            .await;
-        self.tool_bridge_handle()
-            .update_resource(xai_grok_tools::types::resources::AttachedImages(
-                attached_image_refs,
-            ))
-            .await;
-        let prompt_text_for_hook = user_message.clone();
-        {
-            if trace_gcs_config.is_some() {
-                self.chat_state_handle.begin_turn_capture();
-            }
-            let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
-            let mut user_chat = match &origin {
-                super::super::PromptOrigin::TaskCompleted { .. } => {
-                    ConversationItem::task_completed(user_message)
-                }
-                super::super::PromptOrigin::SubagentCompleted { .. } => {
-                    ConversationItem::subagent_completed(user_message)
-                }
-                super::super::PromptOrigin::AgentMessage { .. } => {
-                    ConversationItem::agent_message(user_message)
-                }
-                super::super::PromptOrigin::PeerSessionMessage { .. } => {
-                    // Same chat-state treatment as team agent mail: a
-                    // synthetic user item flagged as model-authored input.
-                    ConversationItem::agent_message(user_message)
-                }
-                super::super::PromptOrigin::WorkflowCompleted { .. } => {
-                    ConversationItem::notification_drain(user_message)
-                }
-                super::super::PromptOrigin::NotificationDrain => {
-                    ConversationItem::notification_drain(user_message)
-                }
-                super::super::PromptOrigin::GoalSummary => {
-                    ConversationItem::goal_summary(user_message)
-                }
-                super::super::PromptOrigin::GoalClassifierNudge => {
-                    ConversationItem::goal_classifier_nudge(user_message)
-                }
-                super::super::PromptOrigin::SchedulerFired => {
-                    ConversationItem::scheduler_fired(user_message)
-                }
-                super::super::PromptOrigin::PlanResume => ConversationItem::user(user_message),
-                super::super::PromptOrigin::User => {
-                    let mut item = ConversationItem::user(
-                        self.maybe_apply_interrupt_envelope(user_message, verbatim),
+                    let cleaned_text = extraction.text;
+                    let count = extraction.images.len();
+                    tracing::info!(
+                        session_id = %self.session_info.id,
+                        count,
+                        "base64 images extracted from user query",
                     );
-                    if let Some(interrupt) = self
-                        .events
-                        .take_prior_interrupt_category()
-                        .and_then(crate::session::events::prior_turn_interrupt_from_cancellation)
-                    {
-                        item.set_prior_turn_interrupt(interrupt);
+                    let acp_imgs: Vec<agent_client_protocol::ImageContent> = extraction
+                        .images
+                        .into_iter()
+                        .map(|img| {
+                            agent_client_protocol::ImageContent::new(img.data, img.mime_type)
+                        })
+                        .collect();
+                    let nr =
+                        crate::session::image_normalize::normalize_images(acp_imgs, false).await;
+                    if !nr.re_encode_fallbacks.is_empty() {
+                        tracing::warn!(
+                            session_id = %self.session_info.id,
+                            notes = %nr.re_encode_fallbacks.join(" "),
+                            "Extracted user query image kept original after re-encode failure",
+                        );
                     }
-                    item
+                    (cleaned_text, nr.images)
                 }
+            } else {
+                (query, Vec::new())
             };
-            user_chat.set_prompt_index(current_prompt_index);
-            if !self.is_cursor_harness() && accepts_images {
-                for image in &user_images {
-                    user_chat.add_image(pick_user_image_url(image));
-                }
-                for image in &extra_images {
-                    user_chat.add_image(format!("data:{};base64,{}", image.mime_type, image.data));
-                }
+            let assembled = crate::session::prompt_parser::ParsedPrompt::assemble_parts_with_skills(
+                &context,
+                &query,
+                &skill_info,
+                is_cursor,
+            );
+            let pre_truncation_text = assembled.clone();
+            let (user_message, truncated_local_path) = if verbatim {
+                (assembled, None)
+            } else {
+                self.maybe_truncate_large_prompt_with_skills(
+                    context,
+                    query,
+                    skill_info,
+                    is_cursor,
+                    current_prompt_index,
+                )
+                .await
+            };
+            let was_truncated = truncated_local_path.is_some();
+            if let Some(tx) = parsed_prompt_tx {
+                let _ = tx.send(ParsedPromptInfo {
+                    text: user_message.clone(),
+                    full_text: if was_truncated {
+                        Some(pre_truncation_text)
+                    } else {
+                        None
+                    },
+                    local_path: truncated_local_path,
+                });
             }
-            if let Some(ack) = persist_ack {
+            // A session created before Codex login may still have an unbound,
+            // fail-closed title client. Adopt isolated Codex OAuth before queuing
+            // the first content chunk so the resolver-refresh message reaches the
+            // persistence actor ahead of title generation on the same FIFO.
+            let summary_auth_provider = self
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .map(|config| config.provider)
+                .unwrap_or_default();
+            let summary_auth_type = self.chat_state_handle.get_credentials().await.auth_type;
+            if turn_auth_refresh_route(summary_auth_provider, summary_auth_type, false)
+                == TurnAuthRefreshRoute::CodexOAuth
+            {
+                self.refresh_token_if_expired().await;
+            }
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::ContentChunk(PersistenceContentChunk::new(
+                    prompt_blocks.to_vec(),
+                )));
+            let model_id = self
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .map(|c| c.model)
+                .unwrap_or_default();
+            let accepts_images = crate::model_image_input::model_accepts_images(&model_id);
+            if self.telemetry_enabled || xai_grok_telemetry::external::is_active() {
+                let effective_client_identifier =
+                    prompt_client_identifier.or_else(|| self.client_identifier.clone());
+                let ev = xai_grok_telemetry::events::PromptSubmitted {
+                    prompt_length: user_message.len(),
+                    model_id,
+                    client_identifier: effective_client_identifier,
+                    screen_mode: prompt_screen_mode,
+                    prompt_text: None,
+                };
+                xai_grok_telemetry::session_ctx::log_event_dual(self.telemetry_enabled, ev);
+            }
+            self.retry_auth_required_servers().await;
+            self.retry_unreachable_servers().await;
+            self.maybe_inject_mcp_reminder().await;
+            self.maybe_inject_mcp_connecting_reminder().await;
+            self.maybe_inject_date_rollover_reminder().await;
+            if matches!(&origin, super::super::PromptOrigin::User) {
+                self.maybe_inject_user_info_update_reminder().await;
+                self.maybe_inject_project_rules_update_reminder().await;
+            }
+            self.inject_plan_mode_reminders().await;
+            self.inject_resumed_tasks_reminder();
+            if matches!(&origin, super::super::PromptOrigin::User) {
+                if let Some(gate) = &self.tool_context.task_wake_suppressed {
+                    gate.set(false);
+                }
+                xai_grok_telemetry::unified_log::info(
+                    "shell.task_wake.gate_cleared",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({ "reason": "handle_prompt_user_start" })),
+                );
+                self.consume_deferred_completions_for_user_turn().await;
+            }
+            self.drain_between_turn_completions().await;
+            self.inject_workflow_status_reminder().await;
+            let user_message = if user_images.is_empty() && extra_images.is_empty() {
+                user_message
+            } else if self.is_cursor_harness() {
+                self.transcribe_user_images(user_message, &user_images)
+                    .await?
+            } else if !accepts_images {
+                let mut message = user_message;
+                if !message.is_empty() {
+                    message.push_str("\n\n");
+                }
+                message.push_str(crate::model_image_input::TEXT_ONLY_MODEL_IMAGE_ERROR);
+                message
+            } else {
+                let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
+                    &crate::session::info::Info {
+                        id: self.session_info.id.clone(),
+                        cwd: self.session_info.cwd.clone(),
+                    },
+                )
+                .map_err(|e| {
+                    acp::Error::internal_error().data(format!("failed to create session dir: {e}"))
+                })?;
+                crate::session::image_describe::persist_and_prepend_image_files(
+                    &session_dir,
+                    &user_images,
+                    &user_message,
+                )
+                .map_err(|e| {
+                    acp::Error::internal_error()
+                        .data(format!("failed to save user images to assets dir: {e}"))
+                })?
+            };
+            let attached_image_refs = if self.is_cursor_harness() || !accepts_images {
+                Vec::new()
+            } else {
+                crate::session::placeholder_images::attached_image_references(&user_images)
+            };
+            self.tool_bridge_handle()
+                .update_resource(xai_grok_tools::types::resources::ImageGenerationTurnId(
+                    uuid::Uuid::now_v7().to_string(),
+                ))
+                .await;
+            self.tool_bridge_handle()
+                .update_resource(xai_grok_tools::types::resources::AttachedImages(
+                    attached_image_refs,
+                ))
+                .await;
+
+            {
+                if trace_gcs_config.is_some() {
+                    self.chat_state_handle.begin_turn_capture();
+                }
+                let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
+                let mut user_chat = match &origin {
+                    super::super::PromptOrigin::TaskCompleted { .. } => {
+                        ConversationItem::task_completed(user_message)
+                    }
+                    super::super::PromptOrigin::SubagentCompleted { .. } => {
+                        ConversationItem::subagent_completed(user_message)
+                    }
+                    super::super::PromptOrigin::ParentAgentMessage { .. } => {
+                        ConversationItem::agent_message(user_message)
+                    }
+                    super::super::PromptOrigin::AgentMessage { .. } => {
+                        ConversationItem::agent_message(user_message)
+                    }
+                    super::super::PromptOrigin::PeerSessionMessage { .. } => {
+                        // Same chat-state treatment as team agent mail: a
+                        // synthetic user item flagged as model-authored input.
+                        ConversationItem::agent_message(user_message)
+                    }
+                    super::super::PromptOrigin::WorkflowCompleted { .. } => {
+                        ConversationItem::notification_drain(user_message)
+                    }
+                    super::super::PromptOrigin::NotificationDrain => {
+                        ConversationItem::notification_drain(user_message)
+                    }
+                    super::super::PromptOrigin::GoalSummary => {
+                        ConversationItem::goal_summary(user_message)
+                    }
+                    super::super::PromptOrigin::GoalClassifierNudge => {
+                        ConversationItem::goal_classifier_nudge(user_message)
+                    }
+                    super::super::PromptOrigin::SchedulerFired => {
+                        ConversationItem::scheduler_fired(user_message)
+                    }
+                    super::super::PromptOrigin::PlanResume => ConversationItem::user(user_message),
+                    super::super::PromptOrigin::User => {
+                        let mut item = ConversationItem::user(
+                            self.maybe_apply_interrupt_envelope(user_message, verbatim),
+                        );
+                        if let Some(interrupt) =
+                            self.events.take_prior_interrupt_category().and_then(
+                                crate::session::events::prior_turn_interrupt_from_cancellation,
+                            )
+                        {
+                            item.set_prior_turn_interrupt(interrupt);
+                        }
+                        item
+                    }
+                };
+                user_chat.set_prompt_index(current_prompt_index);
+                if !self.is_cursor_harness() && accepts_images {
+                    for image in &user_images {
+                        user_chat.add_image(pick_user_image_url(image));
+                    }
+                    for image in &extra_images {
+                        user_chat
+                            .add_image(format!("data:{};base64,{}", image.mime_type, image.data));
+                    }
+                }
                 if self
                     .chat_state_handle
                     .push_user_message_and_ack(user_chat)
@@ -941,47 +1200,60 @@ impl SessionActor {
                         .is_ok()
                         && matches!(flush_rx.await, Ok(Ok(())))
                     {
-                        let _ = ack.send(());
+                        if let Some(ack) = persist_ack {
+                            let _ = ack.send(());
+                        }
                     } else {
                         tracing::error!(
                             session_id = %self.session_info.id.0,
                             prompt_id = %prompt_id,
-                            "persist_ack flush barrier failed"
+                            "user prompt flush barrier failed"
                         );
                     }
                 } else {
                     tracing::error!(
                         session_id = %self.session_info.id.0,
                         prompt_id = %prompt_id,
-                        "persist_ack skipped: chat-state actor unavailable"
+                        "user prompt commit skipped: chat-state actor unavailable"
                     );
                 }
-            } else {
-                self.chat_state_handle.push_user_message(user_chat);
-                self.mark_front_message_committed().await;
             }
         }
-        self.dispatch_hook(
-            xai_grok_hooks::event::HookEventName::UserPromptSubmit,
-            xai_grok_hooks::event::HookPayload::UserPromptSubmit {
-                prompt: Some(prompt_text_for_hook),
-                subagent_type: self.subagent_type_label(),
-            },
-            Some(prompt_id),
-            None,
-        )
-        .await;
         let turn_scope_guard =
             TurnSubagentScopeGuard::new(self.current_prompt_id.clone(), prompt_id.to_string());
         self.open_subagent_spawn_admission();
         let turn_model_id = self.current_model_id().await;
         let doom_event_model = turn_model_id.clone();
         let turn_timer = std::time::Instant::now();
-        let mut result = {
+        let mut result = if let Some((hook_name, reason)) = prompt_block {
+            self.state.lock().await.arm_hook_block_hold();
+            if let Some(kind) = redirect_kind {
+                self.events.set_prior_redirect_kind(kind);
+            }
+            xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::HookBlocked {
+                hook_name: hook_name.clone(),
+                cause: xai_grok_telemetry::events::HookBlockCause::PromptBlocked,
+            });
+            self.send_hook_annotation(&format!(
+                "\u{26a0} Prompt blocked by {}: {reason}",
+                xai_grok_hooks::config::hook_display_name(&hook_name)
+            ))
+            .await;
+            Ok(TurnOutcome::Cancelled {
+                category: Some(crate::session::events::CancellationCategory::HookDenied),
+                context: Some(crate::session::commands::CancellationContext {
+                    hook_name: Some(hook_name),
+                    reason: Some(reason),
+                    ..Default::default()
+                }),
+            })
+        } else {
             let mut round_trace = trace_gcs_config;
             let mut round_artifact = artifact_tracker;
             let mut swarm_rate_limit_attempt = 0u32;
             let mut stop_continuations_this_turn: u32 = 0;
+            let mut salvage =
+                super::length_salvage::LengthSalvage::new(self.length_salvage_budget());
             loop {
                 if self.goal_harness_enabled() {
                     let goal_loop_active = self.goal_tracker.lock().status()
@@ -994,6 +1266,7 @@ impl SessionActor {
                         round_trace.take(),
                         round_artifact.take(),
                         json_schema.clone(),
+                        &mut salvage,
                     )
                     .await;
                 if is_rate_limited_turn_result(&round)
@@ -1034,7 +1307,7 @@ impl SessionActor {
                 if matches!(
                     round,
                     Ok(TurnOutcome::Completed {
-                        refusal: Some(_),
+                        stop: CompletedStop::Refusal(_),
                         ..
                     })
                 ) {
@@ -1051,14 +1324,25 @@ impl SessionActor {
                     self.goal_tracker.lock().status(),
                 );
                 if goal_active {
-                    let decision = if self.goal_runs_on_workflow_engine() {
-                        self.run_goal_round_end().await
-                    } else {
-                        self.run_goal_round_end_legacy().await
-                    };
-                    if let GoalRoundDecision::Continue(directive) = decision {
-                        self.inject_goal_continuation_message(directive).await;
-                        continue;
+                    if self.has_runnable_queued_user_row().await {
+                        xai_grok_telemetry::unified_log::info(
+                            "shell.goal.yielded_to_queued_input",
+                            Some(self.session_info.id.0.as_ref()),
+                            Some(serde_json::json!({ "prompt_id": prompt_id })),
+                        );
+                        break round;
+                    }
+                    if input_origin.is_synthetic() || !self.has_pending_goal_continuation().await {
+                        let decision = if self.goal_runs_on_workflow_engine() {
+                            self.run_goal_round_end().await
+                        } else {
+                            self.run_goal_round_end_legacy().await
+                        };
+                        if let GoalRoundDecision::Continue(directive) = decision {
+                            salvage.round_boundary();
+                            self.inject_goal_continuation_message(directive).await;
+                            continue;
+                        }
                     }
                 }
                 match self
@@ -1068,6 +1352,7 @@ impl SessionActor {
                     StopGateDecision::AllowStop => break round,
                     StopGateDecision::KeepWorking { feedback } => {
                         stop_continuations_this_turn += 1;
+                        salvage.round_boundary();
                         self.chat_state_handle
                             .push_user_message(ConversationItem::stop_hook_feedback(feedback));
                     }
@@ -1105,7 +1390,8 @@ impl SessionActor {
         {
             result = Err(error);
         }
-        let turn_duration_ms = turn_timer.elapsed().as_millis() as u64;
+        let turn_duration_ms =
+            super::turn_task::elapsed_ms_saturating(turn_timer, std::time::Instant::now());
         let handle_prompt_elapsed_ms = handle_prompt_start.elapsed().as_millis() as u64;
         xai_grok_telemetry::unified_log::info(
             "shell.handle_prompt.done",
@@ -1130,13 +1416,13 @@ impl SessionActor {
             })
             .await;
         match &result {
-            Ok(TurnOutcome::Completed { refusal, .. }) => {
+            Ok(TurnOutcome::Completed { stop, .. }) => {
                 self.emit_turn_ended(
                     crate::session::events::TurnOutcomeLabel::Completed,
                     None,
                     None,
                 );
-                if let Some(explanation) = refusal {
+                if let CompletedStop::Refusal(explanation) = stop {
                     self.report_turn_end(
                         prompt_id,
                         TurnEnd::Failed {
@@ -1198,12 +1484,16 @@ impl SessionActor {
                 );
             }
             Ok(TurnOutcome::Cancelled { category, context }) => {
+                let context_json = context.as_ref().and_then(|c| serde_json::to_value(c).ok());
                 self.emit_turn_ended(
                     crate::session::events::TurnOutcomeLabel::Cancelled,
                     *category,
-                    context.clone(),
+                    context_json.clone(),
                 );
-                if let Some(cause) = category {
+                if let Some(cause) = category
+                    && crate::session::events::prior_turn_interrupt_from_cancellation(*cause)
+                        .is_some()
+                {
                     self.events.set_prior_interrupt_category(*cause);
                 }
                 self.send_after_turn_event(xai_tool_protocol::turn_hook::AfterTurnPayload {
@@ -1214,7 +1504,7 @@ impl SessionActor {
                     model_id: turn_model_id.clone(),
                     written_repo_paths: Vec::new(),
                     cancellation_category: cancellation_category_to_wire_string(*category),
-                    cancellation_context: context.clone(),
+                    cancellation_context: context_json,
                 })
                 .await;
                 xai_grok_telemetry::session_ctx::log_event(
@@ -1312,6 +1602,23 @@ impl SessionActor {
             },
         );
         let doom_tally = std::mem::take(&mut *self.doom_loop_turn_tally.lock());
+        if doom_tally.detected() {
+            let summary = doom_tally.detection_summary();
+            xai_grok_telemetry::session_ctx::log_session_event(
+                crate::agent::session_metrics::DoomLoopDetected {
+                    session_id: self.session_info.id.0.to_string(),
+                    turn_number: current_prompt_index as u64,
+                    trigger_count: doom_tally.triggers.len() as u32,
+                    detector_kinds: summary.detector_kinds,
+                    channels: summary.channels,
+                    tightest_tail_threshold: summary.tightest_tail_threshold,
+                    max_exact_sequence_tokens: summary.max_exact_sequence_tokens,
+                    max_exact_repeat_count: summary.max_exact_repeat_count,
+                    recovery_attempts: doom_tally.attempts,
+                    model: doom_event_model.clone(),
+                },
+            );
+        }
         if doom_tally.fired() {
             xai_grok_telemetry::session_ctx::log_session_event(
                 crate::agent::session_metrics::DoomLoopRecovery {
@@ -1348,6 +1655,7 @@ impl SessionActor {
             }
         }
         let usage = self.freeze_prompt_usage(prompt_id).await;
+        self.persist_live_usage().await;
         drop(turn_scope_guard);
         match result {
             Ok(outcome) => {
@@ -1358,13 +1666,13 @@ impl SessionActor {
                     TurnOutcome::Completed {
                         snapshot,
                         structured_output,
-                        refusal,
+                        stop,
                         ..
                     } => (
-                        if refusal.is_some() {
-                            acp::StopReason::Refusal
-                        } else {
-                            acp::StopReason::EndTurn
+                        match stop {
+                            CompletedStop::Refusal(_) => acp::StopReason::Refusal,
+                            CompletedStop::MaxTokens => acp::StopReason::MaxTokens,
+                            CompletedStop::EndTurn => acp::StopReason::EndTurn,
                         },
                         *snapshot,
                         PromptCompletionKind::Completed,
@@ -1376,18 +1684,12 @@ impl SessionActor {
                         PromptCompletionKind::StationarityEnded,
                         None,
                     ),
-                    TurnOutcome::Cancelled { category, context } => {
-                        let cancellation_ctx = context.and_then(|v| serde_json::from_value(v).ok());
-                        (
-                            acp::StopReason::Cancelled,
-                            None,
-                            PromptCompletionKind::Cancelled {
-                                category,
-                                context: cancellation_ctx,
-                            },
-                            None,
-                        )
-                    }
+                    TurnOutcome::Cancelled { category, context } => (
+                        acp::StopReason::Cancelled,
+                        None,
+                        PromptCompletionKind::Cancelled { category, context },
+                        None,
+                    ),
                     TurnOutcome::MaxTurnsReached { limit } => (
                         acp::StopReason::Cancelled,
                         None,
@@ -1416,12 +1718,17 @@ impl SessionActor {
     /// prompt report is marked incomplete immediately and their spend reaches
     /// the session ledger when they finish.
     /// Cancel intentionally skips this multi-second drain (actor-loop safety).
+    #[tracing::instrument(
+        name = "session.freeze_prompt_usage",
+        skip_all,
+        fields(session_id = %self.session_info.id.0, prompt_id = %prompt_id)
+    )]
     pub(super) async fn freeze_prompt_usage(
         &self,
         prompt_id: &str,
     ) -> Option<crate::extensions::notification::PromptUsage> {
-        const DRAIN: std::time::Duration = std::time::Duration::from_secs(120);
-        self.freeze_prompt_usage_bounded(prompt_id, DRAIN).await
+        self.freeze_prompt_usage_bounded(prompt_id, SUBAGENT_USAGE_DRAIN)
+            .await
     }
     /// [`freeze_prompt_usage`] with an explicit drain bound, for tests.
     pub(super) async fn freeze_prompt_usage_bounded(
@@ -1443,52 +1750,57 @@ impl SessionActor {
         prompt_id: &str,
         max_wait: std::time::Duration,
     ) -> UsageDrainOutcome {
-        const POLL: std::time::Duration = std::time::Duration::from_millis(50);
-        let deadline = std::time::Instant::now() + max_wait;
-        loop {
-            let reply = self.outstanding_reply_for_prompt(prompt_id).await;
-            match reply.as_ref() {
-                None => {
-                    tracing::warn!(
-                        prompt_id,
-                        "outstanding subagent query failed; treating usage as incomplete"
-                    );
-                    return UsageDrainOutcome {
-                        fail_closed: true,
-                        background_live: false,
-                        sticky_report: false,
-                    };
-                }
-                Some(r) if r.live_ids.is_empty() => {
-                    return UsageDrainOutcome {
-                        fail_closed: false,
-                        background_live: r.background_live,
-                        sticky_report: r.subagent_usage_not_applied,
-                    };
-                }
-                Some(r) => {
-                    if std::time::Instant::now() >= deadline {
-                        tracing::warn!(
-                            prompt_id,
-                            count = r.live_ids.len(),
-                            max_wait_ms = max_wait.as_millis() as u64,
-                            "subagent usage drain timed out; usage may under-count"
-                        );
-                        return UsageDrainOutcome {
-                            fail_closed: true,
-                            background_live: r.background_live,
-                            sticky_report: r.subagent_usage_not_applied,
-                        };
-                    }
+        let Some(tx) = &self.tool_context.subagent_event_tx else {
+            return UsageDrainOutcome {
+                fail_closed: false,
+                background_live: false,
+                sticky_report: false,
+            };
+        };
+        let coordinator_gone = || {
+            tracing::warn!(
+                prompt_id,
+                "outstanding subagent query failed; treating usage as incomplete"
+            );
+            UsageDrainOutcome {
+                fail_closed: true,
+                background_live: false,
+                sticky_report: false,
+            }
+        };
+        let (respond_to, rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(SubagentEvent::WaitPromptDrained(
+                SubagentWaitPromptDrainedRequest {
+                    parent_session_id: self.session_id_string(),
+                    prompt_id: prompt_id.to_string(),
+                    respond_to,
+                },
+            ))
+            .is_err()
+        {
+            return coordinator_gone();
+        }
+        match tokio::time::timeout(max_wait, rx).await {
+            Ok(Ok(reply)) => UsageDrainOutcome {
+                fail_closed: false,
+                background_live: reply.background_live,
+                sticky_report: reply.subagent_usage_not_applied,
+            },
+            Ok(Err(_)) => coordinator_gone(),
+            Err(_) => {
+                tracing::warn!(
+                    prompt_id,
+                    max_wait_ms = max_wait.as_millis() as u64,
+                    "subagent usage drain timed out; usage may under-count"
+                );
+                UsageDrainOutcome {
+                    fail_closed: true,
+                    background_live: false,
+                    sticky_report: false,
                 }
             }
-            tokio::time::sleep(POLL).await;
         }
-    }
-    pub(super) async fn snapshot_prompt_usage(
-        &self,
-    ) -> Option<crate::extensions::notification::PromptUsage> {
-        self.snapshot_prompt_usage_marked(false).await
     }
     pub(super) async fn snapshot_prompt_usage_marked(
         &self,
@@ -1547,9 +1859,6 @@ impl SessionActor {
         };
         let Some(tx) = &self.tool_context.subagent_event_tx else {
             return false;
-        };
-        use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentMarkUsageNotAppliedRequest,
         };
         let (respond_to, ack) = tokio::sync::oneshot::channel();
         if tx
@@ -1718,6 +2027,7 @@ impl SessionActor {
         trace_gcs_config: Option<crate::session::repo_changes::TraceExportConfig>,
         artifact_tracker: Option<crate::upload::manifest::ArtifactTracker>,
         json_schema: Option<serde_json::Value>,
+        salvage: &mut super::length_salvage::LengthSalvage,
     ) -> Result<TurnOutcome, acp::Error> {
         let _ = self.compaction.auto_compact_suppressed.compare_exchange(
             crate::session::compaction_config::SUPPRESS_TURN,
@@ -1735,6 +2045,7 @@ impl SessionActor {
                         trace_gcs_config,
                         artifact_tracker.as_ref(),
                         json_schema,
+                        &mut *salvage,
                     )
                     .await;
             }
@@ -1748,6 +2059,7 @@ impl SessionActor {
                         trace_gcs_config,
                         artifact_tracker.as_ref(),
                         json_schema,
+                        &mut *salvage,
                     )
                     .await;
             }
@@ -1760,6 +2072,7 @@ impl SessionActor {
                 trace_gcs_config.clone(),
                 artifact_tracker.as_ref(),
                 json_schema.clone(),
+                &mut *salvage,
             )
             .await;
         if matches!(
@@ -1819,6 +2132,7 @@ impl SessionActor {
             })
             .await;
             sleep(delay).await;
+            salvage.round_boundary();
             let recovery_message = ConversationItem::auto_recovery(recovery_prompt.clone());
             self.chat_state_handle.push_user_message(recovery_message);
             result = self
@@ -1827,6 +2141,7 @@ impl SessionActor {
                     trace_gcs_config.clone(),
                     artifact_tracker.as_ref(),
                     None,
+                    &mut *salvage,
                 )
                 .await;
             if matches!(
@@ -2140,6 +2455,31 @@ impl SessionActor {
             ));
         StructuredOutputStep::Complete(validated)
     }
+    async fn persist_live_usage(&self) {
+        let Some(signals) = self.signals_handle().snapshot().await else {
+            return;
+        };
+        if signals.turn_count == 0 {
+            return;
+        }
+        match self.chat_state_handle.try_get_session_usage().await {
+            Ok(ledger) => {
+                let _ = self
+                    .notifications
+                    .persistence_tx
+                    .send(PersistenceMsg::UsageTurn {
+                        turn_number: signals.turn_count,
+                        live: crate::session::usage_file::UsageSummary::from_ledger(&ledger),
+                    });
+            }
+            Err(()) => {
+                tracing::warn!(
+                    turn_number = signals.turn_count,
+                    "failed to snapshot session usage for persist"
+                );
+            }
+        }
+    }
     /// Shared turn-completion bookkeeping (plan cleanup, signals snapshot +
     /// persistence, BigQuery turn delta, feedback prompt). Runs identically for
     /// the native and StructuredOutput-tool completion paths. Returns the
@@ -2334,6 +2674,7 @@ impl SessionActor {
             outcome,
             tool_call_id: ui_call_id.clone(),
             source: crate::session::events::ToolCompletedSource::Shell,
+            rewriting_hook: None,
         });
         self.observability_bridge
             .emit(
@@ -2361,6 +2702,9 @@ impl SessionActor {
             cache_read_tokens = tracing::field::Empty,
             stop_reason = tracing::field::Empty,
             response.has_tool_call = tracing::field::Empty,
+            last_sample.stop_reason = tracing::field::Empty,
+            last_sample.has_tool_call = tracing::field::Empty,
+            last_sample.output_tokens = tracing::field::Empty,
             request_id = tracing::field::Empty,
             ttft_ms = tracing::field::Empty,
             mcp_server.name = tracing::field::Empty,
@@ -2379,6 +2723,7 @@ impl SessionActor {
         trace_gcs_config: Option<crate::session::repo_changes::TraceExportConfig>,
         artifact_tracker: Option<&crate::upload::manifest::ArtifactTracker>,
         json_schema: Option<serde_json::Value>,
+        salvage: &mut super::length_salvage::LengthSalvage,
     ) -> Result<TurnOutcome, acp::Error> {
         let conv_turn_start = std::time::Instant::now();
         let conv_turn_clock = DualClock::now();
@@ -2428,6 +2773,15 @@ impl SessionActor {
         tool_definitions.retain(|definition| {
             self.local_tool_allowed_for_provider(&definition.function.name, model_provider)
         });
+        if self.startup_hints.is_subagent {
+            let bridge = self.tool_bridge_handle();
+            let specs = child_tool_projection::child_safe_tool_specs(
+                tool_definitions.into_iter().map(ToolSpec::from).collect(),
+                child_tool_projection::ChildToolProjection::Rebuilt,
+                |name| bridge.tool_kind(name),
+            );
+            tool_definitions = crate::session::tool_surface::tool_specs_as_definitions(&specs);
+        }
         let tool_mode = self.agent.borrow().tool_mode();
         let code_mode_enabled = matches!(
             tool_mode,
@@ -2441,10 +2795,19 @@ impl SessionActor {
             &api_backend,
         )
         .map_err(|error| acp::Error::internal_error().data(error))?;
-        let forked_tool_override = self
-            .forked_tool_override
-            .as_deref()
-            .map(|tools| self.provider_filtered_tool_specs(tools, model_provider));
+        let forked_tool_override = self.forked_tool_override.as_deref().map(|tools| {
+            let tools = self.provider_filtered_tool_specs(tools, model_provider);
+            if self.startup_hints.is_subagent {
+                let bridge = self.tool_bridge_handle();
+                child_tool_projection::child_safe_tool_specs(
+                    tools,
+                    child_tool_projection::ChildToolProjection::VerbatimMirror,
+                    |name| bridge.tool_kind(name),
+                )
+            } else {
+                tools
+            }
+        });
         let nested_tool_definitions = if let Some(ref override_tools) = forked_tool_override {
             crate::session::tool_surface::tool_specs_as_definitions(override_tools)
         } else {
@@ -2523,8 +2886,14 @@ impl SessionActor {
         let mut identical_tool_calls = IdenticalToolCallRun::default();
         let mut experience_replanning_nudges = std::collections::HashSet::new();
         let mut todo_gate_fires: u32 = 0;
+        let mut length_salvage_streak = LengthSalvageStreak::default();
+        let mut media_gen_resamples: u32 = 0;
         let mut auth_retry_schedule = AuthRetrySchedule::new();
         let mut codex_auth_retry_attempted = false;
+        let mut rate_limit_waits = self.rate_limit_wait_budget();
+        let mut transient_retry_attempts: u32 = 0;
+        let transient_retry_enabled =
+            self.transient_turn_retries && !self.attach_non_interactive.get();
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
@@ -2561,6 +2930,7 @@ impl SessionActor {
                 let run_len = identical_tool_calls.run_len;
                 let tool_name = identical_tool_calls.tool_name.clone();
                 let true_noop = identical_tool_calls.is_true_noop_run;
+                let problematically_repeating = identical_tool_calls.is_problematically_repeating();
                 tracing::warn!(
                     session_id = %self.session_info.id,
                     tool_name = %tool_name,
@@ -2576,11 +2946,13 @@ impl SessionActor {
                         "tool_name": tool_name,
                         "run_len": run_len,
                         "true_noop": true_noop,
+                        "problematically_repeating": problematically_repeating,
                     })),
                 );
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::ActionStationarityStop {
                         true_noop,
+                        problematically_repeating,
                         run_len,
                         tool_name: tool_name.clone(),
                     },
@@ -2600,6 +2972,7 @@ impl SessionActor {
             if identical_tool_calls.take_nudge() {
                 let run_len = identical_tool_calls.run_len;
                 let tool_name = identical_tool_calls.tool_name.clone();
+                let problematically_repeating = identical_tool_calls.is_problematically_repeating();
                 tracing::warn!(
                     session_id = %self.session_info.id,
                     tool_name = %tool_name,
@@ -2613,7 +2986,15 @@ impl SessionActor {
                         "loop_index": loop_index,
                         "tool_name": tool_name,
                         "run_len": run_len,
+                        "problematically_repeating": problematically_repeating,
                     })),
+                );
+                xai_grok_telemetry::session_ctx::log_event(
+                    xai_grok_telemetry::events::ActionStationarityNudge {
+                        problematically_repeating,
+                        run_len,
+                        tool_name: tool_name.clone(),
+                    },
                 );
                 let reminder = self
                     .tool_bridge_handle()
@@ -2628,13 +3009,17 @@ impl SessionActor {
                     .unwrap_or_else(|| ACTION_STATIONARITY_NUDGE_TEMPLATE.to_string());
                 self.push_system_reminder(&reminder);
             }
-            self.drain_interjections_at_safe_point().await;
-            self.flush_pending_skill_reminders().await;
-            self.inject_pending_monitor_events().await;
-            self.drain_detached_swarm_completions().await;
-            if loop_index > 1 && actor_uses_experience_memory(self.startup_hints.is_subagent) {
-                self.maybe_inject_experience_failure_reminder(&mut experience_replanning_nudges)
+            if !salvage.awaiting_continuation() {
+                self.drain_interjections_at_safe_point().await;
+                self.flush_pending_skill_reminders().await;
+                self.inject_pending_monitor_events().await;
+                self.drain_detached_swarm_completions().await;
+                if loop_index > 1 && actor_uses_experience_memory(self.startup_hints.is_subagent) {
+                    self.maybe_inject_experience_failure_reminder(
+                        &mut experience_replanning_nudges,
+                    )
                     .await;
+                }
             }
             let memory_reminder = self.first_turn_memory_reminder().await;
             if memory_reminder.is_some() {
@@ -2646,7 +3031,9 @@ impl SessionActor {
                     "MEMORY_INJECT: first-turn memory context injected"
                 );
             }
-            self.maybe_inject_mcp_reminder().await;
+            if !salvage.awaiting_continuation() {
+                self.maybe_inject_mcp_reminder().await;
+            }
             if self.tool_context.task_output_token_budget.is_none()
                 && self.two_pass_active()
                 && !self.compaction.prefire.has_cache()
@@ -2663,6 +3050,7 @@ impl SessionActor {
                 self.refresh_token_if_expired().await;
             }
             if self.tool_context.task_output_token_budget.is_none()
+                && !salvage.awaiting_continuation()
                 && let Some(trigger_info) = self.check_auto_compact_needed().await
                 && let Err(e) = self.run_compact_only(trigger_info).await
             {
@@ -2731,6 +3119,8 @@ impl SessionActor {
             request.x_grok_turn_idx =
                 Some(self.chat_state_handle.get_prompt_index().await.to_string());
             request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
+            request.x_grok_transient_retry =
+                (transient_retry_attempts > 0).then(|| transient_retry_attempts.to_string());
             if request.x_grok_deployment_id.is_none() {
                 request.x_grok_deployment_id = crate::managed_config::resolve_deployment_id(
                     crate::managed_config::resolve_deployment_key().as_deref(),
@@ -2746,6 +3136,9 @@ impl SessionActor {
                 .map_err(|message| acp::Error::internal_error().data(message))?;
             let request_summary =
                 crate::session::cache_tracker::CacheTracker::summarize_request(&request);
+            if salvage.enabled() {
+                request.length_policy = xai_grok_sampling_types::LengthPolicy::CompletePartial;
+            }
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
             });
@@ -2762,29 +3155,140 @@ impl SessionActor {
                 Some(serde_json::json!({
                     "loop_index": loop_index,
                     "elapsed_since_turn_start_ms": conv_turn_start.elapsed().as_millis() as u64,
+                    "transient_retry_attempts": transient_retry_attempts,
                 })),
             );
             let model_timer = std::time::Instant::now();
-            let sampler_outcome = match self
-                .run_turn_via_sampler(request.clone(), !codex_auth_retry_attempted)
+            let (response, latency) = match self
+                .run_turn_via_sampler(
+                    request.clone(),
+                    !codex_auth_retry_attempted,
+                    &mut rate_limit_waits,
+                    TransientRetryState {
+                        step_attempts: transient_retry_attempts,
+                        prompt_attempts: self.transient_retries_prompt_total.get(),
+                        episode_start: self.transient_episode_start.get(),
+                        enabled: transient_retry_enabled,
+                    },
+                    salvage.awaiting_continuation(),
+                )
                 .await
             {
-                Ok(outcome) => outcome,
+                Ok(SamplerTurnOutcome::Response(r, latency)) => {
+                    salvage.response_arrived();
+                    (r, latency)
+                }
                 Err(error) => {
+                    if salvage.awaiting_continuation()
+                        && crate::sampling::error::is_max_tokens_turn_error(&error)
+                    {
+                        salvage.response_arrived();
+                        xai_grok_telemetry::unified_log::warn(
+                            "shell.turn.length_empty_continuation",
+                            Some(self.session_info.id.0.as_ref()),
+                            Some(serde_json::json!({
+                                "continue_attempts": salvage.continues(),
+                                "continue_budget": salvage.budget(),
+                                "cause": error
+                                    .data
+                                    .as_ref()
+                                    .and_then(|d| {
+                                        d.get(crate::sampling::error::SALVAGE_CAUSE_KEY)
+                                    })
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(crate::sampling::error::SALVAGE_CAUSE_EMPTY),
+                            })),
+                        );
+                        if self.drain_interjections_at_safe_point().await {
+                            salvage.round_boundary();
+                            tracing::info!(
+                                "Drained interjection(s) after an empty continuation; continuing"
+                            );
+                            continue;
+                        }
+                        self.chat_state_handle.pop_stranded_continue_reminder();
+                        let structured_output = match structured_output_validator.as_ref() {
+                            Some(validator) => self
+                                .chat_state_handle
+                                .get_trailing_assistant_report()
+                                .await
+                                .map(|text| validate_structured_output(validator, &text)),
+                            None => None,
+                        };
+                        let snapshot = self
+                            .finalize_turn_bookkeeping(
+                                req_id,
+                                conv_turn_start,
+                                &turn_span_totals,
+                                model_fingerprint.clone(),
+                            )
+                            .await;
+                        return Ok(TurnOutcome::Completed {
+                            snapshot: Box::new(snapshot),
+                            tools_called: turn_tools_called,
+                            structured_output,
+                            stop: CompletedStop::MaxTokens,
+                        });
+                    }
+                    salvage.response_arrived();
+                    salvage.step_boundary();
                     self.tool_context.fail_task_output_usage_closed();
                     return Err(error);
                 }
-            };
-            let (response, latency) = match sampler_outcome {
-                SamplerTurnOutcome::Response(r, latency) => (r, latency),
-                SamplerTurnOutcome::CompactAndResubmit => {
-                    auth_retry_schedule.reset_on_success();
+                Ok(SamplerTurnOutcome::RetryTransient { kind, status_code }) => {
+                    if matches!(kind, xai_grok_sampler::SamplingErrorKind::Api) {
+                        auth_retry_schedule.reset_on_success();
+                    }
+                    let delay = xai_grok_sampler::jitter_backoff(transient_backoff_delay(
+                        transient_retry_attempts,
+                    ));
+                    transient_retry_attempts += 1;
+                    let prompt_total = self.transient_retries_prompt_total.get() + 1;
+                    self.transient_retries_prompt_total.set(prompt_total);
+                    if self.transient_episode_start.get().is_none() {
+                        self.transient_episode_start
+                            .set(Some(tokio::time::Instant::now()));
+                    }
+                    let display_max =
+                        transient_display_ceiling(transient_retry_attempts, prompt_total);
+                    xai_grok_telemetry::unified_log::warn(
+                        "shell.turn.transient_retry_backoff",
+                        Some(self.session_info.id.0.as_ref()),
+                        Some(serde_json::json!({
+                            "loop_index": loop_index,
+                            "kind": kind.as_str(),
+                            "status_code": status_code,
+                            "attempt": transient_retry_attempts,
+                            "max_retries": display_max,
+                            "delay_ms": delay.as_millis() as u64,
+                        })),
+                    );
+                    let cause = match kind {
+                        xai_grok_sampler::SamplingErrorKind::IdleTimeout => "Response stalled",
+                        xai_grok_sampler::SamplingErrorKind::Http => "Connection problem",
+                        _ => "Server error",
+                    };
+                    self.send_xai_notification(XaiSessionUpdate::RetryState(
+                        crate::extensions::notification::RetryState::Retrying {
+                            attempt: transient_retry_attempts,
+                            max_retries: display_max,
+                            reason: format!("{cause}; retrying request"),
+                            error_type: Some(kind.as_str().to_string()),
+                        },
+                    ))
+                    .await;
+                    sleep(delay).await;
                     continue;
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::CompactAndResubmit) => {
+                    auth_retry_schedule.reset_on_success();
+                    transient_retry_attempts = 0;
+                    continue;
+                }
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Codex,
                     ..
-                } => {
+                }) => {
                     // Codex OAuth refresh is one-shot; do not share xAI AuthManager budget.
                     codex_auth_retry_attempted = true;
                     self.send_xai_notification(XaiSessionUpdate::RetryState(
@@ -2792,16 +3296,17 @@ impl SessionActor {
                             attempt: 1,
                             max_retries: 1,
                             reason: "Refreshed Codex OAuth after 401; retrying request".to_string(),
+                            error_type: None,
                         },
                     ))
                     .await;
                     continue;
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Xai,
                     credential,
                     store,
-                } => {
+                }) => {
                     if auth_retry_schedule.reset_if_incident_spans_suspend() {
                         tracing::info!("auth 401 retry: incident spanned a suspend; budget reset");
                         xai_grok_telemetry::unified_log::info(
@@ -2832,6 +3337,7 @@ impl SessionActor {
                                     reason: "Re-authenticated after 401 (request carried no \
                                              credential); retrying request"
                                         .to_string(),
+                                    error_type: None,
                                 },
                             ))
                             .await;
@@ -2861,6 +3367,7 @@ impl SessionActor {
                                     max_retries: AuthRetrySchedule::MAX_RETRIES,
                                     reason: "Re-authenticated after 401; retrying request"
                                         .to_string(),
+                                    error_type: None,
                                 },
                             ))
                             .await;
@@ -2932,85 +3439,85 @@ impl SessionActor {
                         }
                     }
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Kimi,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error()
                         .data("Kimi API-key authentication cannot be refreshed automatically"));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Fireworks,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error().data(
                         "Fireworks AI API-key authentication cannot be refreshed automatically",
                     ));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::DeepSeek,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error().data(
                         "DeepSeek API-key authentication cannot be refreshed automatically",
                     ));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Meta,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error()
                         .data("Meta API-key authentication cannot be refreshed automatically"));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Wafer,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error()
                         .data("Wafer API-key authentication cannot be refreshed automatically"));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Zai,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error()
                         .data("Z AI API-key authentication cannot be refreshed automatically"));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Runinfra,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error().data(
                         "RunInfra API-key authentication cannot be refreshed automatically",
                     ));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Gemini,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error()
                         .data("Gemini API-key authentication cannot be refreshed automatically"));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::OpenCodeGo,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error().data(
                         "OpenCode Go API-key authentication cannot be refreshed automatically",
                     ));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::OpenRouter,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error().data(
                         "OpenRouter API-key authentication cannot be refreshed automatically",
                     ));
                 }
-                SamplerTurnOutcome::RefreshAuthAndResubmit {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
                     provider: xai_grok_sampling_types::ModelProvider::Custom,
                     ..
-                } => {
+                }) => {
                     return Err(acp::Error::internal_error().data(
                         "Custom endpoint authentication cannot be refreshed automatically: check the API key, credential header (bearer vs x_api_key), and wire format saved for this model",
                     ));
@@ -3018,6 +3525,8 @@ impl SessionActor {
             };
             auth_retry_schedule.reset_on_success();
             codex_auth_retry_attempted = false;
+            transient_retry_attempts = 0;
+            self.transient_episode_start.set(None);
             let model_elapsed_ms = model_timer.elapsed().as_millis() as u64;
             let usage = response.usage.as_ref();
             let prompt_tokens = usage.map(|u| u.prompt_tokens);
@@ -3099,12 +3608,25 @@ impl SessionActor {
                             .usage
                             .as_ref()
                             .map(|u| u.cached_prompt_tokens),
+                        cache_creation_tokens: response
+                            .usage
+                            .as_ref()
+                            .map(|u| u.cache_creation_prompt_tokens),
+                        cost_usd_ticks: response.cost_usd_ticks,
                     },
                 );
             }
             self.record_response_token_usage(&response, Some(model_duration_ms));
             let response_completed = self.response_completed_update(&response);
-            if let Some(pt) = prompt_timing.take() {
+            if let Some(mut pt) = prompt_timing.take() {
+                pt.record_stream_latency(
+                    latency.time_to_first_token_ms,
+                    latency.time_to_last_byte_ms,
+                );
+                pt.record_model_result(
+                    latency.attempts,
+                    response.usage.as_ref().map(|u| u.completion_tokens),
+                );
                 let mcp_count = self.mcp_state.lock().await.configs.len() as u32;
                 let mcp_tools = self
                     .agent
@@ -3120,6 +3642,11 @@ impl SessionActor {
                     .get_prompt_index()
                     .await
                     .saturating_sub(1) as u32;
+                if turn_index == 0
+                    && let Some(repo_status_wait_ms) = self.repo_status_prefetch.take_wait_ms()
+                {
+                    pt.record_repo_status_wait(repo_status_wait_ms);
+                }
                 pt.emit(
                     model_duration_ms,
                     turn_index,
@@ -3130,6 +3657,45 @@ impl SessionActor {
                 );
             }
             let mut tool_calls = response.tool_calls().to_vec();
+            let over_cap = self.media_gen_over_cap(&tool_calls);
+            if xai_grok_tools::media_gen_limits::should_resample_egregious(
+                &over_cap,
+                media_gen_resamples,
+                MAX_MEDIA_GEN_OVER_CAP_RESAMPLES,
+            ) {
+                media_gen_resamples += 1;
+                let egregious: Vec<_> = over_cap.into_iter().filter(|o| o.is_egregious()).collect();
+                let reminder = xai_grok_tools::media_gen_limits::resample_reminder(&egregious);
+                tracing::warn!(
+                    session_id = %self.session_info.id,
+                    resample = media_gen_resamples,
+                    "media_gen 2x over-cap — discarding generation and resampling"
+                );
+                xai_grok_telemetry::unified_log::info(
+                    "shell.media_gen.batch_resampled",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "over": egregious.iter().map(|o| serde_json::json!({
+                            "tool_name": o.name,
+                            "total": o.total,
+                            "max": o.max,
+                        })).collect::<Vec<_>>(),
+                        "attempt": media_gen_resamples,
+                        "max_retries": MAX_MEDIA_GEN_OVER_CAP_RESAMPLES,
+                    })),
+                );
+                self.send_xai_notification(XaiSessionUpdate::RetryState(
+                    crate::extensions::notification::RetryState::Retrying {
+                        attempt: media_gen_resamples,
+                        max_retries: MAX_MEDIA_GEN_OVER_CAP_RESAMPLES,
+                        reason: "Too many parallel media-gen calls; retrying".to_string(),
+                        error_type: None,
+                    },
+                ))
+                .await;
+                self.push_system_reminder(&reminder);
+                continue;
+            }
             metrics_drop_guard.record_model_response(tool_calls.len());
             if let Some(fp) = response
                 .assistant()
@@ -3144,16 +3710,29 @@ impl SessionActor {
                 stop_reason == Some(xai_grok_sampling_types::StopReason::ContentFilter);
             let refusal_explanation = response.stop_message.clone();
             let final_answer_text = json_schema.is_some().then(|| response.assistant_text());
-            for item in response.items {
-                match item {
-                    xai_grok_sampling_types::ConversationItem::Assistant(_) => {
-                        self.record_assistant_response(item).await;
-                    }
-                    _ => {
-                        self.chat_state_handle.push_tool_result(item);
+            match length_salvage_streak.on_sample(
+                stop_reason == Some(xai_grok_sampling_types::StopReason::Length)
+                    && !tool_calls.is_empty(),
+            ) {
+                LengthSalvageAction::Exhausted => {
+                    tracing::error!(
+                        session_id = %self.session_info.id,
+                        max = MAX_OUTPUT_TOKEN_LIMIT_RETRIES,
+                        "consecutive Length-salvaged tool-call samples hit the cap — failing the turn"
+                    );
+                    self.tool_context.fail_task_output_usage_closed();
+                    return Err(self.fail_turn_length_salvage_exhausted().await);
+                }
+                LengthSalvageAction::Proceed { inject_reminder } => {
+                    if inject_reminder {
+                        self.push_system_reminder(OUTPUT_TOKEN_LIMIT_REMINDER);
                     }
                 }
+                LengthSalvageAction::NotSalvage => {}
             }
+            let usage_reported = response.usage.is_some();
+            self.record_response_items(response.items, usage_reported)
+                .await;
             if let Some(text) = fallback_text {
                 tracing::warn!(
                     text_len = text.len(),
@@ -3188,9 +3767,81 @@ impl SessionActor {
                 .await;
             }
             self.send_buffered_xai_update(response_completed).await;
+            let schema_complete_at_cap = if stop_reason
+                == Some(xai_grok_sampling_types::StopReason::Length)
+                && tool_calls.is_empty()
+                && salvage.enabled()
+                && let Some(validator) = structured_output_validator.as_ref()
+            {
+                let report = self.chat_state_handle.get_trailing_assistant_report().await;
+                report.and_then(|text| validate_structured_output(validator, &text).ok())
+            } else {
+                None
+            };
+            if let Some(value) = &schema_complete_at_cap {
+                xai_grok_telemetry::unified_log::info(
+                    "shell.turn.length_schema_complete_at_cap",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "continue_attempts": salvage.continues(),
+                        "continue_budget": salvage.budget(),
+                        "document_len": value.to_string().len(),
+                    })),
+                );
+            }
+            if stop_reason == Some(xai_grok_sampling_types::StopReason::Length)
+                && tool_calls.is_empty()
+                && schema_complete_at_cap.is_none()
+            {
+                match salvage.on_length_stop() {
+                    super::length_salvage::SalvageStep::Continue { inject_reminder } => {
+                        if inject_reminder {
+                            let tag = self.reminder_wrapper_tag();
+                            self.chat_state_handle.push_user_message(
+                                ConversationItem::length_continue_reminder(format!(
+                                    "<{tag}>{}</{tag}>",
+                                    super::length_salvage::LENGTH_CONTINUE_REMINDER_BODY
+                                )),
+                            );
+                        }
+                        tracing::warn!(
+                            session_id = %self.session_info.id,
+                            retry = salvage.continues(),
+                            max = salvage.budget(),
+                            "Output token limit exceeded — injecting reminder and retrying"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "shell.turn.length_truncation_continue",
+                            Some(self.session_info.id.0.as_ref()),
+                            Some(serde_json::json!({
+                                "continue_attempts": salvage.continues(),
+                                "continue_budget": salvage.budget(),
+                            })),
+                        );
+                        continue;
+                    }
+                    super::length_salvage::SalvageStep::Exhaust => {
+                        tracing::error!(
+                            session_id = %self.session_info.id,
+                            retries = salvage.continues(),
+                            "Output token limit retries exhausted, completing the turn truncated"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "shell.turn.length_truncation_exhausted",
+                            Some(self.session_info.id.0.as_ref()),
+                            Some(serde_json::json!({
+                                "continue_attempts": salvage.continues(),
+                                "continue_budget": salvage.budget(),
+                            })),
+                        );
+                    }
+                    super::length_salvage::SalvageStep::None => {}
+                }
+            }
             if tool_calls.is_empty() {
                 if !schema_ok
                     && !turn_refused
+                    && !salvage.is_truncated()
                     && let Some(gate_cfg) = self.todo_gate_policy()
                 {
                     let collected = self.collect_todo_gate_input(req_id).await;
@@ -3223,6 +3874,7 @@ impl SessionActor {
                                 .await
                                 .unwrap_or(reminder);
                             self.push_system_reminder(&rendered);
+                            salvage.step_boundary();
                             continue;
                         }
                         let cap = gate_cfg.max_fires_per_prompt;
@@ -3244,6 +3896,7 @@ impl SessionActor {
                     }
                 }
                 if self.drain_interjections_at_safe_point().await {
+                    salvage.round_boundary();
                     tracing::info!("Drained interjection(s) before turn completion; continuing");
                     continue;
                 }
@@ -3256,6 +3909,7 @@ impl SessionActor {
                     )
                     .await;
                 if self.drain_pending_interjections().await {
+                    salvage.round_boundary();
                     tracing::info!(
                         "Drained late interjection(s) during turn-end bookkeeping; continuing"
                     );
@@ -3265,8 +3919,17 @@ impl SessionActor {
                     structured_output_validator.as_ref(),
                     final_answer_text.as_ref(),
                 ) {
+                    _ if schema_complete_at_cap.is_some() => schema_complete_at_cap.map(Ok),
                     (Some(validator), Some(text)) => {
-                        Some(validate_structured_output(validator, text))
+                        let joined = if salvage.any_continues() {
+                            self.chat_state_handle.get_trailing_assistant_report().await
+                        } else {
+                            None
+                        };
+                        Some(validate_structured_output(
+                            validator,
+                            joined.as_deref().unwrap_or(text),
+                        ))
                     }
                     _ => None,
                 };
@@ -3274,9 +3937,16 @@ impl SessionActor {
                     snapshot: Box::new(snapshot),
                     tools_called: turn_tools_called,
                     structured_output,
-                    refusal: turn_refused.then(|| refusal_explanation.clone().unwrap_or_default()),
+                    stop: if turn_refused {
+                        CompletedStop::Refusal(refusal_explanation.clone().unwrap_or_default())
+                    } else if salvage.is_truncated() {
+                        CompletedStop::MaxTokens
+                    } else {
+                        CompletedStop::EndTurn
+                    },
                 });
             }
+            salvage.step_boundary();
             if structured_output_tool && let Some(validator) = structured_output_validator.as_ref()
             {
                 match self
@@ -3301,7 +3971,11 @@ impl SessionActor {
                             snapshot: Box::new(snapshot),
                             tools_called: turn_tools_called,
                             structured_output: Some(validated),
-                            refusal: None,
+                            stop: if salvage.is_truncated() {
+                                CompletedStop::MaxTokens
+                            } else {
+                                CompletedStop::EndTurn
+                            },
                         });
                     }
                     StructuredOutputStep::Retry => continue,
@@ -3318,17 +3992,24 @@ impl SessionActor {
                 }
                 turn_tools_called.push(tc.name.clone());
             }
-            let step_signature = tool_calls
-                .iter()
-                .map(|tc| format!("{}\u{1f}{}", tc.name, tc.arguments.as_ref()))
-                .collect::<Vec<_>>()
-                .join("\u{1e}");
+            let step_signature = step_signature(&tool_calls);
             let step_tool_name = tool_calls
                 .first()
                 .map(|tc| tc.name.clone())
                 .unwrap_or_default();
             let is_true_noop = self.is_run_true_step(&tool_calls).await;
-            identical_tool_calls.observe(&step_signature, &step_tool_name, is_true_noop);
+            let tool_bridge = self.tool_bridge_handle();
+            let step_tool_kinds = tool_calls
+                .iter()
+                .map(|call| tool_bridge.tool_kind(&call.name))
+                .collect::<Vec<_>>();
+            let step_problematic = step_is_problematically_repeating(&step_tool_kinds);
+            identical_tool_calls.observe(
+                &step_signature,
+                &step_tool_name,
+                step_problematic,
+                is_true_noop,
+            );
             if is_true_noop {
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::ShellTrueNoop {
@@ -3399,9 +4080,11 @@ impl SessionActor {
                             category: Some(
                                 crate::session::events::CancellationCategory::PermissionRejected,
                             ),
-                            context: Some(serde_json::json!(
-                                { "tool_name" : tool_name, "reason" : reason, }
-                            )),
+                            context: Some(crate::session::commands::CancellationContext {
+                                tool_name: Some(tool_name),
+                                reason: Some(reason),
+                                ..Default::default()
+                            }),
                         });
                     }
                     Ok(ToolLoop::HookDenied { .. }) => {}
@@ -3448,8 +4131,24 @@ impl SessionActor {
         }
     }
 }
-const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 16;
-const NUDGE_AFTER_IDENTICAL_TOOL_CALLS: u32 = 8;
+fn is_problematically_repeating_kind(kind: Option<ToolKind>) -> bool {
+    matches!(kind, Some(ToolKind::Read | ToolKind::Plan))
+}
+/// Whether a whole sampling step belongs in the tight tier: every call in it must be a problematically repeating kind.
+///
+/// Order-insensitive, like [`step_signature`]: a reordered step is the same step, so it must not flip tiers.
+/// Requiring *every* call, rather than any, keeps a mixed step in the looser tier.
+/// One call that can legitimately repeat (polling a job) makes repeating the whole step legitimate.
+fn step_is_problematically_repeating(kinds: &[Option<ToolKind>]) -> bool {
+    !kinds.is_empty()
+        && kinds
+            .iter()
+            .all(|kind| is_problematically_repeating_kind(*kind))
+}
+pub(super) const NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS: u32 = 4;
+pub(super) const NUDGE_AFTER_IDENTICAL_TOOL_CALLS: u32 = 8;
+pub(super) const MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS: u32 = 8;
+pub(super) const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 12;
 const MAX_CONSECUTIVE_TRUE_NOOPS: u32 = 4;
 const _: () = assert!(NUDGE_AFTER_IDENTICAL_TOOL_CALLS < MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
 const _: () = assert!(MAX_CONSECUTIVE_TRUE_NOOPS < NUDGE_AFTER_IDENTICAL_TOOL_CALLS);
@@ -3844,16 +4543,59 @@ fn hash_step_signature(signature: &str) -> u64 {
 fn command_is_true(cmd: &str) -> bool {
     cmd.trim().eq_ignore_ascii_case("true")
 }
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonicalize_json(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonicalize_json).collect())
+        }
+        other => other,
+    }
+}
+
+fn step_signature(tool_calls: &[xai_grok_sampling_types::conversation::ToolCall]) -> String {
+    let mut parts: Vec<String> = tool_calls
+        .iter()
+        .map(|call| {
+            let arguments = serde_json::from_str::<serde_json::Value>(call.arguments.as_ref())
+                .map(|value| canonicalize_json(value).to_string())
+                .unwrap_or_else(|_| call.arguments.trim().to_string());
+            format!("{}\u{1f}{}", call.name, arguments)
+        })
+        .collect();
+    parts.sort();
+    parts.join("\u{1e}")
+}
+
 #[derive(Default)]
 struct IdenticalToolCallRun {
     last_signature_hash: Option<u64>,
     tool_name: String,
+    /// Whether the repeated step is in the tight threshold tier.
+    /// Decided by the registered kinds of every call in it (see [`step_is_problematically_repeating`]).
+    problematically_repeating_step: bool,
     run_len: u32,
     is_true_noop_run: bool,
     nudged: bool,
 }
 impl IdenticalToolCallRun {
-    fn observe(&mut self, signature: &str, tool_name: &str, is_true_noop: bool) -> u32 {
+    fn observe(
+        &mut self,
+        signature: &str,
+        tool_name: &str,
+        problematically_repeating_step: bool,
+        is_true_noop: bool,
+    ) -> u32 {
         let hash = hash_step_signature(if is_true_noop {
             "\0true_noop"
         } else {
@@ -3868,23 +4610,38 @@ impl IdenticalToolCallRun {
             self.nudged = false;
         }
         self.tool_name = tool_name.to_string();
+        self.problematically_repeating_step = problematically_repeating_step;
         self.run_len
     }
+    /// Whether this run gets the tighter nudge and hard-stop thresholds (see [`step_is_problematically_repeating`]).
+    fn is_problematically_repeating(&self) -> bool {
+        !self.is_true_noop_run && self.problematically_repeating_step
+    }
+    fn nudge_threshold(&self) -> u32 {
+        if self.is_problematically_repeating() {
+            NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS
+        } else {
+            NUDGE_AFTER_IDENTICAL_TOOL_CALLS
+        }
+    }
     /// Once per identical run at/after the nudge threshold. Call only after results are committed.
+    ///
+    /// `true` keepalive runs are exempt: they end the turn silently at [`MAX_CONSECUTIVE_TRUE_NOOPS`] rather than being told to stop polling.
     fn take_nudge(&mut self) -> bool {
-        let fire = self.run_len >= NUDGE_AFTER_IDENTICAL_TOOL_CALLS && !self.nudged;
+        let fire = !self.is_true_noop_run && self.run_len >= self.nudge_threshold() && !self.nudged;
         self.nudged |= fire;
         fire
     }
     fn hard_stop_threshold(&self) -> u32 {
         if self.is_true_noop_run {
             MAX_CONSECUTIVE_TRUE_NOOPS
+        } else if self.is_problematically_repeating() {
+            MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS
         } else {
             MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
         }
     }
 }
-
 #[cfg(test)]
 mod experience_replanning_tests {
     use super::{
@@ -4338,18 +5095,106 @@ mod experience_replanning_tests {
 #[cfg(test)]
 mod identical_tool_call_run_tests {
     use super::{
+        MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS,
+        NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS, ToolKind, step_is_problematically_repeating,
+    };
+    #[test]
+    fn problematically_repeating_tools_use_the_tighter_thresholds() {
+        for tool in ["read_file", "todo_write"] {
+            let mut run = IdenticalToolCallRun::default();
+            for attempt in 1..NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS {
+                assert_eq!(run.observe("same", tool, true, false), attempt);
+                assert!(
+                    !run.take_nudge(),
+                    "{tool} must not nudge at run_len={attempt}"
+                );
+            }
+            assert_eq!(
+                run.observe("same", tool, true, false),
+                NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS
+            );
+            assert!(run.take_nudge(), "{tool} must nudge at its own threshold");
+            assert!(run.is_problematically_repeating());
+            assert_eq!(
+                run.hard_stop_threshold(),
+                MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS
+            );
+        }
+        let mut run = IdenticalToolCallRun::default();
+        for attempt in 1..NUDGE_AFTER_IDENTICAL_TOOL_CALLS {
+            assert_eq!(
+                run.observe("same", "run_terminal_command", false, false),
+                attempt
+            );
+            assert!(
+                !run.take_nudge(),
+                "loose tier must not nudge at run_len={attempt}"
+            );
+        }
+        assert_eq!(
+            run.observe("same", "run_terminal_command", false, false),
+            NUDGE_AFTER_IDENTICAL_TOOL_CALLS
+        );
+        assert!(run.take_nudge());
+        assert!(!run.is_problematically_repeating());
+        assert_eq!(
+            run.hard_stop_threshold(),
+            MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
+        );
+    }
+    /// A step is in the tight tier only when every call in it is `Read`/`Plan`.
+    /// The answer must not depend on the order the model emitted them in.
+    #[test]
+    fn step_tier_needs_every_call_and_ignores_order() {
+        let read = Some(ToolKind::Read);
+        let plan = Some(ToolKind::Plan);
+        let exec = Some(ToolKind::Execute);
+        assert!(step_is_problematically_repeating(&[read]));
+        assert!(step_is_problematically_repeating(&[plan]));
+        assert!(step_is_problematically_repeating(&[read, plan]));
+        assert!(!step_is_problematically_repeating(&[exec]));
+        assert!(!step_is_problematically_repeating(&[None]));
+        assert!(!step_is_problematically_repeating(&[]));
+        assert!(!step_is_problematically_repeating(&[read, exec]));
+        assert!(!step_is_problematically_repeating(&[exec, read]));
+    }
+    /// A `true` keepalive run must end the turn silently at MAX_CONSECUTIVE_TRUE_NOOPS instead of being told to stop polling.
+    /// This holds even though it passes the nudge threshold.
+    #[test]
+    fn true_noop_runs_are_never_nudged() {
+        let mut run = IdenticalToolCallRun::default();
+        for attempt in 1..=MAX_CONSECUTIVE_TRUE_NOOPS {
+            assert_eq!(
+                run.observe(&format!("sig{attempt}"), "bash", false, true),
+                attempt
+            );
+            assert!(
+                !run.take_nudge(),
+                "keepalive run must not nudge; run_len={attempt}"
+            );
+        }
+        assert_eq!(run.hard_stop_threshold(), MAX_CONSECUTIVE_TRUE_NOOPS);
+        let mut last = 0;
+        for _ in 0..NUDGE_AFTER_IDENTICAL_TOOL_CALLS {
+            last = run.observe("poll", "get_task_output", false, false);
+        }
+        assert_eq!(last, NUDGE_AFTER_IDENTICAL_TOOL_CALLS);
+        assert!(run.take_nudge());
+    }
+
+    use super::{
         IdenticalToolCallRun, MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS, MAX_CONSECUTIVE_TRUE_NOOPS,
-        NUDGE_AFTER_IDENTICAL_TOOL_CALLS, command_is_true,
+        NUDGE_AFTER_IDENTICAL_TOOL_CALLS, command_is_true, step_signature,
     };
     #[test]
     fn identical_non_true_resets_and_caps_at_16() {
         let mut run = IdenticalToolCallRun::default();
-        assert_eq!(run.observe("a", "a", false), 1);
-        assert_eq!(run.observe("a", "a", false), 2);
-        assert_eq!(run.observe("b", "b", false), 1);
+        assert_eq!(run.observe("a", "a", false, false), 1);
+        assert_eq!(run.observe("a", "a", false, false), 2);
+        assert_eq!(run.observe("b", "b", false, false), 1);
         let mut last = 0;
         for _ in 0..MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS {
-            last = run.observe("same", "same", false);
+            last = run.observe("same", "same", false, false);
         }
         assert_eq!(last, MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
         assert_eq!(
@@ -4361,12 +5206,72 @@ mod identical_tool_call_run_tests {
     fn true_noops_chain_across_args_and_stop_at_4() {
         let mut run = IdenticalToolCallRun::default();
         for i in 1..=4 {
-            assert_eq!(run.observe(&format!("sig{i}"), "bash", true), i);
+            assert_eq!(run.observe(&format!("sig{i}"), "bash", false, true), i);
         }
         assert!(run.is_true_noop_run);
         assert_eq!(run.hard_stop_threshold(), MAX_CONSECUTIVE_TRUE_NOOPS);
-        assert_eq!(run.observe("squeue", "bash", false), 1);
+        assert_eq!(run.observe("squeue", "bash", false, false), 1);
         assert!(!run.is_true_noop_run);
+    }
+    #[test]
+    fn step_signature_ignores_key_order_and_call_order() {
+        let call = |name: &str, arguments: &str| xai_grok_sampling_types::conversation::ToolCall {
+            id: "id".into(),
+            name: name.to_string(),
+            arguments: arguments.into(),
+        };
+        assert_eq!(
+            step_signature(&[call("read_file", r#"{"path":"a","limit":10}"#)]),
+            step_signature(&[call("read_file", r#"{"limit":10,"path":"a"}"#)]),
+            "key order must not matter"
+        );
+        assert_eq!(
+            step_signature(&[call("read_file", r#"{"a":{"x":1,"y":2}}"#)]),
+            step_signature(&[call("read_file", r#"{"a":{"y":2,"x":1}}"#)]),
+            "nested key order must not matter"
+        );
+        assert_eq!(
+            step_signature(&[call(
+                "todo_write",
+                r#"{"todos":[{"id":1,"status":"pending"}]}"#
+            )]),
+            step_signature(&[call(
+                "todo_write",
+                r#"{"todos":[{"status":"pending","id":1}]}"#
+            )]),
+            "object keys inside arrays must be canonicalized"
+        );
+        let first_call = call("read_file", r#"{"path":"a"}"#);
+        let second_call = call("read_file", r#"{"path":"b"}"#);
+        assert_eq!(
+            step_signature(&[first_call.clone(), second_call.clone()]),
+            step_signature(&[second_call, first_call]),
+            "order of parallel calls must not matter"
+        );
+        assert_ne!(
+            step_signature(&[call("read_file", r#"{"path":"a"}"#)]),
+            step_signature(&[call("read_file", r#"{"path":"b"}"#)])
+        );
+        assert_ne!(
+            step_signature(&[call("todo_write", r#"{"todos":[1,2]}"#)]),
+            step_signature(&[call("todo_write", r#"{"todos":[2,1]}"#)])
+        );
+        assert_eq!(
+            step_signature(&[call("exec", " await tools.read_file({path: 'a'});\n")]),
+            step_signature(&[call("exec", "await tools.read_file({path: 'a'});")])
+        );
+        assert_ne!(
+            step_signature(&[call("exec", "not json a")]),
+            step_signature(&[call("exec", "not json b")])
+        );
+        assert_ne!(
+            step_signature(&[call("read_file", r#"{"path":"a"}"#)]),
+            step_signature(&[
+                call("read_file", r#"{"path":"a"}"#),
+                call("read_file", r#"{"path":"a"}"#),
+            ]),
+            "duplicate calls must not be deduplicated"
+        );
     }
     #[test]
     fn command_is_true_trim_and_case() {
@@ -4379,24 +5284,24 @@ mod identical_tool_call_run_tests {
     fn nudge_latch_fires_once_per_run_after_threshold() {
         let mut run = IdenticalToolCallRun::default();
         for i in 1..NUDGE_AFTER_IDENTICAL_TOOL_CALLS {
-            assert_eq!(run.observe("poll", "get_task_output", false), i);
+            assert_eq!(run.observe("poll", "get_task_output", false, false), i);
             assert!(
                 !run.take_nudge(),
                 "must not nudge before threshold; run_len={i}"
             );
         }
         assert_eq!(
-            run.observe("poll", "get_task_output", false),
+            run.observe("poll", "get_task_output", false, false),
             NUDGE_AFTER_IDENTICAL_TOOL_CALLS
         );
         assert!(run.take_nudge());
         assert!(!run.take_nudge());
         assert_eq!(
-            run.observe("poll", "get_task_output", false),
+            run.observe("poll", "get_task_output", false, false),
             NUDGE_AFTER_IDENTICAL_TOOL_CALLS + 1
         );
         assert!(!run.take_nudge());
-        assert_eq!(run.observe("other", "bash", false), 1);
+        assert_eq!(run.observe("other", "bash", false, false), 1);
         assert!(!run.nudged);
         assert!(!run.take_nudge());
     }
@@ -4491,4 +5396,219 @@ mod structured_output_validation_tests {
         let err = validate_structured_output(&bad, r#"{"name":"alice","age":1}"#).unwrap_err();
         assert_eq!(err, "invalid output schema: boom");
     }
+}
+#[cfg(test)]
+mod last_sample_span_tests {
+    use super::{TurnSpanTotals, record_failed_sample_on_turn_span};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use xai_grok_sampling_types::conversation::{
+        ConversationItem, ConversationResponse, StopReason, TokenUsage, ToolCall,
+    };
+    /// Last-write value per field, the view the OTel bridge exports.
+    #[derive(Default)]
+    struct Fields {
+        strs: BTreeMap<String, String>,
+        i64s: BTreeMap<String, i64>,
+        bools: BTreeMap<String, bool>,
+    }
+    struct FieldVisitor<'a>(&'a mut Fields);
+    impl Visit for FieldVisitor<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0
+                .strs
+                .insert(field.name().to_string(), value.to_string());
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.i64s.insert(field.name().to_string(), value);
+        }
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.0.bools.insert(field.name().to_string(), value);
+        }
+        fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+    }
+    struct RecordCapture {
+        fields: Arc<Mutex<Fields>>,
+    }
+    impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for RecordCapture {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: Context<'_, S>,
+        ) {
+            attrs.record(&mut FieldVisitor(&mut self.fields.lock().unwrap()));
+        }
+        fn on_record(
+            &self,
+            _id: &tracing::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: Context<'_, S>,
+        ) {
+            values.record(&mut FieldVisitor(&mut self.fields.lock().unwrap()));
+        }
+    }
+    fn capture() -> (Arc<Mutex<Fields>>, tracing::subscriber::DefaultGuard) {
+        let fields = Arc::new(Mutex::new(Fields::default()));
+        let subscriber = tracing_subscriber::registry().with(RecordCapture {
+            fields: fields.clone(),
+        });
+        (fields, subscriber.set_default())
+    }
+    /// Declares the same fields as the real turn span's `#[instrument]`.
+    fn turn_span() -> tracing::Span {
+        tracing::info_span!(
+            "session.process_conversation_turn",
+            input_tokens = tracing::field::Empty,
+            output_tokens = tracing::field::Empty,
+            cache_read_tokens = tracing::field::Empty,
+            stop_reason = tracing::field::Empty,
+            response.has_tool_call = tracing::field::Empty,
+            last_sample.stop_reason = tracing::field::Empty,
+            last_sample.has_tool_call = tracing::field::Empty,
+            last_sample.output_tokens = tracing::field::Empty,
+        )
+    }
+    fn sample(
+        stop_reason: Option<StopReason>,
+        with_tool_call: bool,
+        completion_tokens: u32,
+    ) -> ConversationResponse {
+        ConversationResponse {
+            items: vec![if with_tool_call {
+                ConversationItem::assistant_tool_calls(vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".to_string(),
+                    arguments: "{}".into(),
+                }])
+            } else {
+                ConversationItem::assistant("")
+            }],
+            stop_reason,
+            usage: Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens,
+                total_tokens: 100 + completion_tokens,
+                reasoning_tokens: 0,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
+            }),
+            cost_usd_ticks: None,
+            message_chunks_emitted: 0,
+            doom_loop_signals: Vec::new(),
+            stop_message: None,
+            message_id: None,
+            raw_stop_reason: None,
+            stop_sequence: None,
+        }
+    }
+    /// Two delivered samples: legacy fields aggregate, `last_sample.*` tracks the final one.
+    #[test]
+    fn last_sample_fields_track_final_sample_while_legacy_fields_aggregate() {
+        let (fields, _guard) = capture();
+        let span = turn_span();
+        let mut totals = TurnSpanTotals::default();
+        totals.record(&span, &sample(Some(StopReason::ToolCalls), true, 40));
+        totals.record(&span, &sample(Some(StopReason::Length), false, 7));
+        let observed = fields.lock().unwrap();
+        assert_eq!(
+            observed.strs.get("stop_reason").map(String::as_str),
+            Some(StopReason::Length.as_str())
+        );
+        assert_eq!(observed.bools.get("response.has_tool_call"), Some(&true));
+        assert_eq!(observed.i64s.get("output_tokens"), Some(&47));
+        assert_eq!(
+            observed
+                .strs
+                .get("last_sample.stop_reason")
+                .map(String::as_str),
+            Some(StopReason::Length.as_str())
+        );
+        assert_eq!(
+            observed.bools.get("last_sample.has_tool_call"),
+            Some(&false)
+        );
+        assert_eq!(observed.i64s.get("last_sample.output_tokens"), Some(&7));
+    }
+    /// tool_calls success then MaxTokensTruncation failure: `last_sample.*` attributes the dying sample.
+    #[test]
+    fn failed_length_sample_is_attributed_while_legacy_stop_reason_keeps_last_write() {
+        let (fields, _guard) = capture();
+        let span = turn_span();
+        let mut totals = TurnSpanTotals::default();
+        totals.record(&span, &sample(Some(StopReason::ToolCalls), true, 40));
+        record_failed_sample_on_turn_span(
+            &span,
+            xai_grok_sampler::SamplingErrorKind::MaxTokensTruncation,
+        );
+        let observed = fields.lock().unwrap();
+        assert_eq!(
+            observed.strs.get("stop_reason").map(String::as_str),
+            Some(StopReason::ToolCalls.as_str())
+        );
+        assert_eq!(observed.bools.get("response.has_tool_call"), Some(&true));
+        assert_eq!(observed.i64s.get("output_tokens"), Some(&40));
+        assert_eq!(
+            observed
+                .strs
+                .get("last_sample.stop_reason")
+                .map(String::as_str),
+            Some(StopReason::Length.as_str())
+        );
+        assert_eq!(
+            observed.bools.get("last_sample.has_tool_call"),
+            Some(&false)
+        );
+        assert_eq!(observed.i64s.get("last_sample.output_tokens"), Some(&0));
+    }
+    /// `error` / `unreported` sentinels overwrite; no stale previous-sample value survives.
+    #[test]
+    fn non_length_failure_and_unreported_stop_reason_overwrite_last_sample() {
+        let (fields, _guard) = capture();
+        let span = turn_span();
+        let mut totals = TurnSpanTotals::default();
+        totals.record(&span, &sample(Some(StopReason::ToolCalls), true, 40));
+        record_failed_sample_on_turn_span(&span, xai_grok_sampler::SamplingErrorKind::Api);
+        assert_eq!(
+            fields
+                .lock()
+                .unwrap()
+                .strs
+                .get("last_sample.stop_reason")
+                .map(String::as_str),
+            Some(super::LAST_SAMPLE_STOP_REASON_ERROR)
+        );
+        totals.record(&span, &sample(None, true, 3));
+        let observed = fields.lock().unwrap();
+        assert_eq!(
+            observed
+                .strs
+                .get("last_sample.stop_reason")
+                .map(String::as_str),
+            Some(super::LAST_SAMPLE_STOP_REASON_UNREPORTED)
+        );
+        assert_eq!(observed.bools.get("last_sample.has_tool_call"), Some(&true));
+        assert_eq!(observed.i64s.get("last_sample.output_tokens"), Some(&3));
+    }
+}
+#[test]
+fn explicit_origin_controls_echo_without_prompt_id_inference() {
+    assert_eq!(
+        user_echo_mode_for_origin(
+            "ordinary-looking-id",
+            &InputOrigin::new(crate::session::PromptOrigin::NotificationDrain),
+        ),
+        UserEchoMode::PersistOnly,
+    );
+    assert_eq!(
+        user_echo_mode_for_origin(
+            "notifications-spoofed-id",
+            &InputOrigin::new(crate::session::PromptOrigin::User),
+        ),
+        UserEchoMode::Broadcast,
+    );
 }

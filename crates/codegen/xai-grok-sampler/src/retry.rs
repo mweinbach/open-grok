@@ -48,10 +48,8 @@ use xai_grok_sampling_types::{SamplingError, is_retryable_api_status};
 /// no point burning a long backoff just to be rate-limited again.
 pub const RATE_LIMIT_RETRY_THRESHOLD: u32 = 2;
 
-/// Default retry budget when no env or model override is set: at most 14
-/// retries (the attempt reaching this count is fatal). With the 30s cap:
-/// retries 1-4 exponential (2+4+8+16s ≈ 30s), 5-14 flat ~30s (≈ 5 min) —
-/// ≈ 5.5 min total.
+pub const RATE_LIMIT_RETRY_DISABLED: u32 = 1;
+
 pub const DEFAULT_MAX_RETRIES: u32 = 15;
 
 /// Longest single wait on the generic retry path — the exponential-backoff
@@ -63,8 +61,8 @@ pub const DEFAULT_MAX_RETRIES: u32 = 15;
 /// on the header).
 pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Resolve max API retries from an optional env override, model config,
-/// or default ([`DEFAULT_MAX_RETRIES`]).
+pub const TRANSPORT_REBUILD_BACKOFF: Duration = Duration::from_millis(200);
+
 pub(crate) fn resolve_max_retries_with_env(
     env_override: Option<&str>,
     model_max_retries: Option<u32>,
@@ -104,12 +102,10 @@ pub fn retry_backoff_with_jitter(retry_count: u32) -> Duration {
         .checked_shl(shift)
         .unwrap_or(u64::MAX)
         .min(MAX_RETRY_BACKOFF.as_millis() as u64);
-    jittered(Duration::from_millis(base_ms))
+    jitter_backoff(Duration::from_millis(base_ms))
 }
 
-/// +/-20% jitter around `base`, de-syncing clients that failed at the
-/// same instant (e.g. a mass Cloudflare 52x event during an origin outage).
-fn jittered(base: Duration) -> Duration {
+pub fn jitter_backoff(base: Duration) -> Duration {
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -124,15 +120,18 @@ fn jittered(base: Duration) -> Duration {
     Duration::from_millis(base_ms - jitter_range + jitter)
 }
 
-/// What the actor should do next given a sampling error and retry context.
-///
-/// Pure data: callers (the actor's per-request task) are responsible for
-/// performing the actual sleep, image strip, client rebuild, or emit.
+pub fn retry_after_or_backoff(attempt: u32, retry_after_secs: Option<u64>) -> Duration {
+    match retry_after_secs.filter(|secs| *secs > 0) {
+        Some(secs) => jitter_backoff(Duration::from_secs(secs).min(MAX_RETRY_BACKOFF)),
+        None => retry_backoff_with_jitter(attempt),
+    }
+}
+
 #[derive(Debug)]
 pub enum RetryDecision {
-    /// Retry with exponential backoff (transport errors, 5xx,
-    /// empty responses).
-    Retry { backoff: Duration },
+    Retry {
+        backoff: Duration,
+    },
 
     /// Retry honoring the server's `Retry-After` header (429 rate
     /// limits). `is_rate_limited` distinguishes 429s from generic
@@ -146,9 +145,9 @@ pub enum RetryDecision {
     /// Payload Too Large or image processing rejection).
     RetryWithImageStrip,
 
-    /// Retry after rebuilding the HTTP client with HTTP/1.1 (transport
-    /// error, first retry only).
-    RetryWithClientRebuild { backoff: Duration },
+    RetryWithClientRebuild {
+        backoff: Duration,
+    },
 
     /// Emit the error to the session and let it decide what to do
     /// (auth refresh, encrypted-content mismatch).
@@ -185,10 +184,7 @@ pub fn classify_error(
         return RetryDecision::Fatal(clone_error(err));
     }
 
-    // 413 Payload Too Large: strip inline images and try once. The
-    // caller checks if there are images left after the strip; if not,
-    // upgrade to Fatal.
-    if err.is_payload_too_large() {
+    if err.is_payload_too_large() || err.is_byte_size_overflow_coded() {
         return RetryDecision::RetryWithImageStrip;
     }
 
@@ -255,14 +251,16 @@ pub fn classify_error(
         if next_attempt >= max_retries {
             return RetryDecision::Fatal(clone_error(err));
         }
-        let backoff = err
-            .retry_after()
-            .map(|secs| jittered(Duration::from_secs(secs).min(MAX_RETRY_BACKOFF)))
-            .unwrap_or_else(|| retry_backoff_with_jitter(next_attempt));
         if next_attempt == 1 {
+            let backoff = match err {
+                SamplingError::Http(_) => jitter_backoff(TRANSPORT_REBUILD_BACKOFF),
+                _ => retry_after_or_backoff(next_attempt, err.retry_after()),
+            };
             return RetryDecision::RetryWithClientRebuild { backoff };
         }
-        return RetryDecision::Retry { backoff };
+        return RetryDecision::Retry {
+            backoff: retry_after_or_backoff(next_attempt, err.retry_after()),
+        };
     }
 
     // Everything else is fatal.
@@ -417,17 +415,8 @@ pub(crate) fn clone_error(err: &SamplingError) -> SamplingError {
             credential: *credential,
         },
         SamplingError::InvalidConfiguration(msg) => SamplingError::InvalidConfiguration(msg),
-        SamplingError::Http(e) => {
-            // reqwest::Error is not Clone; preserve the rendered message
-            // as an EventStreamError (the closest retryable transport
-            // variant) so callers see an equivalent description.
-            SamplingError::EventStreamError(e.to_string())
-        }
-        SamplingError::Serialization(e) => {
-            // serde_json::Error is not Clone; its Display already carries the
-            // original line/column exactly once.
-            SamplingError::serialization_message(e)
-        }
+        SamplingError::Http(e) => SamplingError::EventStreamError(e.to_string()),
+        SamplingError::Serialization(e) => SamplingError::serialization_message(e),
         SamplingError::Api {
             status,
             message,
@@ -602,6 +591,20 @@ mod tests {
     }
 
     #[test]
+    fn classify_many_image_dimension_400_strips_images() {
+        let err = api_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error: messages.0.content.4.image.source.base64.data: \
+             At least one of the image dimensions exceed max allowed size for \
+             many-image requests: 2000 pixels",
+        );
+        assert!(matches!(
+            classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::RetryWithImageStrip
+        ));
+    }
+
+    #[test]
     fn classify_image_processing_error_500_wrapped_strips_images() {
         let err = api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -691,6 +694,55 @@ mod tests {
     }
 
     #[test]
+    fn tpm_429_with_retry_after_backs_off_despite_size_text() {
+        let err = SamplingError::Api {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "Request too large for model: Limit 30000, Requested 50000 tokens per min"
+                .to_string(),
+            model_metadata: None,
+            retry_after_secs: Some(7),
+            should_retry: None,
+            error_code: None,
+        };
+        match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
+            RetryDecision::RetryWithBackoff {
+                is_rate_limited, ..
+            } => assert!(is_rate_limited),
+            other => panic!("expected RetryWithBackoff, got {other:?}"),
+        }
+        let no_retry_after = api_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Request too large for model: Limit 30000, Requested 50000 tokens per min",
+        );
+        assert!(matches!(
+            classify_error(&no_retry_after, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn rate_limit_retry_layer_splits_by_threshold() {
+        let err = api_err_with_retry_after(StatusCode::TOO_MANY_REQUESTS, 5);
+        assert!(
+            matches!(
+                classify_error(&err, 0, 15, RATE_LIMIT_RETRY_DISABLED),
+                RetryDecision::Fatal(_)
+            ),
+            "disabled threshold must surface the first 429, not wait internally"
+        );
+        assert!(
+            matches!(
+                classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
+                RetryDecision::RetryWithBackoff {
+                    is_rate_limited: true,
+                    ..
+                }
+            ),
+            "default threshold keeps the sampler's own 429 retry"
+        );
+    }
+
+    #[test]
     fn classify_rate_limited_capped_at_threshold() {
         let err = api_err(StatusCode::TOO_MANY_REQUESTS, "slow");
         // retry_count=1, threshold=2 -> next_attempt=2 >= 2 -> Fatal.
@@ -738,6 +790,32 @@ mod tests {
                 assert!(backoff >= Duration::from_millis(1600));
             }
             other => panic!("expected RetryWithClientRebuild, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_failure_first_retry_skips_the_server_backoff() {
+        const CONNECT_GUARD: Duration = Duration::from_secs(5);
+
+        let send_err = tokio::time::timeout(CONNECT_GUARD, reqwest::get("http://127.0.0.1:0"))
+            .await
+            .expect("port 0 connect fails well within the guard")
+            .expect_err("connecting to port 0 must fail");
+        let err = SamplingError::Http(send_err);
+
+        match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
+            RetryDecision::RetryWithClientRebuild { backoff } => assert!(
+                backoff >= Duration::from_millis(160) && backoff <= Duration::from_millis(240),
+                "transport rebuild must not wait the 2s server backoff: {backoff:?}"
+            ),
+            other => panic!("expected RetryWithClientRebuild, got {other:?}"),
+        }
+
+        match classify_error(&err, 1, 5, RATE_LIMIT_RETRY_THRESHOLD) {
+            RetryDecision::Retry { backoff } => {
+                assert!(backoff >= Duration::from_millis(3200), "{backoff:?}");
+            }
+            other => panic!("expected Retry, got {other:?}"),
         }
     }
 
@@ -981,6 +1059,66 @@ mod tests {
             classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
             RetryDecision::Fatal(_)
         ));
+    }
+
+    #[test]
+    fn drifted_size_overflow_wordings_are_fatal_on_turn_path() {
+        let api_500 = SamplingError::Api {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "exceed_context_size_error: request (300000 tokens) exceeds the model \
+                      context size"
+                .into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(matches!(
+            classify_error(&api_500, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::Fatal(_)
+        ));
+
+        let stream = SamplingError::StreamError {
+            error_type: "BAD_REQUEST".into(),
+            message: "Input length (300000 tokens) exceeds the maximum allowed length \
+                      (200000 tokens)"
+                .into(),
+            code: None,
+        };
+        assert!(matches!(
+            classify_error(&stream, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::Fatal(_)
+        ));
+
+        let coded = SamplingError::StreamError {
+            error_type: "BAD_REQUEST".into(),
+            message: "request rejected".into(),
+            code: Some(xai_grok_sampling_types::ApiErrorCode::parse(
+                "exceed_context_size_error",
+            )),
+        };
+        assert!(matches!(
+            classify_error(&coded, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn byte_size_coded_errors_get_image_strip_before_the_veto() {
+        for code in ["413", "payload_too_large", "request_too_large"] {
+            let coded = SamplingError::StreamError {
+                error_type: "BAD_REQUEST".into(),
+                message: "request rejected".into(),
+                code: Some(xai_grok_sampling_types::ApiErrorCode::parse(code)),
+            };
+            assert!(
+                matches!(
+                    classify_error(&coded, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
+                    RetryDecision::RetryWithImageStrip
+                ),
+                "expected image strip for coded {code}"
+            );
+        }
     }
 
     #[test]

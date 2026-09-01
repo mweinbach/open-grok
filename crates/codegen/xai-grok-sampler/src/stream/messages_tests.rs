@@ -54,6 +54,18 @@ fn block_stop(index: u32) -> MessageStreamEvent {
     MessageStreamEvent::ContentBlockStop { index }
 }
 
+fn tool_use_start(index: u32, id: &str, input: serde_json::Value) -> MessageStreamEvent {
+    MessageStreamEvent::ContentBlockStart {
+        index,
+        content_block: ContentBlock::ToolUse {
+            id: id.into(),
+            name: "do_thing".into(),
+            input,
+            cache_control: None,
+        },
+    }
+}
+
 fn message_delta_with_stop(stop: messages::StopReason) -> MessageStreamEvent {
     MessageStreamEvent::MessageDelta {
         delta: MessageDeltaBody {
@@ -438,7 +450,103 @@ async fn pause_turn_and_unknown_stop_reasons_complete_as_stop() {
 /// max_tokens truncation class (fatal, non-retryable), not the
 /// context-length Api class.
 #[tokio::test]
-async fn model_context_window_exceeded_fails_as_max_tokens_truncation() {
+async fn max_tokens_text_only_completes_with_length_stop() {
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(text_block_start(0)),
+        Ok(text_delta(0, "cut answ")),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
+            assert_eq!(response.assistant_text(), "cut answ");
+        }
+        other => panic!("expected Completed(Length), got {other:?}"),
+    }
+}
+
+/// A max_tokens stop carrying a completed tool_use block keeps `stop_reason=Length`.
+/// The ToolCalls override must not mask the truncation: the block's arguments may be a silently-truncated prefix.
+#[tokio::test]
+async fn max_tokens_with_tool_use_keeps_length_stop() {
+    let tool_start = MessageStreamEvent::ContentBlockStart {
+        index: 0,
+        content_block: ContentBlock::ToolUse {
+            id: "call_cut".into(),
+            name: "do_thing".into(),
+            input: serde_json::json!({}),
+            cache_control: None,
+        },
+    };
+    let arg_delta = MessageStreamEvent::ContentBlockDelta {
+        index: 0,
+        delta: StreamDelta::InputJsonDelta {
+            partial_json: "{\"x\": \"trunc".into(),
+        },
+    };
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(tool_start),
+        Ok(arg_delta),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
+            assert_eq!(response.tool_calls().len(), 1, "tool call still carried");
+        }
+        other => panic!("expected Completed(Length), got {other:?}"),
+    }
+}
+
+/// A tool_use block closed with zero argument deltas collects as an empty-arguments tool call.
+/// That is the shape `LengthPolicy::verdict` salvages.
+#[tokio::test]
+async fn max_tokens_tool_use_without_arg_deltas_collects_empty_arguments() {
+    let tool_start = MessageStreamEvent::ContentBlockStart {
+        index: 0,
+        content_block: ContentBlock::ToolUse {
+            id: "call_no_args".into(),
+            name: "do_thing".into(),
+            input: serde_json::json!({}),
+            cache_control: None,
+        },
+    };
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(tool_start),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
+            assert_eq!(response.tool_calls().len(), 1);
+            assert_eq!(response.tool_calls()[0].arguments.as_ref(), "");
+        }
+        other => panic!("expected Completed(Length), got {other:?}"),
+    }
+}
+
+/// Pins the model_context_window_exceeded decision: it maps to the Length stop class and COMPLETES with the partial preserved.
+/// Fail-vs-salvage belongs to `drive_l2`, not this transform.
+#[tokio::test]
+async fn model_context_window_exceeded_completes_with_length_stop() {
     let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
         Ok(message_start()),
         Ok(text_block_start(0)),
@@ -452,21 +560,46 @@ async fn model_context_window_exceeded_fails_as_max_tokens_truncation() {
     let raw = stream::iter(events).boxed();
     let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
 
-    assert!(
-        !evs.iter()
-            .any(|e| matches!(e, SamplingEvent::Completed { .. })),
-        "context-window truncation must not complete: {evs:?}"
-    );
     match evs.last().unwrap() {
-        SamplingEvent::Failed { error, .. } => {
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
             assert_eq!(
-                error.kind,
-                crate::events::SamplingErrorKind::MaxTokensTruncation
+                response.assistant_text(),
+                "truncated answ",
+                "partial content must be preserved"
             );
-            assert!(!error.is_retryable, "truncation is deterministic");
         }
-        other => panic!("expected Failed(MaxTokensTruncation), got {other:?}"),
+        other => panic!("expected Completed(Length), got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn model_context_window_exceeded_fails_as_max_tokens_truncation() {
+    let events = vec![
+        Ok(message_start()),
+        Ok(text_block_start(0)),
+        Ok(text_delta(0, "truncated answ")),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(
+            messages::StopReason::ModelContextWindowExceeded,
+        )),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let events = collect(stream_messages(
+        stream::iter(events).boxed(),
+        None,
+        rid(),
+        Duration::from_secs(60),
+    ))
+    .await;
+    let Some(SamplingEvent::Completed { response, .. }) = events.into_iter().last() else {
+        panic!("stream must preserve the partial response before applying policy");
+    };
+    let error =
+        crate::client::apply_length_policy(xai_grok_sampling_types::LengthPolicy::Fail, *response)
+            .expect_err("legacy failure policy remains deterministic");
+    assert!(matches!(error, SamplingError::MaxTokensTruncation));
+    assert!(!error.is_retryable());
 }
 
 /// Pins the pre-existing override: completed tool_use blocks beat a terminal
@@ -993,4 +1126,220 @@ async fn interrupted_tool_use_block_never_emits_arguments_completion() {
             .any(|event| { matches!(event, SamplingEvent::ToolCallArgumentsComplete { .. }) })
     );
     assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
+}
+
+#[tokio::test]
+async fn ambiguous_empty_tool_waits_for_known_non_length_stop() {
+    for (stop, expected_arguments, expected_stop) in [
+        (
+            Some(messages::StopReason::ToolUse),
+            "{}",
+            StopReason::ToolCalls,
+        ),
+        (
+            Some(messages::StopReason::EndTurn),
+            "{}",
+            StopReason::ToolCalls,
+        ),
+        (
+            Some(messages::StopReason::MaxTokens),
+            "",
+            StopReason::Length,
+        ),
+        (
+            Some(messages::StopReason::ModelContextWindowExceeded),
+            "",
+            StopReason::Length,
+        ),
+        (None, "", StopReason::ToolCalls),
+    ] {
+        let stop_observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = stop_observed.clone();
+        let mut raw_events = vec![
+            Ok(message_start()),
+            Ok(tool_use_start(0, "call_empty", serde_json::json!({}))),
+            Ok(block_stop(0)),
+        ];
+        if let Some(stop) = stop {
+            raw_events.push(Ok(message_delta_with_stop(stop)));
+        }
+        raw_events.push(Ok(MessageStreamEvent::MessageDelta {
+            delta: MessageDeltaBody {
+                stop_reason: None,
+                stop_details: None,
+                stop_sequence: None,
+            },
+            usage: MessageDeltaUsage {
+                output_tokens: 7,
+                input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            },
+        }));
+        raw_events.push(Ok(MessageStreamEvent::MessageStop));
+        let raw = stream::iter(raw_events)
+            .inspect(move |event| {
+                if matches!(event, Ok(MessageStreamEvent::MessageDelta { delta, .. }) if delta.stop_reason.is_some()) {
+                    observed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .boxed();
+        let mut transformed = pin!(stream_messages(raw, None, rid(), Duration::from_secs(60)));
+        let mut events = Vec::new();
+        while let Some(event) = transformed.next().await {
+            if matches!(
+                &event,
+                SamplingEvent::ToolCallArgumentsComplete { .. }
+                    | SamplingEvent::ToolCallDelta {
+                        arguments_delta: Some(_),
+                        ..
+                    }
+            ) {
+                assert!(stop_observed.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SamplingEvent::ToolCallArgumentsComplete { .. }))
+                .count(),
+            usize::from(expected_arguments == "{}"),
+        );
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(expected_stop));
+                assert_eq!(
+                    response.tool_calls()[0].arguments.as_ref(),
+                    expected_arguments
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn closed_empty_tool_followed_by_error_never_completes() {
+    let raw = stream::iter(vec![
+        Ok(message_start()),
+        Ok(tool_use_start(0, "call_empty", serde_json::json!({}))),
+        Ok(block_stop(0)),
+        Err(SamplingError::EventStreamError("connection closed".into())),
+    ])
+    .boxed();
+    let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SamplingEvent::ToolCallArgumentsComplete { .. }
+            | SamplingEvent::ToolCallDelta {
+                arguments_delta: Some(_),
+                ..
+            }
+    )));
+    assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
+}
+
+#[tokio::test]
+async fn max_tokens_tool_completion_requires_complete_json() {
+    use xai_grok_sampling_types::{LengthPolicy, LengthVerdict};
+
+    for (arguments, complete) in [
+        ("{}", true),
+        ("{\"value\":7}", true),
+        ("{\"value\":", false),
+    ] {
+        let stop_observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = stop_observed.clone();
+        let raw = stream::iter(vec![
+            Ok(message_start()),
+            Ok(tool_use_start(0, "call_json", serde_json::json!({}))),
+            Ok(MessageStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: StreamDelta::InputJsonDelta {
+                    partial_json: arguments.into(),
+                },
+            }),
+            Ok(block_stop(0)),
+            Ok(message_delta_with_stop(messages::StopReason::MaxTokens)),
+            Ok(MessageStreamEvent::MessageStop),
+        ])
+        .inspect(move |event| {
+            if matches!(event, Ok(MessageStreamEvent::MessageDelta { .. })) {
+                observed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .boxed();
+        let mut transformed = pin!(stream_messages(raw, None, rid(), Duration::from_secs(60)));
+        let mut completions = 0;
+        let mut completed = false;
+        while let Some(event) = transformed.next().await {
+            match event {
+                SamplingEvent::ToolCallArgumentsComplete { .. } => {
+                    completions += 1;
+                    assert!(complete);
+                    assert!(!stop_observed.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                SamplingEvent::Completed { response, .. } => {
+                    completed = true;
+                    assert_eq!(response.stop_reason, Some(StopReason::Length));
+                    assert_eq!(response.tool_calls()[0].arguments.as_ref(), arguments);
+                    assert_eq!(
+                        LengthPolicy::CompleteToolCalls.verdict(&response),
+                        if complete {
+                            LengthVerdict::SalvageToolCalls
+                        } else {
+                            LengthVerdict::Fail
+                        },
+                    );
+                }
+                SamplingEvent::Failed { error, .. } => panic!("unexpected failure: {error:?}"),
+                _ => {}
+            }
+        }
+        assert!(completed);
+        assert_eq!(completions, usize::from(complete));
+    }
+}
+
+#[tokio::test]
+async fn deferred_empty_tools_preserve_canonical_order() {
+    for (stop, expected_empty_arguments, expected_completions) in [
+        (messages::StopReason::ToolUse, "{}", vec![1, 0]),
+        (messages::StopReason::MaxTokens, "", vec![1]),
+    ] {
+        let raw = stream::iter(vec![
+            Ok(message_start()),
+            Ok(tool_use_start(2, "call_first", serde_json::json!({}))),
+            Ok(tool_use_start(
+                5,
+                "call_second",
+                serde_json::json!({"value": 7}),
+            )),
+            Ok(block_stop(5)),
+            Ok(block_stop(2)),
+            Ok(message_delta_with_stop(stop)),
+            Ok(MessageStreamEvent::MessageStop),
+        ])
+        .boxed();
+        let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+        let completion_indexes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ToolCallArgumentsComplete { tool_index, .. } => Some(*tool_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completion_indexes, expected_completions);
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let calls = response.tool_calls();
+                assert_eq!(calls[0].id.as_ref(), "call_first");
+                assert_eq!(calls[0].arguments.as_ref(), expected_empty_arguments);
+                assert_eq!(calls[1].id.as_ref(), "call_second");
+                assert_eq!(calls[1].arguments.as_ref(), "{\"value\":7}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
 }

@@ -55,7 +55,13 @@ pub enum StrictAppendError {
 pub enum ChatStateCommand {
     // ═══ Mutations (fire-and-forget) ═══
     /// Push a user message into the conversation.
-    PushUserMessage { item: ConversationItem },
+    PushUserMessage {
+        item: ConversationItem,
+    },
+
+    PushUserMessagesBatch {
+        items: Vec<ConversationItem>,
+    },
 
     /// Push a user message and acknowledge once the chat-state actor has
     /// accepted and processed it.
@@ -73,17 +79,33 @@ pub enum ChatStateCommand {
     },
 
     /// Record the assistant's response (text + tool calls).
-    PushAssistantResponse { item: ConversationItem },
+    PushAssistantResponse {
+        item: ConversationItem,
+    },
 
     /// Record a tool result.
-    PushToolResult { item: ConversationItem },
+    PushToolResult {
+        item: ConversationItem,
+    },
+
+    PushModelOutput {
+        item: ConversationItem,
+    },
+
+    PushUnreportedModelOutput {
+        item: ConversationItem,
+    },
 
     /// Record accumulated token usage from a streaming response.
-    RecordTokenUsage { total_tokens: u64 },
+    RecordTokenUsage {
+        total_tokens: u64,
+    },
 
     /// Stash the per-turn `TokenUsage` from the most recent model response.
     /// Overwrites any previously stashed value.
-    RecordLastTurnUsage { usage: TokenUsage },
+    RecordLastTurnUsage {
+        usage: TokenUsage,
+    },
 
     RecordModelCallUsage {
         model_id: Option<String>,
@@ -112,20 +134,30 @@ pub enum ChatStateCommand {
     IncrementPromptIndex,
 
     /// Update the sampling config (e.g., model switch).
-    UpdateSamplingConfig { config: SamplingConfig },
+    UpdateSamplingConfig {
+        config: SamplingConfig,
+    },
 
     /// Soft-trim / hard-clear old tool results because the next request is
     /// already a cold prefix (model swap). Returns how many items changed.
-    PruneForFreshInput { reply: oneshot::Sender<usize> },
+    PruneForFreshInput {
+        reply: oneshot::Sender<usize>,
+    },
 
     /// Track that the agent edited a file path.
-    RecordAgentEditedPath { path: String },
+    RecordAgentEditedPath {
+        path: String,
+    },
 
     /// Record stream timing metadata.
-    RecordStreamStart { timestamp_ms: i64 },
+    RecordStreamStart {
+        timestamp_ms: i64,
+    },
 
     /// Record turn timing metadata.
-    RecordTurnStart { timestamp_ms: i64 },
+    RecordTurnStart {
+        timestamp_ms: i64,
+    },
 
     /// Replace conversation history.
     ReplaceConversation {
@@ -175,16 +207,22 @@ pub enum ChatStateCommand {
     },
 
     /// Cache prompt text for rewind preview.
-    CachePromptText { text: String },
+    CachePromptText {
+        text: String,
+    },
 
     /// Record compaction boundary for rewind.
-    RecordCompactionAt { prompt_index: usize },
+    RecordCompactionAt {
+        prompt_index: usize,
+    },
 
     /// Flush pending persistence writes to disk (end of turn).
     Flush,
 
     /// Update opaque credential secrets held by the actor.
-    UpdateCredentials { credentials: Credentials },
+    UpdateCredentials {
+        credentials: Credentials,
+    },
 
     /// Restore from a snapshot.
     RestoreSnapshot(Box<ChatStateSnapshot>),
@@ -206,7 +244,9 @@ pub enum ChatStateCommand {
     /// Accumulated independently of the live `conversation` and of
     /// `turn_capture`; sealed into a standalone trace turn by
     /// `FlushHarnessTraceTurn`.
-    AppendHarnessTraceItems { items: Vec<ConversationItem> },
+    AppendHarnessTraceItems {
+        items: Vec<ConversationItem>,
+    },
 
     /// Seal the harness items accumulated since the last flush into one
     /// standalone trace turn. Issued once per harness phase (after the planner,
@@ -214,7 +254,11 @@ pub enum ChatStateCommand {
     FlushHarnessTraceTurn,
 
     /// Repair dangling tool calls after a harness-initiated halt.
-    RepairDanglingAfterHarnessHalt { class: &'static str },
+    RepairDanglingAfterHarnessHalt {
+        class: &'static str,
+    },
+
+    PopStrandedContinueReminder,
 
     // ═══ Queries (request/response via oneshot) ═══
     /// Build a ConversationRequest ready to send to the API.
@@ -236,7 +280,9 @@ pub enum ChatStateCommand {
     },
 
     /// Get current prompt index.
-    GetPromptIndex { reply: oneshot::Sender<usize> },
+    GetPromptIndex {
+        reply: oneshot::Sender<usize>,
+    },
 
     /// Get the prompt index at which the last compaction occurred.
     /// `Some` means the context currently holds a compaction summary.
@@ -245,7 +291,9 @@ pub enum ChatStateCommand {
     },
 
     /// Get total accumulated tokens.
-    GetTotalTokens { reply: oneshot::Sender<u64> },
+    GetTotalTokens {
+        reply: oneshot::Sender<u64>,
+    },
 
     /// Retrieve the most recent stashed per-turn `TokenUsage`. Returns
     /// `None` until at least one `RecordLastTurnUsage` has been processed.
@@ -262,10 +310,14 @@ pub enum ChatStateCommand {
     },
 
     /// `total_tokens` + bytes/4 delta from tool results since last model response.
-    GetEstimatedTotalTokens { reply: oneshot::Sender<u64> },
+    GetEstimatedTotalTokens {
+        reply: oneshot::Sender<u64>,
+    },
 
     /// Bytes/4 estimate of all non-system conversation items.
-    GetEstimatedMessagesTokens { reply: oneshot::Sender<u64> },
+    GetEstimatedMessagesTokens {
+        reply: oneshot::Sender<u64>,
+    },
 
     /// Get sampling config.
     GetSamplingConfig {
@@ -300,7 +352,9 @@ pub enum ChatStateCommand {
     },
 
     /// Get credential secrets.
-    GetCredentials { reply: oneshot::Sender<Credentials> },
+    GetCredentials {
+        reply: oneshot::Sender<Credentials>,
+    },
 
     GetLastModelMetadata {
         reply: oneshot::Sender<ModelMetadata>,
@@ -323,17 +377,25 @@ pub enum ChatStateCommand {
     // ═══ Narrow targeted queries (avoid full-conversation clone) ═══
     /// Get the number of items in the conversation.
     /// Cheaper than `GetConversation` when only the length is needed.
-    GetConversationLen { reply: oneshot::Sender<usize> },
+    GetConversationLen {
+        reply: oneshot::Sender<usize>,
+    },
 
     /// Whether any assistant tool call lacks a matching `ToolResult` (i.e. the
     /// dangling-tool-call repair would fire on the next request build).
     /// Cheaper than `GetConversation` when only this predicate is needed.
-    HasDanglingToolCalls { reply: oneshot::Sender<bool> },
+    HasDanglingToolCalls {
+        reply: oneshot::Sender<bool>,
+    },
 
     /// Get the text content of the last assistant message with non-empty text.
     /// Returns `None` if no such message exists.
     /// Cheaper than `GetConversation` when only the final assistant response is needed.
     GetLastAssistantText {
+        reply: oneshot::Sender<Option<String>>,
+    },
+
+    GetTrailingAssistantReport {
         reply: oneshot::Sender<Option<String>>,
     },
 
@@ -401,6 +463,9 @@ mod tests {
         // Mutations
         let _ = ChatStateCommand::PushUserMessage {
             item: ConversationItem::user("hello"),
+        };
+        let _ = ChatStateCommand::PushUserMessagesBatch {
+            items: vec![ConversationItem::user("hello")],
         };
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::PushUserMessageAndAck {
@@ -528,6 +593,9 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetLastAssistantText { reply: tx };
+
+        let (tx, _rx) = oneshot::channel();
+        let _ = ChatStateCommand::GetTrailingAssistantReport { reply: tx };
 
         let (tx, _rx) = oneshot::channel();
         let _ = ChatStateCommand::GetLastAssistantTextInTurn { reply: tx };

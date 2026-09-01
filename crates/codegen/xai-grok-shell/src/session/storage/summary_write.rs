@@ -22,10 +22,8 @@ use fs2::FileExt;
 use xai_grok_sampling_types::ReasoningEffort;
 
 use crate::session::persistence::Summary;
+use crate::session::worktree::WorktreeIdentity;
 
-/// How a counter field changes. `Increment` is applied to the in-lock fresh
-/// read (never precomputed by the caller, which would re-open the race); `Set`
-/// is an absolute rewrite (compaction / rewind).
 #[derive(Debug, Clone)]
 pub(crate) enum CounterOp {
     Increment(usize),
@@ -96,6 +94,7 @@ pub(crate) struct SummaryPatch {
     /// automatic LLM title generation so it never clobbers a title the user
     /// set via `/rename`. Ignored when `generated_title` is also set.
     pub generated_title_if_absent: Option<String>,
+    pub generated_title_regenerate: Option<String>,
     /// Clear a manual `/rename` pin (`/rename --auto`). Sets
     /// `title_is_manual = false` and, when a manual pin was present,
     /// blanks `generated_title` and `session_summary` so `display_title()`
@@ -106,6 +105,8 @@ pub(crate) struct SummaryPatch {
     /// applies (last-writer-wins); `Some(None)` clears it (conversation
     /// rewind removed the described work).
     pub last_turn_summary: Option<Option<(String, String)>>,
+    pub session_kind_if_absent: Option<String>,
+    pub last_recap: Option<Option<String>>,
 }
 
 impl Summary {
@@ -183,6 +184,14 @@ impl Summary {
             self.last_turn_summary = text;
             self.last_turn_summary_prompt_id = prompt_id;
         }
+        if self.session_kind.is_none()
+            && let Some(kind) = &patch.session_kind_if_absent
+        {
+            self.session_kind = Some(kind.clone());
+        }
+        if let Some(recap) = &patch.last_recap {
+            self.last_recap = recap.clone();
+        }
         let mut absent_title_applied = false;
         if patch.reset_title_to_auto {
             // Gate on a real pin (`manual_title_opt`), not a stale flag
@@ -205,6 +214,11 @@ impl Summary {
             // Manual `/rename`: recorded so clients can restore the
             // prompt-border title on resume.
             self.title_is_manual = true;
+        } else if let Some(title) = &patch.generated_title_regenerate {
+            if !self.title_is_manual {
+                self.set_title_overwrite(title);
+                absent_title_applied = true;
+            }
         } else if let Some(title) = &patch.generated_title_if_absent {
             // Auto-generated titles defer to any title already present, so a
             // manual `/rename` is never overwritten by a racing LLM title.
@@ -222,6 +236,11 @@ impl Summary {
     /// Set `generated_title`, mirroring into `session_summary` while that field
     /// is still empty so older clients that only read `session_summary` see the
     /// title too.
+    fn set_title_overwrite(&mut self, title: &str) {
+        self.generated_title = Some(title.to_owned());
+        self.session_summary = title.to_owned();
+    }
+
     fn set_title(&mut self, title: &str) {
         self.generated_title = Some(title.to_owned());
         if self.session_summary.is_empty() {
@@ -239,6 +258,74 @@ impl Summary {
 /// [`Summary::apply_patch`]). Because the read-modify-write happens under the
 /// lock, this "set the title only if absent" check is atomic against a
 /// concurrent manual rename.
+pub(crate) enum WorktreeIdentityRepair {
+    Applied(Summary),
+    AlreadyKinded(Summary),
+}
+
+impl WorktreeIdentityRepair {
+    pub(crate) fn into_summary(self) -> Summary {
+        match self {
+            Self::Applied(summary) | Self::AlreadyKinded(summary) => summary,
+        }
+    }
+}
+
+pub(crate) fn repair_worktree_identity(
+    summary_path: &Path,
+    lock_path: &Path,
+    identity: &WorktreeIdentity,
+) -> io::Result<WorktreeIdentityRepair> {
+    let lock = open_lock_file(lock_path)?;
+    lock.lock_exclusive()?;
+    let result = (|| {
+        let mut summary = read_summary(summary_path)?;
+        if summary.session_kind.is_none() {
+            summary.stamp_worktree_identity(identity);
+        } else if summary.worktree_label.is_none() {
+            summary.worktree_label = Some(identity.label.clone());
+        } else {
+            return Ok(WorktreeIdentityRepair::AlreadyKinded(summary));
+        }
+        let previous_mtime = std::fs::metadata(summary_path)
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        write_summary_atomic(summary_path, &summary)?;
+        if let Some(mtime) = previous_mtime
+            && let Err(error) = restore_summary_mtime(summary_path, mtime)
+        {
+            tracing::warn!(
+                "failed to restore summary mtime after worktree identity heal on {}: {error}",
+                summary_path.display()
+            );
+        }
+        Ok(WorktreeIdentityRepair::Applied(summary))
+    })();
+    let _ = lock.unlock();
+    result
+}
+
+pub(crate) fn repair_untagged_worktree_summary(
+    summary: &mut Summary,
+    summary_path: &Path,
+    lock_path: &Path,
+) {
+    if summary.session_kind.is_some() && summary.worktree_label.is_some() {
+        return;
+    }
+    let Some(identity) = crate::session::worktree::worktree_identity_for_cwd(&summary.info.cwd)
+    else {
+        return;
+    };
+    match repair_worktree_identity(summary_path, lock_path, &identity) {
+        Ok(repair) => *summary = repair.into_summary(),
+        Err(error) => tracing::warn!(
+            "failed to repair worktree identity onto {}: {error}",
+            summary_path.display()
+        ),
+    }
+}
+
 pub(crate) fn apply_patch_locked(
     summary_path: &Path,
     lock_path: &Path,
@@ -283,6 +370,27 @@ fn write_summary_atomic(summary_path: &Path, summary: &Summary) -> io::Result<()
     let bytes = serde_json::to_vec_pretty(summary)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     crate::session::storage::write_bytes_atomic(summary_path, &bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESTORE_MTIME_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_restore_summary_mtime() {
+    RESTORE_MTIME_FAULT.set(true);
+}
+
+fn restore_summary_mtime(path: &Path, mtime: std::time::SystemTime) -> io::Result<()> {
+    #[cfg(test)]
+    if RESTORE_MTIME_FAULT.replace(false) {
+        return Err(io::Error::other("injected mtime restore failure"));
+    }
+    OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_modified(mtime)
 }
 
 #[cfg(test)]
@@ -664,5 +772,291 @@ mod tests {
             );
             assert_ne!(summary.display_title(), "Manual Title");
         }
+    }
+    #[tokio::test]
+    async fn session_kind_if_absent_stamps_unset_summary() {
+        let dir = TempDir::new().unwrap();
+        let (adapter, info, summary_path) = new_session(&dir).await;
+
+        adapter
+            .set_session_kind_if_absent(&info, "headless".into())
+            .await
+            .unwrap();
+
+        let summary = read_summary(&summary_path).unwrap();
+        assert_eq!(summary.session_kind.as_deref(), Some("headless"));
+    }
+
+    #[tokio::test]
+    async fn session_kind_if_absent_preserves_existing_kind() {
+        let dir = TempDir::new().unwrap();
+        let (adapter, info, summary_path) = new_session(&dir).await;
+
+        adapter
+            .apply_summary_patch(
+                &info,
+                SummaryPatch {
+                    session_kind_if_absent: Some("subagent".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        adapter
+            .set_session_kind_if_absent(&info, "headless".into())
+            .await
+            .unwrap();
+
+        let summary = read_summary(&summary_path).unwrap();
+        assert_eq!(
+            summary.session_kind.as_deref(),
+            Some("subagent"),
+            "an existing kind must win over a later stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_last_recap_persists_and_clears() {
+        let dir = TempDir::new().unwrap();
+        let (adapter, info, summary_path) = new_session(&dir).await;
+
+        adapter
+            .set_last_recap(&info, Some("Where we left off: fixing the parser".into()))
+            .await
+            .unwrap();
+
+        let summary = read_summary(&summary_path).unwrap();
+        assert_eq!(
+            summary.last_recap.as_deref(),
+            Some("Where we left off: fixing the parser")
+        );
+        assert!(summary.last_turn_summary.is_none());
+
+        adapter.set_last_recap(&info, None).await.unwrap();
+        let summary = read_summary(&summary_path).unwrap();
+        assert!(summary.last_recap.is_none());
+    }
+
+    #[tokio::test]
+    async fn regenerate_overwrites_auto_title() {
+        let dir = TempDir::new().unwrap();
+        let (adapter, info, summary_path) = new_session(&dir).await;
+
+        adapter
+            .set_generated_title_if_absent(&info, "First Prompt Title".into())
+            .await
+            .unwrap();
+        let applied = adapter
+            .regenerate_generated_title(&info, "Refined Real Topic".into())
+            .await
+            .unwrap();
+
+        assert!(applied);
+        let summary = read_summary(&summary_path).unwrap();
+        assert_eq!(summary.display_title(), "Refined Real Topic");
+        assert_eq!(summary.session_summary, "Refined Real Topic");
+        assert!(!summary.title_is_manual);
+    }
+
+    #[tokio::test]
+    async fn regenerate_never_clobbers_manual_title() {
+        let dir = TempDir::new().unwrap();
+        let (adapter, info, summary_path) = new_session(&dir).await;
+
+        adapter
+            .update_session_title(&info, "Manual Title".into())
+            .await
+            .unwrap();
+        let applied = adapter
+            .regenerate_generated_title(&info, "Auto Refresh".into())
+            .await
+            .unwrap();
+
+        assert!(!applied);
+        let summary = read_summary(&summary_path).unwrap();
+        assert_eq!(summary.display_title(), "Manual Title");
+        assert!(summary.title_is_manual);
+    }
+
+    fn as_json(summary: &Summary) -> serde_json::Value {
+        serde_json::to_value(summary).unwrap()
+    }
+
+    fn identity(label: &str, source: Option<&str>) -> WorktreeIdentity {
+        WorktreeIdentity {
+            label: label.to_owned(),
+            source_workspace_dir: source.map(str::to_owned),
+        }
+    }
+
+    fn lock_path_for(summary_path: &Path) -> std::path::PathBuf {
+        summary_path.with_file_name(format!("{}.lock", crate::session::storage::SUMMARY_FILE))
+    }
+
+    #[tokio::test]
+    async fn repair_stamps_untagged_summary_on_disk_without_bumping_updated_at() {
+        let dir = TempDir::new().unwrap();
+        let (_adapter, _info, summary_path) = new_session(&dir).await;
+        let mut expected = read_summary(&summary_path).unwrap();
+
+        let repair = repair_worktree_identity(
+            &summary_path,
+            &lock_path_for(&summary_path),
+            &identity("fix-bug", Some("/home/user/repo")),
+        )
+        .unwrap();
+
+        let WorktreeIdentityRepair::Applied(applied) = repair else {
+            panic!("expected Applied for an untagged summary");
+        };
+        expected.session_kind = Some("worktree".to_owned());
+        expected.worktree_label = Some("fix-bug".to_owned());
+        expected.source_workspace_dir = Some("/home/user/repo".to_owned());
+        assert_eq!(as_json(&applied), as_json(&expected));
+        assert_eq!(
+            as_json(&read_summary(&summary_path).unwrap()),
+            as_json(&applied),
+            "returned summary must mirror the file",
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_stamps_untagged_summary_without_refreshing_file_mtime() {
+        let dir = TempDir::new().unwrap();
+        let (_adapter, _info, summary_path) = new_session(&dir).await;
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&summary_path)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        let mtime_before = std::fs::metadata(&summary_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let repair = repair_worktree_identity(
+            &summary_path,
+            &lock_path_for(&summary_path),
+            &identity("fix-bug", Some("/home/user/repo")),
+        )
+        .unwrap();
+        assert!(matches!(repair, WorktreeIdentityRepair::Applied(_)));
+
+        let mtime_after = std::fs::metadata(&summary_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime_after, mtime_before,
+            "heal rewrite must not refresh mtime; list_sessions_recent uses it"
+        );
+        assert_eq!(
+            read_summary(&summary_path).unwrap().session_kind.as_deref(),
+            Some("worktree")
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_keeps_applied_stamp_when_mtime_restore_fails() {
+        let dir = TempDir::new().unwrap();
+        let (_adapter, _info, summary_path) = new_session(&dir).await;
+        fail_next_restore_summary_mtime();
+
+        let repair = repair_worktree_identity(
+            &summary_path,
+            &lock_path_for(&summary_path),
+            &identity("fix-bug", Some("/home/user/repo")),
+        )
+        .unwrap();
+        let WorktreeIdentityRepair::Applied(applied) = repair else {
+            panic!("mtime restore must not undo a stamp already on disk");
+        };
+        assert_eq!(applied.session_kind.as_deref(), Some("worktree"));
+        assert_eq!(applied.worktree_label.as_deref(), Some("fix-bug"));
+        assert_eq!(
+            read_summary(&summary_path).unwrap().session_kind.as_deref(),
+            Some("worktree")
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_declines_already_kinded_labeled_summary_and_leaves_file_unwritten() {
+        let dir = TempDir::new().unwrap();
+        let (_adapter, _info, summary_path) = new_session(&dir).await;
+        let mut on_disk = read_summary(&summary_path).unwrap();
+        on_disk.session_kind = Some("fork".to_owned());
+        on_disk.worktree_label = Some("existing".to_owned());
+        std::fs::write(&summary_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+        let bytes_before = std::fs::read(&summary_path).unwrap();
+
+        let repair = repair_worktree_identity(
+            &summary_path,
+            &lock_path_for(&summary_path),
+            &identity("fix-bug", Some("/home/user/repo")),
+        )
+        .unwrap();
+
+        let WorktreeIdentityRepair::AlreadyKinded(fresh) = repair else {
+            panic!("expected AlreadyKinded for a kinded labeled summary");
+        };
+        assert_eq!(as_json(&fresh), as_json(&on_disk));
+        assert_eq!(std::fs::read(&summary_path).unwrap(), bytes_before);
+    }
+
+    #[tokio::test]
+    async fn repair_fills_missing_label_on_kinded_summary_without_changing_kind() {
+        let dir = TempDir::new().unwrap();
+        let (_adapter, _info, summary_path) = new_session(&dir).await;
+        let mut on_disk = read_summary(&summary_path).unwrap();
+        on_disk.session_kind = Some("fork".to_owned());
+        on_disk.worktree_label = None;
+        on_disk.source_workspace_dir = Some("/home/user/repo".to_owned());
+        std::fs::write(&summary_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+        let repair = repair_worktree_identity(
+            &summary_path,
+            &lock_path_for(&summary_path),
+            &identity("fix-bug", Some("/other/source")),
+        )
+        .unwrap();
+
+        let WorktreeIdentityRepair::Applied(applied) = repair else {
+            panic!("expected Applied for a kinded unlabeled summary");
+        };
+        assert_eq!(applied.session_kind.as_deref(), Some("fork"));
+        assert_eq!(applied.worktree_label.as_deref(), Some("fix-bug"));
+        assert_eq!(
+            applied.source_workspace_dir.as_deref(),
+            Some("/home/user/repo"),
+            "existing source must not be overwritten by the path identity"
+        );
+        let fresh = read_summary(&summary_path).unwrap();
+        assert_eq!(as_json(&fresh), as_json(&applied));
+    }
+
+    #[tokio::test]
+    async fn repair_second_application_declines_and_keeps_first_stamp() {
+        let dir = TempDir::new().unwrap();
+        let (_adapter, _info, summary_path) = new_session(&dir).await;
+        let lock_path = lock_path_for(&summary_path);
+        repair_worktree_identity(
+            &summary_path,
+            &lock_path,
+            &identity("fix-bug", Some("/home/user/repo")),
+        )
+        .unwrap();
+        let bytes_after_first = std::fs::read(&summary_path).unwrap();
+
+        let repair =
+            repair_worktree_identity(&summary_path, &lock_path, &identity("other-label", None))
+                .unwrap();
+
+        let WorktreeIdentityRepair::AlreadyKinded(fresh) = repair else {
+            panic!("expected the second repair to decline");
+        };
+        assert_eq!(fresh.worktree_label.as_deref(), Some("fix-bug"));
+        assert_eq!(std::fs::read(&summary_path).unwrap(), bytes_after_first);
     }
 }

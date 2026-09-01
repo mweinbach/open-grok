@@ -16,7 +16,7 @@ use super::*;
 struct LifecycleMutationLease {
     session: std::sync::Weak<SessionActor>,
     kind: LifecycleMutationKind,
-    completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+    completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
     armed: bool,
 }
 
@@ -24,7 +24,7 @@ impl LifecycleMutationLease {
     fn new(
         session: &Arc<SessionActor>,
         kind: LifecycleMutationKind,
-        completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+        completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
     ) -> Self {
         Self {
             session: Arc::downgrade(session),
@@ -62,7 +62,7 @@ impl Drop for LifecycleMutationLease {
 async fn release_lifecycle_mutation_and_resume(
     session: Arc<SessionActor>,
     kind: LifecycleMutationKind,
-    completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+    completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
 ) {
     session.end_lifecycle_mutation(kind).await;
     session.maybe_apply_pending_web_search_reload().await;
@@ -82,7 +82,8 @@ impl SessionActor {
         let turn_future_active = self
             .session_turn_active
             .load(std::sync::atomic::Ordering::Acquire);
-        if state.running_task.is_some() || turn_future_active {
+        if state.running_task.is_some() || turn_future_active || state.finalization_gate.is_active()
+        {
             return Err(LifecycleMutationBlock::ActiveTurn);
         }
         if let Some(active) = state.lifecycle_mutation {
@@ -130,7 +131,7 @@ impl SessionActor {
         self: &Arc<Self>,
         user_context: Option<String>,
         respond_to: tokio::sync::oneshot::Sender<acp::Result<()>>,
-        completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+        completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
     ) {
         let kind = LifecycleMutationKind::ManualCompaction;
         if let Err(blocked) = self.begin_lifecycle_mutation(kind).await {
@@ -154,7 +155,7 @@ impl SessionActor {
         respond_to: tokio::sync::oneshot::Sender<
             anyhow::Result<xai_chat_state::compaction_utils::HistoryRepairReport>,
         >,
-        completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+        completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
     ) {
         if dry_run {
             let session = self.clone();

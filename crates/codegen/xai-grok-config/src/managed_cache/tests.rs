@@ -1,5 +1,22 @@
 use super::*;
 
+#[test]
+fn empty_policy_slot_does_not_satisfy_required_artifact() {
+    let home = tempfile::tempdir().unwrap();
+    let cache = ManagedConfigCache {
+        had_requirements: true,
+        ..Default::default()
+    };
+    std::fs::write(home.path().join(crate::REQUIREMENTS_FILENAME), " \n").unwrap();
+    assert!(cache_missing_required_artifact(&cache, home.path()));
+    std::fs::write(
+        home.path().join(crate::REQUIREMENTS_FILENAME),
+        "fail_closed = true",
+    )
+    .unwrap();
+    assert!(!cache_missing_required_artifact(&cache, home.path()));
+}
+
 fn team(id: &str) -> ServingIdentity {
     ServingIdentity::Team(id.to_owned())
 }

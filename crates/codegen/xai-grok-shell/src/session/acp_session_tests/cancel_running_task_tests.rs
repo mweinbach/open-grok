@@ -131,7 +131,9 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 state: TokioMutex::new(State {
                     running_task: None,
                     pending_inputs: VecDeque::new(),
-                    combine_edit_holds: std::collections::HashSet::new(),
+                    edit_holds: std::collections::HashMap::new(),
+                    finalization_gate: Default::default(),
+                    hook_block_hold: Default::default(),
                     pending_notifications: Vec::new(),
                     lifecycle_mutation: None,
                     pending_web_search_reload: None,
@@ -153,7 +155,7 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle,
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -287,7 +289,16 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 managed_mcp_handle: Default::default(),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
+                status_wake: Default::default(),
+                status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                transient_turn_retries: false,
+                transient_retries_prompt_total: Default::default(),
+                transient_episode_start: Default::default(),
+                rate_limit_waits: Default::default(),
+                code_mode_hook_followups: Default::default(),
+                sampling_gate: None,
+                image_strip_rewrite_barrier: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -295,6 +306,8 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 user_input_generation: std::sync::atomic::AtomicU64::new(0),
                 laziness_debug_log: None,
                 deferred_prefix: TaskSlot::new(),
+                repo_status_prefetch:
+                    crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
                 last_announced_user_info_hash: std::cell::Cell::new(None),
@@ -322,10 +335,14 @@ fn persist_ack_waits_for_disk_flush_before_success() {
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
                 turn_summary_enabled: false,
+                title_refresh_enabled: false,
+                title_refresh_task: std::cell::RefCell::new(None),
+                title_refresh_generation: std::cell::Cell::new(0),
+                next_title_refresh_idx: std::cell::Cell::new(0),
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
-                turn_stream_drained: parking_lot::Mutex::new(None),
-                pending_image_strip: parking_lot::Mutex::new(None),
+                turn_stream_drained: parking_lot::Mutex::new(HashMap::new()),
+                pending_image_strip: parking_lot::Mutex::new(HashMap::new()),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -643,7 +660,9 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 state: TokioMutex::new(State {
                     running_task: None,
                     pending_inputs: VecDeque::new(),
-                    combine_edit_holds: std::collections::HashSet::new(),
+                    edit_holds: std::collections::HashMap::new(),
+                    finalization_gate: Default::default(),
+                    hook_block_hold: Default::default(),
                     pending_notifications: Vec::new(),
                     lifecycle_mutation: None,
                     pending_web_search_reload: None,
@@ -665,7 +684,7 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle,
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -802,7 +821,16 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 managed_mcp_handle: Default::default(),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
+                status_wake: Default::default(),
+                status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                transient_turn_retries: false,
+                transient_retries_prompt_total: Default::default(),
+                transient_episode_start: Default::default(),
+                rate_limit_waits: Default::default(),
+                code_mode_hook_followups: Default::default(),
+                sampling_gate: None,
+                image_strip_rewrite_barrier: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -810,6 +838,8 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 user_input_generation: std::sync::atomic::AtomicU64::new(0),
                 laziness_debug_log: None,
                 deferred_prefix: TaskSlot::new(),
+                repo_status_prefetch:
+                    crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
                 last_announced_user_info_hash: std::cell::Cell::new(None),
@@ -837,10 +867,14 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
                 turn_summary_enabled: false,
+                title_refresh_enabled: false,
+                title_refresh_task: std::cell::RefCell::new(None),
+                title_refresh_generation: std::cell::Cell::new(0),
+                next_title_refresh_idx: std::cell::Cell::new(0),
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
-                turn_stream_drained: parking_lot::Mutex::new(None),
-                pending_image_strip: parking_lot::Mutex::new(None),
+                turn_stream_drained: parking_lot::Mutex::new(HashMap::new()),
+                pending_image_strip: parking_lot::Mutex::new(HashMap::new()),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -852,7 +886,13 @@ fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
                 trace_config_template: std::cell::RefCell::new(None),
             });
             let _ = actor
-                .process_conversation_turn_with_recovery("disabled-memory", None, None, None)
+                .process_conversation_turn_with_recovery(
+                    "disabled-memory",
+                    None,
+                    None,
+                    None,
+                    &mut super::length_salvage::LengthSalvage::new(None),
+                )
                 .await;
             let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
             persistence
@@ -922,7 +962,9 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
             let state = TokioMutex::new(State {
                 running_task: None,
                 pending_inputs: VecDeque::new(),
-                combine_edit_holds: std::collections::HashSet::new(),
+                edit_holds: std::collections::HashMap::new(),
+                finalization_gate: Default::default(),
+                hook_block_hold: Default::default(),
                 pending_notifications: Vec::new(),
                 lifecycle_mutation: None,
                 pending_web_search_reload: None,
@@ -968,7 +1010,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(
@@ -1119,7 +1161,16 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
+                status_wake: Default::default(),
+                status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                transient_turn_retries: false,
+                transient_retries_prompt_total: Default::default(),
+                transient_episode_start: Default::default(),
+                rate_limit_waits: Default::default(),
+                code_mode_hook_followups: Default::default(),
+                sampling_gate: None,
+                image_strip_rewrite_barrier: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -1127,6 +1178,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 user_input_generation: std::sync::atomic::AtomicU64::new(0),
                 laziness_debug_log: None,
                 deferred_prefix: TaskSlot::new(),
+                repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(
                     chrono::Local::now().date_naive(),
@@ -1158,14 +1210,18 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
                 turn_summary_enabled: false,
+                title_refresh_enabled: false,
+                title_refresh_task: std::cell::RefCell::new(None),
+                title_refresh_generation: std::cell::Cell::new(0),
+                next_title_refresh_idx: std::cell::Cell::new(0),
                 session_turn_active: std::sync::Arc::new(
                     std::sync::atomic::AtomicBool::new(false),
                 ),
                 streaming_turn_capture: parking_lot::Mutex::new(
                     StreamingTurnCapture::default(),
                 ),
-                turn_stream_drained: parking_lot::Mutex::new(None),
-                pending_image_strip: parking_lot::Mutex::new(None),
+                turn_stream_drained: parking_lot::Mutex::new(HashMap::new()),
+                pending_image_strip: parking_lot::Mutex::new(HashMap::new()),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -1180,17 +1236,14 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
             let bridge = actor.agent.borrow().tool_bridge().clone();
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async move {
+                state.running_task = Some(AgentTask::new_at_epoch("running", actor.turn_report.epoch(), tokio::task::spawn_local(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                         })
-                        .abort_handle(),
-                });
+                        .abort_handle()));
                 state
                     .pending_inputs
                     .push_back(InputItem {
-                        prompt_id: "queued".into(),
+                        prompt_id: "running".into(),
                         prompt_blocks: vec![],
                         prompt_mode: PromptMode::Agent,
                         trace_gcs_config: None,
@@ -1207,6 +1260,8 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                         parsed_prompt_tx: None,
                         queue_meta: None,
                         send_now: false,
+                        initial_child_prompt_ready: None,
+                        traceparent: None,
                     });
             }
             let _ = actor
@@ -1276,13 +1331,17 @@ async fn cancel_records_mid_turn_abort_interrupt_marker() {
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state
+                    .pending_inputs
+                    .push_back(user_item("running", "owner"));
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
             }
             assert_eq!(actor.events.take_prior_interrupt_category(), None);
             let _ = actor
@@ -1317,19 +1376,28 @@ async fn cancel_without_active_tool_arms_interrupt_reminder() {
             let (persistence_tx, _persistence_rx) =
                 tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor
+                .chat_state_handle
+                .push_assistant_response(ConversationItem::assistant(
+                    "Partial answer before interruption",
+                ));
             *actor
                 .current_prompt_id
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state
+                    .pending_inputs
+                    .push_back(user_item("running", "owner"));
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
             }
             assert!(!actor.events.has_active_tool());
             assert!(!actor.events.take_pending_interrupt_reminder());
@@ -1369,13 +1437,17 @@ async fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth() {
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state
+                    .pending_inputs
+                    .push_back(user_item("running", "owner"));
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
             }
             let zombie_guard = crate::tools::tool_context::BlockingWaitGuard::enter(
                 actor.tool_context.blocking_wait_depth.clone(),
@@ -1433,13 +1505,17 @@ async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state
+                    .pending_inputs
+                    .push_back(user_item("running", "owner"));
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
             }
             assert!(!actor.events.has_active_tool());
             let _ = actor
@@ -1725,6 +1801,8 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
                 combined_texts: None,
             }),
             send_now: false,
+            initial_child_prompt_ready: None,
+            traceparent: None,
         };
         (item, rx)
     }
@@ -1745,13 +1823,14 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
             let (q2_item, mut q2_rx) = make_item("q2-pid", "q2");
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async move {
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
                 state.pending_inputs.push_back(running_item);
                 state.pending_inputs.push_back(q1_item);
                 state.pending_inputs.push_back(q2_item);
@@ -2283,6 +2362,8 @@ async fn cancel_resolves_front_when_running_task_is_none() {
                 combined_texts: None,
             }),
             send_now: false,
+            initial_child_prompt_ready: None,
+            traceparent: None,
         };
         (item, rx)
     }
@@ -2462,7 +2543,9 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
             let state = TokioMutex::new(State {
                 running_task: None,
                 pending_inputs: VecDeque::new(),
-                combine_edit_holds: std::collections::HashSet::new(),
+                edit_holds: std::collections::HashMap::new(),
+                finalization_gate: Default::default(),
+                hook_block_hold: Default::default(),
                 pending_notifications: Vec::new(),
                 lifecycle_mutation: None,
                 pending_web_search_reload: None,
@@ -2508,7 +2591,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(
@@ -2659,7 +2742,16 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
+                status_wake: Default::default(),
+                status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                transient_turn_retries: false,
+                transient_retries_prompt_total: Default::default(),
+                transient_episode_start: Default::default(),
+                rate_limit_waits: Default::default(),
+                code_mode_hook_followups: Default::default(),
+                sampling_gate: None,
+                image_strip_rewrite_barrier: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -2667,6 +2759,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 user_input_generation: std::sync::atomic::AtomicU64::new(0),
                 laziness_debug_log: None,
                 deferred_prefix: TaskSlot::new(),
+                repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(
                     chrono::Local::now().date_naive(),
@@ -2698,14 +2791,18 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
                 turn_summary_enabled: false,
+                title_refresh_enabled: false,
+                title_refresh_task: std::cell::RefCell::new(None),
+                title_refresh_generation: std::cell::Cell::new(0),
+                next_title_refresh_idx: std::cell::Cell::new(0),
                 session_turn_active: std::sync::Arc::new(
                     std::sync::atomic::AtomicBool::new(false),
                 ),
                 streaming_turn_capture: parking_lot::Mutex::new(
                     StreamingTurnCapture::default(),
                 ),
-                turn_stream_drained: parking_lot::Mutex::new(None),
-                pending_image_strip: parking_lot::Mutex::new(None),
+                turn_stream_drained: parking_lot::Mutex::new(HashMap::new()),
+                pending_image_strip: parking_lot::Mutex::new(HashMap::new()),
                 sampler_handle: sampler_handle.clone(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -2745,10 +2842,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
             }
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: task.abort_handle(),
-                });
+                state.pending_inputs.push_back(user_item("running", "owner"));
+                state.running_task = Some(AgentTask::new_at_epoch("running", actor.turn_report.epoch(), task.abort_handle()));
             }
             let _ = actor
                 .cancel_running_task(crate::session::CancelOptions {
@@ -2878,6 +2973,8 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
                 combined_texts: None,
             }),
             send_now: false,
+            initial_child_prompt_ready: None,
+            traceparent: None,
         }
     }
     let local = tokio::task::LocalSet::new();
@@ -2894,13 +2991,14 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
                 .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async move {
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
                 state
                     .pending_inputs
                     .push_back(make_item("running", "running"));

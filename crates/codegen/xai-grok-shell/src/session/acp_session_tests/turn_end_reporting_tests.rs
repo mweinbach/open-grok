@@ -164,9 +164,9 @@ impl Harness {
         &self,
         prompt_id: &str,
     ) -> tokio::sync::oneshot::Receiver<PromptTurnResult> {
-        self.start_turn(prompt_id).await;
         let (item, rx) = super::turn_completion_emit_tests::pending_input(prompt_id);
         self.actor.state.lock().await.pending_inputs.push_back(item);
+        self.start_turn(prompt_id).await;
         rx
     }
 
@@ -184,10 +184,18 @@ impl Harness {
             .current_prompt_id
             .lock()
             .expect("current_prompt_id mutex poisoned") = Some(prompt_id.to_string());
-        self.actor.state.lock().await.running_task = Some(AgentTask {
-            prompt_id: prompt_id.into(),
+        let mut state = self.actor.state.lock().await;
+        if state.pending_inputs.is_empty() {
+            state
+                .pending_inputs
+                .push_back(super::turn_completion_emit_tests::pending_input(prompt_id).0);
+        }
+        assert_eq!(state.pending_inputs.front().unwrap().prompt_id, prompt_id);
+        state.running_task = Some(AgentTask::new_at_epoch(
+            prompt_id,
+            self.actor.turn_report.epoch(),
             handle,
-        });
+        ));
     }
 
     async fn cancel(&self, trigger: CancelTrigger) -> super::tasks_cancel::CancelOutcome {
@@ -394,7 +402,9 @@ async fn a_rewind_reports_nothing_but_still_settles_the_session() {
         let outcome = h
             .actor
             .cancel_running_task(crate::session::CancelOptions {
-                rewind_if_no_output: true,
+                history: crate::session::commands::CancelHistoryDisposition::RewindIfNoOutput {
+                    prompt_id: Some("p1".to_string()),
+                },
                 trigger: Some(CancelTrigger::Esc),
                 user_initiated: true,
                 ..Default::default()
@@ -497,7 +507,11 @@ async fn only_a_settled_main_session_offers_an_idle_ping() {
             "a running turn is not idle"
         );
 
-        parent.actor.state.lock().await.running_task = None;
+        {
+            let mut state = parent.actor.state.lock().await;
+            state.running_task.take().unwrap().abort();
+            state.pending_inputs.pop_front();
+        }
         // Suppressed by the interrupt that ended the turn, which must not swallow the ping.
         parent.actor.state.lock().await.notifications_suppressed = true;
         parent.actor.emit_session_idle_if_idle().await;
@@ -788,10 +802,13 @@ async fn a_completion_arriving_after_its_cancel_reports_nothing() {
         h.listen(&[HookEventName::StopCancelled]);
         let _p1 = h.queue_turn("p1").await;
 
+        let (epoch, task_identity) = completion_binding(&h.actor, "p1").await;
         let _ = h.cancel(CancelTrigger::CtrlC).await;
         h.actor
             .handle_completion(
                 "p1".into(),
+                epoch,
+                &task_identity,
                 Ok(PromptTurnOk {
                     stop_reason: acp::StopReason::Cancelled,
                     total_tokens: 0,
@@ -804,6 +821,7 @@ async fn a_completion_arriving_after_its_cancel_reports_nothing() {
                     usage: None,
                     tool_overrides: None,
                 }),
+                None,
             )
             .await;
         h.drain_turn_ends().await;
@@ -831,18 +849,25 @@ async fn a_completion_reports_its_own_cancel_reason() {
         };
 
         let _p1 = h.queue_turn("p1").await;
+        let (epoch, task_identity) = completion_binding(&h.actor, "p1").await;
         h.actor
             .handle_completion(
                 "p1".into(),
+                epoch,
+                &task_identity,
                 ok(PromptCompletionKind::MaxTurnsReached { limit: 1 }),
+                None,
             )
             .await;
 
         h.actor.turn_report.start_next_turn();
         let _p2 = h.queue_turn("p2").await;
+        let (epoch, task_identity) = completion_binding(&h.actor, "p2").await;
         h.actor
             .handle_completion(
                 "p2".into(),
+                epoch,
+                &task_identity,
                 ok(PromptCompletionKind::Cancelled {
                     category: Some(
                         crate::session::events::CancellationCategory::PermissionRejected,
@@ -854,6 +879,7 @@ async fn a_completion_reports_its_own_cancel_reason() {
                         trigger: Some(format!("ctrl_c{}", "y".repeat(2000))),
                     }),
                 }),
+                None,
             )
             .await;
         h.drain_turn_ends().await;
@@ -892,8 +918,8 @@ async fn a_flush_leaves_the_queue_open() {
         let mut h = Harness::new().await;
         h.listen(&[HookEventName::StopCancelled]);
         for prompt_id in ["p1", "p2"] {
-            h.start_turn(prompt_id).await;
             h.actor.turn_report.start_next_turn();
+            h.start_turn(prompt_id).await;
             let _ = h.cancel(CancelTrigger::CtrlC).await;
             h.queue.as_mut().expect("a live queue").flush().await;
         }

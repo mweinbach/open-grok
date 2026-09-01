@@ -61,52 +61,64 @@ fn external_prompt_editor_arms_typed_request_and_preserves_composer_modes() {
     }
 }
 #[test]
-fn external_prompt_editor_refuses_nonminimal_and_owned_input() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.agents.get_mut(&id).unwrap().prompt.set_text("draft");
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(app.pending_editor.is_none(), "full TUI must refuse");
-    app.screen_mode = crate::app::ScreenMode::Minimal;
-    app.agents.get_mut(&id).unwrap().active_pane = ActivePane::Scrollback;
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(
-        matches!(
-            app.pending_editor,
-            Some(crate::app::external_editor::PendingEditorRequest::PromptDraft { .. })
-        ),
-        "minimal's logical composer remains authoritative after Tab/Vim focus"
-    );
-    app.pending_editor = None;
-    app.agents.get_mut(&id).unwrap().cancel_turn_view =
-        Some(crate::views::modal::CancelTurnViewState {
-            active_idx: 0,
-            running_count: 1,
-        });
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(app.pending_editor.is_none(), "modal owner must refuse");
-    assert_eq!(app.agents[&id].prompt.text(), "draft");
-    app.agents.get_mut(&id).unwrap().cancel_turn_view = None;
-    app.agents.get_mut(&id).unwrap().prompt_mode = PromptMode::EditingQueued {
-        id: 1,
-        original: "queued".to_owned(),
-        server_id: None,
-        kind: crate::app::agent::QueueEntryKind::Prompt,
-    };
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(app.pending_editor.is_none(), "queue edit must refuse");
-    assert_eq!(app.agents[&id].prompt.text(), "draft");
-    app.agents.get_mut(&id).unwrap().prompt_mode = PromptMode::Normal;
-    app.agents.get_mut(&id).unwrap().prompt.set_text("/");
-    let models = app.agents[&id].session.models.clone();
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .prompt
-        .refresh_slash(&models);
-    assert!(app.agents[&id].prompt.any_dropdown_open());
-    let _ = dispatch(Action::EditPromptExternal, &mut app);
-    assert!(app.pending_editor.is_none(), "dropdown owner must refuse");
+fn external_prompt_editor_allows_both_screen_modes_and_refuses_owned_input() {
+    for screen_mode in [
+        crate::app::ScreenMode::Fullscreen,
+        crate::app::ScreenMode::Minimal,
+    ] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        app.screen_mode = screen_mode;
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .prompt
+            .set_screen_mode(screen_mode);
+        app.agents.get_mut(&id).unwrap().prompt.set_text("draft");
+        for pane in [ActivePane::Prompt, ActivePane::Scrollback] {
+            app.agents.get_mut(&id).unwrap().active_pane = pane;
+            let _ = dispatch(Action::EditPromptExternal, &mut app);
+            assert!(
+                matches!(
+                    app.pending_editor.take(),
+                    Some(crate::app::external_editor::PendingEditorRequest::PromptDraft {
+                        agent_id,
+                        original_text,
+                    }) if agent_id == id && original_text == "draft"
+                ),
+                "the composer remains editable in {screen_mode:?} with {pane:?} focused"
+            );
+        }
+        app.agents.get_mut(&id).unwrap().cancel_turn_view =
+            Some(crate::views::modal::CancelTurnViewState {
+                active_idx: 0,
+                running_count: 1,
+            });
+        let _ = dispatch(Action::EditPromptExternal, &mut app);
+        assert!(app.pending_editor.is_none(), "modal owner must refuse");
+        assert_eq!(app.agents[&id].prompt.text(), "draft");
+        app.agents.get_mut(&id).unwrap().cancel_turn_view = None;
+        app.agents.get_mut(&id).unwrap().prompt_mode = PromptMode::EditingQueued {
+            id: 1,
+            original: "queued".to_owned(),
+            server_id: None,
+            kind: crate::app::agent::QueueEntryKind::Prompt,
+        };
+        let _ = dispatch(Action::EditPromptExternal, &mut app);
+        assert!(app.pending_editor.is_none(), "queue edit must refuse");
+        assert_eq!(app.agents[&id].prompt.text(), "draft");
+        app.agents.get_mut(&id).unwrap().prompt_mode = PromptMode::Normal;
+        app.agents.get_mut(&id).unwrap().prompt.set_text("/");
+        let models = app.agents[&id].session.models.clone();
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .prompt
+            .refresh_slash(&models);
+        assert!(app.agents[&id].prompt.any_dropdown_open());
+        let _ = dispatch(Action::EditPromptExternal, &mut app);
+        assert!(app.pending_editor.is_none(), "dropdown owner must refuse");
+    }
 }
 #[test]
 fn external_prompt_editor_refuses_elements_with_visible_message() {
@@ -245,6 +257,7 @@ fn deferred_paste_completion_after_refused_editor_does_not_implicitly_send_witho
                 target: crate::app::actions::ClipboardPasteTarget::AgentPrompt {
                     agent_id: id,
                     images_dir: None,
+                    feedback_tool_call_id: None,
                 },
                 source: crate::app::actions::ClipboardPasteSource::ClipboardKey {
                     text: crate::app::actions::ClipboardTextRead::Success(Some(
@@ -356,7 +369,14 @@ fn send_feedback_clears_active_ephemeral_tip() {
         &mut std::collections::HashMap::new(),
     );
     assert!(agent.ephemeral_tip.is_active());
-    let _ = dispatch(Action::SendFeedback("it broke".into()), &mut app);
+    let _ = dispatch(
+        Action::SendFeedback {
+            text: "it broke".into(),
+            images: Default::default(),
+            trace: None,
+        },
+        &mut app,
+    );
     assert!(
         !app.agents.get(&id).unwrap().ephemeral_tip.is_active(),
         "feedback submit must clear the tip"
@@ -551,7 +571,7 @@ fn mark_turn_finished_clears_start_and_stamps_active() {
     let agent = app.agents.get_mut(&id).unwrap();
     agent.turn_started_at = Some(std::time::Instant::now());
     agent.last_active_at = None;
-    agent.mark_turn_finished();
+    agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Completed);
     assert!(
         agent.turn_started_at.is_none(),
         "turn_started_at must be cleared"
@@ -2016,8 +2036,11 @@ fn pr13_each_setter_writes_to_its_own_mirror() {
 /// registry test alone can't see `AgentView::new`'s constant.
 #[test]
 fn pager_registry_default_matches_agent_view_new_initializer() {
-    use crate::settings::{SettingKind, SettingOwner, SettingsRegistry};
+    use crate::settings::{
+        SettingKind, SettingOwner, SettingsRegistry, current_value_for, default_value_for,
+    };
     let app = test_app_with_agent();
+    let pager_snapshot = crate::app::dispatch::settings::ui::build_pager_snapshot(&app);
     let agent = app
         .agents
         .get(&AgentId(0))
@@ -2061,6 +2084,33 @@ fn pager_registry_default_matches_agent_view_new_initializer() {
                          from the agent's default appearance config ({live}). Update one \
                          to match the other — ScrollConfig::default() is the source of \
                          truth.",
+                );
+            }
+            ("custom_models", SettingKind::Group { .. })
+            | ("custom_models.list", SettingKind::DynamicMultiSelect { .. }) => {
+                assert!(
+                    current_value_for(meta.key, &app.current_ui, &pager_snapshot).is_none(),
+                    "{} has no scalar runtime default",
+                    meta.key,
+                );
+            }
+            (
+                "custom_model_id"
+                | "custom_model_slug"
+                | "custom_model_name"
+                | "custom_model_provider"
+                | "custom_model_base_url"
+                | "custom_model_context_window"
+                | "custom_model_backend"
+                | "custom_model_env_key"
+                | "custom_model_save",
+                _,
+            ) => {
+                assert_eq!(
+                    current_value_for(meta.key, &app.current_ui, &pager_snapshot),
+                    Some(default_value_for(meta)),
+                    "registry default for `{}` drifts from build_pager_snapshot's draft initializer",
+                    meta.key,
                 );
             }
             _ => {
@@ -2248,7 +2298,6 @@ fn build_rows_idle_anchor_is_frozen_last_active_at() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2264,7 +2313,6 @@ fn build_rows_idle_anchor_is_frozen_last_active_at() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2292,7 +2340,6 @@ fn build_rows_working_anchor_is_turn_started_at() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2325,7 +2372,6 @@ fn build_rows_fallback_anchor_is_frozen_when_last_active_at_is_none() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2334,7 +2380,6 @@ fn build_rows_fallback_anchor_is_frozen_when_last_active_at_is_none() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,
@@ -2400,7 +2445,6 @@ fn top_level_label_strips_control_characters() {
         &app.agents,
         &std::collections::BTreeSet::new(),
         &[],
-        None,
         crate::views::dashboard::Grouping::State,
         &crate::views::dashboard::Filter::None,
         None,

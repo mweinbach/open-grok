@@ -92,6 +92,9 @@ pub enum QuestionFocus {
 /// submitted selection into an [`crate::app::actions::Action`].
 #[derive(Debug, Clone)]
 pub enum LocalQuestionKind {
+    PromptBlocked {
+        row_id: u64,
+    },
     /// Modal opened by `/fork` to resolve the worktree question.
     /// On submit, the selected option index plus the carried directive
     /// are translated into an
@@ -837,6 +840,10 @@ impl QuestionViewState {
             .first()
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
+    }
+
+    pub fn is_feedback_report(&self) -> bool {
+        matches!(self.local_kind, Some(LocalQuestionKind::Feedback))
     }
 
     /// Labels of the selected options for a given question.

@@ -4,6 +4,7 @@ name = "xai-grok-shared"
 edition.workspace = true
 
 [dependencies]
+xai-dirs = { path = "../xai-dirs" }
 agent-client-protocol = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -21,6 +22,7 @@ tracing = { workspace = true }
 urlencoding = { workspace = true }
 xai-grok-config-types = { workspace = true }
 xai-grok-models = { workspace = true }
+xai-grok-status-line = { path = "../xai-grok-status-line" }
 xai-grok-tools = { workspace = true }
 xai-tty-utils = { workspace = true }
 

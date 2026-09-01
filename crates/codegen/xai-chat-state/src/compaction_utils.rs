@@ -5,9 +5,43 @@
 //! this crate and `xai-grok-shell` can share them without duplication.
 use std::collections::BTreeSet;
 use xai_grok_sampling_types::{
-    ContentPart, ConversationItem, CustomToolOutputContent, CustomToolOutputItem, ToolResultItem,
-    decode_custom_tool_call_id,
+    ContentPart, ConversationItem, CustomToolOutputContent, CustomToolOutputItem, SyntheticReason,
+    ToolResultItem, decode_custom_tool_call_id,
 };
+
+pub const AGENT_MESSAGE_MODEL_LABEL: &str =
+    "[Message authored by another agent; not a human request or approval.]";
+
+pub struct ModelRequestHistory(Vec<ConversationItem>);
+
+impl ModelRequestHistory {
+    pub fn from_raw(conversation: Vec<ConversationItem>) -> Self {
+        Self(
+            conversation
+                .into_iter()
+                .map(|item| match item {
+                    ConversationItem::User(mut user)
+                        if user.synthetic_reason
+                            == Some(xai_grok_sampling_types::SyntheticReason::AgentMessage) =>
+                    {
+                        user.content.insert(
+                            0,
+                            ContentPart::Text {
+                                text: std::sync::Arc::<str>::from(AGENT_MESSAGE_MODEL_LABEL),
+                            },
+                        );
+                        ConversationItem::User(user)
+                    }
+                    other => other,
+                })
+                .collect(),
+        )
+    }
+
+    pub fn into_items(self) -> Vec<ConversationItem> {
+        self.0
+    }
+}
 
 fn tool_output_call_id(item: &ConversationItem) -> Option<&str> {
     match item {
@@ -833,6 +867,75 @@ pub struct TodoSummary {
     pub content: String,
     pub status: TodoSummaryStatus,
 }
+
+#[derive(Clone, Copy)]
+enum AgentMessagePosition {
+    Only,
+    BeforeHuman,
+    AfterHuman,
+}
+
+#[derive(Clone)]
+pub struct AgentMessageAnchor {
+    item: ConversationItem,
+    position: AgentMessagePosition,
+}
+
+fn extract_latest_agent_message(conversation: &[ConversationItem]) -> Option<AgentMessageAnchor> {
+    let agent_message_index = conversation.iter().rposition(|item| {
+        matches!(
+            item,
+            ConversationItem::User(user)
+                if user.synthetic_reason == Some(SyntheticReason::AgentMessage)
+        )
+    })?;
+    let position = match conversation.iter().rposition(is_real_user_turn) {
+        Some(human_index) if agent_message_index < human_index => AgentMessagePosition::BeforeHuman,
+        Some(_) => AgentMessagePosition::AfterHuman,
+        None => AgentMessagePosition::Only,
+    };
+    Some(AgentMessageAnchor {
+        item: conversation[agent_message_index].clone(),
+        position,
+    })
+}
+
+fn extract_messages_since_last_compaction_anchor(
+    conversation: &[ConversationItem],
+) -> Vec<ConversationItem> {
+    let boundary = conversation.iter().rposition(|item| {
+        is_real_user_turn(item)
+            || matches!(
+                item,
+                ConversationItem::User(user)
+                    if user.synthetic_reason == Some(SyntheticReason::AgentMessage)
+            )
+    });
+    let start = boundary.map_or(0, |index| {
+        if matches!(
+            &conversation[index],
+            ConversationItem::User(user)
+                if user.synthetic_reason == Some(SyntheticReason::AgentMessage)
+        ) {
+            index
+        } else {
+            index + 1
+        }
+    });
+    conversation[start..]
+        .iter()
+        .filter_map(|item| match item {
+            ConversationItem::User(user)
+                if user.synthetic_reason == Some(SyntheticReason::AgentMessage) =>
+            {
+                Some(item.clone())
+            }
+            ConversationItem::Assistant(_) => Some(item.clone()),
+            output => placeholder_tool_output(output),
+        })
+        .collect()
+}
+
 /// Context captured at compaction time.
 ///
 /// This is a pure data struct — rendering into system-reminder format is
@@ -847,6 +950,7 @@ pub struct CompactionStateContext {
     /// results).  Synthetic user injections (system reminders) do not reset
     /// the boundary, preventing orphaned ToolResults in the compacted output.
     pub recent_messages: Vec<ConversationItem>,
+    pub agent_message_anchor: Option<AgentMessageAnchor>,
     /// The last real user query text (skips synthetic injections and
     /// auto-continue prompts).
     pub last_user_query: Option<String>,
@@ -884,7 +988,8 @@ impl CompactionStateContext {
         Self {
             cwd_generation: inputs.cwd_generation,
             destination_project_instructions: inputs.destination_project_instructions,
-            recent_messages: extract_messages_since_last_real_user(conversation),
+            recent_messages: extract_messages_since_last_compaction_anchor(conversation),
+            agent_message_anchor: extract_latest_agent_message(conversation),
             last_user_query: extract_last_real_user_query(conversation),
             agent_edited_paths: inputs.agent_edited_paths.into_iter().collect(),
             running_tasks: inputs.running_tasks,
@@ -920,6 +1025,10 @@ impl CompactionStateContext {
             cwd_generation: self.cwd_generation,
             destination_project_instructions: self.destination_project_instructions.clone(),
             recent_messages: Vec::new(),
+            agent_message_anchor: self
+                .agent_message_anchor
+                .clone()
+                .or_else(|| extract_latest_agent_message(&self.recent_messages)),
             last_user_query: self.last_user_query.clone(),
             agent_edited_paths: self.agent_edited_paths.clone(),
             running_tasks: self.running_tasks.clone(),
@@ -1167,8 +1276,32 @@ pub fn build_compacted_history(input: CompactedHistoryInput<'_>) -> Vec<Conversa
     if let Some(reminder) = project_instructions {
         compacted.push(ConversationItem::project_instructions(reminder.clone()));
     }
+    let anchor = input
+        .state_context
+        .agent_message_anchor
+        .clone()
+        .filter(|_| {
+            !input.state_context.recent_messages.iter().any(|item| {
+                matches!(
+                    item,
+                    ConversationItem::User(user)
+                        if user.synthetic_reason == Some(SyntheticReason::AgentMessage)
+                )
+            })
+        });
+    if let Some(anchor) = anchor
+        .as_ref()
+        .filter(|anchor| matches!(anchor.position, AgentMessagePosition::BeforeHuman))
+    {
+        compacted.push(anchor.item.clone());
+    }
     if let Some(ref last_query) = input.state_context.last_user_query {
         compacted.push(ConversationItem::user(wrap_user_query(last_query)));
+    }
+    if let Some(anchor) =
+        anchor.filter(|anchor| !matches!(anchor.position, AgentMessagePosition::BeforeHuman))
+    {
+        compacted.push(anchor.item);
     }
     if summary_first {
         compacted.push(summary_item);
@@ -1351,6 +1484,234 @@ pub fn strip_displaced_tool_results(items: &mut Vec<ConversationItem>) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_message_projection_uses_generic_label_and_preserves_image_only_payload() {
+        let agent_message = ConversationItem::agent_message("");
+        let ConversationItem::User(mut image_only) = agent_message else {
+            panic!("agent_message must construct a user item");
+        };
+        image_only.content = vec![ContentPart::Image {
+            url: "data:image/png;base64,abc".into(),
+        }];
+        let raw = ConversationItem::User(image_only);
+        let prepared = ModelRequestHistory::from_raw(vec![raw]);
+        let projected = prepared.into_items();
+        let ConversationItem::User(user) = &projected[0] else {
+            panic!("projected agent message must stay a user item");
+        };
+        assert!(matches!(
+            user.content.as_slice(),
+            [ContentPart::Text { text }, ContentPart::Image { url }]
+                if text.as_ref() == AGENT_MESSAGE_MODEL_LABEL
+                    && url.as_ref() == "data:image/png;base64,abc"
+        ));
+    }
+    fn agent_message_anchors(items: &[ConversationItem]) -> Vec<&ConversationItem> {
+        items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    ConversationItem::User(user)
+                        if user.synthetic_reason == Some(SyntheticReason::AgentMessage)
+                )
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn agent_message_anchor_survives_two_compactions_with_raw_content_unchanged() {
+        let raw_agent_message = "model-authored message from another agent";
+        let conversation = vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("<user_query>human task</user_query>"),
+            ConversationItem::assistant("before agent message"),
+            ConversationItem::agent_message(raw_agent_message),
+            ConversationItem::notification_drain("runtime wake"),
+            ConversationItem::task_completed("task wake"),
+            ConversationItem::assistant("working tail"),
+            ConversationItem::tool_result("tc1", "tool output"),
+        ];
+        let raw_agent_message_bytes = serde_json::to_vec(&conversation[3]).unwrap();
+        async fn compact_once(conversation: &[ConversationItem]) -> Vec<ConversationItem> {
+            let state_context =
+                CompactionStateContext::build(conversation, CompactionInputs::default())
+                    .await
+                    .for_compaction();
+            assert!(state_context.recent_messages.is_empty());
+            build_compacted_history(CompactedHistoryInput {
+                system_message: ConversationItem::system("sys"),
+                user_message_prefix: "prefix".into(),
+                agents_md_reminder: None,
+                state_context: &state_context,
+                compaction_summary: "summary".into(),
+                system_reminder: None,
+                summary_before_recent: false,
+                transcript_hint: None,
+                summary_count: 1,
+            })
+        }
+        let compacted_once = compact_once(&conversation).await;
+        assert!(matches!(
+            &compacted_once[2],
+            ConversationItem::User(user)
+                if user.synthetic_reason.is_none()
+                    && compacted_once[2].text_content()
+                        == "<user_query>\nhuman task\n</user_query>"
+        ));
+        assert!(matches!(
+            &compacted_once[3],
+            ConversationItem::User(user)
+                if user.synthetic_reason == Some(SyntheticReason::AgentMessage)
+                    && compacted_once[3].text_content() == raw_agent_message
+        ));
+        let compacted_once_anchors = agent_message_anchors(&compacted_once);
+        assert_eq!(compacted_once_anchors.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(compacted_once_anchors[0]).unwrap(),
+            raw_agent_message_bytes
+        );
+        let compacted_twice = compact_once(&compacted_once).await;
+        assert!(matches!(
+            &compacted_twice[2],
+            ConversationItem::User(user)
+                if user.synthetic_reason.is_none()
+                    && compacted_twice[2].text_content()
+                        == "<user_query>\nhuman task\n</user_query>"
+        ));
+        assert!(matches!(
+            &compacted_twice[3],
+            ConversationItem::User(user)
+                if user.synthetic_reason == Some(SyntheticReason::AgentMessage)
+                    && compacted_twice[3].text_content() == raw_agent_message
+        ));
+        let compacted_twice_anchors = agent_message_anchors(&compacted_twice);
+        assert_eq!(compacted_twice_anchors.len(), 1);
+        assert_eq!(compacted_twice_anchors[0].text_content(), raw_agent_message);
+        assert_eq!(
+            serde_json::to_vec(compacted_twice_anchors[0]).unwrap(),
+            raw_agent_message_bytes
+        );
+        assert!(!compacted_twice.iter().any(|item| {
+            matches!(
+                item,
+                ConversationItem::Assistant(_) | ConversationItem::ToolResult(_)
+            )
+        }));
+        assert!(!compacted_twice.iter().any(|item| {
+            matches!(
+                item,
+                ConversationItem::User(user)
+                    if matches!(
+                        user.synthetic_reason,
+                        Some(SyntheticReason::NotificationDrain | SyntheticReason::TaskCompleted)
+                    )
+            )
+        }));
+        assert_eq!(extract_real_user_queries(&conversation), vec!["human task"]);
+        let agent_only = vec![
+            ConversationItem::system("sys"),
+            ConversationItem::agent_message(raw_agent_message),
+        ];
+        let agent_only_context =
+            CompactionStateContext::build(&agent_only, CompactionInputs::default()).await;
+        assert!(agent_only_context.last_user_query.is_none());
+        let agent_only_compacted = build_compacted_history(CompactedHistoryInput {
+            system_message: ConversationItem::system("sys"),
+            user_message_prefix: "prefix".into(),
+            agents_md_reminder: None,
+            state_context: &agent_only_context,
+            compaction_summary: "summary".into(),
+            system_reminder: None,
+            summary_before_recent: false,
+            transcript_hint: None,
+            summary_count: 1,
+        });
+        assert_eq!(agent_message_anchors(&agent_only_compacted).len(), 1);
+    }
+    #[tokio::test]
+    async fn agent_message_before_latest_human_survives_compaction_exactly_once() {
+        let raw_agent_message = "generic assignment from another agent";
+        let conversation = vec![
+            ConversationItem::system("sys"),
+            ConversationItem::agent_message(raw_agent_message),
+            ConversationItem::notification_drain("runtime wake"),
+            ConversationItem::task_completed("task wake"),
+            ConversationItem::user("<user_query>latest human query</user_query>"),
+            ConversationItem::assistant("working tail"),
+        ];
+        let raw_agent_message_bytes = serde_json::to_vec(&conversation[1]).unwrap();
+        let state_context =
+            CompactionStateContext::build(&conversation, CompactionInputs::default())
+                .await
+                .for_compaction();
+        assert_eq!(
+            state_context.last_user_query.as_deref(),
+            Some("latest human query")
+        );
+        assert!(state_context.recent_messages.is_empty());
+        let compacted = build_compacted_history(CompactedHistoryInput {
+            system_message: ConversationItem::system("sys"),
+            user_message_prefix: "prefix".into(),
+            agents_md_reminder: None,
+            state_context: &state_context,
+            compaction_summary: "summary".into(),
+            system_reminder: None,
+            summary_before_recent: false,
+            transcript_hint: None,
+            summary_count: 1,
+        });
+        assert!(matches!(
+            &compacted[2],
+            ConversationItem::User(user)
+                if user.synthetic_reason == Some(SyntheticReason::AgentMessage)
+                    && compacted[2].text_content() == raw_agent_message
+        ));
+        assert!(matches!(
+            &compacted[3],
+            ConversationItem::User(user)
+                if user.synthetic_reason.is_none()
+                    && compacted[3].text_content()
+                        == "<user_query>\nlatest human query\n</user_query>"
+        ));
+        let compacted_anchors = agent_message_anchors(&compacted);
+        assert_eq!(compacted_anchors.len(), 1);
+        assert_eq!(compacted_anchors[0].text_content(), raw_agent_message);
+        assert_eq!(
+            serde_json::to_vec(compacted_anchors[0]).unwrap(),
+            raw_agent_message_bytes
+        );
+        assert!(!compacted.iter().any(|item| {
+            matches!(
+                item,
+                ConversationItem::User(user)
+                    if matches!(
+                        user.synthetic_reason,
+                        Some(SyntheticReason::NotificationDrain | SyntheticReason::TaskCompleted)
+                    )
+            )
+        }));
+        let human_only = vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("<user_query>latest human query</user_query>"),
+        ];
+        let human_only_context =
+            CompactionStateContext::build(&human_only, CompactionInputs::default()).await;
+        assert!(human_only_context.agent_message_anchor.is_none());
+        let human_only_compacted = build_compacted_history(CompactedHistoryInput {
+            system_message: ConversationItem::system("sys"),
+            user_message_prefix: "prefix".into(),
+            agents_md_reminder: None,
+            state_context: &human_only_context,
+            compaction_summary: "summary".into(),
+            system_reminder: None,
+            summary_before_recent: false,
+            transcript_hint: None,
+            summary_count: 1,
+        });
+        assert!(agent_message_anchors(&human_only_compacted).is_empty());
+    }
+
     use xai_grok_sampling_types::{CustomToolOutputImageDetail, SyntheticReason};
 
     fn raw_compaction_item(encrypted_content: &str) -> ConversationItem {
@@ -3415,6 +3776,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
     #[test]
     fn generation_zero_compaction_keeps_legacy_project_instructions() {
         let state_context = CompactionStateContext {
+            agent_message_anchor: None,
             cwd_generation: 0,
             destination_project_instructions: Some("destination rules".into()),
             recent_messages: vec![],
@@ -3441,6 +3803,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
     #[test]
     fn relocated_compaction_uses_destination_project_instructions() {
         let state_context = CompactionStateContext {
+            agent_message_anchor: None,
             cwd_generation: 1,
             destination_project_instructions: Some("destination rules".into()),
             recent_messages: vec![],
@@ -3467,6 +3830,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
     #[test]
     fn relocated_compaction_does_not_restore_source_instructions_when_destination_has_none() {
         let state_context = CompactionStateContext {
+            agent_message_anchor: None,
             cwd_generation: 1,
             destination_project_instructions: None,
             recent_messages: vec![],
@@ -3496,6 +3860,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
     #[test]
     fn build_compacted_history_tags_agents_md_with_project_instructions() {
         let state_context = CompactionStateContext {
+            agent_message_anchor: None,
             cwd_generation: 0,
             destination_project_instructions: None,
             recent_messages: vec![],
@@ -3539,6 +3904,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
     #[test]
     fn build_compacted_history_omits_agents_md_when_none() {
         let state_context = CompactionStateContext {
+            agent_message_anchor: None,
             cwd_generation: 0,
             destination_project_instructions: None,
             recent_messages: vec![],

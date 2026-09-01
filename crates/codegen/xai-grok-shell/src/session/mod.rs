@@ -3,7 +3,9 @@ pub mod announcement_state;
 pub mod cache_tracker;
 pub mod commands;
 pub(crate) mod compaction_config;
+pub(crate) mod doom_loop_telemetry;
 pub mod handle;
+pub(crate) mod mcp_elicitation;
 pub(crate) mod memory_state;
 pub mod merge;
 pub(crate) mod native_agents;
@@ -12,6 +14,8 @@ pub mod pending_interaction;
 pub mod prompt_queue;
 pub(crate) mod swarm_mode;
 pub mod two_pass;
+pub mod usage_file;
+pub mod visibility;
 pub use self::acp_session::*;
 pub use self::acp_types::*;
 pub use self::cache_tracker::{
@@ -28,7 +32,12 @@ pub use self::persistence::{
 pub use self::result::{Empty, ExtMethodResult};
 pub use self::share::{ShareSessionRequest, ShareSessionResponse};
 pub use prod_mc_cli_chat_proxy_types::feedback_types::{
-    ClientType, FeedbackTerminalInfo, RatingType,
+    ClientType, FeedbackImage, FeedbackImageError, FeedbackTerminalInfo, MAX_FEEDBACK_IMAGE_BYTES,
+    MAX_FEEDBACK_IMAGE_TOTAL_BYTES, MAX_FEEDBACK_IMAGES, RatingType, feedback_image_extension,
+};
+pub use xai_agent_lifecycle::{
+    AnalyticsClass, CompactionClass, InputAuthority, InputPolicy, QueuePolicy, ShutdownPolicy,
+    TurnBoundary,
 };
 pub use xai_fsnotify::{FsConfig, FsEvent, FsEventKind, FsEventSource, FsNotifyError, GitMetaKind};
 /// `false` twin: this template is not compiled into this build, so no
@@ -79,6 +88,10 @@ pub enum PromptOrigin {
     AgentMessage {
         message_id: String,
     },
+    ParentAgentMessage {
+        message_id: String,
+        sender_session_id: String,
+    },
     /// Follow-up turn injected by a peer Open Grok session on the session
     /// bus (possibly from another project or process). Delivery semantics
     /// mirror [`Self::AgentMessage`]; the envelope frames the body as
@@ -112,6 +125,54 @@ pub enum PromptOrigin {
     PlanResume,
 }
 impl PromptOrigin {
+    pub fn policy(&self) -> InputPolicy {
+        match self {
+            Self::User => InputPolicy {
+                authority: InputAuthority::HumanIntent,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::HumanPrompt,
+                compaction: CompactionClass::HumanAnchor,
+                queue: QueuePolicy::VisibleEditable,
+                shutdown: ShutdownPolicy::Drain,
+            },
+            Self::ParentAgentMessage { .. }
+            | Self::AgentMessage { .. }
+            | Self::PeerSessionMessage { .. } => InputPolicy {
+                authority: InputAuthority::ModelAuthoredUntrusted,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::AgentMessage,
+                compaction: CompactionClass::ConversationalAgentAnchor,
+                queue: if matches!(self, Self::ParentAgentMessage { .. }) {
+                    QueuePolicy::VisibleProtected
+                } else {
+                    QueuePolicy::Hidden
+                },
+                shutdown: ShutdownPolicy::Drain,
+            },
+            Self::TaskCompleted { .. }
+            | Self::SubagentCompleted { .. }
+            | Self::WorkflowCompleted { .. }
+            | Self::SchedulerFired => InputPolicy {
+                authority: InputAuthority::RuntimeControl,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::RuntimeWake,
+                compaction: CompactionClass::RuntimeEphemera,
+                queue: QueuePolicy::Hidden,
+                shutdown: ShutdownPolicy::CancelWithProducer,
+            },
+            Self::NotificationDrain
+            | Self::GoalSummary
+            | Self::GoalClassifierNudge
+            | Self::PlanResume => InputPolicy {
+                authority: InputAuthority::RuntimeControl,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::RuntimeWake,
+                compaction: CompactionClass::RuntimeEphemera,
+                queue: QueuePolicy::Hidden,
+                shutdown: ShutdownPolicy::DropEphemeral,
+            },
+        }
+    }
     /// Parse a prompt_id string into a `PromptOrigin`.
     pub fn from_prompt_id(prompt_id: &str) -> Self {
         if let Some(task_id) = prompt_id.strip_prefix("task-completed-") {
@@ -121,6 +182,11 @@ impl PromptOrigin {
         } else if let Some(subagent_id) = prompt_id.strip_prefix("subagent-completed-") {
             Self::SubagentCompleted {
                 subagent_id: subagent_id.to_string(),
+            }
+        } else if let Some(message_id) = prompt_id.strip_prefix("parent-message-") {
+            Self::ParentAgentMessage {
+                message_id: message_id.to_owned(),
+                sender_session_id: String::new(),
             }
         } else if let Some(message_id) = prompt_id.strip_prefix("agent-message-") {
             Self::AgentMessage {
@@ -160,7 +226,10 @@ impl PromptOrigin {
     /// real user turns always render.
     pub fn hide_user_echo_from_scrollback(&self) -> bool {
         match self {
-            Self::User | Self::SchedulerFired | Self::PlanResume => false,
+            Self::User
+            | Self::ParentAgentMessage { .. }
+            | Self::SchedulerFired
+            | Self::PlanResume => false,
             Self::TaskCompleted { .. }
             | Self::SubagentCompleted { .. }
             | Self::AgentMessage { .. }
@@ -175,7 +244,9 @@ impl PromptOrigin {
         match self {
             Self::TaskCompleted { task_id } => Some(task_id),
             Self::SubagentCompleted { subagent_id } => Some(subagent_id),
-            Self::AgentMessage { .. } | Self::PeerSessionMessage { .. } => None,
+            Self::AgentMessage { .. }
+            | Self::ParentAgentMessage { .. }
+            | Self::PeerSessionMessage { .. } => None,
             Self::WorkflowCompleted { completion_id } => Some(completion_id),
             Self::User
             | Self::NotificationDrain
@@ -189,6 +260,28 @@ impl PromptOrigin {
 #[cfg(test)]
 mod tests {
     use super::PromptOrigin;
+    #[test]
+    fn agent_messages_never_carry_human_authority() {
+        for origin in [
+            PromptOrigin::ParentAgentMessage {
+                message_id: "message".to_owned(),
+                sender_session_id: "parent".to_owned(),
+            },
+            PromptOrigin::AgentMessage {
+                message_id: "message".to_owned(),
+            },
+            PromptOrigin::PeerSessionMessage {
+                message_id: "message".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                origin.policy().authority,
+                super::InputAuthority::ModelAuthoredUntrusted
+            );
+            assert_eq!(origin.policy().shutdown, super::ShutdownPolicy::Drain);
+        }
+    }
+
     #[test]
     fn from_prompt_id_user() {
         assert_eq!(
@@ -377,10 +470,12 @@ pub mod prompt_parser;
 pub(crate) mod prompt_timing;
 pub(crate) mod replay_events;
 pub mod repo_changes;
+pub(crate) mod repo_status_prefix;
 #[path = "restore_stub.rs"]
 pub mod restore;
 pub mod result;
 pub mod signals;
+pub(crate) mod slash_authority;
 pub(crate) mod slash_commands;
 pub use slash_commands::PAGER_COMMAND_KEYS;
 pub mod storage;

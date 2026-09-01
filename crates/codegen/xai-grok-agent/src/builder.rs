@@ -102,6 +102,7 @@ pub struct AgentBuilder {
     app_builder_deployer_config:
         xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig,
     write_file_enabled: bool,
+    active_agent_messages_enabled: bool,
     subagents_enabled: bool,
     background_workflows_enabled: bool,
     ask_user_question_enabled: bool,
@@ -193,9 +194,11 @@ fn apply_workflow_tool_gates(
             .tools
             .retain(|tool| tool.kind != Some(ToolKind::GoalUpdate));
     } else {
-        tool_config
-            .tools
-            .retain(|tool| tool.kind != Some(ToolKind::Workflow));
+        tool_config.tools.retain(|tool| {
+            !xai_grok_tools::implementations::grok_build::workflow::is_workflow_tool(
+                tool.kind, &tool.id,
+            )
+        });
     }
 }
 impl AgentBuilder {
@@ -246,6 +249,7 @@ impl AgentBuilder {
             video_gen_config: Default::default(),
             app_builder_deployer_config: Default::default(),
             write_file_enabled: true,
+            active_agent_messages_enabled: false,
             subagents_enabled: false,
             background_workflows_enabled: false,
             ask_user_question_enabled: true,
@@ -575,6 +579,10 @@ impl AgentBuilder {
         self.write_file_enabled = enabled;
         self
     }
+    pub fn with_active_agent_messages_enabled(mut self, enabled: bool) -> Self {
+        self.active_agent_messages_enabled = enabled;
+        self
+    }
     /// Enable or disable subagent (task tool) support.
     ///
     /// When disabled, the `TaskTool` is stripped from the
@@ -837,6 +845,27 @@ impl AgentBuilder {
             }
             ensure_plan_mode_tools(&mut tool_config);
         }
+        let active_agent_message = xai_grok_tools::registry::types::ToolConfig::for_tool::<
+            xai_grok_tools::implementations::grok_build::send_subagent_message::SendSubagentMessageTool,
+        >();
+        let is_active_agent_message = |tool: &xai_grok_tools::registry::types::ToolConfig| {
+            tool.kind == Some(ToolKind::ActiveAgentMessage)
+                || tool_id_eq(&tool.id, &active_agent_message.id)
+        };
+        let can_inject_active_agent_message = self.active_agent_messages_enabled
+            && self.prompt_audience == PromptAudience::Primary
+            && definition.inject_default_tools;
+        if can_inject_active_agent_message {
+            if !tool_config.tools.iter().any(is_active_agent_message) {
+                tool_config.tools.push(active_agent_message);
+            }
+        } else if !self.active_agent_messages_enabled
+            || self.prompt_audience != PromptAudience::Primary
+        {
+            tool_config
+                .tools
+                .retain(|tool| !is_active_agent_message(tool));
+        }
         // Child plan approval renders on the parent view. Keep this guard after
         // default-tool injection so rebuilding a child cannot restore the tools.
         if self.prompt_audience == PromptAudience::Subagent {
@@ -860,12 +889,11 @@ impl AgentBuilder {
                 tc.id != mem_search_id && tc.id != experience_search_id && tc.id != mem_get_id
             });
         }
-        if !self.ask_user_question_enabled {
-            let ask_user_id = format!(
-                "{}:ask_user_question",
-                xai_grok_tools::types::tool::ToolNamespace::GrokBuild,
-            );
-            tool_config.tools.retain(|tc| tc.id != ask_user_id);
+        if self.prompt_audience == PromptAudience::Subagent || !self.ask_user_question_enabled {
+            tool_config.tools.retain(|tool| {
+                tool.kind != Some(ToolKind::AskUser)
+                    && !tool_id_eq(&tool.id, "GrokBuild:ask_user_question")
+            });
         }
         apply_workflow_tool_gates(&mut tool_config, self.background_workflows_enabled);
         let task_tool_id = format!(
@@ -1147,6 +1175,13 @@ impl AgentBuilder {
                     params.insert("auto_background_on_timeout".into(), false.into());
                 }
             }
+        }
+        if self.prompt_audience == PromptAudience::Subagent {
+            tool_config.tools.retain(|tool| {
+                !xai_grok_tools::implementations::grok_build::workflow::is_workflow_tool(
+                    tool.kind, &tool.id,
+                )
+            });
         }
         if self.native_agents_enabled {
             use xai_grok_tools::implementations::codex::multi_agent_v2;
@@ -1515,6 +1550,165 @@ fn resolve_shell_for_prompt() -> String {
 mod tests {
     use super::*;
     use crate::config::AgentScope;
+    async fn root_gated_tool_names(
+        definition: AgentDefinition,
+        audience: PromptAudience,
+        active_messages: Option<bool>,
+    ) -> Vec<String> {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        let directory = tempfile::tempdir().unwrap();
+        let mut builder = AgentBuilder::new(
+            directory.path().to_owned(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(definition)
+        .with_subagents_enabled(true)
+        .with_background_workflows_enabled(true)
+        .with_prompt_audience(audience);
+        if let Some(enabled) = active_messages {
+            builder = builder.with_active_agent_messages_enabled(enabled);
+        }
+        builder
+            .build()
+            .await
+            .expect("agent with root-gated tools should build")
+            .tool_definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect()
+    }
+    #[tokio::test]
+    async fn active_agent_messages_require_explicit_root_opt_in() {
+        use xai_grok_tools::implementations::grok_build::send_subagent_message::SendSubagentMessageTool;
+        for enabled in [None, Some(false), Some(true)] {
+            for predeclared in [false, true] {
+                let mut definition = AgentDefinition::default_grok_build();
+                if predeclared {
+                    definition
+                        .tool_config
+                        .tools
+                        .push((&SendSubagentMessageTool).into());
+                }
+                let names =
+                    root_gated_tool_names(definition, PromptAudience::Primary, enabled).await;
+                assert_eq!(
+                    names
+                        .iter()
+                        .filter(|name| *name == "send_subagent_message")
+                        .count(),
+                    usize::from(enabled == Some(true))
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn active_agent_messages_respect_curated_toolsets() {
+        use xai_grok_tools::implementations::grok_build::send_subagent_message::SendSubagentMessageTool;
+        let mut definition = AgentDefinition::default_grok_build();
+        definition.inject_default_tools = false;
+        let baseline =
+            root_gated_tool_names(definition.clone(), PromptAudience::Primary, Some(false)).await;
+        let enabled =
+            root_gated_tool_names(definition.clone(), PromptAudience::Primary, Some(true)).await;
+        assert_eq!(enabled, baseline);
+        assert!(!enabled.iter().any(|name| name == "send_subagent_message"));
+        definition
+            .tool_config
+            .tools
+            .push((&SendSubagentMessageTool).into());
+        let names = root_gated_tool_names(definition, PromptAudience::Primary, Some(true)).await;
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == "send_subagent_message")
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn root_only_tools_are_removed_from_every_child_profile() {
+        for definition in [
+            AgentDefinition::default_grok_build(),
+            AgentDefinition::general_purpose(),
+            AgentDefinition::codex(),
+        ] {
+            let names =
+                root_gated_tool_names(definition, PromptAudience::Subagent, Some(true)).await;
+            for root_only in ["workflow", "ask_user_question", "send_subagent_message"] {
+                assert!(
+                    !names.iter().any(|name| name == root_only),
+                    "child exposed {root_only}: {names:?}"
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn custom_child_toolsets_cannot_reintroduce_root_only_tools() {
+        use xai_grok_tools::implementations::grok_build::send_subagent_message::SendSubagentMessageTool;
+        use xai_grok_tools::implementations::grok_build::{
+            AskUserQuestionTool, ReadFileTool, WorkflowTool,
+        };
+        use xai_grok_tools::registry::types::ToolConfig;
+        let mut definition = AgentDefinition::general_purpose();
+        definition.inject_default_tools = false;
+        definition.tool_config.tools = vec![
+            (&ReadFileTool).into(),
+            (&WorkflowTool).into(),
+            (&AskUserQuestionTool).into(),
+            (&SendSubagentMessageTool).into(),
+            ToolConfig::from_id("GrokBuild:workflow"),
+            ToolConfig::from_id("GrokBuild:ask_user_question"),
+            ToolConfig::from_id("GrokBuild:send_subagent_message"),
+        ];
+        let names = root_gated_tool_names(definition, PromptAudience::Subagent, Some(true)).await;
+        assert!(names.iter().any(|name| name == "read_file"));
+        for root_only in ["workflow", "ask_user_question", "send_subagent_message"] {
+            assert!(!names.iter().any(|name| name == root_only));
+        }
+    }
+    #[tokio::test]
+    async fn child_root_tool_gates_preserve_unrelated_tools() {
+        let definition = AgentDefinition::default_grok_build();
+        let primary =
+            root_gated_tool_names(definition.clone(), PromptAudience::Primary, Some(true)).await;
+        let child = root_gated_tool_names(definition, PromptAudience::Subagent, Some(true)).await;
+        for root_only in ["workflow", "ask_user_question", "send_subagent_message"] {
+            assert!(primary.iter().any(|name| name == root_only));
+        }
+        let lost: Vec<&str> = primary
+            .iter()
+            .filter(|name| !child.contains(name))
+            .map(String::as_str)
+            .collect();
+        assert!(
+            lost.iter().all(|name| [
+                "workflow",
+                "ask_user_question",
+                "send_subagent_message",
+                "enter_plan_mode",
+                "exit_plan_mode"
+            ]
+            .contains(name)),
+            "unexpected child tool loss: {lost:?}"
+        );
+        assert!(child.iter().all(|name| primary.contains(name)));
+    }
+    #[test]
+    fn disabled_workflows_strip_kindless_configs() {
+        use xai_grok_tools::registry::types::{ToolConfig, ToolServerConfig};
+        let mut config = ToolServerConfig {
+            tools: vec![
+                ToolConfig::from_id("GrokBuild:workflow"),
+                ToolConfig::from_id("GrokBuild:read_file"),
+            ],
+            behavior_preset: None,
+        };
+        apply_workflow_tool_gates(&mut config, false);
+        assert_eq!(config.tools.len(), 1);
+        assert_eq!(config.tools[0].id, "GrokBuild:read_file");
+    }
     fn entry(name: &str, desc: &str, source: SubagentSource) -> SubagentEntry {
         SubagentEntry {
             name: name.to_string(),
@@ -1842,8 +2036,8 @@ mod tests {
                 "[{label}] subagent must not expose plan-mode lifecycle tools: {names:?}"
             );
             assert!(
-                names.contains(&"ask_user_question"),
-                "[{label}] stripping plan mode must preserve independently enabled ask-user: {names:?}"
+                !names.contains(&"ask_user_question"),
+                "[{label}] subagent must not expose root-only human questions: {names:?}"
             );
         }
     }

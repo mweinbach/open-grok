@@ -226,6 +226,11 @@ pub fn apply_child_tool_policy(
     capability_mode: Option<SubagentCapabilityMode>,
     allow_nested_subagents: bool,
 ) {
+    definition.tool_config.tools.retain(|tool| {
+        !xai_grok_tools::implementations::grok_build::workflow::is_workflow_tool(
+            tool.kind, &tool.id,
+        )
+    });
     if let Some(mode) = capability_mode {
         mode.filter_tool_config(&mut definition.tool_config);
     }
@@ -305,6 +310,47 @@ pub async fn render_subagent_initial_user_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn general_purpose_definition_omits_workflow() {
+        let definition = AgentDefinition::general_purpose();
+        assert!(definition.tool_config.tools.iter().all(|tool| {
+            !xai_grok_tools::implementations::grok_build::workflow::is_workflow_tool(
+                tool.kind, &tool.id,
+            )
+        }));
+        assert!(
+            definition
+                .tool_config
+                .tools
+                .iter()
+                .any(|tool| tool.kind == Some(ToolKind::Read))
+        );
+    }
+    #[test]
+    fn child_tool_policy_strips_typed_and_kindless_workflows_only() {
+        use xai_grok_tools::implementations::grok_build::WorkflowTool;
+        use xai_grok_tools::registry::types::ToolConfig;
+        let mut definition = AgentDefinition::general_purpose();
+        let expected: Vec<_> = definition
+            .tool_config
+            .tools
+            .iter()
+            .map(|tool| tool.id.clone())
+            .collect();
+        definition.tool_config.tools.extend([
+            (&WorkflowTool).into(),
+            ToolConfig::from_id("GrokBuild:workflow"),
+            ToolConfig::from_id("workflow"),
+        ]);
+        apply_child_tool_policy(&mut definition, None, true);
+        let actual: Vec<_> = definition
+            .tool_config
+            .tools
+            .iter()
+            .map(|tool| tool.id.clone())
+            .collect();
+        assert_eq!(actual, expected);
+    }
     fn context<'a>(
         cwd: &'a Path,
         toggles: &'a HashMap<String, bool>,

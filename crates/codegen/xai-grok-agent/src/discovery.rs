@@ -199,7 +199,7 @@ pub(crate) fn user_agent_dirs(
 
 pub fn discover(cwd: &Path) -> Vec<AgentDefinition> {
     let grok = xai_grok_config::user_grok_home();
-    discover_with_home(cwd, dirs::home_dir().as_deref(), grok.as_deref())
+    discover_with_home(cwd, xai_dirs::home_dir().as_deref(), grok.as_deref())
 }
 
 fn discover_with_home(
@@ -226,7 +226,7 @@ fn discover_with_home(
 /// Checks built-ins first, then user-level dirs, then bundled.
 pub fn by_name(name: &str) -> Option<AgentDefinition> {
     let grok = xai_grok_config::user_grok_home();
-    by_name_with_home(name, dirs::home_dir().as_deref(), grok.as_deref())
+    by_name_with_home(name, xai_dirs::home_dir().as_deref(), grok.as_deref())
 }
 
 fn by_name_with_home(
@@ -262,7 +262,7 @@ fn by_name_with_home(
 /// to built-ins, user-level, and finally bundled definitions.
 pub fn by_name_in_cwd(name: &str, cwd: &Path) -> Option<AgentDefinition> {
     let grok = xai_grok_config::user_grok_home();
-    by_name_in_cwd_with_home(name, cwd, dirs::home_dir().as_deref(), grok.as_deref())
+    by_name_in_cwd_with_home(name, cwd, xai_dirs::home_dir().as_deref(), grok.as_deref())
 }
 
 fn by_name_in_cwd_with_home(
@@ -310,6 +310,43 @@ fn source_from_agent_def(def: &AgentDefinition) -> ConfigSource {
 
 // ── Plugin-aware variants ─────────────────────────────────────────────
 
+#[derive(Debug)]
+pub struct PluginAgent {
+    pub qualified_name: String,
+    pub scope: AgentScope,
+    pub definition: AgentDefinition,
+}
+
+pub fn plugin_agents(registry: &crate::plugins::PluginRegistry) -> Vec<PluginAgent> {
+    let mut agents = Vec::new();
+    for plugin in registry.enabled_plugins() {
+        for agent_dir in &plugin.agent_dirs {
+            let Ok(entries) = std::fs::read_dir(agent_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+                    continue;
+                }
+                let Some(definition) = load_plugin_agent_definition(plugin, &path) else {
+                    continue;
+                };
+                let scope = match plugin.scope {
+                    crate::plugins::PluginScope::Project => AgentScope::Project,
+                    _ => AgentScope::User,
+                };
+                agents.push(PluginAgent {
+                    qualified_name: format!("{}:{}", plugin.name, definition.name),
+                    scope,
+                    definition,
+                });
+            }
+        }
+    }
+    agents
+}
+
 /// Build the complete list of enabled subagents, including plugin agents.
 pub fn all_subagents_with_plugins(
     cwd: &Path,
@@ -321,7 +358,7 @@ pub fn all_subagents_with_plugins(
         cwd,
         toggle,
         plugins,
-        dirs::home_dir().as_deref(),
+        xai_dirs::home_dir().as_deref(),
         grok.as_deref(),
     )
 }
@@ -338,52 +375,24 @@ fn all_subagents_with_plugins_and_home(
 
     // Append plugin agents under qualified names
     if let Some(registry) = plugins {
-        for plugin in registry.enabled_plugins() {
-            for agent_dir in &plugin.agent_dirs {
-                if !agent_dir.is_dir() {
-                    continue;
-                }
-                let agent_entries = match std::fs::read_dir(agent_dir) {
-                    Ok(entries) => entries,
-                    Err(_) => continue,
-                };
-                for entry in agent_entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                        continue;
-                    }
-                    // Use frontmatter-only parsing for untrusted plugins.
-                    let Some(def) = load_plugin_agent_definition(plugin, &path) else {
-                        continue;
-                    };
-
-                    let qualified_name = format!("{}:{}", plugin.name, def.name);
-
-                    // Skip if a native entry already has this qualified name
-                    if entries.iter().any(|e| e.name == qualified_name) {
-                        continue;
-                    }
-
-                    // Map plugin scope to agent scope
-                    let agent_scope = match plugin.scope {
-                        crate::plugins::PluginScope::Project => AgentScope::Project,
-                        crate::plugins::PluginScope::User => AgentScope::User,
-                        _ => AgentScope::User,
-                    };
-
-                    let config_source = ConfigSource::Plugin {
-                        plugin_name: plugin.name.clone(),
-                        path: path.clone(),
-                    };
-                    entries.push(SubagentEntry {
-                        name: qualified_name,
-                        description: def.description,
-                        source: SubagentSource::UserDefined { scope: agent_scope },
-                        shadows_builtin: None,
-                        config_source,
-                    });
-                }
+        for agent in plugin_agents(registry) {
+            if entries
+                .iter()
+                .any(|entry| entry.name == agent.qualified_name)
+            {
+                continue;
             }
+            if !toggle.get(&agent.qualified_name).copied().unwrap_or(true) {
+                continue;
+            }
+            let config_source = source_from_agent_def(&agent.definition);
+            entries.push(SubagentEntry {
+                name: agent.qualified_name,
+                description: agent.definition.description,
+                source: SubagentSource::UserDefined { scope: agent.scope },
+                shadows_builtin: None,
+                config_source,
+            });
         }
     }
 
@@ -404,7 +413,7 @@ pub fn by_name_in_cwd_with_plugins(
         name,
         cwd,
         plugins,
-        dirs::home_dir().as_deref(),
+        xai_dirs::home_dir().as_deref(),
         grok.as_deref(),
     )
 }
@@ -1369,6 +1378,54 @@ mod tests {
         assert_eq!(def.scope, AgentScope::Bundled);
         assert_eq!(def.description, "Bundled reviewer");
         assert!(def.plugin_name.is_none());
+    }
+
+    #[test]
+    fn plugin_agent_catalog_uses_qualified_toggles_and_preserves_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("workspace");
+        let home = directory.path().join("home");
+        let agents = directory.path().join("plugin/agents");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&agents).unwrap();
+        write_agent_file(&agents, "reviewer.md", "reviewer", "Plugin reviewer");
+        let registry =
+            make_plugin_registry("plugin-one", PluginScope::Project, vec![agents.clone()]);
+        let catalog = plugin_agents(&registry);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].qualified_name, "plugin-one:reviewer");
+        assert_eq!(catalog[0].scope, AgentScope::Project);
+        assert_eq!(
+            catalog[0].definition.plugin_name.as_deref(),
+            Some("plugin-one")
+        );
+        assert_eq!(
+            catalog[0].definition.source_path.as_ref(),
+            Some(&agents.join("reviewer.md"))
+        );
+        for (toggle, visible) in [
+            (HashMap::new(), true),
+            (HashMap::from([("reviewer".to_owned(), false)]), true),
+            (
+                HashMap::from([("plugin-one:reviewer".to_owned(), false)]),
+                false,
+            ),
+        ] {
+            let entries = all_subagents_with_plugins_and_home(
+                &cwd,
+                &toggle,
+                Some(&registry),
+                Some(&home),
+                Some(&home.join(".opengrok")),
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .any(|entry| entry.name == "plugin-one:reviewer"),
+                visible
+            );
+        }
     }
 
     #[test]

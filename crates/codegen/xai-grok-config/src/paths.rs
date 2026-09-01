@@ -26,8 +26,7 @@ const CLAUDE_MANAGED_SETTINGS_PATH: &str = "/etc/claude-code/managed-settings.js
 /// Keep the dunce canonicalization in sync with the hand-rolled duplicate in
 /// `xai_fast_worktree::db::resolve_grok_home` (deliberately standalone crate).
 pub fn default_grok_home() -> PathBuf {
-    #[allow(deprecated)]
-    let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let home = xai_dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     dunce::canonicalize(&home).unwrap_or(home).join(".opengrok")
 }
 
@@ -35,11 +34,7 @@ pub fn default_grok_home() -> PathBuf {
 pub fn grok_home() -> PathBuf {
     OPENGROK_HOME
         .get_or_init(|| {
-            let grok_home = if let Ok(v) = std::env::var("OPENGROK_HOME") {
-                PathBuf::from(v)
-            } else {
-                default_grok_home()
-            };
+            let grok_home = resolve_grok_home().unwrap_or_else(default_grok_home);
             let _ = std::fs::create_dir_all(&grok_home);
             grok_home
         })
@@ -52,9 +47,41 @@ pub fn grok_home() -> PathBuf {
 /// that *scan* user-global grok resources (hooks, marketplace sources, ...) don't
 /// mistake a project's `.opengrok` tree for the user-global one when no home resolves.
 pub fn user_grok_home() -> Option<PathBuf> {
-    #[allow(deprecated)]
-    let resolvable = std::env::var_os("OPENGROK_HOME").is_some() || std::env::home_dir().is_some();
-    resolvable.then(grok_home)
+    resolve_grok_home().is_some().then(grok_home)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokHomeSource {
+    EnvOverride,
+    HomeDefault,
+}
+
+fn resolve_grok_home_from(
+    home_override: Option<&std::ffi::OsStr>,
+    home: Option<&std::path::Path>,
+) -> Option<(PathBuf, GrokHomeSource)> {
+    if let Some(home_override) = home_override.filter(|value| !value.is_empty()) {
+        return Some((PathBuf::from(home_override), GrokHomeSource::EnvOverride));
+    }
+    home.map(|home| {
+        (
+            dunce::canonicalize(home)
+                .unwrap_or_else(|_| home.to_path_buf())
+                .join(".opengrok"),
+            GrokHomeSource::HomeDefault,
+        )
+    })
+}
+
+pub fn resolve_grok_home() -> Option<PathBuf> {
+    resolve_grok_home_with_source().map(|(home, _)| home)
+}
+
+pub fn resolve_grok_home_with_source() -> Option<(PathBuf, GrokHomeSource)> {
+    resolve_grok_home_from(
+        std::env::var_os("OPENGROK_HOME").as_deref(),
+        xai_dirs::home_dir().as_deref(),
+    )
 }
 
 /// Canonical Open Grok application path: `$OPENGROK_HOME/bin/open-grok` (Unix) or
@@ -267,6 +294,37 @@ fn slugify(input: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn home_override_is_verbatim_and_empty_override_uses_namespaced_default() {
+        let home = tempfile::tempdir().unwrap();
+        let override_path = home.path().join("unresolved").join("..").join("state");
+        assert_eq!(
+            super::resolve_grok_home_from(Some(override_path.as_os_str()), Some(home.path())),
+            Some((override_path, super::GrokHomeSource::EnvOverride))
+        );
+        assert_eq!(
+            super::resolve_grok_home_from(Some(std::ffi::OsStr::new("")), Some(home.path())),
+            Some((
+                dunce::canonicalize(home.path()).unwrap().join(".opengrok"),
+                super::GrokHomeSource::HomeDefault,
+            ))
+        );
+        assert_eq!(super::resolve_grok_home_from(None, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_override_preserves_non_unicode_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        let override_path = std::ffi::OsStr::from_bytes(b"/tmp/opengrok-\xff");
+        assert_eq!(
+            super::resolve_grok_home_from(Some(override_path), None),
+            Some((
+                std::path::PathBuf::from(override_path),
+                super::GrokHomeSource::EnvOverride
+            ))
+        );
+    }
     use super::*;
     use tempfile::TempDir;
 

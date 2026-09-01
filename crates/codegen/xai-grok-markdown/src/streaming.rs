@@ -315,6 +315,9 @@ impl StreamingMarkdownRenderer {
         self.output
             .hyperlinks
             .retain(|h| h.line_index < self.frozen.lines_len);
+        self.output
+            .tables
+            .retain(|table| table.line_index < self.frozen.lines_len);
         // Discard stale tail code-block spans (keep frozen ones — those whose
         // body lies entirely within the frozen prefix). A still-open fence in
         // the tail has no span at all, so spans become stable only once frozen.
@@ -370,6 +373,12 @@ impl StreamingMarkdownRenderer {
             .extend(tail_output.hyperlinks.into_iter().map(|mut h| {
                 h.line_index += frozen_lines;
                 h
+            }));
+        self.output
+            .tables
+            .extend(tail_output.tables.into_iter().map(|mut table| {
+                table.line_index += frozen_lines;
+                table
             }));
 
         // Append tail code-block spans, rebasing their tail-relative ranges to
@@ -1566,6 +1575,37 @@ Final paragraph with no trailing newline."#;
             &["```rust\nfn main() {}\n```\n\n\n", "Paragraph\n\n"],
             "code block triple newline",
         );
+    }
+
+    #[test]
+    fn table_copy_metadata_matches_full_render_after_streaming_and_resize() {
+        let source = "Intro\n\n| Name | Value |\n| --- | --- |\n| Test | foo/bar and long prose |\n\nTail\n\n| Next | Link |\n| --- | --- |\n| Row | https://example.com/long/path |\n\n";
+        let mut streamed = StreamingMarkdownRenderer::new(test_style::STYLE, true);
+        streamed.set_max_table_width(Some(28));
+        for chunk in split_into_chunks(source, 3) {
+            streamed.push_and_render(chunk, None);
+        }
+        let mut full = StreamingMarkdownRenderer::new(test_style::STYLE, true);
+        full.set_max_table_width(Some(28));
+        full.push_and_render(source, None);
+        full.finish(None);
+        assert_eq!(streamed.view().tables, full.view().tables);
+        assert_eq!(streamed.view().tables.len(), 2);
+        assert_eq!(
+            streamed.view().tables[0].cells[3].text,
+            "foo/bar and long prose"
+        );
+        assert_eq!(
+            streamed.view().tables[1].cells[3].text,
+            "https://example.com/long/path"
+        );
+        streamed.set_max_table_width(Some(48));
+        streamed.render(None);
+        full.set_max_table_width(Some(48));
+        full.finish(None);
+        assert_eq!(streamed.view().tables, full.view().tables);
+        let before_finish = streamed.view().tables.to_vec();
+        assert_eq!(streamed.finish(None).tables, before_finish);
     }
 
     #[test]

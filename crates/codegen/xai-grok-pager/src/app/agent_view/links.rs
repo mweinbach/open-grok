@@ -119,10 +119,19 @@ impl AgentView {
             self.push_cta_link_span(link_spans_out, self.hit_upgrade_cta.rect, url);
         }
     }
-    /// Emit an OSC 8 hyperlink span over a CTA button `rect` when armed (draw
-    /// already suppressed it under prompt dropdowns) and no frame occluder
-    /// covers it (same drop-whole rule as the scrollback spans — e.g. the
-    /// goal-detail overlay can reach the top/bottom rows on short terminals).
+    pub(super) fn push_status_line_link_spans(
+        &self,
+        link_spans_out: &mut Vec<xai_ratatui_inline::LinkSpan>,
+        status_line_spans: Vec<xai_ratatui_inline::LinkSpan>,
+    ) {
+        for span in status_line_spans {
+            let width = span.col_end.saturating_sub(span.col_start);
+            let row = ratatui::layout::Rect::new(span.col_start, span.row, width, 1);
+            if !self.rect_occluded(row) {
+                link_spans_out.push(span);
+            }
+        }
+    }
     fn push_cta_link_span(
         &self,
         link_spans_out: &mut Vec<xai_ratatui_inline::LinkSpan>,
@@ -367,6 +376,7 @@ mod link_click_tests {
             screen_x: 0,
             selectable_cols: 0..40,
             text: "selectable scrollback line for drag selection".into(),
+            painted_region: None,
             joiner_to_previous: None,
         });
         agent.update_scrollback_selection_state(model, Default::default());

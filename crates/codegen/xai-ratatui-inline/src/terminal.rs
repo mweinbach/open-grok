@@ -40,7 +40,7 @@ struct LinkRef {
 }
 
 struct LastNamedOsc8 {
-    source_id: u32,
+    source_id: Option<u32>,
     url: Arc<str>,
     osc8_id: u32,
 }
@@ -85,19 +85,15 @@ fn next_osc8_id(
     last_named: &mut Option<LastNamedOsc8>,
     next: &mut u32,
 ) -> Option<u32> {
-    let Some(source_id) = span.id else {
-        *last_named = None;
-        return None;
-    };
     if let Some(last) = last_named.as_ref()
-        && last.source_id == source_id
+        && last.source_id == span.id
         && last.url.as_ref() == span.url.as_ref()
     {
         return Some(last.osc8_id);
     }
     *next = next.saturating_add(1);
     *last_named = Some(LastNamedOsc8 {
-        source_id,
+        source_id: span.id,
         url: Arc::clone(&span.url),
         osc8_id: *next,
     });
@@ -1357,6 +1353,35 @@ impl<B: Backend> Terminal<B> {
     }
 
     /// HACK: this is made pub
+    pub fn set_viewport(&mut self, viewport: Viewport) -> io::Result<()> {
+        let area = match viewport {
+            Viewport::Fullscreen | Viewport::Inline(_) => {
+                Rect::from((Position::ORIGIN, self.backend.size()?))
+            }
+            Viewport::Fixed(area) => area,
+        };
+        let (viewport_area, cursor_pos) = match viewport {
+            Viewport::Fullscreen => (area, Position::ORIGIN),
+            Viewport::Inline(height) => {
+                compute_inline_size(&mut self.backend, height, area.as_size(), 0)?
+            }
+            Viewport::Fixed(area) => (area, area.as_position()),
+        };
+        let link_len = (viewport_area.width as usize) * (viewport_area.height as usize);
+        self.viewport = viewport;
+        self.viewport_area = viewport_area;
+        self.last_known_area = area;
+        self.last_known_cursor_pos = cursor_pos;
+        self.buffers = [Buffer::empty(viewport_area), Buffer::empty(viewport_area)];
+        self.current = 0;
+        for layer in self.link_ids.iter_mut() {
+            layer.clear();
+            layer.resize(link_len, 0);
+        }
+        self.link_tables[0].clear();
+        self.link_tables[1].clear();
+        Ok(())
+    }
     pub fn set_viewport_area(&mut self, area: Rect) {
         self.buffers[self.current].resize(area);
         self.buffers[1 - self.current].resize(area);
@@ -1433,6 +1458,34 @@ mod inline_resize_tests {
 
     /// Growth after a shrink must expand again — the viewport tracks the live
     /// terminal size in both directions, repeatedly.
+    #[test]
+    fn set_viewport_round_trips_fullscreen_and_inline() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 24),
+            TerminalOptions {
+                viewport: Viewport::Fullscreen,
+            },
+        )
+        .unwrap();
+        assert_eq!(terminal.viewport_area(), Rect::new(0, 0, 80, 24));
+        terminal.set_viewport(Viewport::Inline(10)).unwrap();
+        let inline_area = terminal.viewport_area();
+        assert_eq!(inline_area.width, 80);
+        assert_eq!(inline_area.height, 10);
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                assert_eq!(area.height, 10);
+            })
+            .unwrap();
+        terminal.set_viewport(Viewport::Fullscreen).unwrap();
+        assert_eq!(terminal.viewport_area(), Rect::new(0, 0, 80, 24));
+        terminal
+            .draw(|frame| {
+                assert_eq!(frame.area(), Rect::new(0, 0, 80, 24));
+            })
+            .unwrap();
+    }
     #[test]
     fn inline_full_height_tracks_across_shrink_then_grow() {
         let mut terminal = full_height_inline(80, 30);

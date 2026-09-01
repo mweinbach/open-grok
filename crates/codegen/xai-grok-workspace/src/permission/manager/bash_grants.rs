@@ -112,6 +112,10 @@ pub(super) fn bash_grant_segments(cmd: &str) -> Vec<String> {
 /// the injection floor via the raw key.
 pub(super) fn persist_bash_always_allow(state: &mut PermissionState, cmd: &str, prefix: &str) {
     let Some(h) = primary_command_from_script(cmd) else {
+        tracing::warn!(
+            %prefix,
+            "always-allow selected for a script with no primary command; no grant persisted"
+        );
         return;
     };
     let words = &h.highlighted_words;
@@ -122,6 +126,11 @@ pub(super) fn persist_bash_always_allow(state: &mut PermissionState, cmd: &str, 
         state.allowed_bash_commands.insert(prefix.to_owned());
     } else if h.prefix.is_empty() && h.suffix.is_empty() && words.join(" ") == prefix {
         state.allowed_bash_commands.insert(cmd.to_owned());
+    } else {
+        tracing::warn!(
+            %prefix,
+            "always-allow label did not verify against the primary command; no grant persisted"
+        );
     }
 }
 
@@ -285,8 +294,8 @@ mod tests {
         let h = primary_command_from_script(CMD).unwrap();
         assert_eq!(h.highlighted_words.len(), 5);
         assert!(always_allow_scope_persists(&h, 3)); // `git show -e`
-        assert!(!always_allow_scope_persists(&h, 4)); // `git show -e A B` — ambiguous
-        assert!(always_allow_scope_persists(&h, 5)); // full command → raw fallback
+        assert!(!always_allow_scope_persists(&h, 4)); // `git show -e A B`, ambiguous
+        assert!(always_allow_scope_persists(&h, 5)); // The full command persists via the raw fallback
 
         // Cross-check against the real persist path for every scope.
         for n in 1..=h.highlighted_words.len() {
@@ -399,6 +408,9 @@ mod tests {
         // though the WIDEST join is argv-ambiguous.
         assert!(always_allow_row_is_effective(
             r#"terraform plan -var "x=1 2" | head"#
+        ));
+        assert!(always_allow_row_is_effective(
+            "cargo test --lib && echo done"
         ));
     }
 

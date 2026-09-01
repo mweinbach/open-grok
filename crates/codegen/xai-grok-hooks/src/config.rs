@@ -125,17 +125,54 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 5;
 
 pub const DEFAULT_TIMEOUT_MS: u64 = DEFAULT_TIMEOUT_SECS * 1000;
 
-/// Stop gates run real verification (builds, tests) and fail open on timeout, so
-/// the short observe default would silently disable a ported stop policy.
-pub const DEFAULT_STOP_GATE_TIMEOUT_SECS: u64 = 600;
+pub const DEFAULT_VERIFICATION_GATE_TIMEOUT_SECS: u64 = 600;
 
-pub const DEFAULT_STOP_GATE_TIMEOUT_MS: u64 = DEFAULT_STOP_GATE_TIMEOUT_SECS * 1000;
+pub const DEFAULT_VERIFICATION_GATE_TIMEOUT_MS: u64 = DEFAULT_VERIFICATION_GATE_TIMEOUT_SECS * 1000;
+
+pub const DEFAULT_PROMPT_GATE_TIMEOUT_SECS: u64 = 30;
+
+pub const DEFAULT_PROMPT_GATE_TIMEOUT_MS: u64 = DEFAULT_PROMPT_GATE_TIMEOUT_SECS * 1000;
+
+pub const SESSION_END_HOOK_BUDGET_DEFAULT_MS: u64 = 1_500;
+pub const SESSION_END_HOOK_BUDGET_MAX_MS: u64 = 60_000;
+
+fn resolve_session_end_default(value: Option<&str>) -> u64 {
+    let Some(value) = value else {
+        return SESSION_END_HOOK_BUDGET_DEFAULT_MS;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(ms) if ms > 0 => ms.min(SESSION_END_HOOK_BUDGET_MAX_MS),
+        _ => {
+            tracing::warn!(
+                value,
+                "GROK_SESSION_END_HOOKS_TIMEOUT_MS must be a positive integer; using default {}ms",
+                SESSION_END_HOOK_BUDGET_DEFAULT_MS
+            );
+            SESSION_END_HOOK_BUDGET_DEFAULT_MS
+        }
+    }
+}
+
+fn session_end_default_timeout_ms() -> u64 {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        resolve_session_end_default(
+            std::env::var("GROK_SESSION_END_HOOKS_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
 
 fn default_timeout_ms(event: crate::event::HookEventName) -> u64 {
-    if event.traits().gate == crate::event::GateKind::Stop {
-        DEFAULT_STOP_GATE_TIMEOUT_MS
-    } else {
-        DEFAULT_TIMEOUT_MS
+    use crate::event::GateKind;
+    if event == crate::event::HookEventName::SessionEnd {
+        return session_end_default_timeout_ms();
+    }
+    match event.traits().gate {
+        GateKind::Stop | GateKind::PostTool => DEFAULT_VERIFICATION_GATE_TIMEOUT_MS,
+        GateKind::Prompt => DEFAULT_PROMPT_GATE_TIMEOUT_MS,
+        GateKind::Observe | GateKind::Tool => DEFAULT_TIMEOUT_MS,
     }
 }
 
@@ -220,8 +257,12 @@ pub fn expand_env_vars_with_extra_skipping_runner_vars(
     crate::env_expand::expand_env_vars_with_process_skip(input, extra, RUNNER_ALWAYS_SET_ENV)
 }
 
-/// Namespace prefixes stamped on hook names, matched by [`hook_origin`]. Shared
-/// so a rename can't silently reclassify a tier.
+impl HookSpec {
+    pub fn is_managed_policy(&self) -> bool {
+        self.layer.is_managed_policy()
+    }
+}
+
 pub const GLOBAL_HOOK_PREFIX: &str = "global/";
 pub const PROJECT_HOOK_PREFIX: &str = "project/";
 pub const PLUGIN_HOOK_PREFIX: &str = "plugin/";
@@ -247,7 +288,7 @@ pub fn hook_origin(spec: &HookSpec) -> HookOrigin {
     match spec.layer {
         HookProvenance::SystemManaged => HookOrigin::SystemManaged,
         HookProvenance::Managed => HookOrigin::Managed,
-        HookProvenance::Requirements => HookOrigin::Requirements,
+        HookProvenance::Requirements | HookProvenance::UserRequirements => HookOrigin::Requirements,
         HookProvenance::User => HookOrigin::UserConfig,
         HookProvenance::Plugin => HookOrigin::Plugin,
         HookProvenance::Unknown => HookOrigin::Unknown,
@@ -267,6 +308,40 @@ pub fn hook_origin(spec: &HookSpec) -> HookOrigin {
             }
         }
     }
+}
+
+pub fn hook_display_name(qualified: &str) -> &str {
+    let source = strip_spec_path(qualified);
+    match source {
+        "user" | "requirements/user" => "a user hook",
+        "managed" => "a managed hook",
+        "system_managed" | "requirements/system" => "a managed policy hook",
+        _ => source,
+    }
+}
+
+fn strip_spec_path(qualified: &str) -> &str {
+    match qualified.rsplit_once(':') {
+        Some((source, tail)) if !source.is_empty() && is_spec_path(tail) => source,
+        _ => qualified,
+    }
+}
+
+fn is_spec_path(tail: &str) -> bool {
+    let Some((event, indices)) = tail.split_once('[') else {
+        return false;
+    };
+    let Some((event_idx, hook_idx)) = indices.split_once("].hooks[") else {
+        return false;
+    };
+    let Some(hook_idx) = hook_idx.strip_suffix(']') else {
+        return false;
+    };
+    let is_index = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    !event.is_empty()
+        && event.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        && is_index(event_idx)
+        && is_index(hook_idx)
 }
 
 /// Parse hooks from a JSON value (e.g. from agent definition frontmatter).
@@ -531,12 +606,17 @@ fn build_one_spec(
     compiled_matcher: Option<HookMatcher>,
     ctx: &SpecContext<'_>,
 ) -> Result<HookSpec, HookError> {
-    let timeout_ms = handler
-        .timeout
-        // Untrusted config value: saturate rather than overflow (debug panic /
-        // release wrap) on an absurd timeout.
-        .map(|secs| secs.saturating_mul(1000))
-        .unwrap_or(default_timeout_ms(event));
+    let timeout_ms = match handler.timeout {
+        None | Some(0) => default_timeout_ms(event),
+        Some(secs) => {
+            let ms = secs.saturating_mul(1000);
+            if event == crate::event::HookEventName::SessionEnd {
+                ms.min(SESSION_END_HOOK_BUDGET_MAX_MS)
+            } else {
+                ms
+            }
+        }
+    };
 
     let mut extra_env: HashMap<String, String> = handler.env;
     strip_reserved_env_keys(&mut extra_env, &name, ctx.error_path);
@@ -617,6 +697,111 @@ fn strip_reserved_env_keys(
 mod tests {
     use super::*;
     use crate::test_support::with_env_var;
+
+    #[test]
+    fn is_managed_policy_covers_root_owned_tiers_only() {
+        fn expected(layer: HookProvenance) -> bool {
+            match layer {
+                HookProvenance::SystemManaged | HookProvenance::Requirements => true,
+                HookProvenance::Managed
+                | HookProvenance::UserRequirements
+                | HookProvenance::User
+                | HookProvenance::File
+                | HookProvenance::Plugin
+                | HookProvenance::Unknown => false,
+            }
+        }
+        for layer in [
+            HookProvenance::SystemManaged,
+            HookProvenance::Managed,
+            HookProvenance::Requirements,
+            HookProvenance::UserRequirements,
+            HookProvenance::User,
+            HookProvenance::File,
+            HookProvenance::Plugin,
+            HookProvenance::Unknown,
+        ] {
+            assert_eq!(
+                layer.is_managed_policy(),
+                expected(layer),
+                "is_managed_policy wrong for {layer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_display_name_hides_config_paths() {
+        for (qualified, expected) in [
+            ("user:user_prompt_submit[0].hooks[0]", "a user hook"),
+            (
+                "requirements/user:user_prompt_submit[0].hooks[0]",
+                "a user hook",
+            ),
+            ("managed:pre_tool_use[2].hooks[1]", "a managed hook"),
+            (
+                "requirements/system:pre_tool_use[0].hooks[0]",
+                "a managed policy hook",
+            ),
+            (
+                "system_managed:user_prompt_submit[0].hooks[0]",
+                "a managed policy hook",
+            ),
+            (
+                "global/block-hihi:user_prompt_submit[0].hooks[0]",
+                "global/block-hihi",
+            ),
+            (
+                "agent:code-reviewer:user_prompt_submit[0].hooks[0]",
+                "agent:code-reviewer",
+            ),
+            ("client:cb-123", "client:cb-123"),
+            ("a hook", "a hook"),
+        ] {
+            assert_eq!(hook_display_name(qualified), expected, "for {qualified}");
+        }
+    }
+
+    #[test]
+    fn hook_display_name_tracks_stamped_names() {
+        let tiers = [
+            ("user", HookProvenance::User, "a user hook"),
+            (
+                "requirements/user",
+                HookProvenance::UserRequirements,
+                "a user hook",
+            ),
+            ("managed", HookProvenance::Managed, "a managed hook"),
+            (
+                "requirements/system",
+                HookProvenance::Requirements,
+                "a managed policy hook",
+            ),
+            (
+                "system_managed",
+                HookProvenance::SystemManaged,
+                "a managed policy hook",
+            ),
+        ];
+        for (source_name, provenance, expected) in tiers {
+            let layer = xai_grok_config::HookConfigLayer::new(
+                provenance,
+                source_name,
+                toml::from_str::<toml::Value>(
+                    "[[UserPromptSubmit]]\n[[UserPromptSubmit.hooks]]\ntype = \"command\"\ncommand = \"gate.sh\"\n",
+                )
+                .unwrap(),
+            );
+            let (specs, errors) = parse_hooks_from_config_layers(std::slice::from_ref(&layer));
+            assert!(errors.is_empty(), "{source_name}: {errors:?}");
+            let name = &specs[0].name;
+            assert_eq!(hook_display_name(name), expected, "for stamped name {name}");
+            assert_eq!(
+                expected == "a managed policy hook",
+                provenance.is_managed_policy(),
+                "{source_name}: copy must track the trust split"
+            );
+        }
+    }
 
     fn config_layer(source_name: &str, toml_src: &str) -> xai_grok_config::HookConfigLayer {
         let value: toml::Value = toml::from_str(toml_src).unwrap();
@@ -767,6 +952,7 @@ mod tests {
 
     #[test]
     fn parse_default_timeout() {
+        use crate::event::GateKind;
         let json = r#"{
             "hooks": {
                 "SessionEnd": [
@@ -777,18 +963,80 @@ mod tests {
                 ],
                 "SubagentStop": [
                     { "hooks": [{ "type": "command", "command": "sub.sh" }] }
+                ],
+                "PostToolUse": [
+                    { "hooks": [{ "type": "command", "command": "lint.sh" }] }
+                ],
+                "UserPromptSubmit": [
+                    { "hooks": [{ "type": "command", "command": "gate.sh" }] }
                 ]
             }
         }"#;
         let (specs, errors) = parse_hook_file(json, Path::new("/tmp/test.json"));
         assert!(errors.is_empty());
         for spec in &specs {
-            let expected = match spec.event {
-                HookEventName::Stop | HookEventName::SubagentStop => DEFAULT_STOP_GATE_TIMEOUT_MS,
-                _ => DEFAULT_TIMEOUT_MS,
+            let expected = if spec.event == crate::event::HookEventName::SessionEnd {
+                SESSION_END_HOOK_BUDGET_DEFAULT_MS
+            } else {
+                match spec.event.traits().gate {
+                    GateKind::Stop | GateKind::PostTool => DEFAULT_VERIFICATION_GATE_TIMEOUT_MS,
+                    GateKind::Prompt => DEFAULT_PROMPT_GATE_TIMEOUT_MS,
+                    GateKind::Observe | GateKind::Tool => DEFAULT_TIMEOUT_MS,
+                }
             };
             assert_eq!(spec.timeout_ms, expected, "event {}", spec.event);
         }
+    }
+
+    #[test]
+    fn resolve_session_end_default_parses_env() {
+        assert_eq!(
+            resolve_session_end_default(None),
+            SESSION_END_HOOK_BUDGET_DEFAULT_MS
+        );
+        assert_eq!(resolve_session_end_default(Some(" 2000 ")), 2000);
+        assert_eq!(
+            resolve_session_end_default(Some("0")),
+            SESSION_END_HOOK_BUDGET_DEFAULT_MS
+        );
+        assert_eq!(
+            resolve_session_end_default(Some("nope")),
+            SESSION_END_HOOK_BUDGET_DEFAULT_MS
+        );
+        assert_eq!(
+            resolve_session_end_default(Some("600000")),
+            SESSION_END_HOOK_BUDGET_MAX_MS
+        );
+    }
+
+    #[test]
+    fn zero_timeout_floors_to_event_default() {
+        let json = r#"{ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "s.sh", "timeout": 0 }] }] } }"#;
+        let (specs, errors) = parse_hook_file(json, Path::new("/tmp/test.json"));
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_ne!(specs[0].timeout_ms, 0);
+        assert_eq!(specs[0].timeout_ms, default_timeout_ms(specs[0].event));
+    }
+
+    #[test]
+    fn session_end_timeout_resolution() {
+        fn timeout_ms(handler_timeout: Option<u64>) -> u64 {
+            let handler = match handler_timeout {
+                Some(secs) => {
+                    format!(r#"{{ "type": "command", "command": "end.sh", "timeout": {secs} }}"#)
+                }
+                None => r#"{ "type": "command", "command": "end.sh" }"#.to_string(),
+            };
+            let json =
+                format!(r#"{{ "hooks": {{ "SessionEnd": [{{ "hooks": [{handler}] }}] }} }}"#);
+            let (specs, errors) = parse_hook_file(&json, Path::new("/tmp/test.json"));
+            assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+            specs[0].timeout_ms
+        }
+        assert_eq!(timeout_ms(None), SESSION_END_HOOK_BUDGET_DEFAULT_MS);
+        assert_eq!(timeout_ms(Some(10)), 10_000);
+        assert_eq!(timeout_ms(Some(120)), SESSION_END_HOOK_BUDGET_MAX_MS);
+        assert_eq!(timeout_ms(Some(0)), SESSION_END_HOOK_BUDGET_DEFAULT_MS);
     }
 
     #[test]

@@ -255,6 +255,13 @@ JS calls `await tools.search_replace(...)` etc. The exec tool description enumer
 
 Plan mode, hooks, and permission YOLO therefore apply equally to nested edits — see [editing.md](editing.md) and [agent-runtime.md](agent-runtime.md).
 
+The 1.0.13 hook integration also applies Ask/Defer decisions and post-tool
+output replacement to nested calls. Replacement occurs before the value is
+returned to V8. Additional hook context is buffered on the session and appended
+once after the outer transport result; it must not reorder history or expose
+the unredacted nested output. The transport remains hidden in the UI. Follow
+the migration ledger for the current validation status.
+
 ### 5.3 LocalSet channel
 
 V8 threads cannot call SessionActor directly. Flow:

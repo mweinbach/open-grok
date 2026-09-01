@@ -41,7 +41,10 @@ mod child_wait;
 pub use child_wait::{is_child_wait_identity_uncertain, spawn_child_reaper, wait_child_bounded};
 
 mod process_resources;
-pub use process_resources::{ProcessResources, sample_process_memory, sample_process_resources};
+pub use process_resources::{
+    ProcessCpu, ProcessResources, process_memory_limit, process_start_time, sample_process_cpu,
+    sample_process_memory, sample_process_resources,
+};
 
 mod process_scope;
 pub use process_scope::{ProcessScope, global_process_scope};
@@ -726,6 +729,33 @@ impl ProcessGroup {
         #[cfg(windows)]
         {
             self.terminate_job(1)
+        }
+    }
+
+    pub fn preserve_descendants(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            use std::mem::{size_of, zeroed};
+            use windows::Win32::System::JobObjects::{
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            };
+            let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+            unsafe {
+                SetInformationJobObject(
+                    self.job,
+                    JobObjectExtendedLimitInformation,
+                    (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            }
+            .map_err(|error| {
+                io::Error::other(format!("SetInformationJobObject(preserve): {error}"))
+            })
         }
     }
 

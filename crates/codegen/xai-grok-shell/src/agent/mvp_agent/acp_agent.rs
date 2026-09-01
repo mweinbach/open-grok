@@ -1607,6 +1607,7 @@ impl acp::Agent for MvpAgent {
                 respond_to: tx,
                 persist_ack: None,
                 parsed_prompt_tx,
+                initial_child_prompt_ready: None,
             })
             .map_err(|e| {
                 acp::Error::internal_error()
@@ -1648,6 +1649,7 @@ impl acp::Agent for MvpAgent {
                                 last_turn_usage: None,
                                 prompt_usage: None,
                                 cancellation_category: None,
+                                cancellation_context: None,
                                 cancel_trigger: None,
                                 structured_output: None,
                                 tool_overrides: applied_tool_overrides.clone(),
@@ -1672,20 +1674,20 @@ impl acp::Agent for MvpAgent {
                 .as_ref()
                 .map(|ok| ok.stop_reason)
                 .map_err(Clone::clone);
-            let (stop_reason_value, agent_result_value) = crate::sampling::error::prompt_complete_fields(
-                &mapped,
-            );
             let turn_id = arguments
                 .meta
                 .as_ref()
                 .and_then(|m| m.get("turnId"))
                 .and_then(|v| v.as_u64());
-            let mut payload = serde_json::json!({
-                "sessionId": arguments.session_id.to_string(),
-                "promptId": prompt_id.as_str(),
-                "stopReason": stop_reason_value,
-                "agentResult": agent_result_value,
-            });
+            let mut payload = crate::session::turn_completion::prompt_complete_payload(
+                &arguments.session_id, &prompt_id, &mapped,
+            );
+            if let Some(category) = stop_result.as_ref().ok().and_then(|ok| ok.completion_kind.cancellation_category_meta()) {
+                payload["cancellationCategory"] = serde_json::json!(category);
+            }
+            if let Some(context) = stop_result.as_ref().ok().and_then(|ok| ok.completion_kind.cancellation_context_meta()) {
+                payload["cancellationContext"] = context;
+            }
             if let Some(tid) = turn_id {
                 payload["turnId"] = serde_json::json!(tid);
             }
@@ -2204,19 +2206,8 @@ impl acp::Agent for MvpAgent {
                     }
                 }
                 let last_turn_usage = last_turn_usage_for_meta;
-                let cancellation_category = match &completion_kind {
-                    crate::session::commands::PromptCompletionKind::Cancelled {
-                        category: Some(cat),
-                        ..
-                    } => Some(format!("{cat:?}")),
-                    crate::session::commands::PromptCompletionKind::MaxTurnsReached {
-                        ..
-                    } => Some("max_turns_reached".to_string()),
-                    crate::session::commands::PromptCompletionKind::StationarityEnded => {
-                        Some("action_stationarity".to_string())
-                    }
-                    _ => None,
-                };
+                let cancellation_category = completion_kind.cancellation_category_meta();
+                let cancellation_context = completion_kind.cancellation_context_meta();
                 Ok(
                     acp::PromptResponse::new(stop_reason)
                         .meta(
@@ -2228,6 +2219,7 @@ impl acp::Agent for MvpAgent {
                                     last_turn_usage: last_turn_usage.as_ref(),
                                     prompt_usage,
                                     cancellation_category,
+                                    cancellation_context,
                                     cancel_trigger,
                                     structured_output,
                                     tool_overrides: applied_tool_overrides,
@@ -2438,7 +2430,13 @@ impl acp::Agent for MvpAgent {
                 .send(
                     SessionCommand::Cancel(crate::session::CancelOptions {
                         cancel_subagents,
-                        rewind_if_no_output,
+                        history: if rewind_if_no_output {
+                            crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                                prompt_id: args.meta.as_ref()
+                                    .and_then(|meta| meta.get("promptId"))
+                                    .and_then(serde_json::Value::as_str).map(str::to_owned),
+                            }
+                        } else { crate::session::CancelHistoryDisposition::Keep },
                         trigger: cancel_trigger,
                         user_initiated: true,
                         ..Default::default()

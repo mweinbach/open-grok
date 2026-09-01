@@ -3,6 +3,52 @@
 //!
 //! [session setup]: https://agentclientprotocol.com/protocol/v1/session-setup
 use super::*;
+
+fn parse_client_session_kind(meta: Option<&acp::Meta>) -> Result<Option<String>, acp::Error> {
+    let Some(kind) = meta
+        .and_then(|meta| meta.get("sessionKind").or_else(|| meta.get("session_kind")))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    if kind == "headless" {
+        return Ok(Some(kind.to_owned()));
+    }
+    if kind.starts_with("subagent") {
+        return Err(acp::Error::invalid_params()
+            .data("_meta.sessionKind uses the server-reserved subagent namespace"));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod client_session_kind_tests {
+    use super::*;
+
+    #[test]
+    fn only_headless_is_client_minted() {
+        for kind in [
+            "headless",
+            "unknown",
+            "worktree",
+            "subagent",
+            "subagent_workflow",
+        ] {
+            let mut meta = acp::Meta::new();
+            meta.insert("sessionKind".to_owned(), serde_json::json!(kind));
+            let result = parse_client_session_kind(Some(&meta));
+            if kind.starts_with("subagent") {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    (kind == "headless").then(|| kind.to_owned())
+                );
+            }
+        }
+        assert_eq!(parse_client_session_kind(None).unwrap(), None);
+    }
+}
 /// Refusals resume must give verbatim, so a test cannot mistake some other
 /// `invalid_params` for the guard it is pinning.
 pub(super) const RESUME_REFUSES_CHAT: &str =
@@ -149,18 +195,26 @@ struct SessionWorkspace {
     mcp_servers: Vec<acp::McpServer>,
     mcp_meta_config_map: McpMetaConfigMap,
 }
-/// Open the telemetry session context, then describe the session for storage.
-/// Both pipelines start here, so both appear in session metrics identically.
-fn begin_session(session_id: &acp::SessionId, cwd: &AbsPathBuf) -> SessionInfo {
-    xai_grok_telemetry::session_ctx::log_session_event(
-        crate::agent::session_metrics::SessionStarted {
-            session_id: session_id.0.to_string(),
-        },
-    );
+fn session_info_for(session_id: &acp::SessionId, cwd: &AbsPathBuf) -> SessionInfo {
     SessionInfo {
         id: session_id.clone(),
         cwd: cwd.as_str().to_owned(),
     }
+}
+fn log_session_started(
+    session_id: &acp::SessionId,
+    kind: xai_grok_telemetry::session_metrics::SessionStartKind,
+    setup_duration: std::time::Duration,
+    restored_from_disk: bool,
+) {
+    xai_grok_telemetry::session_ctx::log_session_event(
+        crate::agent::session_metrics::SessionStarted::new(
+            session_id.0.to_string(),
+            kind,
+            setup_duration,
+            restored_from_disk,
+        ),
+    );
 }
 impl MvpAgent {
     /// Read this client's capabilities, falling back to the agent's own state
@@ -240,7 +294,9 @@ impl MvpAgent {
         &self,
         arguments: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
+        let setup_started = std::time::Instant::now();
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
+        let client_session_kind = parse_client_session_kind(arguments.meta.as_ref())?;
         tracing::debug!(config = ?self.sampling_config, "Received new session request {arguments:?}");
         let init = self.initialize_request.get().ok_or_else(|| {
             acp::Error::invalid_params().data("initialize must be called before new_session")
@@ -343,7 +399,7 @@ impl MvpAgent {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             });
-        let session_info = begin_session(&session_id, &cwd);
+        let session_info = session_info_for(&session_id, &cwd);
         let mut model_agent_type: Option<String> = None;
         let mut session_sampling_override: Option<SamplingConfig> = None;
         let mut disallowed_custom: Option<String> = None;
@@ -452,8 +508,7 @@ impl MvpAgent {
             }
         }
         let (summary_client, summary_model) = self.build_summary_client(&session_sampling)?;
-        let relay_sync = if session_sampling.provider
-            == xai_grok_sampling_types::ModelProvider::Xai
+        let relay_sync = if session_sampling.provider == xai_grok_sampling_types::ModelProvider::Xai
         {
             self.start_relay_sync(&session_id, &session_info)
         } else {
@@ -483,6 +538,7 @@ impl MvpAgent {
                 Some(self.gateway.clone()),
                 summary_model,
                 registry_title_sync,
+                client_session_kind,
             )
             .await
             .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?
@@ -686,6 +742,12 @@ impl MvpAgent {
         }
         #[cfg(all(feature = "local-workspace", unix))]
         local_ws_reap_guard.disarm();
+        log_session_started(
+            &session_id,
+            xai_grok_telemetry::session_metrics::SessionStartKind::New,
+            setup_started.elapsed(),
+            false,
+        );
         Ok(acp::NewSessionResponse::new(session_id)
             .models(Some(models))
             .meta(meta.as_object().cloned()))
@@ -701,6 +763,7 @@ impl MvpAgent {
         arguments: acp::LoadSessionRequest,
         op: AttachOperation,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
+        let setup_started = std::time::Instant::now();
         let _load_guard = self.begin_session_load(&arguments.session_id);
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         self.sweep_dead_sessions();
@@ -777,7 +840,7 @@ impl MvpAgent {
                 crate::session::worktree_pool::cleanup_stale_pool_worktrees(Some(&root));
             });
         }
-        let session_info = begin_session(&session_id, &cwd);
+        let session_info = session_info_for(&session_id, &cwd);
         let current_session_dir = crate::session::persistence::session_dir(&session_info);
         tokio::task::spawn_blocking(move || {
             crate::session::persistence::cleanup_stale_sessions(Some(&current_session_dir));
@@ -814,19 +877,17 @@ impl MvpAgent {
         // RelaySync connects as soon as it is constructed, so fail closed
         // before loading the persistence actor. A missing/legacy summary is
         // not enough provenance to start an xAI-only relay.
-        let persisted_relay_allowed =
-            crate::session::persistence::find_summary_by_session_id(&session_id.0)
-                .is_some_and(|summary| {
-                    if summary.ever_used_codex {
-                        return false;
-                    }
-                    self.resolve_sampling_config_for_model(
-                        &summary.current_model_id,
-                        origin_client.clone(),
-                    )
-                    .provider
-                        == xai_grok_sampling_types::ModelProvider::Xai
-                });
+        let persisted_relay_allowed = crate::session::persistence::find_summary_by_session_id(
+            &session_id.0,
+        )
+        .is_some_and(|summary| {
+            if summary.ever_used_codex {
+                return false;
+            }
+            self.resolve_sampling_config_for_model(&summary.current_model_id, origin_client.clone())
+                .provider
+                == xai_grok_sampling_types::ModelProvider::Xai
+        });
         let relay_sync = if persisted_relay_allowed {
             self.start_relay_sync(&session_id, &session_info)
         } else {
@@ -885,19 +946,14 @@ impl MvpAgent {
             // persisted routing slug. Preserve exact-key semantics.
             startup_model_id.clone()
         };
-        let startup_sampling = self.resolve_sampling_config_for_model(
-            &startup_auth_model_id,
-            origin_client.clone(),
-        );
+        let startup_sampling =
+            self.resolve_sampling_config_for_model(&startup_auth_model_id, origin_client.clone());
         let startup_tool_policy_override = requested_model_id
             .is_none()
             .then_some(summary.resolved_tool_policy.clone())
             .flatten()
             .filter(|policy| {
-                policy.is_exact_route(
-                    startup_sampling.provider,
-                    &startup_sampling.api_backend,
-                )
+                policy.is_exact_route(startup_sampling.provider, &startup_sampling.api_backend)
             });
         match startup_sampling.provider.profile().session_auth {
             xai_grok_sampling_types::BuiltInSessionAuthKind::ApiKeyOnly
@@ -1085,6 +1141,7 @@ impl MvpAgent {
                 );
             }
         }
+        self.attach_status_line(&session_id, request_meta.as_ref(), init);
         if let Some(hooks) = crate::extensions::hooks::reconnect_client_hooks(request_meta.as_ref())
             && let Some(handle) = self.resident_handle(&session_id)
         {
@@ -1151,6 +1208,19 @@ impl MvpAgent {
                 restored_from_disk: true,
             });
         }
+        log_session_started(
+            &session_id,
+            match op {
+                AttachOperation::Load => {
+                    xai_grok_telemetry::session_metrics::SessionStartKind::Load
+                }
+                AttachOperation::Resume => {
+                    xai_grok_telemetry::session_metrics::SessionStartKind::Resume
+                }
+            },
+            setup_started.elapsed(),
+            !session_exists,
+        );
         Ok(response)
     }
     /// Restore-code phase: check the persisted HEAD out into `cwd`, then
@@ -1252,10 +1322,7 @@ impl MvpAgent {
             )
         } else {
             let code_mode_transport_ids = self
-                .persisted_code_mode_transport_ids(
-                    chat_history,
-                    updates_file_path.as_deref(),
-                )
+                .persisted_code_mode_transport_ids(chat_history, updates_file_path.as_deref())
                 .await;
             let (tokens, replay_end_offset, unfinished_subagents) = self
                 .replay_session_updates(
@@ -1434,7 +1501,10 @@ impl MvpAgent {
                     })),
                 );
             }
-            (catalog_key, acp_agent::LoadModelSelectionOrigin::PersistedIdentity)
+            (
+                catalog_key,
+                acp_agent::LoadModelSelectionOrigin::PersistedIdentity,
+            )
         } else if available.is_empty() {
             tracing::warn!(
                 session_id = %session_id.0,
@@ -1465,7 +1535,10 @@ impl MvpAgent {
             );
             self.send_model_auto_switched(&session_id, &persisted_model, &fallback, &reason)
                 .await;
-            (fallback, acp_agent::LoadModelSelectionOrigin::UnavailableFallback)
+            (
+                fallback,
+                acp_agent::LoadModelSelectionOrigin::UnavailableFallback,
+            )
         } else {
             let fallback = available
                 .keys()
@@ -1498,7 +1571,10 @@ impl MvpAgent {
                 .await;
             self.session_registry
                 .set_unavailable_model(&session_id, persisted_model.clone());
-            (fallback, acp_agent::LoadModelSelectionOrigin::UnavailableFallback)
+            (
+                fallback,
+                acp_agent::LoadModelSelectionOrigin::UnavailableFallback,
+            )
         };
         tracing::debug!(
             session_id = %session_id.0,
@@ -1566,16 +1642,11 @@ impl MvpAgent {
                     );
                     map
                 });
-            let restore_request =
-                acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
-                    .meta(restore_meta);
+            let restore_request = acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
+                .meta(restore_meta);
             if let Some(policy) = restored_tool_policy {
-                crate::agent::handlers::model_switch::apply_restored(
-                    self,
-                    restore_request,
-                    policy,
-                )
-                .await?;
+                crate::agent::handlers::model_switch::apply_restored(self, restore_request, policy)
+                    .await?;
             } else {
                 crate::agent::handlers::model_switch::apply(self, restore_request).await?;
             }

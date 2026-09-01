@@ -205,6 +205,8 @@ pub enum ActiveModal {
     },
     /// Session picker (opened from /resume command or command palette).
     SessionPicker {
+        generation: u64,
+        detail_seq: u64,
         /// Unified picker state.
         state: crate::views::picker::PickerState,
         /// Fetched session entries (None = not yet loaded).

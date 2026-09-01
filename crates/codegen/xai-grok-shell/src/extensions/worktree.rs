@@ -168,6 +168,7 @@ pub async fn handle(
                 worktree_type_default,
                 req.worktree_type.unwrap_or(worktree_type_default.into()),
             );
+            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
             let result = ops
                 .dispatch(&req, None)
                 .await
@@ -218,6 +219,7 @@ pub async fn handle(
                 worktree_type_default,
                 req.worktree_type.unwrap_or(worktree_type_default.into()),
             );
+            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
             // Dispatch prepare through workspace
             let result = ops
                 .dispatch(
@@ -298,6 +300,7 @@ pub async fn handle(
                 worktree_type_default,
                 req.worktree_type.unwrap_or(worktree_type_default.into()),
             );
+            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
             let result = ops
                 .dispatch(
                     &xai_grok_workspace::workspace_ops::CreateWorktreeFromWorktreeSyncReq {
@@ -318,6 +321,8 @@ pub async fn handle(
                 worktree_type_default,
                 req.worktree_type.unwrap_or(worktree_type_default.into()),
             );
+            let mut grove_worktree = None;
+            apply_grove_worktree_flag(agent, &mut grove_worktree);
             let registry_client = agent.session_registry_client();
             let agent_id = xai_grok_telemetry::id::agent_id();
 
@@ -330,6 +335,7 @@ pub async fn handle(
                     registry_client.as_ref(),
                     Some(agent.auth_manager.clone()),
                     &agent_id,
+                    grove_worktree.unwrap_or(false),
                 )
                 .await,
             )
@@ -435,9 +441,57 @@ pub async fn handle(
     }
 }
 
+fn apply_grove_worktree_flag(agent: &MvpAgent, slot: &mut Option<bool>) {
+    let root = crate::config::load_effective_config()
+        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let config = agent.cfg.borrow();
+    apply_grove_worktree_gate(slot, &root, config.remote_settings.as_ref());
+}
+
+pub(crate) fn apply_grove_worktree_gate(
+    slot: &mut Option<bool>,
+    root: &toml::Value,
+    remote: Option<&crate::util::config::RemoteSettings>,
+) {
+    let (enabled, source) = crate::util::config::gate_grove_worktree(*slot, root, remote);
+    tracing::info!(
+        target: WORKTREE_EXT_LOG,
+        grove_worktree = enabled,
+        source,
+        "WORKTREE_REQUEST_SHELL: resolved grove materialize strategy"
+    );
+    *slot = Some(enabled);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_grove_worktree_gate_does_not_bypass_remote_kill_or_unavailability() {
+        let root: toml::Value = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let remote = crate::util::config::RemoteSettings {
+            grove_worktree: Some(false),
+            ..Default::default()
+        };
+        let mut slot = Some(true);
+        apply_grove_worktree_gate(&mut slot, &root, Some(&remote));
+        assert_eq!(slot, Some(false));
+        slot = Some(true);
+        apply_grove_worktree_gate(&mut slot, &root, None);
+        assert_eq!(slot, Some(false));
+    }
+
+    #[test]
+    fn apply_grove_worktree_gate_preserves_explicit_choice_when_remote_allows() {
+        let root: toml::Value = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let remote = crate::util::config::RemoteSettings::default();
+        for requested in [false, true] {
+            let mut slot = Some(requested);
+            apply_grove_worktree_gate(&mut slot, &root, Some(&remote));
+            assert_eq!(slot, Some(requested));
+        }
+    }
 
     #[test]
     fn list_request_all_defaults() {

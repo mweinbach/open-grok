@@ -1107,7 +1107,9 @@ impl ScrollbackState {
                 .sum();
             // gap_after of the last entry acts as the trailing gap (always 1)
             // for selection box bottom corner space, so total is correct as-is.
-            self.total_height = total;
+            self.release_pin_reserve_if_below_fold();
+            self.pin_reserve_pad = self.pin_reserve_pad_rows(total);
+            self.total_height = total.saturating_add(self.pin_reserve_pad);
         }
     }
 

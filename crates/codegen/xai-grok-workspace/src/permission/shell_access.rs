@@ -1,7 +1,7 @@
 //! Detect file reads/writes inside a shell command so a managed `Read`/`Edit`
 //! deny/ask can't be bypassed via a shell reader/writer/redirect.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tree_sitter::Node;
 
@@ -10,7 +10,8 @@ use crate::permission::bash_command_splitting::{
     try_parse_shell, unwrap_wrappers,
 };
 use crate::permission::policy::{
-    CompiledPolicy, GateDecision, InlineShellScript, ShellWord, combine_gate_decisions,
+    CompiledPolicy, GateDecision, InlineShellScript, ShellWord, SymlinkFollow,
+    combine_gate_decisions, follow_absolute_symlink, resolve_following_symlinks,
     shell_dash_c_script,
 };
 use crate::permission::types::{AccessKind, Decision};
@@ -165,7 +166,7 @@ impl CompiledPolicy {
                 }
                 Some(ShellFileMode::Read) => &[ShellFileMode::Read],
                 Some(ShellFileMode::Write) => &[ShellFileMode::Write],
-                None => continue,
+                Some(ShellFileMode::Create) | None => continue,
             };
             for &token in &candidates {
                 if shell_arg_is_ambiguous(token) {
@@ -200,7 +201,8 @@ impl CompiledPolicy {
         // keep text-only matching (absolute operands are cwd-independent).
         let rule_cwd = (is_absolute || !cwd_unpinned).then_some(cwd);
         // Escalate only: drop Allow so a file allow-rule can't auto-approve here.
-        let escalate = |access: &AccessKind| match self.evaluate_with_cwd(access, rule_cwd) {
+        let escalate = |access: &AccessKind| match self.evaluate_lexical_with_cwd(access, rule_cwd)
+        {
             Some(Decision::Reject(reason)) => Some(GateDecision::Reject(reason)),
             Some(Decision::Ask) => Some(GateDecision::AskRuleMatch),
             _ => None,
@@ -223,13 +225,10 @@ impl CompiledPolicy {
             } else {
                 normalize_shell_path(&cwd.join(&path).to_string_lossy())
             };
-            match resolve_symlink_target(&raw_absolute) {
-                Some(resolved) if resolved != absolute => escalate(&shell_access(mode, resolved)),
-                Some(_) => None,
-                // Unresolvable (depth/cycle/error): fail closed to Ask when any
-                // component of the operand is a symlink, rather than silently
-                // allowing it (covers mid-path chains, not just the leaf).
-                None => path_has_symlink(&raw_absolute).then_some(GateDecision::AskFailClosed),
+            match follow_absolute_symlink(&raw_absolute, &absolute) {
+                SymlinkFollow::Target(resolved) => escalate(&shell_access(mode, resolved)),
+                SymlinkFollow::Unresolvable => Some(GateDecision::AskFailClosed),
+                SymlinkFollow::None => None,
             }
         });
         let path_decision = escalate(&shell_access(mode, path.clone()));
@@ -298,25 +297,64 @@ pub(crate) fn command_words_write_paths(words: &[String]) -> Vec<String> {
 /// `git --output`, `cp`/`mv` dest, `tee`/`truncate`, in-place `sed`/`rustfmt`,
 /// `uniq` output, ...). No safe-sink filtering — the caller decides.
 pub(crate) fn command_write_paths_in_tree(root: Node<'_>, src: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let split = command_write_paths_split(root, src);
+    let mut out = split.redirect_paths;
+    out.extend(split.word_paths);
+    out
+}
 
-    // Output redirects (`> f`, `>> f`); fd-dups/heredocs are already skipped.
-    for redirect in shell_redirect_targets(root, src) {
-        if matches!(redirect.mode, ShellFileMode::Write)
-            && let Some(path) = redirect.path
-        {
-            out.push(path);
+pub(crate) struct WritePathsSplit {
+    pub(crate) redirect_paths: Vec<String>,
+    pub(crate) unextracted_write_redirect: bool,
+    pub(crate) word_paths: Vec<String>,
+    pub(crate) creation_paths: Vec<String>,
+}
+
+pub(crate) fn command_write_paths_split(root: Node<'_>, src: &str) -> WritePathsSplit {
+    let mut redirect_paths = Vec::new();
+    let mut unextracted_write_redirect = false;
+    for r in shell_redirect_targets(root, src) {
+        if matches!(r.mode, ShellFileMode::Write) {
+            match r.path {
+                Some(path) => redirect_paths.push(path),
+                None => unextracted_write_redirect = true,
+            }
         }
     }
     // Per-command writers, after peeling env/timeout/... wrappers.
+    let mut word_paths = Vec::new();
+    let mut creation_paths = Vec::new();
     for invocation in shell_command_invocations(root, src) {
         let words = InvocationSlice {
             words: &invocation.words,
         }
         .literal_words();
-        out.extend(command_words_write_paths(&words));
+        word_paths.extend(command_words_write_paths(&words));
+        creation_paths.extend(command_words_creation_paths(&words));
     }
-    out
+    WritePathsSplit {
+        redirect_paths,
+        unextracted_write_redirect,
+        word_paths,
+        creation_paths,
+    }
+}
+
+pub(crate) fn is_creation_program(program: &str) -> bool {
+    matches!(program, "mkdir" | "touch")
+}
+
+pub(crate) fn command_words_creation_paths(words: &[String]) -> Vec<String> {
+    let inner = unwrap_wrappers(words);
+    let Some(program) = inner.first().map(|w| shell_program_name(w)) else {
+        return Vec::new();
+    };
+    shell_path_command_operands(&program.to_ascii_lowercase(), inner)
+        .into_iter()
+        .flatten()
+        .filter(|(_, mode)| matches!(mode, ShellFileMode::Create))
+        .map(|(path, _)| path.to_owned())
+        .collect()
 }
 
 /// Safe write sinks that do not touch a real file. Exact match.
@@ -421,7 +459,7 @@ pub(crate) fn edit_target_protection(path: &Path) -> Option<ProtectedEditReason>
     if let Some(reason) = protected_edit_reason(&lexical) {
         return Some(reason);
     }
-    let Some(resolved) = resolve_following_symlinks(path, 0) else {
+    let Some(resolved) = resolve_following_symlinks(path) else {
         return Some(ProtectedEditReason::Sensitive);
     };
     if let Some(reason) = protected_edit_reason(&resolved) {
@@ -515,10 +553,10 @@ fn protected_grok_config_file_with_home(
             | xai_grok_config::MANAGED_CONFIG_FILENAME
             | xai_grok_config::REQUIREMENTS_FILENAME,
         ) => ProtectedEditReason::GrokConfig,
-        Some("sandbox.toml") => ProtectedEditReason::GrokSandbox,
+        Some(xai_grok_config::SANDBOX_CONFIG_FILENAME) => ProtectedEditReason::GrokSandbox,
         _ => return None,
     };
-    let in_dot_grok = components.len() >= 2 && components[components.len() - 2] == ".grok";
+    let in_dot_grok = components.len() >= 2 && components[components.len() - 2] == ".opengrok";
     let in_grok_home = || grok_home_matches(user_grok_home, |home| path.parent() == Some(home));
     (in_dot_grok || in_grok_home()).then_some(reason)
 }
@@ -532,7 +570,7 @@ fn grok_home_matches(home: Option<&Path>, pred: impl Fn(&Path) -> bool) -> bool 
     home.is_some_and(|home| {
         let lexical = xai_grok_paths::normalize_lexically(home);
         pred(&lexical)
-            || resolve_following_symlinks(&lexical, 0).is_some_and(|resolved| pred(&resolved))
+            || resolve_following_symlinks(&lexical).is_some_and(|resolved| pred(&resolved))
     })
 }
 
@@ -541,8 +579,10 @@ fn path_is_under_user_grok_hook_root(path: &Path, grok_home: &Path) -> bool {
 }
 
 fn protected_grok_hook_root(path: &Path, components: &[&str]) -> bool {
-    components.windows(2).any(|pair| pair == [".grok", "hooks"])
-        || components.ends_with(&[".grok", "hooks-paths"])
+    components
+        .windows(2)
+        .any(|pair| pair == [".opengrok", "hooks"])
+        || components.ends_with(&[".opengrok", "hooks-paths"])
         || grok_home_matches(xai_grok_config::user_grok_home().as_deref(), |home| {
             path_is_under_user_grok_hook_root(path, home)
         })
@@ -564,7 +604,7 @@ fn protected_git_hooks_path(components: &[&str]) -> bool {
 /// as macOS `/etc -> /private/etc` compare in the same namespace. Resolution
 /// failure is conservative: the caller then requires confirmation.
 fn resolved_path_is_within_root(resolved_path: &Path, root: &Path) -> bool {
-    resolve_following_symlinks(root, 0)
+    resolve_following_symlinks(root)
         .map(|resolved_root| resolved_path.starts_with(resolved_root))
         .unwrap_or(true)
 }
@@ -573,6 +613,7 @@ fn resolved_path_is_within_root(resolved_path: &Path, root: &Path) -> bool {
 pub(crate) enum ShellFileMode {
     Read,
     Write,
+    Create,
 }
 
 /// Tools that read/write a file named as an argument. Not exhaustive — redirects
@@ -686,6 +727,10 @@ fn cwd_poison_positions(root: Node<'_>, src: &str) -> Vec<CwdPoison> {
         }
     }
     positions
+}
+
+pub(crate) fn script_has_cwd_change(root: Node<'_>, src: &str) -> bool {
+    !cwd_poison_positions(root, src).is_empty()
 }
 
 /// Whether an operand runs after a cwd change in its nearest execution scope.
@@ -1109,7 +1154,7 @@ fn special_file_operands(program: &str, words: &[String]) -> Vec<(String, ShellF
 fn shell_access(mode: ShellFileMode, path: String) -> AccessKind {
     match mode {
         ShellFileMode::Read => AccessKind::Read(Some(path)),
-        ShellFileMode::Write => AccessKind::Edit(path),
+        ShellFileMode::Write | ShellFileMode::Create => AccessKind::Edit(path),
     }
 }
 
@@ -1153,10 +1198,16 @@ fn shell_path_command_operands<'a>(
                     .collect(),
             )
         }
-        "rm" | "rmdir" | "mkdir" | "touch" => Some(
+        "rm" | "rmdir" => Some(
             shell_file_candidates(words)
                 .into_iter()
                 .map(|c| (c, ShellFileMode::Write))
+                .collect(),
+        ),
+        p if is_creation_program(p) => Some(
+            shell_file_candidates(words)
+                .into_iter()
+                .map(|c| (c, ShellFileMode::Create))
                 .collect(),
         ),
         // `uniq [INPUT [OUTPUT]]`: a 2nd positional is the output file (Write);
@@ -1249,98 +1300,6 @@ fn lexical_normalize(path: &str) -> String {
         (true, true, false) => format!("/{body}"),
         (true, true, true) => "/".to_owned(),
         (true, false, _) => body,
-    }
-}
-
-/// Whether *any* existing component of `absolute` is a symlink — used to fail
-/// closed (Ask) when a linky operand can't be fully resolved, including a
-/// mid-path link (not just the leaf).
-fn path_has_symlink(absolute: &str) -> bool {
-    let path = Path::new(absolute);
-    if !path.is_absolute() {
-        return false;
-    }
-    let mut prefix = PathBuf::new();
-    for comp in path.components() {
-        prefix.push(comp);
-        if std::fs::symlink_metadata(&prefix)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Resolve a filesystem-absolute operand to its real symlink target. `None` for
-/// relative/unanchorable inputs. Input must be absolute so resolution anchors to
-/// the command's cwd, not the process cwd. Point-in-time (TOCTOU) only.
-fn resolve_symlink_target(absolute: &str) -> Option<String> {
-    let path = Path::new(absolute);
-    if !path.is_absolute() {
-        return None;
-    }
-    let resolved = resolve_following_symlinks(path, 0)?;
-    // `/`-normalize so the result matches rule text on Windows (backslash form).
-    Some(normalize_shell_path(&resolved.to_string_lossy()))
-}
-
-/// Resolve `path` following every symlink, including a *dangling* final link
-/// (which `canonicalize` alone rejects) and not-yet-existing trailing
-/// components. Depth-bounded against cycles; unexpected fs errors yield `None`.
-/// Blocking fs syscalls; runs for shell operands under file rules and direct edits.
-fn resolve_following_symlinks(path: &Path, depth: usize) -> Option<PathBuf> {
-    const MAX_SYMLINK_DEPTH: usize = 40;
-    if depth > MAX_SYMLINK_DEPTH {
-        return None;
-    }
-    // `dunce` avoids Windows `\\?\` verbatim paths (repo convention).
-    if let Ok(canonical) = dunce::canonicalize(path) {
-        return Some(canonical);
-    }
-    // Resolve the parent, then the final component, so a dangling/new leaf still follows.
-    // Missing components are valid new paths; other metadata errors fail closed.
-    let parent = path.parent()?;
-    let file_name = path.file_name()?;
-    let resolved_parent = resolve_following_symlinks(parent, depth + 1)?;
-    let candidate = resolved_parent.join(file_name);
-    let metadata = match std::fs::symlink_metadata(&candidate) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return None,
-    };
-    if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
-        // A symlink must be followed; if it can't be read, treat the whole path
-        // as unresolved (`None`) rather than returning the link's own path.
-        let target = std::fs::read_link(&candidate).ok()?;
-        let target = if target.is_absolute() {
-            target
-        } else {
-            resolved_parent.join(target)
-        };
-        return resolve_following_symlinks(&target, depth + 1);
-    }
-    Some(candidate)
-}
-
-fn decision_rank(decision: &Decision) -> u8 {
-    match decision {
-        Decision::Reject(_) | Decision::PolicyDeny(_) => 3,
-        Decision::Ask => 2,
-        Decision::Allow => 1,
-        _ => 0,
-    }
-}
-
-pub(crate) fn combine_decisions(a: Option<Decision>, b: Option<Decision>) -> Option<Decision> {
-    match (a, b) {
-        (None, other) | (other, None) => other,
-        (Some(a), Some(b)) => Some(if decision_rank(&a) >= decision_rank(&b) {
-            a
-        } else {
-            b
-        }),
     }
 }
 
@@ -1447,8 +1406,8 @@ mod tests {
             "/etc",
             "/etc/grok-test",
             "/work/subdir/../.git/hooks/pre-commit",
-            "/home/user/.grok/sandbox.toml",
-            "/work/project/.grok/sandbox.toml",
+            "/home/user/.opengrok/sandbox.toml",
+            "/work/project/.opengrok/sandbox.toml",
         ] {
             assert!(
                 edit_target_protection(Path::new(path)).is_some(),
@@ -1457,7 +1416,7 @@ mod tests {
         }
         for path in [
             "/work/src/main.rs",
-            "/work/project/.grok/config.toml/backup",
+            "/work/project/.opengrok/config.toml/backup",
             "/work/project/sandbox.toml",
             "/work/project/requirements.toml",
             "/work/project/managed_config.toml",
@@ -1500,7 +1459,7 @@ mod tests {
     fn edit_target_protection_classifies_reasons() {
         let cases = [
             (
-                "/home/user/.grok/hooks/evil.json",
+                "/home/user/.opengrok/hooks/evil.json",
                 ProtectedEditReason::HookRoot,
             ),
             ("/work/.git/hooks/pre-commit", ProtectedEditReason::GitHooks),
@@ -1508,23 +1467,23 @@ mod tests {
             ("/home/user/.zshrc", ProtectedEditReason::StartupFile),
             ("/etc/hosts", ProtectedEditReason::Etc),
             (
-                "/home/user/.grok/config.toml",
+                "/home/user/.opengrok/config.toml",
                 ProtectedEditReason::GrokConfig,
             ),
             (
-                "/home/user/.grok/sandbox.toml",
+                "/home/user/.opengrok/sandbox.toml",
                 ProtectedEditReason::GrokSandbox,
             ),
             (
-                "/work/project/.grok/sandbox.toml",
+                "/work/project/.opengrok/sandbox.toml",
                 ProtectedEditReason::GrokSandbox,
             ),
             (
-                "/home/user/.grok/managed_config.toml",
+                "/home/user/.opengrok/managed_config.toml",
                 ProtectedEditReason::GrokConfig,
             ),
             (
-                "/home/user/.grok/requirements.toml",
+                "/home/user/.opengrok/requirements.toml",
                 ProtectedEditReason::GrokConfig,
             ),
             (
@@ -1554,14 +1513,14 @@ mod tests {
     #[test]
     fn sensitive_edit_targets_include_hook_roots() {
         for path in [
-            "/home/user/.grok/hooks/evil.json",
-            "/home/user/.grok/hooks/nested/deep.json",
-            "/home/user/.grok/hooks-paths",
+            "/home/user/.opengrok/hooks/evil.json",
+            "/home/user/.opengrok/hooks/nested/deep.json",
+            "/home/user/.opengrok/hooks-paths",
             "/home/user/.claude/settings.json",
             "/home/user/.claude/settings.local.json",
             "/home/user/.cursor/hooks.json",
-            "/work/project/.grok/hooks/local.json",
-            "/work/project/.grok/hooks-paths",
+            "/work/project/.opengrok/hooks/local.json",
+            "/work/project/.opengrok/hooks-paths",
         ] {
             assert!(
                 edit_target_protection(Path::new(path)).is_some(),
@@ -1569,8 +1528,8 @@ mod tests {
             );
         }
         for path in [
-            "/home/user/.grok/hooks-disabled/note.json",
-            "/home/user/.grok/hooks-evil/note.json",
+            "/home/user/.opengrok/hooks-disabled/note.json",
+            "/home/user/.opengrok/hooks-evil/note.json",
             "/home/user/project/src/hooks.json",
             "/home/user/.claude/other.json",
             "/home/user/.cursor/settings.json",
@@ -1631,7 +1590,7 @@ mod tests {
             ws.path().join("module-hooks-link"),
         )
         .unwrap();
-        let grok_hook = outside.path().join(".grok/hooks/evil.json");
+        let grok_hook = outside.path().join(".opengrok/hooks/evil.json");
         std::fs::create_dir_all(grok_hook.parent().unwrap()).unwrap();
         std::fs::write(&grok_hook, b"{}").unwrap();
         symlink(&grok_hook, ws.path().join("grok-hook-link")).unwrap();
@@ -1657,33 +1616,47 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home_path = home.path();
         for (file, reason) in [
-            ("config.toml", ProtectedEditReason::GrokConfig),
-            ("managed_config.toml", ProtectedEditReason::GrokConfig),
-            ("requirements.toml", ProtectedEditReason::GrokConfig),
-            ("sandbox.toml", ProtectedEditReason::GrokSandbox),
+            (
+                xai_grok_config::USER_CONFIG_FILENAME,
+                ProtectedEditReason::GrokConfig,
+            ),
+            (
+                xai_grok_config::MANAGED_CONFIG_FILENAME,
+                ProtectedEditReason::GrokConfig,
+            ),
+            (
+                xai_grok_config::REQUIREMENTS_FILENAME,
+                ProtectedEditReason::GrokConfig,
+            ),
+            (
+                xai_grok_config::SANDBOX_CONFIG_FILENAME,
+                ProtectedEditReason::GrokSandbox,
+            ),
         ] {
             let path = home_path.join(file);
             let components = [file];
             assert_eq!(
                 protected_grok_config_file_with_home(&path, &components, Some(home_path)),
                 Some(reason),
-                "{file} directly under $GROK_HOME must be protected"
+                "{file} directly under $OPENGROK_HOME must be protected"
             );
         }
         // Same file names elsewhere (or with no resolvable home) stay ordinary.
-        let elsewhere = home_path.join("sub").join("sandbox.toml");
+        let elsewhere = home_path
+            .join("sub")
+            .join(xai_grok_config::SANDBOX_CONFIG_FILENAME);
         assert_eq!(
             protected_grok_config_file_with_home(
                 &elsewhere,
-                &["sub", "sandbox.toml"],
+                &["sub", xai_grok_config::SANDBOX_CONFIG_FILENAME],
                 Some(home_path)
             ),
             None
         );
         assert_eq!(
             protected_grok_config_file_with_home(
-                &home_path.join("sandbox.toml"),
-                &["sandbox.toml"],
+                &home_path.join(xai_grok_config::SANDBOX_CONFIG_FILENAME),
+                &[xai_grok_config::SANDBOX_CONFIG_FILENAME],
                 None
             ),
             None
@@ -1704,11 +1677,11 @@ mod tests {
         symlink(&real_home, &link).unwrap();
         // tempdir paths can themselves contain symlinks (macOS /var -> /private/var);
         // compare against the physical home the production resolver will produce.
-        let physical_home = resolve_following_symlinks(&real_home, 0).unwrap();
+        let physical_home = resolve_following_symlinks(&real_home).unwrap();
         assert_eq!(
             protected_grok_config_file_with_home(
-                &physical_home.join("sandbox.toml"),
-                &["sandbox.toml"],
+                &physical_home.join(xai_grok_config::SANDBOX_CONFIG_FILENAME),
+                &[xai_grok_config::SANDBOX_CONFIG_FILENAME],
                 Some(&link)
             ),
             Some(ProtectedEditReason::GrokSandbox)
@@ -1731,7 +1704,7 @@ mod tests {
 
     #[test]
     fn resolved_root_alias_matches_physical_destination() {
-        let resolved_root = resolve_following_symlinks(Path::new("/etc"), 0).unwrap();
+        let resolved_root = resolve_following_symlinks(Path::new("/etc")).unwrap();
         assert!(resolved_path_is_within_root(
             &resolved_root.join("grok-test"),
             Path::new("/etc")

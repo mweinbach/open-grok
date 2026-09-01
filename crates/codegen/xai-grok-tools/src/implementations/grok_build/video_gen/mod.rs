@@ -153,6 +153,8 @@ pub struct VideoGenClient {
     /// (free / X Basic). The video tools short-circuit before any HTTP call
     /// and return the SuperGrok upsell prose. See [`VideoGenClient::is_tier_restricted`].
     tier_restricted: bool,
+    session_header: Option<HeaderValue>,
+    defaults_have_session_header: bool,
 }
 
 impl VideoGenClient {
@@ -202,21 +204,29 @@ impl VideoGenClient {
             Ok::<(), xai_tool_runtime::ToolError>(())
         })?;
 
-        let http = xai_grok_extra_ca::with_extra_root_certificates(
-            reqwest::Client::builder().default_headers(headers),
-        )
-        .build()
+        let defaults_have_session_header =
+            headers.contains_key(super::image_gen::SESSION_ID_HEADER);
+        let key = crate::util::shared_http::cache_key(&format!("video_gen:{base_url}"), &headers);
+        let http = crate::util::shared_http::cached_client(key, || {
+            xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder.default_headers(headers.clone())
+            })
+        })
         .map_err(|e| {
             xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "Failed to build HTTP client: {e}"
             ))
         })?;
 
-        let download_http = xai_grok_extra_ca::with_extra_root_certificates(
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(VIDEO_DOWNLOAD_TIMEOUT_SECS)),
-        )
-        .build()
+        let download_key = crate::util::shared_http::cache_key(
+            "video_gen_download",
+            &reqwest::header::HeaderMap::new(),
+        );
+        let download_http = crate::util::shared_http::cached_client(download_key, || {
+            xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder.timeout(std::time::Duration::from_secs(VIDEO_DOWNLOAD_TIMEOUT_SECS))
+            })
+        })
         .map_err(|e| {
             xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "Failed to build download client: {e}"
@@ -235,7 +245,34 @@ impl VideoGenClient {
             api_key_provider,
             attribution_callback: None,
             tier_restricted: *tier_restricted,
+            session_header: None,
+            defaults_have_session_header,
         })
+    }
+
+    pub fn with_session_id(mut self, session_id: &str) -> Self {
+        if !self.defaults_have_session_header
+            && let Ok(value) = HeaderValue::from_str(session_id)
+        {
+            self.session_header = Some(value);
+        }
+        self
+    }
+
+    fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        sent_bearer: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self.http.request(method, url);
+        if let Some(bearer) = sent_bearer {
+            request = request.header(AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        if let Some(session) = &self.session_header {
+            request = request.header(super::image_gen::SESSION_ID_HEADER, session.clone());
+        }
+        request
     }
 
     /// Whether the current user's tier (free / X Basic) is zero-limited on
@@ -297,14 +334,10 @@ impl VideoGenClient {
         };
 
         let sent_bearer = self.current_bearer().await;
-        let mut req = self
-            .http
-            .post(&start_url)
+        let req = self
+            .request(reqwest::Method::POST, &start_url, sent_bearer.as_deref())
             .timeout(std::time::Duration::from_secs(VIDEO_START_TIMEOUT_SECS))
             .json(&payload);
-        if let Some(ref key) = sent_bearer {
-            req = req.header(AUTHORIZATION, format!("Bearer {key}"));
-        }
 
         let response = req.send().await.map_err(|e| {
             xai_tool_runtime::ToolError::invalid_arguments(format!(
@@ -367,10 +400,9 @@ impl VideoGenClient {
             }
 
             let poll_sent_bearer = self.current_bearer().await;
-            let mut poll_req = self.http.get(&poll_url).timeout(poll_timeout);
-            if let Some(ref key) = poll_sent_bearer {
-                poll_req = poll_req.header(AUTHORIZATION, format!("Bearer {key}"));
-            }
+            let poll_req = self
+                .request(reqwest::Method::GET, &poll_url, poll_sent_bearer.as_deref())
+                .timeout(poll_timeout);
 
             let poll_response = poll_req.send().await.map_err(|e| {
                 xai_tool_runtime::ToolError::invalid_arguments(format!(

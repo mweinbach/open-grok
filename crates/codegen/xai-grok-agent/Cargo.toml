@@ -6,6 +6,7 @@ edition.workspace = true
 description = "Agent builder, definition parsing, and system prompt assembly"
 
 [dependencies]
+xai-dirs = { path = "../xai-dirs" }
 dunce = { workspace = true }
 xai-grok-hooks = { path = "../xai-grok-hooks" }
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }

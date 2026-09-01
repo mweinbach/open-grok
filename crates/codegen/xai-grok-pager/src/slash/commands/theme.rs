@@ -178,6 +178,8 @@ mod tests {
                 has_session_announcements: false,
                 billing_surface_visible: true,
                 workflows_available: true,
+                saved_workflows: &[],
+                workflow_runs: &[],
                 screen_mode: crate::app::ScreenMode::Fullscreen,
                 current_title: None,
             };
@@ -201,6 +203,8 @@ mod tests {
                 has_session_announcements: false,
                 billing_surface_visible: true,
                 workflows_available: true,
+                saved_workflows: &[],
+                workflow_runs: &[],
                 screen_mode: crate::app::ScreenMode::Fullscreen,
                 current_title: None,
             };
@@ -225,6 +229,8 @@ mod tests {
                 has_session_announcements: false,
                 billing_surface_visible: true,
                 workflows_available: true,
+                saved_workflows: &[],
+                workflow_runs: &[],
                 screen_mode: crate::app::ScreenMode::Fullscreen,
                 current_title: None,
             };
@@ -250,6 +256,8 @@ mod tests {
                 has_session_announcements: false,
                 billing_surface_visible: true,
                 workflows_available: true,
+                saved_workflows: &[],
+                workflow_runs: &[],
                 screen_mode: crate::app::ScreenMode::Fullscreen,
                 current_title: None,
             };
@@ -279,6 +287,8 @@ mod tests {
                 has_session_announcements: false,
                 billing_surface_visible: true,
                 workflows_available: true,
+                saved_workflows: &[],
+                workflow_runs: &[],
                 screen_mode: crate::app::ScreenMode::Fullscreen,
                 current_title: None,
             };

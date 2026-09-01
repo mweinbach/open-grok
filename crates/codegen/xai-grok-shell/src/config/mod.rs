@@ -229,6 +229,8 @@ pub struct SubagentsConfig {
     pub max_depth: Option<i64>,
     #[serde(default)]
     pub max_concurrent: Option<i64>,
+    #[serde(default)]
+    pub sampling_limit: Option<i64>,
     /// `"queue"` or `"fail"`.
     #[serde(default)]
     pub limit_behavior: Option<String>,
@@ -493,6 +495,18 @@ impl SubagentsConfig {
         Self::DEFAULT_MAX_DEPTH
     }
     pub const ENV_MAX_CONCURRENT: &'static str = "GROK_MAX_CONCURRENT_SUBAGENTS";
+    pub const ENV_SAMPLING_LIMIT: &'static str = "GROK_SUBAGENT_SAMPLING_LIMIT";
+    pub const MAX_SAMPLING_LIMIT: usize = 512;
+
+    pub(crate) fn resolve_sampling_limit(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+        default: usize,
+    ) -> usize {
+        Self::resolve_count(Self::ENV_SAMPLING_LIMIT, env, config, remote, default)
+            .clamp(1, Self::MAX_SAMPLING_LIMIT)
+    }
     pub const ENV_LIMIT_BEHAVIOR: &'static str = "GROK_SUBAGENT_LIMIT_BEHAVIOR";
     pub const ENV_WORKFLOW_MAX_CONCURRENT: &'static str = "GROK_WORKFLOW_MAX_CONCURRENT_AGENTS";
     /// Clamp to `1..`; a limit can be adjusted but never disabled.
@@ -860,6 +874,26 @@ impl ModelOverrideConfig {
         result
     }
 }
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct MediaGenToolsConfig {
+    pub max_parallel_image_gen_calls: Option<i64>,
+    pub max_parallel_video_gen_calls: Option<i64>,
+}
+
+fn resolve_media_gen_count(
+    env: Option<&str>,
+    config: Option<i64>,
+    remote: Option<u32>,
+    default: usize,
+) -> usize {
+    env.and_then(|value| value.trim().parse::<i64>().ok())
+        .or(config)
+        .or(remote.map(i64::from))
+        .map(|value| usize::try_from(value.max(1)).unwrap_or(usize::MAX))
+        .unwrap_or(default)
+}
+
 /// Tool behavior configuration (`[tools]` in config.toml).
 ///
 /// Controls cross-cutting tool behavior such as `.gitignore` filtering.
@@ -872,6 +906,7 @@ impl ModelOverrideConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
+    pub media_gen: MediaGenToolsConfig,
     /// When `true`, all tools (including `read_file`) filter gitignored
     /// files. When `false` (default), each tool picks its own default.
     pub respect_gitignore: bool,
@@ -888,6 +923,58 @@ pub struct ToolsConfig {
         Option<xai_grok_tools::implementations::grok_build::video_gen::ZdrVideoOutputS3Config>,
 }
 impl ToolsConfig {
+    pub const ENV_MAX_PARALLEL_IMAGE_GEN_CALLS: &'static str = "GROK_MAX_PARALLEL_IMAGE_GEN_CALLS";
+    pub const ENV_MAX_PARALLEL_VIDEO_GEN_CALLS: &'static str = "GROK_MAX_PARALLEL_VIDEO_GEN_CALLS";
+
+    pub(crate) fn resolve_max_parallel_image_gen_calls(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+    ) -> usize {
+        resolve_media_gen_count(
+            env,
+            config,
+            remote,
+            xai_grok_tools::media_gen_limits::DEFAULT_MAX_PARALLEL_IMAGE_GEN,
+        )
+    }
+
+    pub(crate) fn resolve_max_parallel_video_gen_calls(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+    ) -> usize {
+        resolve_media_gen_count(
+            env,
+            config,
+            remote,
+            xai_grok_tools::media_gen_limits::DEFAULT_MAX_PARALLEL_VIDEO_GEN,
+        )
+    }
+
+    pub(crate) fn resolve_media_gen_batch_limits(
+        remote: Option<&crate::util::config::RemoteSettings>,
+    ) -> xai_grok_tools::media_gen_limits::MediaGenBatchLimits {
+        let config =
+            load_effective_config().unwrap_or_else(|_| toml::Value::Table(Default::default()));
+        let tools = Self::resolve(&config);
+        xai_grok_tools::media_gen_limits::MediaGenBatchLimits {
+            max_image: Self::resolve_max_parallel_image_gen_calls(
+                std::env::var(Self::ENV_MAX_PARALLEL_IMAGE_GEN_CALLS)
+                    .ok()
+                    .as_deref(),
+                tools.media_gen.max_parallel_image_gen_calls,
+                remote.and_then(|settings| settings.max_parallel_image_gen_calls),
+            ),
+            max_video: Self::resolve_max_parallel_video_gen_calls(
+                std::env::var(Self::ENV_MAX_PARALLEL_VIDEO_GEN_CALLS)
+                    .ok()
+                    .as_deref(),
+                tools.media_gen.max_parallel_video_gen_calls,
+                remote.and_then(|settings| settings.max_parallel_video_gen_calls),
+            ),
+        }
+    }
     /// Resolve the final tools config, in priority order:
     /// 1. Env vars `GROK_RESPECT_GITIGNORE` and
     ///    `GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS` (`0`/`false` off,
@@ -901,6 +988,10 @@ impl ToolsConfig {
     pub fn resolve(config: &toml::Value) -> Self {
         let tools = config.get("tools");
         let mut result = Self {
+            media_gen: MediaGenToolsConfig {
+                max_parallel_image_gen_calls: tools.and_then(|tools| tools.get("media_gen")?.get("max_parallel_image_gen_calls")?.as_integer()),
+                max_parallel_video_gen_calls: tools.and_then(|tools| tools.get("media_gen")?.get("max_parallel_video_gen_calls")?.as_integer()),
+            },
             respect_gitignore: tools
                 .and_then(|t| t.get("respect_gitignore"))
                 .and_then(|v| v.as_bool())
@@ -1285,6 +1376,7 @@ fn apply_requirements_inner(
     pin_feature!(write_file);
     pin_feature!(session_search);
     pin_requirement_only!(remote_fetch);
+    pin_requirement_only!(title_refresh);
     if let Some(val) = req_bool(req, "telemetry", "trace_upload") {
         config.requirements.trace_upload.pin(val, source.clone());
         if config.telemetry.trace_upload != Some(val) {
@@ -1478,6 +1570,31 @@ fn apply_requirements_inner(
 ///
 /// `cli_profile` is the resumed/forced base profile (a resumed session's saved
 /// profile, or an explicit `--sandbox`); it wins over a fresh env/config read.
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, PartialEq, Eq)]
+enum BwrapStartup<Command> {
+    ReexecRequired(Command),
+    ReexecOptional(Command),
+    Verify,
+    Refuse,
+    Continue,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn route_bwrap_startup<Command>(
+    command: Option<Command>,
+    is_inside_bwrap: bool,
+    requires_bwrap: bool,
+) -> BwrapStartup<Command> {
+    match command {
+        Some(command) if requires_bwrap => BwrapStartup::ReexecRequired(command),
+        Some(command) => BwrapStartup::ReexecOptional(command),
+        None if requires_bwrap && is_inside_bwrap => BwrapStartup::Verify,
+        None if requires_bwrap => BwrapStartup::Refuse,
+        None => BwrapStartup::Continue,
+    }
+}
+
 pub fn apply_sandbox(
     sandbox_config: Option<&crate::agent::config::SandboxSettingsConfig>,
     cli_profile: Option<&str>,
@@ -1516,7 +1633,10 @@ pub fn apply_sandbox(
     let requires_hook_write_deny =
         xai_grok_sandbox::requires_hook_write_deny(&sandbox_profile, &workspace);
     #[cfg(target_os = "linux")]
-    let requires_bwrap = requires_read_deny || requires_hook_write_deny;
+    let requires_data_write_deny =
+        xai_grok_sandbox::requires_data_write_deny(&sandbox_profile, &workspace);
+    #[cfg(target_os = "linux")]
+    let requires_bwrap = requires_read_deny || requires_hook_write_deny || requires_data_write_deny;
     #[cfg(target_os = "linux")]
     {
         let refuse_unprotected = |cause: &str| {
@@ -1525,8 +1645,12 @@ pub fn apply_sandbox(
                  {cause} Refusing to start with denied paths unprotected."
             );
         };
-        match xai_grok_sandbox::bwrap_reexec_for_profile(&sandbox_profile, &workspace) {
-            Some(mut cmd) => {
+        match route_bwrap_startup(
+            xai_grok_sandbox::bwrap_reexec_for_profile(&sandbox_profile, &workspace),
+            xai_grok_sandbox::is_inside_bwrap(),
+            requires_bwrap,
+        ) {
+            BwrapStartup::ReexecRequired(mut cmd) | BwrapStartup::ReexecOptional(mut cmd) => {
                 use std::os::unix::process::CommandExt;
                 let err = cmd.exec();
                 if requires_bwrap {
@@ -1542,7 +1666,27 @@ pub fn apply_sandbox(
                      Install bubblewrap: apt install -y bubblewrap"
                 );
             }
-            None if requires_bwrap && xai_grok_sandbox::is_inside_bwrap() => {
+            BwrapStartup::Verify => {
+                if requires_read_deny
+                    && let Err(error) =
+                        xai_grok_sandbox::verify_read_deny_enforced(&sandbox_profile, &workspace)
+                {
+                    eprintln!(
+                        "error: required read-deny mounts not verified ({error}); refusing to start"
+                    );
+                    std::process::exit(1);
+                }
+                if requires_data_write_deny
+                    && let Err(error) = xai_grok_sandbox::verify_data_write_deny_enforced(
+                        &sandbox_profile,
+                        &workspace,
+                    )
+                {
+                    eprintln!(
+                        "error: required data write-deny mounts not verified ({error}); refusing to start"
+                    );
+                    std::process::exit(1);
+                }
                 if requires_hook_write_deny
                     && let Err(e) = xai_grok_sandbox::verify_hook_write_deny_enforced()
                 {
@@ -1554,14 +1698,14 @@ pub fn apply_sandbox(
                     std::process::exit(1);
                 }
             }
-            None if requires_bwrap => {
+            BwrapStartup::Refuse => {
                 refuse_unprotected(
                     "the deny list could not be prepared; see the error above \
                      for the specific cause.",
                 );
                 std::process::exit(1);
             }
-            None => {}
+            BwrapStartup::Continue => {}
         }
     }
     if sandbox_profile != xai_grok_sandbox::ProfileName::Off {
@@ -1578,12 +1722,7 @@ pub fn apply_sandbox(
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            #[cfg(target_os = "macos")]
             let unappliable = requires_protection && !sandbox.is_applied();
-            #[cfg(target_os = "linux")]
-            let unappliable = requires_protection
-                && !sandbox.is_applied()
-                && !xai_grok_sandbox::is_inside_bwrap();
             if unappliable {
                 eprintln!(
                     "error: could not apply the '{}' sandbox profile; see the \
@@ -2026,7 +2165,20 @@ pub(crate) fn add_hooks_path_to_file(
 ///
 /// If the path is not found (exact string match), this is a no-op.
 /// Matches the same exact-string behavior as `add_hooks_path`.
-pub(crate) fn remove_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn registered_hook_paths() -> std::collections::HashSet<String> {
+    std::fs::read_to_string(crate::util::grok_home::grok_home().join("hooks-paths"))
+        .map(|content| {
+            content
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn remove_hooks_path(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     remove_hooks_path_from_file(
         path,
         &crate::util::grok_home::grok_home().join("hooks-paths"),
@@ -2036,10 +2188,10 @@ pub(crate) fn remove_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Er
 pub(crate) fn remove_hooks_path_from_file(
     path: &str,
     paths_file: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let content = match std::fs::read_to_string(paths_file) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
     let mut found = false;
@@ -2055,7 +2207,7 @@ pub(crate) fn remove_hooks_path_from_file(
         })
         .collect();
     if !found {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = paths_file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2064,7 +2216,7 @@ pub(crate) fn remove_hooks_path_from_file(
         paths_file,
         new_lines.join("\n") + (if new_lines.is_empty() { "" } else { "\n" }),
     )?;
-    Ok(())
+    Ok(true)
 }
 #[cfg(test)]
 mod tests;

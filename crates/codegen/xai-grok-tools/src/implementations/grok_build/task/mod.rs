@@ -14,6 +14,7 @@
 //! - `SubagentForegroundWait` — host wait-window guard factory (optional)
 //! - `TaskModelValidator` — validates explicit model slugs before spawn
 
+mod active_message;
 pub mod admission;
 pub mod backend;
 pub mod coordinator;
@@ -410,6 +411,8 @@ impl xai_tool_runtime::Tool for TaskTool {
             }
         }
 
+        let foreground_wait = foreground_wait.map(|wait| wait.enter());
+
         // 2. Eager validation — catch unknown / disabled / not-allowed
         //    types before the fire-and-forget background spawn.
         match backend
@@ -442,14 +445,22 @@ impl xai_tool_runtime::Tool for TaskTool {
                     input.subagent_type
                 )));
             }
-            SubagentValidateTypeOutcome::ValidationUnavailable => {
-                // `custom` (not `invalid_arguments`) so the model doesn't
-                // retry with a different name on transport faults.
+            SubagentValidateTypeOutcome::CoordinatorGone => {
                 return Err(xai_tool_runtime::ToolError::custom(
                     "validation_unavailable",
                     format!(
-                        "Cannot validate subagent type '{}': the subagent coordinator is \
-                         unreachable. Retry shortly or notify ops.",
+                        "Cannot validate subagent type '{}': the subagent coordinator \
+                         has shut down. Retrying will not help.",
+                        input.subagent_type
+                    ),
+                ));
+            }
+            SubagentValidateTypeOutcome::ValidationUnavailable => {
+                return Err(xai_tool_runtime::ToolError::custom(
+                    "validation_unavailable",
+                    format!(
+                        "Cannot validate subagent type '{}': the subagent coordinator did \
+                         not respond (it may be busy). Retry shortly.",
                         input.subagent_type
                     ),
                 ));
@@ -551,6 +562,7 @@ impl xai_tool_runtime::Tool for TaskTool {
             ));
         }
         if input.run_in_background {
+            drop(foreground_wait);
             let bg_backend = backend.clone();
             let bg_id = id.clone();
             let bg_type = input.subagent_type.clone();
@@ -600,7 +612,6 @@ impl xai_tool_runtime::Tool for TaskTool {
         }
 
         // 5. Blocking mode (default): spawn via backend and await result
-        let _foreground_wait = foreground_wait.map(|wait| wait.enter());
         let result = backend.backend().spawn(request).await;
         if let Some(forwarder) = cancellation_forwarder {
             forwarder.abort();
@@ -1751,12 +1762,104 @@ mod tests {
             task_input("explore", true),
         )
         .await;
-        let msg = result.expect_err("must error").to_string();
+        let err = result.expect_err("must error");
         assert!(
-            msg.contains("subagent coordinator is unreachable")
+            matches!(err.kind, xai_tool_runtime::ToolErrorKind::Custom),
+            "transport faults must not be invalid_arguments (the model would \
+             retry with a mutated name): {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("subagent coordinator did not respond")
                 && msg.contains("Cannot validate subagent type"),
         );
         assert!(!msg.contains("Unknown subagent type"));
+    }
+
+    #[tokio::test]
+    async fn foreground_wait_covers_eager_validation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DepthGuard(Arc<AtomicUsize>);
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        for run_in_background in [false, true] {
+            let wait_depth = Arc::new(AtomicUsize::new(0));
+            let depth_seen_by_validation = Arc::new(AtomicUsize::new(usize::MAX));
+
+            let depth_for_validation = Arc::clone(&wait_depth);
+            let seen = Arc::clone(&depth_seen_by_validation);
+            let (backend, mut rx) = make_backend_with_validation_fn(move |_, _| {
+                seen.store(
+                    depth_for_validation.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                SubagentValidateTypeOutcome::Ok
+            });
+
+            let mut resources = resources_for_task(backend);
+            let depth_for_factory = Arc::clone(&wait_depth);
+            resources.insert(SubagentForegroundWait::new(move |kind| {
+                assert_eq!(kind, ForegroundWaitKind::Interruptible);
+                depth_for_factory.fetch_add(1, Ordering::SeqCst);
+                Box::new(DepthGuard(Arc::clone(&depth_for_factory)))
+            }));
+
+            let drain = tokio::spawn(async move {
+                if let Some(SubagentEvent::Spawn(boxed)) = rx.recv().await {
+                    let _ = boxed.respond_with(|boxed| SubagentResult {
+                        success: true,
+                        subagent_id: boxed.id.clone(),
+                        child_session_id: boxed.id.clone(),
+                        ..Default::default()
+                    });
+                }
+            });
+
+            let result = xai_tool_runtime::Tool::run(
+                &TaskTool,
+                test_ctx(resources.into_shared()),
+                task_input("explore", run_in_background),
+            )
+            .await;
+            assert!(result.is_ok(), "bg={run_in_background}: {result:?}");
+            assert_eq!(
+                depth_seen_by_validation.load(Ordering::SeqCst),
+                1,
+                "bg={run_in_background}: wait window must be open while validation is in flight"
+            );
+            assert_eq!(
+                wait_depth.load(Ordering::SeqCst),
+                0,
+                "bg={run_in_background}: guard must be released after the run"
+            );
+            drain.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_gone_error_does_not_invite_retry() {
+        let (tx, rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        drop(rx);
+        let backend = SubagentBackendResource(Arc::new(ChannelBackend::new(tx)));
+        let resources = resources_for_task(backend);
+
+        let result = xai_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx(resources.into_shared()),
+            task_input("explore", true),
+        )
+        .await;
+        let msg = result.expect_err("must error").to_string();
+        assert!(msg.contains("has shut down"), "{msg}");
+        assert!(
+            !msg.contains("Retry shortly"),
+            "terminal fault must not invite a retry: {msg}"
+        );
     }
 
     #[tokio::test]

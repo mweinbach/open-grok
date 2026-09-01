@@ -190,6 +190,8 @@ mod tests {
             has_session_announcements: false,
             billing_surface_visible: true,
             workflows_available: false,
+            saved_workflows: &[],
+            workflow_runs: &[],
             screen_mode: crate::app::ScreenMode::Inline,
             current_title: None,
         };

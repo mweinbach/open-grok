@@ -23,21 +23,21 @@ impl SessionActor {
         &self,
         simplified_messages: &[ConversationItem],
         summary: &str,
-    ) {
+    ) -> bool {
         let Some(detail) = self.compaction.compaction_mode.segment_detail() else {
-            return;
+            return false;
         };
         let cleaned_summary = format_compact_summary(summary);
         let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let _ = self
-            .notifications
+        self.notifications
             .persistence_tx
             .send(PersistenceMsg::CompactionSegment(CompactionSegmentFile {
                 items: simplified_messages.to_vec(),
                 summary: cleaned_summary,
                 detail,
                 timestamp,
-            }));
+            }))
+            .is_ok()
     }
     /// Pointer text appended to the summary — where pre-compaction history lives
     /// (`updates.jsonl` for `Transcript`, the `compaction/` store otherwise). No

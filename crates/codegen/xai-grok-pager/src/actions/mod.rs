@@ -37,8 +37,7 @@ pub enum ActionId {
     // Prompt
     SendPrompt,
     InterjectPrompt,
-    /// Enable voice mode and start recording (`/voice`). Not a toggle — it
-    /// never turns voice mode off; capture is controlled by [`Self::VoiceToggle`].
+    StashPrompt,
     EnableVoiceMode,
     /// Start/stop mic capture (Ctrl+Space / Esc). Starting also enables voice
     /// mode and spawns the pipeline if needed — no `/voice` prerequisite.

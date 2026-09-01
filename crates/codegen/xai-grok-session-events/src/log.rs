@@ -122,6 +122,7 @@ mod tests {
             outcome: ToolOutcome::Success,
             tool_call_id: "call_xyz".into(),
             source: crate::types::ToolCompletedSource::Shell,
+            rewriting_hook: None,
         });
         writer.emit(Event::TurnEnded {
             outcome: TurnOutcomeLabel::Completed,

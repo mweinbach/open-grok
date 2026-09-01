@@ -28,11 +28,31 @@
 
 pub use rmcp;
 
+#[doc(hidden)]
+pub fn isolate_grok_home_for_tests() {
+    static HOME: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let directory = tempfile::TempDir::new()
+            .expect("test Open Grok home")
+            .keep();
+        unsafe { std::env::set_var("OPENGROK_HOME", &directory) };
+        let memo = xai_grok_config::grok_home();
+        assert!(
+            memo.starts_with(&directory),
+            "Open Grok home memo was warmed before test isolation: {}",
+            memo.display()
+        );
+    });
+}
+
 pub mod acp_transport;
+mod auth_status;
 pub mod credentials;
+pub mod elicitation;
 pub mod liveness;
 pub mod mcp_http_client;
 pub mod oauth;
 pub mod oauth_config;
+pub mod owned_clients;
 pub mod servers;
 pub mod wire;

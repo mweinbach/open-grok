@@ -67,6 +67,12 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         auth: None,
         parent_cwd: PathBuf::from("/tmp"),
         parent_session_id: "test-parent".into(),
+        active_message_telemetry: crate::session::telemetry::ActiveAgentMessageTelemetrySource::new(
+            "test-parent".to_owned(),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            crate::session::persistence::ProviderBoundary::default(),
+            false,
+        ),
         inherited_tool_overrides: None,
         yolo_mode: false,
         subagent_event_tx: tx,
@@ -152,6 +158,8 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         parent_terminal_backend: None,
         parent_notification_handle: None,
         parent_scheduler_handle: None,
+        sampling_gate: None,
+        subagent_coordinator_sender: None,
     }
 }
 #[derive(Default)]
@@ -181,6 +189,13 @@ impl xai_grok_tools::implementations::lsp::LspBackend for DummyLspDispatch {
         None
     }
     async fn notify_file_changed(&self, _path: &std::path::Path, _content: &str) {}
+    async fn notify_file_event(
+        &self,
+        _path: &std::path::Path,
+        _content: Option<&str>,
+        _kind: xai_grok_tools::implementations::lsp::DiskChangeKind,
+    ) {
+    }
     async fn read_diagnostics(
         &self,
         _paths: &[std::path::PathBuf],

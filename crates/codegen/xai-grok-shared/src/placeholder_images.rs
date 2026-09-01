@@ -339,7 +339,7 @@ pub enum PlaceholderLoadError {
 /// etc. be exfil-able. Instead, only the typical user-paste image
 /// directories are added.
 pub fn default_allowed_prefixes(workspace_cwd: &Path) -> Vec<PathBuf> {
-    default_allowed_prefixes_with_home(workspace_cwd, dirs::home_dir())
+    default_allowed_prefixes_with_home(workspace_cwd, xai_dirs::home_dir())
 }
 
 /// Test-injectable variant of [`default_allowed_prefixes`]. Production

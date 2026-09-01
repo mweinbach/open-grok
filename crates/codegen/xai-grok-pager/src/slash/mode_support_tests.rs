@@ -113,13 +113,6 @@ fn mode_specific_builtin_refusals_are_pinned() {
                     .to_string()
             ),
             (
-                "edit-prompt",
-                "/edit-prompt isn't available in fullscreen mode (the full TUI has no \
-                 external-editor path — Ctrl+G is the tasks pane there). \
-                 Run /minimal to switch this session."
-                    .to_string()
-            ),
-            (
                 "expand",
                 "/expand isn't available in fullscreen mode — press Tab to focus the \
                  scrollback, then → on the block."
@@ -161,13 +154,6 @@ fn mode_specific_builtin_refusals_are_pinned() {
                 "tutorial",
                 "/tutorial isn't available in minimal mode \
                  (the tutorial overlay needs fullscreen). \
-                 Run /fullscreen to switch this session."
-                    .to_string()
-            ),
-            (
-                "workflows",
-                "/workflows isn't available in minimal mode \
-                 (the workflow run pane needs fullscreen). \
                  Run /fullscreen to switch this session."
                     .to_string()
             ),

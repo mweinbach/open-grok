@@ -700,6 +700,7 @@ pub struct Requirements {
     pub sandbox_profile: Constrained<String>,
     pub respect_gitignore: Constrained<bool>,
     pub remote_fetch: Constrained<bool>,
+    pub title_refresh: Constrained<bool>,
 }
 /// Inputs for resolving `#[serde(skip)]` runtime fields after `new_from_toml_cfg()`.
 ///
@@ -1192,6 +1193,8 @@ pub struct ModelsConfig {
     pub max_retries: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_idle_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_rate_limit_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
 }
@@ -2121,6 +2124,17 @@ impl Config {
         let unrecognized_keys = match user_config.as_table() {
             Some(user_table) => unused_keys
                 .into_iter()
+                .flat_map(|path| {
+                    if path == "toolset.web_search"
+                        && let Some(table) = user_config
+                            .get("toolset")
+                            .and_then(|toolset| toolset.get("web_search"))
+                            .and_then(toml::Value::as_table)
+                    {
+                        return table.keys().map(|key| format!("{path}.{key}")).collect();
+                    }
+                    vec![path]
+                })
                 .filter(|path| {
                     let top_level = path.split('.').next().unwrap_or(path);
                     user_table.contains_key(top_level)
@@ -2495,6 +2509,21 @@ impl Config {
     }
     pub(crate) fn is_turn_summary_enabled(&self) -> bool {
         self.resolve_turn_summary().value
+    }
+    pub(crate) fn is_title_refresh_enabled(&self) -> bool {
+        self.resolve_title_refresh().value
+    }
+    pub(crate) fn resolve_title_refresh(&self) -> Resolved<bool> {
+        BoolFlag::env("GROK_TITLE_REFRESH")
+            .requirement(self.requirements.title_refresh.pinned())
+            .config(self.features.title_refresh)
+            .feature_flag(
+                self.remote_settings
+                    .as_ref()
+                    .and_then(|settings| settings.title_refresh),
+            )
+            .default(self.is_turn_summary_enabled())
+            .resolve()
     }
     pub(crate) fn is_voice_mode_enabled(&self) -> bool {
         self.resolve_voice_mode().value
@@ -4194,6 +4223,10 @@ fn apply_global_scalar_defaults(
         if let Some(v) = models.inference_idle_timeout_secs {
             info.inference_idle_timeout_secs.get_or_insert(v);
         }
+        if let Some(attempts) = models.subagent_rate_limit_max_attempts {
+            info.subagent_rate_limit_max_attempts
+                .get_or_insert(attempts);
+        }
         // `[models].stream_tool_calls` is a live preference fallback (see
         // `stream_tool_calls_preference`), not a per-model fill. Filling
         // every ModelInfo here would pin the value and block the Settings
@@ -4430,6 +4463,7 @@ fn default_models(
                 agent_type: m.agent_type,
                 inference_idle_timeout_secs: m.inference_idle_timeout_secs,
                 max_retries: None,
+                subagent_rate_limit_max_attempts: None,
                 api_key: None,
                 env_key: m.env_key,
                 extra_headers: IndexMap::new(),
@@ -4576,6 +4610,8 @@ pub struct ModelEntryConfig {
     /// Can also be set via the `GROK_MAX_RETRIES` environment variable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_rate_limit_max_attempts: Option<u32>,
     /// Exclude from the client model picker; still usable internally (web_search, etc.).
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
@@ -4664,6 +4700,7 @@ pub struct ConfigModelOverride {
     pub agent_type: Option<String>,
     pub inference_idle_timeout_secs: Option<u64>,
     pub max_retries: Option<u32>,
+    pub subagent_rate_limit_max_attempts: Option<u32>,
     pub hidden: Option<bool>,
     pub supported_in_api: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -4830,6 +4867,9 @@ impl ConfigModelOverride {
         if self.max_retries.is_some() {
             entry.info.max_retries = self.max_retries;
         }
+        if self.subagent_rate_limit_max_attempts.is_some() {
+            entry.info.subagent_rate_limit_max_attempts = self.subagent_rate_limit_max_attempts;
+        }
         if let Some(v) = self.hidden {
             entry.info.hidden = v;
         }
@@ -4961,6 +5001,8 @@ pub struct ModelInfo {
     /// Per-chunk idle timeout for inference streaming (see `ModelEntryConfig`).
     pub inference_idle_timeout_secs: Option<u64>,
     pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_rate_limit_max_attempts: Option<u32>,
     /// Never show in picker (any auth). See also `supported_in_api`.
     pub hidden: bool,
     /// May the user select this model for normal chat? Derived from
@@ -5034,6 +5076,7 @@ impl ModelInfo {
             agent_type: default_agent_type(),
             inference_idle_timeout_secs: None,
             max_retries: None,
+            subagent_rate_limit_max_attempts: None,
             hidden: false,
             supported_in_api: true,
             reasoning_effort: None,
@@ -5082,6 +5125,7 @@ impl ModelInfo {
             agent_type: entry.agent_type.clone(),
             inference_idle_timeout_secs: entry.inference_idle_timeout_secs,
             max_retries: entry.max_retries,
+            subagent_rate_limit_max_attempts: entry.subagent_rate_limit_max_attempts,
             hidden: entry.hidden,
             supported_in_api: entry.supported_in_api,
             reasoning_effort: entry.reasoning_effort,
@@ -5508,6 +5552,8 @@ pub struct Features {
     /// `None` = defer to remote settings / env / default (`true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_summary: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_refresh: Option<bool>,
     /// Voice dictation (STT). `None` = env / remote / default on.
     /// Set `false` in requirements or managed config to force off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6102,6 +6148,7 @@ pub fn resolve_aux_model_sampling_config(
                 agent_type: default_agent_type(),
                 inference_idle_timeout_secs: None,
                 max_retries: None,
+                subagent_rate_limit_max_attempts: None,
                 hidden: true,
                 supported_in_api: true,
                 reasoning_effort: None,
@@ -6521,6 +6568,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             agent_type: default_agent_type(),
             inference_idle_timeout_secs: None,
             max_retries: None,
+            subagent_rate_limit_max_attempts: None,
             hidden: true,
             user_selectable: true,
             supported_in_api: true,
@@ -8083,6 +8131,7 @@ reasoning_effort = "low"
                 agent_type: default_agent_type(),
                 inference_idle_timeout_secs: None,
                 max_retries: None,
+                subagent_rate_limit_max_attempts: None,
                 hidden: false,
                 supported_in_api: true,
                 reasoning_effort: None,
@@ -8890,7 +8939,7 @@ reasoning_effort = "low"
         );
         assert_eq!(
             resolve_compaction_mode_from(None, None, None),
-            CompactionMode::Summary
+            CompactionMode::Segments(xai_chat_state::CompactionDetail::Verbose)
         );
     }
     /// Detail shares the env>config>remote>default combinator that the mode
@@ -9491,6 +9540,7 @@ reasoning_effort = "low"
             agent_type: default_agent_type(),
             inference_idle_timeout_secs: None,
             max_retries: None,
+            subagent_rate_limit_max_attempts: None,
             hidden: false,
             supported_in_api: true,
             reasoning_effort: None,
@@ -9660,6 +9710,7 @@ reasoning_effort = "low"
             agent_type: "codex".to_string(),
             inference_idle_timeout_secs: None,
             max_retries: None,
+            subagent_rate_limit_max_attempts: None,
             hidden: false,
             supported_in_api: true,
             reasoning_effort: None,
@@ -10159,6 +10210,7 @@ reasoning_effort = "low"
             agent_type: default_agent_type(),
             inference_idle_timeout_secs: Some(120),
             max_retries: None,
+            subagent_rate_limit_max_attempts: None,
             hidden: false,
             supported_in_api: true,
             reasoning_effort: None,
@@ -11160,6 +11212,44 @@ reasoning_effort = "low"
         assert_eq!(r.source, ConfigSource::Env);
         unsafe { std::env::remove_var("GROK_TURN_SUMMARY") };
     }
+    #[test]
+    #[serial]
+    fn resolve_title_refresh_follows_summary_unless_explicit_or_pinned() {
+        unsafe {
+            std::env::remove_var("GROK_TITLE_REFRESH");
+            std::env::remove_var("GROK_TURN_SUMMARY");
+        }
+        let mut config = Config {
+            features: Features {
+                turn_summary: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!config.is_title_refresh_enabled());
+        config.remote_settings = Some(crate::util::config::RemoteSettings {
+            title_refresh: Some(true),
+            ..Default::default()
+        });
+        assert!(config.is_title_refresh_enabled());
+        config.features.title_refresh = Some(false);
+        assert!(!config.is_title_refresh_enabled());
+        unsafe { std::env::set_var("GROK_TITLE_REFRESH", "1") };
+        assert!(config.is_title_refresh_enabled());
+        config.requirements.title_refresh.pin(
+            false,
+            crate::config::RequirementSource::Requirements {
+                path: std::path::PathBuf::from("requirements.toml"),
+            },
+        );
+        assert!(!config.is_title_refresh_enabled());
+        assert_eq!(
+            config.resolve_title_refresh().source,
+            ConfigSource::Requirement
+        );
+        unsafe { std::env::remove_var("GROK_TITLE_REFRESH") };
+    }
+
     /// Precedence: env > config.toml > remote settings > default(false). One test
     /// covers the full ladder so we do not maintain a matrix of flag cases.
     #[test]
@@ -12705,11 +12795,16 @@ agent_type = "cursor"
     #[test]
     fn web_search_domain_keys_are_not_reported_unused() {
         for key in ["allowed_domains", "excluded_domains"] {
+            assert!(
+                unused_keys_from_toml(&format!("[toolset.web_search]\n{key} = [\"docs.x.ai\"]"))
+                    .is_empty()
+            );
             let unused = unused_keys_from_toml(&format!(
                 r#"
                 [toolset.web_search]
                 {key} = ["docs.x.ai"]
                 not_a_real_key = true
+                api_key = "ignored-test-value"
             "#
             ));
             assert!(
@@ -12724,6 +12819,7 @@ agent_type = "cursor"
                     .any(|k| k == "toolset.web_search.not_a_real_key"),
                 "real typos in the same section still surface: {unused:?}"
             );
+            assert!(unused.iter().any(|key| key == "toolset.web_search.api_key"));
         }
     }
     #[test]
@@ -14182,6 +14278,7 @@ default = "grok-4.5"
                 agent_type: default_agent_type(),
                 inference_idle_timeout_secs: None,
                 max_retries: None,
+                subagent_rate_limit_max_attempts: None,
                 hidden: false,
                 supported_in_api: true,
                 reasoning_effort: None,
@@ -14341,6 +14438,7 @@ default = "grok-4.5"
         cfg.models.max_completion_tokens = Some(4096);
         cfg.models.max_retries = Some(9);
         cfg.models.inference_idle_timeout_secs = Some(600);
+        cfg.models.subagent_rate_limit_max_attempts = Some(12);
         cfg.models.stream_tool_calls = Some(true);
         let entry = prefetch_model_entry("remote-only-model", 200_000, ApiBackend::default());
         let mut prefetched = IndexMap::new();
@@ -14355,6 +14453,7 @@ default = "grok-4.5"
         assert_eq!(info.max_completion_tokens, Some(4096));
         assert_eq!(info.max_retries, Some(9));
         assert_eq!(info.inference_idle_timeout_secs, Some(600));
+        assert_eq!(info.subagent_rate_limit_max_attempts, Some(12));
         assert_eq!(
             info.stream_tool_calls, None,
             "[models].stream_tool_calls is a live preference fallback, not a per-model fill"
@@ -14388,6 +14487,144 @@ default = "grok-4.5"
             model.info.max_completion_tokens,
             Some(8192),
             "a global-only default must still be inherited"
+        );
+    }
+    #[test]
+    fn subagent_rate_limit_model_precedence_preserves_zero_and_unset() {
+        for (global, remote, local, expected) in [
+            (None, None, None, None),
+            (Some(12), None, None, Some(12)),
+            (Some(12), Some(8), None, Some(8)),
+            (Some(12), Some(8), Some(4), Some(4)),
+            (Some(12), Some(8), Some(0), Some(0)),
+            (Some(12), Some(0), None, Some(0)),
+            (Some(0), None, None, Some(0)),
+        ] {
+            let mut config = Config::default();
+            config.models.subagent_rate_limit_max_attempts = global;
+            config.config_models.insert(
+                "retry-model".into(),
+                ConfigModelOverride {
+                    subagent_rate_limit_max_attempts: local,
+                    ..Default::default()
+                },
+            );
+            let mut entry = prefetch_model_entry("retry-model", 200_000, ApiBackend::Responses);
+            entry.info.subagent_rate_limit_max_attempts = remote;
+            let prefetched = IndexMap::from([("retry-model".into(), entry)]);
+            let resolved = resolve_model_list(&config, Some(prefetched));
+            assert_eq!(
+                resolved["retry-model"]
+                    .info
+                    .subagent_rate_limit_max_attempts,
+                expected,
+                "global={global:?}, remote={remote:?}, local={local:?}"
+            );
+        }
+    }
+    #[test]
+    fn subagent_rate_limit_override_preserves_provider_and_native_metadata() {
+        let endpoints = EndpointsConfig::default();
+        for provider in [
+            ModelProvider::Xai,
+            ModelProvider::Codex,
+            ModelProvider::Fireworks,
+            ModelProvider::Custom,
+        ] {
+            let mut entry = ModelEntry::fallback("retry-model", &endpoints);
+            entry.info.provider = provider;
+            entry.info.base_url = "https://model.invalid/v1".into();
+            entry.info.api_backend = ApiBackend::Responses;
+            entry
+                .info
+                .extra_headers
+                .insert("x-model".into(), "fixture".into());
+            entry
+                .info
+                .query_params
+                .insert("version".into(), "test".into());
+            entry
+                .info
+                .env_http_headers
+                .insert("x-tenant".into(), "TEST_TENANT".into());
+            entry.info.subagent_rate_limit_max_attempts = Some(12);
+            if provider == ModelProvider::Codex {
+                entry.info.tool_mode = Some(ToolMode::CodeModeOnly);
+                entry.info.subagent_context_default = Some(SubagentContextMode::Fork);
+                entry.info.codex_multi_agent_v2 = true;
+                entry.info.use_responses_lite = true;
+                entry.info.experimental_supported_tools = vec!["multi_agent_v2".into()];
+                entry.info.apply_patch_tool_type = Some("freeform".into());
+                entry.info.agent_type = "codex".into();
+            }
+            entry.api_key = Some("fixture-only-key".into());
+            entry.env_key = Some(EnvKeys::single("TEST_PROVIDER_KEY"));
+            entry.api_base_url = Some("https://key-route.invalid/v1".into());
+            let mut expected = entry.clone();
+            expected.info.subagent_rate_limit_max_attempts = Some(0);
+            let resolved = ConfigModelOverride {
+                subagent_rate_limit_max_attempts: Some(0),
+                ..Default::default()
+            }
+            .apply("retry-model", Some(entry), &endpoints);
+            assert_eq!(
+                serde_json::to_value(resolved).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn subagent_rate_limit_settings_parse_from_toml() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [models]
+            subagent_rate_limit_max_attempts = 12
+            [model.retry-model]
+            provider = "custom"
+            model = "retry-model"
+            base_url = "https://model.invalid/v1"
+            subagent_rate_limit_max_attempts = 0
+        "#,
+        )
+        .unwrap();
+        let config = Config::new_from_toml_cfg(&raw).unwrap();
+        assert_eq!(config.models.subagent_rate_limit_max_attempts, Some(12));
+        assert_eq!(
+            config.config_models["retry-model"].subagent_rate_limit_max_attempts,
+            Some(0)
+        );
+        assert!(config.config_warnings.is_empty());
+        let resolved = resolve_model_list(&config, None);
+        assert_eq!(
+            resolved["retry-model"]
+                .info
+                .subagent_rate_limit_max_attempts,
+            Some(0)
+        );
+    }
+    #[test]
+    fn subagent_rate_limit_metadata_round_trips_and_accepts_legacy_entries() {
+        let model = ModelInfo::fallback("retry-model");
+        let mut value = serde_json::to_value(model).unwrap();
+        assert!(value.get("subagent_rate_limit_max_attempts").is_none());
+        let legacy: ModelInfo = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(legacy.subagent_rate_limit_max_attempts, None);
+        value["subagent_rate_limit_max_attempts"] = serde_json::json!(0);
+        let parsed: ModelInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.subagent_rate_limit_max_attempts, Some(0));
+        let mut entry = default_models(
+            &EndpointsConfig::default(),
+            crate::kimi_models::KimiApiEndpoint::Platform,
+        )
+        .into_values()
+        .next()
+        .expect("embedded model catalog is nonempty");
+        entry.subagent_rate_limit_max_attempts = Some(8);
+        let serialized = serde_json::to_value(&entry).unwrap();
+        let parsed: ModelEntryConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            ModelInfo::from_config(&parsed).subagent_rate_limit_max_attempts,
+            Some(8)
         );
     }
     #[test]

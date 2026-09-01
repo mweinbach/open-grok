@@ -195,36 +195,32 @@ impl SessionActor {
     pub(super) async fn handle_completion(
         &self,
         prompt_id: String,
+        epoch: TurnEpoch,
+        task_identity: &TaskIdentity,
         result: PromptTurnResult,
+        elapsed_ms: Option<u64>,
     ) -> bool {
+        let Some(mut lease) =
+            self.state
+                .lock()
+                .await
+                .claim_task_finalization(&prompt_id, epoch, task_identity)
+        else {
+            tracing::warn!(%prompt_id, "dropping stale turn completion");
+            return false;
+        };
         let result = result.map(|mut ok| {
             ok.tool_overrides = self.effective_tool_overrides();
             ok
         });
-        let became_idle = {
-            let mut current_prompt_id = self
-                .current_prompt_id
-                .lock()
-                .expect("current_prompt_id mutex poisoned");
-            if current_prompt_id.as_deref() == Some(prompt_id.as_str()) {
-                *current_prompt_id = None;
-            }
-            current_prompt_id.is_none()
-        };
-        if became_idle {
+        let should_flush_reminders = self
+            .current_prompt_id
+            .lock()
+            .expect("current_prompt_id mutex poisoned")
+            .as_deref()
+            .is_none_or(|current| current == prompt_id);
+        if should_flush_reminders {
             self.flush_pending_skill_reminders().await;
-            // Idle-gated: a stale completion must not clobber the promoted turn's resources.
-            self.agent
-                .borrow()
-                .tool_bridge()
-                .update_resource(
-                    xai_grok_tools::implementations::grok_build::task::types::CurrentPromptIdResource(
-                        String::new(),
-                    ),
-                )
-                .await;
-            // Goal turn is over — re-enable per-tool-call completion reminders.
-            self.set_goal_loop_active_resource(false).await;
         }
 
         // Read before the lock: the report below runs under it and cannot await.
@@ -291,11 +287,20 @@ impl SessionActor {
                 },
             );
         }
-        // Ownership-gated: a stale completion must not null the promoted turn's
-        // task, or `maybe_start_running_task` would double-spawn the prompt.
-        if state.running_prompt_id() == Some(prompt_id.as_str()) || owned_completion {
-            state.running_task = None;
-        }
+        let held_rows = (finalizes_turn
+            && state.hook_block_held()
+            && !state.pending_inputs.is_empty()
+            && matches!(
+                &result,
+                Ok(PromptTurnOk {
+                    completion_kind: PromptCompletionKind::Cancelled {
+                        category: Some(crate::session::events::CancellationCategory::HookDenied),
+                        ..
+                    },
+                    ..
+                })
+            ))
+        .then_some(state.pending_inputs.len());
         if broadcast_queue {
             self.broadcast_queue_changed(&state);
         }
@@ -319,6 +324,10 @@ impl SessionActor {
         // Drop the state guard before the async emit so the persist/broadcast
         // fork doesn't run under the state lock.
         drop(state);
+
+        if let Some(held_rows) = held_rows {
+            self.send_hook_annotation(&format!("{held_rows} queued prompt(s) on hold after the block. Edit or remove them, or send a prompt to resume.")).await;
+        }
 
         // Durable twin of the fire-and-forget `prompt_complete` (emitted from
         // `MvpAgent::prompt`): publish the turn's terminal on the persisted +
@@ -346,8 +355,21 @@ impl SessionActor {
                 &mapped,
                 usage,
                 completion_cancel_trigger(&result),
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|ok| ok.completion_kind.cancellation_category_meta())
+                    .as_deref(),
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|ok| ok.completion_kind.cancellation_context_meta()),
+                elapsed_ms,
             )
             .await;
+        }
+        if !self.finish_finalization_lease(&mut lease).await {
+            tracing::error!(%prompt_id, "turn finalization lease could not be released");
         }
         owned_completion
     }
@@ -371,23 +393,71 @@ impl SessionActor {
         mapped: &std::result::Result<acp::StopReason, acp::Error>,
         usage: Option<crate::extensions::notification::PromptUsage>,
         cancel_trigger: Option<&str>,
+        cancellation_category: Option<&str>,
+        cancellation_context: Option<serde_json::Value>,
+        elapsed_ms: Option<u64>,
     ) {
-        let (stop_reason, agent_result) = crate::sampling::error::prompt_complete_fields(mapped);
-        let extra_meta = cancel_trigger.map(|t| {
-            [("cancelTrigger".to_string(), serde_json::json!(t))]
-                .into_iter()
-                .collect()
-        });
-        self.send_xai_notification_with_extra_meta(
+        let (stop_reason, agent_result, error_kind) =
+            crate::sampling::error::prompt_complete_fields(mapped);
+        let mut extra = serde_json::Map::new();
+        if let Some(trigger) = cancel_trigger {
+            extra.insert("cancelTrigger".to_owned(), serde_json::json!(trigger));
+        }
+        if let Some(category) = cancellation_category {
+            extra.insert(
+                "cancellationCategory".to_owned(),
+                serde_json::json!(category),
+            );
+        }
+        if let Some(context) = cancellation_context {
+            extra.insert("cancellationContext".to_owned(), context);
+        }
+        self.send_xai_notification_durable_with_extra_meta(
             crate::session::turn_completion::build_turn_completed(
                 prompt_id,
                 stop_reason,
                 agent_result,
+                error_kind,
                 usage,
+                elapsed_ms,
             ),
-            extra_meta,
+            (!extra.is_empty()).then_some(extra),
         )
         .await;
+        self.emit_status_snapshot_detached();
+    }
+
+    async fn send_xai_notification_durable_with_extra_meta(
+        &self,
+        update: XaiSessionUpdate,
+        extra_meta: Option<serde_json::Map<String, serde_json::Value>>,
+    ) {
+        self.close_rewind_window().await;
+        let mut meta = self.build_notification_meta();
+        if let (Some(meta), Some(extra)) = (meta.as_object_mut(), extra_meta) {
+            meta.extend(extra);
+        }
+        let notification = XaiSessionNotification {
+            session_id: self.session_info.id.clone(),
+            update,
+            meta: Some(meta),
+        };
+        let (respond_to, _) = oneshot::channel();
+        let _ = self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::AppendUpdateDurablyAndAck {
+                update: SessionUpdate::Xai(Box::new(notification.clone())),
+                respond_to,
+            });
+        if let Ok(params) = serde_json::value::to_raw_value(&notification) {
+            self.notifications
+                .gateway
+                .forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/session_notification",
+                    params.into(),
+                ));
+        }
     }
 
     /// Telemetry error category; delegates to `stop_failure_error_type` so the

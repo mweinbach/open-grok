@@ -2824,6 +2824,8 @@ mod tests {
 
     fn make_entry(id: &str, summary: &str, repo_name: &str) -> SessionPickerEntry {
         SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: id.into(),
             summary: summary.into(),
             updated_at: chrono::Utc::now(),
@@ -2971,14 +2973,14 @@ mod tests {
         let before_write =
             crate::terminal::overlay::static_image(&png(), 20, 10, 0, 0, owner_id).unwrap();
         assert!(
-            !before_write.as_str().contains("a=t"),
+            !before_write.as_str().contains("a=T"),
             "constructing the clear must not commit ownership"
         );
         post_flush.write_to(&mut Vec::new()).unwrap();
         let after_write =
             crate::terminal::overlay::static_image(&png(), 20, 10, 0, 0, owner_id).unwrap();
         assert!(
-            after_write.as_str().contains("a=t"),
+            after_write.as_str().contains("a=T"),
             "writing the clear must commit ownership"
         );
     }
@@ -3098,8 +3100,8 @@ mod tests {
         );
     }
 
-    /// The hidden-external hint stays pinned on the welcome picker's default
-    /// Grok view when scanned foreign rows exist — even when the native list
+    /// The hidden-external hint stays pinned on the welcome picker's
+    /// Headless view when scanned foreign rows exist — even when the native list
     /// overflows the viewport — and never renders under `--chat` (foreign
     /// scanning is disabled there, so the hint is dead weight).
     #[test]
@@ -3112,7 +3114,15 @@ mod tests {
         // More native rows than the viewport fits: a trailing list row would
         // scroll out of view, a pinned row must not.
         let mut entries: Vec<SessionPickerEntry> = (0..30)
-            .map(|i| make_entry(&format!("s{i}"), &format!("native session {i}"), "repo"))
+            .map(|index| {
+                let mut entry = make_entry(
+                    &format!("s{index}"),
+                    &format!("native session {index}"),
+                    "repo",
+                );
+                entry.session_kind = Some("headless".into());
+                entry
+            })
             .collect();
         let mut foreign = make_entry("f1", "Claude work", "repo");
         foreign.source = "claude".into();
@@ -3137,7 +3147,7 @@ mod tests {
                     entries_query: None,
                     tick: 0,
                     grouped: false,
-                    source_filter: crate::views::session_picker::SourceFilter::default(),
+                    source_filter: crate::views::session_picker::SourceFilter::Headless,
                     chat_mode,
                 },
             );
@@ -3157,7 +3167,7 @@ mod tests {
         let build_mode = render(false);
         assert!(
             build_mode.contains("1 external session hidden \u{b7} f to show"),
-            "default Grok filter must pin the hidden-external hint:\n{build_mode}"
+            "Headless filter must pin the hidden-external hint:\n{build_mode}"
         );
         assert!(
             build_mode.find("external session hidden") < build_mode.find("native session 0"),
@@ -3165,7 +3175,7 @@ mod tests {
         );
         assert!(
             !build_mode.contains("Claude work"),
-            "the foreign row itself stays hidden under the default filter:\n{build_mode}"
+            "the foreign row itself stays hidden under the Headless filter:\n{build_mode}"
         );
 
         let chat = render(true);

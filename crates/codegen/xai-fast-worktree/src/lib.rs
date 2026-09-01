@@ -19,8 +19,14 @@ pub mod db;
 #[cfg(feature = "metadata")]
 pub mod discovery;
 mod git;
+mod metrics;
 #[cfg(target_os = "linux")]
 pub(crate) mod mount_info;
+#[cfg(unix)]
+mod nfs;
+#[cfg(not(unix))]
+#[path = "nfs_stub.rs"]
+mod nfs;
 #[cfg(target_os = "linux")]
 mod overlay;
 pub mod sync;
@@ -63,7 +69,7 @@ pub use db::{
 pub use discovery::{
     RebuildReport, WORKTREE_DEPTH, WORKTREE_POOL_DIR, WORKTREES_DIR, discover_worktrees,
     managed_worktree_roots, path_under_managed_worktree_roots, path_under_worktree_roots,
-    rebuild_worktree_db,
+    rebuild_worktree_db, rebuild_worktree_db_with_grove_data,
 };
 pub use git::checkout::{
     rehydrate_worktree_from_ref, snapshot_worktree_to_ref, transfer_snapshot_to_repo,
@@ -72,7 +78,28 @@ pub use git::{
     StaleWorktreeMatch, remove_stale_worktree_registration, remove_stale_worktree_registrations,
     remove_stale_worktree_registrations_under,
 };
+pub use metrics::{
+    grove_wt_create_count, grove_wt_create_last_duration_ns, record_grove_wt_create,
+};
+pub use nfs::create_latency_stamp;
+pub use nfs::{
+    CleanArtifactsReply, DetachReply, NfsAdopted, NfsCreateDecision, NfsStatusView,
+    NfsWorktreeClient, NfsWorktreeOpts, SalvageReply, dest_is_known_unmounted, dest_is_mountpoint,
+    dest_is_nfs_mount, source_is_linked_local_view,
+};
 pub use sync::{SourceDirtyState, SyncReport, WorktreeSync, collect_source_dirty_state};
+pub use worktree::{STRATEGY_GROVE_FUSE, STRATEGY_GROVE_NFS, STRATEGY_NFS, is_grove_strategy};
+
+pub fn local_salvage(
+    _dest: &std::path::Path,
+    _out: &std::path::Path,
+) -> anyhow::Result<SalvageReply> {
+    anyhow::bail!("Grove must be running to salvage worktree data in this build")
+}
+
+pub fn local_clean_artifacts(_dest: &std::path::Path) -> anyhow::Result<CleanArtifactsReply> {
+    anyhow::bail!("Grove must be running to clean worktree artifacts in this build")
+}
 #[cfg(target_os = "linux")]
 pub use worktree::execute::cleanup_snapshot_git_state;
 

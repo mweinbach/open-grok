@@ -2740,7 +2740,9 @@ fn dashboard_stop_with_peek_open_moves_selection_and_peek_down_one() {
             &reg,
             None,
             &[],
-            false,
+            app.workspace_dashboard_enabled,
+            app.workspace_snapshot.as_ref(),
+            app.dashboard_sessions_loading,
             None,
         );
     };
@@ -3229,6 +3231,8 @@ mod welcome_workspace_mode {
         app.active_view = ActiveView::Welcome;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::LocalWorkspace;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "conv-1".into(),
             summary: "hello".into(),
             updated_at: chrono::Utc::now(),
@@ -3275,6 +3279,8 @@ mod welcome_workspace_mode {
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         let _planted = super::super::super::plant_local_build_session(tmp.path(), "build-1");
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-1".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3334,6 +3340,8 @@ mod welcome_workspace_mode {
         app.cwd_has_git_ancestor = true;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-wt".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3371,6 +3379,8 @@ mod welcome_workspace_mode {
         app.cwd_has_git_ancestor = true;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::LocalWorkspace;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-wt".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3415,6 +3425,8 @@ mod welcome_workspace_mode {
         app.cwd_has_git_ancestor = false;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-wt".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3458,6 +3470,8 @@ mod welcome_workspace_mode {
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         let _planted = super::super::super::plant_local_build_session(tmp.path(), "build-lock");
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "build-lock".into(),
             summary: "local work".into(),
             updated_at: chrono::Utc::now(),
@@ -3503,6 +3517,8 @@ mod welcome_workspace_mode {
         app.active_view = ActiveView::Welcome;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "missing-build".into(),
             summary: "gone".into(),
             updated_at: chrono::Utc::now(),
@@ -3576,6 +3592,8 @@ mod welcome_workspace_mode {
         app.local_workspace_startup_locked = true;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "conv-lock".into(),
             summary: "hello".into(),
             updated_at: chrono::Utc::now(),
@@ -3649,6 +3667,8 @@ mod welcome_workspace_mode {
         app.active_view = ActiveView::Welcome;
         app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
         app.session_picker_entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: "remote-1".into(),
             summary: "remote row".into(),
             updated_at: chrono::Utc::now(),
@@ -3689,6 +3709,9 @@ mod welcome_workspace_mode {
         assert!(!welcome_history_build_bypass_applies(&[], true));
         assert!(!welcome_history_build_bypass_applies(
             &[Effect::FetchSessionList {
+                host: crate::views::session_picker_surface::SessionPickerHost::Welcome,
+                generation: 0,
+                headless_policy: Default::default(),
                 query: None,
                 seq: 0,
                 kind_filter: None,
@@ -3715,6 +3738,7 @@ mod welcome_workspace_mode {
         assert!(welcome_history_build_bypass_applies(
             &[Effect::CreateWorktreeSession {
                 agent_id: AgentId(0),
+                permission_mode_override: None,
                 load_session_id: Some("s".into()),
                 label: None,
                 git_ref: None,
@@ -3728,6 +3752,7 @@ mod welcome_workspace_mode {
             crate::app::event_loop::welcome_history_build_bypass_consume(
                 &[Effect::CreateWorktreeSession {
                     agent_id: AgentId(0),
+                    permission_mode_override: None,
                     load_session_id: Some("s".into()),
                     label: None,
                     git_ref: None,

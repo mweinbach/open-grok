@@ -68,6 +68,8 @@ impl AgentView {
             has_session_announcements: slash_controller.has_session_announcements(),
             billing_surface_visible: slash_controller.billing_surface_visible(),
             workflows_available: slash_controller.workflows_available(),
+            saved_workflows: slash_controller.registry().saved_workflows(),
+            workflow_runs: slash_controller.workflow_runs(),
             screen_mode: slash_controller.screen_mode(),
             current_title: slash_controller.current_title(),
         };
@@ -903,6 +905,8 @@ impl AgentView {
                                         })
                                     };
                                     self.active_modal = Some(ActiveModal::SessionPicker {
+                                        generation: 0,
+                                        detail_seq: 0,
                                         state: crate::views::picker::PickerState::default(),
                                         entries: None,
                                         loading: true,
@@ -2487,6 +2491,8 @@ mod session_picker_delete_tests {
 
     fn entry(id: &str) -> SessionPickerEntry {
         SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: id.into(),
             summary: id.into(),
             updated_at: chrono::Utc::now(),
@@ -2507,6 +2513,8 @@ mod session_picker_delete_tests {
 
     fn open_picker(agent: &mut AgentView, entries: Vec<SessionPickerEntry>) {
         agent.active_modal = Some(ActiveModal::SessionPicker {
+            generation: 0,
+            detail_seq: 0,
             state: crate::views::picker::PickerState::default(),
             entries: Some(entries),
             loading: false,

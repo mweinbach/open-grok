@@ -231,6 +231,9 @@ fn grok_computer_toolset() -> ToolServerConfig {
         (&grok_build::GrepTool).into(),
         (&grok_build::KillTerminalCommandTool).into(),
         (&grok_build::GetTerminalCommandOutputTool).into(),
+        (&grok_build::SchedulerCreateTool).into(),
+        (&grok_build::SchedulerDeleteTool).into(),
+        (&grok_build::SchedulerListTool).into(),
     ];
     ToolServerConfig {
         tools,
@@ -288,6 +291,12 @@ pub fn toolset_for_preset(preset: &str) -> Option<ToolServerConfig> {
         .or_else(|| registered_toolset_preset(&normalized))
 }
 fn default_grok_build_toolset() -> ToolServerConfig {
+    grok_build_core_toolset(true)
+}
+fn general_purpose_toolset() -> ToolServerConfig {
+    grok_build_core_toolset(false)
+}
+fn grok_build_core_toolset(include_workflow: bool) -> ToolServerConfig {
     let mut tools = vec![
         bash_tool_config(),
         (&grok_build::ReadFileTool).into(),
@@ -309,8 +318,10 @@ fn default_grok_build_toolset() -> ToolServerConfig {
         (&search_tool::SearchTool).into(),
         (&use_tool::UseTool).into(),
         (&grok_build::UpdateGoalTool).into(),
-        (&grok_build::WorkflowTool).into(),
     ];
+    if include_workflow {
+        tools.push((&grok_build::WorkflowTool).into());
+    }
     tools.extend(collaboration_tool_configs());
     tools.extend(session_collaboration_tool_configs());
     ToolServerConfig {
@@ -1400,7 +1411,7 @@ impl AgentDefinition {
     fn scope_from_path(path: &Path) -> AgentScope {
         let path_str = path.to_string_lossy();
         let grok = xai_grok_config::user_grok_home();
-        let home = dirs::home_dir();
+        let home = xai_dirs::home_dir();
         for (dir, scope) in crate::discovery::user_agent_dirs(home.as_deref(), grok.as_deref()) {
             if path.starts_with(&dir) {
                 return scope;
@@ -1629,6 +1640,7 @@ impl AgentDefinition {
             description: xai_tool_types::GENERAL_PURPOSE_SUBAGENT
                 .description
                 .to_string(),
+            tool_config: general_purpose_toolset(),
             prompt_body: Some(subagent_prompts::GENERAL_PURPOSE_PROMPT.to_string()),
             ..Self::base(BuiltinAgentName::GeneralPurpose, "")
         }
@@ -1891,6 +1903,40 @@ mod tests {
                 assert!(t.name_override.is_none(), "tool `{}` must not rename", t.id);
             }
         }
+    }
+    #[test]
+    fn grok_computer_includes_scheduler_lifecycle_tools() {
+        let config = toolset_for_preset("grok-computer").unwrap();
+        for scheduled_tool in [
+            ToolConfig::from(&grok_build::SchedulerCreateTool),
+            ToolConfig::from(&grok_build::SchedulerDeleteTool),
+            ToolConfig::from(&grok_build::SchedulerListTool),
+        ] {
+            assert_eq!(
+                config
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.id == scheduled_tool.id)
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn general_purpose_preserves_core_tools_except_workflow() {
+        let expected: Vec<_> = default_grok_build_toolset()
+            .tools
+            .into_iter()
+            .filter(|tool| !grok_build::workflow::is_workflow_tool(tool.kind, &tool.id))
+            .map(|tool| tool.id)
+            .collect();
+        let actual: Vec<_> = AgentDefinition::general_purpose()
+            .tool_config
+            .tools
+            .into_iter()
+            .map(|tool| tool.id)
+            .collect();
+        assert_eq!(actual, expected);
     }
     /// The grok-computer preset must ship a full-file write tool (legacy
     /// `write_file` parity) — the same OpenCode `write` tool the grok-build

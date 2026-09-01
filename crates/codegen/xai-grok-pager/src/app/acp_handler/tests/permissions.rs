@@ -97,8 +97,80 @@
         );
     }
 
-    /// Manual recap with an uncommitted in-flight spinner: filled in place
-    /// (no second block), animation stopped.
+    fn hook_ask_permission_req(
+        raw_input: serde_json::Value,
+        title: &str,
+        options: Vec<acp::PermissionOption>,
+    ) -> acp::RequestPermissionRequest {
+        let ask = xai_grok_workspace::permission::HookAsk {
+            hook_name: "guard".to_owned(),
+            reason: Some("confirm this".to_owned()),
+        };
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            xai_grok_workspace::permission::HOOK_ASK_META_KEY.to_owned(),
+            serde_json::to_value(&ask).unwrap(),
+        );
+        let fields = acp::ToolCallUpdateFields::new()
+            .raw_input(Some(raw_input))
+            .title(Some(ask.prompt_header(title)));
+        acp::RequestPermissionRequest::new(
+            acp::SessionId::new(std::sync::Arc::from("s1")),
+            acp::ToolCallUpdate::new(acp::ToolCallId::new(std::sync::Arc::from("call-1")), fields),
+            options,
+        )
+        .meta(Some(meta))
+    }
+
+    fn allow_all_edits_option() -> acp::PermissionOption {
+        acp::PermissionOption::new(
+            acp::PermissionOptionId::new(std::sync::Arc::from("allow-edits-session")),
+            "Yes, allow all edits this session".to_string(),
+            acp::PermissionOptionKind::AllowAlways,
+        )
+    }
+
+    #[test]
+    fn hook_ask_is_the_first_description_line_on_every_prompt_shape() {
+        let ask_line = "hook 'guard' asks: confirm this";
+        for (raw_input, acp_title, options, expected_title, expected_command) in [
+            (
+                serde_json::json!({"command": "rm -rf /tmp/x", "description": "Clean tmp"}),
+                "Execute `rm -rf /tmp/x`",
+                vec![],
+                "Clean tmp",
+                Some("rm -rf /tmp/x"),
+            ),
+            (
+                serde_json::json!({"file_path": "/tmp/x.rs", "old_string": "a", "new_string": "b"}),
+                "Edit /tmp/x.rs",
+                vec![allow_all_edits_option()],
+                "Allow Edit to /tmp/x.rs?",
+                None,
+            ),
+            (
+                serde_json::json!({"target_file": "/tmp/x.rs"}),
+                "Read `/tmp/x.rs`",
+                vec![],
+                "Allow Read `/tmp/x.rs`?",
+                None,
+            ),
+            (
+                serde_json::json!({"cmd": "ls -la"}),
+                "Execute `ls -la`",
+                vec![],
+                "Allow Execute?",
+                Some("ls -la"),
+            ),
+        ] {
+            let req = hook_ask_permission_req(raw_input, acp_title, options);
+            let (title, description, command) = build_permission_display(&req, None, false);
+            assert_eq!(title, expected_title);
+            assert_eq!(command.as_deref(), expected_command);
+            assert_eq!(description.first().map(String::as_str), Some(ask_line));
+        }
+    }
+
     #[test]
     fn recap_fills_uncommitted_spinner_in_place() {
         let mut agent = make_agent(Some("s1"));
@@ -490,4 +562,3 @@
         assert_eq!(agent.active_pane, AgentPane::Scrollback);
         assert!(agent.permission_stashed_pane.is_none());
     }
-

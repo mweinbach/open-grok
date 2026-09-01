@@ -85,6 +85,8 @@ impl SessionActor {
             persist_ack: None,
             parsed_prompt_tx: None,
             queue_meta: None,
+            initial_child_prompt_ready: None,
+            traceparent: None,
             // Send-now semantics (see doc): a later real send-now must not
             // leapfrog this fallback in `queue_input`'s FIFO scan.
             send_now: front,

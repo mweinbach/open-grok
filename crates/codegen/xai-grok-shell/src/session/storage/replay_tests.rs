@@ -4,10 +4,11 @@
 use agent_client_protocol as acp;
 
 use super::replay::{
-    ReplayPathHint, ReplayToolCollapser, collect_unfinished_subagents, filter_delta_replay_lines,
-    for_each_replay_update_in_file, line_is_available_commands_update, line_is_dropped_on_replay,
-    line_is_in_progress_tool_call_update, prepare_replay_lines, resolve_replay_updates_path,
-    stream_replay_updates_at, stream_replay_updates_at_hinted,
+    ReplayLookupFallback, ReplayPathHint, ReplayToolCollapser, ReplayedUpdate,
+    collect_unfinished_subagents, filter_delta_replay_lines, for_each_replay_update_in_file,
+    line_is_available_commands_update, line_is_dropped_on_replay,
+    line_is_in_progress_tool_call_update, prepare_replay_lines, replay_would_emit,
+    resolve_replay_updates_path, stream_replay_updates_at, stream_replay_updates_at_hinted,
 };
 use super::{
     PromptExtractEvent, ReplayEmission, SUMMARY_FILE, SessionUpdate, SessionUpdateEnvelope,
@@ -1031,12 +1032,16 @@ fn stream_replay_forwards_completed_tool_call_update_without_base() {
         ReplayPathHint {
             parent_cwd: Some(std::path::Path::new(cwd)),
             child_cwd: None,
+            ..Default::default()
         },
         |u| updates.push(u),
     )
     .unwrap();
     assert_eq!(updates.len(), 1);
-    assert!(matches!(&updates[0], acp::SessionUpdate::ToolCallUpdate(_)));
+    assert!(matches!(
+        &updates[0],
+        ReplayedUpdate::Acp(acp::SessionUpdate::ToolCallUpdate(_), _)
+    ));
 }
 
 #[test]
@@ -1055,6 +1060,7 @@ fn child_fast_path_finds_updates_under_parent_encoded_cwd() {
         ReplayPathHint {
             parent_cwd: Some(std::path::Path::new(cwd)),
             child_cwd: None,
+            ..Default::default()
         },
     )
     .unwrap()
@@ -1079,6 +1085,7 @@ fn child_fast_path_finds_updates_under_child_cwd() {
         ReplayPathHint {
             parent_cwd: Some(std::path::Path::new(parent_cwd)),
             child_cwd: Some(std::path::Path::new(child_cwd)),
+            ..Default::default()
         },
     )
     .unwrap()
@@ -1105,6 +1112,7 @@ fn child_lookup_falls_back_when_fast_path_misses() {
         ReplayPathHint {
             parent_cwd: Some(std::path::Path::new("/parent/cwd")),
             child_cwd: None,
+            ..Default::default()
         },
         |_| count += 1,
     )
@@ -1126,6 +1134,7 @@ fn child_lookup_missing_session_is_empty() {
         ReplayPathHint {
             parent_cwd: Some(std::path::Path::new("/tmp")),
             child_cwd: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1190,4 +1199,205 @@ fn child_lookup_sees_session_created_after_prior_miss() {
     let path =
         resolve_replay_updates_path("late-child", home.path(), ReplayPathHint::default()).unwrap();
     assert_eq!(path.as_deref(), Some(dir.join(UPDATES_FILE).as_path()));
+}
+
+fn persist_xai_update(update: crate::extensions::notification::SessionUpdate) -> String {
+    let notif = crate::extensions::notification::SessionNotification {
+        session_id: acp::SessionId::new("s"),
+        update,
+        meta: None,
+    };
+    let envelope =
+        SessionUpdateEnvelope::from_update(&SessionUpdate::Xai(Box::new(notif))).unwrap();
+    serde_json::to_string(&envelope).unwrap()
+}
+
+#[test]
+fn stream_replay_forwards_xai_updates_in_file_order() {
+    let home = tempfile::tempdir().unwrap();
+    let sid = "child-xai";
+    let dir = home.path().join("sessions").join("cwd").join(sid);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(SUMMARY_FILE), "{}").unwrap();
+    let compact = persist_xai_update(
+        crate::extensions::notification::SessionUpdate::AutoCompactCompleted {
+            tokens_before: Some(1_000),
+            tokens_after: 100,
+            elapsed_ms: Some(5),
+            summary_preview: None,
+        },
+    );
+    let msg = acp_envelope(
+        r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}"#,
+    );
+    std::fs::write(dir.join(UPDATES_FILE), format!("{compact}\n{msg}\n")).unwrap();
+
+    let mut kinds = Vec::new();
+    let emission =
+        stream_replay_updates_at_hinted(sid, home.path(), ReplayPathHint::default(), |user| {
+            kinds.push(matches!(user, ReplayedUpdate::Xai(_)));
+        })
+        .unwrap();
+    assert_eq!(emission, ReplayEmission::Emitted);
+    assert_eq!(kinds, vec![true, false], "xai then acp, in file order");
+}
+
+#[test]
+fn stream_replay_forwards_persisted_line_meta() {
+    let home = tempfile::tempdir().unwrap();
+    let sid = "child-meta";
+    let dir = home.path().join("sessions").join("cwd").join(sid);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(SUMMARY_FILE), "{}").unwrap();
+    let msg = acp_envelope_with_meta(
+        r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}"#,
+        r#"{"agentTimestampMs":1700000000000}"#,
+    );
+    std::fs::write(dir.join(UPDATES_FILE), format!("{msg}\n")).unwrap();
+
+    let mut metas = Vec::new();
+    let emission =
+        stream_replay_updates_at_hinted(sid, home.path(), ReplayPathHint::default(), |user| {
+            if let ReplayedUpdate::Acp(_, meta) = user {
+                metas.push(meta);
+            }
+        })
+        .unwrap();
+    assert_eq!(emission, ReplayEmission::Emitted);
+    assert_eq!(metas.len(), 1);
+    let meta = metas[0]
+        .as_ref()
+        .expect("persisted _meta must be forwarded");
+    assert_eq!(
+        meta.get("agentTimestampMs")
+            .and_then(|value| value.as_i64()),
+        Some(1_700_000_000_000)
+    );
+}
+
+#[test]
+fn xai_only_transcript_forwards_but_stays_empty() {
+    let home = tempfile::tempdir().unwrap();
+    let sid = "child-xai-only";
+    let dir = home.path().join("sessions").join("cwd").join(sid);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(SUMMARY_FILE), "{}").unwrap();
+    let retry = persist_xai_update(crate::extensions::notification::SessionUpdate::RetryState(
+        crate::extensions::notification::RetryState::Retrying {
+            attempt: 1,
+            max_retries: 3,
+            reason: "overloaded".into(),
+            error_type: None,
+        },
+    ));
+    std::fs::write(dir.join(UPDATES_FILE), format!("{retry}\n")).unwrap();
+
+    let mut xai = 0usize;
+    let emission =
+        stream_replay_updates_at_hinted(sid, home.path(), ReplayPathHint::default(), |user| {
+            if matches!(user, ReplayedUpdate::Xai(_)) {
+                xai += 1;
+            }
+        })
+        .unwrap();
+    assert_eq!(xai, 1);
+    assert_eq!(emission, ReplayEmission::Empty);
+}
+
+#[test]
+fn replay_would_emit_requires_an_emitting_acp_line() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+    assert!(!replay_would_emit("nope", home.path(), ReplayPathHint::default()).unwrap());
+
+    let sid = "child-probe";
+    let dir = home.path().join("sessions").join("cwd").join(sid);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(SUMMARY_FILE), "{}").unwrap();
+    let probe = |contents: &str| {
+        std::fs::write(dir.join(UPDATES_FILE), contents).unwrap();
+        replay_would_emit(sid, home.path(), ReplayPathHint::default()).unwrap()
+    };
+
+    assert!(!probe(""), "empty file");
+    assert!(!probe("{}\n"), "non-empty but unparseable envelope");
+    assert!(
+        !probe(r#"{"method":"session/update","params":{"sessionId":"s","update":{"session"#),
+        "torn line (crash mid-write)"
+    );
+    let xai_only = persist_xai_update(
+        crate::extensions::notification::SessionUpdate::AutoCompactCompleted {
+            tokens_before: Some(1_000),
+            tokens_after: 100,
+            elapsed_ms: Some(5),
+            summary_preview: None,
+        },
+    );
+    assert!(
+        !probe(&format!("{xai_only}\n")),
+        "xAI events alone never count as Emitted"
+    );
+    let acu =
+        acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
+    assert!(!probe(&format!("{acu}\n")), "catalog lines are dropped");
+    let orphan_start =
+        acp_envelope(r#"{"sessionUpdate":"tool_call_update","toolCallId":"t1","title":"bash"}"#);
+    assert!(
+        !probe(&format!("{orphan_start}\n")),
+        "a baseless non-completed ToolCallUpdate never emits"
+    );
+
+    let msg = acp_envelope(
+        r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}"#,
+    );
+    assert!(probe(&format!("{msg}\n")), "a content line emits");
+    let tool = acp_envelope(
+        r#"{"sessionUpdate":"tool_call","toolCallId":"t1","title":"bash","status":"pending"}"#,
+    );
+    assert!(
+        probe(&format!("{tool}\n")),
+        "a start-only ToolCall emits via the EOF pending flush"
+    );
+    let done = acp_envelope(
+        r#"{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}"#,
+    );
+    assert!(
+        probe(&format!("{done}\n")),
+        "a completed ToolCallUpdate emits even without its base"
+    );
+    assert!(
+        probe(&format!("{xai_only}\n{msg}\n")),
+        "an emitting line after non-emitting ones is found"
+    );
+}
+
+#[test]
+fn child_lookup_hinted_only_skips_scan_when_fast_path_misses() {
+    let home = tempfile::tempdir().unwrap();
+    let other = xai_grok_config::encode_cwd_dirname("/other/cwd");
+    let sid = "relocated-child-hinted";
+    let dir = home.path().join("sessions").join(&other).join(sid);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(SUMMARY_FILE), "{}").unwrap();
+    let line = acp_envelope(
+        r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}"#,
+    );
+    std::fs::write(dir.join(UPDATES_FILE), format!("{line}\n")).unwrap();
+    let hint = ReplayPathHint {
+        parent_cwd: Some(std::path::Path::new("/parent/cwd")),
+        child_cwd: None,
+        fallback: ReplayLookupFallback::HintedOnly,
+    };
+    let path = resolve_replay_updates_path(sid, home.path(), hint).unwrap();
+    assert!(
+        path.is_none(),
+        "HintedOnly must not scan when cwd hints miss"
+    );
+    let mut count = 0usize;
+    let emission = stream_replay_updates_at_hinted(sid, home.path(), hint, |_| count += 1).unwrap();
+    assert_eq!(emission, ReplayEmission::Empty);
+    assert_eq!(
+        count, 0,
+        "HintedOnly miss must not stream a foreign-cwd file"
+    );
 }

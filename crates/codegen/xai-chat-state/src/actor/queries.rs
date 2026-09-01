@@ -68,10 +68,10 @@ impl ChatStateActor {
         self.state.conversation.truncate(truncate_at);
         self.state.prompt_texts.truncate(target_prompt_index);
         self.state.prompt_index = target_prompt_index;
-        self.state.total_tokens =
-            super::state::estimate_conversation_tokens(&self.state.conversation);
+        let base_estimate = super::state::estimate_conversation_tokens(&self.state.conversation);
+        self.state.total_tokens = self.reseed_total_tokens(base_estimate);
         self.state.estimated_tokens_since_model = 0;
-        self.state.estimate_at_last_response = self.state.total_tokens;
+        self.state.estimate_at_last_response = base_estimate;
 
         self.persistence.replace_history(&self.state.conversation);
 
@@ -149,6 +149,52 @@ impl ChatStateActor {
             }
             None
         })
+    }
+
+    pub(super) fn get_trailing_assistant_report(&self) -> Option<String> {
+        let mut items = self.state.conversation.iter().rev();
+        let mut segments: Vec<&str> = Vec::new();
+        for item in items.by_ref() {
+            match item {
+                xai_grok_sampling_types::ConversationItem::Assistant(first)
+                    if !first.content.trim().is_empty() =>
+                {
+                    segments.push(first.content.as_ref());
+                    break;
+                }
+                xai_grok_sampling_types::ConversationItem::User(user)
+                    if user.prompt_index.is_some()
+                        || user
+                            .synthetic_reason
+                            .as_ref()
+                            .is_none_or(|record| record.starts_prompt_turn()) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        for item in items {
+            match item {
+                xai_grok_sampling_types::ConversationItem::Assistant(first) => {
+                    if !first.tool_calls.is_empty() {
+                        break;
+                    }
+                    if !first.content.trim().is_empty() {
+                        segments.push(first.content.as_ref());
+                    }
+                }
+                xai_grok_sampling_types::ConversationItem::Reasoning(_) => {}
+                xai_grok_sampling_types::ConversationItem::User(user)
+                    if user.synthetic_reason
+                        == Some(xai_grok_sampling_types::SyntheticReason::LengthContinue) => {}
+                _ => break,
+            }
+        }
+        if segments.is_empty() {
+            return None;
+        }
+        Some(segments.iter().rev().copied().collect())
     }
 
     /// Return the current turn's last assistant message with non-empty text, or

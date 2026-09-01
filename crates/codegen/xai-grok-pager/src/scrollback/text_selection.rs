@@ -8,8 +8,9 @@ use ratatui::style::{Color, Modifier};
 use regex::Regex;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use xai_grok_markdown::{CellJoin, TableCopyMeta};
 
-use crate::scrollback::table_geometry::{CellRef, TableGeometry};
+use crate::scrollback::table_geometry::{CellRef, TableGeometry, WrappedCellJoiner};
 use crate::scrollback::types::SelectionBoundary;
 use crate::theme::Theme;
 
@@ -160,6 +161,7 @@ pub struct ResolvedSelectableLine {
     pub screen_x: u16,
     pub selectable_cols: Range<u16>,
     pub text: String,
+    pub painted_region: Option<String>,
     pub joiner_to_previous: Option<String>,
 }
 
@@ -622,9 +624,10 @@ fn render_selection_overlay_impl(
             table_selected_cols_for_line(geom, kind, anchor, head, line.block_line_idx)
                 .into_iter()
                 .map(|cols| {
-                    let snapped = endpoint_start_col(&line.text, cols.start)
-                        ..endpoint_end_col(&line.text, cols.end.saturating_sub(1));
-                    clip_cols_to_content(&line.text, snapped)
+                    let display = display_text_for_cols(&line.text);
+                    let snapped = endpoint_start_col(display.as_ref(), cols.start)
+                        ..endpoint_end_col(display.as_ref(), cols.end.saturating_sub(1));
+                    clip_cols_to_content(display.as_ref(), snapped)
                 })
                 .collect()
         } else {
@@ -670,9 +673,9 @@ fn table_cell_span(
     let clamp = |ep: SelectionEndpoint| {
         (
             ep.block_line_idx
-                .clamp(lines.start, lines.end.saturating_sub(1)),
+                .clamp(lines.start, lines.end.saturating_sub(1).max(lines.start)),
             ep.col_within_range
-                .clamp(band.start, band.end.saturating_sub(1)),
+                .clamp(band.start, band.end.saturating_sub(1).max(band.start)),
         )
     };
     let a = clamp(anchor);
@@ -755,7 +758,10 @@ fn table_selected_cols_for_line(
             if row < r0 || row > r1 {
                 return Vec::new();
             }
-            (c0..=c1).map(|c| geom.band(c)).collect()
+            (c0..=c1)
+                .filter(|&column| column < geom.n_cols())
+                .map(|column| geom.band(column))
+                .collect()
         }
     }
 }
@@ -795,6 +801,15 @@ pub fn reconstruct_table_selection_text(
     drag: &ActiveTextDrag,
     text_at: impl Fn(usize) -> Option<String>,
 ) -> Option<String> {
+    reconstruct_table_selection_text_with_meta(geom, drag, text_at, None)
+}
+
+pub fn reconstruct_table_selection_text_with_meta(
+    geom: &TableGeometry,
+    drag: &ActiveTextDrag,
+    text_at: impl Fn(usize) -> Option<String>,
+    meta: Option<&TableCopyMeta>,
+) -> Option<String> {
     let anchor = SelectionEndpoint {
         block_line_idx: drag.anchor.block_line_idx,
         col_within_range: drag.anchor.col_within_range,
@@ -807,11 +822,24 @@ pub fn reconstruct_table_selection_text(
         SelectionKind::Linear => None,
         SelectionKind::TableCell => {
             let cell = geom.cell_at(anchor.block_line_idx, anchor.col_within_range)?;
+            let Some(n_cols) = geom.checked_n_cols() else {
+                return Some(String::new());
+            };
+            if cell.row >= geom.n_rows() || cell.col >= n_cols {
+                return Some(String::new());
+            }
             let band = geom.band(cell.col);
             let ((l0, c0), (l1, c1)) = table_cell_span(geom, cell, anchor, head);
-            let mut out = String::new();
+            if l0 > l1 {
+                return Some(String::new());
+            }
+            let row_start = geom.row_lines(cell.row).start;
+            let mut joined = String::new();
+            let mut prev_vis = None;
+            let mut joiner = WrappedCellJoiner::new(band.end.saturating_sub(band.start));
+            let copy = geom.cell_copy(cell, meta);
             for line in l0..=l1 {
-                let text = text_at(line)?;
+                let Some(text) = text_at(line) else { continue };
                 let start = if line == l0 {
                     endpoint_start_col(&text, c0).max(band.start)
                 } else {
@@ -822,19 +850,37 @@ pub fn reconstruct_table_selection_text(
                 } else {
                     band.end
                 };
-                let slice = crate::scrollback::types::slice_display_cols(&text, start, end);
-                let fragment = slice.trim();
-                if fragment.is_empty() {
-                    continue;
+                let copied = crate::scrollback::types::slice_display_cols(&text, start, end);
+                if let Some(copy) = copy {
+                    let fragment = copied.trim();
+                    if fragment.is_empty() {
+                        continue;
+                    }
+                    let vis = line.saturating_sub(row_start);
+                    if let Some(prev) = prev_vis {
+                        for join_index in prev..vis {
+                            if let Some(CellJoin::Gap(gap)) = copy.joins.get(join_index) {
+                                joined.push_str(gap);
+                            }
+                        }
+                    }
+                    joined.push_str(fragment);
+                    prev_vis = Some(vis);
+                } else {
+                    let full_band =
+                        crate::scrollback::types::slice_display_cols(&text, band.start, band.end);
+                    joiner.push(&full_band, copied.trim());
                 }
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push_str(fragment);
             }
-            Some(out)
+            if copy.is_some() {
+                Some(joined)
+            } else {
+                Some(joiner.into_string())
+            }
         }
-        SelectionKind::TableGrid { anchor, head } => Some(geom.grid_tsv(anchor, head, text_at)),
+        SelectionKind::TableGrid { anchor, head } => {
+            Some(geom.grid_tsv_with_meta(anchor, head, text_at, meta))
+        }
     }
 }
 
@@ -865,7 +911,22 @@ fn selection_slice_for_line_by_block_idx(
         .selectable_cols
         .end
         .saturating_sub(line.selectable_cols.start);
-    let selected = slice_text_cols(&line.text, cols.clone());
+    let selected = if crate::render::bidi::is_enabled() {
+        match line.painted_region.as_deref() {
+            Some(region) if line.text.trim_end() != region.trim_end() => line.text.clone(),
+            Some(region) => {
+                let sliced = slice_text_cols(region, cols.clone());
+                if cols.end == visible_width && line.text == region.trim_end() {
+                    sliced.trim_end().to_string()
+                } else {
+                    sliced
+                }
+            }
+            None => slice_text_cols(&line.text, cols.clone()),
+        }
+    } else {
+        slice_text_cols(&line.text, cols.clone())
+    };
     Some(apply_selection_boundary(
         selected,
         boundary,
@@ -916,10 +977,17 @@ fn selected_cols_for_endpoints(
         return None;
     }
 
+    let snap_src = if crate::render::bidi::is_enabled() {
+        line.painted_region.as_deref().unwrap_or(line.text.as_str())
+    } else {
+        line.text.as_str()
+    };
+    let display = display_text_for_cols(snap_src);
     if start_bl == end_bl {
-        let start = endpoint_start_col(&line.text, min(anchor_col, head_col));
+        let start = endpoint_start_col(display.as_ref(), min(anchor_col, head_col));
         return Some(
-            start.min(width)..endpoint_end_col(&line.text, max(anchor_col, head_col)).min(width),
+            start.min(width)
+                ..endpoint_end_col(display.as_ref(), max(anchor_col, head_col)).min(width),
         );
     }
 
@@ -929,7 +997,7 @@ fn selected_cols_for_endpoints(
         } else {
             head_col
         };
-        return Some(endpoint_start_col(&line.text, start).min(width)..width);
+        return Some(endpoint_start_col(display.as_ref(), start).min(width)..width);
     }
 
     if bl == end_bl {
@@ -938,7 +1006,7 @@ fn selected_cols_for_endpoints(
         } else {
             anchor_col
         };
-        return Some(0..endpoint_end_col(&line.text, end).min(width));
+        return Some(0..endpoint_end_col(display.as_ref(), end).min(width));
     }
 
     Some(0..width)
@@ -991,7 +1059,9 @@ pub(crate) fn reconstruct_full_selection_text_with_boundaries(
     boundaries: &crate::scrollback::types::SelectionBoundaries,
     drag: &ActiveTextDrag,
 ) -> Option<String> {
-    use crate::scrollback::types::{derive_selection_text, selectable_cols};
+    use crate::scrollback::types::{
+        Selectable, painted_selectable_region, selectable_cols, slice_display_cols,
+    };
 
     let start_bl = min(drag.anchor.block_line_idx, drag.head.block_line_idx);
     let end_bl = max(drag.anchor.block_line_idx, drag.head.block_line_idx);
@@ -1009,32 +1079,46 @@ pub(crate) fn reconstruct_full_selection_text_with_boundaries(
             continue;
         }
 
-        let text = derive_selection_text(line);
         let Some(cols) = selectable_cols(&line.content, &line.selectable) else {
             continue;
         };
-        let width = cols.end.saturating_sub(cols.start);
+        let boundary = boundaries.get(idx).map(Arc::as_ref);
+        let width = boundary
+            .map_or(cols.clone(), |boundary| {
+                boundary.anchored_cols(cols.clone())
+            })
+            .end
+            .saturating_sub(cols.start);
 
         // Snap endpoints exactly like selected_cols_for_endpoints: `col_range.end == width` decides suffix re-attachment below,
         // so an unsnapped end stopping mid-character would drop a suffix that the highlight includes.
+        let region = painted_selectable_region(line);
+
+        let override_text = line
+            .selection_text
+            .as_deref()
+            .filter(|ov| ov.trim_end() != region.trim_end());
+
+        let display = display_text_for_cols(&region);
         let col_range = if start_bl == end_bl {
             let s = min(drag.anchor.col_within_range, drag.head.col_within_range);
             let e = max(drag.anchor.col_within_range, drag.head.col_within_range);
-            endpoint_start_col(&text, s).min(width)..endpoint_end_col(&text, e).min(width)
+            endpoint_start_col(display.as_ref(), s).min(width)
+                ..endpoint_end_col(display.as_ref(), e).min(width)
         } else if idx == start_bl {
             let s = if anchor_is_start {
                 drag.anchor.col_within_range
             } else {
                 drag.head.col_within_range
             };
-            endpoint_start_col(&text, s).min(width)..width
+            endpoint_start_col(display.as_ref(), s).min(width)..width
         } else if idx == end_bl {
             let e = if anchor_is_start {
                 drag.head.col_within_range
             } else {
                 drag.anchor.col_within_range
             };
-            0..endpoint_end_col(&text, e).min(width)
+            0..endpoint_end_col(display.as_ref(), e).min(width)
         } else {
             0..width
         };
@@ -1043,10 +1127,21 @@ pub(crate) fn reconstruct_full_selection_text_with_boundaries(
             out.push_str(line.joiner.as_deref().unwrap_or("\n"));
         }
         first = false;
-        let selected = slice_text_cols(&text, col_range.clone());
+        let selected = match override_text {
+            Some(ov) if crate::render::bidi::is_enabled() => ov.to_string(),
+            Some(ov) => slice_display_cols(ov, col_range.start, col_range.end),
+            None => {
+                let sliced = slice_text_cols(&region, col_range.clone());
+                if matches!(line.selectable, Selectable::All) && col_range.end == width {
+                    sliced.trim_end().to_string()
+                } else {
+                    sliced
+                }
+            }
+        };
         out.push_str(&apply_selection_boundary(
             selected,
-            boundaries.get(idx).map(Arc::as_ref),
+            boundary,
             col_range.start == 0,
             col_range.end == width,
         ));
@@ -1058,7 +1153,17 @@ pub(crate) fn reconstruct_full_selection_text_with_boundaries(
     Some(out)
 }
 
+fn display_text_for_cols(text: &str) -> std::borrow::Cow<'_, str> {
+    crate::render::bidi::visual_text(text)
+}
 fn slice_text_cols(text: &str, cols: Range<u16>) -> String {
+    if crate::render::bidi::is_enabled() && crate::render::bidi::needs_bidi(text) {
+        return crate::render::bidi::logical_slice_for_visual_cols(
+            text,
+            cols.start as usize,
+            cols.end as usize,
+        );
+    }
     crate::scrollback::types::slice_display_cols(text, cols.start, cols.end)
 }
 
@@ -1283,9 +1388,14 @@ pub fn semantic_selection_at(
     }
 
     // Common single-row case: skip concat allocation.
-    if lo == hi {
-        let line = &lines[lo];
-        let (sel, text) = word_or_url_slice(&line.text, hit.col_within_range, separators)?;
+    if lo == hi || (crate::render::bidi::is_enabled() && wrap_group_needs_bidi(lines, lo, hi)) {
+        let line = &lines[if lo == hi { lo } else { hit_pos }];
+        let src = if crate::render::bidi::is_enabled() {
+            line.painted_region.as_deref().unwrap_or(line.text.as_str())
+        } else {
+            line.text.as_str()
+        };
+        let (sel, text) = word_or_url_slice(src, hit.col_within_range, separators)?;
         return Some(SemanticSelection {
             anchor: SelectionEndpoint {
                 block_line_idx: line.block_line_idx,
@@ -1368,13 +1478,23 @@ fn map_local_hit_to_concat_col(
     }
 }
 
+fn wrap_group_needs_bidi(lines: &[ResolvedSelectableLine], lo: usize, hi: usize) -> bool {
+    lines[lo..=hi]
+        .iter()
+        .any(|line| crate::render::bidi::needs_bidi(&line.text))
+}
 fn word_or_url_slice(text: &str, col: u16, separators: &str) -> Option<(Range<u16>, String)> {
-    let range = url_range_at_col(text, col)
-        .unwrap_or_else(|| word_boundaries_at_col(text, col, separators));
+    let display = display_text_for_cols(text);
+    let range = url_range_at_col(display.as_ref(), col)
+        .unwrap_or_else(|| word_boundaries_at_col(display.as_ref(), col, separators));
     if range.is_empty() {
         return None;
     }
-    let sliced = crate::scrollback::types::slice_display_cols(text, range.start, range.end);
+    let sliced = if crate::render::bidi::needs_bidi(text) {
+        slice_text_cols(text, range.clone())
+    } else {
+        crate::scrollback::types::slice_display_cols(text, range.start, range.end)
+    };
     if sliced.is_empty() {
         return None;
     }
@@ -1422,6 +1542,7 @@ fn map_inclusive_concat_col(
 mod tests {
     use super::*;
 
+    use xai_grok_markdown::TableCellCopy;
     fn single_line_drag(block_line_idx: usize, width: u16) -> ActiveTextDrag {
         ActiveTextDrag {
             anchor: RangeHit {
@@ -1457,6 +1578,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..5,
                 text: text.to_string(),
+                painted_region: None,
                 joiner_to_previous: joiner.clone(),
             });
             assert!(boundaries.is_empty());
@@ -1485,6 +1607,248 @@ mod tests {
         }
     }
 
+    static BIDI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    struct BidiLatchGuard(bool);
+    impl Drop for BidiLatchGuard {
+        fn drop(&mut self) {
+            crate::render::bidi::set_enabled(self.0);
+        }
+    }
+    fn with_rtl_bidi<Output>(callback: impl FnOnce() -> Output) -> Output {
+        let _guard = BIDI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _latch = BidiLatchGuard(crate::render::bidi::is_enabled());
+        crate::render::bidi::set_enabled(true);
+        callback()
+    }
+
+    #[test]
+    fn rtl_drag_copies_logical_text_from_painted_cells() {
+        use crate::scrollback::types::{BlockLine, Selectable};
+        with_rtl_bidi(|| {
+            let make = |text: &str| BlockLine {
+                content: ratatui::text::Line::from(text.to_string()),
+                selectable: Selectable::All,
+                selection_range: Some(0),
+                ..Default::default()
+            };
+            let drag_cols = |anchor_column: u16, head_column: u16| ActiveTextDrag {
+                anchor: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: 0,
+                    col_within_range: anchor_column,
+                },
+                head: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: 0,
+                    col_within_range: head_column,
+                },
+                kind: SelectionKind::Linear,
+                anchor_content_width: None,
+            };
+
+            assert_eq!(
+                reconstruct_full_selection_text(&[make("Hi خوب")], &drag_cols(3, 5)),
+                Some("خوب".to_string()),
+            );
+            assert_eq!(
+                reconstruct_full_selection_text(&[make("خوب  ")], &drag_cols(0, 4)),
+                Some("خوب".to_string()),
+            );
+        });
+    }
+
+    #[test]
+    fn visual_selectable_cols_shifts_region_past_rtl_ellipsis() {
+        use crate::scrollback::types::{
+            BlockLine, Selectable, selectable_cols, visual_selectable_cols,
+        };
+        let line = BlockLine {
+            content: ratatui::text::Line::from(vec![
+                ratatui::text::Span::raw("خوب"),
+                ratatui::text::Span::raw("…"),
+            ]),
+            selectable: Selectable::Spans(0..1),
+            selection_range: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(selectable_cols(&line.content, &line.selectable), Some(0..3));
+        assert_eq!(visual_selectable_cols(&line), Some(0..3));
+        with_rtl_bidi(|| {
+            assert_eq!(visual_selectable_cols(&line), Some(1..4));
+        });
+    }
+
+    #[test]
+    fn rtl_overlay_slice_maps_painted_region_not_trimmed_text() {
+        with_rtl_bidi(|| {
+            let mut model = ResolvedSelectionModel::default();
+            model.push_line(ResolvedSelectableLine {
+                entry_idx: 0,
+                range_id: 0,
+                block_line_idx: 0,
+                screen_y: 0,
+                screen_x: 0,
+                selectable_cols: 0..5,
+                text: "خوب".to_string(),
+                painted_region: Some("خوب  ".to_string()),
+                joiner_to_previous: None,
+            });
+            let drag = ActiveTextDrag {
+                anchor: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: 0,
+                    col_within_range: 2,
+                },
+                head: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: 0,
+                    col_within_range: 4,
+                },
+                kind: SelectionKind::Linear,
+                anchor_content_width: None,
+            };
+            assert_eq!(
+                reconstruct_selection_text(&model, &drag),
+                Some("خوب".to_string()),
+            );
+        });
+    }
+
+    #[test]
+    fn rtl_overlay_override_row_copies_whole_stored_text() {
+        with_rtl_bidi(|| {
+            let mut model = ResolvedSelectionModel::default();
+            model.push_line(ResolvedSelectableLine {
+                entry_idx: 0,
+                range_id: 0,
+                block_line_idx: 0,
+                screen_y: 0,
+                screen_x: 0,
+                selectable_cols: 0..3,
+                text: "/path/خوب/file".to_string(),
+                painted_region: Some("خوب".to_string()),
+                joiner_to_previous: None,
+            });
+            let drag = ActiveTextDrag {
+                anchor: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: 0,
+                    col_within_range: 0,
+                },
+                head: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: 0,
+                    col_within_range: 1,
+                },
+                kind: SelectionKind::Linear,
+                anchor_content_width: None,
+            };
+            assert_eq!(
+                reconstruct_selection_text(&model, &drag),
+                Some("/path/خوب/file".to_string()),
+            );
+        });
+    }
+
+    #[test]
+    fn rtl_override_row_copies_whole_stored_text() {
+        use crate::scrollback::types::{BlockLine, Selectable};
+        with_rtl_bidi(|| {
+            let line = BlockLine {
+                content: ratatui::text::Line::from("خوب".to_string()),
+                selectable: Selectable::All,
+                selection_range: Some(0),
+                selection_text: Some("/path/خوب/file".to_string()),
+                ..Default::default()
+            };
+            let drag = ActiveTextDrag {
+                anchor: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: 0,
+                    col_within_range: 0,
+                },
+                head: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: 0,
+                    col_within_range: 1,
+                },
+                kind: SelectionKind::Linear,
+                anchor_content_width: None,
+            };
+            assert_eq!(
+                reconstruct_full_selection_text(&[line], &drag),
+                Some("/path/خوب/file".to_string()),
+            );
+        });
+    }
+
+    #[test]
+    fn ligature_line_selects_last_cell() {
+        use crate::scrollback::types::{BlockLine, Selectable};
+        let line = BlockLine {
+            content: ratatui::text::Line::from("Hello سلام world".to_string()),
+            selectable: Selectable::All,
+            selection_range: Some(0),
+            ..Default::default()
+        };
+        let drag = ActiveTextDrag {
+            anchor: RangeHit {
+                entry_idx: 0,
+                range_id: 0,
+                block_line_idx: 0,
+                col_within_range: 0,
+            },
+            head: RangeHit {
+                entry_idx: 0,
+                range_id: 0,
+                block_line_idx: 0,
+                col_within_range: 15,
+            },
+            kind: SelectionKind::Linear,
+            anchor_content_width: None,
+        };
+        assert_eq!(
+            reconstruct_full_selection_text(&[line], &drag),
+            Some("Hello سلام world".to_string()),
+        );
+    }
+
+    #[test]
+    fn rtl_double_click_selects_logical_word_from_painted_cells() {
+        with_rtl_bidi(|| {
+            let mut model = ResolvedSelectionModel::default();
+            model.push_line(ResolvedSelectableLine {
+                entry_idx: 0,
+                range_id: 0,
+                block_line_idx: 0,
+                screen_y: 0,
+                screen_x: 0,
+                selectable_cols: 0..3,
+                text: "خوب".to_string(),
+                painted_region: None,
+                joiner_to_previous: None,
+            });
+            let hit = RangeHit {
+                entry_idx: 0,
+                range_id: 0,
+                block_line_idx: 0,
+                col_within_range: 1,
+            };
+            let sel = semantic_selection_at(&model, &hit, DEFAULT_WORD_SEPARATORS)
+                .expect("word selection");
+            assert_eq!(sel.text, "خوب");
+        });
+    }
     #[test]
     fn edit_boundaries_apply_only_at_selected_path_edges() {
         use crate::scrollback::types::{
@@ -1505,6 +1869,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..3,
                 text: text.to_string(),
+                painted_region: None,
                 joiner_to_previous: joiner,
             };
             resolved_boundaries.push(
@@ -1580,6 +1945,7 @@ mod tests {
             screen_x: 10,
             selectable_cols: 2..6,
             text: "body".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
 
@@ -1601,6 +1967,7 @@ mod tests {
             screen_x: 10,
             selectable_cols: 2..6,
             text: "body".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
 
@@ -1630,6 +1997,7 @@ mod tests {
             screen_x: 4,
             selectable_cols,
             text: "text".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         }
     }
@@ -1911,6 +2279,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..(text.len() as u16),
                 text: text.to_string(),
+                painted_region: None,
                 joiner_to_previous: if i > 0 { Some("\n".to_string()) } else { None },
             });
         }
@@ -1956,6 +2325,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..(line_text.len() as u16),
                 text: line_text.to_string(),
+                painted_region: None,
                 joiner_to_previous: if i > 0 { Some("\n".to_string()) } else { None },
             });
         }
@@ -2454,6 +2824,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..display_width(text),
                 text: (*text).to_string(),
+                painted_region: None,
                 joiner_to_previous: joiner.map(str::to_string),
             });
         }
@@ -2742,6 +3113,7 @@ mod tests {
             screen_x: 0,
             selectable_cols: 0..5,
             text: "ab".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
         padded.push_line(ResolvedSelectableLine {
@@ -2752,6 +3124,7 @@ mod tests {
             screen_x: 0,
             selectable_cols: 0..2,
             text: "cd".to_string(),
+            painted_region: None,
             joiner_to_previous: Some(" ".to_string()),
         });
         assert_eq!(
@@ -2875,6 +3248,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..last_width,
                 text,
+                painted_region: None,
                 joiner_to_previous: joiner,
             });
         }
@@ -2909,6 +3283,7 @@ mod tests {
             screen_x: 0,
             selectable_cols,
             text: String::new(),
+            painted_region: None,
             joiner_to_previous: None,
         }
     }
@@ -3101,6 +3476,7 @@ mod tests {
                 screen_x: 2,
                 selectable_cols: 0..10,
                 text: format!("line {i}"),
+                painted_region: None,
                 joiner_to_previous: if i > 0 { Some("\n".into()) } else { None },
             });
         }
@@ -3190,6 +3566,7 @@ mod tests {
             screen_x: 5,
             selectable_cols: 0..20,
             text: "hello world foo bar".into(),
+            painted_region: None,
             joiner_to_previous: None,
         });
         // Selecting cols 6..11 ("world") on a line at screen_x=5.
@@ -3237,6 +3614,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..15,
                 text: format!("line {i} content"),
+                painted_region: None,
                 joiner_to_previous: if i > 0 { Some("\n".into()) } else { None },
             });
         }
@@ -3298,6 +3676,7 @@ mod tests {
             screen_x: 4,
             selectable_cols: 2..10,
             text: "hello wo".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
 
@@ -3324,6 +3703,7 @@ mod tests {
             screen_x: 4,
             selectable_cols: 2..6,
             text: "body".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
 
@@ -3349,6 +3729,7 @@ mod tests {
             screen_x: 10,
             selectable_cols: 2..6,
             text: "body".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
 
@@ -3374,6 +3755,7 @@ mod tests {
             screen_x: 0,
             selectable_cols: 0..5,
             text: "hello".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
         model.push_line(ResolvedSelectableLine {
@@ -3384,6 +3766,7 @@ mod tests {
             screen_x: 10,
             selectable_cols: 0..5,
             text: "world".to_string(),
+            painted_region: None,
             joiner_to_previous: None,
         });
 
@@ -3433,6 +3816,7 @@ mod tests {
                 screen_x: 0,
                 selectable_cols: 0..(text.chars().count() as u16),
                 text: text.to_string(),
+                painted_region: None,
                 joiner_to_previous: None,
             });
         }
@@ -3567,6 +3951,50 @@ mod tests {
         assert_eq!(
             reconstruct_table_selection_text(&geom, &drag, table_text_at),
             Some("Ali".to_string())
+        );
+    }
+
+    #[test]
+    fn reconstruct_out_of_bounds_grid_does_not_panic() {
+        let geom = table_geometry();
+        let drag = table_drag(
+            (1, 3),
+            (1, 3),
+            SelectionKind::TableGrid {
+                anchor: CellRef { row: 99, col: 99 },
+                head: CellRef { row: 99, col: 99 },
+            },
+        );
+        assert_eq!(
+            reconstruct_table_selection_text(&geom, &drag, table_text_at),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn reconstruct_cell_selection_keeps_joins_across_skipped_blanks() {
+        const LINES: &[&str] = &[
+            "┌────────┐",
+            "│ foo    │",
+            "│        │",
+            "│ bar    │",
+            "└────────┘",
+        ];
+        let text_at = |index: usize| LINES.get(index).map(|line| line.to_string());
+        let geom = TableGeometry::detect(text_at, 1).expect("grid");
+        let meta = TableCopyMeta {
+            line_index: 0,
+            line_count: LINES.len(),
+            n_cols: 1,
+            cells: vec![TableCellCopy {
+                text: "foo\n\nbar".into(),
+                joins: vec![CellJoin::Tight, CellJoin::Gap("\n\n".into())],
+            }],
+        };
+        let drag = table_drag((1, 2), (3, 5), SelectionKind::TableCell);
+        assert_eq!(
+            reconstruct_table_selection_text_with_meta(&geom, &drag, text_at, Some(&meta)),
+            Some("foo\n\nbar".to_string())
         );
     }
 

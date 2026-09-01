@@ -37,6 +37,7 @@ use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_sampling_types::conversation::ConversationItem;
 use xai_grok_session_events::types::CancellationCategory;
 use xai_grok_subagent_resolution::ResumeSourceData;
+use xai_grok_tools::implementations::grok_build;
 use xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer;
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
     ChildCompletion, ChildControl, ChildRunOutput, LocalBoxFuture, StartedChild, SubagentProgress,
@@ -47,8 +48,12 @@ use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod antigravity_runner;
 mod attempt_runner;
+mod child_runtime;
 mod handle_request;
+mod prompt_turn_receipt;
+mod prompt_turn_result;
 pub(crate) use handle_request::run_shell_child;
+pub(crate) use prompt_turn_receipt::PromptTurnReceipt;
 /// How the child session's initial context was bootstrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InitialContextSource {
@@ -127,10 +132,13 @@ pub(crate) struct SubagentSpawnContext {
     pub auth: Option<crate::auth::GrokAuth>,
     pub parent_cwd: PathBuf,
     pub parent_session_id: String,
+    pub active_message_telemetry: crate::session::telemetry::ActiveAgentMessageTelemetrySource,
     /// The parent's cutoff at spawn, applied to the child's first turn. `None` if unset.
     pub inherited_tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
     pub yolo_mode: bool,
     pub subagent_event_tx: mpsc::UnboundedSender<SubagentEvent>,
+    pub subagent_coordinator_sender: Option<grok_build::task::backend::SubagentCoordinatorSender>,
+    pub sampling_gate: Option<Arc<tokio::sync::Semaphore>>,
     pub parent_depth: u32,
     pub subagents_max_depth: u32,
     pub workflow_max_concurrent_agents: usize,
@@ -442,13 +450,47 @@ impl SubagentSpawnContext {
 /// Shell runtime handle retained while a child is active.
 pub(crate) struct ShellChildRuntime {
     pub child_handle: SessionHandle,
-    pub _child_thread: SessionThread,
+    pub _child_thread: Option<SessionThread>,
     pub provider: xai_grok_sampling_types::ModelProvider,
     pub api_backend: xai_grok_sampling_types::ApiBackend,
     pub native_agent_protocol: bool,
+    pub receipt_sink: mpsc::Sender<PromptTurnReceipt>,
+    pub active_message_telemetry: crate::session::telemetry::ActiveAgentMessageTelemetrySource,
 }
 impl ChildControl for ShellChildRuntime {
     type ProgressFuture = LocalBoxFuture<SubagentProgress>;
+    fn send_active_message(
+        &self,
+        delivery: ActiveAgentMessageDelivery,
+    ) -> grok_build::task::coordinator::SendBoxFuture<
+        grok_build::task::coordinator::ActiveMessageAdmission,
+    > {
+        if delivery.operation() != grok_build::task::types::ActiveAgentMessageOperation::Queue {
+            return Box::pin(async {
+                grok_build::task::coordinator::ActiveMessageAdmission::Unsupported
+            });
+        }
+        let command_tx = self.child_handle.cmd_tx.clone();
+        let receipt_sink = self.receipt_sink.clone();
+        let telemetry = self.active_message_telemetry.capture();
+        Box::pin(async move {
+            let (respond_to, result) = oneshot::channel();
+            if command_tx
+                .send(SessionCommand::ParentAgentMessage {
+                    delivery,
+                    receipt_sink,
+                    telemetry,
+                    respond_to,
+                })
+                .is_err()
+            {
+                return grok_build::task::coordinator::ActiveMessageAdmission::ChannelClosed;
+            }
+            result
+                .await
+                .unwrap_or(grok_build::task::coordinator::ActiveMessageAdmission::ChannelClosed)
+        })
+    }
     fn progress(&self) -> Self::ProgressFuture {
         let signals = self.child_handle.signals_handle.clone();
         Box::pin(async move {
@@ -1596,6 +1638,22 @@ impl ForkDirective {
         }
     }
 }
+async fn load_subagent_history(directory: &Path) -> std::io::Result<Vec<ConversationItem>> {
+    let directory = directory.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
+            crate::util::grok_home::grok_home(),
+        )
+        .load_chat_history_from_dir(&directory)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+fn resume_token_limit(context_window: u64, auto_compact_threshold_percent: u8) -> u64 {
+    context_window.saturating_mul(u64::from(auto_compact_threshold_percent.min(95))) / 100
+}
+
 /// Phase 3: resume (fail-closed on copy error) > fork (live then disk, fail-open) > New.
 /// Unresolved non-empty resume is aborted by the caller before this runs.
 async fn bootstrap_initial_context(
@@ -1633,6 +1691,7 @@ async fn bootstrap_initial_context(
             copy_plan_state: false,
             copy_plan_mode_state: false,
             copy_signals: false,
+            copy_usage: false,
             copy_tool_state: true,
             fork_filter: false,
             ..Default::default()
@@ -1643,7 +1702,7 @@ async fn bootstrap_initial_context(
             .await
         {
             Ok(result) => {
-                let conversation = match storage.load_chat_history_from_dir(child_session_dir) {
+                let conversation = match load_subagent_history(child_session_dir).await {
                     Ok(items) if !items.is_empty() => items,
                     Ok(_) => {
                         return BootstrapInitialContext::ResumeAbort(format!(
@@ -1661,14 +1720,16 @@ async fn bootstrap_initial_context(
                     }
                 };
                 let estimated_tokens = xai_chat_state::estimate_conversation_tokens(&conversation);
-                const SAFE_RESUME_PERCENT: u64 = 80;
-                let threshold = child_context_window * SAFE_RESUME_PERCENT / 100;
-                if estimated_tokens > threshold {
+                let threshold = resume_token_limit(
+                    child_context_window,
+                    ctx.resolve_auto_compact_threshold_percent(effective_model_id),
+                );
+                if child_context_window == 0 || estimated_tokens > threshold {
                     return BootstrapInitialContext::ResumeAbort(format!(
                         "Cannot resume from subagent '{}': source transcript \
-                         (~{estimated_tokens} tokens) exceeds {SAFE_RESUME_PERCENT}% of \
-                         the model's context window ({child_context_window} tokens). \
-                         The source conversation is too large for the current model.",
+                         (~{estimated_tokens} tokens) exceeds the resume limit \
+                         ({threshold} of {child_context_window} tokens). Compact the source \
+                         first, or resume on a model with a larger context window.",
                         source.subagent_id,
                     ));
                 }
@@ -1723,16 +1784,23 @@ async fn bootstrap_initial_context(
         && native_turns.is_some()
         && let Some(parent_info) = &ctx.parent_session_info
     {
-        let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
-            crate::util::grok_home::grok_home(),
-        );
-        live_items = storage
-            .load_chat_history_from_dir(&session::persistence::session_dir(parent_info))
+        live_items = load_subagent_history(&session::persistence::session_dir(parent_info))
+            .await
             .ok();
     }
     if let Some(items) = live_items {
-        let items = select_native_fork_turns(items, native_turns);
-        let ctx_out = verbatim_or_normalize_fork(items, child_context_window);
+        let ctx_out = tokio::task::spawn_blocking(move || {
+            let items = select_native_fork_turns(items, native_turns);
+            verbatim_or_normalize_fork(items, child_context_window)
+        })
+        .await
+        .unwrap_or_else(|error| InitialContext {
+            source: InitialContextSource::New,
+            copy_error: Some(format!("Failed to prepare parent context: {error}")),
+            prefix_len: None,
+            conversation: Vec::new(),
+            verbatim_fork: false,
+        });
         tracing::info!(
             subagent_id = %request.id,
             subagent_type = %request.subagent_type,
@@ -1774,6 +1842,7 @@ async fn bootstrap_initial_context(
             copy_plan_state: false,
             copy_plan_mode_state: false,
             copy_signals: false,
+            copy_usage: false,
             copy_tool_state: false,
             fork_filter: true,
             ..Default::default()
@@ -1791,8 +1860,8 @@ async fn bootstrap_initial_context(
                     tool_state = result.tool_state_copied,
                     "Fork-copied parent session data into child (disk fallback)"
                 );
-                let items = storage
-                    .load_chat_history_from_dir(child_session_dir)
+                let items = load_subagent_history(child_session_dir)
+                    .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(
                             error = %e,
@@ -1871,12 +1940,9 @@ async fn digest_fork_initial_context(
     if items.is_empty()
         && let Some(ref parent_info) = ctx.parent_session_info
     {
-        let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
-            crate::util::grok_home::grok_home(),
-        );
         let parent_dir = session::persistence::session_dir(parent_info);
-        items = storage
-            .load_chat_history_from_dir(&parent_dir)
+        items = load_subagent_history(&parent_dir)
+            .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "digest fork: failed to load parent history from disk");
                 vec![]
@@ -2043,6 +2109,24 @@ fn select_override_cwd<'a>(
         request_cwd
     }
 }
+async fn load_resume_source(
+    resume_id: &str,
+    parent_session_id: &str,
+    parent_cwd: &Path,
+) -> Option<ResumeSourceData> {
+    let resume_id = resume_id.to_owned();
+    let parent_session_id = parent_session_id.to_owned();
+    let parent_cwd = parent_cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        durable_resume_source_for(&resume_id, &parent_session_id, &parent_cwd)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load subagent resume metadata");
+        None
+    })
+}
+
 fn durable_resume_source_for(
     id: &str,
     parent_session_id: &str,
@@ -2448,7 +2532,8 @@ pub(crate) fn describe_subagent_type(
         SubagentValidateTypeOutcome::Unknown { available } => {
             return SubagentDescribeOutcome::Unknown { available };
         }
-        SubagentValidateTypeOutcome::ValidationUnavailable => {
+        SubagentValidateTypeOutcome::ValidationUnavailable
+        | SubagentValidateTypeOutcome::CoordinatorGone => {
             return SubagentDescribeOutcome::Unavailable;
         }
         SubagentValidateTypeOutcome::Ok => {}
@@ -2601,11 +2686,15 @@ async fn await_subagent_turn_with_summary_floor(
     if !is_completed_subagent_wait_outcome(&initial) {
         return SubagentWaitResult::new(initial);
     }
-    let initial_text = child_handle
-        .chat_state_handle
-        .get_last_assistant_text()
-        .await
-        .unwrap_or_default();
+    let initial_text = child_actor_query(
+        "initial_assistant_report",
+        child_handle
+            .chat_state_handle
+            .get_trailing_assistant_report(),
+        None,
+    )
+    .await
+    .unwrap_or_default();
     if !should_request_final_summary_continuation(&initial_text) {
         return SubagentWaitResult::new(initial);
     }
@@ -2633,6 +2722,7 @@ async fn await_subagent_turn_with_summary_floor(
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
+            initial_child_prompt_ready: None,
         })
         .is_err()
     {
@@ -2644,11 +2734,15 @@ async fn await_subagent_turn_with_summary_floor(
         return SubagentWaitResult::cancelled();
     }
     let continuation_text = if is_completed_subagent_wait_outcome(&continuation) {
-        child_handle
-            .chat_state_handle
-            .get_last_assistant_text()
-            .await
-            .unwrap_or_default()
+        child_actor_query(
+            "continuation_assistant_report",
+            child_handle
+                .chat_state_handle
+                .get_trailing_assistant_report(),
+            None,
+        )
+        .await
+        .unwrap_or_default()
     } else {
         String::new()
     };
@@ -2668,12 +2762,31 @@ async fn await_subagent_turn_or_cancellation(
     }
 }
 async fn signals_snapshot_counts(child_handle: &SessionHandle) -> (u32, u32) {
-    child_handle
-        .signals_handle
-        .snapshot()
-        .await
-        .map(|snapshot| (snapshot.tool_call_count, snapshot.turn_count))
-        .unwrap_or((0, 0))
+    child_actor_query(
+        "signals_snapshot",
+        child_handle.signals_handle.snapshot(),
+        None,
+    )
+    .await
+    .map(|snapshot| (snapshot.tool_call_count, snapshot.turn_count))
+    .unwrap_or((0, 0))
+}
+
+async fn child_actor_query<Output>(
+    what: &'static str,
+    query: impl std::future::Future<Output = Output>,
+    fallback: Output,
+) -> Output {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), query).await {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::warn!(
+                query = what,
+                "child actor did not answer in time; using fallback"
+            );
+            fallback
+        }
+    }
 }
 fn cancellation_error_message(
     category: Option<xai_grok_session_events::types::CancellationCategory>,
@@ -2776,6 +2889,7 @@ fn inject_subagent_completed_prompt(
     let message = xai_grok_tools::reminders::task_completion::format_subagent_completion(
         &summary,
         Some(task_output_tool_name),
+        None,
     );
     let wrapped = xai_grok_tools::reminders::wrap_reminder(&message);
     let prompt_id = format!("subagent-completed-{subagent_id}");
@@ -2807,6 +2921,7 @@ fn inject_subagent_completed_prompt(
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
+            initial_child_prompt_ready: None,
         })
         .is_err()
     {

@@ -434,6 +434,8 @@ pub(crate) fn map_summary(summary: ForeignSessionSummary) -> SessionPickerEntry 
     let updated_at = chrono::DateTime::<chrono::Utc>::from(summary.updated_at);
     let cwd = summary.cwd.to_string_lossy().into_owned();
     SessionPickerEntry {
+        last_recap: None,
+        session_kind: None,
         id: summary.native_id,
         summary: summary.title,
         updated_at,
@@ -544,6 +546,8 @@ mod tests {
     fn picker_entry(id: &str, source: &str, timestamp: i64) -> SessionPickerEntry {
         let timestamp = chrono::DateTime::from_timestamp(timestamp, 0).unwrap();
         SessionPickerEntry {
+            last_recap: None,
+            session_kind: None,
             id: id.into(),
             summary: id.into(),
             updated_at: timestamp,

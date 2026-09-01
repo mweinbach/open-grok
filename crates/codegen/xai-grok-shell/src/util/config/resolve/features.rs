@@ -1,5 +1,100 @@
 use crate::util::config::RemoteSettings;
 use toml::Value as TomlValue;
+#[cfg(test)]
+mod repo_status_in_system_prompt_tests {
+    use super::compose_repo_status_in_system_prompt;
+    use crate::util::config::RemoteSettings;
+
+    fn features_toml(value: bool) -> toml::Value {
+        toml::from_str(&format!(
+            "[features]\nrepo_status_in_system_prompt = {value}\n"
+        ))
+        .unwrap()
+    }
+
+    fn remote(value: bool) -> RemoteSettings {
+        RemoteSettings {
+            repo_status_in_system_prompt: Some(value),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn precedence_requirements_over_env_over_config_over_remote_over_default() {
+        assert!(compose_repo_status_in_system_prompt(None, None, None, None));
+        assert!(!compose_repo_status_in_system_prompt(
+            None,
+            None,
+            Some(&remote(false)),
+            None
+        ));
+        assert!(!compose_repo_status_in_system_prompt(
+            None,
+            Some(&features_toml(false)),
+            Some(&remote(true)),
+            None
+        ));
+        assert!(compose_repo_status_in_system_prompt(
+            None,
+            Some(&features_toml(false)),
+            Some(&remote(false)),
+            Some(true)
+        ));
+        assert!(!compose_repo_status_in_system_prompt(
+            Some(&features_toml(false)),
+            Some(&features_toml(true)),
+            Some(&remote(true)),
+            Some(true)
+        ));
+    }
+}
+
+pub(crate) fn resolve_repo_status_in_system_prompt(remote: Option<&RemoteSettings>) -> bool {
+    use xai_grok_config_types::{Feature, FeatureSources};
+    let user_config = crate::config::load_effective_config().ok();
+    let requirements = crate::config::load_merged_requirements();
+    let env = FeatureSources::from_process_env(Feature::RepoStatusInSystemPrompt).env;
+    compose_repo_status_in_system_prompt(requirements.as_ref(), user_config.as_ref(), remote, env)
+}
+
+fn compose_repo_status_in_system_prompt(
+    requirements: Option<&TomlValue>,
+    user: Option<&TomlValue>,
+    remote: Option<&RemoteSettings>,
+    env: Option<bool>,
+) -> bool {
+    use xai_grok_config_types::{Feature, FeatureSources};
+    let feature = Feature::RepoStatusInSystemPrompt;
+    let from_toml = |value: Option<&TomlValue>| -> Option<bool> {
+        value?.get("features")?.get(feature.key())?.as_bool()
+    };
+    feature
+        .resolve(FeatureSources {
+            pin: from_toml(requirements),
+            env,
+            config: from_toml(user),
+            remote: feature.remote_value(remote),
+        })
+        .value
+}
+
+pub(crate) fn resolve_turn_transient_retry(remote: Option<bool>) -> bool {
+    let config = crate::config::load_effective_config().ok();
+    let requirements = crate::config::load_merged_requirements();
+    let from_toml = |value: Option<&TomlValue>| {
+        value?
+            .get("features")?
+            .get("turn_transient_retry")?
+            .as_bool()
+    };
+    crate::agent::config::BoolFlag::env("OPENGROK_TRANSIENT_TURN_RETRY")
+        .requirement(from_toml(requirements.as_ref()))
+        .config(from_toml(config.as_ref()))
+        .feature_flag(remote)
+        .default(true)
+        .resolve()
+        .value
+}
 
 /// Resolve whether ZDR users are allowed to use the product.
 ///
@@ -78,6 +173,7 @@ fn remote_fetch_enabled_from_layers(layers: &crate::config::ConfigLayers) -> boo
         system_requirements,
         mdm_requirements,
         campaigns: _,
+        env_overlay: _,
     } = layers;
     [
         mdm_requirements.as_ref(),

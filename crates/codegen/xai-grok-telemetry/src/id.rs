@@ -3,8 +3,9 @@
 //! Extracted from `xai-grok-shell::agent::unique_identifier` so the
 //! telemetry engine can stamp events without depending on shell internals.
 //! `$GROK_HOME` is resolved through `xai-grok-config::grok_home`.
+use std::sync::{Once, OnceLock};
 
-use std::sync::OnceLock;
+const ENV_AGENT_ID: &str = "OPENGROK_AGENT_ID";
 
 /// Cached agent ID - stored in memory after first load.
 static AGENT_ID: OnceLock<String> = OnceLock::new();
@@ -25,6 +26,33 @@ pub fn agent_id() -> String {
 /// Returns a per-process agent instance ID.
 /// This is stable across WebSocket reconnects within the same process,
 /// but changes on process restart.
+pub async fn agent_id_async() -> String {
+    if let Some(id) = AGENT_ID.get() {
+        return id.clone();
+    }
+    match tokio::task::spawn_blocking(agent_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(error = %err, "agent id blocking task failed; reading inline");
+            agent_id()
+        }
+    }
+}
+
+pub fn prefetch_agent_id() {
+    static PREFETCH: Once = Once::new();
+    PREFETCH.call_once(|| {
+        if let Err(err) = std::thread::Builder::new()
+            .name("agent-id-fetch".into())
+            .spawn(|| {
+                agent_id();
+            })
+        {
+            tracing::warn!(error = %err, "failed to spawn the agent id prefetch thread");
+        }
+    });
+}
+
 pub fn agent_instance_id() -> String {
     AGENT_INSTANCE_ID
         .get_or_init(|| uuid::Uuid::new_v4().to_string())
@@ -32,9 +60,15 @@ pub fn agent_instance_id() -> String {
 }
 
 fn load_or_compute_agent_id() -> String {
-    let cache_path = xai_grok_config::grok_home().join("agent_id");
+    if let Ok(id) = std::env::var(ENV_AGENT_ID) {
+        let id = id.trim();
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
 
     // Try to read from cache file first (fast path)
+    let cache_path = xai_grok_config::grok_home().join("agent_id");
     if let Ok(cached) = std::fs::read_to_string(&cache_path) {
         let cached = cached.trim();
         if !cached.is_empty() {
@@ -48,7 +82,15 @@ fn load_or_compute_agent_id() -> String {
     // - Linux: /etc/machine-id is shared across containers from the same base
     //   image, so include $HOSTNAME (container/host name) for uniqueness.
     // - Fallback: random UUIDv4 if mid or hostname are unavailable.
-    let machine_hash = if cfg!(target_os = "linux") {
+    let hash = compute_machine_hash();
+    let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, hash.as_bytes()).to_string();
+    // Save to cache file with owner-only perms (best effort).
+    let _ = write_agent_id_cache(&cache_path, &id);
+    id
+}
+
+fn compute_machine_hash() -> String {
+    if cfg!(target_os = "linux") {
         match std::env::var("HOSTNAME") {
             Ok(hostname) if !hostname.is_empty() => {
                 let key = format!("agent_id:{hostname}");
@@ -58,13 +100,7 @@ fn load_or_compute_agent_id() -> String {
         }
     } else {
         mid::get("agent_id").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
-    };
-    let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, machine_hash.as_bytes()).to_string();
-
-    // Save to cache file with owner-only perms (best effort).
-    let _ = write_agent_id_cache(&cache_path, &id);
-
-    id
+    }
 }
 
 /// Write `$GROK_HOME/agent_id` as owner-read/write only (Unix 0o600) — it is a

@@ -479,6 +479,7 @@ async fn team_switch_evicts_prior_teams_policy() {
     assert!(home.join("requirements.toml").exists());
     assert!(home.join("managed_config.toml").exists());
     std::fs::write(home.join("managed_config.sig.json"), "{}").unwrap();
+    std::fs::write(home.join("managed_identity.sig.json"), "{}").unwrap();
 
     // Switch to team B, whose server returns a row (team_id) but no artifacts.
     let body_b = serde_json::json!({
@@ -492,10 +493,13 @@ async fn team_switch_evicts_prior_teams_policy() {
     write_config(&home, &url_b);
     write_team_auth(&home, "team-b");
 
-    let wrote = xai_grok_shell::managed_config::sync()
+    let changed = xai_grok_shell::managed_config::sync()
         .await
         .expect("team B sync must not fail the session");
-    assert!(!wrote, "team B serves no artifacts, so nothing is written");
+    assert!(
+        changed,
+        "removing team A's policy artifacts is a policy change"
+    );
 
     // Team A's enforced policy is gone — team B does not inherit it.
     assert!(
@@ -509,6 +513,10 @@ async fn team_switch_evicts_prior_teams_policy() {
     assert!(
         !home.join("managed_config.sig.json").exists(),
         "team A's stale sidecar must be evicted on the switch to team B"
+    );
+    assert!(
+        !home.join("managed_identity.sig.json").exists(),
+        "team A's identity claim must be evicted on the switch to team B"
     );
 
     // The marker is now team B's and must not claim B served A's artifacts.
@@ -534,6 +542,12 @@ async fn team_switch_evicts_prior_teams_policy() {
     assert!(!xai_grok_shell::config::is_managed_config_stale_for(
         &team_identity("team-b")
     ));
+    assert!(
+        !xai_grok_shell::managed_config::sync()
+            .await
+            .expect("a repeated empty team B sync should succeed"),
+        "refreshing only the marker after eviction is not another policy change"
+    );
 }
 
 /// An artifact the server stops serving is removed on the next sync (disk converges
@@ -1119,13 +1133,11 @@ async fn identity_change_permits_offline_team_switch_and_purges_prior_team() {
     }
 }
 
-/// The gate purge takes the managed-config lock best-effort and SKIPS on contention (the holder
-/// owns the transition). While held, an A→B switch retains team A's files — and the gate still
-/// permits (a pure identity mismatch is not gate-grade tamper); once released, the next gate
-/// call purges — proving the skip was contention-driven, not a silent no-op.
+/// A contended lock retains the prior team's artifacts and refuses startup until a
+/// coherent policy snapshot can be read. Releasing it lets the gate purge and proceed.
 #[tokio::test]
 #[serial]
-async fn gate_purge_skips_while_lock_contended() {
+async fn gate_purge_refuses_while_lock_contended() {
     let home = test_home().clone();
     reset(&home);
 
@@ -1147,7 +1159,6 @@ async fn gate_purge_skips_while_lock_contended() {
 
     write_team_auth(&home, "team-b");
 
-    // Hold the managed-config flock (the same lock the gate purge tries), so the purge skips.
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1157,9 +1168,12 @@ async fn gate_purge_skips_while_lock_contended() {
         .unwrap();
     lock.lock().unwrap();
 
-    assert!(
-        xai_grok_shell::managed_config::managed_policy_gate().is_ok(),
-        "a contended purge skip leaves a pure identity mismatch, which must not refuse"
+    assert_eq!(
+        xai_grok_shell::managed_config::managed_policy_gate_with_lock_wait(
+            std::time::Duration::from_millis(100)
+        ),
+        Err(xai_grok_shell::managed_config::ManagedPolicyRefusal::Busy),
+        "a contended lock must never expose an incoherent policy snapshot"
     );
     assert!(
         home.join("requirements.toml").exists(),
@@ -1187,9 +1201,8 @@ async fn gate_purge_skips_while_lock_contended() {
 }
 
 /// A TRANSIENT lock holder must not turn an offline team switch into a skipped purge:
-/// the purge retries the lock once after 100ms (`PURGE_LOCK_RETRY_DELAY`), so a holder
-/// that releases within that window (~20ms here) is absorbed and the SAME gate call
-/// purges team A on the second attempt.
+/// the bounded lock wait absorbs a holder that releases promptly (~20ms here), so
+/// the same gate call purges team A and proceeds.
 #[tokio::test]
 #[serial]
 async fn gate_purge_retries_past_a_transient_lock_holder() {

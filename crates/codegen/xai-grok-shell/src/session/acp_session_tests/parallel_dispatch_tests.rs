@@ -195,7 +195,10 @@ fn lock_path_for_args_matches_grok_build_file_path() {
         "old_string": "foo",
         "new_string": "bar",
     });
-    assert_eq!(lock_path_for_args(&args), Some("/repo/src/main.rs"));
+    assert_eq!(
+        lock_path_for_args(&args, std::path::Path::new("/repo")),
+        Some("/repo/src/main.rs".to_string())
+    );
 }
 
 #[test]
@@ -206,7 +209,10 @@ fn lock_path_for_args_matches_path_arg() {
         "old_string": "foo",
         "new_string": "bar",
     });
-    assert_eq!(lock_path_for_args(&args), Some("/repo/src/main.rs"));
+    assert_eq!(
+        lock_path_for_args(&args, std::path::Path::new("/repo")),
+        Some("/repo/src/main.rs".to_string())
+    );
 }
 
 #[test]
@@ -215,7 +221,10 @@ fn lock_path_for_args_matches_grok_build_target_file() {
     let args = serde_json::json!({
         "target_file": "/repo/src/main.rs",
     });
-    assert_eq!(lock_path_for_args(&args), Some("/repo/src/main.rs"));
+    assert_eq!(
+        lock_path_for_args(&args, std::path::Path::new("/repo")),
+        Some("/repo/src/main.rs".to_string())
+    );
 }
 
 #[test]
@@ -227,9 +236,18 @@ fn lock_path_for_args_returns_none_for_pathless_tools() {
         "command": "ls -la",
         "description": "list",
     });
-    assert_eq!(lock_path_for_args(&args), None);
-    assert_eq!(lock_path_for_args(&serde_json::json!({})), None);
-    assert_eq!(lock_path_for_args(&serde_json::json!(null)), None);
+    assert_eq!(
+        lock_path_for_args(&args, std::path::Path::new("/repo")),
+        None
+    );
+    assert_eq!(
+        lock_path_for_args(&serde_json::json!({}), std::path::Path::new("/repo")),
+        None
+    );
+    assert_eq!(
+        lock_path_for_args(&serde_json::json!(null), std::path::Path::new("/repo")),
+        None
+    );
 }
 
 #[test]
@@ -237,9 +255,15 @@ fn lock_path_for_args_ignores_non_string_path_values() {
     // Defensive: if a model emits a non-string, treat as no lock rather
     // than panicking or coercing — the tool layer will reject it.
     let args = serde_json::json!({"file_path": 42});
-    assert_eq!(lock_path_for_args(&args), None);
+    assert_eq!(
+        lock_path_for_args(&args, std::path::Path::new("/repo")),
+        None
+    );
     let args = serde_json::json!({"path": ["/a", "/b"]});
-    assert_eq!(lock_path_for_args(&args), None);
+    assert_eq!(
+        lock_path_for_args(&args, std::path::Path::new("/repo")),
+        None
+    );
 }
 
 #[test]
@@ -259,8 +283,14 @@ fn lock_path_for_args_buckets_parallel_compat_strreplace_to_same_lock() {
         "old_string": "baz",
         "new_string": "qux",
     });
-    assert_eq!(lock_path_for_args(&call_a), lock_path_for_args(&call_b));
-    assert_eq!(lock_path_for_args(&call_a), Some("/repo/src/main.rs"));
+    assert_eq!(
+        lock_path_for_args(&call_a, std::path::Path::new("/repo")),
+        lock_path_for_args(&call_b, std::path::Path::new("/repo"))
+    );
+    assert_eq!(
+        lock_path_for_args(&call_a, std::path::Path::new("/repo")),
+        Some("/repo/src/main.rs".to_string())
+    );
 
     // Cross-file calls must bucket independently so they keep running
     // concurrently — otherwise we'd serialize unrelated edits and tank
@@ -270,7 +300,10 @@ fn lock_path_for_args_buckets_parallel_compat_strreplace_to_same_lock() {
         "old_string": "x",
         "new_string": "y",
     });
-    assert_ne!(lock_path_for_args(&call_a), lock_path_for_args(&call_c));
+    assert_ne!(
+        lock_path_for_args(&call_a, std::path::Path::new("/repo")),
+        lock_path_for_args(&call_c, std::path::Path::new("/repo"))
+    );
 }
 
 #[test]
@@ -291,7 +324,10 @@ fn lock_path_for_args_buckets_grok_build_and_compat_to_same_lock_for_same_file()
         "old_string": "c",
         "new_string": "d",
     });
-    assert_eq!(lock_path_for_args(&grok), lock_path_for_args(&compat));
+    assert_eq!(
+        lock_path_for_args(&grok, std::path::Path::new("/repo")),
+        lock_path_for_args(&compat, std::path::Path::new("/repo"))
+    );
 }
 
 /// Regression: skill-discovery reminders must land after all tool results, not mid-batch.

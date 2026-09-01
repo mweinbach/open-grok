@@ -11,11 +11,14 @@
 //!          -> search_fts::SessionSearchIndex (SQLite FTS5)
 //! ```
 
+use std::io;
+
 use agent_client_protocol as acp;
 use serde::{Deserialize, Serialize};
 
 use crate::session::storage::search::{SessionSearchRequest, SessionSearchResponse};
 use crate::session::storage::search_fts::SessionSearchRow;
+use crate::session::visibility::{ClassifiedSessionKind, HeadlessPolicy, policy_admits};
 
 use super::ExtResult;
 
@@ -36,6 +39,8 @@ pub(crate) struct SearchSessionsRequest {
     /// Whether to include content snippets in results.
     #[serde(default)]
     pub include_content: bool,
+    #[serde(default)]
+    pub headless: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -72,25 +77,153 @@ pub async fn handle(args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
         "x.ai/session/search" => {
             let req: SearchSessionsRequest = super::parse_params(args)?;
-            let internal_req = SessionSearchRequest {
-                query: req.query,
-                cwd: req.cwd,
-                limit: req.limit,
-                offset: req.offset,
-                include_content: req.include_content,
-            };
+            let headless = HeadlessPolicy::from_wire(req.headless.as_deref());
+            let SearchSessionsRequest {
+                query,
+                cwd,
+                limit,
+                offset,
+                include_content,
+                headless: _,
+            } = req;
+            validate_search_window(limit, offset)?;
 
+            let kind_index = std::sync::Arc::new(
+                tokio::task::spawn_blocking(crate::session::persistence::SessionKindIndex::load)
+                    .await
+                    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
+                    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?,
+            );
             let root_dir = crate::util::grok_home::grok_home();
-            let result = crate::session::storage::search::execute_search(&root_dir, &internal_req)
+            let fetch = |index_offset: usize, batch: usize| {
+                let query = query.clone();
+                let cwd = cwd.clone();
+                let root_dir = root_dir.clone();
+                let kind_index = kind_index.clone();
+                async move {
+                    let internal_req = SessionSearchRequest {
+                        query,
+                        cwd,
+                        limit: batch,
+                        offset: index_offset,
+                        include_content,
+                    };
+                    let resp = to_response(
+                        crate::session::storage::search::execute_search(&root_dir, &internal_req)
+                            .await?,
+                    );
+                    let has_more = resp.next_offset.is_some();
+                    let bootstrapping = resp.bootstrapping;
+                    let hits = tokio::task::spawn_blocking(move || {
+                        resp.results
+                            .into_iter()
+                            .map(|hit| {
+                                let kind = kind_index.kind(&hit.session_id);
+                                (hit, kind)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                    Ok(ClassifiedPage {
+                        hits,
+                        has_more,
+                        bootstrapping,
+                    })
+                }
+            };
+            let result = walk_admitted_window(fetch, offset, limit, headless)
                 .await
-                .map(to_response)
-                .map_err(|e| anyhow::anyhow!(e));
+                .map_err(|error| anyhow::anyhow!(error));
 
             super::to_ext_response(result)
         }
         _ => Err(acp::Error::method_not_found()),
     }
 }
+
+const MAX_SEARCH_RESULTS: usize = 100;
+const MAX_FILTERED_OFFSET: usize = 1_000;
+const MAX_CLASSIFIED_HITS: usize = 1_200;
+const WALK_BATCH: usize = 50;
+
+fn validate_search_window(limit: usize, offset: usize) -> Result<(), acp::Error> {
+    if limit == 0 || limit > MAX_SEARCH_RESULTS || offset > MAX_FILTERED_OFFSET {
+        return Err(acp::Error::invalid_params().data(format!(
+            "session search limit must be 1..={MAX_SEARCH_RESULTS} and offset <= {MAX_FILTERED_OFFSET}"
+        )));
+    }
+    Ok(())
+}
+
+struct ClassifiedPage {
+    hits: Vec<(SearchSessionHit, ClassifiedSessionKind)>,
+    has_more: bool,
+    bootstrapping: bool,
+}
+async fn walk_admitted_window<F, Fut>(
+    mut fetch: F,
+    offset: usize,
+    limit: usize,
+    headless: HeadlessPolicy,
+) -> io::Result<SearchSessionsResponse>
+where
+    F: FnMut(usize, usize) -> Fut,
+    Fut: Future<Output = io::Result<ClassifiedPage>>,
+{
+    let batch = limit.clamp(WALK_BATCH, MAX_CLASSIFIED_HITS);
+    let mut index_offset = 0;
+    let mut skipped = 0;
+    let mut results = Vec::new();
+    let mut has_more_results = false;
+    let mut is_exhausted = false;
+    let first_page = fetch(index_offset, batch).await?;
+    let mut bootstrapping = first_page.bootstrapping;
+    let mut page = first_page;
+    loop {
+        let remaining = MAX_CLASSIFIED_HITS.saturating_sub(index_offset);
+        let truncated = page.hits.len() > remaining;
+        let page_len = page.hits.len().min(remaining);
+        for (hit, kind) in page.hits.into_iter().take(page_len) {
+            if !policy_admits(headless, kind) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if results.len() < limit {
+                results.push(hit);
+            } else {
+                has_more_results = true;
+                break;
+            }
+        }
+        if has_more_results {
+            break;
+        }
+        index_offset += page_len;
+        if truncated || (index_offset >= MAX_CLASSIFIED_HITS && page.has_more) {
+            break;
+        }
+        if !page.has_more || page_len == 0 {
+            is_exhausted = true;
+            break;
+        }
+        page = fetch(index_offset, batch.min(MAX_CLASSIFIED_HITS - index_offset)).await?;
+        bootstrapping |= page.bootstrapping;
+    }
+    Ok(SearchSessionsResponse {
+        next_offset: has_more_results.then(|| offset + results.len()),
+        total_estimate: is_exhausted.then(|| skipped + results.len()),
+        results,
+        bootstrapping,
+    })
+}
+
+#[cfg(test)]
+#[path = "session_search_tests.rs"]
+mod tests;
 
 /// Convert the internal response to the ACP-facing response.
 fn to_response(resp: SessionSearchResponse) -> SearchSessionsResponse {

@@ -260,11 +260,19 @@ type Expectations = Arc<std::sync::Mutex<ExpectationState>>;
 type ScriptQueues = Arc<std::sync::Mutex<HashMap<String, VecDeque<ScriptedResponse>>>>;
 
 #[derive(Clone)]
+struct ConcurrencyCap {
+    slots: Arc<tokio::sync::Semaphore>,
+    hold: Duration,
+    retry_after_secs: u64,
+}
+
+#[derive(Clone)]
 pub(crate) struct InferenceOverrides {
     expectations: Expectations,
     scripted: ScriptQueues,
     completion_gate: Arc<CompletionGate>,
     required_token: Option<Arc<str>>,
+    concurrency_cap: Arc<std::sync::Mutex<Option<ConcurrencyCap>>>,
 }
 
 impl InferenceOverrides {
@@ -274,7 +282,16 @@ impl InferenceOverrides {
             scripted: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_gate: Arc::new(CompletionGate::default()),
             required_token: required_token.map(Arc::from),
+            concurrency_cap: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn set_concurrency_cap(&self, cap: usize, hold: Duration, retry_after_secs: u64) {
+        *self.concurrency_cap.lock().unwrap() = Some(ConcurrencyCap {
+            slots: Arc::new(tokio::sync::Semaphore::new(cap)),
+            hold,
+            retry_after_secs,
+        });
     }
 
     pub(crate) fn classify(
@@ -315,7 +332,27 @@ impl InferenceOverrides {
             return Some(response.into_response_paced(delay, wait).await);
         }
 
-        self.auth_rejection(headers)
+        if let Some(rejection) = self.auth_rejection(headers) {
+            return Some(rejection);
+        }
+
+        let cap = self.concurrency_cap.lock().unwrap().clone();
+        if let Some(cap) = cap {
+            match Arc::clone(&cap.slots).try_acquire_owned() {
+                Ok(permit) => {
+                    tokio::time::sleep(cap.hold).await;
+                    drop(permit);
+                }
+                Err(_) => {
+                    let mut reply = ScriptedResponse::text(429, "concurrent request cap exceeded");
+                    reply
+                        .headers
+                        .push(("retry-after".to_string(), cap.retry_after_secs.to_string()));
+                    return Some(reply.into_response_paced(delay, None).await);
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn register_expectation(
@@ -635,4 +672,35 @@ fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrency_cap_releases_slots_after_hold_and_cancellation() {
+        let overrides = InferenceOverrides::new(None);
+        overrides.set_concurrency_cap(1, Duration::from_millis(10), 7);
+        let headers = HeaderMap::new();
+        let request = overrides.classify(InferenceEndpoint::ChatCompletions, &headers, &json!({}));
+        let mut admitted = Box::pin(overrides.response_override(&request, &headers, None));
+        assert!(futures_util::poll!(&mut admitted).is_pending());
+
+        let rejected = overrides
+            .response_override(&request, &headers, None)
+            .await
+            .expect("the occupied slot must reject another default response");
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()["retry-after"], "7");
+        assert!(admitted.await.is_none());
+
+        let mut cancelled = Box::pin(overrides.response_override(&request, &headers, None));
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+
+        let mut replacement = Box::pin(overrides.response_override(&request, &headers, None));
+        assert!(futures_util::poll!(&mut replacement).is_pending());
+        assert!(replacement.await.is_none());
+    }
 }

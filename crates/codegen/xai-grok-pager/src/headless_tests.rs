@@ -1,6 +1,144 @@
 use pretty_assertions::assert_eq;
 
 #[test]
+fn fresh_headless_metadata_preserves_explicit_session_and_model() {
+    for session_id in [None, Some("session-1")] {
+        for model_id in [None, Some("configured-provider-model")] {
+            let meta = super::headless_create_meta(session_id, model_id);
+            assert_eq!(meta["sessionKind"], "headless");
+            assert_eq!(
+                meta.get("sessionId").and_then(serde_json::Value::as_str),
+                session_id
+            );
+            assert_eq!(
+                meta.get("modelId").and_then(serde_json::Value::as_str),
+                model_id
+            );
+            assert_eq!(
+                meta.len(),
+                1 + usize::from(session_id.is_some()) + usize::from(model_id.is_some())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn memory_flush_waits_for_response_and_drains_lifecycle_notifications() {
+    use agent_client_protocol as acp;
+    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage};
+
+    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = acp::SessionId::new("flush-session");
+    let mut emitter = super::HeadlessEmitter::new(super::OutputFormat::Json, false);
+    let server = async {
+        let Some(AcpAgentMessage::ExtMethod(request)) = agent_rx.recv().await else {
+            panic!("expected memory flush extension request");
+        };
+        assert_eq!(request.request.method.as_ref(), "x.ai/memory/flush");
+        let params: serde_json::Value = serde_json::from_str(request.request.params.get()).unwrap();
+        assert_eq!(params, serde_json::json!({"session_id": "flush-session"}));
+        for update in [
+            serde_json::json!({"sessionUpdate": "memory_flush_started"}),
+            serde_json::json!({"sessionUpdate": "memory_flush_completed", "result": "updated", "path": "memory.md"}),
+        ] {
+            let params = serde_json::value::to_raw_value(&serde_json::json!({
+                "sessionId": "flush-session",
+                "update": update,
+            }))
+            .unwrap();
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            client_tx
+                .send(AcpClientMessage::ExtNotification(AcpArgs {
+                    request: acp::ExtNotification::new("x.ai/session_notification", params.into()),
+                    response_tx,
+                }))
+                .unwrap();
+            response_rx.await.unwrap().unwrap();
+        }
+        let response =
+            serde_json::value::to_raw_value(&serde_json::json!({"flushed": true})).unwrap();
+        request
+            .response_tx
+            .send(Ok(acp::ExtResponse::new(response.into())))
+            .unwrap();
+    };
+    let (result, ()) = tokio::join!(
+        super::run_headless_memory_flush(
+            &agent_tx,
+            &mut client_rx,
+            &session_id,
+            &mut emitter,
+            false
+        ),
+        server,
+    );
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[tokio::test]
+async fn memory_flush_rejects_skipped_or_malformed_responses() {
+    use agent_client_protocol as acp;
+    use xai_acp_lib::AcpAgentMessage;
+
+    for response in [r#"{"flushed":false}"#, "{}", "null"] {
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session_id = acp::SessionId::new("flush-session");
+        let mut emitter = super::HeadlessEmitter::new(super::OutputFormat::Json, false);
+        let server = async {
+            let Some(AcpAgentMessage::ExtMethod(request)) = agent_rx.recv().await else {
+                panic!("expected memory flush extension request");
+            };
+            let response = serde_json::value::RawValue::from_string(response.to_string()).unwrap();
+            request
+                .response_tx
+                .send(Ok(acp::ExtResponse::new(response.into())))
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            super::run_headless_memory_flush(
+                &agent_tx,
+                &mut client_rx,
+                &session_id,
+                &mut emitter,
+                false
+            ),
+            server,
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("memory flush skipped")
+        );
+    }
+}
+
+#[tokio::test]
+async fn memory_flush_reports_closed_connection() {
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(client_tx);
+    let mut emitter = super::HeadlessEmitter::new(super::OutputFormat::Json, false);
+    let session_id = agent_client_protocol::SessionId::new("flush-session");
+    let result = super::run_headless_memory_flush(
+        &agent_tx,
+        &mut client_rx,
+        &session_id,
+        &mut emitter,
+        false,
+    )
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("connection closed")
+    );
+}
+
+#[test]
 fn lifecycle_tracking_is_independent_of_wait_flag() {
     let mut pending = std::collections::HashSet::new();
     let mut completed = std::collections::HashSet::new();
@@ -200,7 +338,7 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
     );
 }
 
-/// `begin_session` before the model/effort apply lets a post-open error carry the real context.
+/// `begin_session` runs before the model and effort are applied, so a post-open error carries the real context.
 #[test]
 fn post_open_error_carries_real_session_context() {
     let mut pre = reducer_for(OutputFormat::StreamingMessagesJson).unwrap();
@@ -284,7 +422,6 @@ fn headless_remote_miss_restores_conversation_instead_of_deferring_worktree() {
             RemoteMissPlan::DeferToWorktree { .. }
         ));
     }
-    // when asserting the conversation / in-place-refuse arms.
     let mut conv = headless_materialize_ctx(false, false);
     conv.allow_remote_restore = true;
     assert_eq!(

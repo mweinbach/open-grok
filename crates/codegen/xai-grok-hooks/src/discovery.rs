@@ -27,10 +27,11 @@ impl HookRegistry {
     /// Returns true when any enabled hook is registered for `event` or its
     /// alias spelling. Allocation-free guard for hot paths.
     pub fn has_enabled_hooks_for_canonical(&self, event: HookEventName) -> bool {
+        let disabled = crate::trust::DisabledHooks::load();
         let enabled = |specs: &[HookSpec]| {
             specs
                 .iter()
-                .any(|s| s.enabled && !crate::trust::is_hook_disabled(&s.name))
+                .any(|s| s.is_managed_policy() || (s.enabled && !disabled.contains(&s.name)))
         };
         let canonical = event.canonical();
         enabled(self.hooks_for(canonical))
@@ -99,10 +100,10 @@ impl HookRegistry {
         all
     }
 
-    /// Rebuild the `matcher` field (serde skips it) from `configured_matcher`
-    /// after any wire restore; until then a configured pattern acts as match-all.
-    /// An invalid pattern can't be rejected here (the registry is live), so it
-    /// installs [`HookMatcher::never`]: fail closed rather than match all.
+    pub fn find_by_name(&self, name: &str) -> Option<&HookSpec> {
+        self.hooks.values().flatten().find(|s| s.name == name)
+    }
+
     pub fn recompile_matchers(&mut self) {
         for specs in self.hooks.values_mut() {
             for spec in specs.iter_mut() {
@@ -217,8 +218,8 @@ pub fn collect_specs_from_sources(
 /// are intentionally excluded from the key.
 pub fn registry_from_specs_deduped(specs: Vec<HookSpec>) -> HookRegistry {
     let mut hooks: HashMap<HookEventName, Vec<HookSpec>> = HashMap::new();
-    let mut seen_content: std::collections::HashSet<(HookEventName, String, String, String)> =
-        std::collections::HashSet::new();
+    let mut seen_content: HashMap<(HookEventName, String, String, String), (HookEventName, usize)> =
+        HashMap::new();
     for spec in specs {
         let key = (
             spec.event.canonical(),
@@ -226,15 +227,34 @@ pub fn registry_from_specs_deduped(specs: Vec<HookSpec>) -> HookRegistry {
             spec.url_raw.clone().unwrap_or_default(),
             spec.configured_matcher.clone().unwrap_or_default(),
         );
-        if seen_content.insert(key) {
-            hooks.entry(spec.event).or_default().push(spec);
-        } else {
-            tracing::debug!(
-                hook_name = %spec.name,
-                event = %spec.event,
-                matcher = ?spec.configured_matcher,
-                "hooks: skipping duplicate hook (same content + matcher already loaded from earlier source)"
-            );
+        match seen_content.get(&key) {
+            None => {
+                let event_specs = hooks.entry(spec.event).or_default();
+                seen_content.insert(key, (spec.event, event_specs.len()));
+                event_specs.push(spec);
+            }
+            Some(&(kept_event, kept_idx)) => {
+                let kept = hooks.get_mut(&kept_event).and_then(|v| v.get_mut(kept_idx));
+                if let Some(kept) = kept
+                    && spec.layer.authority_rank() > kept.layer.authority_rank()
+                {
+                    tracing::debug!(
+                        hook_name = %spec.name,
+                        replaced = %kept.name,
+                        "hooks: higher-authority copy of a duplicate hook wins over the earlier lower-tier copy"
+                    );
+                    let mut spec = spec;
+                    spec.event = kept_event;
+                    *kept = spec;
+                } else {
+                    tracing::debug!(
+                        hook_name = %spec.name,
+                        event = %spec.event,
+                        matcher = ?spec.configured_matcher,
+                        "hooks: skipping duplicate hook (same content + matcher already loaded from earlier source)"
+                    );
+                }
+            }
         }
     }
     HookRegistry { hooks }
@@ -395,8 +415,10 @@ mod tests {
             .collect();
         let expected: std::collections::HashSet<_> = [
             HookEventName::PreToolUse,
+            HookEventName::PostToolUse,
             HookEventName::Stop,
             HookEventName::SubagentStop,
+            HookEventName::UserPromptSubmit,
         ]
         .into_iter()
         .collect();
@@ -415,7 +437,7 @@ mod tests {
     #[test]
     fn load_nonexistent_dir() {
         let (registry, errors) = load_hooks(Some(Path::new("/nonexistent/path/hooks")), None);
-        assert!(errors.is_empty()); // NotFound is silent
+        assert!(errors.is_empty());
         assert!(registry.is_empty());
     }
 
@@ -614,7 +636,7 @@ mod tests {
             ))],
             &[],
         );
-        assert!(errors.is_empty()); // Missing file is fine, not an error.
+        assert!(errors.is_empty());
         assert!(registry.is_empty());
     }
 
@@ -685,6 +707,101 @@ mod tests {
         assert_eq!(hooks.len(), 2);
         assert!(hooks[0].name.starts_with("global/"));
         assert!(hooks[1].name.starts_with("project/"));
+    }
+
+    #[test]
+    fn dedup_keeps_the_managed_policy_copy_regardless_of_order() {
+        let spec = |name: &str, layer, timeout_ms| crate::config::HookSpec {
+            name: name.to_string(),
+            event: HookEventName::PreToolUse,
+            handler_type: crate::config::HandlerType::Command,
+            configured_matcher: None,
+            matcher: None,
+            enabled: true,
+            command: Some("pinned.sh".into()),
+            command_raw: Some("pinned.sh".to_string()),
+            url: None,
+            url_raw: None,
+            timeout_ms,
+            source_dir: std::path::PathBuf::from("/tmp"),
+            extra_env: std::collections::HashMap::new(),
+            layer,
+        };
+        use crate::config::HookProvenance;
+
+        let registry = registry_from_specs_deduped(vec![
+            spec("user:pre[0]", HookProvenance::User, 1),
+            spec(
+                "requirements/system:pre[0]",
+                HookProvenance::Requirements,
+                5000,
+            ),
+        ]);
+        let hooks = registry.hooks_for(HookEventName::PreToolUse);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].layer, HookProvenance::Requirements);
+        assert_eq!(hooks[0].timeout_ms, 5000, "pinned copy's fields survive");
+        assert!(hooks[0].is_managed_policy());
+
+        let registry = registry_from_specs_deduped(vec![
+            spec(
+                "requirements/system:pre[0]",
+                HookProvenance::Requirements,
+                5000,
+            ),
+            spec("user:pre[0]", HookProvenance::User, 1),
+        ]);
+        let hooks = registry.hooks_for(HookEventName::PreToolUse);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].layer, HookProvenance::Requirements);
+
+        let registry = registry_from_specs_deduped(vec![
+            spec(
+                "requirements/user:pre[0]",
+                HookProvenance::UserRequirements,
+                1,
+            ),
+            spec("system_managed:pre[0]", HookProvenance::SystemManaged, 5000),
+        ]);
+        let hooks = registry.hooks_for(HookEventName::PreToolUse);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].layer, HookProvenance::SystemManaged);
+        assert_eq!(hooks[0].timeout_ms, 5000);
+        assert!(hooks[0].is_managed_policy());
+    }
+
+    #[test]
+    fn has_enabled_hooks_counts_managed_hooks_despite_disable_state() {
+        let mut spec = crate::config::HookSpec {
+            name: "requirements/system:stop[0].hooks[0]".to_string(),
+            event: HookEventName::Stop,
+            handler_type: crate::config::HandlerType::Command,
+            configured_matcher: None,
+            matcher: None,
+            enabled: false, // disable signal; managed policy must ignore it
+            command: Some("stop.sh".into()),
+            command_raw: Some("stop.sh".to_string()),
+            url: None,
+            url_raw: None,
+            timeout_ms: 5000,
+            source_dir: std::path::PathBuf::from("/tmp"),
+            extra_env: std::collections::HashMap::new(),
+            layer: crate::config::HookProvenance::Requirements,
+        };
+        let mut registry = HookRegistry::default();
+        registry.append_specs(vec![spec.clone()]);
+        assert!(
+            registry.has_enabled_hooks_for_canonical(HookEventName::Stop),
+            "managed-policy hook must count as enabled"
+        );
+
+        spec.layer = crate::config::HookProvenance::File;
+        let mut registry = HookRegistry::default();
+        registry.append_specs(vec![spec]);
+        assert!(
+            !registry.has_enabled_hooks_for_canonical(HookEventName::Stop),
+            "a disabled file hook must not count"
+        );
     }
 
     #[test]

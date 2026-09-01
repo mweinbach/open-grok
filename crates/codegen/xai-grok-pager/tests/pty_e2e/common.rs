@@ -325,13 +325,34 @@ pub(crate) const CTRL_SEMICOLON: &[u8] = b"\x1b[59;5u";
 /// Wire prefix the shell puts on interjected messages.
 pub(crate) const INTERJECTION_WIRE_PREFIX: &str = "The user sent a message while you were working";
 
-/// ~5s of paced streaming so the test can type during the turn.
 pub(crate) fn slow_turn_text(sentinel: &str) -> String {
-    let mut s = String::from(sentinel);
-    for i in 0..30 {
-        s.push_str(&format!(" streaming{i}"));
+    let mut text = String::from(sentinel);
+    for index in 0..30 {
+        text.push_str(&format!(" streaming{index}"));
     }
-    s
+    text
+}
+
+pub(crate) fn fake_editor_command(
+    directory: &std::path::Path,
+    unix_body: &str,
+    windows_body: &str,
+) -> String {
+    if cfg!(windows) {
+        let script = directory.join("local-editor.cmd");
+        std::fs::write(&script, windows_body).expect("write Windows editor script");
+        format!("cmd /C '{}'", script.display())
+    } else {
+        let script = directory.join("local-editor.sh");
+        std::fs::write(&script, unix_body).expect("write Unix editor script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+                .expect("make editor executable");
+        }
+        format!("'{}'", script.display())
+    }
 }
 
 /// All user-message contents across every recorded request, in order.

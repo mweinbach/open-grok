@@ -152,6 +152,7 @@ impl EventTracker {
                 outcome: crate::types::ToolOutcome::Cancelled,
                 tool_call_id: tool.tool_call_id,
                 source: crate::types::ToolCompletedSource::Shell,
+                rewriting_hook: None,
             });
         }
     }

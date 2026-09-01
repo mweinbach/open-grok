@@ -7,7 +7,7 @@ use xai_grok_config::signed_policy::now_unix;
 
 /// Which credential a config fetch used — tailors error messages and the
 /// post-fetch confirmation (team vs deployment).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum ManagedConfigSource {
     DeploymentKey,
     TeamOauth,
@@ -33,6 +33,14 @@ impl ManagedConfigSource {
 pub enum ManagedConfigError {
     #[error("Can't reach the server. Check your network connection and try again.\n  ({0})")]
     Network(String),
+    #[error(
+        "Can't verify the server's security certificate. This usually means your organization's root certificates aren't installed. Install them, then try again.\n  ({0})"
+    )]
+    CertificateUntrusted(String),
+    #[error(
+        "The server's security certificate is invalid (for example expired or issued for a different hostname), so it can't be trusted. Installing a root certificate won't fix this; contact the server administrator.\n  ({0})"
+    )]
+    CertificateInvalid(String),
     #[error(
         "The connection to the server was interrupted or timed out before completing. This is usually temporary; please try again.\n  ({0})"
     )]
@@ -78,7 +86,7 @@ impl ManagedConfigError {
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, serde::Serialize, Deserialize, Default)]
 pub(super) struct ManagedConfigResponse {
     #[serde(default)]
     pub(super) deployment_id: Option<String>,
@@ -160,11 +168,15 @@ impl ManagedConfigResponse {
 /// Result of applying a fetched managed-config response.
 pub(super) enum ApplyOutcome {
     /// Locked, persisted policy, recorded marker. `wrote` = ≥1 artifact written or removed.
-    Applied { wrote: bool },
+    Applied {
+        wrote: bool,
+    },
     /// Nothing persisted/marked: lock held by another process, or credential vanished mid-fetch.
     Skipped,
     /// Envelope failed verification — nothing persisted or marked.
     SignatureRejected,
+    Staged,
+    StaleStage,
 }
 
 impl ApplyOutcome {

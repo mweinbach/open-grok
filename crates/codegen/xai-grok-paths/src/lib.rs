@@ -115,6 +115,14 @@ impl AbsPathBuf {
         Self(self.0.join(path.as_ref()))
     }
 
+    pub fn into_string(self) -> String {
+        self.0.into_string()
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.0.is_dir()
+    }
+
     /// Check if `self` contains `path` (normalizing `.`/`..`).
     pub fn contains_path(&self, path: &AbsPathBuf) -> bool {
         normalize_lexically(path.as_path()).starts_with(self.as_path())
@@ -206,6 +214,18 @@ impl ToAbsPath for String {
 pub struct RelPathBuf(camino::Utf8PathBuf);
 
 impl RelPathBuf {
+    pub fn as_path(&self) -> &std::path::Path {
+        self.0.as_std_path()
+    }
+
+    pub fn to_path_buf(&self) -> PathBuf {
+        self.as_path().to_path_buf()
+    }
+
+    pub fn into_string(self) -> String {
+        self.0.into_string()
+    }
+
     /// Create from a string or PathBuf. Errors if absolute or not UTF-8.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, RelPathError> {
         let path = path.into();

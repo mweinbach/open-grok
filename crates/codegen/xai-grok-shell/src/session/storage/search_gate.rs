@@ -41,6 +41,7 @@ pub(crate) fn session_search_off_reason(source: ConfigSource) -> &'static str {
     match source {
         ConfigSource::Requirement => "a requirements.toml pin or an MDM policy",
         ConfigSource::Env => "the GROK_SESSION_SEARCH environment variable",
+        ConfigSource::EnvOverlay => "an environment overlay",
         ConfigSource::Remote => "a remote setting",
         ConfigSource::Config
         | ConfigSource::UserConfig

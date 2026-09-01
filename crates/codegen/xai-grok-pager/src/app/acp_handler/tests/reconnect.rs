@@ -432,6 +432,29 @@
     }
 
     #[test]
+    fn accepted_late_replay_requests_redraw_after_reload_finalizes() {
+        let mut app = make_app_with_agent("session-late-tail");
+        let agent_id = AgentId(0);
+        app.agents.get_mut(&agent_id).unwrap().begin_session_reload(1);
+        assert!(!handle(
+            replay_chunk("session-late-tail", "replayed prefix", "session-late-tail-1"),
+            &mut app,
+        ));
+        assert!(app.agents.get_mut(&agent_id).unwrap().finish_session_reload(1, true));
+        assert!(!app.agents[&agent_id].session.loading_replay);
+        let previous_len = app.agents[&agent_id].scrollback.len();
+
+        assert!(handle(
+            replay_chunk("session-late-tail", "accepted tail", "session-late-tail-2"),
+            &mut app,
+        ), "accepted replay after finalization must redraw the visible transcript");
+        let agent = &app.agents[&agent_id];
+        assert_eq!(agent.last_seen_event_id.as_deref(), Some("session-late-tail-2"));
+        assert_eq!(agent.scrollback.len(), previous_len + 1);
+        assert!(!agent.scrollback.in_batch());
+    }
+
+    #[test]
     fn full_replay_rebuilds_subagent_row_from_stashed_domain_state() {
         let mut app = make_app_with_agent("sess-subagent-reload");
         let id = AgentId(0);
@@ -454,10 +477,15 @@
             .unwrap(),
             "sess-subagent-reload-1",
         );
-        assert!(handle_ext_notification(&replay, &mut app));
+        assert!(
+            !handle_ext_notification(&replay, &mut app),
+            "subagent replay must not redraw a partially loaded transcript"
+        );
 
         let agent = app.agents.get_mut(&id).unwrap();
-        assert!(agent.finish_session_reload(1, true));
+        assert!(agent.finish_session_reload(1, true), "reload finalization reports the visible change");
+        assert!(!agent.session.loading_replay);
+        assert!(!agent.scrollback.in_batch());
         assert_eq!(agent.scrollback.len(), 1);
         let info = &agent.subagent_sessions["child-replay"];
         assert!(

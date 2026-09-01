@@ -688,6 +688,25 @@ pub struct DeferredModelSwitch {
     /// (`Effect::SwitchModel.prev_model_id`) if the switch fails.
     pub prev_model_id: Option<acp::ModelId>,
 }
+pub const PROMPT_HISTORY_CAP: usize = 200;
+#[derive(Debug, Clone)]
+pub struct BlockedPromptContext {
+    pub row_id: u64,
+    pub hook_name: Option<String>,
+    pub reason: Option<String>,
+    pub was_combined: bool,
+}
+pub fn remember_prompt(list: &mut Vec<String>, text: &str) {
+    let key = text.trim();
+    if key.is_empty() {
+        return;
+    }
+    if list.first().is_some_and(|p| p.trim() == key) {
+        return;
+    }
+    list.insert(0, text.to_owned());
+    list.truncate(PROMPT_HISTORY_CAP);
+}
 /// Per-agent business logic (ACP session, models, state).
 ///
 /// External code should use the facade methods (`handle_update`,
@@ -781,6 +800,8 @@ pub struct AgentSession {
     /// `SwitchModelComplete`, or by `begin_session_reload` when a reconnect
     /// drops the in-flight RPC — else a lost completion jams the queue forever.
     pub model_switch_pending: bool,
+    pub hook_block_hold: bool,
+    pub blocked_prompt: Option<BlockedPromptContext>,
     /// A provider settings/key change requires this session's sampler to be
     /// rebuilt before another queued prompt may start. Unlike the RPC-local
     /// `model_switch_pending`, this spans endpoint/key refresh work.
@@ -1183,6 +1204,8 @@ mod tests {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,

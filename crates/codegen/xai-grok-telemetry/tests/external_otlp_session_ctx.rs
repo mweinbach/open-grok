@@ -63,6 +63,8 @@ fn ambient_ctx_injects_session_turn_and_prompt_id() {
             completion_tokens: None,
             reasoning_tokens: None,
             cached_prompt_tokens: None,
+            cache_creation_tokens: None,
+            cost_usd_ticks: None,
         });
     }));
 

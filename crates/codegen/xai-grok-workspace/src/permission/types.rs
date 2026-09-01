@@ -104,6 +104,8 @@ pub struct PermissionEvent {
     /// requester gone mid-classify).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifier_verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_tool_approvals: Option<bool>,
 }
 /// A permission decision plus the authoritative manager [`PermissionEvent`] that
 /// produced it. The manager builds exactly one event per decision, sends one
@@ -191,8 +193,12 @@ impl ClientType {
             Self::Desktop => "desktop",
         }
     }
+    pub const fn can_present_permission_prompt(self) -> bool {
+        !matches!(self, Self::Generic)
+    }
 }
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum AccessKind {
     Read(Option<String>),
     Grep {
@@ -210,6 +216,9 @@ pub enum AccessKind {
     },
     WebFetch(String),
     WebSearch(String),
+    AgentMessage {
+        subagent_id: String,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -271,20 +280,64 @@ pub struct RequestPathContext {
     pub real_cwd: std::path::PathBuf,
     pub display_cwd: Option<std::path::PathBuf>,
 }
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookAsk {
+    pub hook_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+pub const HOOK_ASK_META_KEY: &str = "hookAsk";
+const HOOK_ASK_SEPARATOR: &str = " — ";
+impl HookAsk {
+    pub fn ask_line(&self) -> String {
+        let hook_name = &self.hook_name;
+        let reason = self.reason.as_deref().unwrap_or_default();
+        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        if reason.is_empty() {
+            format!("hook '{hook_name}' asks for confirmation")
+        } else {
+            format!("hook '{hook_name}' asks: {reason}")
+        }
+    }
+    pub fn prompt_header(&self, action: &str) -> String {
+        format!("{action}{HOOK_ASK_SEPARATOR}{}", self.ask_line())
+    }
+    pub fn strip_prompt_header<'a>(&self, title: &'a str) -> &'a str {
+        title
+            .strip_suffix(self.ask_line().as_str())
+            .and_then(|action| action.strip_suffix(HOOK_ASK_SEPARATOR))
+            .unwrap_or(title)
+    }
+}
+#[derive(Debug, Clone)]
+pub struct PermissionRequest {
+    pub access: AccessKind,
+    pub tool_call_update: acp::ToolCallUpdate,
+    pub path_context: Option<RequestPathContext>,
+    pub session_id: Option<String>,
+    pub subagent_type: Option<String>,
+    pub subagent_description: Option<String>,
+    pub hook_ask: Option<HookAsk>,
+}
+impl PermissionRequest {
+    pub fn new(access: AccessKind, tool_call_update: acp::ToolCallUpdate) -> Self {
+        Self {
+            access,
+            tool_call_update,
+            path_context: None,
+            session_id: None,
+            subagent_type: None,
+            subagent_description: None,
+            hook_ask: None,
+        }
+    }
+}
 #[allow(clippy::large_enum_variant)]
 pub enum PermissionCommand {
     Request {
-        access: AccessKind,
-        tool_call_update: acp::ToolCallUpdate,
-        path_context: Option<RequestPathContext>,
+        request: PermissionRequest,
         respond_to: oneshot::Sender<PermissionResolution>,
-        /// Session ID originating this request. Used to attribute
-        /// permission events to child subagents.
-        session_id: Option<String>,
-        /// Subagent type if this request is from a child (e.g. "explore").
-        subagent_type: Option<String>,
-        /// Subagent description if this request is from a child.
-        subagent_description: Option<String>,
     },
     /// Set the YOLO mode (auto-approve all permissions)
     SetYoloMode(bool),
@@ -326,6 +379,10 @@ impl From<&xai_grok_tools::types::ToolInput> for AccessKind {
             | ToolInput::WaitTasks(_)
             | ToolInput::KillTask(_)
             | ToolInput::Skill(_) => AccessKind::Read(None),
+            ToolInput::Task(t) => AccessKind::Edit(format!("task:{}", t.subagent_type)),
+            ToolInput::SendSubagentMessage(message) => AccessKind::AgentMessage {
+                subagent_id: message.subagent_id.clone(),
+            },
             ToolInput::WebSearch(ws) => AccessKind::WebSearch(ws.query.clone()),
             ToolInput::SearchReplace(search_replace) => {
                 AccessKind::Edit(search_replace.file_path.to_string())
@@ -344,11 +401,48 @@ impl From<&xai_grok_tools::types::ToolInput> for AccessKind {
                 input: u.tool_input.clone(),
             },
             ToolInput::WebFetch(wf) => AccessKind::WebFetch(wf.url.clone()),
-            ToolInput::Dynamic(_) => AccessKind::Read(None),
+            ToolInput::Dynamic(value) => access_kind_from_dynamic(value),
             #[allow(unreachable_patterns)]
             _ => AccessKind::Read(None),
         }
     }
+}
+fn dynamic_string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+}
+fn dynamic_has_field(value: &serde_json::Value, keys: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| keys.iter().any(|key| object.contains_key(*key)))
+}
+fn access_kind_from_dynamic(value: &serde_json::Value) -> AccessKind {
+    if let Some(path) = dynamic_string_field(value, &["filePath", "file_path", "path"]) {
+        let is_mutation = dynamic_has_field(
+            value,
+            &[
+                "oldString",
+                "old_string",
+                "newString",
+                "new_string",
+                "content",
+                "edits",
+                "replaceAll",
+                "replace_all",
+            ],
+        );
+        return if is_mutation {
+            AccessKind::Edit(path)
+        } else {
+            AccessKind::Read(Some(path))
+        };
+    }
+    if let Some(command) = dynamic_string_field(value, &["command"]) {
+        return AccessKind::Bash(command);
+    }
+    AccessKind::Read(None)
 }
 /// Permission policy configuration (duplicated from util/config.rs for Phase 1 move independence; identical).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -358,12 +452,15 @@ pub struct PermissionConfig {
     /// What to do when no rule or pre-decision resolves a tool call.
     #[serde(default)]
     pub prompt_policy: PromptPolicy,
+    #[serde(default)]
+    pub default_mode_configured: bool,
 }
 impl PermissionConfig {
     pub fn new(rules: Vec<PermissionRule>) -> Self {
         Self {
             rules,
             prompt_policy: PromptPolicy::Ask,
+            default_mode_configured: false,
         }
     }
 }
@@ -379,6 +476,7 @@ pub enum PromptPolicy {
     /// Use the auto-mode classifier (`permissions.defaultMode: "auto"`).
     /// Seeded into the permission manager's auto flag at session start.
     Auto,
+    Allow,
 }
 /// A single permission rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +507,7 @@ pub enum RuleAction {
 /// Tool filter for permission rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ToolFilter {
     #[default]
     Any,
@@ -419,6 +518,8 @@ pub enum ToolFilter {
     Mcp,
     WebFetch,
     WebSearch,
+    #[serde(rename = "agent_message", alias = "agentmessage")]
+    AgentMessage,
 }
 /// Where a requirement/permission was loaded from (duplicated for claude_compat).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,15 +530,12 @@ pub enum RequirementSource {
     Requirements {
         path: std::path::PathBuf,
     },
-    /// Root-owned system-dir `requirements.toml`. Distinguished at load time
-    /// (`RequirementsLayer::is_system`), never inferred from `path`.
     SystemRequirements {
         path: std::path::PathBuf,
     },
     ManagedSettings {
         path: std::path::PathBuf,
     },
-    /// Defaults tier; never an admin source.
     ManagedConfig {
         path: std::path::PathBuf,
     },
@@ -476,6 +574,44 @@ pub struct Sourced<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hook_ask_header_keeps_the_action_and_names_the_hook() {
+        let with_reason = HookAsk {
+            hook_name: "guard".to_owned(),
+            reason: Some("confirm this".to_owned()),
+        };
+        let header = with_reason.prompt_header("Run `deploy`");
+        assert_eq!(header, "Run `deploy` — hook 'guard' asks: confirm this");
+        assert_eq!(with_reason.strip_prompt_header(&header), "Run `deploy`");
+        let bare = HookAsk {
+            hook_name: "guard".to_owned(),
+            reason: None,
+        };
+        assert_eq!(
+            bare.prompt_header("Run `deploy`"),
+            "Run `deploy` — hook 'guard' asks for confirmation"
+        );
+        let blank = HookAsk {
+            hook_name: "guard".to_owned(),
+            reason: Some("  \n".to_owned()),
+        };
+        assert_eq!(blank.ask_line(), bare.ask_line());
+        let multiline = HookAsk {
+            hook_name: "guard".to_owned(),
+            reason: Some("confirm\nthis".to_owned()),
+        };
+        assert_eq!(multiline.ask_line(), with_reason.ask_line());
+    }
+    #[test]
+    fn agent_message_tool_filter_serde_is_dedicated_and_unknown_is_rejected() {
+        let filter: ToolFilter = serde_json::from_str(r#""agent_message""#).unwrap();
+        assert_eq!(filter, ToolFilter::AgentMessage);
+        assert_eq!(
+            serde_json::to_string(&filter).unwrap(),
+            r#""agent_message""#
+        );
+        assert!(serde_json::from_str::<ToolFilter>(r#""future_tool""#).is_err());
+    }
     #[test]
     fn permission_event_subagent_fields_default_to_none() {
         let json = r#"{
@@ -557,6 +693,7 @@ mod tests {
             queue_depth: Some(3),
             security_findings: Some(vec!["opaque_shell".into()]),
             classifier_verdict: Some("block".into()),
+            remember_tool_approvals: Some(true),
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["subagent_session_id"], "child-1");
@@ -572,6 +709,7 @@ mod tests {
         assert_eq!(json["queue_depth"], 3);
         assert_eq!(json["security_findings"][0], "opaque_shell");
         assert_eq!(json["classifier_verdict"], "block");
+        assert_eq!(json["remember_tool_approvals"], true);
     }
     #[test]
     fn permission_event_skips_none_optional_fields() {
@@ -600,6 +738,7 @@ mod tests {
             queue_depth: None,
             security_findings: None,
             classifier_verdict: None,
+            remember_tool_approvals: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("subagent_session_id"));
@@ -614,6 +753,7 @@ mod tests {
         assert!(!json.contains("queue_depth"));
         assert!(!json.contains("security_findings"));
         assert!(!json.contains("classifier_verdict"));
+        assert!(!json.contains("remember_tool_approvals"));
     }
     #[test]
     fn hashline_edit_maps_to_edit_access() {
@@ -644,6 +784,21 @@ mod tests {
             matches!(access, AccessKind::Bash(ref cmd) if cmd == "cargo test"),
             "Bash should produce AccessKind::Bash with the command, got {access:?}"
         );
+    }
+    #[test]
+    fn active_agent_message_maps_to_dedicated_access_without_text() {
+        use xai_grok_tools::implementations::grok_build::send_subagent_message::SendSubagentMessageInput;
+        use xai_grok_tools::types::ToolInput;
+        let text = "private follow-up";
+        let access = AccessKind::from(&ToolInput::SendSubagentMessage(SendSubagentMessageInput {
+            subagent_id: "sub-1".into(),
+            text: text.into(),
+        }));
+        let AccessKind::AgentMessage { subagent_id } = access else {
+            panic!("active agent messages must use dedicated access")
+        };
+        assert_eq!(subagent_id, "sub-1");
+        assert!(!subagent_id.contains(text));
     }
     #[test]
     fn use_tool_maps_to_mcp_tool_access() {
@@ -748,6 +903,66 @@ mod tests {
             matches!(access, AccessKind::Edit(ref p) if p == "/tmp/secret.txt"),
             "Write should produce AccessKind::Edit with the file path, got {access:?}"
         );
+    }
+    #[test]
+    fn write_scoped_and_dynamic_inputs_map_to_edit_not_read() {
+        use xai_grok_tools::implementations::opencode::edit::EditInput;
+        use xai_grok_tools::types::ToolInput;
+        use xai_tool_types::TaskToolInput;
+        let edit = ToolInput::from(EditInput {
+            file_path: "/tmp/denied.txt".into(),
+            old_string: "ORIGINAL".into(),
+            new_string: "BYPASS".into(),
+            replace_all: false,
+        });
+        assert!(matches!(
+            &edit,
+            ToolInput::Dynamic(arguments)
+                if arguments["filePath"] == "/tmp/denied.txt"
+                    && arguments["oldString"] == "ORIGINAL"
+                    && arguments["newString"] == "BYPASS"
+        ));
+        assert!(matches!(
+            AccessKind::from(&edit),
+            AccessKind::Edit(p) if p == "/tmp/denied.txt"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Task(TaskToolInput {
+                prompt: "edit config.toml".into(),
+                description: "spawn".into(),
+                subagent_type: "general-purpose".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+                context: None,
+                reasoning_effort: None,
+            })),
+            AccessKind::Edit(p) if p == "task:general-purpose"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                "filePath": "/tmp/denied.txt",
+                "oldString": "a",
+                "newString": "b",
+            }))),
+            AccessKind::Edit(p) if p == "/tmp/denied.txt"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                "filePath": "src/main.rs"
+            }))),
+            AccessKind::Read(Some(p)) if p == "src/main.rs"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                "command": "rm -rf /"
+            }))),
+            AccessKind::Bash(c) if c == "rm -rf /"
+        ));
     }
     #[test]
     fn client_type_deserializes_grok_shell_as_generic() {

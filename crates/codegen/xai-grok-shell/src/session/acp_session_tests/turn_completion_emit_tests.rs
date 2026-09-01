@@ -24,7 +24,9 @@ fn drain_persistence(rx: &mut mpsc::UnboundedReceiver<PersistenceMsg>) -> Vec<Pe
 fn is_turn_completed(m: &PersistenceMsg) -> bool {
     matches!(
         m,
-        PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(n))
+        PersistenceMsg::AppendUpdateDurablyAndAck {
+            update: crate::session::storage::SessionUpdate::Xai(n), ..
+        }
             if matches!(n.update, XaiSessionUpdate::TurnCompleted { .. })
     )
 }
@@ -41,7 +43,10 @@ fn is_agent_message_delta(m: &PersistenceMsg) -> bool {
 /// `TurnCompleted`, if any.
 fn turn_completed_fields(msgs: &[PersistenceMsg]) -> Option<(String, String, Option<String>)> {
     msgs.iter().find_map(|m| match m {
-        PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(n)) => match &n.update {
+        PersistenceMsg::AppendUpdateDurablyAndAck {
+            update: crate::session::storage::SessionUpdate::Xai(n),
+            ..
+        } => match &n.update {
             XaiSessionUpdate::TurnCompleted {
                 prompt_id,
                 stop_reason,
@@ -77,6 +82,8 @@ pub(super) fn pending_input(prompt_id: &str) -> (InputItem, oneshot::Receiver<Pr
         parsed_prompt_tx: None,
         queue_meta: None,
         send_now: false,
+        initial_child_prompt_ready: None,
+        traceparent: None,
     };
     (item, rx)
 }
@@ -92,8 +99,9 @@ async fn normal_completion_persists_turn_completed_after_buffered_delta_flush() 
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _gateway_rx) =
+            let (gateway_tx, gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            spawn_gateway_loop(gateway_rx);
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             // Buffering enabled with a long window so a streamed delta is HELD
             // in the replay buffer until an explicit flush — the exact state the
@@ -114,6 +122,7 @@ async fn normal_completion_persists_turn_completed_after_buffered_delta_flush() 
             let (item, _rx) = pending_input("p1");
             {
                 let mut state = actor.state.lock().await;
+                state.running_task = Some(running_task_stub("p1"));
                 state.pending_inputs.push_back(item);
             }
 
@@ -146,9 +155,12 @@ async fn normal_completion_persists_turn_completed_after_buffered_delta_flush() 
                 actor.emit_buffered(notification).await;
             }
 
+            let (epoch, task_identity) = completion_binding(&actor, "p1").await;
             actor
                 .handle_completion(
                     "p1".to_string(),
+                    epoch,
+                    &task_identity,
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::EndTurn,
                         total_tokens: 0,
@@ -158,6 +170,7 @@ async fn normal_completion_persists_turn_completed_after_buffered_delta_flush() 
                         usage: None,
                         tool_overrides: None,
                     }),
+                    None,
                 )
                 .await;
 
@@ -200,8 +213,9 @@ async fn error_completion_persists_turn_completed_with_error_detail() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _gateway_rx) =
+            let (gateway_tx, gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            spawn_gateway_loop(gateway_rx);
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
@@ -212,13 +226,18 @@ async fn error_completion_persists_turn_completed_with_error_detail() {
             let (item, _rx) = pending_input("p-err");
             {
                 let mut state = actor.state.lock().await;
+                state.running_task = Some(running_task_stub("p-err"));
                 state.pending_inputs.push_back(item);
             }
 
+            let (epoch, task_identity) = completion_binding(&actor, "p-err").await;
             actor
                 .handle_completion(
                     "p-err".to_string(),
+                    epoch,
+                    &task_identity,
                     Err(acp::Error::internal_error().data("boom")),
+                    None,
                 )
                 .await;
 
@@ -237,8 +256,9 @@ async fn cancellation_persists_turn_completed_cancelled() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _gateway_rx) =
+            let (gateway_tx, gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            spawn_gateway_loop(gateway_rx);
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
@@ -250,13 +270,14 @@ async fn cancellation_persists_turn_completed_cancelled() {
             let (item, _rx) = pending_input("running");
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
                 state.pending_inputs.push_back(item);
             }
 
@@ -291,11 +312,10 @@ async fn cancellation_persists_turn_completed_cancelled() {
 /// Pull the first persisted `TurnCompleted`'s notification `_meta`, if any.
 fn turn_completed_meta(msgs: &[PersistenceMsg]) -> Option<serde_json::Value> {
     msgs.iter().find_map(|m| match m {
-        PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(n))
-            if matches!(n.update, XaiSessionUpdate::TurnCompleted { .. }) =>
-        {
-            n.meta.clone()
-        }
+        PersistenceMsg::AppendUpdateDurablyAndAck {
+            update: crate::session::storage::SessionUpdate::Xai(n),
+            ..
+        } if matches!(n.update, XaiSessionUpdate::TurnCompleted { .. }) => n.meta.clone(),
         _ => None,
     })
 }
@@ -311,8 +331,9 @@ async fn send_now_cancel_in_completion_race_window_still_persists_turn_completed
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _gateway_rx) =
+            let (gateway_tx, gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            spawn_gateway_loop(gateway_rx);
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
@@ -324,13 +345,14 @@ async fn send_now_cancel_in_completion_race_window_still_persists_turn_completed
             let (item, _rpc_rx) = pending_input("running");
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
                 state.pending_inputs.push_back(item);
             }
 
@@ -360,6 +382,19 @@ async fn send_now_cancel_stamps_cancel_trigger_on_turn_end() {
         .run_until(async {
             let (gateway_tx, mut gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+            tokio::task::spawn_local(async move {
+                while let Some(message) = gateway_rx.recv().await {
+                    match message {
+                        xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                        message => {
+                            let _ = captured_tx.send(message);
+                        }
+                    }
+                }
+            });
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
@@ -370,13 +405,14 @@ async fn send_now_cancel_stamps_cancel_trigger_on_turn_end() {
             let (item, rpc_rx) = pending_input("running");
             {
                 let mut state = actor.state.lock().await;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "running".into(),
-                    handle: tokio::task::spawn_local(async {
+                state.running_task = Some(AgentTask::new_at_epoch(
+                    "running",
+                    actor.turn_report.epoch(),
+                    tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
-                });
+                ));
                 state.pending_inputs.push_back(item);
             }
 
@@ -396,18 +432,21 @@ async fn send_now_cancel_stamps_cancel_trigger_on_turn_end() {
                 "the terminal `_meta` must carry cancelTrigger=send_now"
             );
 
-            let mut wire_meta = None;
-            while let Ok(msg) = gateway_rx.try_recv() {
-                if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg
-                    && args.request.method.as_ref() == "x.ai/session_notification"
-                    && let Ok(v) =
-                        serde_json::from_str::<serde_json::Value>(args.request.params.get())
-                    && v["update"]["sessionUpdate"] == "turn_completed"
-                {
-                    wire_meta = Some(v["_meta"].clone());
+            let wire_meta = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Some(message) = captured_rx.recv().await {
+                    if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = message
+                        && args.request.method.as_ref() == "x.ai/session_notification"
+                        && let Ok(notification) =
+                            serde_json::from_str::<serde_json::Value>(args.request.params.get())
+                        && notification["update"]["sessionUpdate"] == "turn_completed"
+                    {
+                        return notification["_meta"].clone();
+                    }
                 }
-            }
-            let wire_meta = wire_meta.expect("the TurnCompleted terminal must reach the wire");
+                panic!("gateway closed before the TurnCompleted terminal");
+            })
+            .await
+            .expect("the TurnCompleted terminal must reach the wire");
             assert_eq!(
                 wire_meta["cancelTrigger"], "send_now",
                 "wire `_meta.cancelTrigger` must be send_now"
@@ -437,8 +476,9 @@ async fn no_output_rewind_cancel_emits_no_turn_completed() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _gateway_rx) =
+            let (gateway_tx, gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            spawn_gateway_loop(gateway_rx);
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
@@ -451,13 +491,10 @@ async fn no_output_rewind_cancel_emits_no_turn_completed() {
             {
                 let mut state = actor.state.lock().await;
                 state.rewindable = true;
-                state.running_task = Some(AgentTask {
-                    prompt_id: "rw".into(),
-                    handle: tokio::task::spawn_local(async {
+                state.running_task = Some(AgentTask::new_at_epoch("rw", actor.turn_report.epoch(), tokio::task::spawn_local(async {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
-                    .abort_handle(),
-                });
+                    .abort_handle()));
                 state.pending_inputs.push_back(item);
             }
 
@@ -465,7 +502,7 @@ async fn no_output_rewind_cancel_emits_no_turn_completed() {
             // path: the turn is treated as UNSENT, so — in lock-step with the
             // legacy emit_turn_ended — NO durable terminal is emitted (else
             // replay would finalize a turn that was rewound, not completed).
-            let _ = actor.cancel_running_task(crate::session::CancelOptions { rewind_if_no_output: true, user_initiated: true, ..Default::default() }).await;
+            let _ = actor.cancel_running_task(crate::session::CancelOptions { history: crate::session::commands::CancelHistoryDisposition::RewindIfNoOutput { prompt_id: Some("rw".to_string()) }, user_initiated: true, ..Default::default() }).await;
 
             let msgs = drain_persistence(&mut persistence_rx);
             assert!(
@@ -481,16 +518,13 @@ async fn removed_from_queue_completion_emits_no_turn_completed() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _gateway_rx) =
+            let (gateway_tx, gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            spawn_gateway_loop(gateway_rx);
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
-            *actor
-                .current_prompt_id
-                .lock()
-                .expect("current_prompt_id mutex poisoned") = Some("p-removed".to_string());
-            let (item, _rx) = pending_input("p-removed");
+            let (item, response_rx) = user_item_with_rx("p-removed", "owner");
             {
                 let mut state = actor.state.lock().await;
                 state.pending_inputs.push_back(item);
@@ -498,20 +532,15 @@ async fn removed_from_queue_completion_emits_no_turn_completed() {
 
             // A removed queued prompt never started a turn — it must emit no
             // durable terminal even though it resolves with `Cancelled`.
-            actor
-                .handle_completion(
-                    "p-removed".to_string(),
-                    Ok(PromptTurnOk {
-                        stop_reason: acp::StopReason::Cancelled,
-                        total_tokens: 0,
-                        turn_snapshot: None,
-                        completion_kind: PromptCompletionKind::RemovedFromQueue,
-                        structured_output: None,
-                        usage: None,
-                        tool_overrides: None,
-                    }),
-                )
-                .await;
+            assert!(
+                actor
+                    .handle_remove_queued_prompt("p-removed", 0, None)
+                    .await
+            );
+            assert!(matches!(
+                response_rx.await.unwrap().unwrap().completion_kind,
+                PromptCompletionKind::RemovedFromQueue
+            ));
 
             let msgs = drain_persistence(&mut persistence_rx);
             assert!(
@@ -527,8 +556,9 @@ async fn unknown_prompt_completion_emits_no_turn_completed() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _gateway_rx) =
+            let (gateway_tx, gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            spawn_gateway_loop(gateway_rx);
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
@@ -537,14 +567,27 @@ async fn unknown_prompt_completion_emits_no_turn_completed() {
             // stale `(prompt, EndTurn)` completion now lands on the unknown-prompt
             // branch of handle_completion. It must NOT emit a second terminal —
             // the Cancel path already emitted TurnCompleted{cancelled} for it.
-            *actor
-                .current_prompt_id
-                .lock()
-                .expect("current_prompt_id mutex poisoned") = None;
+            let (item, response_rx) = pending_input("already-finalized");
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(item);
+                state.running_task = Some(running_task_stub("already-finalized"));
+            }
+            let (epoch, task_identity) = completion_binding(&actor, "already-finalized").await;
+            actor
+                .cancel_running_task(crate::session::CancelOptions::default())
+                .await;
+            assert_eq!(
+                response_rx.await.unwrap().unwrap().stop_reason,
+                acp::StopReason::Cancelled
+            );
+            assert!(turn_completed_fields(&drain_persistence(&mut persistence_rx)).is_some());
 
             actor
                 .handle_completion(
                     "already-finalized".to_string(),
+                    epoch,
+                    &task_identity,
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::EndTurn,
                         total_tokens: 0,
@@ -554,6 +597,7 @@ async fn unknown_prompt_completion_emits_no_turn_completed() {
                         usage: None,
                         tool_overrides: None,
                     }),
+                    None,
                 )
                 .await;
 

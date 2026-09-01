@@ -19,13 +19,18 @@ pub struct WorkingDirectoryChange {
     pub directories: Vec<PathBuf>,
 }
 /// Structured context for a cancelled turn, replacing stringly-typed JSON.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CancellationContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hook_name: Option<String>,
     /// What triggered the cancel (e.g. `"send_now"`, `"esc"`, `"mouse"`);
     /// surfaced as `cancelTrigger` on the turn-end `_meta`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
 }
 /// Failure surface of a `/btw` side question. Kept typed until the ACP
@@ -68,6 +73,45 @@ pub enum PromptCompletionKind {
     /// `MvpAgent::prompt`'s short-circuit and `respond_removed_prompt`.
     RemovedFromQueue,
 }
+pub const HOOK_DENIED_CATEGORY: &str = "HookDenied";
+pub const MAX_TURNS_REACHED_CATEGORY: &str = "max_turns_reached";
+pub const ACTION_STATIONARITY_CATEGORY: &str = "action_stationarity";
+
+pub fn meta_category_str(
+    category: xai_grok_session_events::types::CancellationCategory,
+) -> &'static str {
+    use xai_grok_session_events::types::CancellationCategory;
+    match category {
+        CancellationCategory::HookDenied => HOOK_DENIED_CATEGORY,
+        CancellationCategory::PermissionRejected => "PermissionRejected",
+        CancellationCategory::PermissionCancelled => "PermissionCancelled",
+        CancellationCategory::MidTurnAbort => "MidTurnAbort",
+    }
+}
+
+impl PromptCompletionKind {
+    pub fn cancellation_category_meta(&self) -> Option<String> {
+        match self {
+            Self::Cancelled { category, .. } => {
+                category.map(|category| meta_category_str(category).to_owned())
+            }
+            Self::MaxTurnsReached { .. } => Some(MAX_TURNS_REACHED_CATEGORY.to_owned()),
+            Self::StationarityEnded => Some(ACTION_STATIONARITY_CATEGORY.to_owned()),
+            Self::Completed | Self::Rewound | Self::RemovedFromQueue => None,
+        }
+    }
+
+    pub fn cancellation_context_meta(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Cancelled {
+                context: Some(context),
+                ..
+            } => serde_json::to_value(context).ok(),
+            _ => None,
+        }
+    }
+}
+
 /// Successful prompt/turn payload returned to the ACP layer and trace uploaders.
 #[derive(Debug, Clone)]
 pub struct PromptTurnOk {
@@ -248,16 +292,39 @@ impl CancelTrigger {
         }
     }
 }
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CancelHistoryDisposition {
+    #[default]
+    Keep,
+    RewindIfNoOutput {
+        prompt_id: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CancelOptions {
     pub cancel_subagents: bool,
     pub kill_background_tasks: bool,
-    pub rewind_if_no_output: bool,
+    pub history: CancelHistoryDisposition,
     pub trigger: Option<CancelTrigger>,
     /// Drives the cancel-rate metric, and marks an untriggered cancel as the user's.
     pub user_initiated: bool,
 }
 pub enum SessionCommand {
+    #[expect(
+        private_interfaces,
+        reason = "active-message receipts and telemetry are internal runtime channels"
+    )]
+    ParentAgentMessage {
+        delivery:
+            xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageDelivery,
+        receipt_sink: tokio::sync::mpsc::Sender<crate::agent::subagent::PromptTurnReceipt>,
+        telemetry: crate::session::telemetry::ActiveAgentMessageParentTelemetry,
+        respond_to: oneshot::Sender<
+            xai_grok_tools::implementations::grok_build::task::coordinator::ActiveMessageAdmission,
+        >,
+    },
+    EmitStatusSnapshot,
     Initialize {
         system_prompt: String,
     },
@@ -273,6 +340,9 @@ pub enum SessionCommand {
     /// reverse-request so the client re-shows approval chrome over a real live
     /// waiter. Fire-and-forget; the actor spawns the round-trip + decision.
     RestorePlanApproval,
+    TitleRenamed {
+        manual: bool,
+    },
     GetToolOverrides {
         respond_to: oneshot::Sender<Option<xai_grok_sampling_types::ToolOverrides>>,
     },
@@ -319,6 +389,7 @@ pub enum SessionCommand {
         /// caller so it can use the fully-rendered prompt for metadata.json without
         /// re-parsing. The session sends on this channel right after parsing.
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
+        initial_child_prompt_ready: Option<oneshot::Sender<()>>,
     },
     SessionMode {
         session_mode: acp::SessionModeId,

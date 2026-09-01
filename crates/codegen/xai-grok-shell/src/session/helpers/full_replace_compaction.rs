@@ -38,6 +38,7 @@ use xai_chat_state::compaction_utils::{
 };
 
 use crate::sampling::Client as OaiCompatClient;
+use crate::sampling::error::acp_error_message;
 use crate::session::helpers::session_compact::{
     CompactFailure, CompactOutput, build_compaction_chat_history, generate_session_compact,
 };
@@ -164,34 +165,70 @@ impl CompactionSampler for ShellCompactionSampler {
 /// [`CompactionSampleError`] so the shared retry loop classifies it the same
 /// way the in-shell loop did:
 ///
+/// - `Overflow` → [`CompactionSampleError::ContextOverflow`], preserving the
+///   typed input-ladder signal independently of upstream message wording.
 /// - `Deterministic` → [`CompactionSampleError::Build`] (whose
-///   `is_deterministic()` is `true`); a context-length overflow keeps its
-///   message text so the engine's `is_context_length_error` check fires and
-///   sets `context_overflow`.
+///   `is_deterministic()` is `true`).
 /// - `Transient` → [`CompactionSampleError::Other`] (`is_deterministic()` is
 ///   `false`), so the engine retries it.
 fn compact_failure_to_sample_error(failure: CompactFailure) -> CompactionSampleError {
-    let (deterministic, err) = match failure {
-        CompactFailure::Deterministic(err) => (true, err),
-        CompactFailure::Transient(err) => (false, err),
-        CompactFailure::Cancelled => (true, CompactFailure::cancelled_error()),
-    };
-    let message = acp_error_message(&err);
-    if deterministic {
-        CompactionSampleError::Build(message)
-    } else {
-        CompactionSampleError::Other(anyhow::anyhow!(message))
+    match failure {
+        CompactFailure::Overflow(error) => {
+            CompactionSampleError::ContextOverflow(acp_error_message(&error))
+        }
+        CompactFailure::Deterministic(error) => {
+            CompactionSampleError::Build(acp_error_message(&error))
+        }
+        CompactFailure::Transient(error) => {
+            CompactionSampleError::Other(anyhow::anyhow!(acp_error_message(&error)))
+        }
+        CompactFailure::Cancelled => {
+            CompactionSampleError::Build(acp_error_message(&CompactFailure::cancelled_error()))
+        }
     }
 }
 
-/// Render the human-readable detail an `acp::Error` carries in its `data`
-/// field (where `classify_*` stash `"compact failed: <upstream>"`).
-fn acp_error_message(err: &acp::Error) -> String {
-    err.data
-        .as_ref()
-        .and_then(|d| d.as_str())
-        .unwrap_or("<no data>")
-        .to_string()
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_classification_does_not_depend_on_message_text() {
+        let mapped = compact_failure_to_sample_error(CompactFailure::Overflow(
+            acp::Error::internal_error().data("generic upstream rejection"),
+        ));
+        assert!(mapped.is_context_overflow());
+        assert!(mapped.is_deterministic());
+        assert_eq!(mapped.to_string(), "generic upstream rejection");
+    }
+
+    #[test]
+    fn cancellation_keeps_typed_payload_message_without_overflow() {
+        let mapped = compact_failure_to_sample_error(CompactFailure::Cancelled);
+        assert!(mapped.is_deterministic());
+        assert!(!mapped.is_context_overflow());
+        assert!(
+            matches!(mapped, CompactionSampleError::Build(message) if message == "compact cancelled")
+        );
+    }
+
+    #[test]
+    fn deterministic_and_transient_failures_keep_their_distinction() {
+        let mapped = compact_failure_to_sample_error(CompactFailure::Deterministic(
+            acp::Error::internal_error().data(serde_json::json!({"message": "invalid schema"})),
+        ));
+        assert!(mapped.is_deterministic());
+        assert!(!mapped.is_context_overflow());
+        assert!(
+            matches!(mapped, CompactionSampleError::Build(message) if message == "invalid schema")
+        );
+        let mapped = compact_failure_to_sample_error(CompactFailure::Transient(
+            acp::Error::internal_error(),
+        ));
+        assert!(!mapped.is_deterministic());
+        assert!(!mapped.is_context_overflow());
+        assert_eq!(mapped.to_string(), "Internal error");
+    }
 }
 
 /// Collected telemetry from a full-replace pass, drained by the L5 loop after

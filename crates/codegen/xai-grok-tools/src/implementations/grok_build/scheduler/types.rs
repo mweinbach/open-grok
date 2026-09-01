@@ -263,7 +263,7 @@ impl ScheduledTask {
             now
         };
         Self {
-            id: uuid::Uuid::now_v7().to_string().replace('-', "")[..12].to_string(),
+            id: uuid::Uuid::now_v7().to_string(),
             interval_secs,
             prompt,
             recurring,
@@ -302,6 +302,13 @@ impl ScheduledTask {
     /// Whether this task has expired (recurring tasks only).
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         self.expires_at.is_some_and(|exp| now >= exp)
+    }
+
+    pub fn pending_fire_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if self.is_expired(now) || (!self.recurring && self.last_fired_at.is_some()) {
+            return None;
+        }
+        Some(self.next_fire_at())
     }
 }
 
@@ -417,9 +424,29 @@ mod tests {
     }
 
     #[test]
-    fn task_id_is_12_chars() {
-        let task = ScheduledTask::new(300, "test".into(), true, false);
-        assert_eq!(task.id.len(), 12);
+    fn task_ids_are_full_unique_uuid_v7_values() {
+        let first = ScheduledTask::new(300, "first".into(), true, false);
+        let second = ScheduledTask::new(300, "second".into(), true, false);
+
+        assert_ne!(first.id, second.id);
+        for id in [&first.id, &second.id] {
+            let parsed = uuid::Uuid::parse_str(id).unwrap();
+            assert_eq!(parsed.get_version_num(), 7);
+            assert_eq!(parsed.to_string(), *id);
+        }
+    }
+
+    #[test]
+    fn pending_fire_excludes_expired_and_finished_one_shots() {
+        let now = Utc::now();
+        let mut task = ScheduledTask::new(60, "test".into(), false, false);
+        assert!(task.pending_fire_at(now).is_some());
+        task.last_fired_at = Some(now);
+        assert!(task.pending_fire_at(now).is_none());
+        task.recurring = true;
+        assert!(task.pending_fire_at(now).is_some());
+        task.expires_at = Some(now);
+        assert!(task.pending_fire_at(now).is_none());
     }
 
     #[test]

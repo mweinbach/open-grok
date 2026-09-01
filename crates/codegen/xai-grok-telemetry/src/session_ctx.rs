@@ -95,6 +95,24 @@ pub async fn with_session_ctx<F: std::future::Future>(ctx: TelemetryCtx, fut: F)
 /// event-name prefix so shell and workspace events are distinguishable on the
 /// wire while sharing this emitter (and the `event_value` derivation in
 /// [`crate::client`]).
+fn clone_current() -> Option<TelemetryCtx> {
+    TELEMETRY_CTX.try_with(|context| (**context).clone()).ok()
+}
+
+pub fn spawn_local_in_session_ctx<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + 'static,
+    F::Output: 'static,
+{
+    let ctx = clone_current();
+    tokio::task::spawn_local(async move {
+        match ctx {
+            Some(ctx) => with_session_ctx(ctx, fut).await,
+            None => fut.await,
+        }
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumCount)]
 pub enum EmitterOrigin {
     /// `xai-grok-shell` (and the pager/TUI that emit through it).
@@ -155,6 +173,14 @@ pub fn log_event<T: TelemetryEvent>(data: T) {
 /// [`crate::external::emit`] directly otherwise keeps `session.count` /
 /// `turn.count` exactly-once on every path while never sending an internal
 /// record under ZDR.
+pub async fn log_event_now<T: TelemetryEvent>(data: T) {
+    crate::external::emit(&data);
+    if !client::is_enabled() {
+        return;
+    }
+    emit_event_now(T::NAME, data).await;
+}
+
 pub fn log_event_dual<T: TelemetryEvent>(internal_enabled: bool, data: T) {
     if internal_enabled {
         log_event(data);
@@ -202,10 +228,24 @@ pub fn emit_event<T: Serialize + Send + 'static>(event_suffix: impl Into<String>
 /// Posts spawned by [`emit_event_with_origin`] that haven't finished. Emission
 /// is fire-and-forget so it never blocks a turn, which also means a process
 /// exiting right after emitting drops the event — see [`drain_pending`].
+pub async fn emit_event_now<T: Serialize + Send + 'static>(
+    event_suffix: impl Into<String>,
+    data: T,
+) {
+    emit_event_with_origin_now(EmitterOrigin::Shell, event_suffix, data).await;
+}
+
 static PENDING_EVENTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Decrement on every exit path, including a panicking or cancelled post.
 struct PendingEventGuard;
+
+impl PendingEventGuard {
+    fn register() -> Self {
+        PENDING_EVENTS.fetch_add(1, Ordering::Release);
+        Self
+    }
+}
 
 impl Drop for PendingEventGuard {
     fn drop(&mut self) {
@@ -220,6 +260,26 @@ pub const CLI_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 /// Wait (up to `timeout`) for in-flight event posts to finish. For commands
 /// that exit as soon as their work is done; the agent runs long enough that
 /// its events land on their own.
+const SESSION_EXIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub(crate) fn drains_at_session_exit(entrypoint: Option<crate::process_info::Entrypoint>) -> bool {
+    use crate::process_info::Entrypoint;
+    matches!(
+        entrypoint,
+        None | Some(Entrypoint::Headless | Entrypoint::Cli)
+    )
+}
+
+pub async fn drain_at_session_exit() {
+    if drains_at_session_exit(crate::process_info::entrypoint()) {
+        drain_pending(SESSION_EXIT_DRAIN).await;
+    }
+}
+
+pub async fn drain_at_process_exit() {
+    drain_pending(SESSION_EXIT_DRAIN).await;
+}
+
 pub async fn drain_pending(timeout: std::time::Duration) {
     let deadline = std::time::Instant::now() + timeout;
     while PENDING_EVENTS.load(Ordering::Acquire) > 0 {
@@ -235,11 +295,13 @@ pub async fn drain_pending(timeout: std::time::Duration) {
 }
 
 /// Emit an event whose analytics name is `{origin prefix}{event_suffix}`.
-pub fn emit_event_with_origin<T: Serialize + Send + 'static>(
+type CtxSnapshot = Option<(String, Option<u32>)>;
+
+fn take_emit_context<T>(
     origin: EmitterOrigin,
     event_suffix: impl Into<String>,
     data: T,
-) {
+) -> (String, CtxSnapshot, crate::activity::ActivitySnapshot, T) {
     let event_name = format!("{}{}", origin.event_prefix(), event_suffix.into());
     let ctx_snapshot = TELEMETRY_CTX
         .try_with(|c| {
@@ -249,6 +311,51 @@ pub fn emit_event_with_origin<T: Serialize + Send + 'static>(
             )
         })
         .ok();
+    let activity = crate::activity::ActivitySnapshot::read();
+    (event_name, ctx_snapshot, activity, data)
+}
+
+async fn post_event<T: Serialize>(
+    event_name: String,
+    ctx_snapshot: CtxSnapshot,
+    activity: crate::activity::ActivitySnapshot,
+    data: T,
+) {
+    let user_ctx = UserContext::collect();
+    let request_id = format!("{}-{}", event_name, uuid::Uuid::new_v4());
+
+    let mut metadata = match serde_json::to_value(data) {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(other) => {
+            let mut metadata = Metadata::new();
+            metadata.insert("value".into(), other);
+            metadata
+        }
+        Err(_) => Metadata::new(),
+    };
+
+    if let Some((session_id, turn_number)) = ctx_snapshot {
+        metadata.insert("session_id".into(), json!(session_id));
+        if let Some(turn) = turn_number {
+            metadata.insert("turn_number".into(), json!(turn));
+        }
+    }
+
+    if let Ok(serde_json::Value::Object(gauges)) = serde_json::to_value(activity) {
+        for (key, value) in gauges {
+            metadata.entry(key).or_insert(value);
+        }
+    }
+
+    client::track(&event_name, &request_id, &user_ctx, metadata).await;
+}
+
+pub fn emit_event_with_origin<T: Serialize + Send + 'static>(
+    origin: EmitterOrigin,
+    event_suffix: impl Into<String>,
+    data: T,
+) {
+    let (event_name, ctx_snapshot, activity, data) = take_emit_context(origin, event_suffix, data);
 
     if tokio::runtime::Handle::try_current().is_err() {
         // `spawn` below panics without a runtime; counting first would pin the
@@ -256,35 +363,44 @@ pub fn emit_event_with_origin<T: Serialize + Send + 'static>(
         tracing::debug!(event = %event_name, "telemetry: no runtime, dropping event");
         return;
     }
-    PENDING_EVENTS.fetch_add(1, Ordering::Release);
+    let pending = PendingEventGuard::register();
     tokio::spawn(async move {
-        let _pending = PendingEventGuard;
-        let user_ctx = UserContext::collect();
-        let request_id = format!("{}-{}", event_name, uuid::Uuid::new_v4());
-
-        let mut metadata = match serde_json::to_value(data) {
-            Ok(serde_json::Value::Object(map)) => map,
-            Ok(other) => {
-                let mut m = Metadata::new();
-                m.insert("value".into(), other);
-                m
-            }
-            Err(_) => Metadata::new(),
-        };
-
-        if let Some((session_id, turn_number)) = ctx_snapshot {
-            metadata.insert("session_id".into(), json!(session_id));
-            if let Some(turn) = turn_number {
-                metadata.insert("turn_number".into(), json!(turn));
-            }
-        }
-
-        client::track(&event_name, &request_id, &user_ctx, metadata).await;
+        let _pending = pending;
+        post_event(event_name, ctx_snapshot, activity, data).await;
     });
+}
+
+pub async fn emit_event_with_origin_now<T: Serialize + Send + 'static>(
+    origin: EmitterOrigin,
+    event_suffix: impl Into<String>,
+    data: T,
+) {
+    let (event_name, ctx_snapshot, activity, data) = take_emit_context(origin, event_suffix, data);
+    post_event(event_name, ctx_snapshot, activity, data).await;
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_one_shot_flows_drain_at_session_exit() {
+        use crate::process_info::Entrypoint;
+        use crate::session_ctx::drains_at_session_exit;
+        assert!(drains_at_session_exit(None), "undeclared stays fail-open");
+        assert!(drains_at_session_exit(Some(Entrypoint::Headless)));
+        assert!(drains_at_session_exit(Some(Entrypoint::Cli)));
+        for outlives in [
+            Entrypoint::Embedded,
+            Entrypoint::Pager,
+            Entrypoint::Leader,
+            Entrypoint::Workspace,
+        ] {
+            assert!(
+                !drains_at_session_exit(Some(outlives)),
+                "{outlives:?} outlives its sessions and must not block teardown"
+            );
+        }
+    }
+
     use super::*;
 
     /// The debug-log firehose router (`debug_log`) finds the session span by its
@@ -308,11 +424,31 @@ mod tests {
         });
     }
 
+    static EMIT_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn awaited_emit_finishes_without_session_exit_drain() {
+        let _guard = EMIT_TEST_GUARD.lock().await;
+        let before = PENDING_EVENTS.load(Ordering::Acquire);
+        emit_event_with_origin_now(
+            EmitterOrigin::Shell,
+            "session_end_timings",
+            json!({ "probe": true }),
+        )
+        .await;
+        assert_eq!(
+            PENDING_EVENTS.load(Ordering::Acquire),
+            before,
+            "awaited emit must not register a PENDING_EVENTS guard (survives runtime drop)"
+        );
+    }
+
     /// What a command exiting right after emitting (`grok login`) relies on.
     /// Asserts on the wait, not on the gauge: it is process-global and other
     /// tests in this binary emit concurrently.
     #[tokio::test]
     async fn drain_pending_waits_for_in_flight_posts() {
+        let _guard = EMIT_TEST_GUARD.lock().await;
         emit_event_with_origin(
             EmitterOrigin::Shell,
             "drain_probe",
@@ -390,5 +526,101 @@ mod tests {
             total,
             "every origin must yield a distinct prefix",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_local_in_session_ctx_reenters_parent_ctx() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let ctx = TelemetryCtx::new(
+                    "sess-inherit".into(),
+                    Arc::new(tokio::sync::Mutex::new(7usize)),
+                );
+                with_session_ctx(ctx, async {
+                    begin_prompt_id();
+                    let parent_prompt = external_ctx_snapshot().expect("parent ctx").prompt_id;
+                    assert!(parent_prompt.is_some());
+                    let child = spawn_local_in_session_ctx(async {
+                        external_ctx_snapshot().expect("child re-enters ctx")
+                    })
+                    .await
+                    .expect("join");
+                    assert_eq!(child.session_id, "sess-inherit");
+                    assert_eq!(child.turn_number, Some(7));
+                    assert_eq!(child.prompt_id, parent_prompt);
+                })
+                .await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_local_in_session_ctx_is_noop_outside_ctx() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let seen = spawn_local_in_session_ctx(async { external_ctx_snapshot().is_some() })
+                    .await
+                    .expect("join");
+                assert!(!seen, "helper must not invent a ctx");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_local_in_session_ctx_puts_session_id_on_work_event() {
+        use crate::external::test_support::{TestStream, build, emit_event_into};
+        use opentelemetry::logs::AnyValue;
+
+        fn work() -> crate::events::TurnCompleted {
+            crate::events::TurnCompleted {
+                outcome: crate::events::Outcome::Completed,
+                duration_ms: 10,
+                tool_call_count: 1,
+                model_id: "grok-4".into(),
+                cancellation_category: None,
+                error_category: None,
+            }
+        }
+        fn session_id(stream: &TestStream) -> Option<String> {
+            let logs = stream.logs.get_emitted_logs().expect("in-memory logs");
+            logs.first()?
+                .record
+                .attributes_iter()
+                .find_map(|(key, value)| {
+                    (key.as_str() == "session.id").then(|| match value {
+                        AnyValue::String(stream) => stream.as_str().to_owned(),
+                        other => format!("{other:?}"),
+                    })
+                })
+        }
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let ctx = TelemetryCtx::new(
+                    "sess-wire".into(),
+                    Arc::new(tokio::sync::Mutex::new(1usize)),
+                );
+                with_session_ctx(ctx, async {
+                    let bare = tokio::task::spawn_local(async {
+                        let stream = build(Default::default());
+                        emit_event_into(&stream, &work());
+                        session_id(&stream)
+                    })
+                    .await
+                    .expect("join");
+                    assert_eq!(bare, None, "bare spawn_local drops session.id");
+
+                    let fixed = spawn_local_in_session_ctx(async {
+                        let stream = build(Default::default());
+                        emit_event_into(&stream, &work());
+                        session_id(&stream)
+                    })
+                    .await
+                    .expect("join");
+                    assert_eq!(fixed.as_deref(), Some("sess-wire"));
+                })
+                .await;
+            })
+            .await;
     }
 }

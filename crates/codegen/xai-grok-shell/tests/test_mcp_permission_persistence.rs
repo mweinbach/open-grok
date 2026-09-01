@@ -17,8 +17,8 @@ use xai_grok_workspace::permission::types::{
     PatternMode, PermissionConfig, PermissionRule, RuleAction, ToolFilter,
 };
 use xai_grok_workspace::permission::{
-    AccessKind, ClientType, Decision, PermissionCommand, PermissionHandle, PermissionState,
-    spawn_permission_manager, spawn_permission_manager_with_hub,
+    AccessKind, ClientType, Decision, PermissionCommand, PermissionHandle, PermissionRequest,
+    PermissionState, spawn_permission_manager, spawn_permission_manager_with_hub,
 };
 
 /// Shared `OPENGROK_HOME` for the entire test binary. The `OnceLock` in
@@ -155,13 +155,8 @@ impl FakeGateway {
 async fn request(handle: &PermissionHandle, access: AccessKind, id: &str) -> Decision {
     let (tx, rx) = oneshot::channel();
     let cmd = PermissionCommand::Request {
-        access,
-        tool_call_update: tool_call_update(id, "mcp"),
-        path_context: None,
+        request: PermissionRequest::new(access, tool_call_update(id, "mcp")),
         respond_to: tx,
-        session_id: None,
-        subagent_type: None,
-        subagent_description: None,
     };
     let PermissionHandle::Actor { cmd_tx, .. } = handle else {
         panic!("expected actor handle");

@@ -44,6 +44,27 @@ MvpAgent  (LocalSet)
 | Path helpers | `xai-grok-shared/src/session/mod.rs` (`session_dir`), `xai-grok-tools` / `xai-grok-shell-base` `util/grok_home` |
 | ACP entry | `…/agent/mvp_agent/acp_agent.rs` (`new_session`, `load_session`) |
 
+### 1.0.13 integration boundaries
+
+The migration status and outstanding validation are recorded in
+[`../upstream/1.0.13-parity.md`](../upstream/1.0.13-parity.md).
+
+- `turn_task.rs` binds completion to prompt id, epoch and pointer identity;
+  `FinalizationGate` prevents promotion while completion or cancellation owns
+  the prior task. A matching prompt id alone is insufficient after respawn.
+- `TurnCompleted` uses the durable append rail and retains optional
+  `error_kind`, `elapsed_ms`, cancellation category and cancellation context.
+  The legacy prompt-complete notification derives its result from the same
+  canonical error mapping; it is not a replacement for durable replay.
+- Client `_meta.sessionKind` may claim `headless`; the `subagent*` namespace is
+  server-reserved. Existing persisted session kind is not overwritten on load.
+- MCP elicitation lives on the root session's LocalSet. Its inbox is installed
+  before startup handshakes, and the coordinator follows current attachment
+  interactivity rather than frozen spawn hints.
+- Status-line updates are transient and capability-gated per attachment.
+  Reattaching requests a fresh snapshot; headless/uninterested attachments do
+  not inherit the previous client's status subscription.
+
 ---
 
 ## Session identity

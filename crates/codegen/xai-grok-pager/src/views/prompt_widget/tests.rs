@@ -3,6 +3,22 @@
     use crate::input::key::key;
 
     #[test]
+    fn feedback_image_owner_cleans_unconsumed_temp_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("feedback.png");
+        std::fs::write(&path, [1, 2, 3]).unwrap();
+        let mut image = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+            data: vec![1, 2, 3],
+            mime_type: "image/png".into(),
+        });
+        image.staged_temp_path = Some(path.clone());
+        let owner = FeedbackImages::from(vec![image]);
+        assert_eq!(owner.len(), 1);
+        drop(owner);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn submit_via_try_send() {
         let mut pw = PromptWidget::new();
         pw.textarea.insert_str("hello world");
@@ -1118,19 +1134,19 @@
             .draw(&mut buf, area, Some(overlay), &style, None, None)
             .post_flush_escapes
             .expect("first preview");
-        assert!(first_escape.as_str().contains("a=t"));
+        assert!(first_escape.as_str().contains("a=T"));
         let _ = first_escape.commit();
         let second_escape = second
             .draw(&mut buf, area, Some(overlay), &style, None, None)
             .post_flush_escapes
             .expect("second preview");
-        assert!(second_escape.as_str().contains("a=t"));
+        assert!(second_escape.as_str().contains("a=T"));
         let _ = second_escape.commit();
         let first_again = first
             .draw(&mut buf, area, Some(overlay), &style, None, None)
             .post_flush_escapes
             .expect("first preview again");
-        assert!(first_again.as_str().contains("a=t"));
+        assert!(first_again.as_str().contains("a=T"));
     }
 
     #[test]

@@ -194,6 +194,11 @@ pub(crate) fn build_screen_mode_relaunch_args(
 }
 
 /// Env value written for a screen-mode relaunch (`minimal` / `fullscreen`).
+pub(crate) fn exec_switch_forced() -> bool {
+    std::env::var("GROK_SCREEN_MODE_SWITCH")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("exec"))
+}
+
 pub(crate) fn screen_mode_env_value(want_minimal: bool) -> &'static str {
     if want_minimal {
         "minimal"

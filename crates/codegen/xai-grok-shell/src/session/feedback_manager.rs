@@ -91,6 +91,12 @@ pub(crate) async fn submit_feedback_workflow(
         author_identity,
     } = opts;
 
+    if let Err(error) =
+        crate::session::feedback::validate_feedback_image_payloads(&submission.images)
+    {
+        return SubmitOutcome::Failed(error);
+    }
+
     if let Some(user_meta) = crate::agent::mvp_agent::parse_json_object_env("GROK_USER_METADATA") {
         submission.merge_metadata(user_meta);
     }
@@ -106,6 +112,17 @@ pub(crate) async fn submit_feedback_workflow(
     }
 
     if let Some(tx) = persistence_tx {
+        let images = std::mem::take(&mut submission.images);
+        let mut persisted = submission.clone();
+        persisted.images = images
+            .iter()
+            .map(|image| crate::session::feedback::FeedbackImage {
+                data: format!("<{} base64 bytes stripped>", image.data.len()),
+                mime_type: image.mime_type.clone(),
+                file_name: image.file_name.clone(),
+            })
+            .collect();
+        submission.images = images;
         let entry = LocalFeedbackEntry::UserFeedback(UserFeedbackEntry {
             submitted_at: chrono::Utc::now(),
             session_id: submission.session_id.clone(),
@@ -113,7 +130,7 @@ pub(crate) async fn submit_feedback_workflow(
             solicited,
             request_id: submission.request_id.clone(),
             dismissed: false,
-            submission: Some(submission.clone()),
+            submission: Some(persisted),
         });
         if tx.send(PersistenceMsg::Feedback(entry)).is_err() {
             tracing::warn!(
@@ -1976,6 +1993,130 @@ mod author_identity_tests {
         );
         s.model_id = Some("grok-4".to_string());
         s
+    }
+
+    fn image_submission() -> FeedbackSubmission {
+        use base64::Engine;
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let mut submission = text_submission();
+        submission.images = vec![crate::session::feedback::FeedbackImage {
+            data: base64::engine::general_purpose::STANDARD.encode(encoded.into_inner()),
+            mime_type: "image/png".into(),
+            file_name: Some("screenshot.png".into()),
+        }];
+        submission
+    }
+
+    #[tokio::test]
+    async fn image_payload_reaches_eligible_backend_but_not_local_feedback_records() {
+        let (address, captured) = start_capture_server().await;
+        let client = FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{address}/v1"),
+            None,
+        )
+        .with_provider_boundary(ProviderBoundary::default());
+        let mut submission = image_submission();
+        let payload = submission.images[0].data.clone();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = submit_feedback_workflow(
+            &mut submission,
+            Some(&client),
+            Some(&sender),
+            SubmitFeedbackOptions {
+                solicited: false,
+                telemetry_enabled: false,
+                author_identity: None,
+            },
+        )
+        .await;
+        assert!(matches!(outcome, SubmitOutcome::Submitted));
+        let wire = captured.lock().clone().unwrap();
+        assert_eq!(wire["images"][0]["data"], payload);
+        assert!(wire["feedbackText"].is_null());
+        assert!(wire["metadata"].is_null());
+        let PersistenceMsg::Feedback(LocalFeedbackEntry::UserFeedback(entry)) =
+            receiver.try_recv().unwrap()
+        else {
+            panic!("expected local feedback");
+        };
+        let persisted = entry.submission.unwrap();
+        assert!(persisted.images[0].data.contains("base64 bytes stripped"));
+        assert!(
+            !serde_json::to_string(&persisted)
+                .unwrap()
+                .contains(&payload)
+        );
+        assert_eq!(persisted.feedback_text.as_deref(), Some("great session"));
+        assert_eq!(
+            persisted.images[0].file_name.as_deref(),
+            Some("screenshot.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_provider_boundary_closure_blocks_feedback_images() {
+        for provider in [
+            xai_grok_sampling_types::ModelProvider::Codex,
+            xai_grok_sampling_types::ModelProvider::Kimi,
+            xai_grok_sampling_types::ModelProvider::Custom,
+        ] {
+            let (address, captured) = start_capture_server().await;
+            let boundary = ProviderBoundary::default();
+            let client = FeedbackClient::with_client(
+                reqwest::Client::new(),
+                format!("http://{address}/v1"),
+                None,
+            )
+            .with_provider_boundary(boundary.clone());
+            boundary.observe(provider);
+            boundary.observe(xai_grok_sampling_types::ModelProvider::Xai);
+            let mut submission = image_submission();
+            let outcome = submit_feedback_workflow(
+                &mut submission,
+                Some(&client),
+                None,
+                SubmitFeedbackOptions {
+                    solicited: false,
+                    telemetry_enabled: false,
+                    author_identity: None,
+                },
+            )
+            .await;
+            assert!(matches!(outcome, SubmitOutcome::Failed(_)));
+            assert!(captured.lock().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_image_payload_is_not_uploaded_or_persisted() {
+        let (address, captured) = start_capture_server().await;
+        let client = FeedbackClient::with_client(
+            reqwest::Client::new(),
+            format!("http://{address}/v1"),
+            None,
+        )
+        .with_provider_boundary(ProviderBoundary::default());
+        let mut submission = image_submission();
+        submission.images[0].data = "invalid base64".into();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = submit_feedback_workflow(
+            &mut submission,
+            Some(&client),
+            Some(&sender),
+            SubmitFeedbackOptions {
+                solicited: false,
+                telemetry_enabled: false,
+                author_identity: None,
+            },
+        )
+        .await;
+        assert!(matches!(outcome, SubmitOutcome::Failed(_)));
+        assert!(captured.lock().is_none());
+        assert!(receiver.try_recv().is_err());
     }
 
     /// End-to-end: an env var (as a device-management launcher would inject)

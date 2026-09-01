@@ -357,10 +357,26 @@ fn scripted_outstanding_responder(
         let mut queue = replies.into_iter();
         let mut last = None;
         while let Some(event) = rx.recv().await {
-            if let SubagentEvent::Outstanding(req) = event {
-                let reply = queue.next().or_else(|| last.clone()).unwrap_or_default();
-                last = Some(reply.clone());
-                let _ = req.respond_to.send(reply);
+            match event {
+                SubagentEvent::Outstanding(request) => {
+                    let reply = queue.next().or_else(|| last.clone()).unwrap_or_default();
+                    last = Some(reply.clone());
+                    let _ = request.respond_to.send(reply);
+                }
+                SubagentEvent::WaitPromptDrained(mut request) => loop {
+                    let reply = queue.next().or_else(|| last.clone()).unwrap_or_default();
+                    last = Some(reply.clone());
+                    if reply.live_ids.is_empty() {
+                        let _ = request.respond_to.send(reply);
+                        break;
+                    }
+                    if queue.len() == 0 {
+                        request.respond_to.closed().await;
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                },
+                _ => {}
             }
         }
     });

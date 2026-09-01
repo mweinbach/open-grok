@@ -19,8 +19,7 @@ use super::text_selection::{
     VisibleBlockGeometry,
 };
 use super::types::{
-    DisplayMode, derive_selection_text, line_plain_text_into, selectable_cols,
-    selectable_cols_usize,
+    derive_selection_text, line_plain_text_into, selectable_cols, selectable_cols_usize,
 };
 use super::wrappers::{EntryRenderer, group_header_chrome_prefix_width};
 use crate::appearance::AppearanceConfig;
@@ -541,8 +540,10 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
                 block_line_idx: 0,
                 screen_y: render_y,
                 screen_x: entry_row_layout.content.x.saturating_add(chrome_offset),
-                selectable_cols: 0..(label.line.width() as u16),
+                selectable_cols: 0..(crate::scrollback::types::str_display_cells(&label.text)
+                    as u16),
                 text: label.text.clone(),
+                painted_region: None,
                 joiner_to_previous: None,
             });
         }
@@ -574,23 +575,30 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
                     &highlight_text,
                     re,
                     true,
+                    true,
                 );
             }
             if let (Some(range_id), Some(cols)) = (
                 line.selection_range,
                 selectable_cols(&line.content, &line.selectable),
             ) {
+                let boundary = cached_boundaries.get(block_line_idx);
+                let selectable_cols =
+                    crate::scrollback::types::visual_selectable_cols(line).unwrap_or(cols);
                 let resolved_line = ResolvedSelectableLine {
                     entry_idx: logical_idx,
                     range_id,
                     block_line_idx,
                     screen_y,
                     screen_x: entry_row_layout.content.x,
-                    selectable_cols: cols,
+                    selectable_cols: boundary.map_or(selectable_cols.clone(), |boundary| {
+                        boundary.anchored_cols(selectable_cols)
+                    }),
                     text: derive_selection_text(line),
+                    painted_region: Some(crate::scrollback::types::painted_selectable_region(line)),
                     joiner_to_previous: line.joiner.clone(),
                 };
-                if let Some(boundary) = cached_boundaries.get(block_line_idx) {
+                if let Some(boundary) = boundary {
                     selection_boundaries.push(&resolved_line, Arc::clone(boundary));
                 }
                 result.selection_model.push_line(resolved_line);
@@ -602,16 +610,7 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
         // synthetic label text with no links; the expanded verb slot's member
         // row keeps its links (row offsets already shifted past the header).
         if !is_group_header || verb_expanded_slot {
-            let content_line_offset = match &entry.block {
-                RenderBlock::Btw(_) if ctx.mode != DisplayMode::Collapsed => 2,
-                RenderBlock::Thinking(_)
-                    if ctx.mode != DisplayMode::Collapsed
-                        && appearance.scrollback.blocks.thinking.header =>
-                {
-                    2
-                }
-                _ => 0,
-            };
+            let content_line_offset = entry.block.markdown_body_line_offset(ctx.mode, appearance);
             entry.block.with_hyperlinks(|hyperlinks| {
                 if !hyperlinks.is_empty() {
                     map_hyperlinks_to_overlay(
@@ -651,32 +650,36 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
                     if start >= end {
                         continue;
                     }
-                    let (Ok(start), Ok(end)) = (u16::try_from(start), u16::try_from(end)) else {
-                        continue;
-                    };
-                    let (Some(col_start), Some(col_end)) = (
-                        entry_row_layout.content.x.checked_add(start),
-                        entry_row_layout.content.x.checked_add(end),
-                    ) else {
-                        continue;
-                    };
-                    if result.link_overlay.overlaps(screen_row, col_start, col_end) {
-                        continue;
-                    }
                     let painted = derive_selection_text(bl);
                     let fully_visible = cols.end <= visible_width;
-                    result.link_overlay.push(OverlayLink {
-                        screen_row,
-                        col_start,
-                        col_end,
-                        target: target.clone(),
-                        presentation: if fully_visible {
-                            crate::render::osc8::file_link_presentation(&painted, target, cwd)
-                        } else {
-                            crate::render::osc8::LinkPresentation::Opaque
-                        },
-                        id: None,
-                    });
+                    let plain = crate::scrollback::types::line_plain_text(&bl.content);
+                    for (vs, ve) in crate::render::bidi::logical_cols_to_visual(&plain, start, end)
+                    {
+                        let (Ok(vs), Ok(ve)) = (u16::try_from(vs), u16::try_from(ve)) else {
+                            continue;
+                        };
+                        let (Some(col_start), Some(col_end)) = (
+                            entry_row_layout.content.x.checked_add(vs),
+                            entry_row_layout.content.x.checked_add(ve),
+                        ) else {
+                            continue;
+                        };
+                        if result.link_overlay.overlaps(screen_row, col_start, col_end) {
+                            continue;
+                        }
+                        result.link_overlay.push(OverlayLink {
+                            screen_row,
+                            col_start,
+                            col_end,
+                            target: target.clone(),
+                            presentation: if fully_visible {
+                                crate::render::osc8::file_link_presentation(&painted, target, cwd)
+                            } else {
+                                crate::render::osc8::LinkPresentation::Opaque
+                            },
+                            id: None,
+                        });
+                    }
                 }
             }
 
@@ -953,6 +956,7 @@ pub(crate) fn map_hyperlinks_to_overlay(
     // `[videos/1.mp4](videos/1.mp4)` resolve against generated media, then
     // against existing files under the session `cwd`.
     let scheme_filter = crate::terminal::hyperlinks::SchemeFilter::Standard;
+    let mut row_plain_buf = String::new();
     for h in hyperlinks {
         let target = if crate::app::link_opener::is_safe_to_open(&h.url, scheme_filter) {
             crate::render::osc8::LinkTarget::Url(Arc::from(h.url.as_str()))
@@ -986,21 +990,41 @@ pub(crate) fn map_hyperlinks_to_overlay(
                 continue;
             }
 
-            let local_col_start = (overlap_start - seg_col_start) as u16;
-            let local_col_end = (overlap_end - seg_col_start) as u16;
+            let local_col_start = overlap_start - seg_col_start;
+            let local_col_end = overlap_end - seg_col_start;
 
-            overlay.push(OverlayLink {
-                screen_row,
-                col_start: content_x + local_col_start,
-                col_end: content_x + local_col_end,
-                target: target.clone(),
-                presentation: crate::render::osc8::LinkPresentation::Opaque,
-                id: Some(h.id),
-            });
+            let visual_ranges = if crate::render::bidi::is_enabled() {
+                row_plain_buf.clear();
+                line_plain_text_into(&block_output.lines[wrapped_idx].content, &mut row_plain_buf);
+                if crate::render::bidi::needs_bidi(&row_plain_buf) {
+                    crate::render::bidi::logical_cols_to_visual(
+                        &row_plain_buf,
+                        local_col_start,
+                        local_col_end,
+                    )
+                } else {
+                    vec![(local_col_start, local_col_end)]
+                }
+            } else {
+                vec![(local_col_start, local_col_end)]
+            };
+            for (vs, ve) in visual_ranges {
+                if vs >= ve {
+                    continue;
+                }
+
+                overlay.push(OverlayLink {
+                    screen_row,
+                    col_start: content_x + vs as u16,
+                    col_end: content_x + ve as u16,
+                    target: target.clone(),
+                    presentation: crate::render::osc8::LinkPresentation::Opaque,
+                    id: Some(h.id),
+                });
+            }
         }
     }
 }
-
 #[cfg(test)]
 #[path = "render_tests.rs"]
 mod tests;

@@ -28,7 +28,8 @@ use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_error_message};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CodeModeTransport,
-    ConversationRequest, ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER,
+    ConversationRequest, ConversationResponse, CreateResponseWrapper,
+    DEFAULT_EXACT_REPETITION_MIN_TOKENS, DOOM_LOOP_CHECK_HEADER, EXACT_REPETITION_CHECK_HEADER,
     MessagesRequestWrapper, ModelProvider, NamedCustomToolOutputOccurrence,
     OriginalDetailCustomOutputImageOccurrence, ResponseModelMetadata, Result, SamplingError,
     SentCredential, build_messages_request, is_check_event, messages, parse_error_code, rs,
@@ -82,11 +83,6 @@ async fn acquire_provider_request_permit_from(
     )
 }
 
-/// Parse the `Retry-After` response header as delta-seconds.
-/// Our inference backends only emit integer seconds (never HTTP-date),
-/// so we only handle that form. HTTP-dates silently return `None` and
-/// the caller falls back to exponential backoff.
-/// Capped at 120s to prevent absurdly long sleeps from a misbehaving upstream.
 /// Deserialize a Responses API SSE event, with fallbacks for valid wire
 /// shapes that `async_openai` can't parse.
 ///
@@ -2041,6 +2037,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: payload.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: payload.x_grok_turn_idx.as_deref(),
+            transient_retry: payload.x_grok_transient_retry.as_deref(),
             agent_id: payload.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
@@ -2106,6 +2103,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: payload.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: payload.x_grok_turn_idx.as_deref(),
+            transient_retry: payload.x_grok_transient_retry.as_deref(),
             agent_id: payload.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
@@ -2704,6 +2702,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: request.x_grok_turn_idx.as_deref(),
+            transient_retry: request.x_grok_transient_retry.as_deref(),
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
@@ -2887,6 +2886,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: request.x_grok_turn_idx.as_deref(),
+            transient_retry: request.x_grok_transient_retry.as_deref(),
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
@@ -2947,8 +2947,12 @@ impl SamplingClient {
         if let Some(policy) = self.defaults.doom_loop_recovery
             && self.provider_adapter.sends_doom_loop_opt_in()
         {
-            http_request =
-                http_request.header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string());
+            http_request = http_request
+                .header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string())
+                .header(
+                    EXACT_REPETITION_CHECK_HEADER,
+                    DEFAULT_EXACT_REPETITION_MIN_TOKENS.to_string(),
+                );
         }
         let http_request = self
             .apply_codex_turn_metadata_header(http_request, &request_body)
@@ -3172,6 +3176,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: request.x_grok_turn_idx.as_deref(),
+            transient_retry: request.x_grok_transient_retry.as_deref(),
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
@@ -3290,6 +3295,7 @@ impl SamplingClient {
             model_id: &model_id,
             session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
             turn_idx: request.x_grok_turn_idx.as_deref(),
+            transient_retry: request.x_grok_transient_retry.as_deref(),
             agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
@@ -3621,6 +3627,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_cache_affinity_id = request.x_grok_cache_affinity_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
         // The hosted tools travel as raw JSON, spliced in after serialization by
@@ -3643,6 +3650,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_cache_affinity_id = x_grok_cache_affinity_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
+        wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
         wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
@@ -3673,6 +3681,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_cache_affinity_id = request.x_grok_cache_affinity_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
         // The hosted tools travel as raw JSON, spliced in by `create_response` through
@@ -3695,6 +3704,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_cache_affinity_id = x_grok_cache_affinity_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
+        wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
         wrapper.named_custom_tool_outputs = named_custom_tool_outputs;
@@ -3726,6 +3736,7 @@ impl SamplingClient {
         let x_grok_req_id = request.x_grok_req_id.clone();
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
         let messages_request = build_messages_request(&request);
@@ -3735,6 +3746,7 @@ impl SamplingClient {
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
+        wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
 
         if let Some(trace) = trace {
@@ -3759,6 +3771,7 @@ impl SamplingClient {
         let x_grok_req_id = request.x_grok_req_id.clone();
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
         let messages_request = build_messages_request(&request);
@@ -3768,6 +3781,7 @@ impl SamplingClient {
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
+        wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
 
         if let Some(trace) = trace {
@@ -3782,8 +3796,18 @@ impl SamplingClient {
         &self,
         request: ConversationRequest,
     ) -> Result<ConversationResponse> {
+        self.conversation_collect_with_idle_timeout(request, std::time::Duration::from_secs(300))
+            .await
+    }
+
+    /// [`Self::conversation_collect`] with a caller-chosen idle timeout, for short side calls (autocomplete, memory notes) that must give up fast.
+    pub async fn conversation_collect_with_idle_timeout(
+        &self,
+        request: ConversationRequest,
+        idle_timeout: std::time::Duration,
+    ) -> Result<ConversationResponse> {
         let request_id = crate::types::RequestId::random();
-        let idle_timeout = std::time::Duration::from_secs(300);
+        let length_policy = request.length_policy;
         let result = match self.api_backend() {
             ApiBackend::ChatCompletions => {
                 let (raw, meta) = self.conversation_stream(request).await?;
@@ -3811,9 +3835,45 @@ impl SamplingClient {
                 crate::stream::collect_response(events).await
             }
         };
-        result
+        let response = result
             .map(|(response, _metrics)| response)
-            .map_err(stream_collect_error)
+            .map_err(stream_collect_error)?;
+        apply_length_policy(length_policy, response)
+    }
+}
+
+/// Applies the request's [`xai_grok_sampling_types::LengthPolicy`] to a collected response.
+/// Fails a `Length` stop the policy rejects, logs the salvage breadcrumb otherwise.
+/// The single gate shared by `drive_l2` and the direct-collect path so the two cannot drift.
+pub(crate) fn apply_length_policy(
+    policy: xai_grok_sampling_types::LengthPolicy,
+    response: xai_grok_sampling_types::ConversationResponse,
+) -> Result<xai_grok_sampling_types::ConversationResponse> {
+    use xai_grok_sampling_types::LengthVerdict;
+    match policy.verdict(&response) {
+        LengthVerdict::Pass => Ok(response),
+        LengthVerdict::Fail => Err(SamplingError::MaxTokensTruncation),
+        LengthVerdict::Salvage => {
+            tracing::info!(
+                content_len = response
+                    .assistant()
+                    .map_or(0, |assistant| assistant.content.len()),
+                completion_tokens = response.usage.as_ref().map(|usage| usage.completion_tokens),
+                "salvaging Length-truncated response per LengthPolicy::CompletePartial"
+            );
+            Ok(response)
+        }
+        LengthVerdict::SalvageToolCalls => {
+            tracing::info!(
+                tool_calls = response.tool_calls().len(),
+                content_len = response
+                    .assistant()
+                    .map_or(0, |assistant| assistant.content.len()),
+                completion_tokens = response.usage.as_ref().map(|usage| usage.completion_tokens),
+                "completing Length-truncated response with completed tool calls"
+            );
+            Ok(response)
+        }
     }
 }
 
@@ -4490,6 +4550,7 @@ mod tests {
             x_grok_req_id: None,
             x_grok_session_id: None,
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,
@@ -4513,6 +4574,11 @@ mod tests {
                 .and_then(|v| v.get("include_usage"))
                 .and_then(|v| v.as_bool()),
             Some(true)
+        );
+        assert!(
+            !obj.keys().any(|k| k.starts_with("x_grok_")),
+            "x_grok_* are header fields and must never serialize into the body: {:?}",
+            obj.keys().collect::<Vec<_>>()
         );
 
         assert!(
@@ -4930,6 +4996,7 @@ mod tests {
             model_id: "model-1",
             session_id: "session-1",
             turn_idx: Some("7"),
+            transient_retry: Some("7"),
             agent_id: "agent-1",
             deployment_id: Some("deployment-1"),
             user_id: Some("user-1"),
@@ -4946,6 +5013,7 @@ mod tests {
             ("x-grok-model-override", "model-1"),
             ("x-grok-session-id", "session-1"),
             ("x-grok-turn-idx", "7"),
+            ("x-grok-transient-retry", "7"),
             ("x-grok-agent-id", "agent-1"),
             ("x-grok-deployment-id", "deployment-1"),
             ("x-grok-user-id", "user-1"),
@@ -4959,18 +5027,24 @@ mod tests {
             );
         }
 
-        let codex = headers
-            .apply_for_provider(http.post("https://example.test"), ModelProvider::Codex)
-            .build()
-            .expect("Codex request should build");
-        assert!(
-            codex
-                .headers()
-                .keys()
-                .all(|name| !name.as_str().starts_with("x-grok-")),
-            "Codex must not receive any x-grok tracking headers: {:?}",
-            codex.headers()
-        );
+        for registration in &crate::provider::PROVIDER_REGISTRY {
+            if registration.provider == ModelProvider::Xai {
+                continue;
+            }
+            let request = headers
+                .apply_for_provider(http.post("https://example.test"), registration.provider)
+                .build()
+                .expect("provider request should build");
+            assert!(
+                request
+                    .headers()
+                    .keys()
+                    .all(|name| !name.as_str().starts_with("x-grok-")),
+                "{:?} must not receive any x-grok tracking headers: {:?}",
+                registration.provider,
+                request.headers()
+            );
+        }
     }
 
     /// The ChatGPT Codex backend activates the per-conversation prompt cache
@@ -4988,6 +5062,7 @@ mod tests {
             model_id: "model-1",
             session_id: "session-1",
             turn_idx: Some("7"),
+            transient_retry: Some("7"),
             agent_id: "agent-1",
             deployment_id: None,
             user_id: None,

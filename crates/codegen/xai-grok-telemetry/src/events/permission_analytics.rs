@@ -57,12 +57,80 @@ impl TryFrom<&str> for PermissionPromptOutcome {
             | "allow_always_mcp_tool"
             | "allow_always_mcp_server"
             | "allow_edits_for_session" => Ok(Self::Allow),
-            "reject_once" | "reject_always_bash" => Ok(Self::Reject),
+            "reject_once"
+            | "reject_always_bash"
+            | "reject_always_mcp_tool"
+            | "reject_always_domain" => Ok(Self::Reject),
             "cancelled" => Ok(Self::Cancel),
             "followup" => Ok(Self::Followup),
             "error" => Ok(Self::Error),
             _ => Err(()),
         }
+    }
+}
+
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionPromptOutcomeDetail {
+    AllowOnce,
+    AllowAlways,
+    AllowEditsForSession,
+    AllowAlwaysBash,
+    AllowAlwaysBashGlob,
+    AllowAlwaysDomain,
+    AllowAlwaysMcpTool,
+    AllowAlwaysMcpServer,
+    RejectOnce,
+    RejectAlwaysBash,
+    RejectAlwaysMcpTool,
+    RejectAlwaysDomain,
+    Cancelled,
+    Followup,
+    Error,
+}
+
+impl PermissionPromptOutcomeDetail {
+    pub const ALL: &'static [Self] = &[
+        Self::AllowOnce,
+        Self::AllowAlways,
+        Self::AllowEditsForSession,
+        Self::AllowAlwaysBash,
+        Self::AllowAlwaysBashGlob,
+        Self::AllowAlwaysDomain,
+        Self::AllowAlwaysMcpTool,
+        Self::AllowAlwaysMcpServer,
+        Self::RejectOnce,
+        Self::RejectAlwaysBash,
+        Self::RejectAlwaysMcpTool,
+        Self::RejectAlwaysDomain,
+        Self::Cancelled,
+        Self::Followup,
+        Self::Error,
+    ];
+}
+
+impl TryFrom<&str> for PermissionPromptOutcomeDetail {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, ()> {
+        Ok(match value {
+            "allow_once" => Self::AllowOnce,
+            "allow_always" => Self::AllowAlways,
+            "allow_edits_for_session" => Self::AllowEditsForSession,
+            "allow_always_bash" => Self::AllowAlwaysBash,
+            "allow_always_bash_glob" => Self::AllowAlwaysBashGlob,
+            "allow_always_domain" => Self::AllowAlwaysDomain,
+            "allow_always_mcp_tool" => Self::AllowAlwaysMcpTool,
+            "allow_always_mcp_server" => Self::AllowAlwaysMcpServer,
+            "reject_once" => Self::RejectOnce,
+            "reject_always_bash" => Self::RejectAlwaysBash,
+            "reject_always_mcp_tool" => Self::RejectAlwaysMcpTool,
+            "reject_always_domain" => Self::RejectAlwaysDomain,
+            "cancelled" => Self::Cancelled,
+            "followup" => Self::Followup,
+            "error" => Self::Error,
+            _ => return Err(()),
+        })
     }
 }
 
@@ -89,9 +157,11 @@ pub enum PermissionDecisionReason {
     SafeCommand,
     SessionDeny,
     PromptDeny,
+    PromptAllow,
     NeedsUser,
     BashRequestFloor,
     OpaqueShell,
+    HookAsk,
     RequesterGone,
 }
 
@@ -118,9 +188,11 @@ impl PermissionDecisionReason {
         Self::SafeCommand,
         Self::SessionDeny,
         Self::PromptDeny,
+        Self::PromptAllow,
         Self::NeedsUser,
         Self::BashRequestFloor,
         Self::OpaqueShell,
+        Self::HookAsk,
         Self::RequesterGone,
     ];
 }
@@ -149,9 +221,11 @@ impl TryFrom<&str> for PermissionDecisionReason {
             "safe_command" => Self::SafeCommand,
             "session_deny" => Self::SessionDeny,
             "prompt_deny" => Self::PromptDeny,
+            "prompt_allow" => Self::PromptAllow,
             "needs_user" => Self::NeedsUser,
             "bash_request_floor" => Self::BashRequestFloor,
             "opaque_shell" => Self::OpaqueShell,
+            "hook_ask" => Self::HookAsk,
             "requester_gone" => Self::RequesterGone,
             _ => return Err(()),
         })
@@ -350,6 +424,10 @@ pub struct PermissionDecisionPayload {
     /// Normalized human prompt outcome; `None` unless the request was prompted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_outcome: Option<PermissionPromptOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_outcome_detail: Option<PermissionPromptOutcomeDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remember_tool_approvals: Option<bool>,
     /// Canonical decision-reason trigger.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_reason: Option<PermissionDecisionReason>,
@@ -421,7 +499,27 @@ mod permission_analytics_tests {
             Ok(O::Followup)
         );
         assert_eq!(PermissionPromptOutcome::try_from("error"), Ok(O::Error));
+        assert_eq!(
+            PermissionPromptOutcome::try_from("reject_always_mcp_tool"),
+            Ok(PermissionPromptOutcome::Reject)
+        );
+        assert_eq!(
+            PermissionPromptOutcome::try_from("reject_always_domain"),
+            Ok(PermissionPromptOutcome::Reject)
+        );
         assert!(PermissionPromptOutcome::try_from("mystery").is_err());
+    }
+
+    #[test]
+    fn prompt_outcome_detail_round_trips_every_variant() {
+        for &variant in PermissionPromptOutcomeDetail::ALL {
+            let wire = serde_json::to_value(variant).unwrap();
+            assert_eq!(
+                PermissionPromptOutcomeDetail::try_from(wire.as_str().unwrap()),
+                Ok(variant)
+            );
+        }
+        assert!(PermissionPromptOutcomeDetail::try_from("mystery").is_err());
     }
 
     /// Enum↔wire self-consistency for the symmetric analytics enums: every
@@ -467,6 +565,8 @@ mod permission_analytics_tests {
             subagent_type: None,
             manager_prompt_attempted: Some(true),
             prompt_outcome: outcome,
+            prompt_outcome_detail: None,
+            remember_tool_approvals: Some(true),
             decision_reason: reason,
             classifier_source: Some(PermissionClassifierSource::Llm),
             classifier_verdict: verdict,

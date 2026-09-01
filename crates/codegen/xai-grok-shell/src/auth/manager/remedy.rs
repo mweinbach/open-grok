@@ -4,7 +4,14 @@
 use std::sync::Arc;
 
 use super::AuthManager;
+use super::{RefreshReason, TokenType};
+use crate::auth::error::AuthError;
 use crate::auth::model::GrokAuth;
+
+pub(crate) enum BoundedRefresh {
+    Resolved(Box<Result<GrokAuth, AuthError>>),
+    DeadlineElapsed,
+}
 
 /// The way back to a usable credential, as of right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +110,61 @@ impl AuthManager {
             Some(serde_json::json!({ "outcome": logged })),
         );
         outcome
+    }
+
+    pub(crate) async fn refresh_chain_bounded(
+        self: &Arc<Self>,
+        token_type: TokenType,
+        reason: RefreshReason,
+        budget: std::time::Duration,
+    ) -> Result<GrokAuth, AuthError> {
+        match self
+            .refresh_chain_bounded_outcome(token_type, reason, budget)
+            .await
+        {
+            BoundedRefresh::Resolved(result) => *result,
+            BoundedRefresh::DeadlineElapsed => Err(AuthError::transient(
+                "bounded refresh deadline elapsed; refresh continues in background",
+            )),
+        }
+    }
+
+    pub(crate) async fn refresh_chain_bounded_outcome(
+        self: &Arc<Self>,
+        token_type: TokenType,
+        reason: RefreshReason,
+        budget: std::time::Duration,
+    ) -> BoundedRefresh {
+        let manager = Arc::clone(self);
+        let attempt = tokio::spawn(async move { manager.refresh_chain(token_type, reason).await });
+        let (result, outcome) = match tokio::time::timeout(budget, attempt).await {
+            Ok(Ok(result)) => (BoundedRefresh::Resolved(Box::new(result)), "resolved"),
+            Ok(Err(join_error)) => {
+                tracing::error!(
+                    is_panic = join_error.is_panic(),
+                    "bounded refresh task failed"
+                );
+                if let Some(key) = self.attempted_verdict_key(reason) {
+                    self.record_permanent_failure(
+                        key,
+                        crate::auth::error::RefreshTokenFailedReason::Other.into(),
+                    );
+                }
+                (
+                    BoundedRefresh::Resolved(Box::new(Err(AuthError::permanent(
+                        crate::auth::error::RefreshTokenFailedReason::Other,
+                    )))),
+                    "join_error",
+                )
+            }
+            Err(_) => (BoundedRefresh::DeadlineElapsed, "timeout"),
+        };
+        xai_grok_telemetry::unified_log::info(
+            "auth: bounded refresh",
+            None,
+            Some(serde_json::json!({ "reason": format!("{reason:?}"), "outcome": outcome })),
+        );
+        result
     }
 
     /// Classify the current credential's way back.
@@ -379,5 +441,93 @@ mod tests {
         let advice = provider.advice().expect("provider advice");
         assert!(advice.contains("Acme SSO") && advice.contains("/login"));
         assert!(!advice.contains("no need to run /login"));
+    }
+
+    #[tokio::test]
+    async fn panicked_bounded_refresh_records_a_permanent_verdict() {
+        struct PanickingRefresher;
+        #[async_trait::async_trait]
+        impl TokenRefresher for PanickingRefresher {
+            async fn refresh(&self, _reason: RefreshReason) -> RefreshOutcome {
+                panic!("mint died mid-exchange");
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AuthManager::new(directory.path(), GrokComConfig::default()));
+        manager.hot_swap(GrokAuth {
+            key: "expired".into(),
+            auth_mode: AuthMode::Oidc,
+            refresh_token: Some("refresh".into()),
+            expires_at: Some(Utc::now() - Duration::hours(1)),
+            ..GrokAuth::test_default()
+        });
+        manager.set_refresher(Arc::new(PanickingRefresher));
+        let error = manager
+            .refresh_chain_bounded(
+                TokenType::OidcSession,
+                RefreshReason::ServerRejected,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AuthError::Refresh(crate::auth::RefreshTokenError::Permanent(_))
+        ));
+        assert!(manager.has_permanent_failure());
+    }
+
+    #[tokio::test]
+    async fn bounded_deadline_does_not_cancel_rotation_or_persistence() {
+        struct DelayedRefresher;
+        #[async_trait::async_trait]
+        impl TokenRefresher for DelayedRefresher {
+            async fn refresh(&self, _reason: RefreshReason) -> RefreshOutcome {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                RefreshOutcome::Success(Box::new(GrokAuth {
+                    key: "rotated".into(),
+                    auth_mode: AuthMode::Oidc,
+                    refresh_token: Some("rotated-refresh".into()),
+                    expires_at: Some(Utc::now() + Duration::hours(1)),
+                    ..GrokAuth::test_default()
+                }))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            AuthManager::new(directory.path(), GrokComConfig::default())
+                .with_proxy_base_url("http://127.0.0.1:1"),
+        );
+        manager.hot_swap(GrokAuth {
+            key: "expired".into(),
+            auth_mode: AuthMode::Oidc,
+            refresh_token: Some("refresh".into()),
+            expires_at: Some(Utc::now() - Duration::hours(1)),
+            ..GrokAuth::test_default()
+        });
+        manager.set_refresher(Arc::new(DelayedRefresher));
+        assert!(matches!(
+            manager
+                .refresh_chain_bounded_outcome(
+                    TokenType::OidcSession,
+                    RefreshReason::PreRequest,
+                    std::time::Duration::from_millis(1)
+                )
+                .await,
+            BoundedRefresh::DeadlineElapsed
+        ));
+        let auth = manager
+            .refresh_chain_bounded(
+                TokenType::OidcSession,
+                RefreshReason::PreRequest,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.key, "rotated");
+        assert_eq!(
+            manager.read_disk_auth().unwrap().refresh_token.as_deref(),
+            Some("rotated-refresh")
+        );
     }
 }

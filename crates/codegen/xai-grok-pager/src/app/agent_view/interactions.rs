@@ -536,7 +536,14 @@ impl AgentView {
                         }
                     }
                     KeyCode::Char('y') if key.modifiers.is_empty() => {
-                        if !qv.is_on_freeform_row() {
+                        if !qv.is_on_freeform_row()
+                            && !matches!(
+                                qv.local_kind,
+                                Some(
+                                    crate::views::question_view::LocalQuestionKind::PromptBlocked { .. }
+                                )
+                            )
+                        {
                             let cursor = qv.cursor();
                             let active = qv.active_tab;
                             if let Some(question) = qv.questions.get(active)
@@ -1044,6 +1051,15 @@ impl AgentView {
     /// view opened, so typed "additional context" doesn't leak into the
     /// main prompt. Also clears any stashed (tab-hidden) question view.
     fn dismiss_question_view(&mut self) -> InputOutcome {
+        if self.question_view.as_ref().is_some_and(|view| {
+            matches!(
+                view.local_kind,
+                Some(crate::views::question_view::LocalQuestionKind::PromptBlocked { .. })
+            )
+        }) {
+            self.show_toast("Your prompt is blocked — choose Edit, Resend, or Discard");
+            return InputOutcome::Changed;
+        }
         let is_doctor_fix = self.question_view.as_ref().is_some_and(|qv| {
             matches!(
                 qv.local_kind,
@@ -1058,6 +1074,7 @@ impl AgentView {
             self.restore_card_prompt(qv.stashed_prompt);
         }
         self.cleanup_question_state();
+        crate::app::turn_completion::reopen_blocked_card_if_held(self);
         InputOutcome::Changed
     }
     /// Retract an interaction modal (permission / question / plan-approval) that
@@ -1079,6 +1096,28 @@ impl AgentView {
             .is_some_and(|qv| qv.tool_call_id == tool_call_id)
         {
             let _ = self.dismiss_question_view();
+            return true;
+        }
+        if let Some(ev) = self.elicitation_view.as_ref()
+            && ev.tool_call_id == tool_call_id
+        {
+            if ev.is_url_waiting() {
+                return false;
+            }
+            if let Some(mut ev) = self.elicitation_view.take() {
+                let _ = ev.take_response_tx();
+                self.restore_elicitation_prompt(ev.stashed_prompt);
+            }
+            return true;
+        }
+        if self
+            .pending_elicitation
+            .as_ref()
+            .is_some_and(|(req, _)| req.tool_call_id == tool_call_id)
+        {
+            if let Some((_, tx)) = self.pending_elicitation.take() {
+                drop(tx);
+            }
             return true;
         }
         if self
@@ -1140,6 +1179,8 @@ impl AgentView {
     ) {
         if self.permission_stashed_prompt.is_some() {
             self.permission_stashed_prompt = Some(stashed);
+        } else if let Some(question_view) = self.question_view.as_mut() {
+            question_view.stashed_prompt = stashed;
         } else {
             self.prompt.restore(stashed);
         }
@@ -1152,7 +1193,13 @@ impl AgentView {
         skipped: bool,
     ) -> InputOutcome {
         let report = qv.feedback_report();
-        if !skipped && report.is_empty() {
+        if !skipped && self.paste_probe_in_flight > 0 {
+            self.question_view = Some(qv);
+            self.deferred_send = Some(super::AgentDeferredSend::SubmitFeedback);
+            return InputOutcome::Changed;
+        }
+        let images = crate::views::prompt_widget::FeedbackImages::from(self.prompt.drain_images());
+        if !skipped && report.is_empty() && images.is_empty() {
             let freeform = qv.activate_freeform_input();
             self.prompt.set_text_preserving(&freeform);
             self.question_view = Some(qv);
@@ -1161,10 +1208,15 @@ impl AgentView {
         self.record_question_pause(&qv);
         self.restore_card_prompt(qv.stashed_prompt);
         self.cleanup_question_state();
+        crate::app::turn_completion::reopen_blocked_card_if_held(self);
         if skipped {
             return InputOutcome::Changed;
         }
-        InputOutcome::Action(Action::SendFeedback(report))
+        InputOutcome::Action(Action::SendFeedback {
+            text: report,
+            images,
+            trace: None,
+        })
     }
     pub(super) fn submit_question_answers(&mut self, skipped: bool) -> InputOutcome {
         use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionExtResponse;
@@ -1177,6 +1229,16 @@ impl AgentView {
         }
         self.record_question_pause(&qv);
         if let Some(kind) = qv.local_kind.take() {
+            let answered_blocked_card = matches!(
+                kind,
+                crate::views::question_view::LocalQuestionKind::PromptBlocked { .. }
+            );
+            if skipped && answered_blocked_card {
+                qv.local_kind = Some(kind);
+                self.question_view = Some(qv);
+                self.show_toast("Your prompt is blocked — choose Edit, Resend, or Discard");
+                return InputOutcome::Changed;
+            }
             let is_doctor_fix = matches!(
                 kind,
                 crate::views::question_view::LocalQuestionKind::DoctorFix { .. }
@@ -1192,6 +1254,9 @@ impl AgentView {
             };
             self.prompt.restore(qv.stashed_prompt);
             self.cleanup_question_state();
+            if !answered_blocked_card {
+                crate::app::turn_completion::reopen_blocked_card_if_held(self);
+            }
             return outcome;
         }
         let response = if skipped {
@@ -1351,6 +1416,8 @@ mod cancel_turn_mouse_tests {
                 available_commands_generation: 0,
                 available_tools: None,
                 model_switch_pending: false,
+                hook_block_hold: false,
+                blocked_prompt: None,
                 provider_rebind_pending: false,
                 user_model_preference: None,
                 deferred_model_switch: None,

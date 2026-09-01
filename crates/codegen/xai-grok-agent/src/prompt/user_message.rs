@@ -38,6 +38,15 @@ fn neutralize_file_rule_content(content: &str) -> String {
         .replace("</system_reminder>", "&lt;/system_reminder>")
         .replace("<system_reminder>", "&lt;system_reminder>")
 }
+fn push_rule_body(output: &mut String, content: &str) {
+    if !content.starts_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(content);
+    if !content.ends_with('\n') {
+        output.push('\n');
+    }
+}
 pub fn format_rules_section(
     workspace_rules: &[RuleEntry],
     user_rules: &[RuleEntry],
@@ -59,7 +68,7 @@ pub fn format_rules_section(
             out.push_str("<always_applied_workspace_rule name=\"");
             out.push_str(&rule.path);
             out.push_str("\">");
-            out.push_str(&neutralize_file_rule_content(rule.content.trim()));
+            push_rule_body(&mut out, &neutralize_file_rule_content(rule.content.trim()));
             out.push_str("</always_applied_workspace_rule>\n");
         }
         out.push_str("</always_applied_workspace_rules>");
@@ -79,9 +88,9 @@ pub fn format_rules_section(
             }
             out.push_str("<user_rule>");
             if rule.path.is_empty() {
-                out.push_str(&rule.content);
+                push_rule_body(&mut out, &rule.content);
             } else {
-                out.push_str(&neutralize_file_rule_content(&rule.content));
+                push_rule_body(&mut out, &neutralize_file_rule_content(&rule.content));
             }
             out.push_str("</user_rule>\n");
         }
@@ -505,14 +514,12 @@ mod tests {
             "{RULES_SECTION_INTRO}\n\n\n<always_applied_workspace_rules "
         )));
         assert!(block.contains(
-            "<always_applied_workspace_rule name=\"/repo/AGENTS.md\">Use python3.</always_applied_workspace_rule>"
+            "<always_applied_workspace_rule name=\"/repo/AGENTS.md\">\nUse python3.\n</always_applied_workspace_rule>"
         ));
         assert!(block.contains("</always_applied_workspace_rules>\n\n<user_rules "));
-        assert!(
-            block.contains(
-                "<user_rule>Verify UI.</user_rule>\n\n<user_rule>User prefs.</user_rule>"
-            )
-        );
+        assert!(block.contains(
+            "<user_rule>\nVerify UI.\n</user_rule>\n\n<user_rule>\nUser prefs.\n</user_rule>"
+        ));
         assert!(block.ends_with("</rules>"));
     }
     #[test]
@@ -536,6 +543,24 @@ mod tests {
         assert!(!block.contains("keep </rules>"));
         assert_eq!(block.matches("</rules>").count(), 1);
         let synthetic_block = format_rules_section(&[], &synthetic).unwrap();
-        assert!(synthetic_block.contains("<user_rule>raw </rules> stays</user_rule>"));
+        assert!(synthetic_block.contains("<user_rule>\nraw </rules> stays\n</user_rule>"));
+    }
+    #[test]
+    fn format_rules_section_keeps_markdown_headings_on_separate_lines() {
+        for content in [
+            "# Personal Rules\n\n- Be concise.",
+            "\n# Personal Rules\n\n- Be concise.\n",
+        ] {
+            let user = [RuleEntry {
+                path: "/home/dev/.opengrok/rules/personal.md".into(),
+                content: content.into(),
+            }];
+            let block = format_rules_section(&[], &user).unwrap();
+            assert!(block.contains("<user_rule>\n# Personal Rules\n\n- Be concise.\n</user_rule>"));
+            let block = format_rules_section(&user, &[]).unwrap();
+            assert!(block.contains(
+                "\">\n# Personal Rules\n\n- Be concise.\n</always_applied_workspace_rule>"
+            ));
+        }
     }
 }

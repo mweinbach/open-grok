@@ -19,6 +19,8 @@ pub trait SafeBuf {
     /// the buffer area.
     fn set_line_safe(&mut self, x: u16, y: u16, line: &Line<'_>, width: u16);
 
+    fn set_line_safe_bidi(&mut self, column: u16, row: u16, line: &Line<'_>, width: u16);
+
     /// Like `Buffer::set_span` but returns immediately when `y` is outside
     /// the buffer area.
     fn set_span_safe(&mut self, x: u16, y: u16, span: &Span<'_>, width: u16);
@@ -33,6 +35,17 @@ impl SafeBuf for Buffer {
     fn set_line_safe(&mut self, x: u16, y: u16, line: &Line<'_>, width: u16) {
         if y >= self.area.y && y < self.area.bottom() && x < self.area.right() {
             self.set_line(x, y, line, width);
+        }
+    }
+
+    #[inline]
+    fn set_line_safe_bidi(&mut self, column: u16, row: u16, line: &Line<'_>, width: u16) {
+        if row >= self.area.y && row < self.area.bottom() && column < self.area.right() {
+            if let Some(visual) = super::bidi::visual_line(line) {
+                self.set_line(column, row, &visual, width);
+            } else {
+                self.set_line(column, row, line, width);
+            }
         }
     }
 

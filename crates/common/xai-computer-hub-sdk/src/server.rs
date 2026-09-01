@@ -235,6 +235,8 @@ pub struct ToolServerBuilder {
     ws_ping_interval: Option<std::time::Duration>,
     ws_liveness_deadline: Option<std::time::Duration>,
     reconnect_backoff: Option<Arc<[std::time::Duration]>>,
+    reconnect_after_terminal_close_codes: Vec<u16>,
+    initial_connect_attempt_timeout: Option<std::time::Duration>,
     session_handler_resolver: Option<SessionHandlerResolver>,
     binary_version: Option<String>,
     image_capabilities: Vec<String>,
@@ -323,12 +325,28 @@ impl ToolServerBuilder {
     /// Connection knobs handed to [`HubConnection::connect`].
     /// `reconnect_attempt_reset_after` is left `None` so the SDK applies
     /// the 10 s production dwell — not zero, not "never".
+    pub fn reconnect_after_terminal_close_codes(
+        mut self,
+        codes: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        let mut codes: Vec<u16> = codes.into_iter().collect();
+        codes.sort_unstable();
+        codes.dedup();
+        self.reconnect_after_terminal_close_codes = codes;
+        self
+    }
+    pub fn with_initial_connect_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.initial_connect_attempt_timeout = Some(timeout);
+        self
+    }
     pub(crate) fn connection_tuning(&self) -> ConnectionTuning {
         ConnectionTuning {
             ws_ping_interval: self.ws_ping_interval,
             ws_liveness_deadline: self.ws_liveness_deadline,
             reconnect_backoff: self.reconnect_backoff.clone(),
             reconnect_attempt_reset_after: None,
+            reconnect_after_terminal_close_codes: self.reconnect_after_terminal_close_codes.clone(),
+            initial_connect_attempt_timeout: self.initial_connect_attempt_timeout,
         }
     }
 

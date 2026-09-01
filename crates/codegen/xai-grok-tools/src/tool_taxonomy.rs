@@ -58,6 +58,7 @@ impl ToolKind {
             ToolKind::Task => "Subagent",
             ToolKind::AgentSwarm => "Agent Swarm",
             ToolKind::AgentCollaboration => "Agent Collaboration",
+            ToolKind::ActiveAgentMessage => "Send Subagent Message",
             ToolKind::EnterPlan => "Enter Plan Mode",
             ToolKind::ExitPlan => "Exit Plan Mode",
             ToolKind::AskUser => "Ask User",
@@ -66,6 +67,7 @@ impl ToolKind {
             ToolKind::ImageToVideo => "Generate Video",
             ToolKind::ReferenceToVideo => "Generate Video",
             ToolKind::DeployApp => "Deploy App",
+            ToolKind::InitOrUpdateApp => "Init or Update App",
             ToolKind::SearchTool => "Search Tools",
             ToolKind::UseTool => "Use Tool",
             ToolKind::Monitor => "Monitor",
@@ -105,11 +107,13 @@ impl ToolKind {
             | ToolKind::Task
             | ToolKind::AgentSwarm
             | ToolKind::AgentCollaboration
+            | ToolKind::ActiveAgentMessage
             | ToolKind::ImageGen
             | ToolKind::VideoGen
             | ToolKind::ImageToVideo
             | ToolKind::ReferenceToVideo
             | ToolKind::DeployApp
+            | ToolKind::InitOrUpdateApp
             | ToolKind::SearchTool
             | ToolKind::UseTool
             | ToolKind::Monitor
@@ -294,6 +298,21 @@ mod tests {
         assert!(!ToolKind::Edit.is_read_only());
         assert!(!ToolKind::Execute.is_read_only());
         assert!(!ToolKind::Delete.is_read_only());
+    }
+    #[test]
+    fn app_builder_kind_remains_mutating_and_wire_stable() {
+        let kind = ToolKind::InitOrUpdateApp;
+        assert_eq!(kind.as_key(), "init_or_update_app");
+        assert_eq!(kind.presentation_name(), "Init or Update App");
+        assert!(!kind.is_read_only());
+        assert_eq!(
+            serde_json::from_str::<ToolKind>(r#""init_or_update_app""#).unwrap(),
+            kind,
+        );
+        assert_eq!(
+            crate::media_gen_limits::max_calls_per_batch(kind, &Default::default()),
+            None,
+        );
     }
     #[test]
     fn writing_tool_kind_maps_long_argument_tools_only() {

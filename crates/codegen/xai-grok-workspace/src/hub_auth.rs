@@ -1,8 +1,8 @@
-//! Hub [`AuthProvider`] from `~/.grok/auth.json` for the standalone
+//! Hub [`AuthProvider`] from `~/.opengrok/auth.json` for the standalone
 //! `workspace_server` binary: loopback `ws://` uses a plain bearer, otherwise
 //! an auto-refreshing OIDC provider that persists rotated tokens to disk.
 //!
-//! The in-leader `grok workspace` exposure does NOT use this path — it sources
+//! The in-leader `open-grok workspace` exposure does NOT use this path — it sources
 //! an in-memory provider from the leader's `AuthManager` (see
 //! `LeaderAuthProvider`) to avoid racing the leader's own auth.json writer.
 
@@ -12,9 +12,20 @@ use std::sync::Arc;
 
 use url::Url;
 use xai_computer_hub_sdk::{
-    AuthCredential, AuthIdentity, AuthProvider, OidcAuthProviderBuilder, RefreshEvent,
+    AuthCredential, AuthIdentity, AuthProvider, OidcAuthProviderBuilder, OnRefreshCallback,
+    RefreshEvent,
 };
 
+use crate::status_config::ProactiveRefreshConfig;
+
+#[path = "hub_auth/proactive.rs"]
+mod proactive;
+
+pub use proactive::{ProactiveOidcAuthProvider, ProactiveOidcParams};
+
+pub(crate) fn init_metrics() {
+    proactive::init_metrics();
+}
 /// Plain bearer provider that also carries the owner identity parsed from the
 /// same auth.json entry. Used for the loopback / local-dev path (no OIDC
 /// refresh) so the workspace can still derive `WorkspaceIdentity` from the auth
@@ -74,7 +85,7 @@ struct AuthEntry {
 
 pub fn default_auth_path() -> anyhow::Result<PathBuf> {
     let grok = xai_grok_config::user_grok_home()
-        .ok_or_else(|| anyhow::anyhow!("no user grok home (set $GROK_HOME or $HOME)"))?;
+        .ok_or_else(|| anyhow::anyhow!("no user grok home (set $OPENGROK_HOME or $HOME)"))?;
     Ok(grok.join("auth.json"))
 }
 
@@ -88,7 +99,7 @@ pub fn default_auth_path() -> anyhow::Result<PathBuf> {
 fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
     if !path.exists() {
         anyhow::bail!(
-            "No auth credentials found at {}. Run `grok login` first.",
+            "No auth credentials found at {}. Run `open-grok login` first.",
             path.display()
         );
     }
@@ -110,17 +121,40 @@ fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no OIDC auth entry found in {}. Run `grok login` first.",
+                "no OIDC auth entry found in {}. Run `open-grok login` first.",
                 path.display()
             )
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OidcProviderKind {
+    Sdk,
+    Proactive,
+}
+
+pub(crate) fn persist_on_refresh(auth_path: PathBuf, scope_key: String) -> OnRefreshCallback {
+    Arc::new(move |event: &RefreshEvent| {
+        if let Err(e) = write_refreshed_token(&auth_path, &scope_key, event) {
+            tracing::warn!(error = %e, "failed to persist refreshed token to auth.json");
+        }
+    })
+}
+
+fn persist_on_refresh_off_thread(auth_path: PathBuf, scope_key: String) -> OnRefreshCallback {
+    let persist = persist_on_refresh(auth_path, scope_key);
+    Arc::new(move |event: &RefreshEvent| {
+        let persist = persist.clone();
+        let event = event.clone();
+        std::thread::spawn(move || persist(&event));
+    })
+}
 fn build_oidc_provider(
     scope_key: String,
     entry: &AuthEntry,
     auth_path: PathBuf,
-) -> anyhow::Result<Arc<dyn AuthProvider>> {
+    refresh_cfg: &ProactiveRefreshConfig,
+) -> anyhow::Result<(Arc<dyn AuthProvider>, OidcProviderKind)> {
     let refresh_token = entry.refresh_token.as_ref().ok_or_else(|| {
         anyhow::anyhow!("auth entry has no refresh_token — cannot refresh expired tokens")
     })?;
@@ -131,6 +165,21 @@ fn build_oidc_provider(
         anyhow::anyhow!("auth entry has no oidc_client_id — cannot refresh expired tokens")
     })?;
 
+    if refresh_cfg.enabled {
+        return Ok((
+            Arc::new(ProactiveOidcAuthProvider::new(ProactiveOidcParams {
+                access_token: entry.key.clone(),
+                refresh_token: refresh_token.clone(),
+                issuer: issuer.clone(),
+                client_id: client_id.clone(),
+                identity: identity_from_entry(entry),
+                expires_at: entry.expires_at,
+                refresh: refresh_cfg.clone(),
+                on_refresh: Some(persist_on_refresh(auth_path, scope_key)),
+            })),
+            OidcProviderKind::Proactive,
+        ));
+    }
     let mut builder = OidcAuthProviderBuilder::new(&entry.key, refresh_token, issuer, client_id);
 
     // Owner identity is surfaced via `AuthProvider::identity()` so the workspace
@@ -149,18 +198,9 @@ fn build_oidc_provider(
     // The SDK invokes `on_refresh` inside its async refresh path, and the
     // persist below blocks on a cross-process file lock — run it on its own
     // thread so a contended lock never stalls the runtime.
-    builder = builder.on_refresh(Arc::new(move |event: &RefreshEvent| {
-        let auth_path = auth_path.clone();
-        let scope_key = scope_key.clone();
-        let event = event.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = write_refreshed_token(&auth_path, &scope_key, &event) {
-                tracing::warn!(error = %e, "failed to persist refreshed token to auth.json");
-            }
-        });
-    }));
+    builder = builder.on_refresh(persist_on_refresh_off_thread(auth_path, scope_key));
 
-    Ok(Arc::new(builder.build()))
+    Ok((Arc::new(builder.build()), OidcProviderKind::Sdk))
 }
 
 /// How long [`lock_auth_file`] polls for the shared `auth.json.lock` before
@@ -233,7 +273,11 @@ fn lock_inode_is_live(_file: &std::fs::File, _path: &Path) -> bool {
     true
 }
 
-fn write_refreshed_token(path: &Path, scope_key: &str, event: &RefreshEvent) -> anyhow::Result<()> {
+pub(crate) fn write_refreshed_token(
+    path: &Path,
+    scope_key: &str,
+    event: &RefreshEvent,
+) -> anyhow::Result<()> {
     // Read-modify-write under the shared advisory lock. Writing unlocked here
     // raced the shell's own refresh writer: whichever wrote second silently
     // rolled back the other's freshly rotated refresh token on disk — a
@@ -328,10 +372,11 @@ fn write_json_atomic(path: &Path, value: &serde_json::Value) -> anyhow::Result<(
 }
 
 /// Build a hub auth provider for `hub_url`. `auth_config` overrides
-/// the default credential path (`~/.grok/auth.json`).
-pub fn provider(
+/// the default credential path (`~/.opengrok/auth.json`).
+pub fn provider_with_refresh(
     hub_url: &Url,
     auth_config: Option<&Path>,
+    refresh_cfg: &ProactiveRefreshConfig,
 ) -> anyhow::Result<Arc<dyn AuthProvider>> {
     let auth_path = match auth_config {
         Some(p) => p.to_path_buf(),
@@ -349,7 +394,7 @@ pub fn provider(
             token: entry.key.clone(),
         }))
     } else {
-        build_oidc_provider(scope_key, &entry, auth_path)
+        build_oidc_provider(scope_key, &entry, auth_path, refresh_cfg).map(|(provider, _)| provider)
     }
 }
 
@@ -423,7 +468,7 @@ mod tests {
                 "user_id": "u1",
                 "auth_mode": "oidc",
                 "create_time": "2026-01-01T00:00:00Z",
-                "email": "test@x.ai",
+                "email": "test@example.com",
                 "first_name": "Test",
                 "refresh_token": "rt1",
                 "oidc_issuer": "https://auth.x.ai",
@@ -449,7 +494,13 @@ mod tests {
             principal_id: None,
             expires_at: None,
         };
-        let err = build_oidc_provider("oidc".into(), &entry, PathBuf::from("/tmp/x")).unwrap_err();
+        let err = build_oidc_provider(
+            "oidc".into(),
+            &entry,
+            PathBuf::from("/tmp/x"),
+            &ProactiveRefreshConfig::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("refresh_token"));
     }
 
@@ -465,7 +516,13 @@ mod tests {
             principal_id: None,
             expires_at: None,
         };
-        let err = build_oidc_provider("oidc".into(), &entry, PathBuf::from("/tmp/x")).unwrap_err();
+        let err = build_oidc_provider(
+            "oidc".into(),
+            &entry,
+            PathBuf::from("/tmp/x"),
+            &ProactiveRefreshConfig::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("oidc_issuer"));
     }
 
@@ -481,7 +538,13 @@ mod tests {
             principal_id: None,
             expires_at: None,
         };
-        let err = build_oidc_provider("oidc".into(), &entry, PathBuf::from("/tmp/x")).unwrap_err();
+        let err = build_oidc_provider(
+            "oidc".into(),
+            &entry,
+            PathBuf::from("/tmp/x"),
+            &ProactiveRefreshConfig::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("oidc_client_id"));
     }
 
@@ -497,7 +560,17 @@ mod tests {
             principal_id: Some("t1".into()),
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
         };
-        let provider = build_oidc_provider("oidc".into(), &entry, PathBuf::from("/tmp/x")).unwrap();
+        let (provider, kind) = build_oidc_provider(
+            "oidc".into(),
+            &entry,
+            PathBuf::from("/tmp/x"),
+            &ProactiveRefreshConfig {
+                enabled: false,
+                ..ProactiveRefreshConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(kind, OidcProviderKind::Sdk);
         let cred = provider.current();
         match cred {
             xai_computer_hub_sdk::AuthCredential::Bearer { token } => {
@@ -534,7 +607,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(updated["oidc"]["key"], "eyJ.new");
         assert_eq!(updated["oidc"]["refresh_token"], "rt-new");
-        assert_eq!(updated["legacy"]["key"], "xai-old"); // untouched
+        assert_eq!(updated["legacy"]["key"], "xai-old");
     }
 
     /// With several OIDC entries (personal + enterprise login), the one with
@@ -657,7 +730,81 @@ mod tests {
             r#"{ "oidc": { "key": "eyJ.tok", "user_id": "u1", "refresh_token": "rt", "oidc_issuer": "https://auth.x.ai", "oidc_client_id": "c1" } }"#,
         );
         let url = Url::parse("ws://localhost:9988/v1/tools").unwrap();
-        let auth = provider(&url, Some(&path)).unwrap();
+        let auth =
+            provider_with_refresh(&url, Some(&path), &ProactiveRefreshConfig::default()).unwrap();
+        match auth.current() {
+            AuthCredential::Bearer { token } => assert_eq!(token, "eyJ.tok"),
+            _ => panic!("expected Bearer"),
+        }
+        let id = auth.identity().expect("loopback identity present");
+        assert_eq!(id.user_id, "u1");
+    }
+
+    fn complete_oidc_entry() -> AuthEntry {
+        AuthEntry {
+            key: "eyJ.tok".into(),
+            user_id: "u1".into(),
+            refresh_token: Some("rt".into()),
+            oidc_issuer: Some("https://auth.x.ai".into()),
+            oidc_client_id: Some("c1".into()),
+            principal_type: Some("Team".into()),
+            principal_id: Some("t1".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        }
+    }
+
+    #[test]
+    fn build_oidc_provider_flag_off_uses_sdk_provider() {
+        let (provider, kind) = build_oidc_provider(
+            "oidc".into(),
+            &complete_oidc_entry(),
+            PathBuf::from("/tmp/x"),
+            &ProactiveRefreshConfig {
+                enabled: false,
+                ..ProactiveRefreshConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(kind, OidcProviderKind::Sdk);
+        match provider.current() {
+            AuthCredential::Bearer { token } => assert_eq!(token, "eyJ.tok"),
+            _ => panic!("expected Bearer"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_oidc_provider_flag_on_uses_proactive_provider() {
+        let refresh = ProactiveRefreshConfig {
+            enabled: true,
+            ..ProactiveRefreshConfig::default()
+        };
+        let (provider, kind) = build_oidc_provider(
+            "oidc".into(),
+            &complete_oidc_entry(),
+            PathBuf::from("/tmp/x"),
+            &refresh,
+        )
+        .unwrap();
+        assert_eq!(kind, OidcProviderKind::Proactive);
+        match provider.current() {
+            AuthCredential::Bearer { token } => assert_eq!(token, "eyJ.tok"),
+            _ => panic!("expected Bearer"),
+        }
+    }
+
+    #[test]
+    fn provider_loopback_ignores_proactive_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_auth_json(
+            dir.path(),
+            r#"{ "oidc": { "key": "eyJ.tok", "user_id": "u1", "refresh_token": "rt", "oidc_issuer": "https://auth.x.ai", "oidc_client_id": "c1" } }"#,
+        );
+        let refresh = ProactiveRefreshConfig {
+            enabled: true,
+            ..ProactiveRefreshConfig::default()
+        };
+        let url = Url::parse("ws://localhost:9988/v1/tools").unwrap();
+        let auth = provider_with_refresh(&url, Some(&path), &refresh).unwrap();
         match auth.current() {
             AuthCredential::Bearer { token } => assert_eq!(token, "eyJ.tok"),
             _ => panic!("expected Bearer"),
@@ -666,4 +813,10 @@ mod tests {
         let id = auth.identity().expect("loopback identity present");
         assert_eq!(id.user_id, "u1");
     }
+}
+pub fn provider(
+    hub_url: &Url,
+    auth_config: Option<&Path>,
+) -> anyhow::Result<Arc<dyn AuthProvider>> {
+    provider_with_refresh(hub_url, auth_config, &ProactiveRefreshConfig::default())
 }

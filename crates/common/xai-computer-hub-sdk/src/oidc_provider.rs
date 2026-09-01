@@ -199,7 +199,8 @@ impl OidcAuthProvider {
     async fn do_refresh(&self) -> Result<(), Box<dyn std::error::Error>> {
         let refresh_token = self.state.lock().refresh_token.clone();
         let issuer = self.issuer.trim_end_matches('/');
-        let client = reqwest::Client::new();
+        #[allow(clippy::disallowed_methods)]
+        let client = reqwest::Client::builder().build()?;
 
         #[derive(serde::Deserialize)]
         struct Discovery {

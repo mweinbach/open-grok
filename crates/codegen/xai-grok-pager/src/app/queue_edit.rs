@@ -77,6 +77,9 @@ impl AgentView {
             }
             if key.code == KeyCode::Esc || ctrl_c_empty {
                 self.exit_editing_mode();
+                if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                    return Some(InputOutcome::Changed);
+                }
                 return Some(InputOutcome::Action(Action::DrainQueue));
             }
         }
@@ -110,6 +113,7 @@ impl AgentView {
             // Clean edit — silently exit editing mode.
             self.exit_editing_mode();
             self.active_pane = target;
+            crate::app::turn_completion::reopen_blocked_card_if_held(self);
             return Some(true);
         }
         None
@@ -136,6 +140,9 @@ impl AgentView {
                     if self.prompt.text().trim().is_empty() {
                         self.exit_editing_mode();
                         self.set_active_pane(pending_target, true);
+                        if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                            return InputOutcome::Changed;
+                        }
                         if was_drain_blocked {
                             return InputOutcome::Action(Action::DrainQueue);
                         }
@@ -161,6 +168,9 @@ impl AgentView {
                     // Discard changes (revert to original), exit editing.
                     self.exit_editing_mode();
                     self.set_active_pane(pending_target, true);
+                    if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                        return InputOutcome::Changed;
+                    }
                     if was_drain_blocked {
                         return InputOutcome::Action(Action::DrainQueue);
                     }
@@ -185,6 +195,7 @@ impl AgentView {
                             .unwrap_or(0);
                         self.exit_editing_mode();
                         self.set_active_pane(pending_target, true);
+                        crate::app::turn_completion::reopen_blocked_card_if_held(self);
                         return InputOutcome::Action(Action::QueueRemoveShared {
                             id: server_id,
                             expected_version,
@@ -195,8 +206,9 @@ impl AgentView {
                     }
                     self.exit_editing_mode();
                     self.set_active_pane(pending_target, true);
-                    // If drain was blocked and we deleted the front,
-                    // the next prompt (if any) should now drain.
+                    if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                        return InputOutcome::Changed;
+                    }
                     if was_drain_blocked {
                         return InputOutcome::Action(Action::DrainQueue);
                     }
@@ -416,6 +428,16 @@ impl AgentView {
                 }
                 crate::prompt_images::drain_and_cleanup(&mut images);
                 self.exit_editing_mode();
+                if self
+                    .session
+                    .blocked_prompt
+                    .as_ref()
+                    .is_none_or(|b| b.row_id == id)
+                {
+                    self.release_hook_block_hold();
+                } else if crate::app::turn_completion::reopen_blocked_card_if_held(self) {
+                    return InputOutcome::Changed;
+                }
                 if drain {
                     InputOutcome::Action(Action::DrainQueue)
                 } else {
@@ -849,6 +871,7 @@ mod tests {
             target: crate::app::actions::ClipboardPasteTarget::AgentPrompt {
                 agent_id: agent.session.id,
                 images_dir: None,
+                feedback_tool_call_id: None,
             },
             source: crate::app::actions::ClipboardPasteSource::ClipboardKey {
                 text: crate::app::actions::ClipboardTextRead::Success(None),
@@ -1550,9 +1573,19 @@ mod tests {
         }
     }
 
-    /// `exit_editing_mode` clears a stray `EditConfirm` (unreachable in-tree
-    /// after the reorder, so pin the backstop directly) and leaves every
-    /// other modal variant alone.
+    #[test]
+    fn exit_editing_mode_keeps_hook_block_hold() {
+        let mut agent = make_running_agent();
+        agent.session.hook_block_hold = true;
+        agent.prompt_mode = editing_lone_local();
+        agent.exit_editing_mode();
+        assert!(
+            agent.session.hook_block_hold,
+            "a plain edit exit resolves nothing: only saving or deleting the \
+             blocked row releases the hold"
+        );
+    }
+
     #[test]
     fn exit_editing_mode_clears_only_stray_edit_confirm() {
         let mut agent = make_running_agent();

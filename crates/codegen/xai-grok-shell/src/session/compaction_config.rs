@@ -212,6 +212,12 @@ pub(crate) struct CompactionConfig {
     pub cancel: CompactCancelGate,
 }
 
+impl CompactionConfig {
+    pub(crate) fn is_suppressed(&self) -> bool {
+        self.auto_compact_suppressed.load(Ordering::Relaxed) != SUPPRESS_NONE
+    }
+}
+
 #[cfg(test)]
 mod prefire_state_tests {
     use super::*;

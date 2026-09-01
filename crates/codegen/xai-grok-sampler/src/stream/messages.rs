@@ -19,24 +19,7 @@ use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
 use crate::types::RequestId;
 
-/// The verbatim wire string for a Messages API stop reason, before it collapses
-/// into the internal [`StopReason`]. Uses the enum's serde `snake_case`
-/// renaming so it cannot drift from the wire contract.
-fn messages_stop_reason_wire(sr: &messages::StopReason) -> String {
-    match serde_json::to_value(sr) {
-        Ok(serde_json::Value::String(s)) => s,
-        other => {
-            debug_assert!(
-                false,
-                "StopReason must serialize to a string, got {other:?}"
-            );
-            "end_turn".to_string()
-        }
-    }
-}
-
-/// Returns whether a Messages API event reflects real model progress
-/// rather than a liveness-only heartbeat (Ping).
+/// Returns whether a Messages API event reflects real model progress rather than a liveness-only heartbeat (Ping).
 pub(crate) fn messages_event_has_meaningful_content(event: &MessageStreamEvent) -> bool {
     match event {
         MessageStreamEvent::Ping => false,
@@ -78,6 +61,8 @@ enum BlockType {
 /// [`SamplingEvent::Failed`]) per request. Server-side `Error` events
 /// translate to `SamplingError::Api { status: 500, .. }` so the actor's
 /// retry loop treats them as retryable transport-level errors.
+/// Empty tool-input placeholders are finalized only after a non-truncated
+/// stop is known; populated JSON inputs may complete at their block stop.
 pub fn stream_messages<'a>(
     raw_stream: BoxStream<'a, Result<MessageStreamEvent, SamplingError>>,
     model_metadata: Option<ResponseModelMetadata>,
@@ -402,33 +387,16 @@ pub fn stream_messages<'a>(
                                 }
                             }
                             BlockType::ToolUse => {
-                                let mut arguments = state.args_acc;
-                                if arguments.is_empty() {
-                                    arguments.push_str("{}");
-                                    if let Some(&tool_index) = block_to_tool_index.get(&index) {
-                                        yield SamplingEvent::ToolCallDelta {
+                                let arguments = state.args_acc;
+                                if let Some(&tool_index) = block_to_tool_index.get(&index) {
+                                    if serde_json::from_str::<serde::de::IgnoredAny>(&arguments).is_ok() {
+                                        yield SamplingEvent::ToolCallArgumentsComplete {
                                             request_id: request_id.clone(),
                                             tool_index,
-                                            id: None,
-                                            name: None,
-                                            arguments_delta: Some(arguments.clone()),
+                                            id: Some(state.tool_id.clone()),
+                                            name: Some(state.tool_name.clone()),
                                         };
                                     }
-                                }
-                                // The block's arguments are final. Emit before
-                                // assembling the canonical call so consumers
-                                // accumulating fragments can act mid-stream;
-                                // exactly once per block because the state is
-                                // removed above.
-                                if let Some(&tool_index) = block_to_tool_index.get(&index) {
-                                    yield SamplingEvent::ToolCallArgumentsComplete {
-                                        request_id: request_id.clone(),
-                                        tool_index,
-                                        id: Some(state.tool_id.clone()),
-                                        name: Some(state.tool_name.clone()),
-                                    };
-                                }
-                                if let Some(&tool_index) = block_to_tool_index.get(&index) {
                                     assistant_tool_calls.insert(tool_index, ToolCall {
                                         id: std::sync::Arc::<str>::from(state.tool_id),
                                         name: state.tool_name,
@@ -447,10 +415,11 @@ pub fn stream_messages<'a>(
                         final_stop_message = details.explanation;
                     }
                     // Keep the exact wire string so consumers can echo it.
-                    final_raw_stop_reason =
-                        delta.stop_reason.as_ref().map(messages_stop_reason_wire);
-                    // The matched stop sequence rides the same terminal delta
-                    // (present only on a `stop_sequence` stop); carry it verbatim.
+                    final_raw_stop_reason = delta
+                        .stop_reason
+                        .as_ref()
+                        .map(messages::StopReason::wire_str)
+                        .or(final_raw_stop_reason);
                     if delta.stop_sequence.is_some() {
                         final_stop_sequence = delta.stop_sequence.clone();
                     }
@@ -478,7 +447,7 @@ pub fn stream_messages<'a>(
                             // overflow, neither of which exists here.
                             tracing::warn!(
                                 wire_stop_reason = "model_context_window_exceeded",
-                                "context window hit mid-generation; surfacing as max_tokens truncation"
+                                "context window hit mid-generation; mapping to the Length stop class"
                             );
                             StopReason::Length
                         }
@@ -489,7 +458,7 @@ pub fn stream_messages<'a>(
                             );
                             StopReason::Stop
                         }
-                    });
+                    }).or(final_stop_reason);
                     final_output_tokens = usage.output_tokens;
                     // Optional on the delta; preserve message_start values when omitted.
                     if let Some(input) = usage.input_tokens {
@@ -546,12 +515,25 @@ pub fn stream_messages<'a>(
             }
         }
 
-        if final_stop_reason == Some(StopReason::Length) {
-            yield SamplingEvent::Failed {
-                request_id: request_id.clone(),
-                error: SamplingErrorInfo::from(&SamplingError::MaxTokensTruncation),
-            };
-            return;
+        if matches!(final_stop_reason, Some(StopReason::Stop | StopReason::ToolCalls)) {
+            for (&tool_index, call) in &mut assistant_tool_calls {
+                if call.arguments.is_empty() {
+                    call.arguments = std::sync::Arc::from("{}");
+                    yield SamplingEvent::ToolCallDelta {
+                        request_id: request_id.clone(),
+                        tool_index,
+                        id: None,
+                        name: None,
+                        arguments_delta: Some(call.arguments.to_string()),
+                    };
+                    yield SamplingEvent::ToolCallArgumentsComplete {
+                        request_id: request_id.clone(),
+                        tool_index,
+                        id: Some(call.id.to_string()),
+                        name: Some(call.name.clone()),
+                    };
+                }
+            }
         }
 
         // ── Build the final response ─────────────────────────────────
@@ -573,9 +555,9 @@ pub fn stream_messages<'a>(
             None
         };
 
-        let stop_reason = if !assistant_tool_calls.is_empty() {
-            // Completed tool_use blocks win even over Refusal: the calls are
-            // real model output the agent loop must resolve.
+        let stop_reason = if final_stop_reason == Some(StopReason::Length) {
+            final_stop_reason
+        } else if !assistant_tool_calls.is_empty() {
             Some(StopReason::ToolCalls)
         } else {
             final_stop_reason

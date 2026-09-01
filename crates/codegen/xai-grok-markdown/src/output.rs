@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use ratatui::text::Line;
 
-use crate::buffers::CodeBlockMeta;
+use crate::buffers::{CodeBlockMeta, TableCopyMeta};
 
 /// A hyperlink target extracted from rendered markdown.
 ///
@@ -93,6 +93,7 @@ pub struct MarkdownRenderOutput {
     /// Fenced code blocks discovered during rendering, in document order.
     /// One entry per closed fenced block; see [`CodeBlockSpan`].
     pub code_blocks: Vec<CodeBlockSpan>,
+    pub tables: Vec<TableCopyMeta>,
 }
 
 impl MarkdownRenderOutput {
@@ -107,6 +108,7 @@ impl MarkdownRenderOutput {
         self.line_source_map.clear();
         self.hyperlinks.clear();
         self.code_blocks.clear();
+        self.tables.clear();
     }
 
     /// Get a borrowed view of this output.
@@ -116,6 +118,7 @@ impl MarkdownRenderOutput {
             line_source_map: &self.line_source_map,
             hyperlinks: &self.hyperlinks,
             code_blocks: &self.code_blocks,
+            tables: &self.tables,
         }
     }
 }
@@ -138,6 +141,7 @@ pub struct MarkdownRenderView<'a> {
     /// Fenced code blocks discovered during rendering, in document order.
     /// One entry per closed fenced block; see [`CodeBlockSpan`].
     pub code_blocks: &'a [CodeBlockSpan],
+    pub tables: &'a [TableCopyMeta],
 }
 
 impl<'a> MarkdownRenderView<'a> {

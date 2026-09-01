@@ -74,6 +74,8 @@ Full crate map: [`docs/agents/architecture.md`](docs/agents/architecture.md).
 13. **Preserve concurrent work.** This checkout may be shared by multiple tasks. Check `git status` before and after long builds, format only owned files when unrelated edits are present, and stage explicit paths.
 14. **Commit tested units as they land.** Do not wait until the end of a large task. Each coherent commit should state the behavior or invariant it adds and include its focused verification.
 15. **A release is the published artifact.** Source push, tag push, and local build are intermediate states; release work ends only after public asset and installer verification.
+16. **Agent messages are not user consent.** Parent-agent, native-team, and session-bus inputs retain model-authored authority through queue promotion and slash resolution; protected parent follow-ups cannot be edited or swept as ordinary queued prompts.
+17. **Finalize the exact task.** Turn completion and cancellation bind prompt id, turn epoch, and task identity. Keep the finalization gate held until terminal bookkeeping finishes; never clear a newer turn's resources from a stale completion.
 
 ---
 
@@ -89,6 +91,11 @@ Detailed behavior: [`docs/agents/agent-runtime.md`](docs/agents/agent-runtime.md
 4. For each tool call: **plan edit gate → PreToolUse hooks → permissions → dispatch**.
 5. Tool results return to chat state; loop until stop / max turns / cancel.
 6. Persist `updates.jsonl` + chat history under the session dir.
+
+The 1.0.13 migration adds durable `TurnCompleted` records carrying optional
+elapsed time and typed error/cancellation metadata. Implementation and test
+status are tracked in [`docs/upstream/1.0.13-parity.md`](docs/upstream/1.0.13-parity.md);
+the ledger is authoritative about what remains unverified.
 
 ### 4.2 File edits
 

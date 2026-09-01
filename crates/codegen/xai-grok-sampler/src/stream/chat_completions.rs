@@ -293,7 +293,7 @@ pub fn stream_chat_completions<'a>(
 
         // Honor tool calls by overriding the stop reason if the model
         // forgot to set it (mirrors the shell's behavior).
-        if !tool_calls.is_empty() {
+        if !tool_calls.is_empty() && finish_reason != Some(StopReason::Length) {
             finish_reason = Some(StopReason::ToolCalls);
         }
 
@@ -773,6 +773,76 @@ mod tests {
                 );
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn length_finish_completes_with_length_stop() {
+        let raw = stream::iter::<Vec<Result<ChatCompletionChunk, SamplingError>>>(vec![
+            Ok(text_chunk("truncated answ")),
+            Ok(final_chunk(FinishReason::Length)),
+        ])
+        .boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Length));
+                assert_eq!(response.assistant_text(), "truncated answ");
+            }
+            other => panic!("expected Completed(Length), got {other:?}"),
+        }
+    }
+
+    /// A truncated tool call retains its length stop for the common salvage gate.
+    #[tokio::test]
+    async fn tool_calls_override_length_finish() {
+        let tool_chunk = make_chunk(vec![ChatChunkDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: Vec::new(),
+            tool_calls: vec![ChunkToolCallDelta {
+                index: 0,
+                id: Some("call_cut".into()),
+                kind: Some("function".into()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some("do_thing".into()),
+                    arguments: Some("{\"x\": \"trunc".into()),
+                }),
+            }],
+            tool_call_id: None,
+        }]);
+        let raw = stream::iter::<Vec<Result<ChatCompletionChunk, SamplingError>>>(vec![
+            Ok(tool_chunk),
+            Ok(final_chunk(FinishReason::Length)),
+        ])
+        .boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Length));
+                assert_eq!(response.tool_calls().len(), 1);
+                assert_eq!(
+                    xai_grok_sampling_types::LengthPolicy::default().verdict(response),
+                    xai_grok_sampling_types::LengthVerdict::Fail,
+                );
+            }
+            other => panic!("expected Completed(ToolCalls), got {other:?}"),
         }
     }
 

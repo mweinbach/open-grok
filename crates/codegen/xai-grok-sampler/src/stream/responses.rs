@@ -15,9 +15,10 @@ use futures_util::stream::{BoxStream, Stream};
 
 use xai_grok_sampling_types::{
     ConversationItem, ConversationResponse, ResponseModelMetadata, SamplingError, StopReason,
-    TokenUsage, rs,
+    TokenUsage, messages as messages_types, rs,
 };
 
+use crate::doom_loop_recovery::FailedResponseCapture;
 use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
 use crate::stream::display_citations::{DisplayCitationFilter, strip_display_citations_in_items};
@@ -33,8 +34,16 @@ enum ReasoningUnitKey {
     RawText(u32, String, u32),
 }
 
-/// Returns whether a Responses API event reflects real model progress
-/// rather than a liveness-only heartbeat / status transition.
+/// Wire values of `incomplete_details.reason` on an `Incomplete` response.
+/// The xAI server emits the three `max_*` values; `content_filter` is OpenAI vocabulary, kept for spec compatibility.
+const INCOMPLETE_REASON_CONTENT_FILTER: &str = "content_filter";
+const INCOMPLETE_REASON_MAX_OUTPUT_TOKENS: &str = "max_output_tokens";
+/// The model's context window was exhausted mid-generation (xAI extension).
+const INCOMPLETE_REASON_MAX_PROMPT_TOKENS: &str = "max_prompt_tokens";
+/// A server-side time limit cut generation short (xAI extension).
+const INCOMPLETE_REASON_MAX_TIME_LIMIT: &str = "max_time_limit";
+
+/// Returns whether a Responses API event reflects real model progress rather than a liveness-only heartbeat or status transition.
 pub(crate) fn responses_event_has_meaningful_content(event: &rs::ResponseStreamEvent) -> bool {
     use rs::ResponseStreamEvent;
 
@@ -118,11 +127,91 @@ fn missing_tool_input_suffix(streamed: &mut String, complete: &str) -> Option<St
 /// Transform a raw Responses API event stream into a stream of
 /// [`SamplingEvent`]s.
 ///
-/// Yields exactly one terminal event ([`SamplingEvent::Completed`] or
-/// [`SamplingEvent::Failed`]) per request. Server-side `ResponseFailed`
-/// and `ResponseError` events are translated to
-/// `SamplingError::Api { status: 500, .. }` so the actor's retry loop
-/// treats them as retryable.
+/// This is the single observation point: it runs for every frame *before* the abort gate.
+/// The frame a confident signal aborts on is therefore observed exactly like any other.
+/// A completed item is the authoritative copy of what the deltas approximated.
+/// Any frame that names tool activity or compaction state vetoes the replay, since reasoning must never be retried without the item it is bound to.
+fn observe_for_recovery(capture: &FailedResponseCapture, event: &rs::ResponseStreamEvent) {
+    use rs::ResponseStreamEvent as Event;
+    if !capture.is_armed() {
+        return;
+    }
+    match event {
+        Event::ResponseOutputTextDelta(text) => capture.record_output_delta(
+            text.output_index,
+            text.content_index,
+            text.item_id.clone(),
+            &text.delta,
+        ),
+        Event::ResponseOutputTextDone(text) => capture.record_output_done(
+            text.output_index,
+            text.content_index,
+            text.item_id.clone(),
+            text.text.clone(),
+        ),
+        Event::ResponseReasoningTextDelta(reasoning) => capture.record_reasoning_delta(
+            reasoning.output_index,
+            reasoning.content_index,
+            reasoning.item_id.clone(),
+            &reasoning.delta,
+        ),
+        Event::ResponseReasoningTextDone(reasoning) => capture.record_reasoning_done(
+            reasoning.output_index,
+            reasoning.content_index,
+            reasoning.item_id.clone(),
+            reasoning.text.clone(),
+        ),
+        Event::ResponseReasoningSummaryTextDelta(summary) => capture
+            .record_reasoning_summary_delta(
+                summary.output_index,
+                summary.summary_index,
+                summary.item_id.clone(),
+                &summary.delta,
+            ),
+        Event::ResponseReasoningSummaryTextDone(summary) => capture.record_reasoning_summary_done(
+            summary.output_index,
+            summary.summary_index,
+            summary.item_id.clone(),
+            summary.text.clone(),
+        ),
+        Event::ResponseOutputItemAdded(added) => capture.record_item_start(&added.item),
+        Event::ResponseOutputItemDone(done) => {
+            capture.record_output_item(done.output_index, &done.item);
+        }
+        Event::ResponseCompleted(completed) => {
+            capture.record_terminal_output(&completed.response.output);
+        }
+        Event::ResponseIncomplete(incomplete) => {
+            capture.record_terminal_output(&incomplete.response.output);
+        }
+        Event::ResponseFunctionCallArgumentsDelta(_)
+        | Event::ResponseFunctionCallArgumentsDone(_)
+        | Event::ResponseCustomToolCallInputDelta(_)
+        | Event::ResponseCustomToolCallInputDone(_)
+        | Event::ResponseCodeInterpreterCallCodeDelta(_)
+        | Event::ResponseCodeInterpreterCallCodeDone(_)
+        | Event::ResponseCodeInterpreterCallInProgress(_)
+        | Event::ResponseCodeInterpreterCallInterpreting(_)
+        | Event::ResponseCodeInterpreterCallCompleted(_)
+        | Event::ResponseFileSearchCallInProgress(_)
+        | Event::ResponseFileSearchCallSearching(_)
+        | Event::ResponseFileSearchCallCompleted(_)
+        | Event::ResponseWebSearchCallInProgress(_)
+        | Event::ResponseWebSearchCallSearching(_)
+        | Event::ResponseWebSearchCallCompleted(_)
+        | Event::ResponseImageGenerationCallInProgress(_)
+        | Event::ResponseImageGenerationCallGenerating(_)
+        | Event::ResponseImageGenerationCallCompleted(_)
+        | Event::ResponseMCPCallInProgress(_)
+        | Event::ResponseMCPCallCompleted(_)
+        | Event::ResponseMCPCallFailed(_)
+        | Event::ResponseMCPCallArgumentsDelta(_)
+        | Event::ResponseMCPCallArgumentsDone(_) => capture.record_unreplayable(),
+        _ => {}
+    }
+}
+
+/// Transform a raw Responses API event stream into a stream of [`SamplingEvent`]s.
 ///
 /// `doom_loop` is the collector returned alongside `raw_stream` by
 /// `SamplingClient::conversation_stream_responses`; any signals the SSE
@@ -143,6 +232,7 @@ pub fn stream_responses<'a>(
         doom_loop,
         Vec::new(),
         Arc::new(AtomicBool::new(false)),
+        FailedResponseCapture::default(),
     )
 }
 
@@ -165,6 +255,7 @@ pub fn stream_responses_with_client_custom_tools<'a>(
         doom_loop,
         client_custom_tool_names,
         Arc::new(AtomicBool::new(false)),
+        FailedResponseCapture::default(),
     )
 }
 
@@ -180,6 +271,7 @@ pub(crate) fn stream_responses_tracked<'a>(
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
     client_custom_tool_names: Vec<String>,
     output_observed: Arc<AtomicBool>,
+    failed_response: FailedResponseCapture,
 ) -> impl Stream<Item = SamplingEvent> + Send + 'a {
     async_stream::stream! {
         use rs::{ResponseStreamEvent, Status};
@@ -227,6 +319,7 @@ pub(crate) fn stream_responses_tracked<'a>(
         // look up `output_index` here to find the matching `tool_index`.
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
         let mut custom_input_streamed: BTreeMap<u32, String> = BTreeMap::new();
+        let mut completed_custom_inputs: BTreeSet<String> = BTreeSet::new();
         let mut function_arguments_streamed: BTreeMap<u32, String> = BTreeMap::new();
         // Exactly-once guard for `ToolCallArgumentsComplete`, keyed by
         // Responses `output_index`.
@@ -271,12 +364,30 @@ pub(crate) fn stream_responses_tracked<'a>(
                 output_observed.store(true, Ordering::Relaxed);
             }
 
-            // A confident server-detected loop aborts the attempt (dropping
-            // the SSE connection) so the retry loop can resample instead of
-            // streaming the burning tail. Checked before the event is
-            // processed so a terminal frame carrying the signal never
-            // becomes the accepted response while the abort is armed.
-            if let Some(triggers) = doom_loop.as_ref().and_then(|c| c.abort_triggers()) {
+            let is_terminal_response = matches!(
+                &event,
+                ResponseStreamEvent::ResponseCompleted(_)
+                    | ResponseStreamEvent::ResponseIncomplete(_)
+            );
+            observe_for_recovery(&failed_response, &event);
+
+            if !is_terminal_response
+                && let Some(triggers) = doom_loop.as_ref().and_then(|collector| collector.abort_triggers())
+            {
+                let all_triggers = doom_loop
+                    .as_ref()
+                    .map(|collector| {
+                        collector
+                            .take()
+                            .into_iter()
+                            .map(|signal| signal.raw)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                yield SamplingEvent::DoomLoopSignals {
+                    request_id: request_id.clone(),
+                    triggers: all_triggers,
+                };
                 let err = SamplingError::DoomLoopDetected {
                     triggers,
                     aborted_at_chunk: Some(chunk_index),
@@ -830,6 +941,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // the x_search lifecycle start signal.
                 ResponseStreamEvent::ResponseCustomToolCallInputDone(ev) => {
                     if let Some(&tool_index) = output_to_tool_index.get(&ev.output_index) {
+                        completed_custom_inputs.insert(ev.item_id.clone());
                         if !arguments_complete_emitted.contains(&ev.output_index) {
                             let streamed = custom_input_streamed
                                 .entry(ev.output_index)
@@ -921,8 +1033,30 @@ pub(crate) fn stream_responses_tracked<'a>(
         // reconstruct the Codex response from its ordered done items. Never
         // merge both representations, which would duplicate messages and
         // tool calls.
+        let completed_custom_calls: std::collections::HashSet<String> = completed_output_items
+            .values()
+            .filter_map(|item| match item {
+                rs::OutputItem::CustomToolCall(call) => Some(call.call_id.clone()),
+                _ => None,
+            })
+            .collect();
         if response.output.is_empty() && !completed_output_items.is_empty() {
             response.output = completed_output_items.into_values().collect();
+        }
+        if response.status == Status::Incomplete {
+            response.output.retain(|item| match item {
+                rs::OutputItem::CustomToolCall(call)
+                    if client_custom_tool_names.iter().any(|name| name == &call.name) =>
+                {
+                    completed_custom_calls.contains(&call.call_id)
+                        || completed_custom_inputs.contains(&call.id)
+                }
+                rs::OutputItem::FunctionCall(call) => !matches!(
+                    call.status,
+                    Some(rs::OutputStatus::InProgress | rs::OutputStatus::Incomplete)
+                ),
+                _ => true,
+            });
         }
 
         for (output_index, item) in response.output.iter().enumerate() {
@@ -1004,6 +1138,10 @@ pub(crate) fn stream_responses_tracked<'a>(
             .and_then(|s| s.parse::<i64>().ok());
 
         let status = response.status.clone();
+        let incomplete_reason = response
+            .incomplete_details
+            .as_ref()
+            .map(|details| details.reason.clone());
 
         // Drop any mid-widget citation buffer so unfinished markers never
         // surface via fallback reconstruction paths.
@@ -1058,13 +1196,48 @@ pub(crate) fn stream_responses_tracked<'a>(
             _ => false,
         });
 
-        let stop_reason = if has_tool_calls {
-            Some(StopReason::ToolCalls)
+        let incomplete_classification: Option<(StopReason, Option<messages_types::StopReason>)> =
+            if matches!(status, Status::Incomplete) {
+                Some(match incomplete_reason.as_deref() {
+                    Some(INCOMPLETE_REASON_CONTENT_FILTER) => (StopReason::ContentFilter, None),
+                    Some(INCOMPLETE_REASON_MAX_OUTPUT_TOKENS) => (
+                        StopReason::Length,
+                        Some(messages_types::StopReason::MaxTokens),
+                    ),
+                    Some(INCOMPLETE_REASON_MAX_PROMPT_TOKENS) => (
+                        StopReason::Length,
+                        Some(messages_types::StopReason::ModelContextWindowExceeded),
+                    ),
+                    Some(INCOMPLETE_REASON_MAX_TIME_LIMIT) => {
+                        tracing::info!(
+                            request_id = %request_id,
+                            "response cut by the server-side time limit"
+                        );
+                        (StopReason::Length, None)
+                    }
+                    None => (StopReason::Length, None),
+                    Some(other) => {
+                        tracing::warn!(
+                            reason = %other,
+                            "unknown incomplete reason; treating as Length"
+                        );
+                        (StopReason::Length, None)
+                    }
+                })
+            } else {
+                None
+            };
+
+        let (stop_reason, raw_stop_reason) = if has_tool_calls && incomplete_classification.is_none() {
+            (Some(StopReason::ToolCalls), None)
         } else {
             match status {
-                Status::Completed => Some(StopReason::Stop),
-                Status::Incomplete => Some(StopReason::Length),
-                _ => None,
+                Status::Completed => (Some(StopReason::Stop), None),
+                Status::Incomplete => match incomplete_classification {
+                    Some((stop, raw)) => (Some(stop), raw.map(|reason| reason.wire_str())),
+                    None => (None, None),
+                },
+                _ => (None, None),
             }
         };
 
@@ -1095,7 +1268,7 @@ pub(crate) fn stream_responses_tracked<'a>(
             doom_loop_signals,
             stop_message: None, // not reported on the Responses API
             message_id: None,   // no provider message id on the Responses API
-            raw_stop_reason: None,
+            raw_stop_reason,
             stop_sequence: None,
         };
 
@@ -1270,6 +1443,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_abort_on_a_tool_input_frame_vetoes_the_replay() {
+        for tool_frame in [
+            rs::ResponseStreamEvent::ResponseCustomToolCallInputDelta(
+                rs_types::ResponseCustomToolCallInputDeltaEvent {
+                    sequence_number: 1,
+                    output_index: 1,
+                    item_id: "custom-1".into(),
+                    delta: "{\"q\":".into(),
+                },
+            ),
+            rs::ResponseStreamEvent::ResponseCodeInterpreterCallCodeDelta(
+                rs_types::ResponseCodeInterpreterCallCodeDeltaEvent {
+                    sequence_number: 1,
+                    output_index: 1,
+                    item_id: "ci-1".into(),
+                    delta: "print(".into(),
+                },
+            ),
+        ] {
+            let capture = FailedResponseCapture::armed();
+            let collector = crate::doom_loop::DoomLoopSignalCollector::new(
+                xai_grok_sampling_types::DoomLoopRecoveryPolicy::default(),
+            );
+            collector.absorb(
+                xai_grok_sampling_types::doom_loop::DOOM_LOOP_CHECK_EVENT_TYPE,
+                r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:8@thinking"]}}"#,
+            );
+
+            capture.record_reasoning_delta(0, 0, "reasoning-1".into(), "looping thought");
+            let raw = stream::iter(vec![Ok(tool_frame), Ok(completed_event())]).boxed();
+            let events = collect(stream_responses_tracked(
+                raw,
+                None,
+                rid(),
+                Duration::from_secs(60),
+                Some(collector),
+                Vec::new(),
+                Arc::new(AtomicBool::new(false)),
+                capture.clone(),
+            ))
+            .await;
+
+            assert!(
+                matches!(events.last(), Some(SamplingEvent::Failed { .. })),
+                "the confident signal aborts the attempt"
+            );
+            assert!(
+                capture.take_items().is_empty(),
+                "a turn with a call in flight replays nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn missing_completed_event_yields_failed() {
         let raw =
             stream::iter(Vec::<Result<rs::ResponseStreamEvent, SamplingError>>::new()).boxed();
@@ -1289,6 +1516,230 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    fn incomplete_event(reason: &str) -> rs::ResponseStreamEvent {
+        let mut response = build_response(rs_types::Status::Incomplete);
+        response.incomplete_details = Some(rs_types::IncompleteDetails {
+            reason: reason.into(),
+        });
+        rs::ResponseStreamEvent::ResponseIncomplete(rs_types::ResponseIncompleteEvent {
+            response,
+            sequence_number: 0,
+        })
+    }
+
+    /// Returns the (collapsed stop reason, raw wire stop reason) for an Incomplete response ending with the given `incomplete_details.reason`.
+    async fn stop_reasons_for_incomplete(reason: &str) -> (Option<StopReason>, Option<String>) {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("cut")),
+            Ok(incomplete_event(reason)),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                (response.stop_reason, response.raw_stop_reason.clone())
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    async fn stop_reason_for_incomplete(reason: &str) -> Option<StopReason> {
+        stop_reasons_for_incomplete(reason).await.0
+    }
+
+    /// A token-budget cut maps to Length (the salvageable class).
+    #[tokio::test]
+    async fn incomplete_max_output_tokens_maps_to_length() {
+        assert_eq!(
+            stop_reasons_for_incomplete("max_output_tokens").await,
+            (Some(StopReason::Length), Some("max_tokens".to_string()))
+        );
+    }
+
+    /// Context-window exhaustion ("max_prompt_tokens", the xAI extension) is also a Length cut, not the unknown-reason fallback.
+    /// It keeps its wire distinction in `raw_stop_reason`, in the Messages vocabulary.
+    #[tokio::test]
+    async fn incomplete_max_prompt_tokens_maps_to_length() {
+        assert_eq!(
+            stop_reasons_for_incomplete("max_prompt_tokens").await,
+            (
+                Some(StopReason::Length),
+                Some("model_context_window_exceeded".to_string())
+            )
+        );
+    }
+
+    /// A server time-limit cut ("max_time_limit", the xAI extension) is a known Length cut, not the unknown-reason fallback.
+    /// It carries no raw reason (the Messages vocabulary has no word for it).
+    #[tokio::test]
+    async fn incomplete_max_time_limit_maps_to_length() {
+        assert_eq!(
+            stop_reasons_for_incomplete("max_time_limit").await,
+            (Some(StopReason::Length), None)
+        );
+    }
+
+    /// A moderation cut maps to ContentFilter, never Length: a filter-cut response must not be salvaged and continued by `LengthPolicy`.
+    #[tokio::test]
+    async fn incomplete_content_filter_maps_to_content_filter() {
+        assert_eq!(
+            stop_reason_for_incomplete("content_filter").await,
+            Some(StopReason::ContentFilter)
+        );
+    }
+
+    /// A missing `incomplete_details` still maps to Length: an Incomplete response must never look like a clean Stop.
+    #[tokio::test]
+    async fn incomplete_without_details_maps_to_length() {
+        let event =
+            rs::ResponseStreamEvent::ResponseIncomplete(rs_types::ResponseIncompleteEvent {
+                response: build_response(rs_types::Status::Incomplete),
+                sequence_number: 0,
+            });
+        let raw = stream::iter(vec![Ok(text_delta_event("cut")), Ok(event)]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Length));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Partial function arguments retain Length so the salvage gate rejects execution.
+    #[tokio::test]
+    async fn incomplete_with_tool_calls_maps_to_tool_calls() {
+        let mut response = build_response(rs_types::Status::Incomplete);
+        response.incomplete_details = Some(rs_types::IncompleteDetails {
+            reason: "max_output_tokens".into(),
+        });
+        response.output = vec![rs_types::OutputItem::FunctionCall(
+            rs_types::FunctionToolCall {
+                arguments: "{\"x\":1".into(),
+                call_id: "call_1".into(),
+                name: "do_thing".into(),
+                id: None,
+                status: None,
+            },
+        )];
+        let event =
+            rs::ResponseStreamEvent::ResponseIncomplete(rs_types::ResponseIncompleteEvent {
+                response,
+                sequence_number: 0,
+            });
+        let raw = stream::iter(vec![Ok(event)]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Length));
+                assert_eq!(response.raw_stop_reason.as_deref(), Some("max_tokens"));
+                assert_eq!(
+                    xai_grok_sampling_types::LengthPolicy::default().verdict(response),
+                    xai_grok_sampling_types::LengthVerdict::Fail,
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_native_custom_call_requires_completed_output_item() {
+        for completion_event in ["missing", "output_done", "input_done"] {
+            let completed = completion_event != "missing";
+            let call: rs_types::OutputItem = serde_json::from_value(serde_json::json!({
+                "type": "custom_tool_call",
+                "call_id": "custom_call",
+                "id": "custom_item",
+                "name": "exec",
+                "input": "text(await tools.read_file({file_path: '/tmp/input'}));",
+            }))
+            .unwrap();
+            let mut response = build_response(rs_types::Status::Incomplete);
+            response.incomplete_details = Some(rs_types::IncompleteDetails {
+                reason: "max_output_tokens".into(),
+            });
+            response.output = vec![call.clone()];
+            let mut wire = Vec::new();
+            if completion_event == "output_done" {
+                wire.push(Ok(output_item_done_event(0, call)));
+            } else if completion_event == "input_done" {
+                wire.push(Ok(serde_json::from_value(serde_json::json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": 0,
+                    "output_index": 0,
+                    "item": call,
+                }))
+                .unwrap()));
+                wire.push(Ok(serde_json::from_value(serde_json::json!({
+                    "type": "response.custom_tool_call_input.done",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item_id": "custom_item",
+                    "input": "text(await tools.read_file({file_path: '/tmp/input'}));",
+                }))
+                .unwrap()));
+            }
+            wire.push(Ok(rs::ResponseStreamEvent::ResponseIncomplete(
+                rs_types::ResponseIncompleteEvent {
+                    response,
+                    sequence_number: 1,
+                },
+            )));
+            let events = collect(stream_responses_with_client_custom_tools(
+                stream::iter(wire).boxed(),
+                None,
+                rid(),
+                Duration::from_secs(60),
+                None,
+                vec!["exec".to_owned()],
+            ))
+            .await;
+            let Some(SamplingEvent::Completed { response, .. }) = events.last() else {
+                panic!("stream must complete before length policy");
+            };
+            assert_eq!(response.tool_calls().len(), usize::from(completed));
+            assert_eq!(
+                xai_grok_sampling_types::LengthPolicy::default().verdict(response),
+                if completed {
+                    xai_grok_sampling_types::LengthVerdict::SalvageToolCalls
+                } else {
+                    xai_grok_sampling_types::LengthVerdict::Fail
+                },
+            );
+        }
+    }
+
+    /// The unknown-reason arm is the forward-compatibility story.
+    /// A wire value this client has never seen collapses to Length (salvageable, never a parse failure) and carries no raw reason.
+    #[tokio::test]
+    async fn incomplete_unknown_reason_maps_to_length() {
+        assert_eq!(
+            stop_reasons_for_incomplete("some_future_reason").await,
+            (Some(StopReason::Length), None)
+        );
     }
 
     #[tokio::test]
@@ -2003,6 +2454,7 @@ mod tests {
             None,
             Vec::new(),
             Arc::clone(&output_observed),
+            FailedResponseCapture::default(),
         ))
         .await;
 
@@ -2559,7 +3011,7 @@ mod tests {
     /// the signals ride the response instead.
     #[tokio::test]
     async fn confident_signal_aborts_stream_unless_disarmed() {
-        let confident = r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:8@thinking"]}}"#;
+        let confident = r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:8@thinking","exact_repetition:42x3@thinking"]}}"#;
 
         let collector = crate::doom_loop::DoomLoopSignalCollector::default();
         assert!(collector.absorb("response.doom_loop_check", confident));
@@ -2572,6 +3024,14 @@ mod tests {
             Some(collector),
         ))
         .await;
+        assert!(matches!(
+            events.get(events.len().saturating_sub(2)),
+            Some(SamplingEvent::DoomLoopSignals { triggers, .. })
+                if triggers == &[
+                    "tail_repetition:8@thinking".to_string(),
+                    "exact_repetition:42x3@thinking".to_string(),
+                ]
+        ));
         match events.last().unwrap() {
             SamplingEvent::Failed { error, .. } => {
                 assert_eq!(
@@ -2606,7 +3066,7 @@ mod tests {
         .await;
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
-                assert_eq!(response.doom_loop_signals.len(), 1);
+                assert_eq!(response.doom_loop_signals.len(), 2);
             }
             other => panic!("expected Completed after disarm, got {other:?}"),
         }
@@ -2693,6 +3153,7 @@ mod tests {
         ))
         .await;
 
+        assert!(evs.iter().all(|event| event.request_id() == &rid()));
         let completes = tool_call_completes(&evs);
         assert_eq!(completes.len(), 1, "exactly one completion per call");
         assert_eq!(completes[0].0, 0);
@@ -2742,6 +3203,7 @@ mod tests {
         ))
         .await;
 
+        assert!(evs.iter().all(|event| event.request_id() == &rid()));
         // Item-done arrives after input-done but must not duplicate the
         // completion signal.
         let completes = tool_call_completes(&evs);

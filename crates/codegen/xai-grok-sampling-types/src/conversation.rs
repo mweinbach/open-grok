@@ -89,9 +89,11 @@ pub enum SyntheticReason {
     CompactionMeta,
     /// Runtime-injected `<system-reminder>` message. Not real user input.
     SystemReminder,
-    /// Project-level instruction message (AGENTS.md / CLAUDE.md) injected at
-    /// session spawn. Invariant: once placed, never replaced (would bust the
-    /// KV-cache prefix).
+    /// Continue reminder after a salvaged Length truncation.
+    /// Distinct from [`Self::SystemReminder`] so report assembly joins segments around exactly this reminder and no other.
+    LengthContinue,
+    /// Project-level instruction message (AGENTS.md / CLAUDE.md) injected at session spawn.
+    /// Invariant: once placed, never replaced (replacing it would bust the KV-cache prefix).
     ProjectInstructions,
     /// Injected by the auto-continue logic after compaction so the agent
     /// keeps working.  Not real user input.
@@ -162,6 +164,7 @@ impl SyntheticReason {
             | Self::AgentMessage => true,
             Self::CompactionMeta
             | Self::SystemReminder
+            | Self::LengthContinue
             | Self::ProjectInstructions
             | Self::AutoContinue
             | Self::AutoRecovery
@@ -1062,6 +1065,76 @@ impl From<ToolDefinition> for ToolSpec {
 // Conversation Request
 // ============================================================================
 
+/// What the sampler does with a completed response whose stop reason is `Length` (max_tokens truncation).
+///
+/// `Length` can arrive far below any client budget (e.g. an engine-side window clamp after a runaway generation).
+/// Callers that can use partial text opt into `CompletePartial`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LengthPolicy {
+    /// Fail the attempt with `MaxTokensTruncation` (legacy behavior).
+    Fail,
+    /// Complete a response whose tool calls all carry complete arguments; text-only and empty `Length` still fail.
+    /// `Length` is usually context exhaustion (the output budget is the window minus the prompt), so retrying cannot succeed.
+    /// Executing the calls advances the turn toward compaction.
+    /// The default: a caller that does not choose gets its tool calls run and its text-only truncation failed.
+    #[default]
+    CompleteToolCalls,
+    /// Additionally complete with partial text; empty `Length` still fails.
+    CompletePartial,
+}
+
+/// Outcome of applying a [`LengthPolicy`] to a completed response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthVerdict {
+    /// The stop reason is not `Length`; the policy does not apply.
+    Pass,
+    /// A `Length` stop delivered with its partial text content.
+    Salvage,
+    /// A `Length` stop delivered with its completed tool calls.
+    SalvageToolCalls,
+    /// A `Length` stop the policy rejects (`MaxTokensTruncation`).
+    Fail,
+}
+
+impl LengthPolicy {
+    /// The fail-vs-salvage decision for a completed response, including the `Length` stop-reason check.
+    /// Pure; the sampler's `apply_length_policy` wraps it with the error mapping and salvage breadcrumb.
+    /// That keeps the actor path (`drive_l2`) and the direct-collect path from diverging.
+    ///
+    /// Tool calls salvage under every policy except `Fail`, but only with complete arguments.
+    /// The xAI server never emits a completed `tool_calls` entry for a truncated call.
+    /// The JSON check guards providers that close a block they cut mid-arguments.
+    /// Empty Length fails regardless of policy (the outcome is deterministic under a fixed cap; the Empty resample family would retry endlessly).
+    /// All transports retain Length on truncated tool-bearing responses so this gate runs before dispatch.
+    pub fn verdict(self, response: &ConversationResponse) -> LengthVerdict {
+        if response.stop_reason != Some(StopReason::Length) {
+            return LengthVerdict::Pass;
+        }
+        let tool_calls = response.tool_calls();
+        if !tool_calls.is_empty() {
+            let all_arguments_complete = tool_calls.iter().all(|call| {
+                call.is_custom()
+                    || call.arguments.trim().is_empty()
+                    || serde_json::from_str::<serde::de::IgnoredAny>(&call.arguments).is_ok()
+            });
+            return match (self, all_arguments_complete) {
+                (LengthPolicy::Fail, _)
+                | (LengthPolicy::CompleteToolCalls | LengthPolicy::CompletePartial, false) => {
+                    LengthVerdict::Fail
+                }
+                (LengthPolicy::CompleteToolCalls | LengthPolicy::CompletePartial, true) => {
+                    LengthVerdict::SalvageToolCalls
+                }
+            };
+        }
+        if self == LengthPolicy::CompletePartial && response.empty_reason().is_none() {
+            LengthVerdict::Salvage
+        } else {
+            LengthVerdict::Fail
+        }
+    }
+}
+
 /// A complete conversation request that can be sent to either API.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRequest {
@@ -1087,6 +1160,8 @@ pub struct ConversationRequest {
     pub x_grok_req_id: Option<String>,
     pub x_grok_session_id: Option<String>,
     pub x_grok_turn_idx: Option<String>,
+    /// Turn-level resubmit attempt (absent on first submissions); sent as `x-grok-transient-retry` so the proxy can count retry traffic.
+    pub x_grok_transient_retry: Option<String>,
     pub x_grok_agent_id: Option<String>,
     pub x_grok_deployment_id: Option<String>,
     pub x_grok_user_id: Option<String>,
@@ -1108,6 +1183,8 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// What the sampler does when the response stops with `Length`.
+    pub length_policy: LengthPolicy,
 }
 
 /// Location of a custom-output image whose requested detail is `original`.
@@ -2400,6 +2477,14 @@ impl ConversationItem {
             prior_turn_interrupt: None,
             prompt_index: None,
         })
+    }
+
+    pub fn length_continue_reminder(content: impl Into<String>) -> Self {
+        let mut item = Self::user(content);
+        if let Self::User(user) = &mut item {
+            user.synthetic_reason = Some(SyntheticReason::LengthContinue);
+        }
+        item
     }
 
     /// Create a user message with multiple content parts.
@@ -3956,6 +4041,7 @@ impl From<ConversationRequest> for ChatCompletionRequest {
             x_grok_req_id: req.x_grok_req_id,
             x_grok_session_id: req.x_grok_session_id,
             x_grok_turn_idx: req.x_grok_turn_idx,
+            x_grok_transient_retry: req.x_grok_transient_retry,
             x_grok_agent_id: req.x_grok_agent_id,
             x_grok_deployment_id: req.x_grok_deployment_id,
             x_grok_user_id: req.x_grok_user_id,
@@ -10000,17 +10086,6 @@ mod tests {
     }
 
     #[test]
-    fn test_transform_cwd_empty_source_noop() {
-        // Edge case: source and target are the same (no transform needed)
-        let mut items = vec![ConversationItem::user("Hello at /some/path/file.rs")];
-
-        transform_conversation_cwd(&mut items, "/some/path", "/some/path");
-
-        // Content should be unchanged
-        assert_eq!(items[0].text_content(), "Hello at /some/path/file.rs");
-    }
-
-    #[test]
     fn test_transform_cwd_mixed_conversation_full() {
         // Full conversation with all item types and multiple path occurrences
         let src = "/worktree/abc";
@@ -10936,7 +11011,6 @@ mod tests {
         ];
         assert_eq!(dedup_duplicate_tool_results(&mut conv), 1);
         assert_eq!(conv.len(), 3); // assistant + 2 tool_results
-        // c1 should be the real content (last occurrence)
         let c1_results: Vec<_> = conv
             .iter()
             .filter_map(|item| {
@@ -11578,20 +11652,6 @@ mod tests {
 
     // ── SyntheticReason tests ─────────────────────────────────────────────────
 
-    /// Real user messages must have `synthetic_reason = None`.
-    #[test]
-    fn user_message_has_no_synthetic_reason() {
-        let item = ConversationItem::user("hello");
-        if let ConversationItem::User(u) = item {
-            assert!(
-                u.synthetic_reason.is_none(),
-                "real user messages must not have a synthetic_reason"
-            );
-        } else {
-            panic!("expected User variant");
-        }
-    }
-
     /// Historical `doom_loop_warning` tags deserialize as Unknown after removal.
     #[test]
     fn historical_doom_loop_warning_deserializes_as_unknown() {
@@ -12023,6 +12083,93 @@ mod tests {
         assert_eq!(
             resp.empty_reason(),
             Some(crate::error::EmptyReason::NoVisibleContent)
+        );
+    }
+
+    #[test]
+    fn length_policy_verdict_gate() {
+        let length = |item: ConversationItem| {
+            let mut r = make_response(item);
+            r.stop_reason = Some(StopReason::Length);
+            r
+        };
+        let call = |arguments: &str| ToolCall {
+            id: "tc1".into(),
+            name: "do_thing".into(),
+            arguments: arguments.into(),
+        };
+        let text = length(ConversationItem::assistant("partial"));
+        let empty = length(ConversationItem::assistant(""));
+        let complete_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": 1}",
+        )]));
+        let empty_args_tools = length(ConversationItem::assistant_tool_calls(vec![call("")]));
+        let truncated_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": \"trunc",
+        )]));
+        let mixed_tools = length(ConversationItem::assistant_tool_calls(vec![
+            call("{\"x\": 1}"),
+            call("{\"x\": \"trunc"),
+        ]));
+        let stop = make_response(ConversationItem::assistant("done"));
+
+        assert_eq!(LengthPolicy::default(), LengthPolicy::CompleteToolCalls);
+
+        assert_eq!(LengthPolicy::Fail.verdict(&text), LengthVerdict::Fail);
+        assert_eq!(
+            LengthPolicy::Fail.verdict(&complete_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(LengthPolicy::Fail.verdict(&stop), LengthVerdict::Pass);
+
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&complete_tools),
+            LengthVerdict::SalvageToolCalls
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&empty_args_tools),
+            LengthVerdict::SalvageToolCalls
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&truncated_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&mixed_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&text),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&empty),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&stop),
+            LengthVerdict::Pass
+        );
+
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&text),
+            LengthVerdict::Salvage
+        );
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&empty),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&complete_tools),
+            LengthVerdict::SalvageToolCalls
+        );
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&truncated_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&stop),
+            LengthVerdict::Pass
         );
     }
 
@@ -13734,5 +13881,29 @@ mod tests {
         assert!(safe_input[0].to_string().contains("latest request"));
         assert!(!safe_input[0].to_string().contains("opaque-server-summary"));
         assert_eq!(request.raw_codex_input_replacements()[0].value, raw);
+    }
+
+    #[test]
+    fn test_transform_cwd_empty_source_noop() {
+        // Edge case: source and target are the same (no transform needed)
+        let mut items = vec![ConversationItem::user("Hello at /some/path/file.rs")];
+
+        transform_conversation_cwd(&mut items, "/some/path", "/some/path");
+
+        // Content should be unchanged
+        assert_eq!(items[0].text_content(), "Hello at /some/path/file.rs");
+    }
+
+    #[test]
+    fn user_message_has_no_synthetic_reason() {
+        let item = ConversationItem::user("hello");
+        if let ConversationItem::User(u) = item {
+            assert!(
+                u.synthetic_reason.is_none(),
+                "real user messages must not have a synthetic_reason"
+            );
+        } else {
+            panic!("expected User variant");
+        }
     }
 }

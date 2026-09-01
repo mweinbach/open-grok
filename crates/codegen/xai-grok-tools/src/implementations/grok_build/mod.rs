@@ -10,6 +10,7 @@
 //! `AvailableSkills`, `BashParams`) and registers every built-in tool.
 pub mod agent_collaboration;
 pub mod agent_swarm;
+pub use deploy_app as app_builder;
 pub mod ask_user_question;
 pub mod bash;
 #[path = "deploy_app_stub.rs"]
@@ -19,6 +20,9 @@ pub mod exit_plan_mode;
 pub mod grep;
 pub mod image_edit;
 pub mod image_gen;
+pub mod init_or_update_app {
+    pub const INIT_OR_UPDATE_APP_TOOL_NAME: &str = "init_or_update_app";
+}
 pub mod kill_task;
 pub mod list_dir;
 pub mod lsp;
@@ -26,6 +30,7 @@ pub mod monitor;
 pub mod read_file;
 pub mod scheduler;
 pub mod search_replace;
+pub mod send_subagent_message;
 pub mod session_collaboration;
 pub(crate) mod storage;
 pub mod task;
@@ -54,6 +59,7 @@ pub use image_gen::{
     IMAGE_GEN_TOOL_NAME, IMAGINE_COMMAND_NAME, ImageGenTool, imagine_instruction,
     imagine_usage_message,
 };
+pub use init_or_update_app::INIT_OR_UPDATE_APP_TOOL_NAME;
 pub use kill_task::{KillTaskTool, KillTerminalCommandTool};
 pub use list_dir::ListDirTool;
 pub use lsp::LspTool;
@@ -66,6 +72,9 @@ pub use scheduler::create::{
 pub use scheduler::delete::{SCHEDULER_DELETE_TOOL_NAME, SchedulerDeleteTool};
 pub use scheduler::list::SchedulerListTool;
 pub use search_replace::SearchReplaceTool;
+pub use send_subagent_message::{
+    SEND_SUBAGENT_MESSAGE_TOOL_NAME, SendSubagentMessageDisposition, SendSubagentMessageTool,
+};
 pub use session_collaboration::{
     ListSessionsTool, MessageSessionTool, ReadSessionTool, SessionBusResource,
     SessionCollaborationBackend,

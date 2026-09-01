@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -130,53 +131,20 @@ impl McpCredentialStore {
         let path = Self::default_path().ok_or_else(|| {
             McpCredentialError::Other("no user grok home (set $GROK_HOME or $HOME)".into())
         })?;
-        let lock_path = path.with_extension("lock");
-
-        // Ensure parent dir exists.
-        if let Some(parent) = lock_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-
-            let lock_file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)?;
-            let fd = lock_file.as_raw_fd();
-            loop {
-                if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
-                    break;
-                }
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue; // Retry on EINTR.
-                }
+        match acquire_store_lock(&path) {
+            Some(_lock) => {
+                let mut fresh = Self::load_from(&path).unwrap_or_default();
+                mutate(&mut fresh);
+                fresh.save_to(&path)?;
+                *self = fresh;
+                Ok(())
+            }
+            None => {
                 // Lock failed for another reason — fall back to non-atomic write.
                 mutate(self);
-                return self.save_to(&path);
-            }
-
-            // Reload from disk under lock to merge with concurrent writes.
-            let mut fresh = Self::load_from(&path).unwrap_or_default();
-            mutate(&mut fresh);
-            fresh.save_to(&path)?;
-            *self = fresh;
-
-            // Lock released when lock_file is dropped.
+                self.save_to(&path)
+            } // Lock released when lock_file is dropped.
         }
-
-        #[cfg(not(unix))]
-        {
-            // No flock on non-unix — best-effort.
-            mutate(self);
-            self.save_to(&path)?;
-        }
-
-        Ok(())
     }
 
     /// Locked insert ([`Self::locked_mutate_and_save`]) with a freshness
@@ -210,51 +178,7 @@ impl McpCredentialStore {
     /// crash. On Unix, the temp file is created with 0600 permissions from the
     /// start (no TOCTOU window where secrets are world-readable).
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let content = serde_json::to_string_pretty(self)?;
-        let tmp_path = path.with_extension("tmp");
-
-        {
-            use std::io::Write;
-
-            #[cfg(unix)]
-            let file = {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp_path)?
-            };
-            #[cfg(not(unix))]
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-
-            let mut writer = std::io::BufWriter::new(file);
-            writer.write_all(content.as_bytes())?;
-            writer.flush()?;
-        }
-
-        // `mode(0o600)` only applies on create; tighten before rename.
-        // Fail hard on tmp: credentials are not published yet.
-        ensure_owner_only_permissions(&tmp_path)?;
-        std::fs::rename(&tmp_path, path)?;
-        // Best-effort after rename: new tokens are already published.
-        if let Err(e) = ensure_owner_only_permissions(path) {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "mcp: failed to ensure owner-only permissions after credential save"
-            );
-        }
-        Ok(())
+        write_owner_only_atomic(path, &serde_json::to_string_pretty(self)?)
     }
 
     /// Look up credentials for a server.
@@ -336,6 +260,79 @@ fn disk_entry_is_newer(
     }
 }
 
+#[must_use]
+fn acquire_store_lock(store_path: &Path) -> Option<std::fs::File> {
+    let lock_path = store_path.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Some(file);
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return None;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+/// Config URLs can embed secrets.
+fn write_owner_only_atomic(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write;
+
+    let parent = match path.parent() {
+        Some(value_p) if !value_p.as_os_str().is_empty() => value_p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent)?;
+
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    tmp.write_all(content.as_bytes())?;
+    tmp.flush()?;
+    tmp.persist(path).map_err(|value_e| value_e.error)?;
+    Ok(())
+}
+
+/// Last access token an adapter served.
+/// Reauth compares the store against this to tell a fresh token apart from one this client already failed with.
+#[derive(Clone, Default)]
+pub(crate) struct ObservedAccessToken(Arc<parking_lot::Mutex<Option<String>>>);
+
+impl ObservedAccessToken {
+    pub(crate) fn snapshot(&self) -> Option<String> {
+        self.0.lock().clone()
+    }
+
+    pub(crate) fn record(&self, token: Option<String>) {
+        *self.0.lock() = token;
+    }
+}
+
+fn access_token_secret(creds: Option<&rmcp::transport::auth::StoredCredentials>) -> Option<String> {
+    use oauth2::TokenResponse as _;
+    creds
+        .and_then(|value_c| value_c.token_response.as_ref())
+        .map(|value_t| value_t.access_token().secret().clone())
+}
+
 /// Adapter implementing rmcp's `CredentialStore` trait backed by the on-disk
 /// `McpCredentialStore`. Each adapter instance is scoped to a single MCP server
 /// (keyed by name + URL); rmcp's `AuthorizationManager` calls load/save/clear
@@ -343,6 +340,7 @@ fn disk_entry_is_newer(
 pub struct McpCredentialStoreAdapter {
     server_name: String,
     server_url: url::Url,
+    observed: ObservedAccessToken,
 }
 
 impl McpCredentialStoreAdapter {
@@ -350,7 +348,12 @@ impl McpCredentialStoreAdapter {
         Self {
             server_name,
             server_url,
+            observed: ObservedAccessToken::default(),
         }
+    }
+
+    pub(crate) fn observed(&self) -> ObservedAccessToken {
+        self.observed.clone()
     }
 }
 
@@ -364,13 +367,17 @@ impl rmcp::transport::auth::CredentialStore for McpCredentialStoreAdapter {
     > {
         let name = self.server_name.clone();
         let url = self.server_url.clone();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let store = McpCredentialStore::load_default()
                 .map_err(|e| rmcp::transport::auth::AuthError::InternalError(e.to_string()))?;
             Ok(store.get(&name, &url).cloned())
         })
         .await
-        .map_err(|e| rmcp::transport::auth::AuthError::InternalError(e.to_string()))?
+        .map_err(|e| rmcp::transport::auth::AuthError::InternalError(e.to_string()))?;
+        if let Ok(creds) = &result {
+            self.observed.record(access_token_secret(creds.as_ref()));
+        }
+        result
     }
 
     async fn save(

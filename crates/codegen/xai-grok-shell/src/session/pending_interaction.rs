@@ -38,6 +38,7 @@ pub enum PendingKind {
     Permission,
     /// `x.ai/ask_user_question`.
     Question,
+    McpElicitation,
     /// `x.ai/exit_plan_mode` plan approval.
     PlanApproval,
 }

@@ -19,6 +19,9 @@ use crate::version::{
 use xai_grok_shell::util::config;
 use xai_grok_shell::util::grok_home::{grok_application, grok_home};
 
+#[path = "release_artifact.rs"]
+mod release_artifact;
+
 #[derive(Clone, Copy, Debug)]
 pub enum UpdateRunMode {
     Blocking,
@@ -1136,8 +1139,6 @@ pub async fn install_open_grok_release_from_base(
     let asset = platform.asset;
     let base = release_base_url.trim_end_matches('/');
     let tag = format!("v{version}");
-    let asset_url = format!("{base}/download/{tag}/{asset}");
-    let checksum_url = format!("{asset_url}.sha256");
 
     let home = grok_home();
     let download_dir = home.join("downloads");
@@ -1162,28 +1163,11 @@ pub async fn install_open_grok_release_from_base(
     } else {
         canonical_binary_path
     };
-    let checksum_path = unique_temp_sibling(&download_dir.join(&versioned_name), "sha256");
-
     eprintln!(
         "  Downloading Open Grok v{version} ({})...",
         platform.display_name
     );
-    download_with_progress(&asset_url, &binary_path).await?;
-    if let Err(error) = download_silent(&checksum_url, &checksum_path).await {
-        let _ = tokio::fs::remove_file(&binary_path).await;
-        return Err(error).context("downloading published Open Grok SHA-256");
-    }
-
-    let checksum_contents = tokio::fs::read_to_string(&checksum_path).await?;
-    let _ = tokio::fs::remove_file(&checksum_path).await;
-    let expected = parse_published_checksum(&checksum_contents, asset)?;
-    let actual = sha256_file(&binary_path).await?;
-    if actual != expected {
-        let _ = tokio::fs::remove_file(&binary_path).await;
-        anyhow::bail!(
-            "Open Grok SHA-256 verification failed (expected {expected}, got {actual}); current version was not changed"
-        );
-    }
+    release_artifact::download_verified(base, &tag, asset, &binary_path, true).await?;
 
     let reported_version = match smoke_test_open_grok_binary(&binary_path, &version).await {
         Ok(reported_version) => reported_version,
@@ -1450,6 +1434,8 @@ pub async fn download_with_progress(url: &str, dest: &std::path::Path) -> Result
     let resp = client.get(url).send().await?;
 
     if !resp.status().is_success() {
+        resp.error_for_status_ref()
+            .with_context(|| format!("Download failed: HTTP {}", resp.status()))?;
         anyhow::bail!("Download failed: HTTP {}", resp.status());
     }
 
@@ -1510,6 +1496,8 @@ pub async fn download_silent(url: &str, dest: &std::path::Path) -> Result<()> {
     let resp = client.get(url).send().await?;
 
     if !resp.status().is_success() {
+        resp.error_for_status_ref()
+            .with_context(|| format!("Download failed: HTTP {}", resp.status()))?;
         anyhow::bail!("Download failed: HTTP {}", resp.status());
     }
 

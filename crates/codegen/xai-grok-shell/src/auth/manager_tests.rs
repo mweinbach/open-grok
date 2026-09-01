@@ -17,6 +17,35 @@ fn make_auth(expires_at: Option<DateTime<Utc>>, create_time: DateTime<Utc>) -> G
     }
 }
 
+#[tokio::test]
+async fn refresh_adopts_fresh_disk_token_without_waiting_for_file_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = Arc::new(AuthManager::new(directory.path(), GrokComConfig::default()));
+    manager.persist_and_swap(GrokAuth {
+        key: "sibling-fresh".into(),
+        ..make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now())
+    });
+    manager.hot_swap(GrokAuth {
+        key: "expired".into(),
+        ..make_auth(
+            Some(Utc::now() - Duration::hours(1)),
+            Utc::now() - Duration::hours(2),
+        )
+    });
+    let _guard = manager
+        .try_lock_auth_file_async(StdDuration::from_secs(1))
+        .await
+        .unwrap();
+    let auth = tokio::time::timeout(
+        StdDuration::from_millis(500),
+        manager.refresh_chain(TokenType::ExternalBinary, RefreshReason::PreRequest),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(auth.key, "sibling-fresh");
+}
+
 #[test]
 fn expired_within_5min_buffer() {
     let auth = make_auth(Some(Utc::now() + Duration::minutes(4)), Utc::now());

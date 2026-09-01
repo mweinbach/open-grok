@@ -103,11 +103,15 @@ fn external_stream_gates_on_end_to_end() {
         completion_tokens: Some(7),
         reasoning_tokens: Some(3),
         cached_prompt_tokens: Some(9),
+        cache_creation_tokens: None,
+        cost_usd_ticks: None,
     });
     xai_grok_telemetry::log_event(xai_grok_telemetry::events::ToolCallCompleted {
         tool_name: "github__create_issue".into(),
         outcome: xai_grok_session_events::types::ToolOutcome::Success,
+        hook_rewrote: false,
         duration_ms: 12,
+        tool_result_size_bytes: None,
         file_path: Some("/tmp/projectdir/config.toml".into()),
         parameters: Some(serde_json::json!({
             "marker": PARAM_MARK,

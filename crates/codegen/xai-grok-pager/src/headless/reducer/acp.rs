@@ -1,5 +1,5 @@
-//! The `streaming-json` reducer: native ACP session updates, one JSON object
-//! per line. Owns its own wire line shapes ([`AcpLine`] et al.).
+//! The `streaming-json` reducer: native ACP session updates, one JSON object per line.
+//! It defines its own line shapes: [`AcpLine`], [`AcpUsageLine`], [`AcpEndLine`].
 
 use serde::Serialize;
 use serde_json::Value;
@@ -84,6 +84,12 @@ enum AcpLine {
     ImageCompressed {
         message: String,
     },
+    MemoryFlushStarted,
+    MemoryFlushCompleted {
+        result: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
 }
 
 /// `streaming-json` terminal `end` line (spend fields merged in by the caller).
@@ -131,7 +137,6 @@ impl Reducer for AcpReducer {
                 skills: _,
             } => AcpLine::AvailableCommands { tools, commands },
             StreamEvent::Lifecycle(l) => return vec![to_line(&acp_lifecycle_line(l))],
-            // These events feed only the Messages reducer's partial framing.
             StreamEvent::ResponseStarted { .. } | StreamEvent::ReasoningCompleted { .. } => {
                 return vec![];
             }
@@ -197,5 +202,9 @@ fn acp_lifecycle_line(l: Lifecycle) -> AcpLine {
         Lifecycle::CompactCancelled => AcpLine::AutoCompactCancelled,
         Lifecycle::AutoContinue { total_tokens } => AcpLine::AutoContinueCompleted { total_tokens },
         Lifecycle::ImageCompressed { message } => AcpLine::ImageCompressed { message },
+        Lifecycle::MemoryFlushStarted => AcpLine::MemoryFlushStarted,
+        Lifecycle::MemoryFlushCompleted { result, path } => {
+            AcpLine::MemoryFlushCompleted { result, path }
+        }
     }
 }

@@ -19,6 +19,8 @@ toml = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 xai-grok-config = { workspace = true }
+xai-grok-extra-ca = { workspace = true }
+xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 xai-grok-tools = { workspace = true }
 
 [dev-dependencies]

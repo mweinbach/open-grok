@@ -1462,3 +1462,377 @@ fn capped_line_reader_discards_overlong_lines_without_shifting_indexes() {
         vec![(0, b"aa".to_vec()), (1, b"bb".to_vec())]
     );
 }
+
+fn worktree_target_cwd(home: &std::path::Path) -> String {
+    let cwd = home
+        .join("worktrees")
+        .join("xai")
+        .join("fix-bug")
+        .join("src");
+    std::fs::create_dir_all(&cwd).unwrap();
+    cwd.to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn fork_with_default_kind_into_worktree_cwd_stamps_worktree_identity() {
+    let home = TempDir::new().unwrap();
+    let _env = xai_grok_test_support::EnvGuard::set("OPENGROK_HOME", home.path());
+    let adapter = JsonlStorageAdapter::with_root(home.path().join("sessions-root"));
+    let source_info = Info {
+        id: acp::SessionId::new("src-plain-fork"),
+        cwd: "/src".to_string(),
+    };
+    let target_info = Info {
+        id: acp::SessionId::new("tgt-in-worktree"),
+        cwd: worktree_target_cwd(home.path()),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+
+    adapter
+        .copy_session_data(&source_info, &target_info, CopySessionOptions::default())
+        .await
+        .unwrap();
+
+    let summary = adapter.load_summary(&target_info).await.unwrap();
+    assert_eq!(summary.session_kind.as_deref(), Some("worktree"));
+    assert_eq!(summary.worktree_label.as_deref(), Some("fix-bug"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn explicit_subagent_fork_kind_wins_over_worktree_target_cwd() {
+    let home = TempDir::new().unwrap();
+    let _env = xai_grok_test_support::EnvGuard::set("OPENGROK_HOME", home.path());
+    let adapter = JsonlStorageAdapter::with_root(home.path().join("sessions-root"));
+    let source_info = Info {
+        id: acp::SessionId::new("src-subagent-fork"),
+        cwd: "/src".to_string(),
+    };
+    let target_info = Info {
+        id: acp::SessionId::new("tgt-subagent-in-worktree"),
+        cwd: worktree_target_cwd(home.path()),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+
+    let options = CopySessionOptions {
+        session_kind: Some("subagent_fork".to_string()),
+        ..Default::default()
+    };
+    adapter
+        .copy_session_data(&source_info, &target_info, options)
+        .await
+        .unwrap();
+
+    let summary = adapter.load_summary(&target_info).await.unwrap();
+    assert_eq!(summary.session_kind.as_deref(), Some("subagent_fork"));
+    assert!(summary.source_workspace_dir.is_none());
+    assert_eq!(summary.worktree_label.as_deref(), Some("fix-bug"));
+}
+
+#[tokio::test]
+async fn fork_restamps_usage_session_id() {
+    use crate::session::usage_file::SessionUsageFile;
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("src-usage"),
+        cwd: "/src".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+
+    let mut usage = SessionUsageFile::new(source.id.to_string());
+    usage.apply_turn(
+        1,
+        "t1",
+        &crate::session::usage_file::UsageSummary {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            model_calls: 1,
+            turn_count: 1,
+            ..Default::default()
+        },
+        None,
+    );
+    adapter.write_usage(&source, &usage).await.unwrap();
+
+    let target = Info {
+        id: acp::SessionId::new("tgt-usage"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(&source, &target, CopySessionOptions::default())
+        .await
+        .unwrap();
+
+    let copied = adapter.read_usage(&target).await.unwrap().unwrap();
+    assert_eq!(copied.session_id, "tgt-usage");
+    assert_eq!(copied.turns.len(), 1);
+    assert_eq!(copied.session.input_tokens, 10);
+}
+
+#[tokio::test]
+async fn truncating_fork_drops_later_usage_turns() {
+    use crate::session::usage_file::SessionUsageFile;
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("src-usage-trunc"),
+        cwd: "/src".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+
+    let mut usage = SessionUsageFile::new(source.id.to_string());
+    let first = crate::session::usage_file::UsageSummary {
+        input_tokens: 10,
+        output_tokens: 2,
+        total_tokens: 12,
+        model_calls: 1,
+        turn_count: 1,
+        ..Default::default()
+    };
+    usage.apply_turn(1, "t1", &first, None);
+    usage.apply_turn(
+        2,
+        "t2",
+        &crate::session::usage_file::UsageSummary {
+            input_tokens: 25,
+            output_tokens: 7,
+            total_tokens: 32,
+            model_calls: 2,
+            ..Default::default()
+        },
+        Some(&first),
+    );
+    adapter.write_usage(&source, &usage).await.unwrap();
+    adapter
+        .write_signals(
+            &source,
+            &crate::session::signals::SessionSignals {
+                turn_count: 5,
+                user_message_count: 5,
+                assistant_message_count: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let target = Info {
+        id: acp::SessionId::new("tgt-usage-trunc"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(
+            &source,
+            &target,
+            CopySessionOptions {
+                target_prompt_index: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let copied = adapter.read_usage(&target).await.unwrap().unwrap();
+    assert_eq!(copied.session_id, "tgt-usage-trunc");
+    assert_eq!(copied.turns.len(), 1);
+    assert_eq!(copied.turns[0].turn_number, 1);
+    assert_eq!(copied.session.input_tokens, 10);
+    let signals = adapter
+        .load_session(&target)
+        .await
+        .unwrap()
+        .signals
+        .unwrap();
+    assert_eq!(signals.turn_count, 1);
+    assert_eq!(signals.user_message_count, 1);
+}
+
+#[tokio::test]
+async fn copy_usage_is_independent_of_copy_signals() {
+    use crate::session::usage_file::SessionUsageFile;
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("src-usage-flag"),
+        cwd: "/src".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    std::fs::write(adapter.signals_file(&source), b"signals").unwrap();
+    let mut usage = SessionUsageFile::new(source.id.to_string());
+    usage.apply_turn(
+        1,
+        "t1",
+        &crate::session::usage_file::UsageSummary {
+            input_tokens: 10,
+            total_tokens: 10,
+            model_calls: 1,
+            turn_count: 1,
+            ..Default::default()
+        },
+        None,
+    );
+    adapter.write_usage(&source, &usage).await.unwrap();
+
+    let no_signals = Info {
+        id: acp::SessionId::new("tgt-no-signals"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(
+            &source,
+            &no_signals,
+            CopySessionOptions {
+                copy_signals: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let seeded = adapter
+        .load_session(&no_signals)
+        .await
+        .unwrap()
+        .signals
+        .unwrap();
+    assert_eq!(seeded.turn_count, 1);
+    assert!(adapter.read_usage(&no_signals).await.unwrap().is_some());
+
+    let no_usage = Info {
+        id: acp::SessionId::new("tgt-no-usage"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(
+            &source,
+            &no_usage,
+            CopySessionOptions {
+                copy_usage: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(adapter.signals_file(&no_usage).exists());
+    assert!(adapter.read_usage(&no_usage).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn fork_truncation_clears_announced_failure_episodes() {
+    use crate::session::announcement_state::{
+        AnnouncedFailure, AnnouncementState, McpServerFingerprint,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("src-episodes"),
+        cwd: "/src".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    let mut state = serde_json::to_value(AnnouncementState {
+        mcp_server_fingerprints: std::collections::HashMap::from([(
+            "srv".to_string(),
+            McpServerFingerprint {
+                tool_count: 1,
+                description_hash: 2,
+                tool_names_hash: 3,
+            },
+        )]),
+        announced_skill_names: std::collections::HashSet::from(["commit".to_string()]),
+        announced_failed_servers: std::collections::HashMap::from([(
+            "dead".to_string(),
+            AnnouncedFailure::Transport,
+        )]),
+    })
+    .unwrap();
+    state
+        .as_object_mut()
+        .unwrap()
+        .insert("some_future_field".to_string(), true.into());
+    std::fs::write(
+        adapter.announcement_state_file(&source),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+
+    type SetOption = fn(&mut CopySessionOptions);
+    let cases: [(&str, SetOption); 2] = [
+        ("truncating", |options| {
+            options.target_prompt_index = Some(0)
+        }),
+        ("filtering", |options| options.fork_filter = true),
+    ];
+    for (name, set) in cases {
+        let target = Info {
+            id: acp::SessionId::new(format!("tgt-episodes-{name}")),
+            cwd: "/tgt".to_string(),
+        };
+        let mut options = CopySessionOptions::default();
+        set(&mut options);
+        adapter
+            .copy_session_data(&source, &target, options)
+            .await
+            .unwrap();
+        let raw = std::fs::read(adapter.announcement_state_file(&target)).unwrap();
+        let copied: AnnouncementState = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            copied.announced_failed_servers.is_empty(),
+            "{name}: failure episodes must be cleared"
+        );
+        assert_eq!(
+            copied.mcp_server_fingerprints["srv"].tool_count, 1,
+            "{name}: fingerprints survive"
+        );
+        assert!(
+            copied.announced_skill_names.contains("commit"),
+            "{name}: skill names survive"
+        );
+        let raw: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            raw["some_future_field"], true,
+            "{name}: unknown fields survive"
+        );
+    }
+
+    let target_full = Info {
+        id: acp::SessionId::new("tgt-episodes-full"),
+        cwd: "/tgt".to_string(),
+    };
+    adapter
+        .copy_session_data(&source, &target_full, CopySessionOptions::default())
+        .await
+        .unwrap();
+    let copied: AnnouncementState = serde_json::from_slice(
+        &std::fs::read(adapter.announcement_state_file(&target_full)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        copied.announced_failed_servers.get("dead"),
+        Some(&AnnouncedFailure::Transport),
+        "full fork keeps episodes: its context retains the announcement"
+    );
+}

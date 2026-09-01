@@ -10,16 +10,25 @@ const MAX_WORKFLOW_NAME_BYTES: usize = 64;
 pub(crate) struct BuiltinWorkflow {
     pub name: &'static str,
     pub script: &'static str,
+    pub path: &'static str,
 }
 
 pub(crate) const BUILTIN_WORKFLOWS: &[BuiltinWorkflow] = &[
     BuiltinWorkflow {
         name: "deep-research",
         script: include_str!("../workflows/deep_research.rhai"),
+        path: concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/session/workflows/deep_research.rhai"
+        ),
     },
     BuiltinWorkflow {
         name: "ultracode",
         script: include_str!("../workflows/ultracode.rhai"),
+        path: concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/session/workflows/ultracode.rhai"
+        ),
     },
 ];
 
@@ -69,6 +78,12 @@ pub(crate) fn user_workflow_dir() -> PathBuf {
     crate::util::grok_home::grok_home().join("workflows")
 }
 
+pub(crate) fn bundled_workflow_dir() -> PathBuf {
+    crate::util::grok_home::grok_home()
+        .join("bundled")
+        .join("workflows")
+}
+
 pub(crate) struct WorkflowRegistry {
     entries: Vec<RegistryEntry>,
     duplicate_names: BTreeMap<String, &'static str>,
@@ -109,7 +124,7 @@ fn cached_builtin_entries() -> Vec<RegistryEntry> {
             script: builtin.script.to_string(),
             source: WorkflowSource::Builtin,
             source_label: "builtin",
-            path: None,
+            path: Some(PathBuf::from(builtin.path)),
         })
         .collect()
 }
@@ -118,8 +133,12 @@ impl WorkflowRegistry {
     pub(crate) fn scan(session_cwd: Option<&Path>) -> Self {
         let mut entries = Vec::new();
         let mut duplicate_names = BTreeMap::new();
-        let mut builtin_entries = cached_builtin_entries();
 
+        let mut bundled_entries = scan_directory(&bundled_workflow_dir(), "bundled");
+        reject_same_scope_duplicates(&mut bundled_entries, "bundled", &mut duplicate_names);
+        merge_scope(&mut entries, bundled_entries);
+
+        let mut builtin_entries = cached_builtin_entries();
         reject_same_scope_duplicates(&mut builtin_entries, "builtin", &mut duplicate_names);
         merge_scope(&mut entries, builtin_entries);
 
@@ -244,15 +263,47 @@ fn scan_directory(dir: &Path, source_label: &'static str) -> Vec<RegistryEntry> 
         .filter_map(|path| {
             let script = read_trusted_source(&path).ok()?;
             let meta = parse_workflow(&script, Some(&path)).ok()?;
+            let compiled_in = source_label == "bundled"
+                && is_compiled_in_builtin(&meta.name)
+                && bundled_file_is_managed(&path);
             Some(RegistryEntry {
                 meta,
                 script,
-                source: WorkflowSource::File(path.clone()),
-                source_label,
+                source: if compiled_in {
+                    WorkflowSource::Builtin
+                } else {
+                    WorkflowSource::File(path.clone())
+                },
+                source_label: if compiled_in { "builtin" } else { source_label },
                 path: Some(path),
             })
         })
         .collect()
+}
+
+fn is_compiled_in_builtin(name: &str) -> bool {
+    BUILTIN_WORKFLOWS.iter().any(|builtin| builtin.name == name)
+}
+
+fn bundled_file_is_managed(path: &Path) -> bool {
+    let Some(workflows_dir) = path.parent() else {
+        return false;
+    };
+    if workflows_dir.file_name().and_then(|name| name.to_str()) != Some("workflows") {
+        return false;
+    }
+    let Some(root) = workflows_dir.parent() else {
+        return false;
+    };
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let relative = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    xai_grok_bundle::is_managed_bundle_file(root, &relative)
 }
 
 pub(crate) fn resolve_by_name(
@@ -724,6 +775,82 @@ mod tests {
             trusted.resolve_by_name("project-only").unwrap().meta.name,
             "project-only"
         );
+    }
+
+    #[test]
+    fn bundled_workflow_shadows_compiled_in_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled = dir.path().join("workflows");
+        std::fs::create_dir_all(&bundled).unwrap();
+        std::fs::write(
+            bundled.join("deep-research.rhai"),
+            "let meta = #{ name: \"deep-research\", description: \"from-bundle\" };\ncomplete(\"ok\");",
+        )
+        .unwrap();
+
+        let mut entries = scan_directory(&bundled, "bundled");
+        merge_scope(&mut entries, cached_builtin_entries());
+        let hit = entries
+            .iter()
+            .find(|entry| entry.meta.name == "deep-research")
+            .expect("deep-research");
+        assert_eq!(hit.source_label, "bundled");
+        assert!(matches!(hit.source, WorkflowSource::File(_)));
+        assert_eq!(hit.meta.description, "from-bundle");
+    }
+
+    #[test]
+    fn managed_bundled_override_keeps_builtin_privileges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("bundled");
+        let workflows = root.join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let path = workflows.join("deep-research.rhai");
+        let script = "let meta = #{ name: \"deep-research\", description: \"from-bundle\" };\ncomplete(\"ok\");";
+        std::fs::write(&path, script).unwrap();
+        let checksum = xai_grok_bundle::checksum_file(&path).unwrap();
+        let manifest = serde_json::json!({
+            "version": "test",
+            "checksums": { "workflows/deep-research.rhai": checksum },
+        });
+        std::fs::write(root.join("manifest.json"), manifest.to_string()).unwrap();
+
+        let entries = scan_directory(&workflows, "bundled");
+        let hit = entries
+            .iter()
+            .find(|entry| entry.meta.name == "deep-research")
+            .expect("deep-research");
+        assert_eq!(hit.source_label, "builtin");
+        assert_eq!(hit.source, WorkflowSource::Builtin);
+        assert_eq!(hit.meta.description, "from-bundle");
+    }
+
+    #[test]
+    fn bundled_only_workflow_stays_file_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled = dir.path().join("workflows");
+        std::fs::create_dir_all(&bundled).unwrap();
+        std::fs::write(bundled.join("bundle-only.rhai"), script("bundle-only")).unwrap();
+
+        let entries = scan_directory(&bundled, "bundled");
+        let hit = entries
+            .iter()
+            .find(|entry| entry.meta.name == "bundle-only")
+            .expect("bundle-only");
+        assert_eq!(hit.source_label, "bundled");
+        assert!(matches!(hit.source, WorkflowSource::File(_)));
+    }
+
+    #[test]
+    fn compiled_in_workflow_remains_when_bundled_dir_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = scan_directory(&dir.path().join("missing"), "bundled");
+        merge_scope(&mut entries, cached_builtin_entries());
+        let hit = entries
+            .iter()
+            .find(|entry| entry.meta.name == "deep-research")
+            .expect("deep-research");
+        assert_eq!(hit.source_label, "builtin");
     }
 
     #[test]

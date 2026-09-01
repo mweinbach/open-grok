@@ -49,6 +49,22 @@ pub enum VersionOverrideError {
     },
 }
 
+impl VersionOverrideError {
+    pub fn redacted(&self) -> String {
+        match self {
+            Self::Deserialize(_) => {
+                "version_overrides: failed to deserialize (details omitted)".to_owned()
+            }
+            Self::InvalidMinimumVersion { index, .. } => {
+                format!("version_overrides[{index}].minimum_version is not valid semver")
+            }
+            Self::InvalidMaximumVersion { index, .. } => {
+                format!("version_overrides[{index}].maximum_version is not valid semver")
+            }
+        }
+    }
+}
+
 /// Strips `version_overrides` (always) and deep-merges each matching
 /// patch in ascending `minimum_version` order.
 pub fn apply_version_overrides(
@@ -107,6 +123,16 @@ pub fn apply_version_overrides(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_version_diagnostics_do_not_reveal_config_values() {
+        let mut config: toml::Value = toml::from_str(
+            "[[version_overrides]]\nminimum_version = 'private-value-not-a-version'",
+        )
+        .unwrap();
+        let error = apply_version_overrides(&mut config, &Version::new(1, 0, 0)).unwrap_err();
+        assert!(error.redacted().contains("minimum_version"));
+        assert!(!error.redacted().contains("private-value"));
+    }
     use super::*;
 
     fn parse(s: &str) -> toml::Value {

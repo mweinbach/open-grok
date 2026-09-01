@@ -256,6 +256,7 @@ pub(crate) struct CoalescedWindow {
     /// All `TransportClosed` client identities per server seen in the
     /// window.
     pub closed: HashMap<McpServerName, HashSet<u64>>,
+    pub completes: Vec<(McpServerName, String)>,
 }
 
 /// Coalesce the buffered events for one window flush.
@@ -322,6 +323,12 @@ fn insert_event(win: &mut CoalescedWindow, ev: McpClientEvent) {
                 );
             }
         }
+        McpClientEvent::ElicitationComplete {
+            server,
+            elicitation_id,
+        } => {
+            win.completes.push((server, elicitation_id));
+        }
         ev => {
             if let McpClientEvent::TransportClosed { server, client_id } = &ev {
                 win.closed
@@ -357,6 +364,7 @@ fn kind_of(ev: &McpClientEvent) -> McpClientEventKind {
         McpClientEvent::HandshakeFailed { .. } => McpClientEventKind::HandshakeFailed,
         McpClientEvent::ToolsChanged { .. } => McpClientEventKind::ToolsChanged,
         McpClientEvent::ResourcesChanged { .. } => McpClientEventKind::ResourcesChanged,
+        McpClientEvent::ElicitationComplete { .. } => McpClientEventKind::ElicitationComplete,
         McpClientEvent::Ready { .. } => McpClientEventKind::Ready,
         McpClientEvent::ConfigAdded { .. } => McpClientEventKind::ConfigAdded,
         McpClientEvent::ConfigRemoved { .. } => McpClientEventKind::ConfigRemoved,
@@ -405,6 +413,9 @@ pub(crate) fn build_payload(
             McpServerStatusReason::ConfigChanged,
             None,
         ),
+        (McpClientEventKind::ElicitationComplete, _) => {
+            unreachable!("ElicitationComplete is diverted into win.completes by insert_event")
+        }
         (McpClientEventKind::ResourcesChanged, _) => (
             McpServerStatus::Ready,
             McpServerStatusReason::ConfigChanged,
@@ -499,6 +510,35 @@ pub(crate) fn flush_window(
         };
         gateway
             .forward_fire_and_forget(acp::ExtNotification::new(SERVER_STATUS_METHOD, raw.into()));
+    }
+}
+
+fn flush_elicitation_completes(
+    session_id: &str,
+    completes: Vec<(McpServerName, String)>,
+    gateway: &xai_acp_lib::AcpAgentGatewaySender,
+) {
+    for (server, elicitation_id) in completes {
+        let payload = xai_grok_tools::mcp_elicitation::McpElicitCompletePayload {
+            session_id: session_id.to_string(),
+            elicitation_id,
+            server_name: Some(server.clone()),
+        };
+        match serde_json::value::to_raw_value(&payload) {
+            Ok(raw) => {
+                gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                    xai_grok_mcp::wire::MCP_ELICIT_COMPLETE,
+                    raw.into(),
+                ));
+            }
+            Err(value_e) => {
+                tracing::warn!(
+                    server = %server,
+                    error = %value_e,
+                    "failed to serialize mcp/elicit_complete"
+                );
+            }
+        }
     }
 }
 
@@ -675,6 +715,9 @@ pub(crate) async fn run_dispatcher(
             );
             break;
         };
+        let completes = std::mem::take(&mut win.completes);
+
+        flush_elicitation_completes(&session_id, completes, &gateway);
         if win.buf.is_empty() {
             continue;
         }
@@ -828,6 +871,91 @@ mod tests {
         assert_eq!(win.buf.len(), 1, "100 ToolsChanged collapse to one");
         let key = ("github".to_string(), McpClientEventKind::ToolsChanged);
         assert!(win.buf.contains_key(&key));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn elicitation_completes_accumulate_in_window() {
+        let (tx, mut rx) = unbounded_channel::<McpClientEvent>();
+        tx.send(McpClientEvent::ElicitationComplete {
+            server: "github".to_string(),
+            elicitation_id: "a".to_string(),
+        })
+        .unwrap();
+        tx.send(McpClientEvent::ElicitationComplete {
+            server: "github".to_string(),
+            elicitation_id: "b".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let win = collect_window(&mut rx, COALESCE_WINDOW)
+            .await
+            .expect("events arrived");
+        assert!(win.buf.is_empty());
+        assert_eq!(
+            win.completes,
+            vec![
+                ("github".to_string(), "a".to_string()),
+                ("github".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    /// End-to-end: an `ElicitationComplete`-only window has an empty status buffer (`win.buf`).
+    /// The complete notification must still be forwarded to the client.
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn run_dispatcher_forwards_completes_when_buf_is_empty() {
+        use xai_grok_mcp::servers::McpState;
+
+        let mcp_state = Arc::new(TokioMutex::new(McpState::new(vec![])));
+        let shutdown = new_shutdown_state();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gw_tx, mut gw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = xai_acp_lib::AcpAgentGatewaySender::new(gw_tx);
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let dispatcher = tokio::task::spawn_local(run_dispatcher(
+                    "sess-1".to_string(),
+                    rx,
+                    gateway,
+                    mcp_state,
+                    shutdown,
+                    None,
+                    std::path::PathBuf::from("."),
+                ));
+
+                tx.send(McpClientEvent::ElicitationComplete {
+                    server: "github".to_string(),
+                    elicitation_id: "e-1".to_string(),
+                })
+                .unwrap();
+
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(60)).await;
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+
+                let msg = gw_rx
+                    .try_recv()
+                    .expect("complete must be forwarded even with an empty status buffer");
+                let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg else {
+                    panic!("expected ExtNotification");
+                };
+                assert_eq!(
+                    args.request.method.as_ref(),
+                    xai_grok_mcp::wire::MCP_ELICIT_COMPLETE
+                );
+                let v: serde_json::Value = serde_json::from_str(args.request.params.get()).unwrap();
+                assert_eq!(v["sessionId"], "sess-1");
+                assert_eq!(v["elicitationId"], "e-1");
+                assert_eq!(v["serverName"], "github");
+
+                dispatcher.abort();
+            })
+            .await;
     }
 
     /// Contract: events for different servers don't collapse,

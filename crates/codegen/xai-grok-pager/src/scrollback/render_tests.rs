@@ -631,8 +631,15 @@ fn rendered_verb_group_header_aggregates_hook_outcomes_and_keeps_compact_members
         ),
         "collapsed header must show every hidden hook outcome: {header_row:?}"
     );
+    let header_glyph_x =
+        viewport.x + HorizontalLayout::ACCENT + state.appearance().scrollback.layout.block_pad_left;
     assert_eq!(
-        buf[(0, 0)].fg,
+        buf[(header_glyph_x, viewport.y)].symbol(),
+        crate::glyphs::diamond_dotted(),
+        "the group header's failure indicator is its content-column diamond"
+    );
+    assert_eq!(
+        buf[(header_glyph_x, viewport.y)].fg,
         Theme::current().accent_error,
         "failed hook marks the group header as errored"
     );

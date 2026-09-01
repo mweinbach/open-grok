@@ -17,6 +17,7 @@ use xai_grok_workspace::session::file_state::RewindPoint;
 use crate::session::signals::SessionSignals;
 use crate::session::storage::relocation::{RelocationError, RelocationView};
 use crate::session::storage::{JsonlStorageAdapter, StorageAdapter};
+use crate::session::visibility::ClassifiedSessionKind;
 use crate::tools::todo::TodoState;
 use crate::util::grok_home::grok_home;
 use agent_client_protocol as acp;
@@ -429,11 +430,12 @@ pub enum PersistenceMsg {
         next_trace_turn: u64,
         request_id: Option<String>,
     },
-    /// Persist a snapshot of the session signals.
     Signals(SessionSignals),
-    /// Persist announcement tracking state (MCP + skill announcement dedup).
+    UsageTurn {
+        turn_number: u32,
+        live: crate::session::usage_file::UsageSummary,
+    },
     AnnouncementState(crate::session::announcement_state::AnnouncementState),
-    /// Persist goal mode orchestration state.
     GoalModeState(crate::session::goal_tracker::GoalOrchestration),
     DeleteGoalModeState {
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
@@ -472,6 +474,8 @@ pub enum PersistenceMsg {
     /// Routed back through the persistence channel so the storage write
     /// stays sequential with other summary.json mutations.
     GeneratedTitle(String),
+    RegenerateTitle(String),
+    LastRecap(Option<String>),
     /// Manual `/rename` title. Rides this FIFO channel so the resulting
     /// `SetTitle` cannot race a `GeneratedTitle` `SetTitle` out-of-band.
     ManualTitleRenamed(String),
@@ -770,6 +774,10 @@ fn session_exists_in_root(session_id: &str, sessions_root: &Path) -> bool {
         .is_ok_and(|path| path.is_some())
 }
 
+pub(crate) fn title_is_manual_in_dir(session_dir: &Path) -> bool {
+    read_summary_from_dir(session_dir).is_ok_and(|summary| summary.title_is_manual)
+}
+
 /// Find and read a session summary given only its ID (scans all CWD directories).
 pub(crate) fn find_summary_by_session_id(session_id: &str) -> Option<Summary> {
     find_summary_by_session_id_in_root(session_id, &grok_home().join("sessions"))
@@ -798,15 +806,62 @@ fn read_summary_from_dir(session_dir: &Path) -> RelocationResult<Summary> {
     serde_json::from_slice(&bytes).map_err(|source| RelocationError::Json { path, source })
 }
 
-/// The most recently updated local session summary for `cwd` (by
-/// `last_active_at` else `updated_at`), or `None` if there are no local sessions
-/// for that cwd. Sync and local-only — suitable for the startup path that must
-/// resolve the sandbox profile before the (irreversible) OS sandbox is applied.
+pub(crate) struct SessionKindIndex {
+    view: RelocationView,
+}
+
+impl SessionKindIndex {
+    pub(crate) fn load() -> io::Result<Self> {
+        Self::load_in_root(&grok_home().join("sessions"))
+    }
+
+    pub(crate) fn load_in_root(sessions_root: &Path) -> io::Result<Self> {
+        Ok(Self {
+            view: storage_view(sessions_root).map_err(io::Error::other)?,
+        })
+    }
+
+    pub(crate) fn kind(&self, session_id: &str) -> ClassifiedSessionKind {
+        match self.view.find_persisted_session_dir(session_id) {
+            Ok(Some(dir)) => match read_summary_from_dir(&dir) {
+                Ok(summary) if summary.is_headless() => ClassifiedSessionKind::Headless,
+                Ok(_) => ClassifiedSessionKind::Interactive,
+                Err(_) => ClassifiedSessionKind::Unknown,
+            },
+            Ok(None) | Err(_) => ClassifiedSessionKind::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecentSessionSelection {
+    Interactive,
+    Any,
+}
+
+impl RecentSessionSelection {
+    pub fn from_headless_policy(policy: crate::session::visibility::HeadlessPolicy) -> Self {
+        match policy {
+            crate::session::visibility::HeadlessPolicy::Exclude => Self::Interactive,
+            crate::session::visibility::HeadlessPolicy::Only
+            | crate::session::visibility::HeadlessPolicy::Include => Self::Any,
+        }
+    }
+
+    pub fn admits(self, summary: &Summary) -> bool {
+        match self {
+            Self::Interactive => !summary.is_headless(),
+            Self::Any => true,
+        }
+    }
+}
+
 fn most_recent_local_summary_for_cwd_in_root(cwd: &str, sessions_root: &Path) -> Option<Summary> {
     most_recent_local_summary_for_cwd_in_view(
         cwd,
         &storage_view(sessions_root).ok()?,
         read_summary_from_dir,
+        RecentSessionSelection::Interactive,
     )
     .ok()
     .flatten()
@@ -816,6 +871,7 @@ fn most_recent_local_summary_for_cwd_in_view(
     cwd: &str,
     view: &RelocationView,
     read_summary: SummaryReader,
+    selection: RecentSessionSelection,
 ) -> RelocationResult<Option<Summary>> {
     let mut best: Option<Summary> = None;
     for session_dir in view.session_dirs(Some(cwd))? {
@@ -827,7 +883,7 @@ fn most_recent_local_summary_for_cwd_in_view(
             }
             Err(error) => return Err(error),
         };
-        if summary.is_hidden() {
+        if summary.is_hidden() || !selection.admits(&summary) {
             continue;
         }
         if best.as_ref().is_none_or(|current| {
@@ -842,19 +898,17 @@ fn most_recent_local_summary_for_cwd_in_view(
     Ok(best)
 }
 
-/// Sync, local-only session summaries for `cwd` (hidden sessions filtered).
-/// For startup paths that must resolve a resume target before the
-/// irreversible OS sandbox is applied; async callers use [`list_summaries`].
 ///
-/// Listing failures propagate so pre-sandbox callers can fail closed;
-/// individual unreadable summaries are skipped, matching the async path's
-/// tolerance for a single corrupt file.
-pub fn local_summaries_for_cwd_sync(cwd: &str) -> io::Result<Vec<Summary>> {
-    local_summaries_for_cwd_sync_in_root(cwd, &grok_home().join("sessions"))
+pub fn local_summaries_for_cwd_sync(
+    cwd: &str,
+    selection: RecentSessionSelection,
+) -> io::Result<Vec<Summary>> {
+    local_summaries_for_cwd_sync_in_root(cwd, selection, &grok_home().join("sessions"))
 }
 
 fn local_summaries_for_cwd_sync_in_root(
     cwd: &str,
+    selection: RecentSessionSelection,
     sessions_root: &Path,
 ) -> io::Result<Vec<Summary>> {
     let view = storage_view(sessions_root).map_err(io::Error::other)?;
@@ -862,29 +916,32 @@ fn local_summaries_for_cwd_sync_in_root(
     Ok(dirs
         .iter()
         .filter_map(|dir| read_summary_from_dir(dir).ok())
-        .filter(|s| !s.is_hidden())
+        .filter(|summary| !summary.is_hidden() && selection.admits(summary))
         .collect())
 }
 
-/// Best-effort lookup of the sandbox profile persisted with a session that is
-/// about to be resumed, used at startup to restore the session's profile before
-/// the (irreversible) OS sandbox is applied.
 ///
-/// - `session_id`: the explicit id from `--resume <id>` / `--load <id>` /
-///   `-s <id>`. Resolved directly across all cwds, then — for a remote id that
-///   was restored into a local child — via that child's `parent_session_id`.
-/// - `cwd`: the current working directory. Used to resolve a remote id to its
-///   local child, and as the lookup key for `-c` / `--continue` and bare
-///   `--resume` (most-recent-for-cwd).
 ///
-/// Returns `None` when not resuming, the session isn't found locally, or it has
-/// no persisted profile (sessions created before this was tracked) — callers
-/// then fall back to the normal config/CLI resolution.
 pub fn resumed_session_sandbox_profile(
     session_id: Option<&str>,
     cwd: Option<&str>,
 ) -> Option<String> {
     resumed_session_sandbox_profile_in_root(session_id, cwd, &grok_home().join("sessions"))
+}
+
+pub fn resolve_recent_session_sandbox_profile(
+    cwd: Option<&str>,
+    selection: RecentSessionSelection,
+) -> Option<String> {
+    most_recent_local_summary_for_cwd_in_view(
+        cwd?,
+        &storage_view(&grok_home().join("sessions")).ok()?,
+        read_summary_from_dir,
+        selection,
+    )
+    .ok()
+    .flatten()
+    .and_then(|summary| summary.sandbox_profile)
 }
 
 fn resumed_session_sandbox_profile_in_root(
@@ -926,9 +983,33 @@ pub(crate) fn ensure_owner_only_session_dir_in(
     grok_home: &Path,
     info: &Info,
 ) -> std::io::Result<PathBuf> {
-    let _ = crate::util::grok_home::ensure_sessions_cwd_dir_in(grok_home, &info.cwd);
+    ensure_owner_only_session_dir_in_with(
+        grok_home,
+        info,
+        crate::session::storage::sync_dir_durable,
+        crate::session::storage::sync_file_durable,
+    )
+}
+
+fn ensure_owner_only_session_dir_in_with(
+    grok_home: &Path,
+    info: &Info,
+    sync_dir: impl Fn(&Path) -> std::io::Result<()>,
+    sync_file: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
     let dir = session_dir_in(grok_home, info);
-    crate::util::grok_home::create_dir_all_owner_only(&dir)?;
+    crate::session::storage::create_dir_all_durable_with(
+        &dir,
+        |dir| {
+            if let Ok(cwd_dir) =
+                crate::util::grok_home::ensure_sessions_cwd_dir_in(grok_home, &info.cwd)
+            {
+                crate::session::storage::sync_cwd_marker_if_present_with(&cwd_dir, &sync_file)?;
+            }
+            crate::util::grok_home::create_dir_all_owner_only(dir)
+        },
+        sync_dir,
+    )?;
     Ok(dir)
 }
 
@@ -1113,6 +1194,8 @@ pub struct Summary {
     /// Prompt id of the turn `last_turn_summary` describes (provenance).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn_summary_prompt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recap: Option<String>,
     /// Stable prompt-cache identity for this session. Providers that key
     /// server-side prefix caching on a session id (Codex `prompt_cache_key`
     /// and session-affinity headers; xAI `x-grok-session-id` fallback) reuse
@@ -1161,13 +1244,15 @@ pub(crate) fn cache_affinity_from_session_dir(dir: &Path) -> Option<String> {
         .restore_cache_affinity_id()
 }
 
+pub(crate) const WORKTREE_SESSION_KIND: &str = "worktree";
+
 impl Summary {
     pub(crate) fn new(info: &Info, model_id: acp::ModelId) -> std::io::Result<Self> {
         let git_metadata =
             xai_grok_workspace::session::git::resolve_persisted_session_git_metadata_sync(
                 std::path::Path::new(&info.cwd),
             );
-        Ok(Self {
+        let mut summary = Self {
             info: info.clone(),
             cwd_generation: 0,
             previous_cwd: None,
@@ -1203,14 +1288,28 @@ impl Summary {
             last_active_at: None,
             generated_title: None,
             title_is_manual: false,
-            worktree_label: crate::session::worktree::lookup_worktree_label(&info.cwd),
+            worktree_label: None,
             agent_name: None,
             sandbox_profile: None,
             reasoning_effort: None,
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
+            last_recap: None,
             cache_affinity_id: nonempty_cache_affinity(Some(info.id.0.as_ref())),
-        })
+        };
+        if let Some(identity) = crate::session::worktree::worktree_identity_for_cwd(&info.cwd) {
+            summary.stamp_worktree_identity(&identity);
+        }
+        Ok(summary)
+    }
+
+    pub(crate) fn stamp_worktree_identity(
+        &mut self,
+        identity: &crate::session::worktree::WorktreeIdentity,
+    ) {
+        self.session_kind = Some(WORKTREE_SESSION_KIND.to_string());
+        self.worktree_label = Some(identity.label.clone());
+        self.source_workspace_dir = identity.source_workspace_dir.clone();
     }
 
     /// Persisted prompt-cache identity, if this summary recorded one.
@@ -1243,6 +1342,10 @@ impl Summary {
                 .as_deref()
                 .is_some_and(|k| k.starts_with("subagent")),
         )
+    }
+
+    pub fn is_headless(&self) -> bool {
+        self.session_kind.as_deref() == Some(crate::session::visibility::SESSION_KIND_HEADLESS)
     }
 
     /// Preferred display title: `generated_title` if non-empty, else `session_summary`.
@@ -1831,6 +1934,31 @@ mod generated_title_tests {
     }
 
     #[test]
+    fn title_is_manual_in_dir_requires_a_readable_typed_summary() {
+        let directory = tempfile::tempdir().unwrap();
+        let summary_path = directory.path().join("summary.json");
+        assert!(!title_is_manual_in_dir(directory.path()));
+        std::fs::write(&summary_path, b"not json").unwrap();
+        assert!(!title_is_manual_in_dir(directory.path()));
+        std::fs::write(&summary_path, br#"{"title_is_manual":true}"#).unwrap();
+        assert!(!title_is_manual_in_dir(directory.path()));
+
+        let mut summary = Summary::new(
+            &Info {
+                id: acp::SessionId::new("test"),
+                cwd: "/tmp".into(),
+            },
+            default_model_id(),
+        )
+        .unwrap();
+        std::fs::write(&summary_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        assert!(!title_is_manual_in_dir(directory.path()));
+        summary.title_is_manual = true;
+        std::fs::write(&summary_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        assert!(title_is_manual_in_dir(directory.path()));
+    }
+
+    #[test]
     fn title_is_manual_defaults_false_and_skips_when_unset() {
         // Old summary.json without the field: default false, so pre-existing
         // renames show no border title until renamed again.
@@ -2109,6 +2237,11 @@ struct SessionPersistence {
     gateway: Option<GatewaySender>,
     disk_full_tx: watch::Sender<bool>,
     disk_full_notified: bool,
+    dirty_files: crate::session::storage::SessionFileSet,
+    pending_write_error: Option<io::Error>,
+    last_usage_live: Option<crate::session::usage_file::UsageSummary>,
+    last_usage_turn: Option<u32>,
+    last_incoming_turn: Option<u32>,
 }
 
 impl SessionPersistence {
@@ -2221,7 +2354,28 @@ impl SessionPersistence {
             .append_update_commit_aware(&self.info, update)
             .await;
         self.observe_append_update(&result);
+        match &result {
+            Ok(()) | Err(crate::session::storage::AppendUpdateError::Committed(_)) => {
+                self.dirty_files.updates = true;
+            }
+            Err(crate::session::storage::AppendUpdateError::NotCommitted(error)) => {
+                self.note_write_failure(error);
+            }
+        }
         result
+    }
+
+    fn note_write_failure(&mut self, error: &io::Error) {
+        if self.pending_write_error.is_none() {
+            self.pending_write_error = Some(io::Error::new(error.kind(), error.to_string()));
+        }
+    }
+
+    fn take_pending_write_error(&mut self) -> io::Result<()> {
+        match self.pending_write_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn observe_io<T>(&mut self, result: &io::Result<T>) {
@@ -2241,6 +2395,20 @@ impl SessionPersistence {
             Err(
                 crate::session::storage::AppendUpdateError::NotCommitted(error)
                 | crate::session::storage::AppendUpdateError::Committed(error),
+            ) if is_disk_full_io_error(error) => self.mark_disk_full(),
+            Err(_) => {}
+        }
+    }
+
+    fn observe_append_chat(
+        &mut self,
+        result: &Result<(), crate::session::storage::AppendChatError>,
+    ) {
+        match result {
+            Ok(()) => self.clear_disk_full(),
+            Err(
+                crate::session::storage::AppendChatError::NotCommitted(error)
+                | crate::session::storage::AppendChatError::Committed(error),
             ) if is_disk_full_io_error(error) => self.mark_disk_full(),
             Err(_) => {}
         }
@@ -2391,6 +2559,7 @@ impl SessionPersistence {
     /// Restore uncommitted failures; sync committed records before returning errors.
     async fn drain_pending(&mut self) -> Result<(), crate::session::storage::AppendUpdateError> {
         if let Some(notification) = self.pending_notification.take() {
+            let had_prior_latch = self.pending_write_error.is_some();
             let result = self
                 .write_update(&SessionUpdate::Acp(Box::new(notification.clone())))
                 .await;
@@ -2404,6 +2573,9 @@ impl SessionPersistence {
                 }
                 PendingAppendOutcome::NotCommittedErr(notification, error) => {
                     self.pending_notification = Some(notification);
+                    if !had_prior_latch {
+                        self.pending_write_error = None;
+                    }
                     return Err(crate::session::storage::AppendUpdateError::NotCommitted(
                         error,
                     ));
@@ -2417,12 +2589,23 @@ impl SessionPersistence {
         &mut self,
         update: SessionUpdate,
     ) -> Result<(), crate::session::storage::AppendUpdateError> {
-        self.drain_pending().await?;
+        match self.drain_pending().await {
+            Ok(()) => {}
+            Err(crate::session::storage::AppendUpdateError::Committed(_)) => {}
+            Err(error) => return Err(error),
+        }
         let result = self
             .storage
             .append_update_durable_commit_aware(&self.info, &update)
             .await;
         self.observe_append_update(&result);
+        match &result {
+            Ok(()) => {}
+            Err(crate::session::storage::AppendUpdateError::Committed(_)) => {
+                self.dirty_files.updates = true;
+            }
+            Err(crate::session::storage::AppendUpdateError::NotCommitted(_)) => {}
+        }
         match (&update, &result) {
             (SessionUpdate::Acp(notification), Ok(()))
             | (
@@ -2437,10 +2620,14 @@ impl SessionPersistence {
     /// Flush any pending merged ACP notification to disk and remote sync.
     /// A no-op drain must not clear the disk-full latch.
     async fn flush_pending(&mut self) -> io::Result<()> {
-        let result = self
-            .drain_pending()
-            .await
-            .map_err(crate::session::storage::AppendUpdateError::into_io_error);
+        let result = match self.drain_pending().await {
+            Ok(()) => Ok(()),
+            Err(crate::session::storage::AppendUpdateError::Committed(error)) => {
+                tracing::warn!(%error, "failed to write pending update");
+                Ok(())
+            }
+            Err(error) => Err(error.into_io_error()),
+        };
         if let Err(error) = &result {
             tracing::warn!(%error, "failed to write pending update");
         }
@@ -2459,17 +2646,80 @@ impl SessionPersistence {
 
     /// Flush pending writes and sync all session files to disk.
     /// Called before CopyFile to ensure all data is persisted.
-    async fn flush_and_sync(&mut self) {
-        let _ = self.flush_pending().await;
-        if let Err(e) = self.storage.sync_session_files(&self.info).await {
-            tracing::warn!(?e, "Failed to sync session files to disk");
+    async fn flush_and_sync(&mut self) -> io::Result<()> {
+        let flushed = self.flush_pending().await;
+        let prior_write = self.take_pending_write_error();
+        let synced = self.sync_files_and_clear(self.dirty_files).await;
+        flushed.and(prior_write).and(synced)
+    }
+
+    async fn flush_and_sync_all(&mut self) -> io::Result<()> {
+        let flushed = self.flush_pending().await;
+        let synced = self
+            .sync_files_and_clear(crate::session::storage::SessionFileSet::ALL)
+            .await;
+        flushed.and(synced)
+    }
+
+    async fn sync_files_and_clear(
+        &mut self,
+        files: crate::session::storage::SessionFileSet,
+    ) -> io::Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let synced = self
+            .storage
+            .sync_session_files_selected(&self.info, files)
+            .await;
+        match &synced {
+            Ok(()) => self.dirty_files = Default::default(),
+            Err(error) => tracing::warn!(?error, "Failed to sync session files to disk"),
+        }
+        synced
+    }
+
+    fn announce_adopted_title(&self, title: String) {
+        // Announce to clients only now that the title is
+        // adopted, so a title rejected for racing a manual
+        // `/rename` never overwrites the client's title.
+        crate::session::summary::notify_client(&self.gateway, &self.info, &title);
+        if self.provider_boundary.allows_xai_export()
+            && let Some(sync) = &self.remote_sync
+        {
+            sync.set_title(title.clone());
+        }
+        if self.provider_boundary.allows_xai_export()
+            && let Some(reg) = self.registry_title_sync.as_ref()
+            && !reg.suppress_for_zdr
+        {
+            let client = reg.client.clone();
+            let provider_boundary = self.provider_boundary.clone();
+            let sid = self.info.id.to_string();
+            let value = title;
+            tokio::spawn(async move {
+                if !provider_boundary.allows_xai_export() {
+                    return;
+                }
+                let req = crate::agent::session_registry_client::UpdateRequest {
+                    summary: Some(value),
+                    first_prompt: None,
+                    last_turn_number: None,
+                    repo_head_at_end: None,
+                    restorable_turn_number: None,
+                };
+                if let Err(error) = client.update(&sid, &req).await {
+                    tracing::warn!(
+                        error = %error,
+                        session_id = %sid,
+                        "session registry summary sync failed after title generation"
+                    );
+                }
+            });
         }
     }
 
     async fn run(mut self) {
-        // Persistence traffic counts as worktree activity; debounced so
-        // long-resident sessions (leader/remote, active for days without a
-        // re-open) stay out of gc expiry without per-message DB writes.
         // The constructors fire the t=0 touch, so this starts at now().
         let mut last_worktree_touch = std::time::Instant::now();
         while let Some(msg) = self.rx.recv().await {
@@ -2486,7 +2736,7 @@ impl SessionPersistence {
                     let _ = self.flush_pending().await;
                 }
                 PersistenceMsg::FlushAndAck { respond_to } => {
-                    let result = self.flush_pending().await;
+                    let result = self.flush_and_sync().await;
                     let _ = respond_to.send(result);
                 }
                 PersistenceMsg::ProbeWritable { respond_to } => {
@@ -2521,16 +2771,29 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::AppendUpdateDurablyAndAck { update, respond_to } => {
                     let result = self.handle_durable_append(update).await;
-                    let _ = respond_to.send(result);
+                    if let Err(Err(error)) = respond_to.send(result) {
+                        tracing::warn!(%error, "failed to write durable update");
+                    }
                 }
                 PersistenceMsg::Chat(chat_msg) => {
                     let result = self
                         .storage
-                        .append_chat_message(&self.info, &chat_msg)
+                        .append_chat_message_commit_aware(&self.info, &chat_msg)
                         .await;
-                    self.observe_io(&result);
-                    if let Err(e) = result {
-                        tracing::warn!(?e, "failed to write chat message");
+                    self.observe_append_chat(&result);
+                    match &result {
+                        Ok(()) => self.dirty_files.chat = true,
+                        Err(crate::session::storage::AppendChatError::Committed(error)) => {
+                            tracing::warn!(
+                                %error,
+                                "failed to write chat bookkeeping after append"
+                            );
+                            self.dirty_files.chat = true;
+                        }
+                        Err(crate::session::storage::AppendChatError::NotCommitted(error)) => {
+                            tracing::warn!(%error, "failed to write chat message");
+                            self.note_write_failure(error);
+                        }
                     }
                 }
                 PersistenceMsg::AppendCwdSwitchAndAck { item, respond_to } => {
@@ -2562,8 +2825,8 @@ impl SessionPersistence {
                         .replace_chat_history(&self.info, &messages)
                         .await;
                     self.observe_io(&result);
-                    if let Err(e) = result {
-                        tracing::warn!(?e, "failed to replace chat history");
+                    if let Err(error) = result {
+                        tracing::warn!(?error, "failed to replace chat history");
                     }
                 }
                 PersistenceMsg::ReplaceChatHistoryForStripAndAck {
@@ -2578,8 +2841,8 @@ impl SessionPersistence {
                     )
                     .await;
                     self.observe_io(&result);
-                    if let Err(e) = &result {
-                        tracing::warn!(?e, "image-strip history rewrite failed");
+                    if let Err(error) = &result {
+                        tracing::warn!(?error, "image-strip history rewrite failed");
                     }
                     let _ = respond_to.send(result);
                 }
@@ -2592,7 +2855,7 @@ impl SessionPersistence {
                 } => {
                     self.current_provider = provider;
                     self.observe_provider(provider).await;
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_current_model_and_agent(
                             &self.info,
@@ -2603,7 +2866,7 @@ impl SessionPersistence {
                         )
                         .await
                     {
-                        tracing::warn!(?e, "failed to update current model");
+                        tracing::warn!(?error, "failed to update current model");
                     }
                     if self.provider_boundary.allows_xai_export()
                         && let Some(sync) = &self.remote_sync
@@ -2612,12 +2875,12 @@ impl SessionPersistence {
                     }
                 }
                 PersistenceMsg::PreviousTurnModel(previous_model) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_previous_turn_model(&self.info, previous_model)
                         .await
                     {
-                        tracing::warn!(?e, "failed to update previous-turn model metadata");
+                        tracing::warn!(?error, "failed to update previous-turn model metadata");
                     }
                 }
                 PersistenceMsg::ObserveProvider(provider) => {
@@ -2627,24 +2890,26 @@ impl SessionPersistence {
                     self.summary.refresh_codex_bearer_resolver(bearer_resolver);
                 }
                 PersistenceMsg::PlanState(state) => {
-                    if let Err(e) = self.storage.write_plan_state(&self.info, &state).await {
-                        tracing::warn!(?e, "failed to write plan state");
+                    if let Err(error) = self.storage.write_plan_state(&self.info, &state).await {
+                        tracing::warn!(?error, "failed to write plan state");
                     }
                 }
                 PersistenceMsg::PlanModeState(state) => {
-                    if let Err(e) = self.storage.write_plan_mode_state(&self.info, &state).await {
-                        tracing::warn!(?e, "failed to write plan mode state");
+                    if let Err(error) = self.storage.write_plan_mode_state(&self.info, &state).await
+                    {
+                        tracing::warn!(?error, "failed to write plan mode state");
                     }
                 }
                 PersistenceMsg::GoalModeState(state) => {
-                    if let Err(e) = self.storage.write_goal_mode_state(&self.info, &state).await {
-                        tracing::warn!(?e, "failed to write goal mode state");
+                    if let Err(error) = self.storage.write_goal_mode_state(&self.info, &state).await
+                    {
+                        tracing::warn!(?error, "failed to write goal mode state");
                     }
                 }
                 PersistenceMsg::DeleteGoalModeState { respond_to } => {
                     let result = self.storage.delete_goal_mode_state(&self.info).await;
-                    if let Err(e) = &result {
-                        tracing::warn!(?e, "failed to delete goal mode state");
+                    if let Err(error) = &result {
+                        tracing::warn!(?error, "failed to delete goal mode state");
                     }
                     let _ = respond_to.send(result);
                 }
@@ -2671,12 +2936,12 @@ impl SessionPersistence {
                     let _ = respond_to.send(result);
                 }
                 PersistenceMsg::DeleteWorkflowRunState(run_id) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .delete_workflow_run_state(&self.info, &run_id)
                         .await
                     {
-                        tracing::warn!(%run_id, ?e, "failed to delete workflow run state");
+                        tracing::warn!(%run_id, ?error, "failed to delete workflow run state");
                     }
                 }
                 PersistenceMsg::ContentChunk(content_chunks) => {
@@ -2705,6 +2970,22 @@ impl SessionPersistence {
                         &self.info.cwd,
                     );
                 }
+                PersistenceMsg::LastRecap(recap) => {
+                    if let Err(error) = self.storage.set_last_recap(&self.info, recap).await {
+                        tracing::warn!(%error, "failed to persist last recap");
+                    }
+                }
+                PersistenceMsg::RegenerateTitle(title) => {
+                    match self
+                        .storage
+                        .regenerate_generated_title(&self.info, title.clone())
+                        .await
+                    {
+                        Ok(true) => self.announce_adopted_title(title),
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(%error, "failed to persist refreshed title"),
+                    }
+                }
                 PersistenceMsg::GeneratedTitle(title) => {
                     // Auto-generated titles must never overwrite a title the
                     // user set via `/rename`. `set_generated_title_if_absent`
@@ -2717,57 +2998,14 @@ impl SessionPersistence {
                         .set_generated_title_if_absent(&self.info, title.clone())
                         .await
                     {
-                        Ok(true) => {
-                            // Announce to clients only now that the title is
-                            // adopted, so a title rejected for racing a manual
-                            // `/rename` never overwrites the client's title.
-                            crate::session::summary::notify_client(
-                                &self.gateway,
-                                &self.info,
-                                &title,
-                            );
-                            if self.provider_boundary.allows_xai_export()
-                                && let Some(sync) = &self.remote_sync
-                            {
-                                sync.set_title(title.clone());
-                            }
-                            if self.provider_boundary.allows_xai_export()
-                                && let Some(reg) = self.registry_title_sync.as_ref()
-                                && !reg.suppress_for_zdr
-                            {
-                                let client = reg.client.clone();
-                                let provider_boundary = self.provider_boundary.clone();
-                                let sid = self.info.id.to_string();
-                                let t = title;
-                                tokio::spawn(async move {
-                                    if !provider_boundary.allows_xai_export() {
-                                        return;
-                                    }
-                                    let req =
-                                        crate::agent::session_registry_client::UpdateRequest {
-                                            summary: Some(t),
-                                            first_prompt: None,
-                                            last_turn_number: None,
-                                            repo_head_at_end: None,
-                                            restorable_turn_number: None,
-                                        };
-                                    if let Err(e) = client.update(&sid, &req).await {
-                                        tracing::warn!(
-                                            error = %e,
-                                            session_id = %sid,
-                                            "session registry summary sync failed after title generation"
-                                        );
-                                    }
-                                });
-                            }
-                        }
+                        Ok(true) => self.announce_adopted_title(title),
                         Ok(false) => {
                             tracing::debug!(
                                 "session already has a title on disk; discarding generated title"
                             );
                         }
-                        Err(e) => {
-                            tracing::warn!(?e, "failed to persist generated session title");
+                        Err(error) => {
+                            tracing::warn!(?error, "failed to persist generated session title");
                         }
                     }
                 }
@@ -2787,128 +3025,137 @@ impl SessionPersistence {
                     }
                 }
                 PersistenceMsg::LastTurnSummary(summary) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .set_last_turn_summary(&self.info, summary)
                         .await
                     {
-                        tracing::warn!(?e, "failed to persist last turn summary");
+                        tracing::warn!(?error, "failed to persist last turn summary");
                     }
                 }
                 PersistenceMsg::RewindPoint(point) => {
                     let result = self.storage.append_rewind_point(&self.info, &point).await;
                     self.observe_io(&result);
-                    if let Err(e) = result {
-                        tracing::warn!(?e, "failed to write rewind point");
+                    match result {
+                        Ok(()) => self.dirty_files.rewind_points = true,
+                        Err(error) => {
+                            tracing::warn!(?error, "failed to write rewind point");
+                            self.note_write_failure(&error);
+                        }
                     }
                 }
                 PersistenceMsg::TruncateRewindPoints { from_index } => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .truncate_rewind_points_from(&self.info, from_index)
                         .await
                     {
-                        tracing::warn!(?e, from_index, "failed to truncate rewind points");
+                        tracing::warn!(?error, from_index, "failed to truncate rewind points");
                     }
                 }
                 PersistenceMsg::MergeRewindPointsFrom { target_index } => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .merge_rewind_points_from(&self.info, target_index)
                         .await
                     {
-                        tracing::warn!(?e, target_index, "failed to merge rewind points");
+                        tracing::warn!(?error, target_index, "failed to merge rewind points");
                     }
                 }
                 PersistenceMsg::CollectionId(collection_id) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_collection_id(&self.info, &collection_id)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write collection id");
+                        tracing::warn!(?error, "failed to write collection id");
                     }
                 }
                 PersistenceMsg::NextTraceTurn {
                     next_trace_turn,
                     request_id,
                 } => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_next_trace_turn(&self.info, next_trace_turn, request_id.as_deref())
                         .await
                     {
-                        tracing::warn!(?e, "failed to write next trace turn");
+                        tracing::warn!(?error, "failed to write next trace turn");
                     }
                 }
                 PersistenceMsg::Signals(signals) => {
-                    if let Err(e) = self.storage.write_signals(&self.info, &signals).await {
-                        tracing::warn!(?e, "failed to write session signals");
+                    if let Err(error) = self.storage.write_signals(&self.info, &signals).await {
+                        tracing::warn!(?error, "failed to write session signals");
+                    }
+                }
+                PersistenceMsg::UsageTurn { turn_number, live } => {
+                    if let Err(error) = self.persist_usage_turn(turn_number, &live).await {
+                        tracing::warn!(?error, turn_number, "failed to write session usage");
                     }
                 }
                 PersistenceMsg::AnnouncementState(state) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .write_announcement_state(&self.info, &state)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write announcement state");
+                        tracing::warn!(?error, "failed to write announcement state");
                     }
                 }
                 PersistenceMsg::Feedback(entry) => {
-                    if let Err(e) = self.storage.append_feedback(&self.info, &entry).await {
-                        tracing::warn!(?e, "failed to write feedback entry");
+                    if let Err(error) = self.storage.append_feedback(&self.info, &entry).await {
+                        tracing::warn!(?error, "failed to write feedback entry");
                     }
                 }
                 PersistenceMsg::Btw(entry) => {
-                    if let Err(e) = self.storage.append_btw(&self.info, &entry).await {
-                        tracing::warn!(?e, "failed to write btw entry");
+                    if let Err(error) = self.storage.append_btw(&self.info, &entry).await {
+                        tracing::warn!(?error, "failed to write btw entry");
                     }
                 }
                 PersistenceMsg::GitHead { commit, branch } => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .update_git_head(&self.info, commit, branch)
                         .await
                     {
-                        tracing::warn!(?e, "failed to persist git HEAD");
+                        tracing::warn!(?error, "failed to persist git HEAD");
                     }
                 }
                 PersistenceMsg::CompactionCheckpoint(checkpoint) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .write_compaction_checkpoint(&self.info, &checkpoint)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write compaction checkpoint file");
+                        tracing::warn!(?error, "failed to write compaction checkpoint file");
                     }
                 }
                 PersistenceMsg::CompactionRequest(request) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .write_compaction_request(&self.info, &request)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write compaction request artifact");
+                        tracing::warn!(?error, "failed to write compaction request artifact");
                     }
                 }
                 PersistenceMsg::RecapRequest(request) => {
-                    if let Err(e) = self.storage.write_recap_request(&self.info, &request).await {
-                        tracing::warn!(?e, "failed to write recap request artifact");
+                    if let Err(error) = self.storage.write_recap_request(&self.info, &request).await
+                    {
+                        tracing::warn!(?error, "failed to write recap request artifact");
                     }
                 }
                 PersistenceMsg::CompactionSegment(segment) => {
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .storage
                         .write_compaction_segment(&self.info, &segment)
                         .await
                     {
-                        tracing::warn!(?e, "failed to write compaction segment");
+                        tracing::warn!(?error, "failed to write compaction segment");
                     }
                 }
                 PersistenceMsg::CopyFile { one_shot } => {
-                    // Flush pending writes and sync all session files to disk before copying.
-                    self.flush_and_sync().await;
+                    let _ = self.flush_and_sync_all().await;
 
                     let result = self.copy_session_dir_to_memory().await;
                     let _ = one_shot.send(result);
@@ -2935,6 +3182,36 @@ impl SessionPersistence {
             Ok(SessionStateCopy { files })
         })
         .await?
+    }
+}
+
+impl SessionPersistence {
+    async fn persist_usage_turn(
+        &mut self,
+        turn_number: u32,
+        live: &crate::session::usage_file::UsageSummary,
+    ) -> io::Result<()> {
+        let mut file = self
+            .storage
+            .read_usage(&self.info)
+            .await?
+            .unwrap_or_else(|| {
+                crate::session::usage_file::SessionUsageFile::new(self.info.id.to_string())
+            });
+        file.session_id = self.info.id.to_string();
+        file.restore_apply_cursor(self.last_incoming_turn, self.last_usage_turn);
+        file.apply_turn(
+            turn_number,
+            Utc::now().to_rfc3339(),
+            live,
+            self.last_usage_live.as_ref(),
+        );
+        let (incoming, written) = file.apply_cursor();
+        self.storage.write_usage(&self.info, &file).await?;
+        self.last_usage_live = Some(live.clone());
+        self.last_incoming_turn = incoming;
+        self.last_usage_turn = written;
+        Ok(())
     }
 }
 
@@ -3213,6 +3490,7 @@ pub(crate) async fn new(
     gateway: Option<GatewaySender>,
     session_summary_model: String,
     registry_title_sync: Option<RegistryGeneratedTitleSync>,
+    session_kind: Option<String>,
 ) -> io::Result<PersistenceHandle> {
     let root_dir = grok_home();
     let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
@@ -3220,6 +3498,13 @@ pub(crate) async fn new(
     // Initialize session in storage
     let mut summary = storage.init_session(info, model_id.clone()).await?;
     touch_worktree_for_session(info).await;
+
+    if summary.session_kind.is_none()
+        && let Some(kind) = session_kind
+    {
+        storage.set_session_kind_if_absent(info, kind).await?;
+        summary = storage.load_summary(info).await?;
+    }
 
     // Update model if different
     if summary.current_model_id != model_id {
@@ -3271,6 +3556,11 @@ pub(crate) async fn new(
             gateway,
             disk_full_tx,
             disk_full_notified: false,
+            dirty_files: Default::default(),
+            pending_write_error: None,
+            last_usage_live: None,
+            last_usage_turn: None,
+            last_incoming_turn: None,
         };
         persistence.run().await;
     });
@@ -3300,11 +3590,15 @@ pub(crate) async fn new_with_explicit_dir(
     let storage: Box<dyn StorageAdapter> =
         Box::new(JsonlStorageAdapter::with_explicit_session_dir(target_dir));
 
-    // Initialize session in storage (creates summary.json, etc.)
     let mut summary = storage.init_session(info, model_id.clone()).await?;
     touch_worktree_for_session(info).await;
-    if summary.session_kind.is_none() {
+    if summary
+        .session_kind
+        .as_deref()
+        .is_none_or(|kind| kind == WORKTREE_SESSION_KIND)
+    {
         summary.session_kind = Some("subagent".to_string());
+        summary.source_workspace_dir = None;
     }
     let summary_json = serde_json::to_vec_pretty(&summary)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -3346,6 +3640,11 @@ pub(crate) async fn new_with_explicit_dir(
             gateway: None,
             disk_full_tx,
             disk_full_notified: false,
+            dirty_files: Default::default(),
+            pending_write_error: None,
+            last_usage_live: None,
+            last_usage_turn: None,
+            last_incoming_turn: None,
         };
         persistence.run().await;
     });
@@ -3489,6 +3788,11 @@ pub(crate) async fn load(
             gateway,
             disk_full_tx,
             disk_full_notified: false,
+            dirty_files: Default::default(),
+            pending_write_error: None,
+            last_usage_live: None,
+            last_usage_turn: None,
+            last_incoming_turn: None,
         };
         persistence.run().await;
     });
@@ -3596,6 +3900,11 @@ pub(crate) async fn load_light(
             gateway,
             disk_full_tx,
             disk_full_notified: false,
+            dirty_files: Default::default(),
+            pending_write_error: None,
+            last_usage_live: None,
+            last_usage_turn: None,
+            last_incoming_turn: None,
         };
         persistence.run().await;
     });
@@ -4467,9 +4776,9 @@ mod find_summary_by_session_id_tests {
 #[cfg(test)]
 mod resumed_sandbox_profile_tests {
     use super::{
-        RelocationError, RelocationView, most_recent_local_summary_for_cwd_in_root,
-        most_recent_local_summary_for_cwd_in_view, read_summary_from_dir,
-        resumed_session_sandbox_profile_in_root,
+        RecentSessionSelection, RelocationError, RelocationView,
+        most_recent_local_summary_for_cwd_in_root, most_recent_local_summary_for_cwd_in_view,
+        read_summary_from_dir, resumed_session_sandbox_profile_in_root,
     };
     use std::{fs, io};
     use tempfile::TempDir;
@@ -4686,17 +4995,22 @@ mod resumed_sandbox_profile_tests {
         );
         let view = RelocationView::load_for_sessions_root(&root).unwrap();
 
-        let picked = most_recent_local_summary_for_cwd_in_view(cwd, &view, |session_dir| {
-            if session_dir.ends_with("removed") {
-                Err(RelocationError::Io {
-                    operation: "read",
-                    path: session_dir.join("summary.json"),
-                    source: io::Error::new(io::ErrorKind::NotFound, "injected"),
-                })
-            } else {
-                read_summary_from_dir(session_dir)
-            }
-        })
+        let picked = most_recent_local_summary_for_cwd_in_view(
+            cwd,
+            &view,
+            |session_dir| {
+                if session_dir.ends_with("removed") {
+                    Err(RelocationError::Io {
+                        operation: "read",
+                        path: session_dir.join("summary.json"),
+                        source: io::Error::new(io::ErrorKind::NotFound, "injected"),
+                    })
+                } else {
+                    read_summary_from_dir(session_dir)
+                }
+            },
+            RecentSessionSelection::Interactive,
+        )
         .unwrap()
         .unwrap();
         assert_eq!(picked.info.id.0.as_ref(), "valid");
@@ -4727,17 +5041,22 @@ mod resumed_sandbox_profile_tests {
         );
         let view = RelocationView::load_for_sessions_root(&root).unwrap();
 
-        let error = most_recent_local_summary_for_cwd_in_view(cwd, &view, |session_dir| {
-            if session_dir.ends_with("unreadable-newer") {
-                Err(RelocationError::Io {
-                    operation: "read",
-                    path: session_dir.join("summary.json"),
-                    source: io::Error::new(io::ErrorKind::PermissionDenied, "injected"),
-                })
-            } else {
-                read_summary_from_dir(session_dir)
-            }
-        })
+        let error = most_recent_local_summary_for_cwd_in_view(
+            cwd,
+            &view,
+            |session_dir| {
+                if session_dir.ends_with("unreadable-newer") {
+                    Err(RelocationError::Io {
+                        operation: "read",
+                        path: session_dir.join("summary.json"),
+                        source: io::Error::new(io::ErrorKind::PermissionDenied, "injected"),
+                    })
+                } else {
+                    read_summary_from_dir(session_dir)
+                }
+            },
+            RecentSessionSelection::Interactive,
+        )
         .unwrap_err();
         assert!(matches!(
             error,

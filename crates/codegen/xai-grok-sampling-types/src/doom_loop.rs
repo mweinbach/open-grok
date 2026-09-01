@@ -23,6 +23,10 @@ use serde::{Deserialize, Serialize};
 
 /// Request header whose presence enables the server-side check.
 pub const DOOM_LOOP_CHECK_HEADER: &str = "x-grok-doom-loop-check";
+/// Exact-repetition reporting sibling header.
+/// The default client value is the production-safe minimum of 64 tokens.
+pub const EXACT_REPETITION_CHECK_HEADER: &str = "x-grok-exact-repetition-check";
+pub const DEFAULT_EXACT_REPETITION_MIN_TOKENS: usize = 64;
 
 /// `type` of the non-standard mid-stream SSE event — also its SSE `event:`
 /// name. async-openai's typed `rs::ResponseStreamEvent` does not know this
@@ -156,7 +160,12 @@ pub enum DoomLoopSignalKind {
     /// `tail_repetition:{threshold}@{channel}` — a repeating tail was found
     /// at the given detector threshold.
     TailRepetition(u32),
-    /// `low_logprob@{channel}` — degenerate low-entropy generation.
+    /// `exact_repetition:{sequence_tokens}x{repeat_count}@{channel}`: an exact token sequence repeated consecutively.
+    ExactRepetition {
+        sequence_tokens: u32,
+        repeat_count: u32,
+    },
+    /// `low_logprob@{channel}`: degenerate low-entropy generation.
     LowLogprob,
     /// Any label this client version cannot classify; the unparsed kind
     /// segment is preserved verbatim.
@@ -188,6 +197,18 @@ impl DoomLoopSignal {
                 Ok(t) => DoomLoopSignalKind::TailRepetition(t),
                 Err(_) => DoomLoopSignalKind::Unknown(head.to_string()),
             },
+            Some(("exact_repetition", dimensions)) => dimensions
+                .split_once('x')
+                .and_then(|(sequence, count)| {
+                    Some((sequence.parse::<u32>().ok()?, count.parse::<u32>().ok()?))
+                })
+                .map_or_else(
+                    || DoomLoopSignalKind::Unknown(head.to_string()),
+                    |(sequence_tokens, repeat_count)| DoomLoopSignalKind::ExactRepetition {
+                        sequence_tokens,
+                        repeat_count,
+                    },
+                ),
             None if head == "low_logprob" => DoomLoopSignalKind::LowLogprob,
             _ => DoomLoopSignalKind::Unknown(head.to_string()),
         };
@@ -304,6 +325,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_exact_repetition_label() {
+        let signal = DoomLoopSignal::parse("exact_repetition:42x3@thinking");
+        assert_eq!(
+            signal.kind,
+            DoomLoopSignalKind::ExactRepetition {
+                sequence_tokens: 42,
+                repeat_count: 3,
+            }
+        );
+        assert_eq!(signal.channel, "thinking");
+        assert_eq!(signal.raw, "exact_repetition:42x3@thinking");
+    }
+
+    #[test]
     fn parse_low_logprob_label() {
         let s = DoomLoopSignal::parse("low_logprob@response");
         assert_eq!(s.kind, DoomLoopSignalKind::LowLogprob);
@@ -326,6 +361,10 @@ mod tests {
         // Non-numeric threshold.
         assert!(matches!(
             DoomLoopSignal::parse("tail_repetition:huge@thinking").kind,
+            DoomLoopSignalKind::Unknown(_)
+        ));
+        assert!(matches!(
+            DoomLoopSignal::parse("exact_repetition:bad@thinking").kind,
             DoomLoopSignalKind::Unknown(_)
         ));
         // low_logprob must not carry a threshold segment.

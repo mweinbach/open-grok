@@ -54,3 +54,50 @@ pub fn tab_width() -> u8 {
 pub fn set_tab_width(w: u8) {
     TAB_WIDTH.store(w, Ordering::Relaxed);
 }
+
+pub fn expand_tabs(text: &str) -> std::borrow::Cow<'_, str> {
+    let width = tab_width();
+    if width == 0 || !text.contains('\t') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(text.replace('\t', &" ".repeat(usize::from(width))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_tabs_borrows_text_without_tabs() {
+        assert!(matches!(
+            expand_tabs("שלום\n界\u{1b}[31mred"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial(TAB_WIDTH)]
+    fn expand_tabs_respects_configured_width_without_touching_controls() {
+        struct RestoreTabWidth(u8);
+
+        impl Drop for RestoreTabWidth {
+            fn drop(&mut self) {
+                set_tab_width(self.0);
+            }
+        }
+
+        let _restore = RestoreTabWidth(tab_width());
+        for width in [0, 1, 4, 8] {
+            set_tab_width(width);
+            let source = "界\tשלום\n\t\u{1b}[31mred";
+            let expanded = expand_tabs(source);
+            if width == 0 {
+                assert!(matches!(expanded, std::borrow::Cow::Borrowed(_)));
+                assert_eq!(expanded, source);
+            } else {
+                let spaces = " ".repeat(usize::from(width));
+                assert_eq!(expanded, format!("界{spaces}שלום\n{spaces}\u{1b}[31mred"));
+            }
+        }
+    }
+}

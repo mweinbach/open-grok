@@ -3,6 +3,7 @@
 //! payload preparation.
 #![allow(clippy::items_after_test_module)]
 use super::*;
+use crate::session::repo_status_prefix::RepoStatusSnapshot;
 /// Normalize a free-form name (e.g. an MCP server identifier) into a
 /// single safe filesystem segment.
 ///
@@ -241,8 +242,8 @@ mod partition_rules_by_scope_tests {
         assert!(rules.contains("name=\"/repo/AGENTS.md\""));
         assert!(rules.contains("name=\"/repo/CLAUDE.md\""));
         assert!(rules.contains("name=\"/repo/.opengrok/rules/x.md\""));
-        assert!(rules.contains("<user_rule>home-grok-body</user_rule>"));
-        assert!(rules.contains("<user_rule>home-claude-body</user_rule>"));
+        assert!(rules.contains("<user_rule>\nhome-grok-body\n</user_rule>"));
+        assert!(rules.contains("<user_rule>\nhome-claude-body\n</user_rule>"));
         assert!(!rules.contains("## From:"));
         assert!(!rules.contains("<system-reminder>"));
     }
@@ -629,10 +630,11 @@ impl SessionActor {
                 def.include_browser_verification(),
             )
         };
+        let repo_status = self.resolve_repo_status_prefix().await;
         let mut prefix_carries_fallback_date = false;
         let mut out = if !matches!(template, UserMessageTemplate::Default) {
             if let Some(rendered) = self
-                .build_templated_user_message(cwd, template.clone())
+                .build_templated_user_message(cwd, template.clone(), repo_status.as_ref())
                 .await
             {
                 rendered
@@ -641,16 +643,10 @@ impl SessionActor {
                     "templated user message render failed; falling back to legacy prefix"
                 );
                 prefix_carries_fallback_date = !template.surfaces_local_date();
-                if self.startup_hints.skip_git_status {
-                    construct_user_message_minimal(cwd, None)
-                } else {
-                    construct_user_message(cwd, self.vcs_kind, None, None).await
-                }
+                self.construct_legacy_prefix(cwd, repo_status.as_ref())
             }
-        } else if self.startup_hints.skip_git_status {
-            construct_user_message_minimal(cwd, None)
         } else {
-            construct_user_message(cwd, self.vcs_kind, None, None).await
+            self.construct_legacy_prefix(cwd, repo_status.as_ref())
         };
         if matches!(template, UserMessageTemplate::Default) && include_verification {
             let (workspace_rules, mut user_rules) = self.gather_partitioned_rules();
@@ -719,14 +715,18 @@ impl SessionActor {
         &self,
         cwd: &std::path::Path,
         template: xai_grok_agent::prompt::user_message::UserMessageTemplate,
+        repo_status: Option<&RepoStatusSnapshot>,
     ) -> Option<String> {
         use xai_grok_agent::prompt::user_message::UserMessageContext;
         self.wait_for_mcp_templated_prefix_ready(&template).await;
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let (vcs_root, vcs_status) = self.gather_vcs_for_prefix(cwd).await;
+        let (vcs_root, vcs_status) = match repo_status {
+            Some(snapshot) => (snapshot.root.clone(), snapshot.templated_status()),
+            None => (None, None),
+        };
         let (workspace_rules, user_rules) = self.gather_partitioned_rules();
         let mut user_rules = user_rules;
-        let skills = bridge.slash_skills().await;
+        let skills = self.slash_skills_for_resolve().await;
         let mcp_servers = self.gather_mcp_servers(cwd).await;
         if self
             .agent
@@ -771,36 +771,55 @@ impl SessionActor {
         };
         ctx.render(&bridge).await
     }
-    /// Gather VCS root + status with the same 2s timeout used by the legacy
-    /// `construct_user_message` path. Returns `(root, status)` -- either may
-    /// be `None` if VCS is absent or the lookup timed out.
-    async fn gather_vcs_for_prefix(
+    fn construct_legacy_prefix(
         &self,
         cwd: &std::path::Path,
-    ) -> (Option<std::path::PathBuf>, Option<String>) {
-        use xai_grok_workspace::file_system::{git_status_short, jj_status};
-        use xai_grok_workspace::session::git::VcsKind;
-        if matches!(self.vcs_kind, VcsKind::None) {
-            return (None, None);
+        repo_status: Option<&RepoStatusSnapshot>,
+    ) -> String {
+        let mut prefix = construct_user_message_minimal(cwd, None);
+        if let Some(status) = repo_status.and_then(|snapshot| snapshot.legacy_status()) {
+            prefix.push_str(&crate::session::user_message::format_vcs_status_block(
+                &status,
+                self.vcs_kind,
+            ));
         }
-        let root = git2::Repository::discover(cwd).ok().and_then(|repo| {
-            repo.workdir().map(|p| {
-                let s = p.to_string_lossy();
-                let trimmed = s.trim_end_matches('/');
-                std::path::PathBuf::from(trimmed)
-            })
-        });
-        let timeout = std::time::Duration::from_secs(5);
-        let status = if self.vcs_kind.is_jj() {
-            tokio::time::timeout(timeout, jj_status(cwd)).await
-        } else {
-            tokio::time::timeout(timeout, git_status_short(cwd)).await
+        prefix
+    }
+    async fn resolve_repo_status_prefix(&self) -> Option<RepoStatusSnapshot> {
+        use crate::session::repo_status_prefix::{
+            REPO_STATUS_WAIT_BUDGET, RepoStatusPlan, gather_repo_status,
         };
-        let status = match status {
-            Ok(Ok(s)) if !s.trim().is_empty() => Some(s.trim_end().to_string()),
-            _ => None,
-        };
-        (root, status)
+        match self.repo_status_prefetch.plan() {
+            RepoStatusPlan::NoRepo => None,
+            RepoStatusPlan::RootOnly { root, vcs_kind } => {
+                Some(RepoStatusSnapshot::root_only(root.clone(), *vcs_kind))
+            }
+            RepoStatusPlan::Gather { inputs, .. } => {
+                use tracing::Instrument;
+                let wait_start = std::time::Instant::now();
+                let snapshot = match self.repo_status_prefetch.take_prefetch() {
+                    Some(mut prefetch) => {
+                        prefetch
+                            .snapshot_within(REPO_STATUS_WAIT_BUDGET)
+                            .instrument(tracing::info_span!("prompt.repo_status_wait"))
+                            .await
+                    }
+                    None => gather_repo_status(inputs).await,
+                };
+                self.log_repo_status_wait(wait_start.elapsed());
+                Some(snapshot.unwrap_or_else(|| inputs.missed_snapshot()))
+            }
+        }
+    }
+    fn log_repo_status_wait(&self, waited: std::time::Duration) {
+        let wait_ms = self.repo_status_prefetch.record_wait(waited);
+        if wait_ms > 0 {
+            tracing::info!(
+                session_id = %self.session_info.id.0,
+                repo_status_wait_ms = wait_ms,
+                "user prefix waited on the repo status prefetch"
+            );
+        }
     }
     /// `None` twin: descriptor materialization is unavailable in this build.
     fn workspace_mcps_root(_cwd: &std::path::Path) -> Option<std::path::PathBuf> {

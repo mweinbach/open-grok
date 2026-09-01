@@ -37,6 +37,11 @@ pub enum HunkTrackerCommand {
     /// Reset baseline after commit
     ResetBaseline { path: PathBuf },
 
+    SetWorkingDir {
+        working_dir: PathBuf,
+        reply: oneshot::Sender<()>,
+    },
+
     // === Action Commands (accept/reject hunks) ===
     /// Apply action (accept/reject) to a specific hunk
     HunkAction {

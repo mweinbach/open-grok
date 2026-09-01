@@ -6,14 +6,14 @@ edition.workspace = true
 description = "Opt-in extra TLS roots from OPENGROK_EXTRA_CA_BUNDLE (validated DER cache + reqwest 0.12 adapters)"
 
 [dependencies]
-reqwest = { workspace = true }
-# Explicit pin (not `workspace = true`): the workspace rustls pin enables
-# aws-lc-rs. This crate only needs RootCertStore + PEM parse, so stay
-# default-features = false with `std` (enables pki-types/std for PEM).
-rustls = { version = "0.23", default-features = false, features = ["std"] }
+reqwest = { workspace = true, features = ["rustls-tls-native-roots-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
+rustls-native-certs = "0.8"
 tracing = { workspace = true }
+webpki-roots = "1"
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = { workspace = true }
 
 [lints]

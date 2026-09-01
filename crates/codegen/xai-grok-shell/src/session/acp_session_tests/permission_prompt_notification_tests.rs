@@ -362,8 +362,8 @@ async fn pre_tool_use_invalid_updated_input_is_tool_parsing_error() {
 
             let result = prepare(&actor, read_call("call_bad_rewrite")).await;
             assert!(
-                matches!(result, Err(ToolLoop::ToolParsingError)),
-                "an invalid hook updatedInput must surface as a parse error, got {result:?}"
+                matches!(&result, Err(ToolLoop::HookDenied { hook_name }) if hook_name == "test/pretooluse"),
+                "an invalid hook updatedInput must be denied with its hook attribution, got {result:?}"
             );
         })
         .await;

@@ -398,6 +398,31 @@ impl JsonlStorageAdapter {
             &self.signals_file(source_info),
             &self.signals_file(target_info),
         )?;
+        let usage_copied = copy_sidecar_file(
+            options.copy_usage,
+            &self.usage_file(source_info),
+            &self.usage_file(target_info),
+        )?;
+        if let Some(max_turn) = options.target_prompt_index.map(|item| (item + 1) as u32) {
+            if usage_copied {
+                restamp_copied_usage(
+                    &self.usage_file(target_info),
+                    &target_info.id,
+                    Some(max_turn),
+                )?;
+            }
+            if usage_copied && signals_copied {
+                clip_copied_signals_turns(&self.signals_file(target_info), max_turn)?;
+            }
+        } else if usage_copied {
+            restamp_copied_usage(&self.usage_file(target_info), &target_info.id, None)?;
+        }
+        if usage_copied && !signals_copied {
+            seed_signals_turn_from_usage(
+                &self.usage_file(target_info),
+                &self.signals_file(target_info),
+            )?;
+        }
         let plan_mode_state_copied = copy_sidecar_file(
             options.copy_plan_mode_state,
             &self.plan_mode_state_file(source_info),
@@ -413,6 +438,27 @@ impl JsonlStorageAdapter {
             &self.announcement_state_file(source_info),
             &self.announcement_state_file(target_info),
         )?;
+        if announcement_state_copied
+            && (options.target_prompt_index.is_some() || options.fork_filter)
+        {
+            clear_announced_failure_episodes(&self.announcement_state_file(target_info))?;
+        }
+
+        if let Some(parent_checkpoint) =
+            crate::session::helpers::session_summary::load_title_refresh_watermark(
+                &self.session_dir(source_info),
+            )
+        {
+            let child_checkpoint = if options.target_prompt_index.is_none() {
+                parent_checkpoint
+            } else {
+                0
+            };
+            crate::session::helpers::session_summary::save_title_refresh_watermark(
+                &self.session_dir(target_info),
+                child_checkpoint,
+            );
+        }
 
         // Copied verbatim: the archive is immutable, so no cwd rewrite.
         let compaction_segments_copied = if options.copy_compaction_segments {
@@ -490,7 +536,9 @@ fn fork_summary(
         .flatten();
     // Compute before moving `source` fields that do not implement Copy.
     let cache_affinity_id = Some(source.prompt_cache_affinity_id());
-    Summary {
+    let target_worktree_identity =
+        crate::session::worktree::worktree_identity_for_cwd(&target_info.cwd);
+    let mut summary = Summary {
         info: target_info.clone(),
         cwd_generation: source.cwd_generation,
         previous_cwd: source.previous_cwd,
@@ -531,15 +579,13 @@ fn fork_summary(
         grok_home: crate::session::persistence::grok_home_string(),
         last_active_at: source.last_active_at,
         generated_title: source.generated_title,
-        // A fork keeps the parent's title, so its manual-ness rides along.
         title_is_manual: source.title_is_manual,
-        worktree_label: source.worktree_label,
+        worktree_label: target_worktree_identity
+            .as_ref()
+            .map(|identity| identity.label.clone()),
         agent_name: source.agent_name,
         sandbox_profile: source.sandbox_profile,
         reasoning_effort: source.reasoning_effort,
-        // Full forks keep the parent's last turn. Partial forks
-        // (`target_prompt_index`) may drop that turn, so clear the summary
-        // rather than showing work that is not in the child conversation.
         last_turn_summary: if options.target_prompt_index.is_some() {
             None
         } else {
@@ -554,13 +600,118 @@ fn fork_summary(
         // session/load still *tries* the warmed prompt cache. Server TTL
         // may have expired; a new key would guarantee a miss.
         cache_affinity_id,
+        last_recap: if options.target_prompt_index.is_some() {
+            None
+        } else {
+            source.last_recap
+        },
+    };
+    if options.session_kind.is_none()
+        && let Some(identity) = &target_worktree_identity
+    {
+        summary.stamp_worktree_identity(identity);
+        if let Some(source_workspace_dir) = &options.source_workspace_dir {
+            summary.source_workspace_dir = Some(source_workspace_dir.clone());
+        }
     }
+    summary
 }
 
 /// Copy one optional sidecar file (plan, signals, tool state, ...) when
 /// enabled and present; reports whether a copy happened. A sidecar that
 /// exists but is not a regular file is skipped with a warning rather than
 /// failing the fork.
+fn clear_announced_failure_episodes(path: &Path) -> io::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let Ok(mut state) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(());
+    };
+    let Some(fields) = state.as_object_mut() else {
+        return Ok(());
+    };
+    if fields.remove("announced_failed_servers").is_none() {
+        return Ok(());
+    }
+    crate::session::storage::write_bytes_atomic(
+        path,
+        &serde_json::to_vec(&state).map_err(invalid_data)?,
+    )
+}
+
+fn clip_copied_signals_turns(path: &Path, max_turn: u32) -> io::Result<()> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Ok(mut signals) = serde_json::from_slice::<crate::session::signals::SessionSignals>(&data)
+    else {
+        return Ok(());
+    };
+    if signals.turn_count > max_turn {
+        signals.turn_count = max_turn;
+    }
+    if signals.user_message_count > max_turn {
+        signals.user_message_count = max_turn;
+    }
+    if signals.assistant_message_count > max_turn {
+        signals.assistant_message_count = max_turn;
+    }
+    crate::session::storage::write_bytes_atomic(
+        path,
+        &serde_json::to_vec(&signals).map_err(invalid_data)?,
+    )
+}
+
+fn seed_signals_turn_from_usage(usage_path: &Path, signals_path: &Path) -> io::Result<()> {
+    let data = match std::fs::read(usage_path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Ok(file) = serde_json::from_slice::<crate::session::usage_file::SessionUsageFile>(&data)
+    else {
+        return Ok(());
+    };
+    let Some(max_turn) = file.turns.iter().map(|turn| turn.turn_number).max() else {
+        return Ok(());
+    };
+    let signals = crate::session::signals::SessionSignals {
+        turn_count: max_turn,
+        user_message_count: max_turn,
+        ..Default::default()
+    };
+    crate::session::storage::write_bytes_atomic(
+        signals_path,
+        &serde_json::to_vec(&signals).map_err(invalid_data)?,
+    )
+}
+
+fn restamp_copied_usage(
+    path: &Path,
+    session_id: &acp::SessionId,
+    max_turn: Option<u32>,
+) -> io::Result<()> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Ok(mut file) =
+        serde_json::from_slice::<crate::session::usage_file::SessionUsageFile>(&data)
+    else {
+        return Ok(());
+    };
+    file.session_id = session_id.to_string();
+    if let Some(max_turn) = max_turn {
+        file.retain_turns_through(max_turn);
+    }
+    crate::session::storage::write_bytes_atomic(
+        path,
+        &serde_json::to_vec_pretty(&file).map_err(invalid_data)?,
+    )
+}
+
 fn copy_sidecar_file(enabled: bool, src: &Path, dst: &Path) -> io::Result<bool> {
     if !enabled {
         return Ok(false);

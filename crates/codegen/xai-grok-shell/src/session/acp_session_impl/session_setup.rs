@@ -126,11 +126,24 @@ impl SessionActor {
                         == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
             )
         });
-        let effects = bridge.apply_pending_skill_update().await?;
-        if let Some(item) = self.wrap_skill_reminder(&effects) {
-            conversation.push(item);
+        let effects = bridge.apply_pending_skill_update().await;
+        let skill_text = effects.as_ref().and_then(|update| {
+            if is_cursor && update.kind == xai_grok_tools::types::skill_discovery_tracker::SkillUpdateKind::BaselineChange {
+                None
+            } else {
+                update.system_reminder.as_deref()
+            }
+        });
+        if let Some(body) = crate::session::workflow::listing::merge_listing_sections(
+            skill_text,
+            self.workflow_listing_for_prompt().as_deref(),
+        ) {
+            let tag = self.reminder_wrapper_tag();
+            conversation.push(ConversationItem::system_reminder(format!(
+                "<{tag}>\n{body}\n</{tag}>"
+            )));
         }
-        Some(effects)
+        effects
     }
     pub(super) async fn build_prefix_background(&self) -> String {
         let start = std::time::Instant::now();
@@ -243,13 +256,21 @@ impl SessionActor {
         }
         skill_count
     }
+    pub(crate) async fn slash_skills_for_resolve(
+        &self,
+    ) -> Vec<xai_grok_tools::implementations::skills::types::SkillInfo> {
+        #[cfg(test)]
+        crate::session::slash_authority::record_skill_catalog_call();
+        let bridge = self.tool_bridge_handle();
+        bridge.slash_skills().await
+    }
     /// Send `AvailableCommandsUpdate` to the client.
     ///
     /// Reads the current slash-command skill list from the tools layer
     /// (`SkillManager`), NOT from `PromptContext`.
     pub(super) async fn send_available_commands_update(&self) {
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let skills = bridge.slash_skills().await;
+        let skills = self.slash_skills_for_resolve().await;
         let tool_names: Vec<String> = bridge
             .tool_definitions()
             .await
@@ -622,10 +643,13 @@ impl SessionActor {
         let turn_index = self.chat_state_handle.get_prompt_index().await as u64;
         tracing::info!(turn_index, turns, resolved_model_id = ?model_metadata.resolved_model_id, model_fingerprint = ?model_metadata.model_fingerprint, "build_session_info");
         let model_fingerprint = model_metadata.model_fingerprint;
+        let show_checkpoint_identity = model
+            .as_ref()
+            .is_some_and(|model| self.models_manager.model_show_model_fingerprint(model));
         let resolved_model_id = model_metadata.resolved_model_id.filter(|resolved| {
-            model
-                .as_deref()
-                .is_some_and(|m| should_show_resolved_model(m, resolved))
+            model.as_deref().is_some_and(|model| {
+                should_show_resolved_model(model, resolved, show_checkpoint_identity)
+            })
         });
         let signals = self.signals_handle().snapshot().await;
         let compaction_count = signals.as_ref().map(|s| s.compaction_count).unwrap_or(0);

@@ -472,6 +472,7 @@ async fn handle_notification(
                         respond_to,
                         persist_ack: None,
                         parsed_prompt_tx: None,
+                        initial_child_prompt_ready: None,
                     })
                     .is_ok();
                 if !enqueued {

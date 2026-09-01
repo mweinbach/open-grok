@@ -460,7 +460,7 @@ fn seed_trust_state(
 
 /// Pause terminal input and wait up to `timeout` for the reader to acknowledge.
 /// Returns with the pause still asserted; the handoff owner resumes the reader.
-fn park_input_reader(
+pub(super) fn park_input_reader(
     input_paused: &std::sync::atomic::AtomicBool,
     reader_parked: &std::sync::atomic::AtomicBool,
     timeout: Duration,
@@ -945,6 +945,123 @@ fn run_pending_suspends(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_pending_mode_switch(
+    app: &mut AppView,
+    terminal: &mut PagerTerminal,
+    minimal_live_rows: u16,
+    input_paused: &std::sync::atomic::AtomicBool,
+    reader_parked: &std::sync::atomic::AtomicBool,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimedInputEvent>,
+    presenter: &mut Presenter,
+    tasks: &mut JoinSet<TaskResult>,
+    progress_tx: &tokio::sync::mpsc::UnboundedSender<effects::RestoreProgressMsg>,
+    status_line_refresh_interval: &mut Option<Duration>,
+    status_line_refresh_at: &mut Option<Instant>,
+) -> bool {
+    let Some(target) = app.pending_screen_mode_switch.take() else {
+        return false;
+    };
+    let from = app.screen_mode;
+    if target == from {
+        return false;
+    }
+    match crate::app::mode_switch::transition_terminal(
+        terminal,
+        from,
+        target,
+        minimal_live_rows,
+        input_paused,
+        reader_parked,
+        input_rx,
+    ) {
+        crate::app::mode_switch::ModeSwitchOutcome::Switched => {
+            crate::app::mode_switch::reseed_screen_mode(app, target);
+            *status_line_refresh_interval =
+                if super::status_line::draws_a_row(&app.current_ui.status_line) {
+                    app.status_line_refresh_interval()
+                } else {
+                    None
+                };
+            *status_line_refresh_at =
+                status_line_refresh_interval.map(|interval| Instant::now() + interval);
+            if target.is_minimal() {
+                crate::theme::reset_cursor_color();
+                crate::app::mode_switch::dismiss_fullscreen_only_surfaces(app);
+                super::MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let ActiveView::Agent(agent_id) = app.active_view
+                    && let Some(agent) = app.agents.get_mut(&agent_id)
+                {
+                    crate::app::mode_switch::push_block_behind_live_stream(
+                        &mut agent.scrollback,
+                        crate::scrollback::block::RenderBlock::system(
+                            "Switched to minimal mode · /fullscreen to go back",
+                        ),
+                    );
+                }
+            } else {
+                crate::theme::apply_cursor_color();
+                super::MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN
+                    .store(false, std::sync::atomic::Ordering::Release);
+                for agent in app.agents.values_mut() {
+                    agent.set_sticky_toast_recursive(None);
+                }
+                if let ActiveView::Agent(agent_id) = app.active_view
+                    && let Some(agent) = app.agents.get_mut(&agent_id)
+                {
+                    agent.show_toast("Switched to fullscreen mode · /minimal to go back");
+                }
+            }
+            tracing::info!(
+                from = from.meta_label(),
+                to = target.meta_label(),
+                "in-process screen-mode switch"
+            );
+            presenter.request_presentation(app, terminal, true);
+            false
+        }
+        crate::app::mode_switch::ModeSwitchOutcome::Aborted(reason) => {
+            tracing::warn!(%reason, "screen-mode switch aborted; staying in current mode");
+            if let ActiveView::Agent(agent_id) = app.active_view
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+            {
+                crate::app::mode_switch::push_block_behind_live_stream(
+                    &mut agent.scrollback,
+                    crate::scrollback::block::RenderBlock::system(format!(
+                        "Couldn't switch to {} mode: {reason}",
+                        target.meta_label()
+                    )),
+                );
+            }
+            presenter.request_presentation(app, terminal, true);
+            false
+        }
+        crate::app::mode_switch::ModeSwitchOutcome::NeedsExecFallback(reason) => {
+            tracing::error!(%reason, "screen-mode switch failed; falling back to exec relaunch");
+            if let Some(session_id) = app.active_session_id().map(str::to_owned) {
+                app.relaunch = Some(crate::app::app_view::ScreenModeRelaunch {
+                    minimal: target.is_minimal(),
+                    session_id,
+                });
+            }
+            let effects: Vec<super::actions::Effect> = app
+                .agents
+                .values()
+                .filter_map(|agent| {
+                    agent.session.session_id.as_ref().map(|sid| {
+                        super::actions::Effect::UnregisterActiveSession {
+                            session_id: sid.clone(),
+                        }
+                    })
+                })
+                .collect();
+            let _ = process_effects(effects, tasks, app, progress_tx);
+            true
+        }
+    }
+}
+
 /// Minimal mode opens an empty session after the welcome branch (now, or
 /// post-auth via the deferred drain), so that session create ends startup.
 fn minimal_will_open_session(term_state: &TerminalState, app: &AppView) -> bool {
@@ -1171,6 +1288,8 @@ pub(crate) async fn run(
     app.plugin_cta_enabled = xai_grok_config::env_bool("GROK_PLUGIN_CTA")
         .or_else(|| remote_settings.as_ref().and_then(|s| s.plugin_cta))
         .unwrap_or(false);
+    app.workspace_dashboard_enabled =
+        xai_grok_config::env_bool("GROK_WORKSPACE_DASHBOARD").unwrap_or(false);
     // Resolve after auth so API-key and managed policy precedence are known.
     let voice_mode_enabled = crate::app::resolve_voice_mode_live(
         remote_settings.as_ref().and_then(|s| s.voice_mode_enabled),
@@ -1644,6 +1763,7 @@ pub(crate) async fn run(
     // Seed app state from disk once at the I/O boundary so dispatch
     // stays sans-IO.
     app.current_ui = load_initial_ui_config();
+    super::status_line::metrics::global().report_config(&app.current_ui.status_line);
     // Keep the field-tolerant appearance cache and the UI snapshot aligned.
     let show_timeline = crate::appearance::cache::load_show_timeline();
     app.current_ui.show_timeline = Some(show_timeline);
@@ -1931,6 +2051,14 @@ pub(crate) async fn run(
     // Animation tick: only scheduled when there are running entries.
     let mut tick_interval = tick_interval;
     let mut animation_tick_at: Option<Instant> = None;
+    let mut status_line_refresh_interval =
+        if super::status_line::draws_a_row(&app.current_ui.status_line) {
+            app.status_line_refresh_interval()
+        } else {
+            None
+        };
+    let mut status_line_refresh_at =
+        status_line_refresh_interval.map(|interval| Instant::now() + interval);
 
     // Whether the extra Kitty keyboard layer (WASD release events) is
     // currently pushed for the /gboom game. Synced to `gboom_active` each
@@ -2230,6 +2358,7 @@ pub(crate) async fn run(
     // caught; a focus report is only swallowed when its `\e` and `[I`/`[O`
     // land in the same batch.
     let mut csi_filter = super::csi_filter::CsiFragmentFilter::new();
+    let mut x10_filter = super::x10_filter::X10ReassemblyFilter::new();
 
     // Swallows the fire-and-forget XTVERSION reply whenever it arrives;
     // armed only when the startup query is still unanswered.
@@ -2286,6 +2415,11 @@ pub(crate) async fn run(
             break;
         }
 
+        let workspace_effects = super::workspace_sync::drain(&mut app);
+        if process_effects(workspace_effects, &mut tasks, &mut app, &progress_tx) {
+            break;
+        }
+
         if let Err(e) = run_pending_suspends(
             &mut app,
             terminal,
@@ -2298,6 +2432,22 @@ pub(crate) async fn run(
         ) {
             app.finish_startup(xai_grok_telemetry::startup::StartupOutcome::Error);
             return Err(e);
+        }
+
+        if run_pending_mode_switch(
+            &mut app,
+            terminal,
+            config_watcher.current().minimal_live_rows,
+            &input_paused,
+            &reader_parked,
+            &mut input_rx,
+            &mut presenter,
+            &mut tasks,
+            &progress_tx,
+            &mut status_line_refresh_interval,
+            &mut status_line_refresh_at,
+        ) {
+            break;
         }
 
         // Lazy voice pipeline: only after `/voice` or Ctrl+Space while gates
@@ -2382,7 +2532,10 @@ pub(crate) async fn run(
         // closed→open transition rather than every iteration. Applies in both
         // modes: leader mode polls the live roster, non-leader mode polls the
         // local on-disk idle-session list.
-        if roster_poll_at.is_none() && matches!(app.active_view, ActiveView::AgentDashboard) {
+        if !app.workspace_dashboard_enabled
+            && roster_poll_at.is_none()
+            && matches!(app.active_view, ActiveView::AgentDashboard)
+        {
             roster_poll_at = Some(Instant::now());
         }
 
@@ -2398,6 +2551,12 @@ pub(crate) async fn run(
         // Future that sleeps until the next animation tick, or waits forever if none.
         let animation_tick = async {
             match animation_tick_at {
+                Some(at) => sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        let status_line_refresh = async {
+            match status_line_refresh_at {
                 Some(at) => sleep_until(at).await,
                 None => std::future::pending().await,
             }
@@ -2584,6 +2743,11 @@ pub(crate) async fn run(
                     }
                 }
 
+                super::workspace_sync::request(&mut app);
+
+                if app.status_line.force_pending() {
+                    schedule_tick(&mut animation_tick_at, &app, tick_interval);
+                }
                 if state_changed {
                     schedule_tick(&mut animation_tick_at, &app, tick_interval);
                     resize_debounce_at = None;
@@ -2688,7 +2852,7 @@ pub(crate) async fn run(
                     // The full TUI surfaces this on the welcome screen, which
                     // minimal has none of — commit a one-line notice into
                     // native scrollback instead (update notice).
-                    if term_state.screen_mode.is_minimal() {
+                    if app.screen_mode.is_minimal() {
                         dispatch::commit_minimal_update_notice(&mut app, &latest);
                     }
                     presenter.request(false);
@@ -2701,7 +2865,7 @@ pub(crate) async fn run(
                 let Some(ev) = maybe_ev else { break };
                 let result = drain_and_process(
                     ev, &mut input_rx, &mut app, &mut tasks, &progress_tx,
-                    &mut csi_filter, &mut xt_filter,
+                    &mut csi_filter, &mut x10_filter, &mut xt_filter,
                 ).await;
                 if result.should_quit {
                     break;
@@ -2729,6 +2893,12 @@ pub(crate) async fn run(
                         // Debounce: schedule a single draw after the size stabilizes.
                         // Each new resize resets the timer so we only rebuild layout once.
                         resize_debounce_at = Some(Instant::now() + RESIZE_DEBOUNCE);
+                        if crate::terminal::overlay::has_committed_owner()
+                            && crate::terminal::image::prompt_preview_graphics_protocol()
+                                == crate::terminal::image::GraphicsProtocol::ITerm2
+                        {
+                            presenter.request(false);
+                        }
                     } else {
                         // Non-resize change (or a shown tip): draw immediately
                         // (picks up any pending resize too).
@@ -2742,6 +2912,18 @@ pub(crate) async fn run(
             }
 
             // Debounced resize: draw once the terminal size has stabilized.
+            _ = status_line_refresh => {
+                status_line_refresh_at = None;
+                app.note_status_line_refresh_due();
+                schedule_tick(&mut animation_tick_at, &app, tick_interval);
+                if app.status_line.take_changed() {
+                    presenter.request(false);
+                }
+                if let Some(interval) = status_line_refresh_interval {
+                    status_line_refresh_at = Some(Instant::now() + interval);
+                }
+            }
+
             _ = resize_debounce => {
                 resize_debounce_at = None;
                 presenter.request(false);
@@ -2846,7 +3028,7 @@ pub(crate) async fn run(
                 // roster; outside leader mode we poll the local on-disk
                 // idle-session list so the dashboard still shows idle sessions.
                 let dashboard_open = matches!(app.active_view, ActiveView::AgentDashboard);
-                if dashboard_open {
+                if dashboard_open && !app.workspace_dashboard_enabled {
                     let eff = if leader_status_rx.is_some() {
                         Effect::FetchRoster
                     } else {
@@ -3613,6 +3795,7 @@ async fn drain_and_process(
     tasks: &mut JoinSet<TaskResult>,
     progress_tx: &tokio::sync::mpsc::UnboundedSender<effects::RestoreProgressMsg>,
     csi_filter: &mut super::csi_filter::CsiFragmentFilter,
+    x10_filter: &mut super::x10_filter::X10ReassemblyFilter,
     xt_filter: &mut super::xt_filter::XtversionFilter,
 ) -> DrainResult {
     let mut needs_draw = false;
@@ -3653,6 +3836,7 @@ async fn drain_and_process(
         coalesce_rapid_keys(raw_events)
     };
     let coalesced = csi_filter.filter(coalesced);
+    let coalesced = x10_filter.filter(coalesced);
     let mut coalesced = coalesced
         .into_iter()
         .map(normalize_input_event)
@@ -3853,6 +4037,7 @@ async fn drain_and_process(
                 needs_draw = true;
                 if is_resize {
                     had_resize = true;
+                    app.queue_status_line_resize();
                 } else {
                     had_non_resize_change = true;
                 }
@@ -4458,6 +4643,7 @@ mod tests {
         use crate::app::agent::AgentId;
         let worktree = Effect::CreateWorktreeSession {
             agent_id: AgentId(0),
+            permission_mode_override: None,
             load_session_id: None,
             label: None,
             git_ref: None,
@@ -4807,6 +4993,7 @@ mod tests {
         assert_eq!(app.suppress_code_restore_once.as_deref(), Some("child"));
         let wt = Effect::CreateWorktreeSession {
             agent_id: AgentId(0),
+            permission_mode_override: None,
             load_session_id: Some("child".into()),
             label: None,
             git_ref: None,

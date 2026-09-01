@@ -4,7 +4,6 @@
 //! action arm. Split out of `dispatch.rs` verbatim (pure code motion).
 
 use super::ctx::{NO_SESSION_NOTICE, active_agent_session_id, with_active_agent};
-use super::interject::record_interject_prompt_history;
 use crate::acp::meta::user_prompt_meta;
 use crate::app::actions::Effect;
 use crate::app::agent::{AgentCommand, AgentId};
@@ -230,6 +229,9 @@ impl QueueDrain {
 }
 
 pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> QueueDrain {
+    if agent.session.hook_block_hold {
+        return QueueDrain::blocked();
+    }
     use crate::app::agent::QueueEntryKind;
     use crate::unified_log as ulog;
 
@@ -1098,8 +1100,9 @@ pub(super) fn dispatch_queue_interject_shared(
             with_active_agent(app, |agent| {
                 // Edited override is user-typed text — keep it Ctrl+R recallable.
                 if let Some(text) = &new_text {
-                    record_interject_prompt_history(agent, text);
+                    agent.record_prompt_in_history(text);
                 }
+                agent.release_hook_block_hold();
                 agent.note_self_originated_prompt(&id);
                 arm_send_now_and_paint(agent, &id, new_text.as_deref());
             });
@@ -1963,8 +1966,29 @@ mod tests {
         assert!(blocked.page_flip_entry.is_none());
     }
 
-    /// Turn-start path: the leader/viewer adoption shim
-    /// clears the previous response's follow-up chips.
+    #[test]
+    fn drain_blocked_while_hook_hold_armed() {
+        let mut app = test_app_with_agent();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.session.enqueue_prompt("queued follow-up".into());
+        agent.session.hook_block_hold = true;
+
+        let held = maybe_drain_queue(agent);
+        assert!(held.effects.is_empty(), "a held queue must not drain");
+        assert_eq!(
+            agent.session.pending_prompts.len(),
+            1,
+            "the row stays queued"
+        );
+
+        agent.release_hook_block_hold();
+        let drained = maybe_drain_queue(agent);
+        assert!(
+            !drained.effects.is_empty(),
+            "a released queue drains normally"
+        );
+    }
+
     #[test]
     fn shim_clears_follow_up_chips() {
         let mut app = test_app_with_agent();

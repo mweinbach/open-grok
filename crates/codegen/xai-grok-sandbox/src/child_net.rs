@@ -35,7 +35,7 @@ mod ns_lockdown {
     /// Linux `clone3` (arch-portable number; not always exported by libc).
     pub(super) const SYS_CLONE3: u32 = 435;
 
-    fn stmt(code: u32, k: u32) -> sock_filter {
+    pub(super) fn stmt(code: u32, k: u32) -> sock_filter {
         sock_filter {
             code: code as u16,
             jt: 0,
@@ -44,7 +44,7 @@ mod ns_lockdown {
         }
     }
 
-    fn jump(code: u32, k: u32, jt: u8, jf: u8) -> sock_filter {
+    pub(super) fn jump(code: u32, k: u32, jt: u8, jf: u8) -> sock_filter {
         sock_filter {
             code: code as u16,
             jt,
@@ -59,23 +59,61 @@ mod ns_lockdown {
     /// - `clone3` → ENOSYS (flags live in a pointed-to struct classic BPF cannot
     ///   inspect; ENOSYS makes libc fall back to legacy clone for ordinary
     ///   spawn, while direct malicious clone3 cannot create namespaces)
-    pub fn build_namespace_lockdown_filter() -> Vec<sock_filter> {
-        use libc::{
-            BPF_ABS, BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W, SYS_clone,
-            SYS_setns, SYS_unshare,
-        };
-
-        let mut f = Vec::with_capacity(22);
+    pub(super) fn push_arch_nr_gate(f: &mut Vec<sock_filter>) {
+        use libc::{BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W};
         f.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH));
         f.push(jump(BPF_JMP | BPF_JEQ | BPF_K, EXPECTED_ARCH, 1, 0));
         f.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
         f.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR));
         #[cfg(target_arch = "x86_64")]
         {
-            f.push(jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1));
+            f.push(jump(
+                BPF_JMP | libc::BPF_JSET | BPF_K,
+                X32_SYSCALL_BIT,
+                0,
+                1,
+            ));
             f.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
         }
-        for sys in [SYS_unshare as u32, SYS_setns as u32] {
+    }
+
+    fn mount_mutation_syscalls() -> [u32; 9] {
+        use libc::{
+            SYS_fsconfig, SYS_fsmount, SYS_fsopen, SYS_mount, SYS_mount_setattr, SYS_move_mount,
+            SYS_pivot_root, SYS_umount2,
+        };
+        const SYS_OPEN_TREE: u32 = 428;
+        [
+            SYS_mount as u32,
+            SYS_umount2 as u32,
+            SYS_pivot_root as u32,
+            SYS_OPEN_TREE,
+            SYS_move_mount as u32,
+            SYS_fsopen as u32,
+            SYS_fsconfig as u32,
+            SYS_fsmount as u32,
+            SYS_mount_setattr as u32,
+        ]
+    }
+
+    #[cfg(test)]
+    pub(super) fn mount_mutation_syscalls_for_test() -> [u32; 9] {
+        mount_mutation_syscalls()
+    }
+
+    pub fn build_namespace_lockdown_filter() -> Vec<sock_filter> {
+        use libc::{
+            BPF_ABS, BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W, SYS_clone,
+            SYS_setns, SYS_unshare,
+        };
+
+        let mount_mutations = mount_mutation_syscalls();
+        let mut f = Vec::with_capacity(mount_mutations.len() * 2 + 22);
+        push_arch_nr_gate(&mut f);
+        for sys in mount_mutations
+            .into_iter()
+            .chain([SYS_unshare as u32, SYS_setns as u32])
+        {
             f.push(jump(BPF_JMP | BPF_JEQ | BPF_K, sys, 0, 1));
             f.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
         }
@@ -141,58 +179,57 @@ mod ns_lockdown {
 /// # Safety
 /// After fork / before exec.
 #[cfg(target_os = "linux")]
-pub unsafe fn install_child_network_filter() -> std::io::Result<()> {
+fn child_network_blocked_syscalls() -> [u32; 11] {
     use libc::{
-        BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W, PR_SET_NO_NEW_PRIVS,
-        PR_SET_SECCOMP, SECCOMP_MODE_FILTER, SYS_accept, SYS_accept4, SYS_bind, SYS_connect,
-        SYS_listen, SYS_sendmsg, SYS_sendto, prctl, sock_filter, sock_fprog,
+        SYS_accept, SYS_accept4, SYS_bind, SYS_connect, SYS_io_uring_enter, SYS_io_uring_register,
+        SYS_io_uring_setup, SYS_listen, SYS_sendmmsg, SYS_sendmsg, SYS_sendto,
     };
 
-    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
-    const EPERM_VAL: u32 = 1;
+    [
+        SYS_connect as u32,
+        SYS_bind as u32,
+        SYS_sendto as u32,
+        SYS_sendmsg as u32,
+        SYS_sendmmsg as u32,
+        SYS_listen as u32,
+        SYS_accept as u32,
+        SYS_accept4 as u32,
+        SYS_io_uring_setup as u32,
+        SYS_io_uring_enter as u32,
+        SYS_io_uring_register as u32,
+    ]
+}
 
-    let blocked: &[i64] = &[
-        SYS_connect,
-        SYS_bind,
-        SYS_sendto,
-        SYS_sendmsg,
-        SYS_listen,
-        SYS_accept,
-        SYS_accept4,
-    ];
-    let mut filter: Vec<sock_filter> = Vec::new();
-    filter.push(sock_filter {
-        code: (BPF_LD | BPF_W | BPF_ABS) as u16,
-        jt: 0,
-        jf: 0,
-        k: 0,
-    });
+#[cfg(target_os = "linux")]
+fn build_child_network_filter() -> Vec<libc::sock_filter> {
+    use libc::{BPF_JEQ, BPF_JMP, BPF_K, BPF_RET};
+    use ns_lockdown::{EPERM_VAL, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, jump, stmt};
+
+    let blocked = child_network_blocked_syscalls();
+    let mut f = Vec::with_capacity(blocked.len() + 10);
+    ns_lockdown::push_arch_nr_gate(&mut f);
     let n = blocked.len();
     for (i, &sys) in blocked.iter().enumerate() {
         let remaining = n - i - 1;
-        filter.push(sock_filter {
-            code: (BPF_JMP | BPF_JEQ | BPF_K) as u16,
-            jt: remaining as u8 + 1,
-            jf: 0,
-            k: sys as u32,
-        });
+        f.push(jump(BPF_JMP | BPF_JEQ | BPF_K, sys, remaining as u8 + 1, 0));
     }
-    filter.push(sock_filter {
-        code: (BPF_RET | BPF_K) as u16,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_ALLOW,
-    });
-    filter.push(sock_filter {
-        code: (BPF_RET | BPF_K) as u16,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_ERRNO | EPERM_VAL,
-    });
+    f.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    f.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
+    f
+}
+
+#[cfg(target_os = "linux")]
+pub fn prebuilt_child_network_filter() -> &'static [libc::sock_filter] {
+    static FILTER: std::sync::OnceLock<Vec<libc::sock_filter>> = std::sync::OnceLock::new();
+    FILTER.get_or_init(build_child_network_filter)
+}
+
+#[cfg(target_os = "linux")]
+pub unsafe fn install_child_network_filter(filter: &[libc::sock_filter]) -> std::io::Result<()> {
+    use libc::{PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prctl, sock_fprog};
     let prog = sock_fprog {
         len: filter.len() as u16,
-        filter: filter.as_mut_ptr(),
+        filter: filter.as_ptr().cast_mut(),
     };
     if unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(std::io::Error::last_os_error());
@@ -225,9 +262,29 @@ pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
 
 /// # Safety
 /// After fork / before exec.
-#[cfg(not(target_os = "linux"))]
-pub unsafe fn install_child_network_filter() -> std::io::Result<()> {
-    Ok(())
+pub fn restrict_child_network(cmd: &mut tokio::process::Command) {
+    #[cfg(target_os = "linux")]
+    if crate::should_restrict_child_network() {
+        let filter = prebuilt_child_network_filter();
+        unsafe {
+            cmd.pre_exec(move || install_child_network_filter(filter));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
+pub fn restrict_child_network_std(cmd: &mut std::process::Command) {
+    #[cfg(target_os = "linux")]
+    if crate::should_restrict_child_network() {
+        use std::os::unix::process::CommandExt;
+        let filter = prebuilt_child_network_filter();
+        unsafe {
+            cmd.pre_exec(move || install_child_network_filter(filter));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
 }
 
 /// # Safety
@@ -293,9 +350,12 @@ mod tests {
     }
 
     #[test]
-    fn namespace_filter_targets_unshare_setns_clone3_and_clone() {
+    fn namespace_filter_targets_mount_and_namespace_mutations() {
         let f = build_namespace_lockdown_filter();
         let jeqs = filter_jeq_immediates(&f);
+        for syscall in mount_mutation_syscalls_for_test() {
+            assert!(jeqs.contains(&syscall), "mount syscall {syscall}: {jeqs:?}");
+        }
         assert!(jeqs.contains(&(SYS_unshare as u32)), "{jeqs:?}");
         assert!(jeqs.contains(&(SYS_setns as u32)), "{jeqs:?}");
         assert!(jeqs.contains(&SYS_CLONE3), "{jeqs:?}");
@@ -328,8 +388,14 @@ mod tests {
     }
 
     #[test]
-    fn bpf_eval_clone3_enosys_unshare_setns_eperm_read_allowed() {
+    fn bpf_eval_mount_and_namespace_mutations_are_blocked() {
         let f = build_namespace_lockdown_filter();
+        for syscall in mount_mutation_syscalls_for_test() {
+            assert!(
+                is_eperm(eval(&f, EXPECTED_ARCH, syscall, 0)),
+                "mount syscall {syscall} must be EPERM"
+            );
+        }
         assert!(is_enosys(eval(&f, EXPECTED_ARCH, SYS_CLONE3, 0)));
         assert!(is_eperm(eval(&f, EXPECTED_ARCH, SYS_unshare as u32, 0)));
         assert!(is_eperm(eval(&f, EXPECTED_ARCH, SYS_setns as u32, 0)));
@@ -363,5 +429,57 @@ mod tests {
     fn filter_ends_with_allow() {
         let f = build_namespace_lockdown_filter();
         assert_eq!(f.last().unwrap().k, SECCOMP_RET_ALLOW);
+    }
+    #[test]
+    fn child_network_filter_blocks_connect_equivalents_allows_read_socket() {
+        let f = super::build_child_network_filter();
+        for sys in super::child_network_blocked_syscalls() {
+            assert!(
+                is_eperm(eval(&f, EXPECTED_ARCH, sys, 0)),
+                "syscall {sys} must be EPERM"
+            );
+        }
+        assert!(is_allow(eval(&f, EXPECTED_ARCH, libc::SYS_read as u32, 0)));
+        assert!(is_allow(eval(
+            &f,
+            EXPECTED_ARCH,
+            libc::SYS_socket as u32,
+            0
+        )));
+    }
+
+    #[test]
+    fn child_network_filter_wrong_arch_and_x32_denied() {
+        let f = super::build_child_network_filter();
+        assert!(is_eperm(eval(&f, 0xdead_beef, libc::SYS_read as u32, 0)));
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(is_eperm(eval(
+                &f,
+                EXPECTED_ARCH,
+                (libc::SYS_read as u32) | X32_SYSCALL_BIT,
+                0
+            )));
+        }
+    }
+
+    #[test]
+    fn namespace_filter_targets_unshare_setns_clone3_and_clone() {
+        let f = build_namespace_lockdown_filter();
+        let jeqs = filter_jeq_immediates(&f);
+        assert!(jeqs.contains(&(SYS_unshare as u32)), "{jeqs:?}");
+        assert!(jeqs.contains(&(SYS_setns as u32)), "{jeqs:?}");
+        assert!(jeqs.contains(&SYS_CLONE3), "{jeqs:?}");
+        assert!(jeqs.contains(&(SYS_clone as u32)), "{jeqs:?}");
+        assert!(jeqs.contains(&EXPECTED_ARCH), "{jeqs:?}");
+    }
+
+    #[test]
+    fn bpf_eval_clone3_enosys_unshare_setns_eperm_read_allowed() {
+        let f = build_namespace_lockdown_filter();
+        assert!(is_enosys(eval(&f, EXPECTED_ARCH, SYS_CLONE3, 0)));
+        assert!(is_eperm(eval(&f, EXPECTED_ARCH, SYS_unshare as u32, 0)));
+        assert!(is_eperm(eval(&f, EXPECTED_ARCH, SYS_setns as u32, 0)));
+        assert!(is_allow(eval(&f, EXPECTED_ARCH, 0, 0)));
     }
 }

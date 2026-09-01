@@ -10,10 +10,11 @@ use super::*;
 /// `running_task.is_some()`. The never-completing task is torn down when the
 /// test's `LocalSet` is dropped.
 async fn fake_running_turn(actor: &SessionActor) {
-    actor.state.lock().await.running_task = Some(AgentTask {
-        prompt_id: "running-turn".into(),
-        handle: tokio::task::spawn_local(std::future::pending::<()>()).abort_handle(),
-    });
+    actor.state.lock().await.running_task = Some(AgentTask::new_at_epoch(
+        "running-turn",
+        actor.turn_report.epoch(),
+        tokio::task::spawn_local(std::future::pending::<()>()).abort_handle(),
+    ));
 }
 
 /// Toggling plan mode ON mid-turn activates immediately (Pending is skipped)

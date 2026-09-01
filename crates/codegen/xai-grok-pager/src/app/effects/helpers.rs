@@ -7,8 +7,8 @@ use super::actions::{PermissionModePersist, SubagentKillOutcome, TaskResult};
 use super::agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::{
-    RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
-    http_status_from_error,
+    RATE_LIMITED_ERROR_CODE, error_detail_from_data, error_kind_str_from_error,
+    format_rate_limited_user_message, http_status_from_error,
 };
 use xai_grok_shell::session::ExtMethodResult;
 use xai_grok_shell::session::unified_list::ListScope;
@@ -21,6 +21,40 @@ const SESSION_RPC_SLACK: std::time::Duration = std::time::Duration::from_secs(50
 /// process; the agent inherits the same environment.
 pub(super) fn session_rpc_timeout() -> std::time::Duration {
     SESSION_RPC_FLOOR.max(xai_grok_workspace::envrc::loader_budget() + SESSION_RPC_SLACK)
+}
+
+pub(super) fn encode_feedback_images(
+    images: crate::views::prompt_widget::FeedbackImages,
+) -> Result<Vec<xai_grok_shell::session::FeedbackImage>, String> {
+    use base64::Engine as _;
+    use xai_grok_shell::session::{
+        MAX_FEEDBACK_IMAGE_BYTES, MAX_FEEDBACK_IMAGE_TOTAL_BYTES, MAX_FEEDBACK_IMAGES,
+        feedback_image_extension,
+    };
+    if images.len() > MAX_FEEDBACK_IMAGES {
+        return Err(format!("Feedback supports at most {MAX_FEEDBACK_IMAGES} images."));
+    }
+    let mut encoded = Vec::new();
+    let mut total_bytes = 0usize;
+    for image in images.as_slice() {
+        let (bytes, mime_type) = crate::prompt_images::load_for_send(image)
+            .ok_or_else(|| "Could not read a feedback attachment.".to_owned())?;
+        if feedback_image_extension(&mime_type).is_none() {
+            return Err("Unsupported feedback image format.".to_owned());
+        }
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if bytes.len() > MAX_FEEDBACK_IMAGE_BYTES || total_bytes > MAX_FEEDBACK_IMAGE_TOTAL_BYTES {
+            return Err("Feedback images exceed the attachment size limit.".to_owned());
+        }
+        encoded.push(xai_grok_shell::session::FeedbackImage {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type,
+            file_name: image.source_path.as_deref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned()),
+        });
+    }
+    Ok(encoded)
 }
 /// `acp_send` bounded by [`session_rpc_timeout`]; on expiry, an error naming
 /// `action` instead of an eternal spinner.
@@ -149,7 +183,7 @@ pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> Strin
         .unwrap_or_else(|| err.to_string());
     crate::app::error_display::format_request_failure(
             http_status_from_error(err),
-            None,
+            crate::app::error_display::wire_error_kind(error_kind_str_from_error(err)),
             &raw,
         )
         .message()
@@ -832,6 +866,16 @@ pub(super) fn parse_session_picker_entries(
                 .or_else(|| v.get("last_turn_summary"))
                 .and_then(|s| s.as_str())
                 .map(String::from);
+            let last_recap = v
+                .get("lastRecap")
+                .or_else(|| v.get("last_recap"))
+                .and_then(|s| s.as_str())
+                .map(String::from);
+            let session_kind = v
+                .get("sessionKind")
+                .or_else(|| v.get("session_kind"))
+                .and_then(|s| s.as_str())
+                .map(String::from);
             let repo_name = crate::views::session_picker::repo_name_from_cwd(&cwd_str);
             Some(SessionPickerEntry {
                 id,
@@ -848,6 +892,8 @@ pub(super) fn parse_session_picker_entries(
                 repo_name,
                 worktree_label,
                 last_turn_summary,
+                last_recap,
+                session_kind,
                 card_detail: None,
             })
         })

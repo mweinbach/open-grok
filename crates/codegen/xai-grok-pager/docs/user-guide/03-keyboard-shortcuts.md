@@ -205,7 +205,7 @@ Actions that affect the agent session, available from the agent screen.
 | `Ctrl+M` | Prompt focused | Toggle multiline input mode |
 | `Ctrl+C` | Agent screen | Cancel the current turn (or clear non-empty draft first; see Escape table) |
 | `Ctrl+O` | Agent screen | Toggle always-approve (YOLO) mode |
-| `Ctrl+S` | Agent screen | Open the session picker (resume a previous session) |
+| `Ctrl+S` (alt: `Alt+S`) | Ordinary composer | Stash the current draft, or restore the stash when the composer is empty. Use `/resume` for the session picker. |
 | `Ctrl+;` (alt: `Ctrl+'`) | Agent screen | Toggle the prompt queue pane (when non-empty). **Local macOS** VS Code family only: primary **`Ctrl+4`** (`;` / `'` still alts). SSH and non-Mac keep **`Ctrl+;`** / **`Ctrl+'`**. |
 | `Shift+Tab` | Prompt focused | Cycle mode (Normal → Plan → Always-approve) |
 | `Ctrl+B` | Agent screen | Send the running foreground command to the background |
@@ -220,7 +220,17 @@ Actions that affect the agent session, available from the agent screen.
 
 **Note:** `Ctrl+M` is context-dependent. When the prompt is focused, it toggles multiline input mode. Otherwise, it opens the model picker.
 
-**Note:** Minimal-mode external editing resolves `$VISUAL`, then `$EDITOR`, then `vi`. Values may include quoted arguments. Saving replaces only the draft; an empty file clears it. Drafts with pasted/file/image chips must be edited in the composer so attachments are not flattened.
+**Note:** External editing resolves `$VISUAL`, then `$EDITOR`, then `vi`. Values may include quoted arguments. Saving replaces only the draft; an empty file clears it. Drafts with pasted/file/image chips must be edited in the composer so attachments are not flattened.
+
+External editing is available in both full and minimal modes through the
+command palette. `/edit-prompt` opens an empty draft because the slash command
+itself occupies the composer; use the palette to preserve an existing draft.
+
+**Draft stash:** One draft is retained at a time, including attachments and
+shell-mode state. Stashing another draft replaces it. A draft stashed with the
+shortcut is restored automatically after the next send when the composer is
+empty; the shortcut can also restore it manually. This does not submit the
+stashed draft.
 
 **Note:** `Ctrl+'` is a Windows alt for `Ctrl+;` — some Windows consoles drop the `Ctrl` modifier on punctuation keys.
 
@@ -315,7 +325,11 @@ Bindings that only fire on the welcome screen (before any agent session is open)
 | `Ctrl+I` | Import Claude settings (when available) |
 | `Ctrl+Shift+I` | Dismiss the Claude import row (when available) |
 
-`Ctrl+W`, `Ctrl+I`, and `Ctrl+Shift+I` are only active on the welcome screen. `Ctrl+S` opens the session picker on both the welcome screen and inside an agent session (where it opens as a modal overlay, same as the `/resume` command). `Ctrl+Q` is the same global Quit binding documented above, not a welcome-specific handler.
+`Ctrl+W`, `Ctrl+I`, and `Ctrl+Shift+I` are only active on the welcome screen.
+`Ctrl+S` opens the session picker on the welcome screen; in the ordinary agent
+composer it stashes or restores a draft. Use `/resume` to open the picker from
+an agent session. `Ctrl+Q` is the same global Quit binding documented above,
+not a welcome-specific handler.
 
 ---
 

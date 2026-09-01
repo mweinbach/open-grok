@@ -2194,6 +2194,8 @@ fn set_simple_mode_propagates_to_every_agent() {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,

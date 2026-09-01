@@ -191,8 +191,75 @@ fn str_arg<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
 ///
 /// `target_directory` is deliberately omitted — a directory listing isn't an
 /// edit and must not bucket into a file lock.
-pub(super) fn lock_path_for_args(args: &serde_json::Value) -> Option<&str> {
-    str_arg(args, &["file_path", "path", "target_file"])
+pub(super) fn lock_path_for_args(args: &serde_json::Value, cwd: &Path) -> Option<String> {
+    let input = Path::new(str_arg(args, &["file_path", "path", "target_file"])?);
+    let absolute = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        cwd.join(input)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    let lock_path = canonicalize_existing_ancestor(&normalized).unwrap_or(normalized);
+    Some(lock_path.to_string_lossy().into_owned())
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> Option<std::path::PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = dunce::canonicalize(ancestor) {
+            suffix.reverse();
+            canonical.extend(suffix);
+            return Some(canonical);
+        }
+        suffix.push(ancestor.file_name()?.to_owned());
+        ancestor = ancestor.parent()?;
+    }
+}
+
+#[cfg(test)]
+mod canonical_lock_tests {
+    use super::*;
+
+    #[test]
+    fn relative_and_absolute_paths_share_a_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = dunce::canonicalize(directory.path()).unwrap();
+        let relative = serde_json::json!({"file_path": "nested/../new.txt"});
+        let absolute = serde_json::json!({"path": canonical.join("new.txt")});
+        assert_eq!(
+            lock_path_for_args(&relative, directory.path()),
+            lock_path_for_args(&absolute, directory.path())
+        );
+    }
+
+    #[test]
+    fn resolved_model_identity_requires_catalog_opt_in() {
+        assert!(!should_show_resolved_model(
+            "grok-build",
+            "checkpoint",
+            false
+        ));
+        assert!(should_show_resolved_model(
+            "custom-model",
+            "checkpoint",
+            true
+        ));
+        assert!(!should_show_resolved_model(
+            "checkpoint",
+            "checkpoint",
+            true
+        ));
+    }
 }
 
 /// Pull the path a read/list tool targets and classify it against the store.
@@ -256,8 +323,12 @@ pub(super) fn backend_tool_call_status(result: Option<&serde_json::Value>) -> ac
 }
 
 /// Temporary gate: only expose resolved model ID to the user for these models.
-pub(super) fn should_show_resolved_model(requested: &str, resolved: &str) -> bool {
-    requested != resolved && super::acp_types::is_coding_model_slug(requested)
+pub(super) fn should_show_resolved_model(
+    requested: &str,
+    resolved: &str,
+    show_checkpoint_identity: bool,
+) -> bool {
+    show_checkpoint_identity && requested != resolved
 }
 
 /// Resolve the shell name for the system prompt `Shell:` field.
@@ -588,6 +659,8 @@ mod tests {
             concatenated_json_count: 0,
             dispatch_target_name: None,
             is_read_only: true,
+            rewriting_hook: None,
+            additional_context: Vec::new(),
         }
     }
 

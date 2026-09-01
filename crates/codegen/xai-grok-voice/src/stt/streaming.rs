@@ -60,9 +60,17 @@ impl StreamingSttSession {
         );
         insert_optional_header(&mut request, "User-Agent", &config.user_agent);
 
+        let connector =
+            tokio_tungstenite::Connector::Rustls(xai_grok_extra_ca::rustls_client_config());
+        let disable_nagle = false;
         let (ws, _) = tokio::time::timeout(
             Duration::from_secs(15),
-            tokio_tungstenite::connect_async(request),
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                None,
+                disable_nagle,
+                Some(connector),
+            ),
         )
         .await
         .map_err(|_| VoiceError::WebSocket("connect timed out".into()))?

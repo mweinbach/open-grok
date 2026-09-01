@@ -39,6 +39,7 @@ xai-grok-version = { workspace = true }
 xai-sqlite-journal = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 nix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -12,7 +12,9 @@ use anstyle::{Effects, Reset, Style};
 use ratatui::text::{Line, Span};
 use syntect::highlighting::Style as SyntectStyle;
 
-use crate::buffers::{MarkdownBuffers, RenderEvent, RenderEventKind, unicode_display_width};
+use crate::buffers::{
+    MarkdownBuffers, RenderEvent, RenderEventKind, TableCopyMeta, unicode_display_width,
+};
 use crate::checkpoint::Checkpoint;
 use crate::colors::adapt_style;
 use crate::hyperlinks::{ChunkLinkRange, chunk_link_offsets, emit_segment_hyperlinks};
@@ -526,6 +528,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
         let mut line_source_map: Vec<usize> = Vec::new();
         let mut hyperlinks: Vec<HyperlinkTarget> = Vec::new();
 
+        let mut tables: Vec<TableCopyMeta> = Vec::new();
         let mut last_pos = 0;
         let mut replace: Option<usize> = None;
         let mut table_replace: Option<usize> = None;
@@ -902,6 +905,14 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                         }
                         // Table emits whole pre-rendered lines; reset col so
                         // any subsequent inline content starts at column 0.
+                        if trepl.n_cols > 0 {
+                            tables.push(TableCopyMeta {
+                                line_index: table_base_line,
+                                line_count: trepl.styled_lines.len(),
+                                n_cols: trepl.n_cols,
+                                cells: trepl.cell_copies.clone(),
+                            });
+                        }
                         cur_col_in_line = 0;
 
                         last_pos = trepl.range.end;
@@ -1143,6 +1154,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                 line_source_map,
                 hyperlinks,
                 code_blocks,
+                tables,
             },
             checkpoint,
         )
@@ -1741,7 +1753,7 @@ mod tests {
             // Representable width: at least the widest single grapheme.
             let width = widest.max(4);
 
-            let lines = crate::parse::MarkdownParser::wrap_cell_text(text, width);
+            let lines = crate::parse::MarkdownParser::wrap_cell_text_joins(text, width).0;
             assert!(!lines.is_empty(), "wrap must never return an empty vec");
             assert!(
                 lines.len() > 1,

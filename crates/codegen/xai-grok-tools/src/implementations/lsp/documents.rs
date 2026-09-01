@@ -137,6 +137,10 @@ impl Documents {
         std::mem::take(&mut *self.write()).into_keys().collect()
     }
 
+    pub fn take(&self, uri: &str) -> bool {
+        self.write().remove(uri).is_some()
+    }
+
     fn read(&self) -> RwLockReadGuard<'_, HashMap<String, Tracked>> {
         self.inner.read().unwrap_or_else(|e| e.into_inner())
     }

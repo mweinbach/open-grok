@@ -7,6 +7,8 @@ use std::task::{Context, Poll};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use super::coordinator::active_message::{ActiveChildGeneration, ActiveMessageLifecycle};
+use super::types::ActiveAgentMessageDelivery;
 use super::types::{
     ActiveSubagentSummary, AgentMailboxMessage, AgentMessageDeliveryStatus,
     SubagentCompletionSummary, SubagentDescribeOutcome, SubagentInspection, SubagentRequest,
@@ -33,11 +35,25 @@ pub struct SubagentProgress {
     pub error_count: u32,
 }
 
+pub use super::active_message::ActiveMessageAdmission;
+
+pub const MAX_ACTIVE_MESSAGE_ADMISSIONS_PER_CHILD: usize = 8;
+pub const MAX_ACTIVE_MESSAGE_ADMISSIONS: usize = 64;
+pub const ACTIVE_MESSAGE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const ACTIVE_MESSAGE_FINALIZATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(6);
+
 /// Runtime handle retained while a child is active.
 pub trait ChildControl: 'static {
     type ProgressFuture: Future<Output = SubagentProgress> + 'static;
 
     fn progress(&self) -> Self::ProgressFuture;
+    fn send_active_message(
+        &self,
+        _delivery: ActiveAgentMessageDelivery,
+    ) -> SendBoxFuture<ActiveMessageAdmission> {
+        Box::pin(std::future::ready(ActiveMessageAdmission::Unsupported))
+    }
     fn cancel(&self);
     fn interrupt(&self) -> bool {
         false
@@ -290,6 +306,28 @@ impl<C: 'static> ChildReporter<C> {
         response_rx.await.unwrap_or(false)
     }
 
+    pub async fn finalizing(&self) -> bool {
+        let Some(response_rx) = self.request_finalizing() else {
+            return false;
+        };
+        tokio::time::timeout(ACTIVE_MESSAGE_FINALIZATION_TIMEOUT, response_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
+    }
+
+    pub(super) fn request_finalizing(&self) -> Option<oneshot::Receiver<bool>> {
+        let (respond_to, response_rx) = oneshot::channel();
+        self.tx
+            .send(InternalEvent::Finalizing {
+                subagent_id: self.subagent_id.clone(),
+                respond_to,
+            })
+            .ok()
+            .map(|_| response_rx)
+    }
+
     /// Resolve an in-memory resume source without sharing coordinator state.
     pub async fn resume_source(
         &self,
@@ -316,6 +354,10 @@ pub(super) enum InternalEvent<C> {
     Started {
         subagent_id: String,
         child: StartedChild<C>,
+        respond_to: oneshot::Sender<bool>,
+    },
+    Finalizing {
+        subagent_id: String,
         respond_to: oneshot::Sender<bool>,
     },
     ResumeSource {
@@ -352,6 +394,8 @@ pub(super) struct ActiveChild<C> {
     pub(super) child_cwd: String,
     pub(super) worktree_path: Option<String>,
     pub(super) effective_model_id: String,
+    pub(super) generation: ActiveChildGeneration,
+    pub(super) active_messages: ActiveMessageLifecycle,
     pub(super) control: C,
 }
 
@@ -847,6 +891,7 @@ pub fn completion_summary(
         subagent_id: request.id.clone(),
         subagent_type: request.subagent_type.clone(),
         description: request.description.clone(),
+        loop_task_id: request.runtime_overrides.loop_task_id.clone(),
         success: result.success && !result.cancelled,
         duration_ms: result.duration_ms,
         tool_calls: result.tool_calls,

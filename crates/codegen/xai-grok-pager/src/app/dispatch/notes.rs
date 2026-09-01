@@ -21,7 +21,7 @@ fn next_rewrite_nonce() -> u64 {
 }
 
 /// Bare `/feedback` pane label (first paragraph of the question chrome).
-pub(crate) const FEEDBACK_QUESTION_LABEL: &str = "How can we improve Grok Build?";
+pub(crate) const FEEDBACK_QUESTION_LABEL: &str = "How can we improve Open Grok?";
 
 /// Minimal mode has no toast surface, so the notice goes to the transcript instead.
 fn feedback_notice(app: &mut AppView, message: &str) {
@@ -57,7 +57,11 @@ fn feedback_pane_blocked(agent: &AgentView) -> Option<&'static str> {
 }
 
 /// Open the freeform report pane for bare `/feedback`. Inline text never uses this.
-pub(super) fn dispatch_open_feedback_pane(app: &mut AppView) -> Vec<Effect> {
+pub(super) fn dispatch_open_feedback_pane(
+    app: &mut AppView,
+    prefill: Option<String>,
+    mut images: crate::views::prompt_widget::FeedbackImages,
+) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
@@ -89,9 +93,15 @@ pub(super) fn dispatch_open_feedback_pane(app: &mut AppView) -> Vec<Effect> {
         stashed,
     )
     .with_local_kind(LocalQuestionKind::Feedback);
+    if let Some(prefill) = prefill
+        && let Some(slot) = state.per_question_freeform.get_mut(0)
+    {
+        *slot = prefill;
+    }
     // Freeform-only: start typing immediately.
     let freeform = state.activate_freeform_input();
     agent.prompt.set_text_preserving(&freeform);
+    agent.prompt.adopt_images(images.take());
     agent.question_view = Some(state);
     vec![]
 }
@@ -107,7 +117,18 @@ pub(super) fn dispatch_enter_remember_mode(app: &mut AppView) -> Vec<Effect> {
 }
 
 /// Thank-you is shown immediately; POST is a background effect. The composer is not cleared: the text arrives with the action, not from the prompt.
-pub(super) fn dispatch_send_feedback(app: &mut AppView, text: String) -> Vec<Effect> {
+pub(super) fn dispatch_send_feedback(
+    app: &mut AppView,
+    text: String,
+    images: crate::views::prompt_widget::FeedbackImages,
+) -> Vec<Effect> {
+    if !images.is_empty() && !app.uses_xai_access_controls() {
+        feedback_notice(
+            app,
+            "Feedback attachments are unavailable for this provider.",
+        );
+        return vec![];
+    }
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
@@ -118,7 +139,7 @@ pub(super) fn dispatch_send_feedback(app: &mut AppView, text: String) -> Vec<Eff
     agent.ephemeral_tip.clear_on_submit();
 
     let trimmed = text.trim().to_string();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() && images.is_empty() {
         agent.scrollback.push_block(RenderBlock::system(
             "Please provide feedback text.".to_string(),
         ));
@@ -140,6 +161,7 @@ pub(super) fn dispatch_send_feedback(app: &mut AppView, text: String) -> Vec<Eff
         agent_id: id,
         session_id,
         feedback_text: trimmed,
+        images,
     }]
 }
 
@@ -168,6 +190,9 @@ pub(super) fn dispatch_send_remember_note(app: &mut AppView, text: String) -> Ve
         ));
         return vec![];
     }
+
+    agent.note_draft_consumed();
+    agent.record_prompt_in_history(&trimmed);
 
     let cwd = agent.session.cwd.clone();
 
@@ -432,6 +457,9 @@ pub(super) fn dispatch_send_recap(app: &mut AppView, auto: bool) -> Vec<Effect> 
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
+    if auto && agent.wake_turn_active() {
+        return vec![];
+    }
 
     // Shell is authoritative (remote settings / config / env). Skip client requests
     // entirely when the feature is off so we never hit `x.ai/recap`.

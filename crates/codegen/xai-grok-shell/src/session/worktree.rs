@@ -37,6 +37,7 @@ async fn create_worktree_for_resume(
     copy_mode: WorktreeCopyMode,
     worktree_type: ShellWorktreeType,
     git_ref: Option<String>,
+    grove_worktree: bool,
 ) -> Result<CreateWorktreeFromWorktreeResponse> {
     let copy_mode = if git_ref.is_some() {
         WorktreeCopyMode::Clean
@@ -50,6 +51,7 @@ async fn create_worktree_for_resume(
         git_ref,
         worktree_type: Some(WorktreeType::from(worktree_type)),
         label: None,
+        grove_worktree: Some(grove_worktree),
         cancellation_token: None,
         resolved_dest_path: None,
     };
@@ -65,41 +67,36 @@ async fn create_worktree_for_resume(
 }
 /// Best-effort cleanup of a worktree created during a failed resume flow.
 async fn cleanup_worktree_on_failure(source_cwd: &str, worktree_path: &str) {
-    let wt = std::path::Path::new(worktree_path);
-    if !wt.exists() {
-        return;
-    }
-    let is_jj = find_git_root_from_path(std::path::Path::new(source_cwd))
+    let path = std::path::PathBuf::from(worktree_path);
+    let source = std::path::PathBuf::from(source_cwd);
+    let is_jj = find_git_root_from_path(&source)
         .ok()
         .is_some_and(|root| xai_grok_workspace::session::git::detect_vcs_kind(&root).is_jj());
     if is_jj {
-        if let Err(e) = remove_jj_workspace(worktree_path).await {
-            tracing::warn!(error = %e, "failed to clean up jj workspace after failure");
+        if let Err(error) = remove_jj_workspace(worktree_path).await {
+            tracing::warn!(error = %error, "failed to clean up jj workspace after failure");
         }
-    } else {
-        let wt_path = wt.to_path_buf();
-        match tokio::task::spawn_blocking(move || xai_fast_worktree::remove_worktree(&wt_path))
-            .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "fast remove_worktree failed during cleanup, trying rm");
-                let _ = tokio::fs::remove_dir_all(wt).await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "remove_worktree task panicked during cleanup, trying rm");
-                let _ = tokio::fs::remove_dir_all(wt).await;
-            }
+        return;
+    }
+    match tokio::task::spawn_blocking(move || {
+        xai_fast_worktree::remove_worktree(&path)?;
+        if let Ok(root) = find_git_root_from_path(&source) {
+            xai_fast_worktree::remove_stale_worktree_registration(&root, &path);
         }
-        if let Ok(root) = find_git_root_from_path(std::path::Path::new(source_cwd)) {
-            let wt_path = wt.to_path_buf();
-            let _ = tokio::task::spawn_blocking(move || {
-                xai_fast_worktree::remove_stale_worktree_registration(&root, &wt_path)
-            })
-            .await;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "worktree cleanup failed; retaining remaining data")
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "worktree cleanup task failed; retaining remaining data")
         }
     }
 }
+
 /// Check out a persisted HEAD commit in a worktree, with fetch fallback.
 ///
 /// Always stashes any dirty state (the worktree may carry copies of the
@@ -174,8 +171,8 @@ pub(crate) async fn resume_session_in_worktree(
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
     agent_id: &str,
+    grove_worktree: bool,
 ) -> Result<ResumeSessionInWorktreeResponse> {
-    use xai_grok_workspace::session::git::effective_worktree_path;
     tracing::info!(
         target: WORKTREE_LOG,
         session_id = %req.session_id,
@@ -204,6 +201,7 @@ pub(crate) async fn resume_session_in_worktree(
             registry_client,
             auth_manager,
             agent_id,
+            grove_worktree,
         )
         .await;
     }
@@ -214,9 +212,14 @@ pub(crate) async fn resume_session_in_worktree(
             req.session_id,
         )
     })?;
+    let record = client
+        .get_session(&req.session_id)
+        .await
+        .context("fetching session record for remote restore")?;
+    let turn = crate::session::restore::resolve_restore_turn(&record, None);
     tracing::info!(
         session_id = %req.session_id,
-        "Restoring remote session: creating worktree first to keep source clean"
+        "Restoring remote session: creating worktree after registry lookup"
     );
     let worktree_type = req
         .worktree_type
@@ -227,13 +230,37 @@ pub(crate) async fn resume_session_in_worktree(
         req.copy_mode,
         worktree_type,
         req.git_ref.clone(),
+        grove_worktree,
     )
     .await?;
-    let record = client
-        .get_session(&req.session_id)
-        .await
-        .context("fetching session record for remote restore")?;
-    let turn = crate::session::restore::resolve_restore_turn(&record, None);
+    let dest = wt_resp.worktree_path.clone();
+    let source_cwd = req.source_cwd.clone();
+    match restore_remote_session_into_worktree(
+        req,
+        ops,
+        client,
+        restore_code_default,
+        turn,
+        wt_resp,
+    )
+    .await
+    {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            cleanup_worktree_on_failure(&source_cwd, &dest).await;
+            Err(e)
+        }
+    }
+}
+async fn restore_remote_session_into_worktree(
+    req: &ResumeSessionInWorktreeRequest,
+    #[allow(unused_variables)] ops: &xai_grok_workspace::WorkspaceOps,
+    client: &crate::agent::session_registry_client::SessionRegistryClient,
+    restore_code_default: bool,
+    turn: i32,
+    wt_resp: CreateWorktreeFromWorktreeResponse,
+) -> Result<ResumeSessionInWorktreeResponse> {
+    use xai_grok_workspace::session::git::effective_worktree_path;
     let restore_code = remote_worktree_restores_codebase(req.restore_code, restore_code_default);
     let memory_dl_future = crate::session::restore::download_to_tempfile(
         client,
@@ -261,7 +288,6 @@ pub(crate) async fn resume_session_in_worktree(
         )
         .await;
     if session_state_result.is_skipped() {
-        cleanup_worktree_on_failure(&req.source_cwd, &wt_resp.worktree_path).await;
         anyhow::bail!(
             "Session {} session-state archive was unavailable -- \
              conversation history cannot be recovered. Retry in a few moments.",
@@ -308,6 +334,7 @@ async fn resume_local_session_in_worktree(
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
     agent_id: &str,
+    grove_worktree: bool,
 ) -> Result<ResumeSessionInWorktreeResponse> {
     use crate::session::fork::{ForkSessionRequest, fork_session};
     use xai_grok_workspace::session::git::effective_worktree_path;
@@ -320,6 +347,7 @@ async fn resume_local_session_in_worktree(
         req.copy_mode,
         worktree_type,
         req.git_ref.clone(),
+        grove_worktree,
     )
     .await?;
     tracing::info!(
@@ -933,6 +961,7 @@ mod tests {
             None,
             None,
             "test-agent",
+            false,
         )
         .await;
         let err = result.expect_err("should fail when session not found and no registry");
@@ -988,6 +1017,7 @@ mod tests {
             WorktreeCopyMode::Clean,
             ShellWorktreeType::Linked,
             None,
+            false,
         )
         .await
         .expect("worktree creation should succeed");
@@ -1028,6 +1058,7 @@ mod tests {
             WorktreeCopyMode::Dirty,
             ShellWorktreeType::Linked,
             Some("main".into()),
+            false,
         )
         .await
         .expect("worktree creation with git_ref should succeed");
@@ -1056,6 +1087,7 @@ mod tests {
             WorktreeCopyMode::Clean,
             ShellWorktreeType::Linked,
             None,
+            false,
         )
         .await
         .expect("worktree creation should succeed");

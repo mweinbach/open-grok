@@ -9,6 +9,7 @@
 //! associated futures may be `Send` or non-`Send`; the resulting actor future
 //! inherits that property naturally on stable Rust.
 
+pub(crate) mod active_message;
 mod native;
 mod query;
 mod queue;
@@ -21,6 +22,7 @@ use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
+use super::active_message::ActiveMessageIngress;
 use super::admission::Admission;
 use super::coordinator_state::{
     ActiveChild, AgentMailboxWaiter, BlockingWaiter, BufferedCompletion, ChildRecord,
@@ -28,6 +30,7 @@ use super::coordinator_state::{
     ReplyFuture, TaggedFuture, active_summary, background_at_deadline, background_if_caller_gone,
     completed_snapshot, completion_summary, sleep_until, workflow_outstanding,
 };
+use super::types::ActiveAgentMessageOutcome;
 use super::types::{
     AgentMailboxIdentity, AgentMailboxMessage, AgentMessageDeliveryStatus, AgentMessageSendOutput,
     AgentRosterEntry, ListAgentsOutput, SpawnedSubagentRef, SubagentCancelOutcome,
@@ -35,18 +38,22 @@ use super::types::{
     SubagentRegistryCounts, SubagentRequest, SubagentResult, SubagentResumeLookup,
     SubagentResumeSource, SubagentValidateTypeOutcome, WaitAgentMessagesOutput,
 };
+use active_message::{ActiveChildGeneration, ActiveMessageFuture, ActiveMessageLifecycle};
 
 pub use super::coordinator_state::{
+    ACTIVE_MESSAGE_ADMISSION_TIMEOUT, ACTIVE_MESSAGE_FINALIZATION_TIMEOUT, ActiveMessageAdmission,
     ChildCompletion, ChildControl, ChildReporter, ChildRunOutput, ChildRunRequest, ChildRunner,
     CompletionDisposition, CoordinatorConfig, LimitedSpawnOrigin, LocalBoxFuture,
-    MAX_COMPLETED_ENTRIES, SendBoxFuture, StartedChild, SubagentLimitDecision, SubagentLimitNotice,
-    SubagentLimitSink, SubagentProgress,
+    MAX_ACTIVE_MESSAGE_ADMISSIONS, MAX_ACTIVE_MESSAGE_ADMISSIONS_PER_CHILD, MAX_COMPLETED_ENTRIES,
+    SendBoxFuture, StartedChild, SubagentLimitDecision, SubagentLimitNotice, SubagentLimitSink,
+    SubagentProgress,
 };
 use queue::{QUEUED_REAP_INTERVAL, QueuedCaller, SpawnQueue, StartOrigin};
 
 /// Channel-owned subagent lifecycle actor.
 pub struct SubagentCoordinator<R: ChildRunner> {
     commands: mpsc::UnboundedReceiver<SubagentEvent>,
+    active_message_ingress: Option<mpsc::UnboundedReceiver<ActiveMessageIngress>>,
     internal_tx: mpsc::UnboundedSender<InternalEvent<R::Control>>,
     internal_rx: mpsc::UnboundedReceiver<InternalEvent<R::Control>>,
     runner: R,
@@ -65,6 +72,7 @@ pub struct SubagentCoordinator<R: ChildRunner> {
     completed: HashMap<String, CompletedChild>,
     completed_order: VecDeque<String>,
     waiters: HashMap<String, Vec<BlockingWaiter>>,
+    drain_waiters: HashMap<PromptScope, Vec<oneshot::Sender<SubagentOutstandingReply>>>,
     mailboxes: HashMap<MailboxKey, VecDeque<AgentMailboxMessage>>,
     mailbox_waiters: HashMap<MailboxKey, AgentMailboxWaiter>,
     native_names: HashMap<MailboxKey, String>,
@@ -91,6 +99,8 @@ pub struct SubagentCoordinator<R: ChildRunner> {
     >,
     validations: FuturesUnordered<ReplyFuture<R::ValidateFuture, SubagentValidateTypeOutcome>>,
     descriptions: FuturesUnordered<ReplyFuture<R::DescribeFuture, SubagentDescribeOutcome>>,
+    active_messages: FuturesUnordered<ActiveMessageFuture>,
+    terminal_outputs: HashMap<String, ChildRunOutput<R::CompletionData>>,
     progress: FuturesUnordered<ProgressFuture<<R::Control as ChildControl>::ProgressFuture>>,
     list_requests: HashMap<u64, ListRequest>,
     next_list_request_id: u64,
@@ -106,6 +116,56 @@ const TEARDOWN_DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(3
 struct TeardownDrain {
     waiters: Vec<oneshot::Sender<()>>,
     deadline: tokio::time::Instant,
+}
+
+pub struct SubagentCoordinatorReceiver {
+    commands: mpsc::UnboundedReceiver<SubagentEvent>,
+    pub(crate) active_messages: mpsc::UnboundedReceiver<ActiveMessageIngress>,
+}
+
+impl SubagentCoordinatorReceiver {
+    #[doc(hidden)]
+    pub fn into_event_receiver(self) -> mpsc::UnboundedReceiver<SubagentEvent> {
+        self.commands
+    }
+
+    fn new() -> (
+        crate::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+        Self,
+    ) {
+        Self::paired_with_capacity(MAX_ACTIVE_MESSAGE_ADMISSIONS)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_capacity(
+        capacity: usize,
+    ) -> (
+        crate::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+        Self,
+    ) {
+        Self::paired_with_capacity(capacity)
+    }
+
+    fn paired_with_capacity(
+        capacity: usize,
+    ) -> (
+        crate::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+        Self,
+    ) {
+        let (tx, commands) = mpsc::unbounded_channel();
+        let (active_message_tx, active_messages) = mpsc::unbounded_channel();
+        (
+            crate::implementations::grok_build::task::backend::SubagentCoordinatorSender::from_paired_channels(
+                tx,
+                active_message_tx,
+                capacity,
+            ),
+            Self {
+                commands,
+                active_messages,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -139,14 +199,44 @@ impl PromptScope {
 }
 
 impl<R: ChildRunner> SubagentCoordinator<R> {
+    pub fn channel() -> (
+        crate::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+        SubagentCoordinatorReceiver,
+    ) {
+        SubagentCoordinatorReceiver::new()
+    }
+
     pub fn new(
         commands: mpsc::UnboundedReceiver<SubagentEvent>,
+        runner: R,
+        config: CoordinatorConfig,
+    ) -> Self {
+        Self::from_receivers(commands, None, runner, config)
+    }
+
+    pub fn from_channel(
+        receiver: SubagentCoordinatorReceiver,
+        runner: R,
+        config: CoordinatorConfig,
+    ) -> Self {
+        Self::from_receivers(
+            receiver.commands,
+            Some(receiver.active_messages),
+            runner,
+            config,
+        )
+    }
+
+    fn from_receivers(
+        commands: mpsc::UnboundedReceiver<SubagentEvent>,
+        active_message_ingress: Option<mpsc::UnboundedReceiver<ActiveMessageIngress>>,
         runner: R,
         config: CoordinatorConfig,
     ) -> Self {
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
         Self {
             commands,
+            active_message_ingress,
             internal_tx,
             internal_rx,
             runner,
@@ -160,6 +250,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             completed: HashMap::new(),
             completed_order: VecDeque::new(),
             waiters: HashMap::new(),
+            drain_waiters: HashMap::new(),
             mailboxes: HashMap::new(),
             mailbox_waiters: HashMap::new(),
             native_names: HashMap::new(),
@@ -175,6 +266,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             runs: FuturesUnordered::new(),
             validations: FuturesUnordered::new(),
             descriptions: FuturesUnordered::new(),
+            active_messages: FuturesUnordered::new(),
+            terminal_outputs: HashMap::new(),
             progress: FuturesUnordered::new(),
             list_requests: HashMap::new(),
             next_list_request_id: 0,
@@ -183,14 +276,18 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
 
     pub async fn run(mut self) {
         let mut commands_open = true;
+        let mut active_message_ingress_open = self.active_message_ingress.is_some();
         loop {
             // Queued spawns need no exit check: queued non-empty means some
             // session is at capacity, so `runs` is non-empty, and the last
             // `finish_child` drains the queue before `runs` empties.
             if !commands_open
+                && !active_message_ingress_open
                 && self.runs.is_empty()
                 && self.validations.is_empty()
                 && self.descriptions.is_empty()
+                && self.active_messages.is_empty()
+                && self.terminal_outputs.is_empty()
                 && self.progress.is_empty()
             {
                 debug_assert!(
@@ -204,10 +301,31 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             tokio::select! {
                 biased;
                 Some(event) = self.internal_rx.recv() => self.handle_internal(event),
+                Some(completion) = self.active_messages.next(), if !self.active_messages.is_empty() => {
+                    self.finish_active_message(completion);
+                }
                 Some((id, output)) = self.runs.next(), if !self.runs.is_empty() => {
                     match output {
-                        Ok(output) => self.finish_child(&id, output),
-                        Err(_) => self.finish_panicked_child(&id),
+                        Ok(output) => self.begin_terminalization(&id, output),
+                        Err(_) => self.begin_panicked_terminalization(&id),
+                    }
+                }
+                ingress = async {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "active_message_ingress_open is initialized from Option::is_some and the receiver is never taken"
+                    )]
+                    self.active_message_ingress
+                        .as_mut()
+                        .expect(
+                            "active_message_ingress_open is initialized from Option::is_some and the receiver is never taken",
+                        )
+                        .recv()
+                        .await
+                }, if active_message_ingress_open => {
+                    match ingress {
+                        Some(ingress) => self.handle_send_active_message(ingress),
+                        None => active_message_ingress_open = false,
                     }
                 }
                 Some((respond_to, outcome)) = self.validations.next(), if !self.validations.is_empty() => {
@@ -228,8 +346,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         None => commands_open = false,
                     }
                 }
+                _ = std::future::poll_fn(|cx| {
+                    poll_caller_abandoned(&mut self.pending, &mut self.active, cx)
+                }) => self.reap_abandoned_callers(),
                 _ = sleep_until(deadline), if deadline.is_some() => self.process_deadlines(),
             }
+            self.resolve_drain_waiters();
             while self.completed.len() > MAX_COMPLETED_ENTRIES {
                 let Some(id) = self.completed_order.pop_front() else {
                     break;
@@ -250,6 +372,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         }
 
         self.cancel_all_children();
+        self.active_messages.clear();
     }
 
     fn handle_command(&mut self, command: SubagentEvent) {
@@ -275,6 +398,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             }
             SubagentEvent::WaitAgentMessages(request) => {
                 self.wait_agent_messages(request.identity, request.timeout_ms, request.respond_to);
+            }
+            SubagentEvent::SendActiveMessage(request) => {
+                let _ = request
+                    .respond_to
+                    .send(ActiveAgentMessageOutcome::Unsupported);
             }
             SubagentEvent::Cancel(request) => match request.target {
                 SubagentCancelTarget::SubagentId(id) => {
@@ -385,62 +513,22 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 }
             }
             SubagentEvent::Outstanding(request) => {
-                // Reap again here so turn-freeze / Outstanding polls see
-                // ParentGone even if no other command woke the actor first.
-                self.reap_abandoned_callers();
-                let scoped = |candidate: &SubagentRequest| {
-                    candidate.parent_session_id == request.parent_session_id
-                        && candidate.parent_prompt_id.as_deref() == Some(&request.prompt_id)
-                        && !candidate.owner.is_workflow()
-                };
-                let mut live_ids: Vec<_> = self
-                    .pending
-                    .values()
-                    .filter(|child| scoped(&child.request) && !child.handle_only)
-                    .map(|child| child.request.id.clone())
-                    .chain(
-                        self.active
-                            .values()
-                            .filter(|child| {
-                                // Definition-declared background children are
-                                // background for accounting even while the
-                                // spawning tool block-awaits them.
-                                scoped(&child.request)
-                                    && !child.handle_only
-                                    && !child.definition_background
-                            })
-                            .map(|child| child.request.id.clone()),
-                    )
-                    .chain(
-                        self.queued
-                            .iter()
-                            .filter(|queued| {
-                                scoped(&queued.request)
-                                    && !queued.caller.is_backgrounded()
-                                    && !queued.request.run_in_background
-                            })
-                            .map(|queued| queued.request.id.clone()),
-                    )
-                    .collect();
-                live_ids.sort();
-                let background_live = self
-                    .pending
-                    .values()
-                    .any(|child| scoped(&child.request) && child.handle_only)
-                    || self.active.values().any(|child| {
-                        scoped(&child.request) && (child.handle_only || child.definition_background)
-                    })
-                    || self.queued.iter().any(|queued| {
-                        scoped(&queued.request)
-                            && (queued.request.run_in_background || queued.caller.is_backgrounded())
-                    });
-                let scope =
-                    PromptScope::new(request.parent_session_id.clone(), request.prompt_id.clone());
-                let _ = request.respond_to.send(SubagentOutstandingReply {
-                    live_ids,
-                    background_live,
-                    subagent_usage_not_applied: self.usage_not_applied_prompts.contains(&scope),
-                });
+                let reply = self.outstanding_reply(&request.parent_session_id, &request.prompt_id);
+                let _ = request.respond_to.send(reply);
+            }
+            SubagentEvent::WaitPromptDrained(request) => {
+                let reply = self.outstanding_reply(&request.parent_session_id, &request.prompt_id);
+                if reply.live_ids.is_empty() {
+                    let _ = request.respond_to.send(reply);
+                } else {
+                    self.drain_waiters
+                        .entry(PromptScope::new(
+                            request.parent_session_id,
+                            request.prompt_id,
+                        ))
+                        .or_default()
+                        .push(request.respond_to);
+                }
             }
             SubagentEvent::ClearUsageNotApplied(request) => {
                 self.usage_not_applied_prompts.remove(&PromptScope::new(
@@ -881,12 +969,18 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         child_cwd: child.child_cwd,
                         worktree_path: child.worktree_path,
                         effective_model_id: child.effective_model_id,
+                        generation: ActiveChildGeneration::new(),
+                        active_messages: ActiveMessageLifecycle::default(),
                         control: child.control,
                     },
                 );
                 let _ = respond_to.send(true);
                 self.flush_mailbox_to_started_child(&mailbox_key);
             }
+            InternalEvent::Finalizing {
+                subagent_id,
+                respond_to,
+            } => self.handle_active_message_finalizing(subagent_id, respond_to),
             InternalEvent::ResumeSource {
                 source_id,
                 parent_session_id,
@@ -993,6 +1087,154 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 request.parent_session_id == parent_session_id && !request.owner.is_workflow()
             })
             .count()
+    }
+
+    fn live_turn_blocking_ids<'a>(
+        &'a self,
+        parent_session_id: &'a str,
+        prompt_id: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.pending
+            .values()
+            .filter(move |child| {
+                request_in_scope(&child.request, parent_session_id, prompt_id) && !child.handle_only
+            })
+            .map(|child| child.request.id.as_str())
+            .chain(
+                self.active
+                    .values()
+                    .filter(move |child| {
+                        request_in_scope(&child.request, parent_session_id, prompt_id)
+                            && !child.handle_only
+                            && !child.definition_background
+                    })
+                    .map(|child| child.request.id.as_str()),
+            )
+            .chain(
+                self.queued
+                    .iter()
+                    .filter(move |queued| {
+                        request_in_scope(&queued.request, parent_session_id, prompt_id)
+                            && !queued.caller.is_backgrounded()
+                            && !queued.request.run_in_background
+                    })
+                    .map(|queued| queued.request.id.as_str()),
+            )
+    }
+
+    fn outstanding_reply(
+        &self,
+        parent_session_id: &str,
+        prompt_id: &str,
+    ) -> SubagentOutstandingReply {
+        let mut live_ids: Vec<String> = self
+            .live_turn_blocking_ids(parent_session_id, prompt_id)
+            .map(str::to_owned)
+            .collect();
+        live_ids.sort();
+        let scoped =
+            |request: &SubagentRequest| request_in_scope(request, parent_session_id, prompt_id);
+        let background_live = self
+            .pending
+            .values()
+            .any(|child| scoped(&child.request) && child.handle_only)
+            || self.active.values().any(|child| {
+                scoped(&child.request) && (child.handle_only || child.definition_background)
+            })
+            || self.queued.iter().any(|queued| {
+                scoped(&queued.request)
+                    && (queued.request.run_in_background || queued.caller.is_backgrounded())
+            });
+        let scope = PromptScope::new(parent_session_id.to_owned(), prompt_id.to_owned());
+        SubagentOutstandingReply {
+            live_ids,
+            background_live,
+            subagent_usage_not_applied: self.usage_not_applied_prompts.contains(&scope),
+        }
+    }
+
+    fn scope_has_live_turn_blocking(&self, parent_session_id: &str, prompt_id: &str) -> bool {
+        self.live_turn_blocking_ids(parent_session_id, prompt_id)
+            .next()
+            .is_some()
+    }
+
+    fn resolve_drain_waiters(&mut self) {
+        if self.drain_waiters.is_empty() {
+            return;
+        }
+        let mut parked = std::mem::take(&mut self.drain_waiters);
+        parked.retain(|scope, waiters| {
+            if self.scope_has_live_turn_blocking(&scope.parent_session_id, &scope.prompt_id) {
+                waiters.retain(|waiter| !waiter.is_closed());
+                return !waiters.is_empty();
+            }
+            let reply = self.outstanding_reply(&scope.parent_session_id, &scope.prompt_id);
+            for respond_to in waiters.drain(..) {
+                let _ = respond_to.send(reply.clone());
+            }
+            false
+        });
+        self.drain_waiters = parked;
+    }
+
+    fn begin_terminalization(&mut self, id: &str, output: ChildRunOutput<R::CompletionData>) {
+        let Some(child) = self.active.get_mut(id) else {
+            self.finish_child(id, output);
+            return;
+        };
+        match child.active_messages.start_terminalizing() {
+            Some(is_clean) => self.finish_terminalized_child(id, output, is_clean),
+            None => {
+                self.terminal_outputs.insert(id.to_owned(), output);
+            }
+        }
+    }
+
+    fn begin_panicked_terminalization(&mut self, id: &str) {
+        let request = self
+            .active
+            .get(id)
+            .map(|child| child.request.clone())
+            .or_else(|| self.pending.get(id).map(|child| child.request.clone()));
+        let Some(request) = request else {
+            return;
+        };
+        tracing::error!(subagent_id = id, "subagent child runner panicked");
+        self.begin_terminalization(
+            id,
+            ChildRunOutput {
+                result: SubagentResult {
+                    success: false,
+                    error: Some("Subagent runtime panicked".to_owned()),
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id,
+                    ..Default::default()
+                },
+                completion_data: R::CompletionData::default(),
+                snapshot_ref: None,
+            },
+        );
+    }
+
+    fn finish_terminalized_child(
+        &mut self,
+        id: &str,
+        mut output: ChildRunOutput<R::CompletionData>,
+        is_clean: bool,
+    ) {
+        if !is_clean {
+            output.result.success = false;
+            output.result.cancelled = true;
+            output.result.error.get_or_insert_with(|| {
+                "Active-message admission could not be proven settled".to_owned()
+            });
+            if let Some(child) = self.active.get_mut(id) {
+                child.cancellation.cancel();
+                child.control.cancel();
+            }
+        }
+        self.finish_child(id, output);
     }
 
     fn finish_child(&mut self, id: &str, output: ChildRunOutput<R::CompletionData>) {
@@ -1126,32 +1368,6 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         }
         self.resolve_teardown_drain_waiters(&parent_session_id);
         self.start_queued_within_capacity();
-    }
-
-    fn finish_panicked_child(&mut self, id: &str) {
-        let request = self
-            .active
-            .get(id)
-            .map(|child| child.request.clone())
-            .or_else(|| self.pending.get(id).map(|child| child.request.clone()));
-        let Some(request) = request else {
-            return;
-        };
-        tracing::error!(subagent_id = id, "subagent child runner panicked");
-        self.finish_child(
-            id,
-            ChildRunOutput {
-                result: SubagentResult {
-                    success: false,
-                    error: Some("Subagent runtime panicked".to_owned()),
-                    subagent_id: request.id.clone(),
-                    child_session_id: request.id,
-                    ..Default::default()
-                },
-                completion_data: R::CompletionData::default(),
-                snapshot_ref: None,
-            },
-        );
     }
 
     fn cancel_one(
@@ -1520,6 +1736,36 @@ fn belongs_to_session(request: &SubagentRequest, parent_session_id: Option<&str>
     parent_session_id.is_none_or(|id| request.parent_session_id == id)
 }
 
+fn request_in_scope(request: &SubagentRequest, parent_session_id: &str, prompt_id: &str) -> bool {
+    request.parent_session_id == parent_session_id
+        && request.parent_prompt_id.as_deref() == Some(prompt_id)
+        && !request.owner.is_workflow()
+}
+
+fn poll_caller_abandoned<C: ChildControl>(
+    pending: &mut HashMap<String, PendingChild>,
+    active: &mut HashMap<String, ActiveChild<C>>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<()> {
+    for child in pending.values_mut() {
+        if !child.handle_only
+            && let Some(reply) = child.spawn_reply.as_mut()
+            && reply.poll_closed(cx).is_ready()
+        {
+            return std::task::Poll::Ready(());
+        }
+    }
+    for child in active.values_mut() {
+        if !child.handle_only
+            && let Some(reply) = child.spawn_reply.as_mut()
+            && reply.poll_closed(cx).is_ready()
+        {
+            return std::task::Poll::Ready(());
+        }
+    }
+    std::task::Poll::Pending
+}
+
 impl<R: ChildRunner> Drop for SubagentCoordinator<R> {
     fn drop(&mut self) {
         // Not `remove_queued`: that routes through `finish_child`, which runs
@@ -1527,6 +1773,7 @@ impl<R: ChildRunner> Drop for SubagentCoordinator<R> {
         // host's storage may already be tearing down).
         self.resolve_queued_at_drop();
         self.cancel_all_children();
+        self.active_messages.clear();
     }
 }
 

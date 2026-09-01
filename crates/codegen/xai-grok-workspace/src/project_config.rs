@@ -62,7 +62,7 @@ fn is_user_grok_config_file(config_path: &Path) -> bool {
 /// matching the convention used by skills and AGENTS.md discovery.
 ///
 /// If no git repo is found, only checks `cwd/.grok/config.toml`. Excludes the
-/// user-global config so `cwd == $HOME` does not treat `~/.grok/config.toml` as
+/// user-global config so `cwd == $HOME` does not treat `~/.opengrok/config.toml` as
 /// a project overlay.
 pub fn find_project_configs(cwd: &Path) -> Vec<PathBuf> {
     find_project_configs_in(&RepoDirChain::resolve(cwd).dirs)
@@ -94,8 +94,7 @@ mod tests {
         };
         let user_config = user_home.join("config.toml");
         if user_config.is_file() {
-            #[allow(deprecated)]
-            let home = std::env::home_dir().expect("home dir");
+            let home = dirs::home_dir().expect("home dir");
             let from_home = find_project_configs(&home);
             assert!(
                 !from_home.iter().any(|p| is_user_grok_config_file(p)),

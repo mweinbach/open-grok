@@ -405,6 +405,10 @@ impl PtyHarness {
         self.screen.contains(text)
     }
 
+    pub fn terminal_modes(&self) -> ptyctl::term::TerminalModes {
+        self.screen.terminal().terminal_modes()
+    }
+
     /// Pump PTY output until `condition` becomes true or `timeout` expires.
     ///
     /// The condition is checked before the first pump and after each output

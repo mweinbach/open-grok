@@ -98,6 +98,8 @@ pub enum IntraCompactionError {
 
     /// `apply_steps_compaction` failed for a parser-specific reason
     /// (e.g. SglangEngine rebuild error).
+    #[error("compaction input exceeds size limits: {0}")]
+    ContextOverflow(String),
     #[error("apply failed: {0}")]
     Apply(String),
 }

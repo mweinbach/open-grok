@@ -34,7 +34,7 @@ pub use keyboard::{
 };
 pub use kitty_keyboard::{
     kitty_event_types_withheld, kitty_flags_pushed, kitty_releases_reported,
-    negotiated_kitty_flags, set_pushed_kitty_flags, take_kitty_flags_pushed,
+    negotiated_kitty_flags, pushed_kitty_flags, set_pushed_kitty_flags, take_kitty_flags_pushed,
 };
 pub use term_version::{TermVersion, TermVersionSource};
 
@@ -288,6 +288,7 @@ pub struct TerminalContext {
     /// The brand-corroborated counterpart to `term_program_version` (see
     /// [`term_version`]). Resolved once in [`build_terminal_context_from_env`],
     /// so it does not re-derive if `brand` or `vte_version` change afterwards.
+    pub term_features: Option<String>,
     pub env_term_version: Option<TermVersion>,
 }
 
@@ -992,6 +993,7 @@ pub fn build_terminal_context_from_env(env: &HashMap<String, String>) -> Termina
     // Resolved here: the brand each version var must corroborate is in hand.
     let env_term_version = term_version::detect_env_term_version(env, brand);
 
+    let term_features = env_get(env, "TERM_FEATURES").map(str::to_owned);
     TerminalContext {
         brand,
         env_brand: brand,
@@ -1006,6 +1008,7 @@ pub fn build_terminal_context_from_env(env: &HashMap<String, String>) -> Termina
         vte_version,
         tmux_extended_keys: None,
         term_program_version,
+        term_features,
         env_term_version,
     }
 }

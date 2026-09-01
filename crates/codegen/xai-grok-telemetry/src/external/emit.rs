@@ -13,10 +13,10 @@ use opentelemetry::metrics::{Counter, Histogram, Meter};
 use super::ExternalTelemetry;
 use super::config::ContentGates;
 use super::schema::{
-    AttrValue, ExternalKey, ExternalRecord, Gate, METRIC_ERROR_COUNT, METRIC_SESSION_COUNT,
-    METRIC_STARTUP_PHASE_DURATION, METRIC_STARTUP_TIMEOUT, METRIC_STARTUP_TOTAL,
-    METRIC_TOKEN_USAGE, METRIC_TOOL_DECISION, METRIC_TOOL_USAGE, METRIC_TURN_COUNT,
-    MetricIncrement,
+    AttrValue, ExternalKey, ExternalRecord, Gate, METRIC_COST_USAGE, METRIC_ERROR_COUNT,
+    METRIC_SESSION_COUNT, METRIC_STARTUP_PHASE_DURATION, METRIC_STARTUP_TIMEOUT,
+    METRIC_STARTUP_TOTAL, METRIC_TOKEN_USAGE, METRIC_TOOL_DECISION, METRIC_TOOL_USAGE,
+    METRIC_TURN_COUNT, MetricIncrement,
 };
 
 /// Default OTel buckets end at 10s; startup's failure regime is 10-30s, so
@@ -29,6 +29,7 @@ const STARTUP_MS_BOUNDARIES: &[f64] = &[
 pub(crate) struct Instruments {
     session_count: Counter<u64>,
     token_usage: Counter<u64>,
+    cost_usage: Counter<f64>,
     turn_count: Counter<u64>,
     tool_decision: Counter<u64>,
     tool_usage: Counter<u64>,
@@ -48,6 +49,10 @@ impl Instruments {
             token_usage: meter
                 .u64_counter(METRIC_TOKEN_USAGE)
                 .with_unit("{token}")
+                .build(),
+            cost_usage: meter
+                .f64_counter(METRIC_COST_USAGE)
+                .with_unit("USD")
                 .build(),
             turn_count: meter
                 .u64_counter(METRIC_TURN_COUNT)
@@ -258,6 +263,10 @@ fn add_increment(
             attrs.push(KeyValue::new("type", token_type));
             attrs.push(KeyValue::new("model", scrub(&model)));
             instruments.token_usage.add(count, &attrs);
+        }
+        MetricIncrement::CostUsage { model, cost_usd } => {
+            attrs.push(KeyValue::new("model", scrub(&model)));
+            instruments.cost_usage.add(cost_usd, &attrs);
         }
         MetricIncrement::TurnCount { outcome, model } => {
             attrs.push(KeyValue::new("outcome", outcome));

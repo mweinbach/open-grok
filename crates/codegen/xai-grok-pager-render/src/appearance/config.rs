@@ -162,6 +162,7 @@ pub struct ScrollbackDisplayConfig {
     /// Tabs in model output are replaced with this many spaces before rendering.
     /// Default: 4. Set to 0 to pass through tabs unchanged.
     pub tab_width: u8,
+    pub rtl_bidi: bool,
     /// Maximum number of visible entries in a group of consecutive collapsed
     /// tool-call / thinking blocks. Older entries beyond this limit are hidden
     /// behind a compact "╶╶ N more" header. 0 disables group truncation.
@@ -183,6 +184,7 @@ impl Default for ScrollbackDisplayConfig {
             selection_buttons: false,
             sticky_headers: true,
             tab_width: 4,
+            rtl_bidi: false,
             group_max_visible: 10,
         }
     }
@@ -882,6 +884,8 @@ pub struct RawScrollbackDisplayConfig {
     /// Tabs in model output are replaced with this many spaces before rendering.
     /// Default: 4. Set to 0 to pass through tabs unchanged.
     pub tab_width: Option<u8>,
+    /// Apply app-side Unicode bidirectional reordering. Default false for terminals with native bidi.
+    pub rtl_bidi: Option<bool>,
     /// Maximum visible entries in a consecutive group of collapsed tool/thinking blocks.
     /// Older entries are hidden behind a compact header. 0 = disable. Default: 10.
     pub group_max_visible: Option<u16>,
@@ -901,6 +905,7 @@ impl Default for RawScrollbackDisplayConfig {
             selection_buttons: Some(false),
             sticky_headers: Some(true),
             tab_width: Some(4),
+            rtl_bidi: Some(false),
             group_max_visible: Some(10),
         }
     }
@@ -1428,6 +1433,7 @@ impl From<RawAppearanceConfig> for AppearanceConfig {
                     selection_buttons: raw.scrollback.display.selection_buttons.unwrap_or(false),
                     sticky_headers: raw.scrollback.display.sticky_headers.unwrap_or(true),
                     tab_width: raw.scrollback.display.tab_width.unwrap_or(4),
+                    rtl_bidi: raw.scrollback.display.rtl_bidi.unwrap_or(false),
                     group_max_visible: raw.scrollback.display.group_max_visible.unwrap_or(10),
                 },
             },
@@ -2044,6 +2050,24 @@ fn annotate_table<T: DocumentedFields>(table: &mut toml_edit::Table) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtl_bidi_defaults_off_and_requires_explicit_opt_in() {
+        assert!(!ScrollbackDisplayConfig::default().rtl_bidi);
+        assert_eq!(RawScrollbackDisplayConfig::default().rtl_bidi, Some(false));
+        let omitted: RawAppearanceConfig = toml::from_str("").unwrap();
+        assert!(!AppearanceConfig::from(omitted).scrollback.display.rtl_bidi);
+        for enabled in [false, true] {
+            let raw: RawAppearanceConfig =
+                toml::from_str(&format!("[scrollback.display]\nrtl_bidi = {enabled}\n")).unwrap();
+            let encoded = toml::to_string(&raw).unwrap();
+            let decoded: RawAppearanceConfig = toml::from_str(&encoded).unwrap();
+            assert_eq!(
+                AppearanceConfig::from(decoded).scrollback.display.rtl_bidi,
+                enabled
+            );
+        }
+    }
 
     #[test]
     fn test_parse_hex_color() {

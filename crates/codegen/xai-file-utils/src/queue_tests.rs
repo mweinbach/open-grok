@@ -234,15 +234,17 @@ async fn rejected_blocking_enqueue_does_not_leak_pending() {
         uploads_in_flight: Arc::new(Mutex::new(HashSet::new())),
     };
 
+    let filler_diverted = std::sync::atomic::AtomicBool::new(false);
     let filler = tokio::time::timeout(
         Duration::from_millis(200),
-        queue.enqueue_blocking(
+        queue.enqueue_blocking_with_inline_flag(
             b"filler",
             "s/turn_0/a.json",
             "application/json",
             "a",
             "s",
             0,
+            Some(&filler_diverted),
         ),
     )
     .await;
@@ -250,6 +252,7 @@ async fn rejected_blocking_enqueue_does_not_leak_pending() {
         filler.is_err(),
         "no worker: the accepted item never settles"
     );
+    assert!(!filler_diverted.load(Ordering::Relaxed));
     assert_eq!(
         stats.pending.load(Ordering::Relaxed),
         1,
@@ -258,19 +261,22 @@ async fn rejected_blocking_enqueue_does_not_leak_pending() {
 
     // Full channel: rejected before any await, diverted inline; `pending`
     // must be back to the accepted item only.
+    let overflow_diverted = std::sync::atomic::AtomicBool::new(false);
     let overflow = tokio::time::timeout(
         Duration::from_millis(200),
-        queue.enqueue_blocking(
+        queue.enqueue_blocking_with_inline_flag(
             b"overflow",
             "s/turn_0/b.json",
             "application/json",
             "b",
             "s",
             0,
+            Some(&overflow_diverted),
         ),
     )
     .await;
     drop(overflow);
+    assert!(overflow_diverted.load(Ordering::Relaxed));
     assert_eq!(
         stats.pending.load(Ordering::Relaxed),
         1,

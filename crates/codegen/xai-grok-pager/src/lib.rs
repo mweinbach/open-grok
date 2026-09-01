@@ -6,6 +6,7 @@ pub mod acp;
 pub mod actions;
 pub mod app;
 pub mod client_identity;
+pub mod clone_cmd;
 pub mod completions_cmd;
 mod config_toml_edit;
 pub mod diagnostics;
@@ -72,6 +73,7 @@ pub use xai_grok_pager_render::{
 pub mod trace_cmd;
 pub mod tracing;
 pub mod unified_log;
+pub mod usage_cmd;
 pub mod views;
 pub mod voice;
 pub mod worktree_cmd;

@@ -32,6 +32,8 @@ pub struct PermissionState {
     pub allowed_mcp_servers: HashSet<String>,
     /// Version proving server-wide grants were minted from validated qualified IDs.
     /// Missing or malformed markers are legacy; future integer versions are preserved.
+    pub disallowed_mcp_tools: HashSet<String>,
+    pub disallowed_web_fetch_domains: HashSet<String>,
     #[serde(
         default = "legacy_mcp_server_grants_version",
         deserialize_with = "deserialize_mcp_server_grants_version"
@@ -65,6 +67,8 @@ impl Default for PermissionState {
             allowed_web_fetch_domains: HashSet::new(),
             allowed_mcp_tools: HashSet::new(),
             allowed_mcp_servers: HashSet::new(),
+            disallowed_mcp_tools: HashSet::new(),
+            disallowed_web_fetch_domains: HashSet::new(),
             validated_mcp_server_grants_version: VALIDATED_MCP_SERVER_GRANTS_VERSION,
         }
     }
@@ -95,6 +99,8 @@ impl PermissionState {
             allowed_web_fetch_domains,
             allowed_mcp_tools,
             allowed_mcp_servers,
+            disallowed_mcp_tools,
+            disallowed_web_fetch_domains,
             validated_mcp_server_grants_version: _,
         } = other;
         self.allow_bash_execute |= allow_bash_execute;
@@ -106,6 +112,9 @@ impl PermissionState {
             .extend(allowed_web_fetch_domains);
         self.allowed_mcp_tools.extend(allowed_mcp_tools);
         self.allowed_mcp_servers.extend(allowed_mcp_servers);
+        self.disallowed_mcp_tools.extend(disallowed_mcp_tools);
+        self.disallowed_web_fetch_domains
+            .extend(disallowed_web_fetch_domains);
     }
 }
 
@@ -292,6 +301,55 @@ pub(crate) async fn load_state_from_disk(
     load_state_with_fallback(&dirs.dir, dirs.legacy_dir.as_deref(), client_identifier).await
 }
 
+pub(crate) struct CachedStateStore {
+    dir: std::path::PathBuf,
+    legacy_dir: Option<std::path::PathBuf>,
+    client_identifier: Option<String>,
+    last_sig: Option<(std::time::SystemTime, u64)>,
+}
+
+impl CachedStateStore {
+    pub(crate) async fn resolve_and_load(
+        cwd: &AbsPathBuf,
+        client_identifier: Option<&str>,
+    ) -> (Self, PermissionState) {
+        let dirs = resolve_store_dirs(cwd, false).await;
+        let mut store = Self {
+            dir: dirs.dir,
+            legacy_dir: dirs.legacy_dir,
+            client_identifier: client_identifier.map(str::to_owned),
+            last_sig: None,
+        };
+        store.last_sig = store.current_sig().await;
+        let state = store.read().await;
+        (store, state)
+    }
+
+    async fn current_sig(&self) -> Option<(std::time::SystemTime, u64)> {
+        let path = state_file_path(&self.dir, self.client_identifier.as_deref());
+        let meta = tokio::fs::metadata(path).await.ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    async fn read(&self) -> PermissionState {
+        load_state_with_fallback(
+            &self.dir,
+            self.legacy_dir.as_deref(),
+            self.client_identifier.as_deref(),
+        )
+        .await
+    }
+
+    pub(crate) async fn reload_if_changed(&mut self) -> Option<PermissionState> {
+        let sig = self.current_sig().await;
+        if sig == self.last_sig {
+            return None;
+        }
+        self.last_sig = sig;
+        Some(self.read().await)
+    }
+}
+
 async fn persist_state_to_path_with_writer<F>(
     path: &std::path::Path,
     state: &PermissionState,
@@ -455,6 +513,19 @@ mod tests {
         assert!(denied.contains("rm -rf"));
         assert!(denied.contains("git push --force"));
         assert_eq!(denied.len(), 2);
+    }
+
+    #[test]
+    fn missing_deny_fields_default_empty() {
+        let restored: PermissionState = toml::from_str(
+            r#"
+allowed_mcp_tools = ["linear__list"]
+"#,
+        )
+        .unwrap();
+        assert!(restored.allowed_mcp_tools.contains("linear__list"));
+        assert!(restored.disallowed_mcp_tools.is_empty());
+        assert!(restored.disallowed_web_fetch_domains.is_empty());
     }
 
     #[test]
@@ -1074,6 +1145,33 @@ allowed_mcp_servers = ["a"]
     /// A grant accepted at the repo root must be visible to a session started
     /// in a subdirectory of the same repository, and vice versa: both key the
     /// store to the repository root, not the exact cwd.
+    #[test]
+    fn merge_grants_unions_mcp_and_domain_denies_both_directions() {
+        let mut a = PermissionState::default();
+        a.disallowed_mcp_tools.insert("linear__delete".to_string());
+        a.disallowed_web_fetch_domains
+            .insert("tracker.example".to_string());
+
+        let mut b = PermissionState::default();
+        b.disallowed_mcp_tools.insert("notion__purge".to_string());
+        b.disallowed_web_fetch_domains
+            .insert("evil.example".to_string());
+
+        let mut a2 = a.clone();
+        a2.merge_grants_from(b.clone());
+        assert!(a2.disallowed_mcp_tools.contains("linear__delete"));
+        assert!(a2.disallowed_mcp_tools.contains("notion__purge"));
+        assert!(a2.disallowed_web_fetch_domains.contains("tracker.example"));
+        assert!(a2.disallowed_web_fetch_domains.contains("evil.example"));
+
+        let mut b2 = b;
+        b2.merge_grants_from(a);
+        assert!(b2.disallowed_mcp_tools.contains("linear__delete"));
+        assert!(b2.disallowed_mcp_tools.contains("notion__purge"));
+        assert!(b2.disallowed_web_fetch_domains.contains("tracker.example"));
+        assert!(b2.disallowed_web_fetch_domains.contains("evil.example"));
+    }
+
     #[test]
     fn scope_root_unifies_repo_subdirectories() {
         let tmp = tempfile::tempdir().unwrap();

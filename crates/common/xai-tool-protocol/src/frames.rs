@@ -332,6 +332,62 @@ pub struct ServerInfo {
     pub connected_since: String,
     /// Lifecycle status (Ready, Busy, Draining, etc.).
     pub status: ToolServerLifecycleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerIdentityMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
+}
+impl ServerIdentityMetadata {
+    pub fn from_metadata(metadata: &serde_json::Value) -> Self {
+        let Some(obj) = metadata.as_object() else {
+            return Self::default();
+        };
+        let string_key = |key: &str| {
+            obj.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        Self {
+            hostname: string_key("hostname"),
+            display_name: string_key("display_name"),
+            cwd: string_key("cwd"),
+            sandbox_id: string_key("sandbox_id"),
+            session_id: string_key("session_id"),
+            provider_id: string_key("provider_id"),
+            launch_id: string_key("launch_id"),
+        }
+    }
+    pub fn merge_into(&self, metadata: Option<serde_json::Value>) -> Option<serde_json::Value> {
+        let identity = match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => return metadata,
+        };
+        match metadata {
+            None => Some(serde_json::Value::Object(identity)),
+            Some(serde_json::Value::Object(mut map)) => {
+                for (key, value) in identity {
+                    map.entry(key).or_insert(value);
+                }
+                Some(serde_json::Value::Object(map))
+            }
+            other => other,
+        }
+    }
 }
 
 /// Reply to [`ServersListParams`].
@@ -404,6 +460,8 @@ pub struct ToolsListParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolsListResult {
     pub tools: Vec<xai_tool_types::ToolDescription>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_bound: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -895,6 +953,18 @@ pub enum ToolServerLifecycleStatus {
     ShuttingDown,
     Disconnected,
 }
+impl ToolServerLifecycleStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Ready => "ready",
+            Self::Busy => "busy",
+            Self::Draining => "draining",
+            Self::ShuttingDown => "shutting_down",
+            Self::Disconnected => "disconnected",
+        }
+    }
+}
 
 /// `tool_server.status` payload. `session_id = Some` scopes counters
 /// to that session; `None` is an aggregate across all sessions. Newer
@@ -1019,6 +1089,7 @@ pub enum IdleWithholdReason {
     /// [`PreviewStatusOnly`](Self::PreviewStatusOnly) it never advances the
     /// withhold anchor, so the hub's hold ceiling genuinely caps it.
     ClientPresence,
+    ScheduledTask,
     /// A reason this build does not recognise — a newer sender. Never
     /// constructed locally; only produced by deserialization.
     #[serde(other)]
@@ -1373,6 +1444,7 @@ mod tests {
         ] {
             let json = serde_json::to_value(variant).expect("serialize");
             assert_eq!(json.as_str(), Some(expected_str), "variant {variant:?}");
+            assert_eq!(variant.as_str(), expected_str, "variant {variant:?}");
             let back: super::ToolServerLifecycleStatus =
                 serde_json::from_value(json).expect("deserialize");
             assert_eq!(back, variant);
@@ -1509,6 +1581,7 @@ mod tests {
             super::IdleWithholdReason::PreviewStatusOnly,
             super::IdleWithholdReason::ClientRpc,
             super::IdleWithholdReason::ClientPresence,
+            super::IdleWithholdReason::ScheduledTask,
         ] {
             let expected = match reason {
                 super::IdleWithholdReason::Durability => "durability",
@@ -1517,6 +1590,7 @@ mod tests {
                 super::IdleWithholdReason::PreviewStatusOnly => "preview_status_only",
                 super::IdleWithholdReason::ClientRpc => "client_rpc",
                 super::IdleWithholdReason::ClientPresence => "client_presence",
+                super::IdleWithholdReason::ScheduledTask => "scheduled_task",
                 super::IdleWithholdReason::Unknown => unreachable!("never constructed locally"),
             };
             assert_eq!(
@@ -1820,5 +1894,168 @@ mod tests {
         ] {
             assert!(!is_image_capability_token(name), "expected invalid: {name}");
         }
+    }
+    #[test]
+    fn server_identity_metadata_parses_known_keys_ignoring_extras() {
+        let meta = json!({
+            "hostname": "my-laptop",
+            "display_name": "Work laptop",
+            "cwd": "/home/me/proj",
+            "session_id": "sandbox-announced",
+            "custom_user_key": {"nested": true},
+        });
+        let parsed = ServerIdentityMetadata::from_metadata(&meta);
+        assert_eq!(parsed.hostname.as_deref(), Some("my-laptop"));
+        assert_eq!(parsed.display_name.as_deref(), Some("Work laptop"));
+        assert_eq!(parsed.cwd.as_deref(), Some("/home/me/proj"));
+        assert_eq!(parsed.session_id.as_deref(), Some("sandbox-announced"));
+        assert_eq!(parsed.sandbox_id, None);
+    }
+    #[test]
+    fn server_identity_metadata_parses_sandbox_start_path_payload() {
+        let meta = json!({
+            "cwd": "/workspace",
+            "mode": "remote",
+            "sandbox_id": "sb-start",
+            "session_id": "44444444-4444-4444-4444-444444444444",
+            "provider_id": "test-provider",
+            "launch_id": "55555555-5555-5555-5555-555555555555",
+        });
+        let parsed = ServerIdentityMetadata::from_metadata(&meta);
+        assert_eq!(parsed.cwd.as_deref(), Some("/workspace"));
+        assert_eq!(parsed.sandbox_id.as_deref(), Some("sb-start"));
+        assert_eq!(
+            parsed.session_id.as_deref(),
+            Some("44444444-4444-4444-4444-444444444444")
+        );
+        assert_eq!(parsed.provider_id.as_deref(), Some("test-provider"));
+        assert_eq!(
+            parsed.launch_id.as_deref(),
+            Some("55555555-5555-5555-5555-555555555555")
+        );
+        assert_eq!(parsed.hostname, None);
+    }
+    #[test]
+    fn server_identity_metadata_absent_keys_default_to_none() {
+        let parsed = ServerIdentityMetadata::from_metadata(&json!({"other": 1}));
+        assert_eq!(parsed, ServerIdentityMetadata::default());
+    }
+    #[test]
+    fn server_identity_metadata_garbage_is_all_none_never_error() {
+        for garbage in [
+            json!(null),
+            json!("a string"),
+            json!(42),
+            json!([1, 2, 3]),
+            json!({"hostname": 42}),
+        ] {
+            assert_eq!(
+                ServerIdentityMetadata::from_metadata(&garbage),
+                ServerIdentityMetadata::default(),
+                "garbage metadata must parse to all-None: {garbage}"
+            );
+        }
+    }
+    #[test]
+    fn server_identity_metadata_wrong_typed_key_nulls_only_that_field() {
+        let meta = json!({
+            "hostname": 42,
+            "cwd": ["not", "a", "string"],
+            "session_id": "sess-1",
+            "provider_id": "test-provider",
+        });
+        let parsed = ServerIdentityMetadata::from_metadata(&meta);
+        assert_eq!(parsed.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(parsed.provider_id.as_deref(), Some("test-provider"));
+        assert_eq!(parsed.hostname, None);
+        assert_eq!(parsed.cwd, None);
+    }
+    #[test]
+    fn server_identity_metadata_each_field_survives_bad_siblings() {
+        let keys = [
+            "hostname",
+            "display_name",
+            "cwd",
+            "sandbox_id",
+            "session_id",
+            "provider_id",
+            "launch_id",
+        ];
+        for good in keys {
+            let mut obj = serde_json::Map::new();
+            for key in keys {
+                let value = if key == good {
+                    json!("value")
+                } else {
+                    json!(1)
+                };
+                obj.insert(key.to_owned(), value);
+            }
+            let parsed = ServerIdentityMetadata::from_metadata(&json!(obj));
+            let mut expected = ServerIdentityMetadata::default();
+            match good {
+                "hostname" => expected.hostname = Some("value".to_owned()),
+                "display_name" => expected.display_name = Some("value".to_owned()),
+                "cwd" => expected.cwd = Some("value".to_owned()),
+                "sandbox_id" => expected.sandbox_id = Some("value".to_owned()),
+                "session_id" => expected.session_id = Some("value".to_owned()),
+                "provider_id" => expected.provider_id = Some("value".to_owned()),
+                "launch_id" => expected.launch_id = Some("value".to_owned()),
+                other => unreachable!("unhandled key {other}"),
+            }
+            assert_eq!(parsed, expected, "only {good} must survive");
+        }
+    }
+    #[test]
+    fn server_identity_metadata_merge_preserves_user_keys() {
+        let identity = ServerIdentityMetadata {
+            hostname: Some("host-a".to_owned()),
+            cwd: Some("/work".to_owned()),
+            ..Default::default()
+        };
+        let merged = identity
+            .merge_into(Some(json!({"hostname": "user-override", "extra": true})))
+            .expect("object stays object");
+        assert_eq!(merged["hostname"], "user-override");
+        assert_eq!(merged["cwd"], "/work");
+        assert_eq!(merged["extra"], true);
+        assert!(merged.get("display_name").is_none());
+    }
+    #[test]
+    fn server_identity_metadata_merge_into_none_and_non_object() {
+        let identity = ServerIdentityMetadata {
+            hostname: Some("host-a".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            identity.merge_into(None),
+            Some(json!({"hostname": "host-a"}))
+        );
+        assert_eq!(
+            identity.merge_into(Some(json!("opaque"))),
+            Some(json!("opaque"))
+        );
+    }
+    #[test]
+    fn server_info_last_seen_ms_absent_and_round_trip() {
+        let old = json!({
+            "server_id": "srv-1",
+            "description": "",
+            "metadata": null,
+            "connected_since": "",
+            "status": "ready",
+        });
+        let info: ServerInfo = serde_json::from_value(old).expect("old payload parses");
+        assert_eq!(info.last_seen_ms, None);
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert!(json.get("last_seen_ms").is_none());
+        let with = ServerInfo {
+            last_seen_ms: Some(1_234_567),
+            ..info
+        };
+        let round: ServerInfo =
+            serde_json::from_value(serde_json::to_value(&with).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(round.last_seen_ms, Some(1_234_567));
     }
 }

@@ -4,6 +4,14 @@ use super::*;
 use xai_grok_config_types::ConfigSource;
 
 #[test]
+fn environment_overlay_off_reason_is_reported() {
+    assert_eq!(
+        session_search_off_reason(ConfigSource::EnvOverlay),
+        "an environment overlay"
+    );
+}
+
+#[test]
 #[serial]
 fn gate_never_reopens_once_it_closes() {
     let _gate = IndexGateGuard::snapshot();

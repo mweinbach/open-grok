@@ -166,6 +166,16 @@ pub static USER_GUIDE: &[Doc] = &[
         "Monitoring Usage (External OpenTelemetry)",
         "Export usage metrics to a customer OpenTelemetry collector"
     ),
+    guide!(
+        "25-status-line.md",
+        "Status Line",
+        "Configure built-in items or a custom command-driven status line"
+    ),
+    guide!(
+        "27-clone.md",
+        "Clone a Repository",
+        "Git-backed shallow clones, sparse checkout, and optional Grove integration"
+    ),
 ];
 
 /// Non-user-guide reference docs. Separate from USER_GUIDE because they
@@ -313,6 +323,16 @@ mod tests {
         let doc = find_doc("getting started").expect("should find Getting Started");
         assert_eq!(doc.title, "Getting Started");
         assert!(find_doc("nonexistent guide").is_none());
+    }
+
+    #[test]
+    fn status_line_guide_is_registered() {
+        let doc = find_doc("status line").expect("should find Status Line");
+        assert_eq!(doc.filename, "25-status-line.md");
+        assert_eq!(
+            get_howto_doc("Status Line"),
+            Some(include_str!("../docs/user-guide/25-status-line.md"))
+        );
     }
 
     #[test]

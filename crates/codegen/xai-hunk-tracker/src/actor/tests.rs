@@ -5842,3 +5842,229 @@ async fn refresh_storm_scan_count_during_rebase() {
         "AgentOnly scan must be scoped to tracked paths; staged noise leaked: {staged:?}"
     );
 }
+
+#[tokio::test]
+async fn set_working_dir_rebases_file_state_keys() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let old = temp.path().join("workspace");
+    let new = temp.path().join("workspace").join("conv-abc");
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(old.join("foo.rs"), "fn main() {}\n").unwrap();
+
+    let mut actor = direct_actor(&old, TrackingMode::AgentOnly);
+    actor
+        .record_agent_write(old.join("foo.rs"), "fn main() { 1 }\n".into(), 0, None)
+        .await;
+    let original_hunk_ids = actor.turn_index.clone();
+    let outside = temp.path().join("outside.rs");
+    actor
+        .git_dirty_cache
+        .extend([old.join("foo.rs"), outside.clone()]);
+    actor.git_staged_cache.insert(old.join("foo.rs"));
+    actor.git_repo_state = super::state::GitRepoState::NotARepo;
+    actor.repo_sync_state.head_oid = Some("stale-head".into());
+    assert!(
+        actor.file_states.contains_key(&old.join("foo.rs")),
+        "pre-remount state must be keyed at the original cwd"
+    );
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle_command(crate::commands::HunkTrackerCommand::SetWorkingDir {
+            working_dir: new.clone(),
+            reply: reply_tx,
+        })
+        .await;
+    reply_rx
+        .await
+        .expect("set_working_dir must ack after rekey");
+    assert!(
+        !actor.file_states.contains_key(&old.join("foo.rs")),
+        "old cwd keys must not survive remount"
+    );
+    let remounted = actor
+        .file_states
+        .get(&new.join("foo.rs"))
+        .expect("file state must move onto the new guest root");
+    assert!(remounted.is_agent_file);
+    assert!(!remounted.hunks.is_empty());
+    assert!(
+        remounted
+            .hunks
+            .iter()
+            .all(|hunk| hunk.source.prompt_index() == Some(0))
+    );
+    assert_eq!(actor.turn_index, original_hunk_ids);
+    assert_eq!(actor.git_dirty_cache, [new.join("foo.rs"), outside].into());
+    assert_eq!(actor.git_staged_cache, [new.join("foo.rs")].into());
+    assert!(matches!(
+        actor.git_repo_state,
+        super::state::GitRepoState::Unknown
+    ));
+    assert_eq!(
+        actor.repo_sync_state,
+        super::state::RepoSyncState::default()
+    );
+    assert!(
+        remounted
+            .hunks
+            .iter()
+            .all(|hunk| hunk.path == new.join("foo.rs")),
+        "hunk.path must follow the remounted file key"
+    );
+
+    actor
+        .record_agent_write(new.join("bar.rs"), "fn bar() {}\n".into(), 0, None)
+        .await;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle_command(crate::commands::HunkTrackerCommand::SetWorkingDir {
+            working_dir: new.clone(),
+            reply: reply_tx,
+        })
+        .await;
+    reply_rx.await.expect("idempotent remount must ack");
+    assert!(
+        actor.file_states.contains_key(&new.join("bar.rs")),
+        "keys already under the guest root must not be double-prefixed"
+    );
+    assert!(
+        !actor
+            .file_states
+            .contains_key(&new.join("conv-abc").join("bar.rs")),
+        "rekey must not nest an already-guest path"
+    );
+}
+
+#[tokio::test]
+async fn set_working_dir_merges_colliding_guest_and_old_cwd_keys() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let old = temp.path().join("workspace");
+    let new = temp.path().join("workspace").join("conv-abc");
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(old.join("foo.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(new.join("foo.rs"), "fn main() { guest }\n").unwrap();
+
+    let mut actor = direct_actor(&old, TrackingMode::AgentOnly);
+    actor
+        .record_agent_write(old.join("foo.rs"), "fn main() { old }\n".into(), 0, None)
+        .await;
+    actor
+        .record_agent_write(new.join("foo.rs"), "fn main() { guest }\n".into(), 0, None)
+        .await;
+    assert_eq!(actor.file_states.len(), 2);
+    let guest_baseline = actor.file_states[&new.join("foo.rs")].baseline.clone();
+    let guest_content = actor.file_states[&new.join("foo.rs")]
+        .current_content
+        .clone();
+    let expected_hunks: std::collections::HashSet<_> = actor
+        .file_states
+        .values()
+        .flat_map(|state| state.hunks.iter().map(|hunk| hunk.id.clone()))
+        .collect();
+    actor
+        .file_states
+        .get_mut(&old.join("foo.rs"))
+        .unwrap()
+        .baseline_accepted = true;
+    actor
+        .file_states
+        .get_mut(&new.join("foo.rs"))
+        .unwrap()
+        .is_agent_file = false;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle_command(crate::commands::HunkTrackerCommand::SetWorkingDir {
+            working_dir: new.clone(),
+            reply: reply_tx,
+        })
+        .await;
+    reply_rx.await.expect("set_working_dir must ack");
+    let remounted = actor
+        .file_states
+        .get(&new.join("foo.rs"))
+        .expect("collision must keep a single guest-root key");
+    assert_eq!(actor.file_states.len(), 1);
+    assert_eq!(remounted.baseline, guest_baseline);
+    assert_eq!(remounted.current_content, guest_content);
+    assert!(remounted.is_agent_file);
+    assert!(remounted.baseline_accepted);
+    assert_eq!(
+        remounted
+            .hunks
+            .iter()
+            .map(|hunk| hunk.id.clone())
+            .collect::<std::collections::HashSet<_>>(),
+        expected_hunks
+    );
+    assert!(
+        !remounted.hunks.is_empty(),
+        "merged state must keep hunks from both keys"
+    );
+}
+
+#[tokio::test]
+async fn set_working_dir_handle_waits_for_actor_acknowledgement() {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    let handle = crate::handle::HunkTrackerHandle::new(command_tx);
+    let working_dir = PathBuf::from("/workspace/session-root");
+    let remount = handle.set_working_dir(working_dir.clone());
+    tokio::pin!(remount);
+    let command = tokio::select! {
+        biased;
+        () = &mut remount => panic!("remount returned before acknowledgement"),
+        command = command_rx.recv() => command.expect("remount command"),
+    };
+    let crate::commands::HunkTrackerCommand::SetWorkingDir {
+        working_dir: requested,
+        reply,
+    } = command
+    else {
+        panic!("expected SetWorkingDir command");
+    };
+    assert_eq!(requested, working_dir);
+    assert!(!reply.is_closed());
+    reply.send(()).unwrap();
+    remount.await;
+
+    crate::handle::HunkTrackerHandle::noop()
+        .set_working_dir(PathBuf::from("/unused"))
+        .await;
+}
+
+#[tokio::test]
+async fn writes_after_remount_keep_agent_attribution_and_new_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let original_root = directory.path().join("workspace");
+    let remounted_root = original_root.join("session-root");
+    std::fs::create_dir_all(&remounted_root).unwrap();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = HunkTrackerActor::spawn(
+        "remount-order".into(),
+        original_root.clone(),
+        event_tx,
+        TrackingMode::AgentOnly,
+        cancellation.clone(),
+    );
+    handle.record_agent_write(original_root.join("file.rs"), "before\n".into(), 0, None);
+    handle.set_working_dir(remounted_root.clone()).await;
+    let remounted_path = remounted_root.join("file.rs");
+    handle.record_agent_write(remounted_path.clone(), "after\n".into(), 1, None);
+    let data = handle.get_file_hunk_data(remounted_path.clone()).await;
+    assert_eq!(data.current_content.as_deref(), Some("after\n"));
+    assert!(!data.hunks.is_empty());
+    assert!(
+        data.hunks
+            .iter()
+            .all(|hunk| hunk.path == remounted_path && hunk.source.is_agent_edit())
+    );
+    assert!(
+        handle
+            .get_hunks_for_path(original_root.join("file.rs"))
+            .await
+            .is_empty()
+    );
+    cancellation.cancel();
+}

@@ -18,6 +18,9 @@ use crate::views::modal_window::{
 use crate::views::picker;
 use xai_grok_tools::implementations::skills::types::SkillInfo;
 
+mod workflows_picker_rows;
+use workflows_picker_rows::build_workflows_picker_rows;
+
 /// Check if a name fuzzy-matches the search query.
 /// Empty query matches everything.
 fn fuzzy_matches(name: &str, query: &str) -> bool {
@@ -175,9 +178,6 @@ pub(crate) fn ordered_marketplace_view(
         })
         .collect()
 }
-
-/// Collapse key for the Workflows block on the Skills tab.
-const SKILLS_WORKFLOWS_GROUP_KEY: &str = "Workflows";
 
 /// Group header for a skill scope/source.
 #[derive(Debug, Clone)]
@@ -491,6 +491,7 @@ pub enum ExtensionsTab {
     Plugins,
     Marketplace,
     Skills,
+    Workflows,
     McpServers,
 }
 
@@ -501,6 +502,7 @@ impl ExtensionsTab {
         Self::Plugins,
         Self::Marketplace,
         Self::Skills,
+        Self::Workflows,
         Self::McpServers,
     ];
 
@@ -511,6 +513,7 @@ impl ExtensionsTab {
             Self::Plugins => "Plugins",
             Self::Marketplace => "Marketplace",
             Self::Skills => "Skills",
+            Self::Workflows => "Workflows",
             Self::McpServers => "MCP Servers",
         }
     }
@@ -521,7 +524,8 @@ impl ExtensionsTab {
             Self::Hooks => Self::Plugins,
             Self::Plugins => Self::Marketplace,
             Self::Marketplace => Self::Skills,
-            Self::Skills => Self::McpServers,
+            Self::Skills => Self::Workflows,
+            Self::Workflows => Self::McpServers,
             Self::McpServers => Self::Hooks,
         }
     }
@@ -532,7 +536,8 @@ impl ExtensionsTab {
             Self::Plugins => Self::Hooks,
             Self::Marketplace => Self::Plugins,
             Self::Skills => Self::Marketplace,
-            Self::McpServers => Self::Skills,
+            Self::Workflows => Self::Skills,
+            Self::McpServers => Self::Workflows,
         }
     }
 
@@ -543,9 +548,26 @@ impl ExtensionsTab {
             Self::Plugins => ExtensionsModalTab::Plugins,
             Self::Marketplace => ExtensionsModalTab::Marketplace,
             Self::Skills => ExtensionsModalTab::Skills,
+            Self::Workflows => ExtensionsModalTab::Workflows,
             Self::McpServers => ExtensionsModalTab::McpServers,
         }
     }
+}
+
+pub(crate) fn hook_group_any_enabled<'a>(
+    hooks: impl Iterator<Item = &'a xai_hooks_plugins_types::HookInfo>,
+) -> bool {
+    let unpinned: Vec<_> = hooks.filter(|hook| !hook.pinned).collect();
+    unpinned.is_empty() || unpinned.iter().any(|hook| !hook.disabled)
+}
+
+pub(crate) fn hook_source_pinned(
+    hooks: &[xai_hooks_plugins_types::HookInfo],
+    source_dir: &str,
+) -> bool {
+    hooks
+        .iter()
+        .any(|hook| hook.source_dir == source_dir && hook.pinned)
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,6 +1053,7 @@ pub enum ConfirmationAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalMessage {
     Error(String),
+    Info(String),
     Confirmation {
         message: String,
         action: ConfirmationAction,
@@ -1127,6 +1150,7 @@ pub fn extensions_action_keys(tab: ExtensionsTab) -> Vec<(char, &'static str)> {
             ('x', "remove source"),
         ],
         ExtensionsTab::Skills => vec![(' ', "toggle"), ('f', "filter"), ('r', "reload")],
+        ExtensionsTab::Workflows => vec![('r', "reload")],
         ExtensionsTab::McpServers => MCP_SERVERS_ACTION_KEYS.to_vec(),
     }
 }
@@ -1168,6 +1192,58 @@ fn action_key_footer_desc_for_mapping(
     } else {
         desc
     }
+}
+
+fn selected_hook_source_removable_at(
+    state: &ExtensionsModalState,
+    entry_data_indices: &[Option<usize>],
+    entry_group_keys: &[Option<String>],
+    selected: usize,
+) -> bool {
+    if !matches!(state.active_tab, ExtensionsTab::Hooks) {
+        return true;
+    }
+    let TabDataState::Loaded(ref data) = state.hooks_data else {
+        return true;
+    };
+    if let Some(source_dir) = entry_group_keys.get(selected).and_then(|k| k.as_ref()) {
+        return data
+            .hooks
+            .iter()
+            .any(|hook| &hook.source_dir == source_dir && hook.removable)
+            && !hook_source_pinned(&data.hooks, source_dir);
+    }
+    let Some(idx) = data_index_at(entry_data_indices, selected) else {
+        return true;
+    };
+    data.hooks
+        .get(idx)
+        .is_none_or(|hook| hook.removable && !hook_source_pinned(&data.hooks, &hook.source_dir))
+}
+
+fn selected_hook_policy_enforced_at(
+    state: &ExtensionsModalState,
+    entry_data_indices: &[Option<usize>],
+    entry_group_keys: &[Option<String>],
+    selected: usize,
+) -> bool {
+    if !matches!(state.active_tab, ExtensionsTab::Hooks) {
+        return false;
+    }
+    let TabDataState::Loaded(ref data) = state.hooks_data else {
+        return false;
+    };
+    if let Some(source_dir) = entry_group_keys.get(selected).and_then(|k| k.as_ref()) {
+        let mut members = data
+            .hooks
+            .iter()
+            .filter(|hook| &hook.source_dir == source_dir);
+        return members.all(|hook| hook.pinned);
+    }
+    let Some(idx) = data_index_at(entry_data_indices, selected) else {
+        return false;
+    };
+    data.hooks.get(idx).is_some_and(|hook| hook.pinned)
 }
 
 pub fn action_key_cheatsheet_desc(ch: char, desc: &'static str) -> &'static str {
@@ -1225,12 +1301,11 @@ fn selected_item_enabled_at(
                 TabDataState::Loaded(data) => {
                     let hook = data.hooks.get(idx)?;
                     if state.hooks_collapsed_groups.contains(&hook.source_dir) {
-                        Some(
+                        Some(hook_group_any_enabled(
                             data.hooks
                                 .iter()
-                                .filter(|h| h.source_dir == hook.source_dir)
-                                .any(|h| !h.disabled),
-                        )
+                                .filter(|h| h.source_dir == hook.source_dir),
+                        ))
                     } else {
                         Some(!hook.disabled)
                     }
@@ -1261,6 +1336,7 @@ fn selected_item_enabled_at(
             _ => None,
         },
         ExtensionsTab::Marketplace => None,
+        ExtensionsTab::Workflows => None,
     }
 }
 
@@ -1352,6 +1428,7 @@ pub fn resolve_key(tab: ExtensionsTab, ch: char) -> Option<ButtonAction> {
         (ExtensionsTab::Skills, ' ') => Some(ButtonAction::ToggleSelectedSkill),
         (ExtensionsTab::Skills, 'r') => Some(ButtonAction::ReloadSkills),
         (ExtensionsTab::Skills, 'f') => Some(ButtonAction::CycleFilter),
+        (ExtensionsTab::Workflows, 'r') => Some(ButtonAction::ReloadSkills),
         (ExtensionsTab::McpServers, 'a') => Some(ButtonAction::StartInput {
             command_prefix: "mcp_add".into(),
             // URL is required, Name is optional (auto-derived from URL),
@@ -1396,7 +1473,7 @@ pub fn tab_complete_path(partial: &str) -> Option<String> {
 
     // Expand ~ to home directory.
     let expanded = if let Some(rest) = partial.strip_prefix('~') {
-        let home = dirs::home_dir()?;
+        let home = xai_dirs::home_dir()?;
         if rest.is_empty() || rest == "/" {
             home.to_string_lossy().to_string() + "/"
         } else {
@@ -1660,20 +1737,6 @@ pub struct WorkflowInfo {
     pub path: Option<String>,
 }
 
-impl WorkflowInfo {
-    fn has_usable_command_name(&self) -> bool {
-        let name = self.name.as_str();
-        !name.is_empty()
-            && name.len() <= 64
-            && !name.starts_with('-')
-            && !name.ends_with('-')
-            && !name.contains("--")
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    }
-}
-
 /// State for the hooks/plugins modal popup.
 pub struct ExtensionsModalState {
     /// Shared modal window chrome state (close button, tabs, footer
@@ -1753,18 +1816,17 @@ pub struct ExtensionsModalState {
     /// Maps visible row offset to skill index (for mouse click).
     pub skills_visible_map: Vec<Option<usize>>,
     pub hooks_collapsed_groups: std::collections::HashSet<String>,
+    pub hooks_groups_seeded: bool,
     /// Collapsed plugin source groups (by [`PluginGroup`] key).
     pub plugins_collapsed_groups: std::collections::HashSet<String>,
     /// See [`Self::seed_plugin_groups_once`].
     pub plugins_groups_seeded: bool,
     /// Collapsed marketplace sources (by source index). Default collapsed.
     pub marketplace_collapsed_sources: std::collections::HashSet<usize>,
-    /// Collapsed skill source groups (by [`SkillGroup::label`] / Workflows key).
+    /// Collapsed skill source groups (by [`SkillGroup::label`]).
     pub skills_collapsed_groups: std::collections::HashSet<String>,
     /// See [`Self::seed_skills_groups_once`].
     pub skills_groups_seeded: bool,
-    /// See [`Self::seed_workflows_group_once`].
-    pub workflows_group_seeded: bool,
     /// Expanded skill entries (by skill index). Skills start collapsed.
     pub skills_expanded: std::collections::HashSet<usize>,
     /// Status filter for the plugins tab.
@@ -1845,8 +1907,8 @@ impl ExtensionsModalState {
             skills_expanded: std::collections::HashSet::new(),
             skills_collapsed_groups: std::collections::HashSet::new(),
             skills_groups_seeded: false,
-            workflows_group_seeded: false,
             hooks_collapsed_groups: std::collections::HashSet::new(),
+            hooks_groups_seeded: false,
             plugins_collapsed_groups: std::collections::HashSet::new(),
             plugins_groups_seeded: false,
             marketplace_collapsed_sources: std::collections::HashSet::new(),
@@ -1905,43 +1967,39 @@ impl ExtensionsModalState {
         self.picker_state.hovered = None;
     }
 
+    pub fn seed_hook_groups_once(&mut self, hooks: &[xai_hooks_plugins_types::HookInfo]) {
+        seed_groups_once(
+            &mut self.hooks_groups_seeded,
+            &mut self.hooks_collapsed_groups,
+            hooks,
+            |hook| hook.source_dir.clone(),
+        );
+    }
+
     /// Seed the all-collapsed default for plugin source groups exactly once.
     ///
     /// Called from both plugin-data delivery channels (list fetch and the
     /// `PluginsChanged` push); the first to deliver seeds, later deliveries
     /// preserve the user's expand state.
     pub fn seed_plugin_groups_once(&mut self, plugins: &[xai_hooks_plugins_types::PluginInfo]) {
-        if self.plugins_groups_seeded {
-            return;
-        }
-        self.plugins_collapsed_groups = plugins.iter().map(|p| plugin_group(p).key).collect();
-        self.plugins_groups_seeded = true;
+        seed_groups_once(
+            &mut self.plugins_groups_seeded,
+            &mut self.plugins_collapsed_groups,
+            plugins,
+            |plugin| plugin_group(plugin).key,
+        );
     }
 
     /// Seed default-collapsed skill source groups exactly once.
     ///
-    /// Unions [`SkillGroup::label`] keys into `skills_collapsed_groups` so a
-    /// prior Workflows expand/collapse (seeded independently) is preserved.
     /// Later reloads leave the set alone.
     pub fn seed_skills_groups_once(&mut self, skills: &[SkillInfo]) {
-        if self.skills_groups_seeded {
-            return;
-        }
-        for skill in skills {
-            self.skills_collapsed_groups
-                .insert(skill_group(skill).label);
-        }
-        self.skills_groups_seeded = true;
-    }
-
-    /// Seed default-collapsed Workflows header once (independent of skills load).
-    pub fn seed_workflows_group_once(&mut self) {
-        if self.workflows_group_seeded {
-            return;
-        }
-        self.skills_collapsed_groups
-            .insert(SKILLS_WORKFLOWS_GROUP_KEY.to_string());
-        self.workflows_group_seeded = true;
+        seed_groups_once(
+            &mut self.skills_groups_seeded,
+            &mut self.skills_collapsed_groups,
+            skills,
+            |skill| skill_group(skill).label,
+        );
     }
 
     /// Whether a group header at picker index `sel` with the given
@@ -1957,6 +2015,7 @@ impl ExtensionsModalState {
                 searching || !self.plugins_collapsed_groups.contains(group_key)
             }
             ExtensionsTab::Skills => searching || !self.skills_collapsed_groups.contains(group_key),
+            ExtensionsTab::Workflows => false,
             ExtensionsTab::Marketplace => {
                 let source_has_error = group_key
                     .parse::<usize>()
@@ -2202,6 +2261,18 @@ pub(crate) fn build_mcp_servers_picker_rows(
 }
 
 /// On first MCP list load, collapse each distinct plugin section by default.
+fn seed_groups_once<T>(
+    seeded: &mut bool,
+    collapsed_groups: &mut std::collections::HashSet<String>,
+    items: &[T],
+    group_key: impl Fn(&T) -> String,
+) {
+    if *seeded || items.is_empty() {
+        return;
+    }
+    collapsed_groups.extend(items.iter().map(group_key));
+    *seeded = true;
+}
 pub(crate) fn init_mcps_section_collapse_on_first_load(
     collapsed_sections: &mut std::collections::HashSet<String>,
     initialized: &mut bool,
@@ -2329,12 +2400,18 @@ fn classify_hook_source(source_dir: &str) -> HookSourceMeta {
             let rest_str = rest.to_string_lossy();
             let rest_trimmed = rest_str.strip_prefix('/').unwrap_or(&rest_str);
             format!("Custom: {prefix}/{rest_trimmed}")
-        } else if let Some(home) = dirs::home_dir() {
-            let home_str = home.display().to_string();
-            source_dir
-                .strip_prefix(&home_str)
-                .map(|rest| format!("Custom: ~{rest}"))
-                .unwrap_or_else(|| format!("Custom: {source_dir}"))
+        } else if let Some(home) = xai_dirs::home_dir() {
+            if !home.as_os_str().is_empty()
+                && let Ok(rest) = source_path.strip_prefix(&home)
+            {
+                if rest.as_os_str().is_empty() {
+                    "Custom: ~".into()
+                } else {
+                    format!("Custom: ~/{}", rest.display())
+                }
+            } else {
+                format!("Custom: {source_dir}")
+            }
         } else {
             format!("Custom: {source_dir}")
         }
@@ -2616,6 +2693,7 @@ pub fn render_extensions_modal(
         ExtensionsTab::Plugins => matches!(state.plugins_data, TabDataState::Loading),
         ExtensionsTab::Marketplace => matches!(state.marketplace_data, TabDataState::Loading),
         ExtensionsTab::Skills => matches!(state.skills_data, TabDataState::Loading),
+        ExtensionsTab::Workflows => matches!(state.workflows_data, TabDataState::Loading),
         ExtensionsTab::McpServers => matches!(state.mcps_data, TabDataState::Loading),
     };
 
@@ -2747,86 +2825,23 @@ pub fn render_extensions_modal(
                     entry_badge_text.push(String::new());
                     entry_badge_color.push(None);
                 }
-                match state.workflows_data {
-                    TabDataState::Loaded(ref workflows) => {
-                        let query_lower = state.picker_state.query().to_lowercase();
-                        let mut visible: Vec<&WorkflowInfo> = workflows
-                            .iter()
-                            .filter(|workflow| workflow.has_usable_command_name())
-                            .filter(|w| {
-                                query_lower.is_empty()
-                                    || w.name.to_lowercase().contains(&query_lower)
-                                    || w.description.to_lowercase().contains(&query_lower)
-                            })
-                            .collect();
-                        visible.sort_by(|a, b| cmp_str_ci(&a.name, &b.name));
-                        if !visible.is_empty() {
-                            let searching = !state.picker_state.query().is_empty();
-                            let collapsed = !searching
-                                && state
-                                    .skills_collapsed_groups
-                                    .contains(SKILLS_WORKFLOWS_GROUP_KEY);
-                            let count = visible.len();
-                            entry_labels.push(if count == 1 {
-                                "Workflows (1 workflow)".to_string()
-                            } else {
-                                format!("Workflows ({count} workflows)")
-                            });
-                            entry_right_labels.push(String::new());
-                            entry_desc_lines.push(vec![]);
-                            entry_summary_lines.push(vec![]);
-                            entry_fields.push(vec![]);
-                            entry_is_header.push(false);
-                            entry_dimmed.push(false);
-                            entry_indent.push(0);
-                            entry_data_indices.push(None);
-                            entry_group_keys.push(Some(SKILLS_WORKFLOWS_GROUP_KEY.to_string()));
-                            entry_badge_text.push(String::new());
-                            entry_badge_color.push(None);
-                            if !collapsed {
-                                for wf in visible {
-                                    entry_labels.push(wf.name.clone());
-                                    entry_right_labels.push(format!("({})", wf.source));
-                                    if wf.description.is_empty() {
-                                        entry_desc_lines.push(vec![]);
-                                    } else {
-                                        entry_desc_lines.push(vec![wf.description.clone()]);
-                                    }
-                                    entry_summary_lines.push(vec![]);
-                                    let mut fields = Vec::new();
-                                    if let Some(ref p) = wf.path {
-                                        fields.push(("path".to_string(), p.clone()));
-                                    }
-                                    if let Some(ref w) = wf.when_to_use {
-                                        fields.push(("when to use".to_string(), w.clone()));
-                                    }
-                                    entry_fields.push(fields);
-                                    entry_is_header.push(false);
-                                    entry_dimmed.push(false);
-                                    entry_indent.push(1);
-                                    entry_data_indices.push(None);
-                                    entry_group_keys.push(None);
-                                    entry_badge_text.push(String::new());
-                                    entry_badge_color.push(None);
-                                }
-                            }
-                        }
-                    }
-                    TabDataState::Error(ref msg) => {
-                        entry_labels.push(format!("workflows: {}", msg));
-                        entry_right_labels.push(String::new());
-                        entry_desc_lines.push(vec![]);
-                        entry_summary_lines.push(vec![]);
-                        entry_fields.push(vec![]);
-                        entry_is_header.push(false);
-                        entry_dimmed.push(true);
-                        entry_indent.push(0);
-                        entry_data_indices.push(None);
-                        entry_group_keys.push(None);
-                        entry_badge_text.push(String::new());
-                        entry_badge_color.push(None);
-                    }
-                    TabDataState::Loading => {}
+            }
+            ExtensionsTab::Workflows => {
+                for row in
+                    build_workflows_picker_rows(&state.workflows_data, state.picker_state.query())
+                {
+                    entry_labels.push(row.label);
+                    entry_right_labels.push(row.right_label);
+                    entry_desc_lines.push(row.desc_lines);
+                    entry_summary_lines.push(vec![]);
+                    entry_fields.push(row.fields);
+                    entry_is_header.push(false);
+                    entry_dimmed.push(row.dimmed);
+                    entry_indent.push(0);
+                    entry_data_indices.push(None);
+                    entry_group_keys.push(None);
+                    entry_badge_text.push(String::new());
+                    entry_badge_color.push(None);
                 }
             }
             ExtensionsTab::Plugins => {
@@ -2950,7 +2965,9 @@ pub fn render_extensions_modal(
                         let searching = !state.picker_state.query().is_empty();
                         let collapsed =
                             !searching && state.hooks_collapsed_groups.contains(source_dir);
-                        entry_labels.push(format!("{} ({} hooks)", label, indices.len()));
+                        let count = indices.len();
+                        let noun = if count == 1 { "hook" } else { "hooks" };
+                        entry_labels.push(format!("{label} ({count} {noun})"));
                         entry_right_labels.push(String::new());
                         entry_desc_lines.push(vec![]);
                         entry_summary_lines.push(vec![]);
@@ -2981,12 +2998,16 @@ pub fn render_extensions_modal(
                             entry_indent.push(1);
                             entry_data_indices.push(Some(hi));
                             entry_group_keys.push(None);
-                            entry_badge_text.push(if hook.disabled {
+                            entry_badge_text.push(if hook.pinned {
+                                "[policy]".into()
+                            } else if hook.disabled {
                                 "[disabled]".into()
                             } else {
                                 String::new()
                             });
-                            entry_badge_color.push(if hook.disabled {
+                            entry_badge_color.push(if hook.pinned {
+                                Some(theme.warning)
+                            } else if hook.disabled {
                                 Some(theme.accent_error)
                             } else {
                                 None
@@ -3310,10 +3331,10 @@ pub fn render_extensions_modal(
     // overlay. The full result text is shown non-covering in the footer below.
     if let Some(ref n) = state.result_notice
         && let Some(row) = n.entry_index
+        && let Some(badge) = entry_badge_text.get_mut(row)
+        && badge.is_empty()
     {
-        if let Some(badge) = entry_badge_text.get_mut(row) {
-            *badge = "✓".to_string();
-        }
+        *badge = "✓".to_string();
         if let Some(color) = entry_badge_color.get_mut(row) {
             *color = Some(theme.accent_success);
         }
@@ -3367,18 +3388,35 @@ pub fn render_extensions_modal(
         .filter_map(|(i, &(ch, desc))| {
             let key_str = action_key_display(ch);
             if key_str.is_empty() {
-                None
-            } else {
-                let verb = action_key_footer_desc_for_mapping(
-                    ch,
-                    desc,
+                return None;
+            }
+            let suppressed = match ch {
+                ' ' => selected_hook_policy_enforced_at(
                     state,
                     &entry_data_indices,
                     &entry_group_keys,
                     selected,
-                );
-                Some((i, format!("{key_str} {verb}")))
+                ),
+                'x' => !selected_hook_source_removable_at(
+                    state,
+                    &entry_data_indices,
+                    &entry_group_keys,
+                    selected,
+                ),
+                _ => false,
+            };
+            if suppressed {
+                return None;
             }
+            let verb = action_key_footer_desc_for_mapping(
+                ch,
+                desc,
+                state,
+                &entry_data_indices,
+                &entry_group_keys,
+                selected,
+            );
+            Some((i, format!("{key_str} {verb}")))
         })
         .collect();
 
@@ -3395,7 +3433,7 @@ pub fn render_extensions_modal(
     // would not split correctly through the default Shortcut renderer.
     // The overlay above is shortened to leave the footer line visible.
     let modal_msg_kind = state.modal_message.as_ref().map(|m| match m {
-        ModalMessage::Error(_) => ModalMsgKind::Error,
+        ModalMessage::Error(_) | ModalMessage::Info(_) => ModalMsgKind::Error,
         ModalMessage::Confirmation { .. } => ModalMsgKind::Confirm,
     });
     let mut shortcuts: Vec<Shortcut<'_>> = Vec::new();
@@ -3775,6 +3813,7 @@ pub fn render_extensions_modal(
     if let Some(ref msg) = state.modal_message {
         let (text, fg) = match msg {
             ModalMessage::Error(e) => (e.as_str(), theme.accent_error),
+            ModalMessage::Info(m) => (m.as_str(), theme.text_secondary),
             ModalMessage::Confirmation { message, .. } => (message.as_str(), theme.accent_tool),
         };
         if let Some(popup_rect) = state.window.popup_area {
@@ -3809,7 +3848,10 @@ pub fn render_extensions_modal(
                 let msg_height = wrapped_lines.len().min(msg_area.height as usize);
                 let msg_y = msg_area.y + (msg_area.height.saturating_sub(msg_height as u16)) / 2;
                 for (i, wline) in wrapped_lines.iter().enumerate().take(msg_height) {
-                    buf.set_string(msg_area.x + pad, msg_y + i as u16, wline, text_style);
+                    let line_w = UnicodeWidthStr::width(*wline) as u16;
+                    let message_x =
+                        msg_area.x + pad + max_w.saturating_sub(line_w as usize) as u16 / 2;
+                    buf.set_string(message_x, msg_y + i as u16, wline, text_style);
                 }
                 // Dismissal hints (for both errors and confirmations)
                 // are rendered into the footer below, not inline.
@@ -3862,13 +3904,18 @@ pub fn render_extensions_modal(
         // `Style::reset()` clears all existing modifiers first.
         let clear_style = Style::reset().bg(theme.bg_base);
         let text_style = Style::reset().fg(theme.accent_success).bg(theme.bg_base);
+        let shown_x = footer_area.x
+            + footer_area
+                .width
+                .saturating_sub(UnicodeWidthStr::width(shown.as_str()) as u16)
+                / 2;
         buf.set_string(
             footer_area.x,
             y,
             " ".repeat(footer_area.width as usize),
             clear_style,
         );
-        buf.set_string(footer_area.x + 1, y, &shown, text_style);
+        buf.set_string(shown_x, y, &shown, text_style);
     }
 }
 
@@ -3881,7 +3928,7 @@ fn render_mcp_setup_form(buf: &mut Buffer, area: Rect, setup: &McpSetupFormState
     let w = area.width.saturating_sub(h_inset * 2);
     let rows = (setup.field.options.len() as u16).saturating_add(4);
     let top = area.y + area.height.saturating_sub(rows) / 2;
-    let title = format!("{} — {}", setup.server_name, setup.field.label);
+    let title = format!("{} · {}", setup.server_name, setup.field.label);
     buf.set_string(
         x,
         top,
@@ -4155,6 +4202,31 @@ mod tests {
     }
 
     #[test]
+    fn derive_source_label_does_not_eat_neighbor_profile() {
+        let Some(home) = xai_dirs::home_dir() else {
+            return;
+        };
+        if home.as_os_str().is_empty() {
+            return;
+        }
+        let neighbor = home.as_os_str().to_string_lossy().into_owned() + "bar";
+        let (label, is_custom) = derive_source_label(&neighbor);
+        assert_eq!(label, format!("Custom: {neighbor}"));
+        assert!(is_custom);
+
+        let child = home.join("hooks-extra");
+        let (label, is_custom) = derive_source_label(&child.to_string_lossy());
+        assert_eq!(
+            label,
+            format!(
+                "Custom: ~/{}",
+                std::path::Path::new("hooks-extra").display()
+            )
+        );
+        assert!(is_custom);
+    }
+
+    #[test]
     fn build_entry_non_selectable_leaves_mcp_section_headers_selectable() {
         let mask = build_entry_non_selectable(
             &[false, false, true],
@@ -4236,6 +4308,7 @@ mod tests {
                 ExtensionsTab::Skills,
                 &[(' ', "toggle"), ('f', "filter"), ('r', "reload")],
             ),
+            (ExtensionsTab::Workflows, &[('r', "reload")]),
             (
                 ExtensionsTab::McpServers,
                 &[
@@ -4963,9 +5036,8 @@ mod tests {
     }
 
     #[test]
-    fn skills_tab_renders_workflows_group() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Skills);
-        state.skills_data = TabDataState::Loaded(vec![]);
+    fn workflows_tab_renders_catalog_flat() {
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
         state.workflows_data = TabDataState::Loaded(vec![WorkflowInfo {
             name: "fix-ci".to_string(),
             description: "Fix failing CI on the current PR".to_string(),
@@ -4977,14 +5049,10 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
 
-        assert!(
-            buffer_count(&buf, "Workflows") >= 1,
-            "the Workflows group header must render on the Skills tab"
-        );
         assert_eq!(
             buffer_count(&buf, "fix-ci"),
             1,
-            "the workflow name must render as a row"
+            "the workflow name must render as a flat row"
         );
         assert_eq!(
             buffer_count(&buf, "(builtin)"),
@@ -4992,15 +5060,25 @@ mod tests {
             "the workflow source must render as the right label"
         );
         assert!(
+            !state
+                .entry_labels_cache
+                .iter()
+                .any(|l| l.starts_with("Workflows (")),
+            "the flat catalog must not render a group header"
+        );
+        assert!(
             state.entry_data_indices.iter().all(|d| d.is_none()),
-            "workflow rows (and the header) must not map to skill data indices"
+            "workflow rows are browse-only"
+        );
+        assert!(
+            state.entry_group_keys.iter().all(|k| k.is_none()),
+            "workflow rows are not collapsible groups"
         );
     }
 
     #[test]
-    fn skills_tab_hides_unusable_workflow_names() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Skills);
-        state.skills_data = TabDataState::Loaded(vec![]);
+    fn workflows_tab_shows_all_entries_without_unusable_name_badge() {
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
         state.workflows_data = TabDataState::Loaded(vec![
             WorkflowInfo {
                 name: "valid-workflow".into(),
@@ -5021,7 +5099,67 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
         assert_eq!(buffer_count(&buf, "valid-workflow"), 1);
-        assert_eq!(buffer_count(&buf, "Not Launchable"), 0);
+        assert_eq!(
+            buffer_count(&buf, "Not Launchable"),
+            1,
+            "odd-named catalog entries still render"
+        );
+        assert_eq!(
+            buffer_count(&buf, "[no slash command]"),
+            0,
+            "no unusable-name badge"
+        );
+    }
+
+    #[test]
+    fn workflows_tab_empty_shows_placeholder() {
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
+        state.workflows_data = TabDataState::Loaded(vec![]);
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
+        assert_eq!(
+            state.entry_labels_cache,
+            [workflows_picker_rows::WORKFLOWS_EMPTY_PLACEHOLDER]
+        );
+        assert_eq!(
+            buffer_count(&buf, "No workflows available"),
+            1,
+            "empty catalog renders the dimmed placeholder row"
+        );
+    }
+
+    #[test]
+    fn workflows_tab_error_renders_dimmed_row() {
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
+        state.workflows_data = TabDataState::Error("boom".into());
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
+        assert_eq!(buffer_count(&buf, "Error: boom"), 1);
+    }
+
+    #[test]
+    fn workflows_tab_loading_shows_spinner_not_placeholder() {
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
+        assert!(state.entry_labels_cache.is_empty(), "no rows while loading");
+        assert_eq!(
+            buffer_count(&buf, "Loading"),
+            1,
+            "loading spinner shown instead of the empty placeholder"
+        );
+        assert_eq!(buffer_count(&buf, "No workflows available"), 0);
+    }
+
+    #[test]
+    fn workflows_reload_key_resolves_reload_skills() {
+        assert!(matches!(
+            resolve_key(ExtensionsTab::Workflows, 'r'),
+            Some(ButtonAction::ReloadSkills)
+        ));
     }
 
     // ── Plugin fixtures ─────────────────────────────────────────────
@@ -5097,6 +5235,137 @@ mod tests {
     /// list shape. Render passes freshly built locals into
     /// `action_key_footer_desc_for_mapping` (state publish is post-paint only).
     #[test]
+    fn hook_source_pinned_is_source_level() {
+        let mut pinned = make_hook("policy/a", "/etc/grok", false);
+        pinned.pinned = true;
+        let sibling = make_hook("user/b", "/etc/grok", false);
+        let elsewhere = make_hook("user/c", "/home/u/.grok", false);
+        let hooks = vec![pinned, sibling, elsewhere];
+
+        assert!(hook_source_pinned(&hooks, "/etc/grok"));
+        assert!(!hook_source_pinned(&hooks, "/home/u/.grok"));
+        assert!(!hook_source_pinned(&hooks, "/nonexistent"));
+    }
+
+    #[test]
+    fn policy_enforced_selection_suppresses_space_hint() {
+        let mut pinned = make_hook("policy/a", "/etc/grok", false);
+        pinned.pinned = true;
+        let mut user = make_hook("user/b", "/home/u/.grok", false);
+        user.removable = true;
+
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Hooks);
+        state.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
+            hooks: vec![pinned, user],
+            project_trusted: true,
+            load_errors: Vec::new(),
+        });
+        let data_indices = vec![None, Some(0), None, Some(1)];
+        let group_keys = vec![
+            Some("/etc/grok".to_string()),
+            None,
+            Some("/home/u/.grok".to_string()),
+            None,
+        ];
+
+        let enforced =
+            |sel| selected_hook_policy_enforced_at(&state, &data_indices, &group_keys, sel);
+        let removable =
+            |sel| selected_hook_source_removable_at(&state, &data_indices, &group_keys, sel);
+        assert!(enforced(0));
+        assert!(enforced(1));
+        assert!(!removable(0));
+        assert!(!removable(1));
+        assert!(!enforced(2));
+        assert!(!enforced(3));
+        assert!(removable(2));
+        assert!(removable(3));
+
+        let mut mixed_pinned = make_hook("policy/c", "/mixed", false);
+        mixed_pinned.pinned = true;
+        let mixed_user = make_hook("user/d", "/mixed", false);
+        let mixed_state = {
+            let mut s = ExtensionsModalState::new(ExtensionsTab::Hooks);
+            s.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
+                hooks: vec![mixed_pinned, mixed_user],
+                project_trusted: true,
+                load_errors: Vec::new(),
+            });
+            s
+        };
+        let mixed_indices = vec![None, Some(0), Some(1)];
+        let mixed_keys = vec![Some("/mixed".to_string()), None, None];
+        assert!(!selected_hook_policy_enforced_at(
+            &mixed_state,
+            &mixed_indices,
+            &mixed_keys,
+            0
+        ));
+        for sel in 0..3 {
+            assert!(!selected_hook_source_removable_at(
+                &mixed_state,
+                &mixed_indices,
+                &mixed_keys,
+                sel
+            ));
+        }
+    }
+
+    #[test]
+    fn remove_hint_suppressed_for_registered_but_pinned_source() {
+        let mut pinned = make_hook("policy/a", "/reg/policy", false);
+        pinned.pinned = true;
+        pinned.removable = true;
+        let mut sibling = make_hook("user/b", "/reg/policy", false);
+        sibling.removable = true;
+
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Hooks);
+        state.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
+            hooks: vec![pinned, sibling],
+            project_trusted: true,
+            load_errors: Vec::new(),
+        });
+        let data_indices = vec![None, Some(0), Some(1)];
+        let group_keys = vec![Some("/reg/policy".to_string()), None, None];
+        for sel in 0..3 {
+            assert!(
+                !selected_hook_source_removable_at(&state, &data_indices, &group_keys, sel),
+                "selection {sel} must not offer x remove for a pinned source"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_groups_seed_only_once() {
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Hooks);
+        let hooks = vec![
+            make_hook("a", "/src1", false),
+            make_hook("b", "/src2", false),
+        ];
+        state.seed_hook_groups_once(&[]);
+        state.seed_hook_groups_once(&hooks);
+        assert!(state.hooks_collapsed_groups.contains("/src1"));
+        assert!(state.hooks_collapsed_groups.contains("/src2"));
+
+        state.hooks_collapsed_groups.remove("/src1");
+        state.seed_hook_groups_once(&hooks);
+        assert!(!state.hooks_collapsed_groups.contains("/src1"));
+        assert!(state.hooks_collapsed_groups.contains("/src2"));
+    }
+
+    #[test]
+    fn plugin_and_skill_group_seeds_skip_empty_first_delivery() {
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Plugins);
+        state.seed_plugin_groups_once(&[]);
+        state.seed_plugin_groups_once(&[make_plugin("p")]);
+        assert!(!state.plugins_collapsed_groups.is_empty());
+
+        state.seed_skills_groups_once(&[]);
+        state.seed_skills_groups_once(&[make_skill("alpha", "a")]);
+        assert!(state.skills_collapsed_groups.contains("User"));
+    }
+
+    #[test]
     fn space_footer_follows_refreshed_entry_data_indices_after_filter_shape_change() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::Plugins);
         state.plugins_data = TabDataState::Loaded(xai_hooks_plugins_types::PluginsListResponse {
@@ -5140,6 +5409,7 @@ mod tests {
             ExtensionsTab::Hooks,
             ExtensionsTab::Plugins,
             ExtensionsTab::Skills,
+            ExtensionsTab::Workflows,
             ExtensionsTab::McpServers,
         ] {
             let keys = extensions_action_keys(tab);
@@ -5186,22 +5456,24 @@ mod tests {
         assert_eq!(ExtensionsTab::Hooks.next(), ExtensionsTab::Plugins);
         assert_eq!(ExtensionsTab::Plugins.next(), ExtensionsTab::Marketplace);
         assert_eq!(ExtensionsTab::Marketplace.next(), ExtensionsTab::Skills);
-        assert_eq!(ExtensionsTab::Skills.next(), ExtensionsTab::McpServers);
+        assert_eq!(ExtensionsTab::Skills.next(), ExtensionsTab::Workflows);
+        assert_eq!(ExtensionsTab::Workflows.next(), ExtensionsTab::McpServers);
         assert_eq!(ExtensionsTab::McpServers.next(), ExtensionsTab::Hooks);
     }
 
     #[test]
     fn tab_prev_wraps_around() {
         assert_eq!(ExtensionsTab::Hooks.prev(), ExtensionsTab::McpServers);
-        assert_eq!(ExtensionsTab::McpServers.prev(), ExtensionsTab::Skills);
+        assert_eq!(ExtensionsTab::McpServers.prev(), ExtensionsTab::Workflows);
+        assert_eq!(ExtensionsTab::Workflows.prev(), ExtensionsTab::Skills);
         assert_eq!(ExtensionsTab::Skills.prev(), ExtensionsTab::Marketplace);
         assert_eq!(ExtensionsTab::Marketplace.prev(), ExtensionsTab::Plugins);
         assert_eq!(ExtensionsTab::Plugins.prev(), ExtensionsTab::Hooks);
     }
 
     #[test]
-    fn tab_all_contains_five_tabs() {
-        assert_eq!(ExtensionsTab::ALL.len(), 5);
+    fn tab_all_contains_six_tabs() {
+        assert_eq!(ExtensionsTab::ALL.len(), 6);
     }
 
     // ── Modal state init ────────────────────────────────────────────
@@ -5781,7 +6053,25 @@ mod tests {
             timeout_ms: 10_000,
             source_dir: source_dir.to_string(),
             disabled,
+            pinned: false,
+            removable: false,
         }
+    }
+
+    #[test]
+    fn hook_group_direction_ignores_pinned_hooks() {
+        let mut pinned = make_hook("policy", "/etc/grok", false);
+        pinned.pinned = true;
+
+        let disabled_user = make_hook("user", "/etc/grok", true);
+        assert!(!hook_group_any_enabled(
+            [&pinned, &disabled_user].into_iter()
+        ));
+
+        let enabled_user = make_hook("user2", "/etc/grok", false);
+        assert!(hook_group_any_enabled([&pinned, &enabled_user].into_iter()));
+
+        assert!(hook_group_any_enabled([&pinned].into_iter()));
     }
 
     #[test]
@@ -6891,7 +7181,6 @@ mod tests {
         let skills = vec![make_skill("alpha", "a"), make_skill("beta", "b")];
         state.seed_skills_groups_once(&skills);
         state.skills_data = TabDataState::Loaded(skills);
-        state.workflows_data = TabDataState::Loaded(vec![]);
         state.picker_state.selected = 0;
         let area = Rect::new(0, 0, 100, 40);
         let mut buf = Buffer::empty(area);
@@ -6931,67 +7220,40 @@ mod tests {
     }
 
     #[test]
-    fn workflows_default_collapsed_when_skills_loading_or_error() {
-        let mk_wf = || WorkflowInfo {
+    fn skills_tab_renders_no_workflows_rows() {
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Skills);
+        state.skills_data = TabDataState::Loaded(vec![make_skill("alpha", "a")]);
+        state.workflows_data = TabDataState::Loaded(vec![WorkflowInfo {
             name: "fix-ci".into(),
             description: "Fix CI".into(),
             when_to_use: None,
             source: "builtin".into(),
             path: None,
-        };
-        // Skills still loading: tab is a spinner (no list), but seed must still
-        // mark Workflows collapsed so the first paint after skills fails is collapsed.
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Skills);
-        state.seed_workflows_group_once();
-        state.skills_data = TabDataState::Loading;
-        state.workflows_data = TabDataState::Loaded(vec![mk_wf()]);
-        assert!(
-            state
-                .skills_collapsed_groups
-                .contains(SKILLS_WORKFLOWS_GROUP_KEY),
-            "workflows seed independent of skills load"
-        );
-
-        // Skills failed: list paints; workflows children stay hidden.
-        let mut state_err = ExtensionsModalState::new(ExtensionsTab::Skills);
-        state_err.seed_workflows_group_once();
-        state_err.skills_data = TabDataState::Error("boom".into());
-        state_err.workflows_data = TabDataState::Loaded(vec![mk_wf()]);
+        }]);
         let area = Rect::new(0, 0, 100, 40);
         let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state_err, None, false, 0);
+        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
         assert!(
-            state_err
+            !state
                 .entry_labels_cache
                 .iter()
                 .any(|l| l.starts_with("Workflows (")),
-            "workflows header visible when skills Error"
+            "the Skills tab must not render a Workflows group header"
         );
         assert!(
-            !state_err.entry_labels_cache.iter().any(|l| l == "fix-ci"),
-            "workflows children hidden while collapsed (skills Error)"
+            !state.entry_labels_cache.iter().any(|l| l == "fix-ci"),
+            "workflow rows must not render on the Skills tab"
         );
     }
 
     #[test]
-    fn seed_skills_unions_without_wiping_workflows_expand() {
+    fn seed_skills_groups_collapses_source_groups() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::Skills);
-        state.seed_workflows_group_once();
-        // User expanded Workflows before skills arrived.
-        state
-            .skills_collapsed_groups
-            .remove(SKILLS_WORKFLOWS_GROUP_KEY);
         let skills = vec![make_skill("alpha", "a")];
         state.seed_skills_groups_once(&skills);
         assert!(
-            !state
-                .skills_collapsed_groups
-                .contains(SKILLS_WORKFLOWS_GROUP_KEY),
-            "skills seed must not re-collapse a user-expanded Workflows group"
-        );
-        assert!(
             state.skills_collapsed_groups.contains("User"),
-            "skills seed still collapses skill source groups"
+            "skills seed collapses skill source groups"
         );
     }
 
@@ -7102,7 +7364,6 @@ mod tests {
         // Headers come from render; keep one check that they appear.
         let mut state = ExtensionsModalState::new(ExtensionsTab::Skills);
         state.skills_data = TabDataState::Loaded(skills);
-        state.workflows_data = TabDataState::Loaded(vec![]);
         let area = Rect::new(0, 0, 100, 40);
         let mut buf = Buffer::empty(area);
         render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
@@ -7139,8 +7400,7 @@ mod tests {
 
     #[test]
     fn workflows_sort_az_by_name() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Skills);
-        state.skills_data = TabDataState::Loaded(vec![]);
+        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
         state.workflows_data = TabDataState::Loaded(vec![
             WorkflowInfo {
                 name: "zeta-wf".into(),
@@ -7160,10 +7420,7 @@ mod tests {
         let area = Rect::new(0, 0, 100, 40);
         let mut buf = Buffer::empty(area);
         render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert_eq!(
-            state.entry_labels_cache,
-            ["Workflows (2 workflows)", "alpha-wf", "zeta-wf"]
-        );
+        assert_eq!(state.entry_labels_cache, ["alpha-wf", "zeta-wf"]);
     }
 
     #[test]

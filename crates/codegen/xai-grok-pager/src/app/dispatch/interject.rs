@@ -60,6 +60,7 @@ pub(super) fn dispatch_interject(
     // even when there is no active session, matching the prompt/bash/
     // feedback/remember paths.
     agent.ephemeral_tip.clear_on_submit();
+    agent.release_hook_block_hold();
 
     // A Kimi service/key change invalidates the sampler that owns this
     // session. Preserve the already-consumed payload locally until the
@@ -80,7 +81,7 @@ pub(super) fn dispatch_interject(
         return vec![];
     };
 
-    record_interject_prompt_history(agent, &text);
+    agent.record_prompt_in_history(&text);
 
     // Push a standard user prompt block locally for instant feedback, and
     // record its id so the broadcast echo (`x.ai/session/interjection`) is
@@ -136,6 +137,8 @@ pub(super) fn dispatch_send_prompt_now(
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
+    agent.release_hook_block_hold();
+    agent.credit_limit_stashed_prompt = None;
 
     // Mid-outage guard (mirrors the plain prompt path): the producers already
     // consumed the payload (composer text / queue row), so requeue it locally
@@ -158,7 +161,7 @@ pub(super) fn dispatch_send_prompt_now(
         return vec![];
     };
 
-    record_interject_prompt_history(agent, &text);
+    agent.record_prompt_in_history(&text);
 
     let prompt_id = uuid::Uuid::new_v4().to_string();
     // Self-originated: the ACP gate must treat this prompt's deltas as ours.
@@ -188,24 +191,6 @@ pub(super) fn dispatch_send_prompt_now(
         blocks,
         prompt_id,
     }]
-}
-
-/// Record an interjection in prompt history (Ctrl+R finds interjections).
-/// Shared by `dispatch_interject` and the edited-queued-interject arm — the
-/// user typed both, so both must be recallable.
-pub(super) fn record_interject_prompt_history(agent: &mut AgentView, text: &str) {
-    let trimmed_key = text.trim().to_string();
-    if trimmed_key.is_empty() {
-        return;
-    }
-    agent
-        .session
-        .prompt_history
-        .retain(|p| p.trim() != trimmed_key);
-    agent.session.prompt_history.insert(0, text.to_string());
-    if agent.session.prompt_history.len() > 200 {
-        agent.session.prompt_history.truncate(200);
-    }
 }
 
 #[cfg(test)]

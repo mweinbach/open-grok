@@ -13,6 +13,7 @@ mod router;
 mod session;
 mod settings;
 mod status;
+mod status_line;
 mod swarm;
 mod task_result;
 mod transcript;
@@ -59,6 +60,7 @@ use crate::acp::model_state::ModelState;
 use crate::acp::tracker::AcpUpdateTracker;
 use crate::app::actions::{
     Action, CodexLoginPurpose, Effect, SubagentKillOutcome, SwitchModelError, TaskResult,
+    WorkspaceMemberUpsertFailure,
 };
 use crate::app::agent::{AgentId, AgentSession, AgentState};
 use crate::app::agent_view::{ActivePane, AgentView, PromptMode};
@@ -69,6 +71,7 @@ use crate::app::app_view::{
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::{SessionEvent, ToolCallBlock};
 use crate::scrollback::state::ScrollbackState;
+use crate::views::session_picker_surface::SessionPickerHost;
 use agent_client_protocol as acp;
 use indexmap::IndexMap;
 use std::path::PathBuf;
@@ -134,6 +137,7 @@ fn test_app() -> AppView {
         cwd_has_git_ancestor: false,
         acp_tx: tx,
         scratch: crate::scrollback::render::ScratchBuffer::new(),
+        status_line: Default::default(),
         cursor: crate::render::draw::CursorState::new(),
         pending_action: None,
         exit_session_pending: None,
@@ -293,7 +297,10 @@ fn test_app() -> AppView {
         foreign_session_scan_seq: 0,
         foreign_scan_coordinator: Default::default(),
         session_picker_lanes: Default::default(),
-        session_picker_detail_generation: 0,
+        session_picker_detail_seq: 0,
+        picker_generation_counter: 0,
+        session_picker_generation: 0,
+        dashboard_session_picker: None,
         session_picker_entries_query: None,
         session_picker_pending_delete: None,
         welcome_tick: 0,
@@ -308,6 +315,7 @@ fn test_app() -> AppView {
         import_claude_modal: None,
         welcome_doc_viewer: None,
         screen_mode: crate::app::ScreenMode::Inline,
+        pending_screen_mode_switch: None,
         pending_effects: Vec::new(),
         pending_editor: None,
         pending_pager_path: None,
@@ -317,6 +325,7 @@ fn test_app() -> AppView {
         show_resolved_model: true,
         sharing_enabled: false,
         plugin_cta_enabled: false,
+        workspace_dashboard_enabled: false,
         usage_visible: true,
         has_external_auth_provider: false,
         tier_restricted_commands: Vec::new(),
@@ -327,6 +336,14 @@ fn test_app() -> AppView {
         leader_roster: Vec::new(),
         dashboard_local_sessions: Vec::new(),
         dashboard_sessions_loading: false,
+        workspace_store: None,
+        workspace_snapshot: None,
+        workspace_store_loading: false,
+        workspace_sync_requested: false,
+        workspace_write_in_flight: false,
+        workspace_writes_disabled: false,
+        workspace_retry_metadata: Default::default(),
+        workspace_failed_metadata: Default::default(),
         shared_prompt_queues: std::collections::HashMap::new(),
         optimistic_prompt_echoes: std::collections::HashMap::new(),
         pending_running_adoptions: std::collections::HashMap::new(),
@@ -381,6 +398,8 @@ fn make_test_agent_session(app: &AppView, id: AgentId, sid: &str) -> AgentSessio
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        hook_block_hold: false,
+        blocked_prompt: None,
         provider_rebind_pending: false,
         user_model_preference: None,
         deferred_model_switch: app.deferred_model_switch_from_cli(),
@@ -465,7 +484,7 @@ fn make_test_subagent(child_sid: &str, sa_id: &str) -> crate::app::subagent::Sub
         prompt: None,
         child_cwd: None,
         worktree_path: None,
-        child_updates_replayed: false,
+        transcript: Default::default(),
     }
 }
 fn cta_entry(name: &str, status: &str) -> xai_hooks_plugins_types::MarketplacePluginEntry {
@@ -552,6 +571,9 @@ fn arm_reconcile_with_trigger(
             prompt_id: prompt_id.into(),
             stop_reason: Some(stop_reason.into()),
             agent_result: None,
+            cancellation_category: None,
+            cancellation_context: None,
+            error_kind: None,
             cancel_trigger: cancel_trigger.map(str::to_string),
             received_at: std::time::Instant::now() - age,
         });
@@ -656,6 +678,8 @@ fn insert_placeholder_agent(app: &mut AppView, id: AgentId) {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,
@@ -802,6 +826,8 @@ fn two_agent_app_with_bg_task() -> AppView {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             provider_rebind_pending: false,
             user_model_preference: None,
             deferred_model_switch: None,
@@ -842,6 +868,8 @@ fn setup_reset_confirm_open(app: &mut AppView, key: crate::settings::SettingKey)
 }
 fn make_picker_entry(id: &str, cwd: &str) -> crate::app::app_view::SessionPickerEntry {
     crate::app::app_view::SessionPickerEntry {
+        last_recap: None,
+        session_kind: None,
         id: id.into(),
         summary: id.into(),
         updated_at: chrono::Utc::now(),
@@ -872,6 +900,8 @@ fn open_session_picker_with(
     use crate::views::modal::ActiveModal;
     let agent = get_active_agent_mut(app).expect("active agent");
     agent.active_modal = Some(ActiveModal::SessionPicker {
+        generation: 0,
+        detail_seq: 0,
         state: crate::views::picker::PickerState::default(),
         entries: Some(entries),
         loading: false,
@@ -886,6 +916,30 @@ fn open_session_picker_with(
         pending_delete: None,
     });
 }
+fn modal_picker_generation(app: &AppView) -> u64 {
+    use crate::views::modal::ActiveModal;
+    match get_active_agent(app)
+        .expect("active agent")
+        .active_modal
+        .as_ref()
+    {
+        Some(ActiveModal::SessionPicker { generation, .. }) => *generation,
+        _ => panic!("expected SessionPicker modal"),
+    }
+}
+
+fn modal_picker_detail_seq(app: &AppView) -> u64 {
+    use crate::views::modal::ActiveModal;
+    match get_active_agent(app)
+        .expect("active agent")
+        .active_modal
+        .as_ref()
+    {
+        Some(ActiveModal::SessionPicker { detail_seq, .. }) => *detail_seq,
+        _ => panic!("expected SessionPicker modal"),
+    }
+}
+
 /// Toast strings match the expected format and contain on/off
 /// status.
 fn read_toast(app: &AppView) -> String {
@@ -1003,16 +1057,24 @@ fn dashboard_row_order(app: &AppView) -> Vec<crate::views::dashboard::DashboardR
     } else {
         &app.dashboard_local_sessions
     };
-    let rows = crate::views::dashboard::build_rows_with_roster(
-        &app.agents,
-        &d.pinned,
-        &d.reorder,
-        None,
-        d.grouping,
-        &d.filter,
-        home,
-        roster,
-    );
+    let rows = if app.workspace_dashboard_enabled {
+        app.workspace_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                crate::views::dashboard::build_rows_with_workspace(&app.agents, snapshot, home)
+            })
+            .unwrap_or_default()
+    } else {
+        crate::views::dashboard::build_rows_with_roster(
+            &app.agents,
+            &d.pinned,
+            &d.reorder,
+            d.grouping,
+            &d.filter,
+            home,
+            roster,
+        )
+    };
     crate::views::dashboard::render::focusables(
         &rows,
         d.grouping,

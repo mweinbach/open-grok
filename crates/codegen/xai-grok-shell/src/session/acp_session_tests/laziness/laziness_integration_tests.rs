@@ -344,6 +344,8 @@ async fn idle_recheck_after_sleep_short_circuits_silently() {
                         parsed_prompt_tx: None,
                         queue_meta: None,
                         send_now: false,
+                        initial_child_prompt_ready: None,
+                        traceparent: None,
                     });
             });
             SessionActor::maybe_fire_laziness_check(actor.clone()).await;

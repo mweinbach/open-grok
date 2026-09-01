@@ -182,6 +182,47 @@ async fn force_reinstall_same_version_preserves_the_active_artifact_inode() {
 
 #[tokio::test]
 #[serial]
+async fn compressed_release_installs_only_after_checksum_and_version_smoke() {
+    use std::io::Write;
+
+    let home = test_home();
+    reset_home();
+    set_test_version(OLD_VERSION);
+    let server = MockServer::start().await;
+    let bytes = executable(NEW_VERSION);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&bytes).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let name = format!("{ASSET}.gz");
+    let asset_path = format!("/download/v{NEW_VERSION}/{name}");
+    Mock::given(method("GET"))
+        .and(path(asset_path.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{asset_path}.sha256")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("{}  {name}\n", sha256(&compressed))),
+        )
+        .mount(&server)
+        .await;
+    install_open_grok_release_from_base(NEW_VERSION, &server.uri())
+        .await
+        .unwrap();
+    let managed = home.join("bin/open-grok");
+    assert!(
+        std::fs::symlink_metadata(&managed)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(managed).unwrap(), bytes);
+}
+
+#[tokio::test]
+#[serial]
 async fn version_smoke_test_rejects_a_prefix_match() {
     let _ = test_home();
     reset_home();

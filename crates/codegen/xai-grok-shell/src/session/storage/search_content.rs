@@ -411,6 +411,7 @@ pub(super) fn test_summary(session_id: &str, cwd: &str, title: &str) -> Summary 
         reasoning_effort: None,
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
+        last_recap: None,
         cache_affinity_id: None,
     }
 }

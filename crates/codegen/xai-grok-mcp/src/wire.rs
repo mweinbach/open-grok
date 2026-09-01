@@ -25,3 +25,5 @@ pub const MCP_SERVERS: &str = "x.ai/mcp/servers";
 /// `initialize` `_meta` capability flag advertising in-process SDK MCP support
 /// (enables the SDK's `transport="acp"`): `x.ai/mcp/sdk`.
 pub const MCP_SDK: &str = "x.ai/mcp/sdk";
+pub const MCP_ELICIT: &str = "x.ai/mcp/elicit";
+pub const MCP_ELICIT_COMPLETE: &str = "x.ai/mcp/elicit_complete";

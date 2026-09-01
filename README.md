@@ -360,6 +360,12 @@ pinned revision of
 [`openai/codex`](https://github.com/openai/codex). The pinned commits and
 deliberate compatibility differences are recorded in the documents linked above.
 
+The current working-tree migration targets Grok Build `1.0.13`, snapshot
+`bb7f39d5858cbf5e00de639367f59debbdcb0138` (2026-08-31). Integration and
+verification are tracked in the [parity ledger](docs/upstream/1.0.13-parity.md);
+this is not a claim that a new release has been published. Open Grok retains
+its provider boundaries, namespaced state, Code Mode, and release infrastructure.
+
 This community fork is not affiliated with, sponsored by, or endorsed by xAI,
 SpaceXAI, or OpenAI. Grok, ChatGPT, Codex, and related marks belong to their
 respective owners.

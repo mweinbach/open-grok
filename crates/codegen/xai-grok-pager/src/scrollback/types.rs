@@ -322,6 +322,13 @@ pub fn derive_selection_text(line: &BlockLine) -> String {
     }
 }
 
+pub fn painted_selectable_region(line: &BlockLine) -> String {
+    match selectable_cols(&line.content, &line.selectable) {
+        Some(cols) => slice_display_cols(&line_plain_text(&line.content), cols.start, cols.end),
+        None => String::new(),
+    }
+}
+
 /// Slice `text` to the graphemes overlapping the display-column range `[start, end)`. A wide grapheme is kept whole when the
 /// range covers any of its cells; graphemes that only touch a boundary (start at `end` or end at `start`) stay excluded.
 pub fn slice_display_cols(text: &str, start: u16, end: u16) -> String {
@@ -381,7 +388,7 @@ pub fn grapheme_cells_at(text: &str, col: u16) -> Option<std::ops::Range<u16>> {
 pub fn col_past_grapheme(text: &str, col: u16) -> u16 {
     match grapheme_cells_at(text, col) {
         Some(cells) => cells.end,
-        None => u16::try_from(text.width()).unwrap_or(u16::MAX),
+        None => u16::try_from(str_display_cells(text)).unwrap_or(u16::MAX),
     }
 }
 
@@ -412,6 +419,14 @@ fn grapheme_width(grapheme: &str) -> usize {
     UnicodeWidthStr::width(grapheme)
 }
 
+pub(crate) fn str_display_cells(text: &str) -> usize {
+    text.graphemes(true).map(grapheme_width).sum()
+}
+
+fn span_display_cells(span: &Span) -> usize {
+    str_display_cells(&span.content)
+}
+
 /// Complete output produced by a block for rendering.
 #[derive(Debug, Clone, Default)]
 pub struct BlockOutput {
@@ -424,11 +439,32 @@ pub struct BlockOutput {
 pub(crate) struct SelectionBoundary {
     prefix: String,
     suffix: String,
+    has_empty_row_anchor: bool,
 }
 
 impl SelectionBoundary {
     pub(crate) fn new(prefix: String, suffix: String) -> Self {
-        Self { prefix, suffix }
+        Self {
+            prefix,
+            suffix,
+            has_empty_row_anchor: false,
+        }
+    }
+
+    pub(crate) fn empty_row_anchor(prefix: String, suffix: String) -> Self {
+        Self {
+            prefix,
+            suffix,
+            has_empty_row_anchor: true,
+        }
+    }
+
+    pub(crate) fn anchored_cols(&self, cols: Range<u16>) -> Range<u16> {
+        if self.has_empty_row_anchor && cols.is_empty() {
+            cols.start..cols.start.saturating_add(1)
+        } else {
+            cols
+        }
     }
 
     pub(crate) fn apply(
@@ -586,11 +622,11 @@ pub(crate) fn prewrap_index_per_row(lines: &[BlockLine]) -> Vec<usize> {
 pub(crate) fn selectable_cols_usize(line: &Line, selectable: &Selectable) -> Option<Range<usize>> {
     match selectable {
         Selectable::None => None,
-        Selectable::All => Some(0..line.width()),
+        Selectable::All => Some(0..line.spans.iter().map(span_display_cells).sum()),
         sel @ Selectable::Spans(_) => {
             let r = sel.clamped_span_range(line.spans.len())?;
-            let start_col = line.spans[..r.start].iter().map(|s| s.width()).sum();
-            let end_col = line.spans[..r.end].iter().map(|s| s.width()).sum();
+            let start_col = line.spans[..r.start].iter().map(span_display_cells).sum();
+            let end_col = line.spans[..r.end].iter().map(span_display_cells).sum();
             Some(start_col..end_col)
         }
     }
@@ -600,6 +636,29 @@ pub(crate) fn selectable_cols_usize(line: &Line, selectable: &Selectable) -> Opt
 pub fn selectable_cols(line: &Line, selectable: &Selectable) -> Option<Range<u16>> {
     let cols = selectable_cols_usize(line, selectable)?;
     Some(u16::try_from(cols.start).ok()?..u16::try_from(cols.end).ok()?)
+}
+
+pub fn visual_selectable_cols(line: &BlockLine) -> Option<Range<u16>> {
+    let logical = selectable_cols(&line.content, &line.selectable)?;
+    if !crate::render::bidi::is_enabled() {
+        return Some(logical);
+    }
+    let plain = line_plain_text(&line.content);
+    let ranges = crate::render::bidi::logical_cols_to_visual(
+        &plain,
+        logical.start as usize,
+        logical.end as usize,
+    );
+    let mut it = ranges.into_iter();
+    let Some((first_start, first_end)) = it.next() else {
+        return Some(logical);
+    };
+    let (mut vstart, mut vend) = (first_start, first_end);
+    for (start, end) in it {
+        vstart = vstart.min(start);
+        vend = vend.max(end);
+    }
+    Some(u16::try_from(vstart).unwrap_or(logical.start)..u16::try_from(vend).unwrap_or(logical.end))
 }
 
 #[cfg(test)]

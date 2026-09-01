@@ -304,6 +304,42 @@ pub async fn resolve_permission_config_with_fallback(
 /// claude fallback + CLI `--deny`) can derive the Grep tool's ripgrep excludes
 /// from that same config, rather than re-resolving managed-only and missing CLI
 /// read denies.
+pub const PERMISSION_MODE_ALWAYS_ALLOW: &str = "alwaysAllow";
+
+pub fn apply_permission_mode_hint(
+    config: &mut Option<PermissionConfig>,
+    requested: Option<&str>,
+    trusted_client: bool,
+    policy_block: Option<&'static str>,
+) -> bool {
+    let Some(mode) = requested else { return false };
+    if !trusted_client {
+        warn!(mode, "untrusted startup permission hint ignored");
+        return false;
+    }
+    if mode != PERMISSION_MODE_ALWAYS_ALLOW {
+        warn!(mode, "unrecognized startupHints.permissionMode ignored");
+        return false;
+    }
+    if let Some(reason) = policy_block {
+        warn!(
+            reason,
+            "startupHints.permissionMode=alwaysAllow ignored: always-approve disabled by managed policy"
+        );
+        return false;
+    }
+    let config = config.get_or_insert_with(|| PermissionConfig::new(Vec::new()));
+    if config.default_mode_configured {
+        warn!(
+            prompt_policy = ?config.prompt_policy,
+            "startupHints.permissionMode=alwaysAllow ignored: permissions.defaultMode is explicitly configured"
+        );
+        return false;
+    }
+    config.prompt_policy = PromptPolicy::Allow;
+    info!("session permission prompts resolve as allow (startupHints.permissionMode)");
+    true
+}
 pub fn deny_read_globs_from_config(config: &PermissionConfig) -> Vec<String> {
     config
         .rules
@@ -419,9 +455,9 @@ struct ResolveInputs<'a> {
 }
 
 impl ResolveInputs<'static> {
-    fn live(project_trusted: bool) -> Self {
+    fn live(project_trusted: bool, policy_block: Option<&'static str>) -> Self {
         Self {
-            policy_block: yolo_disabled_by_policy(),
+            policy_block,
             managed: managed_settings(),
             managed_config_rules: managed_config_permissions(
                 &xai_grok_config::managed_config_layers(),
@@ -459,7 +495,20 @@ pub async fn resolve_permissions_with_provenance(
     cwd: &Path,
     project_trusted: bool,
 ) -> Option<ResolvedPermissions> {
-    resolve_permissions_with_provenance_inner(cwd, ResolveInputs::live(project_trusted)).await
+    let lock = yolo_policy_lock();
+    resolve_permissions_with_provenance_pinned(cwd, project_trusted, lock.as_ref()).await
+}
+
+pub async fn resolve_permissions_with_provenance_pinned(
+    cwd: &Path,
+    project_trusted: bool,
+    yolo_lock: Option<&YoloPolicyLock>,
+) -> Option<ResolvedPermissions> {
+    resolve_permissions_with_provenance_inner(
+        cwd,
+        ResolveInputs::live(project_trusted, yolo_lock.map(|lock| lock.reason)),
+    )
+    .await
 }
 
 async fn resolve_permissions_with_provenance_inner(
@@ -500,7 +549,9 @@ async fn resolve_permissions_with_provenance_inner(
     let mut prompt_policy = PromptPolicy::default();
 
     // Apply managed defaultMode synthetics + prompt policy (highest mode tier).
+    let mut default_mode_configured = false;
     if let Some(mode) = managed_mode {
+        default_mode_configured = true;
         prompt_policy = mode.effects().prompt_policy;
         let managed_path = managed
             .features
@@ -525,6 +576,7 @@ async fn resolve_permissions_with_provenance_inner(
         // User-tier prompt_policy only when managed did not set defaultMode.
         if managed_mode.is_none() {
             prompt_policy = config.prompt_policy;
+            default_mode_configured = config.default_mode_configured;
         }
         tag_with_source(
             &mut all_rules,
@@ -539,7 +591,11 @@ async fn resolve_permissions_with_provenance_inner(
 
     // Keep skip-only resolutions alive so the drop reaches `grok inspect`; zero
     // rules with Ask is a no-op for the evaluator, identical to the `None` arm.
-    if all_rules.is_empty() && prompt_policy == PromptPolicy::Ask && skipped.is_empty() {
+    if all_rules.is_empty()
+        && prompt_policy == PromptPolicy::Ask
+        && skipped.is_empty()
+        && !default_mode_configured
+    {
         return None;
     }
 
@@ -552,6 +608,7 @@ async fn resolve_permissions_with_provenance_inner(
         config: PermissionConfig {
             rules,
             prompt_policy,
+            default_mode_configured,
         },
         sources,
         skipped,
@@ -702,6 +759,7 @@ fn resolve_claude_settings_inner(
         PermissionConfig {
             rules: all_rules,
             prompt_policy,
+            default_mode_configured: applied_mode.is_some(),
         },
         all_skipped,
         source_path,
@@ -843,6 +901,11 @@ fn parse_mcp_entries(json: &serde_json::Value, key: &str) -> Vec<AllowedMcpServe
     let mut entries = Vec::new();
     for entry in arr {
         if let Some(url) = entry.get("serverUrl").and_then(|u| u.as_str()) {
+            if key == ALLOWED_MCP_SERVERS_KEY {
+                warn_on_unmatchable_allow_url(url);
+            } else {
+                warn_on_unmatchable_deny_url(url);
+            }
             entries.push(AllowedMcpServer::Http {
                 url_pattern: url.to_string(),
             });
@@ -862,6 +925,119 @@ fn parse_mcp_entries(json: &serde_json::Value, key: &str) -> Vec<AllowedMcpServe
         }
     }
     entries
+}
+
+fn warn_on_unmatchable_allow_url(pattern: &str) {
+    match split_scheme(pattern) {
+        (None, _) => warn!(
+            pattern,
+            "allowedMcpServers serverUrl has no scheme; schemes match literally, so this entry can never match — write e.g. https://{pattern}"
+        ),
+        (Some(scheme), _) if scheme.contains(['*', '?', '[']) => {
+            warn!(
+                pattern,
+                "allowedMcpServers serverUrl has a glob in its scheme; schemes match literally, so this entry can never match — write the scheme out (e.g. https://)"
+            );
+        }
+        (Some(_), rest) => {
+            let (authority, _) = split_authority_path(rest);
+            let authority = authority.rsplit('@').next().unwrap_or(authority);
+            if is_bracketed_ipv6(authority) {
+                let suffix = authority.split_once(']').map_or("", |(_, rest)| rest);
+                let port_ok = suffix.is_empty()
+                    || suffix
+                        .strip_prefix(':')
+                        .is_some_and(|p| p.parse::<u16>().is_ok());
+                if !port_ok {
+                    warn!(
+                        pattern,
+                        "allowedMcpServers serverUrl port is not a number; ports match literally, so this entry can never match"
+                    );
+                }
+                return;
+            }
+            let (host, port) = match authority.rsplit_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (authority, None),
+            };
+            let host = host.trim_end_matches('.');
+            if !host.contains(':')
+                && let Some(p) = port
+                && p.parse::<u16>().is_err()
+            {
+                warn!(
+                    pattern,
+                    "allowedMcpServers serverUrl port is not a number; ports match literally, so this entry can never match"
+                );
+                return;
+            }
+            if host.is_empty() {
+                warn!(
+                    pattern,
+                    "allowedMcpServers serverUrl has no host; this entry can never match"
+                );
+            } else if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+                if v6.to_string() != host {
+                    warn!(
+                        pattern,
+                        canonical = %v6,
+                        "allowedMcpServers serverUrl IPv6 host is not in canonical form and can never match — write the canonical spelling or bracket the address"
+                    );
+                }
+            } else if host.contains(':') && !host.contains(['*', '?', '[']) {
+                warn!(
+                    pattern,
+                    "allowedMcpServers serverUrl IPv6 host must be bracketed; as written this entry can never match"
+                );
+            } else if let Some(ip) = parse_ip_host(host)
+                && ip.to_string() != host
+            {
+                warn!(
+                    pattern,
+                    canonical = %ip,
+                    "allowedMcpServers serverUrl IP host is not in canonical form and can never match — write the canonical spelling"
+                );
+            } else if glob::Pattern::new(&canonicalize_pattern_host(host)).is_err() {
+                warn!(
+                    pattern,
+                    "allowedMcpServers serverUrl host glob does not compile; this entry can never match"
+                );
+            } else {
+                warn_on_dead_unicode_glob_label(pattern, host, "allowedMcpServers");
+            }
+        }
+    }
+}
+
+fn warn_on_unmatchable_deny_url(pattern: &str) {
+    let (host, _) = split_host_path(pattern);
+    match host {
+        None => warn!(
+            pattern,
+            "deniedMcpServers serverUrl has no host; this entry can never match"
+        ),
+        Some(host) => {
+            if glob::Pattern::new(&canonicalize_pattern_host(&host)).is_err() {
+                warn!(
+                    pattern,
+                    "deniedMcpServers serverUrl host glob does not compile; the entry matches nothing"
+                );
+            }
+            warn_on_dead_unicode_glob_label(pattern, &host, "deniedMcpServers");
+        }
+    }
+}
+
+fn warn_on_dead_unicode_glob_label(pattern: &str, host: &str, key: &str) {
+    if host
+        .split('.')
+        .any(|label| !label.is_ascii() && label.contains(['*', '?', '[']))
+    {
+        warn!(
+            pattern,
+            "{key} serverUrl mixes Unicode and glob characters in one host label; runtime hosts are punycoded, so this entry can never match"
+        );
+    }
 }
 
 fn parse_managed_settings_permissions(
@@ -960,7 +1136,16 @@ pub const YOLO_PIN_REASON_LEGACY_YOLO: &str =
 /// allowlists, and the user's own `--yolo` / `[ui] permission_mode` / runtime
 /// toggle drive always-approve; to disable it in grok use a root-owned
 /// `requirements.toml`. Fails open on user-writable layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YoloPolicyLock {
+    pub source_label: String,
+    pub reason: &'static str,
+}
 pub fn yolo_disabled_by_policy() -> Option<&'static str> {
+    yolo_policy_lock().map(|lock| lock.reason)
+}
+
+pub fn yolo_policy_lock() -> Option<YoloPolicyLock> {
     let layers = xai_grok_config::requirements_layers();
     // The source label only names the layer in the non-bool warning; materialize
     // it as a PathBuf so the borrowed iterator below outlives the temporaries.
@@ -993,17 +1178,23 @@ fn requirements_lock_bool(ui: Option<&toml::Value>, key: &str, path: &Path) -> O
 /// without `~/.grok`); `path` only names the layer in a non-bool warning.
 fn resolve_yolo_policy_block<'a>(
     requirement_layers: impl Iterator<Item = (&'a Path, &'a toml::Value)>,
-) -> Option<&'static str> {
+) -> Option<YoloPolicyLock> {
+    let lock = |path: &Path, reason| {
+        Some(YoloPolicyLock {
+            source_label: path.display().to_string(),
+            reason,
+        })
+    };
     for (path, layer) in requirement_layers {
         let ui = layer.get("ui");
         // Native lock key (default false). `true` pins always-approve off.
         if requirements_lock_bool(ui, "disable_bypass_permissions_mode", path) == Some(true) {
-            return Some(YOLO_PIN_REASON_REQUIREMENTS);
+            return lock(path, YOLO_PIN_REASON_REQUIREMENTS);
         }
         // Back-compat alias: `[ui] yolo = false` in requirements.toml still pins
         // (pre-rename configs). A config.toml `yolo` is unaffected (not read here).
         if requirements_lock_bool(ui, "yolo", path) == Some(false) {
-            return Some(YOLO_PIN_REASON_LEGACY_YOLO);
+            return lock(path, YOLO_PIN_REASON_LEGACY_YOLO);
         }
     }
     None
@@ -1095,7 +1286,7 @@ impl McpServerAllowlist {
         }
         self.url_patterns
             .iter()
-            .any(|pat| url_glob_matches(pat, url))
+            .any(|pat| url_allow_matches(pat, url))
     }
 
     /// Command-only (no name-deny check); use `is_server_allowed` for policy. Test-only.
@@ -1145,23 +1336,30 @@ impl McpServerAllowlist {
             | agent_client_protocol::McpServer::Sse(agent_client_protocol::McpServerSse {
                 url,
                 ..
-            }) if !self.url_patterns.is_empty() => {
-                restricted = true;
-                matched |= self
-                    .url_patterns
-                    .iter()
-                    .any(|pat| url_glob_matches(pat, url));
+            }) => {
+                if !self.url_patterns.is_empty() {
+                    restricted = true;
+                    matched |= self
+                        .url_patterns
+                        .iter()
+                        .any(|pat| url_allow_matches(pat, url));
+                }
             }
             agent_client_protocol::McpServer::Stdio(agent_client_protocol::McpServerStdio {
                 command,
                 ..
-            }) if !self.commands.is_empty() => {
-                restricted = true;
-                let command = command.to_string_lossy();
-                matched |= self.commands.iter().any(|c| *c == command);
+            }) => {
+                if !self.commands.is_empty() {
+                    restricted = true;
+                    let command = command.to_string_lossy();
+                    matched |= self.commands.iter().any(|c| *c == command);
+                }
             }
             // TODO(acp-0.10): `McpServer` is #[non_exhaustive].
-            _ => {}
+            _ => {
+                restricted =
+                    restricted || !self.url_patterns.is_empty() || !self.commands.is_empty();
+            }
         }
 
         !restricted || matched
@@ -1238,17 +1436,23 @@ fn mcp_server_name(server: &agent_client_protocol::McpServer) -> &str {
 /// `foo` can't leak onto `foobar`; an empty key never matches.
 fn mcp_name_matches(pattern: &str, name: &str) -> bool {
     fn key(s: &str) -> String {
-        let bare = s.strip_prefix(MANAGED_MCP_PREFIX).unwrap_or(s);
-        let normalized = normalize_managed_name(bare);
+        normalize_managed_name(s.strip_prefix(MANAGED_MCP_PREFIX).unwrap_or(s))
+    }
+    fn truncate(key: String) -> String {
         // Mirror to_managed_name's prefix-inclusive truncation on the bare part.
         let max_bare = MANAGED_MCP_NAME_MAX_CHARS - MANAGED_MCP_PREFIX.len();
-        match normalized.char_indices().nth(max_bare) {
-            Some((i, _)) => normalized[..i].to_string(),
-            None => normalized,
+        match key.char_indices().nth(max_bare) {
+            Some((i, _)) => key[..i].to_string(),
+            None => key,
         }
     }
-    let pattern_key = key(pattern);
-    !pattern_key.is_empty() && pattern_key == key(name)
+    let mut pattern_key = key(pattern);
+    let mut name_key = key(name);
+    if name.starts_with(MANAGED_MCP_PREFIX) && name.chars().count() == MANAGED_MCP_NAME_MAX_CHARS {
+        pattern_key = truncate(pattern_key);
+        name_key = truncate(name_key);
+    }
+    !pattern_key.is_empty() && pattern_key == name_key
 }
 
 /// Glob-match an ALLOW pattern against a URL. Query string and fragment are
@@ -1257,22 +1461,289 @@ fn mcp_name_matches(pattern: &str, name: &str) -> bool {
 /// `:8080`. This is safe for the allowlist because an imprecise allow merely
 /// over-blocks (fail-closed). Deny matching must NOT reuse this — see
 /// [`url_deny_matches`].
-fn url_glob_matches(pattern: &str, url: &str) -> bool {
-    let cleaned = strip_url_query(url);
-    let opts = glob::MatchOptions {
-        case_sensitive: false,
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
+const POLICY_GLOB_OPTS: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: false,
+    require_literal_separator: false,
+    require_literal_leading_dot: false,
+};
+
+const ALLOW_PATH_GLOB_OPTS: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: false,
+    require_literal_leading_dot: false,
+};
+
+fn split_authority_path(s: &str) -> (&str, &str) {
+    match s.find('/') {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, ""),
+    }
+}
+
+struct RuntimeUrl {
+    scheme: String,
+    host: url::Host<String>,
+    port: Option<u16>,
+    path: String,
+}
+
+impl RuntimeUrl {
+    fn parse(url: &str) -> Option<Self> {
+        let parsed = url::Url::parse(url).ok()?;
+        let host = parsed.host()?.to_owned();
+        Some(Self {
+            scheme: parsed.scheme().to_string(),
+            host,
+            port: parsed.port(),
+            path: decode_unreserved_escapes(parsed.path()),
+        })
+    }
+
+    fn host_text(&self) -> String {
+        match &self.host {
+            url::Host::Domain(d) => d.trim_end_matches('.').to_ascii_lowercase(),
+            url::Host::Ipv4(a) => a.to_string(),
+            url::Host::Ipv6(a) => a.to_string(),
+        }
+    }
+
+    fn authority(&self) -> String {
+        let host = match &self.host {
+            url::Host::Ipv6(a) => format!("[{a}]"),
+            _ => self.host_text(),
+        };
+        match self.port {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        }
+    }
+}
+
+fn url_allow_matches(pattern: &str, url: &str) -> bool {
+    let Some(runtime) = RuntimeUrl::parse(url) else {
+        return false;
     };
-    glob::Pattern::new(pattern)
-        .map(|p| p.matches_with(&cleaned, opts))
+    let (pat_scheme, pat_rest) = split_scheme(pattern);
+    match pat_scheme {
+        Some(p) if p.eq_ignore_ascii_case(&runtime.scheme) => {}
+        _ => return false,
+    }
+    let (pat_authority, pat_path) = split_authority_path(pat_rest);
+    let pat_authority = pat_authority.rsplit('@').next().unwrap_or(pat_authority);
+    let url_authority = runtime.authority();
+    if is_bracketed_ipv6(pat_authority) {
+        let pat_authority = strip_pattern_default_port(pat_authority, &runtime.scheme);
+        if !ipv6_authorities_equal(pat_authority, &url_authority) {
+            return false;
+        }
+        return allow_path_matches(&canonicalize_pattern_path(pat_path), &runtime.path);
+    }
+    let (pat_host, pat_port) = match pat_authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (pat_authority, None),
+    };
+    let glob_match = |pat: &str, s: &str| {
+        glob::Pattern::new(pat)
+            .map(|p| p.matches_with(s, POLICY_GLOB_OPTS))
+            .unwrap_or(false)
+    };
+    if !glob_match(&canonicalize_pattern_host(pat_host), &runtime.host_text()) {
+        return false;
+    }
+    let port_ok = match (pat_port, runtime.port) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(p), Some(port)) => p.parse::<u16>() == Ok(port),
+        (Some(p), None) => scheme_default_port(&runtime.scheme)
+            .is_some_and(|default| p.parse::<u16>().ok() == default.parse::<u16>().ok()),
+    };
+    if !port_ok {
+        return false;
+    }
+    allow_path_matches(&canonicalize_pattern_path(pat_path), &runtime.path)
+}
+
+fn canonicalize_pattern_host(host: &str) -> String {
+    let host = host.trim_end_matches('.');
+    if host.is_ascii() && !host.contains('%') {
+        return host.to_ascii_lowercase();
+    }
+    host.split('.')
+        .map(|label| {
+            if label.contains(['*', '?', '[']) || (label.is_ascii() && !label.contains('%')) {
+                label.to_ascii_lowercase()
+            } else {
+                match url::Host::parse(label) {
+                    Ok(url::Host::Domain(canonical)) => canonical,
+                    _ => label.to_ascii_lowercase(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn decode_unreserved_escapes(path: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            let decoded = hi * 16 + lo;
+            if decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'.' | b'_' | b'~') {
+                out.push(decoded);
+            } else {
+                out.push(b'%');
+                out.push(bytes[i + 1].to_ascii_uppercase());
+                out.push(bytes[i + 2].to_ascii_uppercase());
+            }
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn resolve_pattern_dot_segments(path: &str) -> String {
+    if !path.contains("/.") {
+        return path.to_string();
+    }
+    let ends_dir = matches!(path.rsplit('/').next(), Some(".") | Some(".."));
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "." => {}
+            ".." => {
+                if out.len() > 1 {
+                    out.pop();
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    let mut joined = out.join("/");
+    if joined.is_empty() {
+        joined.push('/');
+    }
+    if ends_dir && !joined.ends_with('/') {
+        joined.push('/');
+    }
+    joined
+}
+
+fn canonicalize_pattern_path(path: &str) -> String {
+    let path = resolve_pattern_dot_segments(&decode_unreserved_escapes(path));
+    fn needs_encoding(b: u8) -> bool {
+        !b.is_ascii()
+            || b < 0x20
+            || matches!(
+                b,
+                b' ' | b'"' | b'#' | b'<' | b'>' | b'`' | b'{' | b'}' | 0x7f
+            )
+    }
+    if !path.bytes().any(needs_encoding) {
+        return path;
+    }
+    let hex = |n: u8| {
+        char::from_digit(n as u32, 16)
+            .unwrap_or('0')
+            .to_ascii_uppercase()
+    };
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        if needs_encoding(b) {
+            out.push('%');
+            out.push(hex(b >> 4));
+            out.push(hex(b & 0x0f));
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
+fn scheme_default_port(scheme: &str) -> Option<&'static str> {
+    match scheme {
+        "http" | "ws" => Some("80"),
+        "https" | "wss" => Some("443"),
+        _ => None,
+    }
+}
+
+fn strip_pattern_default_port<'a>(authority: &'a str, scheme: &str) -> &'a str {
+    let Some(default) = scheme_default_port(scheme).and_then(|d| d.parse::<u16>().ok()) else {
+        return authority;
+    };
+    match authority.rsplit_once(':') {
+        Some((host, port)) if host.ends_with(']') && port.parse::<u16>() == Ok(default) => host,
+        _ => authority,
+    }
+}
+
+fn allow_path_matches(pat_path: &str, url_path: &str) -> bool {
+    if pat_path.is_empty() || pat_path == "/" {
+        return url_path == "/";
+    }
+    glob::Pattern::new(pat_path)
+        .map(|p| p.matches_with(url_path, ALLOW_PATH_GLOB_OPTS))
         .unwrap_or(false)
+}
+
+fn is_bracketed_ipv6(authority: &str) -> bool {
+    authority
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .is_some_and(|(addr, _)| addr.parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+fn ipv6_authorities_equal(a: &str, b: &str) -> bool {
+    fn parse(authority: &str) -> Option<(std::net::Ipv6Addr, &str)> {
+        let rest = authority.strip_prefix('[')?;
+        let end = rest.find(']')?;
+        let addr: std::net::Ipv6Addr = rest[..end].parse().ok()?;
+        Some((addr, &rest[end + 1..]))
+    }
+    fn ports_equal(a: &str, b: &str) -> bool {
+        match (
+            a.strip_prefix(':').map(str::parse::<u16>),
+            b.strip_prefix(':').map(str::parse::<u16>),
+        ) {
+            (Some(Ok(pa)), Some(Ok(pb))) => pa == pb,
+            _ => a == b,
+        }
+    }
+    match (parse(a), parse(b)) {
+        (Some((addr_a, port_a)), Some((addr_b, port_b))) => {
+            addr_a == addr_b && ports_equal(port_a, port_b)
+        }
+        _ => a.eq_ignore_ascii_case(b),
+    }
+}
+
+fn split_scheme(s: &str) -> (Option<&str>, &str) {
+    match s.find("://") {
+        Some(i) => (Some(&s[..i]), &s[i + 3..]),
+        None => (None, s),
+    }
 }
 
 /// Host-normalized, scheme/port-agnostic match of a DENY pattern against a URL.
 ///
 /// Deny matching is deliberately *asymmetric* with allow matching
-/// ([`url_glob_matches`]): an `allowedMcpServers` entry may stay literal because
+/// ([`url_allow_matches`]): an `allowedMcpServers` entry may stay literal because
 /// an imprecise allow merely over-blocks, which is fail-closed and therefore
 /// safe. A `deniedMcpServers` entry is a security control that must never fail
 /// *open*, so we ignore scheme and port and compare the parsed host
@@ -1283,34 +1754,52 @@ fn url_deny_matches(pattern: &str, url: &str) -> bool {
     let (Some(pat_host), pat_path) = split_host_path(pattern) else {
         return false;
     };
-    let (Some(url_host), url_path) = split_host_path(&strip_url_query(url)) else {
-        return false;
+    let Some(runtime) = RuntimeUrl::parse(url) else {
+        return true;
     };
-    let opts = glob::MatchOptions {
-        case_sensitive: false,
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
+    let url_host = runtime.host_text();
+    let glob_match = |pat: &str, s: &str| match glob::Pattern::new(pat) {
+        Ok(p) => p.matches_with(s, POLICY_GLOB_OPTS),
+        Err(_) => pat.eq_ignore_ascii_case(s),
     };
-    let glob_match = |pat: &str, s: &str| {
-        glob::Pattern::new(pat)
-            .map(|p| p.matches_with(s, opts))
-            .unwrap_or(false)
-    };
-    if !glob_match(&pat_host, &url_host) {
+    if let (Some(pat_ip), Some(url_ip)) = (parse_ip_host(&pat_host), parse_ip_host(&url_host)) {
+        if pat_ip != url_ip {
+            return false;
+        }
+    } else if !glob_match(&canonicalize_pattern_host(&pat_host), &url_host) {
         return false;
     }
     // A host-only pattern (no path) blocks every path on that host. Otherwise
     // apply the pattern's path as a glob, normalizing an empty URL path to "/"
     // so a `/*` pattern still matches a path-less URL (e.g. `https://host`).
-    if pat_path.is_empty() {
+    let pat_path = canonicalize_pattern_path(&pat_path);
+    if pat_path.is_empty() || pat_path == "/" {
         return true;
     }
-    let url_path = if url_path.is_empty() {
-        "/"
+    match glob::Pattern::new(&pat_path) {
+        Ok(p) => p.matches_with(&runtime.path, POLICY_GLOB_OPTS),
+        Err(e) => {
+            warn!(
+                pattern,
+                error = %e,
+                "invalid deniedMcpServers path glob; denying every path on the matched host"
+            );
+            true
+        }
+    }
+}
+
+fn parse_ip_host(host: &str) -> Option<std::net::IpAddr> {
+    let addr = if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        std::net::IpAddr::V6(v6)
     } else {
-        url_path.as_str()
+        match url::Host::parse(host) {
+            Ok(url::Host::Ipv4(a)) => std::net::IpAddr::V4(a),
+            Ok(url::Host::Ipv6(a)) => std::net::IpAddr::V6(a),
+            _ => return None,
+        }
     };
-    glob_match(&pat_path, url_path)
+    Some(addr.to_canonical())
 }
 
 /// Split a URL or URL pattern into `(host, path)`, dropping scheme, userinfo,
@@ -1327,23 +1816,36 @@ fn split_host_path(s: &str) -> (Option<String>, String) {
     };
     // Drop userinfo (`user:pass@host`) then the port (`host:443`).
     let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let host = authority.split(':').next().unwrap_or(authority);
+    let bracket_ipv6 = authority.strip_prefix('[').and_then(|rest| {
+        let content = match rest.find(']') {
+            Some(i) => &rest[..i],
+            None => rest,
+        };
+        content
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+            .then_some(content)
+    });
+    let host = if let Some(content) = bracket_ipv6 {
+        content
+    } else if let Some((before_port, port)) = authority.rsplit_once(':')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+        && before_port.parse::<std::net::Ipv6Addr>().is_ok()
+    {
+        before_port
+    } else if authority.parse::<std::net::Ipv6Addr>().is_ok() {
+        authority
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     if host.is_empty() {
         (None, path.to_string())
     } else {
         (Some(host), path.to_string())
     }
-}
-
-fn strip_url_query(url: &str) -> String {
-    // Strip query string and fragment: "https://x.com/path?q=1#f" -> "https://x.com/path"
-    let without_fragment = url.split('#').next().unwrap_or(url);
-    without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment)
-        .to_string()
 }
 
 /// When non-empty, only git marketplace sources matching an allowed URL are

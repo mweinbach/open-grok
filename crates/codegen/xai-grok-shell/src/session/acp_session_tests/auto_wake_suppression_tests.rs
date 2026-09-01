@@ -113,7 +113,9 @@ fn pending_notification_cap_keeps_newest_entries() {
         pending_notifications: Vec::new(),
         lifecycle_mutation: None,
         pending_web_search_reload: None,
-        combine_edit_holds: std::collections::HashSet::new(),
+        edit_holds: std::collections::HashMap::new(),
+        finalization_gate: Default::default(),
+        hook_block_hold: Default::default(),
         notifications_suppressed: true,
         rewindable: false,
         front_message_committed: false,
@@ -274,15 +276,10 @@ async fn cancel_barrier_rejects_task_completion_wake_without_reporting_it() {
             ));
             drop(state);
             assert!(reservations.contains("bg-suppressed"));
-            let res = resources.lock().await;
             assert!(
-                res.get::<xai_grok_tools::types::resources::State<
-                    xai_grok_tools::reminders::task_completion::ReportedTaskCompletions,
-                >>()
-                .is_none(),
+                !already_reported(&actor, "bg-suppressed").await,
                 "declined admission must not report before user re-engagement"
             );
-            drop(res);
             let reminder = xai_grok_tools::reminders::TaskCompletionReminder;
             let reminders = xai_grok_tools::types::tool::Reminder::collect_reminders(
                 &reminder,
@@ -364,17 +361,13 @@ async fn non_task_prompt_is_not_subject_to_task_wake_barrier() {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn task_completion_wake_is_admitted_without_cancel_barrier() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (gateway_tx, _) = tokio::sync::mpsc::unbounded_channel::<
-                xai_acp_lib::AcpClientMessage,
-            >();
-            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<
-                PersistenceMsg,
-            >();
+#[test]
+fn task_completion_wake_is_admitted_without_cancel_barrier() {
+    run_on_session_sized_stack(|| {
+        Box::pin(async {
+            let (gateway_tx, _) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = std::sync::Arc::new(
                 create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await,
             );
@@ -413,21 +406,8 @@ async fn task_completion_wake_is_admitted_without_cancel_barrier() {
                 Some(crate::session::PromptOrigin::TaskCompleted { task_id }) if task_id == "bg-normal"
             ));
             drop(state);
-            let resources = actor
-                .agent
-                .borrow()
-                .tool_bridge()
-                .clone()
-                .shared_resources()
-                .await;
             assert!(
-                resources
-                    .lock()
-                    .await
-                    .get::<xai_grok_tools::types::resources::State<
-                        xai_grok_tools::reminders::task_completion::ReportedTaskCompletions,
-                    >>()
-                    .is_none(),
+                !already_reported(&actor, "bg-normal").await,
                 "queue acceptance alone must not mark the completion reported"
             );
             let actor_for_turn = actor.clone();
@@ -449,19 +429,16 @@ async fn task_completion_wake_is_admitted_without_cancel_barrier() {
                     )
                     .await
             });
-            tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    async {
-                        loop {
-                            if already_reported(&actor, "bg-normal").await {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    },
-                )
-                .await
-                .expect("synthetic turn marked completion reported");
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if already_reported(&actor, "bg-normal").await {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("synthetic turn marked completion reported");
             turn.abort();
             assert!(
                 already_reported(&actor, "bg-normal").await,
@@ -475,7 +452,7 @@ async fn task_completion_wake_is_admitted_without_cancel_barrier() {
                     .is_none_or(|ids| !ids.contains("bg-normal"))
             );
         })
-        .await;
+    });
 }
 #[tokio::test(flavor = "current_thread")]
 async fn disk_full_refusal_still_clears_task_completion_reservation() {
@@ -1337,6 +1314,7 @@ async fn handle_bridge_tool_success_runs_consumed_completion_sweep() {
                     0,
                     "test-model",
                     &parsed_args,
+                    None,
                 )
                 .await;
             let state = actor.state.lock().await;
@@ -1363,9 +1341,9 @@ async fn already_reported(actor: &SessionActor, task_id: &str) -> bool {
     use xai_grok_tools::types::resources::State;
     let bridge = actor.agent.borrow().tool_bridge().clone();
     let resources = bridge.shared_resources().await;
-    let mut res = resources.lock().await;
-    let reported = res.get_or_default::<State<ReportedTaskCompletions>>();
-    !reported.mark_reported(task_id)
+    let res = resources.lock().await;
+    res.get::<State<ReportedTaskCompletions>>()
+        .is_some_and(|reported| reported.is_reported(task_id))
 }
 /// Pure decision: a goal-turn-origin task is dropped even when the blanket
 /// goal Active/Complete gate is OFF (status Blocked / paused / None) — the
@@ -1446,7 +1424,7 @@ async fn drain_drops_goal_turn_origin_when_status_none_and_marks_reported() {
                     .push(bash_completed_notification("bg-goal"));
             }
             let (completion_tx, _completion_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(String, PromptTurnResult)>();
+                tokio::sync::mpsc::unbounded_channel::<TurnCompletionMsg>();
             std::sync::Arc::clone(&actor)
                 .maybe_drain_notifications(completion_tx)
                 .await;
@@ -1499,7 +1477,7 @@ async fn reparented_harness_subagent_task_suppressed_when_status_not_active() {
                     .push(bash_completed_notification("bg-skeptic"));
             }
             let (completion_tx, _completion_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(String, PromptTurnResult)>();
+                tokio::sync::mpsc::unbounded_channel::<TurnCompletionMsg>();
             std::sync::Arc::clone(&actor)
                 .maybe_drain_notifications(completion_tx)
                 .await;
@@ -1570,6 +1548,7 @@ async fn between_turn_drain_suppresses_reserved_subagents() {
                         *captured_task.lock().unwrap() = req.suppress_ids.clone();
                         let mk = |id: &str| SubagentCompletionSummary {
                             subagent_id: id.into(),
+                            loop_task_id: None,
                             subagent_type: "general-purpose".into(),
                             description: format!("desc {id}"),
                             success: true,

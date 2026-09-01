@@ -1429,6 +1429,8 @@ impl SessionActor {
                 parsed_prompt_tx: None,
                 queue_meta: None,
                 send_now: false,
+                initial_child_prompt_ready: None,
+                traceparent: None,
             });
         }
         if let Some(rec) = plan.strategy_rec.as_deref() {

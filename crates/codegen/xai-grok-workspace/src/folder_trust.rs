@@ -3,7 +3,7 @@
 //! This is the client/workspace half of the folder-trust gate: it scans a
 //! workspace for repo-local code-exec configs, resolves the pure trust
 //! [`decide`] precedence, prompts (MVP stderr), and reads/writes the durable
-//! [`crate::trust::TrustStore`] (`~/.grok/trusted_folders.toml`). The
+//! [`crate::trust::TrustStore`] (`~/.opengrok/trusted_folders.toml`). The
 //! consume/gating half (the `DECISIONS` cache, `resolve_and_record`,
 //! `project_scope_allowed`, the loader filters) lives in `xai-grok-shell`.
 //!
@@ -24,8 +24,12 @@
 //! provisional and re-checked rather than cached — is a `xai-grok-shell`
 //! concern, documented there.)
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+use parking_lot::Mutex;
 
 use toml::Value as TomlValue;
 use xai_grok_config_types::{BoolFlag, RemoteSettings};
@@ -100,7 +104,7 @@ pub fn decide_inputs_with_interactive(
     is_interactive: bool,
 ) -> DecideInputs {
     DecideInputs {
-        store_trusted: TrustStore::load().is_trusted(key),
+        store_trusted: is_trusted_this_process(key),
         // Deliberate second discover: the caller's `key` came from `workspace_key`
         // (its own git2 discover), and `repo_configs_present` → `RepoDirChain::resolve`
         // discovers the same repo again. Collapsing the two would mean threading the
@@ -110,7 +114,7 @@ pub fn decide_inputs_with_interactive(
         is_interactive,
         // An over-broad key (home / fs-root / non-absolute) can never be recorded
         // by the store, so decide() trusts it rather than prompt on a key that
-        // can't persist (Case 2: cwd IS $HOME, incl. the default `~/.grok`).
+        // can't persist (Case 2: cwd IS $HOME, incl. the default `~/.opengrok`).
         key_recordable: !crate::trust::is_unsafe_trust_root(key),
     }
 }
@@ -181,15 +185,37 @@ fn feature_enabled_for_build(remote: Option<&RemoteSettings>, is_local_build: bo
 /// Persist an explicit `--trust` grant for `cwd`'s workspace so repo-local
 /// servers are honored on the next resolve. Done client-side because trust is
 /// durable: even when the agent runs in a separate leader process it reads the
-/// same `~/.grok/trusted_folders.toml`. Best-effort; a write failure is logged,
+/// same `~/.opengrok/trusted_folders.toml`. Best-effort; a write failure is logged,
 /// not fatal.
+static PROCESS_DECISIONS: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn record_process_decision(key: &Path, trusted: bool) {
+    PROCESS_DECISIONS.lock().insert(key.to_path_buf(), trusted);
+}
+
+pub fn is_trusted_this_process(key: &Path) -> bool {
+    if let Some(&trusted) = PROCESS_DECISIONS.lock().get(key) {
+        return trusted;
+    }
+    TrustStore::load().is_trusted(key)
+}
 pub fn grant_folder_trust(cwd: &Path) {
     // Local/dev builds never gate, so there is nothing to grant: `--trust` is a
     // no-op and the store is left untouched (the whole feature is inert).
     if folder_trust_inert() {
         return;
     }
-    persist_trust(&mut TrustStore::load(), &workspace_key(cwd));
+    let key = workspace_key(cwd);
+    if crate::trust::is_unsafe_trust_root(&key) {
+        return;
+    }
+    let mut store = TrustStore::load();
+    if store.has_decision(&key) && store.is_trusted(&key) {
+        record_process_decision(&key, true);
+        return;
+    }
+    persist_trust(&mut store, &key);
 }
 
 /// Store-only half of revoking trust for `cwd`'s workspace: persist an explicit
@@ -207,16 +233,17 @@ pub fn revoke_folder_trust_store(cwd: &Path) -> bool {
     }
     let key = workspace_key(cwd);
     let mut store = TrustStore::load();
-    let was_trusted = store.is_trusted(&key);
-    // Persist an explicit deny ONLY for an actually-trusted folder: writing one
-    // for a never-trusted folder would record a most-specific child DENY that
-    // overrides a future ancestor `set_trusted` grant (cascade poisoning).
-    if was_trusted && let Err(e) = store.set_untrusted(&key) {
-        tracing::warn!(
-            path = %key.display(),
-            error = %e,
-            "folder trust: failed to persist untrust decision"
-        );
+    let was_trusted =
+        store.is_trusted(&key) || PROCESS_DECISIONS.lock().get(&key).copied() == Some(true);
+    if was_trusted {
+        if let Err(e) = store.set_untrusted(&key) {
+            tracing::warn!(
+                path = %key.display(),
+                error = %e,
+                "folder trust: failed to persist untrust decision"
+            );
+        }
+        record_process_decision(&key, false);
     }
     was_trusted
 }
@@ -229,6 +256,7 @@ pub fn persist_trust(store: &mut TrustStore, key: &Path) {
             "folder trust: failed to persist trust decision"
         );
     }
+    record_process_decision(key, true);
 }
 
 /// Whether any repo-local trust-sensitive config is present for `cwd`. When none
@@ -1118,22 +1146,105 @@ mod tests {
         let _sim = simulate_release_build();
         // Distinct git roots so `workspace_key` keeps parent/child as separate
         // keys (the child's own `.git` stops discovery at the child).
-        let parent = repo_tmp();
-        let child = parent.path().join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        git2::Repository::init(&child).unwrap();
+        let tmp = repo_tmp();
 
         assert!(
-            !revoke_folder_trust_store(&child),
+            !revoke_folder_trust_store(tmp.path()),
             "revoking a never-trusted folder must return false"
         );
 
         // No child deny was written, so an ancestor grant still cascades down.
-        let mut store = TrustStore::load();
-        store.set_trusted(&workspace_key(parent.path())).unwrap();
+        let store = TrustStore::load();
         assert!(
-            TrustStore::load().is_trusted(&workspace_key(&child)),
-            "ancestor grant must cascade to a child revoked-while-untrusted (no poisoning deny)"
+            !store.has_decision(&workspace_key(tmp.path())),
+            "revoking a never-trusted folder must not record a child deny"
+        );
+    }
+
+    #[test]
+    fn grant_folder_trust_skips_rewrite_when_already_trusted_but_flips_untrust() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvVarGuard::set("OPENGROK_HOME", home.path());
+        let _sim = simulate_release_build();
+        let tmp = repo_tmp();
+        let key = workspace_key(tmp.path());
+
+        grant_folder_trust(tmp.path());
+        assert!(
+            TrustStore::load().is_trusted(&key),
+            "first grant must persist trust"
+        );
+
+        let store_path = TrustStore::default_path().expect("isolated OPENGROK_HOME");
+        let after_grant = std::fs::read(&store_path).unwrap();
+        let mut marked = after_grant.clone();
+        marked.extend_from_slice(b"\n# keep-me\n");
+        std::fs::write(&store_path, &marked).unwrap();
+
+        grant_folder_trust(tmp.path());
+        let after_skip = std::fs::read(&store_path).unwrap();
+        assert!(
+            after_skip
+                .windows(b"# keep-me".len())
+                .any(|w| w == b"# keep-me"),
+            "already-trusted grant must not rewrite the store"
+        );
+        assert!(TrustStore::load().is_trusted(&key));
+        let mut store = TrustStore::load();
+        store.set_untrusted(&key).unwrap();
+        assert!(store.has_decision(&key));
+        assert!(!store.is_trusted(&key));
+
+        grant_folder_trust(tmp.path());
+        assert!(
+            TrustStore::load().is_trusted(&key),
+            "explicit untrust record must still persist --trust"
+        );
+    }
+
+    #[test]
+    fn grant_folder_trust_records_process_local_grant_when_persist_denied() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sim = simulate_release_build();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("OPENGROK_HOME", home.path());
+        let store_home = xai_grok_config::user_grok_home().expect("OPENGROK_HOME is set");
+        let deny_path = store_home.join(xai_grok_config::TRUSTED_FOLDERS_FILENAME);
+        if deny_path.is_file() {
+            std::fs::remove_file(&deny_path).unwrap();
+        }
+        std::fs::create_dir_all(&deny_path).unwrap();
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _restore = Restore(deny_path);
+        let tmp = repo_tmp();
+        grant_folder_trust(tmp.path());
+        let key = workspace_key(tmp.path());
+        assert!(
+            !TrustStore::load().is_trusted(&key),
+            "durable store must stay ungranted when persist is denied"
+        );
+        assert!(
+            is_trusted_this_process(&key),
+            "explicit grant must be visible in-process after persist failure"
+        );
+
+        assert!(
+            revoke_folder_trust_store(tmp.path()),
+            "untrust must see the process-local grant"
+        );
+        assert!(
+            !is_trusted_this_process(&key),
+            "untrust must override the process-local grant even when persist is denied"
+        );
+        assert!(
+            !decide_inputs(tmp.path(), &key).store_trusted,
+            "reload/consume must not re-allow the revoked process-local grant"
         );
     }
 
@@ -1146,6 +1257,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _home = EnvVarGuard::set("HOME", home.path());
+        let _userprofile = EnvVarGuard::set("USERPROFILE", home.path());
         git2::Repository::init(home.path()).unwrap();
 
         let home_key = crate::trust::workspace_key(home.path());

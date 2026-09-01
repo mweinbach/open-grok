@@ -118,6 +118,7 @@ moka = { workspace = true, features = ["future"] }
 dhat = { version = "0.3", optional = true }
 base64 = { workspace = true }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+hmac = "0.12"
 sha2 = { workspace = true }
 rand = { workspace = true }
 shlex = { workspace = true }
@@ -130,6 +131,7 @@ xai-grok-paths = { path = "../xai-grok-paths" }
 xai-grok-shell-base = { workspace = true }
 xai-grok-shell-session-support = { workspace = true }
 xai-grok-shared = { workspace = true }
+xai-grok-status-line = { path = "../xai-grok-status-line" }
 xai-tracing-macros = { path = "../xai-tracing-macros" }
 xai-fsnotify = { path = "../xai-fsnotify" }
 xai-codebase-graph = { path = "../xai-codebase-graph" }

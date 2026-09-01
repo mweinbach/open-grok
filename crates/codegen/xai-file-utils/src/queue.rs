@@ -926,6 +926,28 @@ impl UploadQueue {
         session_id: &str,
         turn_number: u64,
     ) -> anyhow::Result<String> {
+        self.enqueue_blocking_with_inline_flag(
+            content,
+            gcs_path,
+            content_type,
+            artifact_name,
+            session_id,
+            turn_number,
+            None,
+        )
+        .await
+    }
+
+    pub async fn enqueue_blocking_with_inline_flag(
+        &self,
+        content: &[u8],
+        gcs_path: &str,
+        content_type: &str,
+        artifact_name: &str,
+        session_id: &str,
+        turn_number: u64,
+        diverted_inline: Option<&std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<String> {
         let temp_path = self.write_temp_file(content, artifact_name, session_id, turn_number)?;
         let sidecar_path = match self.write_sidecar_file(
             &temp_path,
@@ -976,6 +998,9 @@ impl UploadQueue {
                 }
                 if let Some(sidecar) = &rejected.sidecar_path {
                     try_remove_temp(sidecar, Some(&self.stats));
+                }
+                if let Some(flag) = diverted_inline {
+                    flag.store(true, Ordering::Relaxed);
                 }
                 self.stats.enqueue_fallbacks.fetch_add(1, Ordering::Relaxed);
                 self.spawn_inline_upload_owned_snapshot(

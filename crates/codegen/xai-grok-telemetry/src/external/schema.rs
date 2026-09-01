@@ -119,10 +119,13 @@ pub enum ExternalKey {
     OutputTokens,
     ReasoningTokens,
     CacheReadTokens,
+    CacheCreationTokens,
+    CostUsdMicros,
     StatusCode,
     // Tools
     ToolName,
     Success,
+    HookRewrote,
     FileExtension,
     ToolParameters,
     FilePath,
@@ -201,9 +204,12 @@ impl ExternalKey {
             Self::OutputTokens => "output_tokens",
             Self::ReasoningTokens => "reasoning_tokens",
             Self::CacheReadTokens => "cache_read_tokens",
+            Self::CacheCreationTokens => "cache_creation_tokens",
+            Self::CostUsdMicros => "cost_usd_micros",
             Self::StatusCode => "status_code",
             Self::ToolName => "tool_name",
             Self::Success => "success",
+            Self::HookRewrote => "hook_rewrote",
             Self::FileExtension => "file_extension",
             Self::ToolParameters => "tool_parameters",
             Self::FilePath => "file_path",
@@ -275,9 +281,12 @@ pub(crate) const ALL_KEYS: &[ExternalKey] = &[
     ExternalKey::OutputTokens,
     ExternalKey::ReasoningTokens,
     ExternalKey::CacheReadTokens,
+    ExternalKey::CacheCreationTokens,
+    ExternalKey::CostUsdMicros,
     ExternalKey::StatusCode,
     ExternalKey::ToolName,
     ExternalKey::Success,
+    ExternalKey::HookRewrote,
     ExternalKey::FileExtension,
     ExternalKey::ToolParameters,
     ExternalKey::FilePath,
@@ -415,6 +424,10 @@ pub enum MetricIncrement {
         model: String,
         count: u64,
     },
+    CostUsage {
+        model: String,
+        cost_usd: f64,
+    },
     /// `grok_code.turn.count`.
     TurnCount {
         outcome: &'static str,
@@ -438,8 +451,11 @@ pub enum MetricIncrement {
         model: String,
     },
     /// `grok_code.startup.timeout` (`stuck_in` = phase label).
-    StartupTimeout { stuck_in: String, auth_mode: String },
     /// `grok_code.startup.phase_duration` (ms; `phase` = phase label).
+    StartupTimeout {
+        stuck_in: String,
+        auth_mode: String,
+    },
     StartupPhaseDuration {
         phase: String,
         duration_ms: u64,
@@ -509,6 +525,7 @@ impl ExternalRecord {
 
 pub(crate) const METRIC_SESSION_COUNT: &str = "grok_code.session.count";
 pub(crate) const METRIC_TOKEN_USAGE: &str = "grok_code.token.usage";
+pub(crate) const METRIC_COST_USAGE: &str = "grok_code.cost.usage";
 pub(crate) const METRIC_TURN_COUNT: &str = "grok_code.turn.count";
 pub(crate) const METRIC_TOOL_DECISION: &str = "grok_code.tool.decision";
 pub(crate) const METRIC_TOOL_USAGE: &str = "grok_code.tool.usage";
@@ -611,6 +628,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "todo_write",
     "task",
     "spawn_subagent",
+    "send_subagent_message",
     "web_search",
     "web_fetch",
     "lsp",
@@ -676,6 +694,8 @@ pub(crate) fn access_kind_label(k: events::AccessKind) -> &'static str {
         events::AccessKind::Grep => "grep",
         events::AccessKind::Mcp => "mcp",
         events::AccessKind::Web => "web",
+        events::AccessKind::AgentMessage => "agent_message",
+        events::AccessKind::Other => "other",
     }
 }
 
@@ -850,14 +870,24 @@ pub fn map_api_request(ev: &events::ModelResponseReceived) -> Option<ExternalRec
         .attr_opt(ExternalKey::InputTokens, ev.prompt_tokens)
         .attr_opt(ExternalKey::OutputTokens, ev.completion_tokens)
         .attr_opt(ExternalKey::ReasoningTokens, ev.reasoning_tokens)
-        .attr_opt(ExternalKey::CacheReadTokens, ev.cached_prompt_tokens);
+        .attr_opt(ExternalKey::CacheReadTokens, ev.cached_prompt_tokens)
+        .attr_opt(ExternalKey::CacheCreationTokens, ev.cache_creation_tokens);
+    if let Some(ticks) = ev.cost_usd_ticks.filter(|timing| *timing > 0) {
+        rec = rec.attr(ExternalKey::CostUsdMicros, ticks / 10_000).metric(
+            MetricIncrement::CostUsage {
+                model: ev.model_id.clone(),
+                cost_usd: ticks as f64 / 1e10,
+            },
+        );
+    }
     for (token_type, count) in [
         ("input", ev.prompt_tokens),
         ("output", ev.completion_tokens),
         ("reasoning", ev.reasoning_tokens),
         ("cache_read", ev.cached_prompt_tokens),
+        ("cache_creation", ev.cache_creation_tokens),
     ] {
-        if let Some(count) = count.filter(|c| *c > 0) {
+        if let Some(count) = count.filter(|context| *context > 0) {
             rec = rec.metric(MetricIncrement::TokenUsage {
                 token_type,
                 model: ev.model_id.clone(),
@@ -908,6 +938,7 @@ pub fn map_tool_result(ev: &events::ToolCallCompleted) -> Option<ExternalRecord>
             ExternalKey::Success,
             matches!(ev.outcome, ToolOutcome::Success),
         )
+        .attr(ExternalKey::HookRewrote, ev.hook_rewrote)
         .attr(ExternalKey::DurationMs, ev.duration_ms)
         .gated(
             ExternalKey::ToolName,
@@ -1150,7 +1181,7 @@ pub fn map_agent_connect(ev: &events::AgentConnect) -> Option<ExternalRecord> {
 }
 
 /// `StartupComplete` → the total histogram (no external log event).
-pub fn map_startup_complete(ev: &events::StartupComplete) -> Option<ExternalRecord> {
+pub fn map_startup_completed(ev: &events::StartupCompleted) -> Option<ExternalRecord> {
     Some(
         ExternalRecord::default().metric(MetricIncrement::StartupTotal {
             duration_ms: ev.total_ms,
@@ -1170,4 +1201,17 @@ pub fn map_model_switched(ev: &events::ModelSwitched) -> Option<ExternalRecord> 
             .attr(ExternalKey::Success, ev.success)
             .attr_opt(ExternalKey::ErrorCode, ev.error_code.as_deref()),
     )
+}
+
+#[cfg(test)]
+mod access_kind_label_tests {
+    use super::*;
+
+    #[test]
+    fn agent_message_has_dedicated_label() {
+        assert_eq!(
+            access_kind_label(events::AccessKind::AgentMessage),
+            "agent_message"
+        );
+    }
 }

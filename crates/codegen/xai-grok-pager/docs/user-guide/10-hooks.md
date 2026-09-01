@@ -253,9 +253,33 @@ For `PreToolUse` hooks, write JSON to **stdout**:
 
 - **Allow**: `{"decision": "allow"}`
 - **Deny**: `{"decision": "deny", "reason": "Unsafe command detected"}`
+- **Ask for approval**: `{"hookSpecificOutput": {"permissionDecision": "ask", "permissionDecisionReason": "Please review this command"}}`
+- **Defer to normal permissions**: `{"hookSpecificOutput": {"permissionDecision": "defer"}}`
 - **Rewrite the tool input**: `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"command": "npm test"}}}`
 
-`updatedInput` replaces the tool's input before it runs. The value must be a JSON object; a non-object is ignored. The rewritten input is what the plan-mode gate, the permission prompt, and the tool itself all see, so a hook can normalize or harden a call rather than only allow or deny it. Because hooks run before the plan-mode gate, a hook with side effects fires even when plan mode later rejects the call. If the rewritten input fails the tool's schema, the call is blocked and reported as an invalid-input error rather than falling back to the original. A `deny` decision discards any `updatedInput`; when several hooks return one, the last wins. Omitting `decision` while returning `updatedInput` allows the call and applies the rewrite.
+`updatedInput` replaces the tool's input before it runs. The value must be a
+JSON object; a non-object is ignored. Open Grok applies its plan-mode edit
+gate **before hooks**, then checks rewritten input again before permissions
+and dispatch. A hook cannot retarget the call to another tool or bypass plan
+mode, deny rules, or the sandbox. If the rewritten input fails the tool's
+schema, the call is blocked rather than falling back to the original. A
+`deny` decision discards the rewrite; when several hooks return a valid
+rewrite, the last wins. Omitting `decision` permits the rewrite but still
+requires normal authorization.
+
+`ask` requests the normal interactive approval flow; it does not grant
+permission itself. `defer` continues normal permission evaluation. These
+decisions are supported for file/plugin command and HTTP hooks; ACP client
+hook callbacks retain their own supported decision contract.
+
+### Post-tool context and output
+
+`PostToolUse` can return `hookSpecificOutput.additionalContext` to add a note
+for the model after the result. `updatedToolOutput` replaces a built-in tool
+result, while `updatedMCPToolOutput` replaces an MCP result. The replacement
+must match that tool's result format; invalid or wrong-kind replacements are
+ignored. This is result processing, not a way to undo an executed operation.
+The same delivery path applies to ordinary calls and nested Code Mode calls.
 
 ### Exit Codes
 

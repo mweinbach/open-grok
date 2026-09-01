@@ -1151,7 +1151,7 @@ mod tests {
         assert!(!index.contains("src/foo.rs"));
 
         // Check interning worked
-        assert!(index.num_segments() < 6); // "src" should be shared
+        assert!(index.num_segments() < 6); // "src" is interned once across the three src/ paths
     }
 
     #[test]
@@ -1464,7 +1464,7 @@ mod tests {
             let segment = format!("segment_{}", i);
             assert_eq!(interner.intern(&segment), id);
         }
-        assert_eq!(interner.len(), segment_count); // No new segments added
+        assert_eq!(interner.len(), segment_count);
     }
 
     #[test]
@@ -1540,7 +1540,7 @@ mod tests {
         assert_eq!(interner.get_bytes(id_valid), Some(b"hello".as_slice()));
 
         // Intern raw bytes that are not valid UTF-8
-        let invalid_utf8: &[u8] = &[0x80, 0x81, 0x82]; // Invalid UTF-8 sequence
+        let invalid_utf8: &[u8] = &[0x80, 0x81, 0x82];
         let id_invalid = interner.intern_bytes(invalid_utf8);
 
         // get() should return None for non-UTF-8

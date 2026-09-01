@@ -123,10 +123,17 @@ fn app_modal_target(base: u16, ceiling: u16) -> u16 {
 /// shows with no visible diff. Floored at `base` (and at 3) so some live region
 /// always remains; capped at `ceiling` — when tail + modal overflow the screen,
 /// `live::draw_tail` bottom-anchors and clips the top.
-fn modal_target(tail_h: u16, modal_h: u16, base: u16, ceiling: u16) -> u16 {
+fn modal_target(
+    tail_h: u16,
+    modal_h: u16,
+    status_line_height: u16,
+    base: u16,
+    ceiling: u16,
+) -> u16 {
     tail_h
         .saturating_add(modal_h)
         .saturating_add(1) // status row between the tail and the modal
+        .saturating_add(status_line_height)
         .max(base)
         .min(ceiling)
         .max(3)
@@ -207,7 +214,7 @@ fn will_commit(app: &AppView) -> bool {
     if app_modal_active(agent) {
         return false;
     }
-    let turn_running = agent.session.state.is_turn_running();
+    let turn_running = minimal_api::is_turn_or_wake_running(agent);
     super::commit::scan_frontier(&agent.scrollback, turn_running).will_commit
 }
 
@@ -216,6 +223,9 @@ fn compute_target(app: &mut AppView, term_h: u16, width: u16) -> u16 {
     let minimal_live_rows = app.appearance.minimal_live_rows;
     let ceiling = term_h.saturating_sub(1).max(3);
     let base = minimal_live_rows.clamp(3, ceiling);
+    let status_line_height = minimal_api::status_line_frame(app)
+        .height()
+        .min(ceiling.saturating_sub(2));
     // Ctrl+T "force-show" pin; effective visibility (auto-hide) is computed per
     // agent by `todo_panel_height`.
     let force_todos = minimal_api::minimal_show_todos(app);
@@ -291,13 +301,15 @@ fn compute_target(app: &mut AppView, term_h: u16, width: u16) -> u16 {
     if let Some(modal) = active_modal(agent) {
         let modal_h = modal_height(modal, agent, term_h, content_w);
         let tail_h = super::live::tail_height(agent, width, &commit_app);
-        return modal_target(tail_h, modal_h, base, ceiling);
+        return modal_target(tail_h, modal_h, status_line_height, base, ceiling);
     }
 
     // Otherwise size to fit the prompt (it expands as you type) plus any
     // prompt-anchored dropdown.
     let overlay_h = overlay_rows(&agent.prompt, width);
-    let cap = ceiling.saturating_sub(overlay_h + 1).max(1);
+    let cap = ceiling
+        .saturating_sub(overlay_h + 1 + status_line_height)
+        .max(1);
     let prompt_h = agent
         .prompt
         .desired_height(width, &style, false, cap)
@@ -328,10 +340,19 @@ fn compute_target(app: &mut AppView, term_h: u16, width: u16) -> u16 {
     };
     let chrome = 1u16 // status row
         .saturating_add(below_h)
+        .saturating_add(status_line_height)
         .saturating_add(prompt_h);
     let available = ceiling.saturating_sub(chrome);
     let btw_h = minimal_api::minimal_btw_visible_height(raw_btw, width, available);
-    content_target(tail_h, todos_h, btw_h, below_h, prompt_h, ceiling)
+    content_target(
+        tail_h,
+        todos_h,
+        btw_h,
+        below_h,
+        prompt_h,
+        status_line_height,
+        ceiling,
+    )
 }
 
 /// Live-viewport height sized to exactly its content: tail + todo panel + /btw
@@ -343,6 +364,7 @@ fn content_target(
     btw_h: u16,
     overlay_h: u16,
     prompt_h: u16,
+    status_line_height: u16,
     ceiling: u16,
 ) -> u16 {
     tail_h
@@ -351,6 +373,7 @@ fn content_target(
         .saturating_add(1) // status row
         .saturating_add(overlay_h)
         .saturating_add(prompt_h)
+        .saturating_add(status_line_height)
         .clamp(2, ceiling)
 }
 
@@ -441,6 +464,7 @@ pub fn render(
 pub enum Modal {
     Permission,
     Question,
+    Elicitation,
     Rewind,
     /// The "subagents are still running — stop them?" confirm shown when
     /// cancelling a turn with running subagents (`AgentView::cancel_turn_view`).
@@ -469,6 +493,9 @@ pub fn active_modal(agent: &AgentView) -> Option<Modal> {
     }
     if minimal_api::question_view(agent).is_some() {
         return Some(Modal::Question);
+    }
+    if minimal_api::elicitation_view(agent).is_some() {
+        return Some(Modal::Elicitation);
     }
     if minimal_api::rewind_state(agent).is_some() {
         return Some(Modal::Rewind);
@@ -514,6 +541,13 @@ pub fn modal_height(modal: Modal, agent: &mut AgentView, screen_h: u16, content_
                 })
                 .unwrap_or(0)
         }
+        Modal::Elicitation => minimal_api::elicitation_view(agent)
+            .map(|state| {
+                xai_grok_pager::views::elicitation_view::elicitation_view_height(
+                    state, screen_h, content_w,
+                )
+            })
+            .unwrap_or(0),
         Modal::Rewind => minimal_api::rewind_state(agent)
             .map(|rw| xai_grok_pager::views::rewind::rewind_overlay_height(&rw.phase, screen_h))
             .unwrap_or(0),
@@ -544,6 +578,10 @@ pub fn render_modal(
     match modal {
         Modal::Permission => render_permission(buf, area, agent, theme),
         Modal::Question => render_question(buf, area, agent, theme, screen_h),
+        Modal::Elicitation => {
+            minimal_api::render_elicitation(agent, buf, area, theme);
+            None
+        }
         Modal::Rewind => {
             if let Some(rw) = minimal_api::rewind_state(agent) {
                 xai_grok_pager::views::rewind::render_rewind_overlay(buf, area, &rw.phase, true);
@@ -1098,6 +1136,64 @@ mod tests {
     }
 
     #[test]
+    fn dropdown_never_paints_into_the_status_line_band() {
+        let mut prompt = PromptWidget::new();
+        minimal_api::prompt_suggestions_mut(&mut prompt)
+            .dropdown
+            .open = true;
+        minimal_api::prompt_suggestions_mut(&mut prompt)
+            .dropdown
+            .items = vec![completion_item(), completion_item(), completion_item()];
+        let full = Rect::new(0, 0, 80, 12);
+        let prompt_area = Rect::new(0, 6, 80, 1);
+        let layout_cfg = LayoutConfig::default();
+        let theme = Theme::terminal_default();
+        let status_line_height = 2u16;
+        let band_painted = |buffer: &Buffer| {
+            (full.height - status_line_height..full.height).any(|row| {
+                (0..full.width).any(|column| {
+                    buffer
+                        .cell((column, row))
+                        .is_some_and(|cell| cell.symbol() != " ")
+                })
+            })
+        };
+
+        // The 5-row panel below the prompt reaches the last viewport row, so given the full rect it paints into the band
+        let mut buffer = Buffer::empty(full);
+        render(
+            &mut buffer,
+            full,
+            prompt_area,
+            &mut prompt,
+            &layout_cfg,
+            false,
+            &theme,
+        );
+        assert!(band_painted(&buffer), "fixture must reach into the band");
+
+        // With the band excluded the guard drops the panel instead.
+        let mut buffer = Buffer::empty(full);
+        let overlay_area = Rect {
+            height: full.height - status_line_height,
+            ..full
+        };
+        render(
+            &mut buffer,
+            overlay_area,
+            prompt_area,
+            &mut prompt,
+            &layout_cfg,
+            false,
+            &theme,
+        );
+        assert!(
+            !band_painted(&buffer),
+            "the status-line band must stay clean"
+        );
+    }
+
+    #[test]
     fn completion_dropdown_caps_item_rows() {
         use xai_grok_pager::views::completion_dropdown::MAX_VISIBLE_ROWS;
         let mut pw = PromptWidget::new();
@@ -1122,21 +1218,21 @@ mod tests {
         // Viewport = tail + todos + btw + status(1) + overlay + prompt — no base
         // floor, so the prompt sits right after the conversation. Idle (tail 0,
         // empty prompt) is just status + prompt.
-        assert_eq!(content_target(0, 0, 0, 0, 1, 40), 2); // status + 1-row prompt
-        assert_eq!(content_target(0, 3, 0, 0, 1, 40), 5); // + 3 todo rows
-        assert_eq!(content_target(0, 3, 0, 5, 2, 40), 11); // + overlay(5) + 2-row prompt
+        assert_eq!(content_target(0, 0, 0, 0, 1, 0, 40), 2); // status + 1-row prompt
+        assert_eq!(content_target(0, 3, 0, 0, 1, 0, 40), 5); // + 3 todo rows
+        assert_eq!(content_target(0, 3, 0, 5, 2, 0, 40), 11); // + overlay(5) + 2-row prompt
         // /btw Loading is 3 rows; Done/Error grow with the content.
-        assert_eq!(content_target(0, 0, 3, 0, 1, 40), 5); // + btw(3)
+        assert_eq!(content_target(0, 0, 3, 0, 1, 0, 40), 5); // + btw(3)
         // Production idle always reserves ≥1 below the prompt (info bar).
-        assert_eq!(content_target(0, 0, 3, 1, 1, 40), 6); // btw+status+info+prompt
+        assert_eq!(content_target(0, 0, 3, 1, 1, 0, 40), 6); // btw+status+info+prompt
         // todos + btw stack without collapsing either.
-        assert_eq!(content_target(0, 3, 3, 0, 1, 40), 8);
+        assert_eq!(content_target(0, 3, 3, 0, 1, 0, 40), 8);
         // The streaming tail grows the viewport (no fixed empty gap while
         // "thinking": tail 0 → just status + prompt).
-        assert_eq!(content_target(6, 0, 0, 0, 1, 40), 8); // tail(6) + status + prompt
+        assert_eq!(content_target(6, 0, 0, 0, 1, 0, 40), 8); // tail(6) + status + prompt
         // Floored at 2 (status + prompt) and capped at the screen ceiling.
-        assert_eq!(content_target(0, 0, 0, 0, 0, 40), 2);
-        assert_eq!(content_target(50, 0, 0, 0, 0, 20), 20);
+        assert_eq!(content_target(0, 0, 0, 0, 0, 0, 40), 2);
+        assert_eq!(content_target(50, 0, 0, 0, 0, 0, 20), 20);
     }
 
     #[test]
@@ -1156,25 +1252,32 @@ mod tests {
         // tail, so the permission modal must grow to show that diff ABOVE it,
         // not collapse to just the prompt. tail(10) + modal(8) + status(1) = 19,
         // which fits under the ceiling.
-        assert_eq!(modal_target(10, 8, 6, 40), 19);
+        assert_eq!(modal_target(10, 8, 0, 6, 40), 19);
         // No uncommitted tail (e.g. a bash permission with nothing streamed):
         // modal + status only — identical to the pre-fix behavior, no regression.
-        assert_eq!(modal_target(0, 8, 6, 40), 9);
+        assert_eq!(modal_target(0, 8, 0, 6, 40), 9);
         // A tall pending diff + modal overflow the screen → capped at the
         // ceiling; `draw_tail` then bottom-anchors and clips the top of the diff.
-        assert_eq!(modal_target(100, 8, 6, 40), 40);
+        assert_eq!(modal_target(100, 8, 0, 6, 40), 40);
         // Tiny modal, no tail → floored at `base` so some live region remains.
-        assert_eq!(modal_target(0, 1, 6, 40), 6);
+        assert_eq!(modal_target(0, 1, 0, 6, 40), 6);
     }
 
     #[test]
     fn content_target_clamps_to_screen() {
         // Content taller than the screen clamps to the ceiling (then the tail
         // scrolls / clips); a tiny terminal still yields at least the floor.
-        assert_eq!(content_target(30, 0, 0, 0, 1, 24), 24);
-        assert_eq!(content_target(5, 0, 0, 0, 1, 2), 2);
+        assert_eq!(content_target(30, 0, 0, 0, 1, 0, 24), 24);
+        assert_eq!(content_target(5, 0, 0, 0, 1, 0, 2), 2);
         // A tall /btw Done answer still clamps rather than overflowing.
-        assert_eq!(content_target(0, 0, 20, 0, 1, 10), 10);
+        assert_eq!(content_target(0, 0, 20, 0, 1, 0, 10), 10);
+    }
+
+    #[test]
+    fn status_line_rows_are_reserved_in_content_and_modals() {
+        assert_eq!(content_target(0, 0, 0, 1, 1, 1, 40), 4);
+        assert_eq!(content_target(0, 0, 0, 1, 1, 3, 40), 6);
+        assert_eq!(modal_target(10, 8, 2, 6, 40), 21);
     }
 
     #[test]
@@ -1189,7 +1292,7 @@ mod tests {
         assert_eq!(visible(3, 12, 40), 3);
         assert_eq!(visible(3, 80, 2), 0);
         assert_eq!(visible(3, 80, 3), 3);
-        assert_eq!(content_target(0, 0, visible(3, 11, 40), 1, 1, 40), 3);
-        assert_eq!(content_target(0, 0, visible(3, 80, 2), 1, 1, 5), 3);
+        assert_eq!(content_target(0, 0, visible(3, 11, 0, 40), 1, 1, 40), 3);
+        assert_eq!(content_target(0, 0, visible(3, 80, 0, 2), 1, 1, 5), 3);
     }
 }

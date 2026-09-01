@@ -40,8 +40,12 @@ pub use mock_fs::MockFs;
 mod file_tree;
 pub use file_tree::{ListContentsLimits, list_contents, list_contents_multi};
 
+mod process;
+
+mod fsmonitor;
+pub use fsmonitor::{FsmonitorOverride, probe_fsmonitor_override};
 mod git_status;
-pub use git_status::{git_status, git_status_short};
+pub use git_status::{git_status, git_status_short_pinned};
 
 mod jj_status;
 pub use jj_status::jj_status;

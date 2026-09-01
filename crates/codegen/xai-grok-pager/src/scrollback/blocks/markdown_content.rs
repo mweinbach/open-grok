@@ -240,6 +240,14 @@ impl MarkdownContent {
         f(state.renderer.view().hyperlinks)
     }
 
+    pub fn with_table_copy_meta<Output>(
+        &self,
+        callback: impl FnOnce(&[xai_grok_markdown::TableCopyMeta]) -> Output,
+    ) -> Output {
+        let state = self.state.borrow();
+        callback(state.renderer.view().tables)
+    }
+
     /// Pre-wrap line ranges of the ` ```mermaid ` blocks in the current
     /// rendered output, reflecting the current render width.
     ///

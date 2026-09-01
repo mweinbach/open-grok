@@ -662,6 +662,10 @@ pub enum ToolOutput {
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListOutput),
     UpdateGoal(crate::implementations::grok_build::update_goal::UpdateGoalOutput),
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolOutput),
+    #[serde(alias = "SendAgentMessage")]
+    SendSubagentMessage(
+        crate::implementations::grok_build::send_subagent_message::SendSubagentMessageOutput,
+    ),
     /// Dynamic output for runtime-registered tools (MCP, test tools, etc.)
     Dynamic(DynamicOutput),
     /// Generic text output for tools that produce simple formatted text
@@ -765,6 +769,10 @@ impl ToolOutput {
             ToolOutput::ApplyPatch(ApplyPatchOutput::Success { .. }) => false,
             ToolOutput::ApplyPatch(_) => true,
             ToolOutput::CodexGrepFiles(CodexGrepFilesOutput::Error(_)) => true,
+            ToolOutput::SendSubagentMessage(output) => matches!(
+                output.disposition(),
+                crate::implementations::grok_build::SendSubagentMessageDisposition::Rejected
+            ),
             ToolOutput::Todo(
                 TodoWriteOutput::DuplicateId(_) | TodoWriteOutput::InvalidArgument(_),
             ) => true,
@@ -1073,6 +1081,7 @@ impl ToolOutput {
             }
             ToolOutput::UpdateGoal(o) => o.summary.clone(),
             ToolOutput::Workflow(o) => o.message.clone(),
+            ToolOutput::SendSubagentMessage(output) => output.to_string(),
             ToolOutput::ListAgents(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
             ToolOutput::AgentMessageSend(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
             ToolOutput::ListSessions(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
@@ -1413,6 +1422,47 @@ mod tests {
     use serde_json::json;
     use xai_tool_types::KillTaskResult;
     use xai_tool_types::TaskOutputResult;
+    #[test]
+    fn legacy_send_agent_message_output_envelope_deserializes() {
+        use crate::implementations::grok_build::send_subagent_message::SendSubagentMessageOutput;
+        let output: ToolOutput = serde_json::from_value(json!({
+            "type": "SendAgentMessage",
+            "outcome": "channel_closed",
+        }))
+        .expect("legacy output envelope remains replayable");
+        assert_eq!(
+            serde_json::to_value(&output).unwrap()["type"],
+            "SendSubagentMessage"
+        );
+        assert!(matches!(
+            output,
+            ToolOutput::SendSubagentMessage(SendSubagentMessageOutput::ChannelClosed)
+        ));
+    }
+
+    #[test]
+    fn active_message_errors_only_report_confirmed_rejections() {
+        use crate::implementations::grok_build::send_subagent_message::SendSubagentMessageOutput;
+        for (output, expected_error) in [
+            (
+                SendSubagentMessageOutput::Accepted {
+                    message_id: "message".into(),
+                },
+                false,
+            ),
+            (SendSubagentMessageOutput::AdmissionUncertain, false),
+            (SendSubagentMessageOutput::NotFoundOrNotOwned, true),
+            (SendSubagentMessageOutput::NotActiveOrFinalizing, true),
+            (SendSubagentMessageOutput::NotAcceptedBeforeDeadline, true),
+            (SendSubagentMessageOutput::ChannelClosed, true),
+        ] {
+            assert_eq!(
+                ToolOutput::SendSubagentMessage(output).is_error(),
+                expected_error
+            );
+        }
+    }
+
     /// Serialize a ToolOutput to JSON value
     fn to_json(output: ToolOutput) -> serde_json::Value {
         serde_json::to_value(&output).unwrap()

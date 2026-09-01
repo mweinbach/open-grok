@@ -78,7 +78,7 @@ fn trailing_glob_read_write_grants_parent_directory() {
 
     let cache_abs = dunce::canonicalize(&cache).expect("canonicalize cache");
     fs::write(
-        grok_home.join("sandbox.toml"),
+        grok_home.join(xai_grok_config::SANDBOX_CONFIG_FILENAME),
         format!(
             "[profiles.cargo]\nextends = \"workspace\"\nread_write = [{:?}]\n",
             format!("{}/**", cache_abs.display())

@@ -100,10 +100,15 @@ impl WebSearchClient {
                 )
             }
         };
-        let http = xai_grok_extra_ca::with_extra_root_certificates(
-            reqwest::Client::builder().default_headers(headers),
-        )
-        .build()
+        let key = crate::util::shared_http::cache_key(
+            &format!("web_search:{backend:?}:{base_url}"),
+            &headers,
+        );
+        let http = crate::util::shared_http::cached_client(key, || {
+            xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder.default_headers(headers.clone())
+            })
+        })
         .map_err(|_| web_search_error("Failed to initialize web search client"))?;
         Ok(Self {
             http,

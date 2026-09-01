@@ -3,7 +3,7 @@
 use super::common::*;
 
 const FEEDBACK_PLACEHOLDER_SENTINEL: &str = "Please provide as much detail as possible.";
-const FEEDBACK_LABEL_SENTINEL: &str = "How can we improve Grok Build?";
+const FEEDBACK_LABEL_SENTINEL: &str = "How can we improve Open Grok?";
 const THANKS_SENTINEL: &str = "Thanks for the feedback";
 const INLINE_FEEDBACK: &str = "pty-inline-feedback-report-xyz";
 const PANE_FEEDBACK: &str = "pty-pane-feedback-crash-on-empty-xyz";

@@ -27,6 +27,24 @@ This page is the agent-oriented map: where code lives, how to change it safely, 
 Types: `xai-grok-sampling-types` (`ApiBackend`, `ModelProvider`, `ProviderProfile`, `ToolMode`, …).  
 Adapters (credential-free): `xai-grok-sampler/src/provider.rs`.
 
+### Retry and child-session integration
+
+The 1.0.13 shell integration adds request-keyed stream-drain barriers and
+bounded turn-level recovery without changing provider ownership. Retry attempts
+must retain the selected route, credential resolver, opaque-history policy and
+monotonic export boundary. Auth refresh remains provider-specific; transient
+recovery is not permission to fall back to a different provider.
+
+Foreground root turns can use transient recovery unless disabled by resolved
+configuration (`features.turn_transient_retry`,
+`OPENGROK_TRANSIENT_TURN_RETRY`, requirements or remote policy). Current
+attachment interactivity is checked at execution. Child 429 waits use a bounded
+attempt/time budget and a shared sampling semaphore, releasing the permit while
+waiting. Child tool filtering removes root-only workflow/human-question/parent
+message tools while preserving provider-native and flat-team capabilities.
+See [`../upstream/1.0.13-parity.md`](../upstream/1.0.13-parity.md) for outstanding
+compile and regression-test gates.
+
 ## Built-in mapping
 
 | Provider | Backends | Dialect | Hosted tools | Session auth | xAI-only services |

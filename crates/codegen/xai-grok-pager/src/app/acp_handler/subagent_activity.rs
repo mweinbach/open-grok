@@ -31,6 +31,9 @@ pub(super) fn sync_subagent_activity(
     let Some(info) = parent.subagent_sessions.get_mut(child_key) else {
         return;
     };
+    if info.finished && activity_label.is_some() {
+        return;
+    }
     sync_activity_label(
         &mut parent.scrollback,
         info.scrollback_entry_id,

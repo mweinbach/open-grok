@@ -94,6 +94,11 @@ pub(super) fn notification_hook_for_update(
     }
 }
 
+pub(super) struct DeferredPostToolUseScrollback {
+    tool_name: String,
+    results: Vec<xai_grok_hooks::result::HookRunResult>,
+}
+
 impl SessionActor {
     pub(super) fn hook_run_ctx(&self) -> xai_grok_hooks::runner::RunContext<'_> {
         xai_grok_hooks::runner::RunContext {
@@ -192,6 +197,18 @@ impl SessionActor {
             runs,
         })
         .await;
+
+        for r in results {
+            let system_message = match r {
+                HookRunResult::Success { system_message, .. }
+                | HookRunResult::Blocked { system_message, .. }
+                | HookRunResult::Failed { system_message, .. } => system_message.as_deref(),
+                HookRunResult::Skipped { .. } => None,
+            };
+            if let Some(message) = system_message.map(str::trim).filter(|m| !m.is_empty()) {
+                self.send_hook_annotation(message).await;
+            }
+        }
     }
 
     /// Returns the resolved workspace root for hook envelopes.
@@ -252,6 +269,156 @@ impl SessionActor {
             .await;
         self.emit_hook_executed_telemetry(&event.to_string(), tool_name, &results)
             .await;
+    }
+
+    pub(super) async fn dispatch_post_tool_use_hook(
+        &self,
+        prepared: &PreparedToolCall,
+        output: &ToolsToolOutput,
+        duration_ms: Option<u64>,
+    ) -> (PostToolUseDelivery, Option<DeferredPostToolUseScrollback>) {
+        use xai_grok_hooks::event::{HookEventName, HookPayload, truncate_payload};
+
+        if !self.may_have_hooks_for(HookEventName::PostToolUse) {
+            return (PostToolUseDelivery::default(), None);
+        }
+
+        let tool_result = serde_json::to_value(output).unwrap_or(serde_json::Value::Null);
+        let raw_input: serde_json::Value =
+            serde_json::from_str(&prepared.raw_arguments).unwrap_or(serde_json::Value::Null);
+        let (tool_input_value, tool_input_truncated) = truncate_payload(raw_input);
+        let (tool_result_value, tool_result_truncated) = truncate_payload(tool_result);
+        let hook_tool_name = prepared.hook_tool_name().to_owned();
+
+        let event = HookEventName::PostToolUse.to_string();
+        let envelope = self.make_hook_envelope(
+            HookEventName::PostToolUse,
+            None,
+            HookPayload::PostToolUse {
+                tool_name: hook_tool_name.clone(),
+                tool_use_id: prepared.call_id.clone(),
+                tool_input: tool_input_value,
+                tool_result: tool_result_value,
+                tool_input_truncated,
+                tool_result_truncated,
+                duration_ms,
+                is_backgrounded: false,
+                subagent_type: self.subagent_type_label(),
+            },
+        );
+        let registry = self.hook_registry.borrow().clone();
+        let mut dispatch_result = if let Some(registry) = registry {
+            let ctx = self.hook_run_ctx();
+            xai_grok_hooks::dispatcher::dispatch_post_tool_use(&registry, &envelope, &ctx).await
+        } else {
+            xai_grok_hooks::dispatcher::PostToolUseResult::default()
+        };
+        dispatch_result.merge(self.run_post_tool_use_client_hooks(&envelope).await);
+
+        let mut results = std::mem::take(&mut dispatch_result.results);
+        let delivery = plan_post_tool_use_delivery(
+            dispatch_result,
+            output,
+            self.reminder_wrapper_tag(),
+            &mut results,
+        );
+
+        self.emit_hook_executed_telemetry(&event, Some(&hook_tool_name), &results)
+            .await;
+        let deferred = DeferredPostToolUseScrollback {
+            tool_name: hook_tool_name,
+            results,
+        };
+        (delivery, Some(deferred))
+    }
+
+    pub(super) async fn emit_post_tool_use_scrollback(
+        &self,
+        deferred: DeferredPostToolUseScrollback,
+    ) {
+        let event = xai_grok_hooks::event::HookEventName::PostToolUse.to_string();
+        self.send_hook_execution(&event, Some(&deferred.tool_name), None, &deferred.results)
+            .await;
+    }
+
+    pub(super) async fn dispatch_tool_failure(
+        &self,
+        prepared: &PreparedToolCall,
+        error_text: String,
+        duration_ms: u64,
+    ) -> Vec<xai_grok_hooks::dispatcher::AdditionalContext> {
+        if !self.may_have_hooks_for(xai_grok_hooks::event::HookEventName::PostToolUseFailure) {
+            return Vec::new();
+        }
+        let raw_input: serde_json::Value =
+            serde_json::from_str(&prepared.raw_arguments).unwrap_or(serde_json::Value::Null);
+        let (tool_input, tool_input_truncated) = xai_grok_hooks::event::truncate_payload(raw_input);
+        let hook_tool_name = prepared.hook_tool_name();
+        self.dispatch_post_tool_use_failure_hook(
+            xai_grok_hooks::event::HookPayload::PostToolUseFailure {
+                tool_name: hook_tool_name.to_owned(),
+                tool_use_id: prepared.call_id.clone(),
+                tool_input,
+                tool_input_truncated,
+                error: error_text,
+                duration_ms: Some(duration_ms),
+                is_interrupt: false,
+                subagent_type: self.subagent_type_label(),
+            },
+            hook_tool_name,
+        )
+        .await
+    }
+
+    async fn dispatch_post_tool_use_failure_hook(
+        &self,
+        payload: xai_grok_hooks::event::HookPayload,
+        tool_name: &str,
+    ) -> Vec<xai_grok_hooks::dispatcher::AdditionalContext> {
+        let event = xai_grok_hooks::event::HookEventName::PostToolUseFailure;
+        let envelope = self.fire_hook(event, None, payload);
+        let Some(registry) = self.hook_registry.borrow().clone() else {
+            return Vec::new();
+        };
+        let ctx = self.hook_run_ctx();
+        let result =
+            xai_grok_hooks::dispatcher::dispatch_post_tool_use_failure(&registry, &envelope, &ctx)
+                .await;
+        self.send_hook_execution(&event.to_string(), Some(tool_name), None, &result.results)
+            .await;
+        self.emit_hook_executed_telemetry(&event.to_string(), Some(tool_name), &result.results)
+            .await;
+        result.additional_context
+    }
+
+    pub(super) fn should_enforce_prompt_block(
+        &self,
+        policy: &xai_agent_lifecycle::InputPolicy,
+    ) -> bool {
+        policy.authority.is_human_intent() && !self.startup_hints.is_subagent
+    }
+
+    pub(super) async fn dispatch_prompt_submit_hook(
+        &self,
+        payload: xai_grok_hooks::event::HookPayload,
+        prompt_id: Option<&str>,
+    ) -> xai_grok_hooks::result::PromptDecision {
+        let event = xai_grok_hooks::event::HookEventName::UserPromptSubmit;
+        if !self.may_have_hooks_for(event) {
+            return xai_grok_hooks::result::PromptDecision::Allow;
+        }
+        let envelope = self.fire_hook(event, prompt_id.map(|s| s.to_string()), payload);
+        let Some(registry) = self.hook_registry.borrow().clone() else {
+            return xai_grok_hooks::result::PromptDecision::Allow;
+        };
+        let ctx = self.hook_run_ctx();
+        let gate =
+            xai_grok_hooks::dispatcher::dispatch_prompt_gate(&registry, &envelope, &ctx).await;
+        self.send_hook_execution(&event.to_string(), None, prompt_id, &gate.results)
+            .await;
+        self.emit_hook_executed_telemetry(&event.to_string(), None, &gate.results)
+            .await;
+        gate.decision
     }
 
     pub(super) async fn emit_hook_executed_telemetry(
@@ -330,6 +497,7 @@ mod notification_hook_filter_tests {
             attempt: 1,
             max_retries: 3,
             reason: "timeout".into(),
+            error_type: None,
         });
         assert!(notification_hook_for_update(&update).is_none());
     }

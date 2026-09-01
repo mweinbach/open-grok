@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const EDIT_HOLD_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// Running-turn display fields for `x.ai/queue/changed` (clients paint turn-start UI).
 pub(super) struct RunningPromptDisplay {
     pub id: String,
@@ -26,6 +28,8 @@ pub(crate) struct QueueInputRequest {
     pub(crate) respond_to: oneshot::Sender<PromptTurnResult>,
     pub(crate) persist_ack: Option<oneshot::Sender<()>>,
     pub(crate) parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
+    pub(crate) initial_child_prompt_ready: Option<oneshot::Sender<()>>,
+    pub(crate) traceparent: Option<String>,
 }
 
 impl QueueInputRequest {
@@ -52,6 +56,8 @@ impl QueueInputRequest {
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
+            initial_child_prompt_ready: None,
+            traceparent: None,
         }
     }
 }
@@ -80,6 +86,8 @@ impl SessionActor {
             respond_to,
             persist_ack,
             parsed_prompt_tx,
+            initial_child_prompt_ready,
+            traceparent,
         } = request;
         tracing::info!("queueing prompt: {prompt_id}");
         let queue_depth = { self.state.lock().await.pending_inputs.len() };
@@ -189,7 +197,9 @@ impl SessionActor {
                     && state.running_prompt_id() != Some(i.prompt_id.as_str())
             });
             if preempt_armed {
-                let dropped = state.sweep_pending_inputs(|i| i.origin.is_synthetic());
+                let dropped = state.sweep_pending_inputs(|item| {
+                    InputOrigin::new(item.origin.clone()).is_preemptible_runtime_wake()
+                });
                 if let Some(reservations) = &self.tool_context.task_completion_reservations {
                     for task_id in dropped
                         .iter()
@@ -254,6 +264,8 @@ impl SessionActor {
             respond_to,
             persist_ack,
             parsed_prompt_tx,
+            initial_child_prompt_ready,
+            traceparent,
             queue_meta,
             send_now: false,
         };
@@ -270,7 +282,7 @@ impl SessionActor {
         // interjection and steers the orchestrator to detach instead.
         let orchestrating = self.tool_context.blocking_wait_depth.orchestration_depth() > 0;
         let held_user_queue = state.pending_inputs.iter().any(|queued| {
-            !queued.origin.is_synthetic()
+            (queued.is_queue_visible() || !queued.origin.is_synthetic())
                 && Some(queued.prompt_id.as_str()) != running_front_id.as_deref()
         });
         let auto_send_now = turn_running && blocked_in_wait && !held_user_queue;
@@ -395,6 +407,9 @@ impl SessionActor {
         let running_id = state.running_prompt_id();
         let mut out = Vec::new();
         for item in &state.pending_inputs {
+            if !item.is_queue_visible() {
+                continue;
+            }
             let Some(meta) = &item.queue_meta else {
                 continue;
             };
@@ -513,6 +528,70 @@ impl SessionActor {
         state.running_prompt_id() == Some(prompt_id)
     }
 
+    fn has_protected_row(state: &State, id: &str) -> bool {
+        state
+            .pending_inputs
+            .iter()
+            .any(|item| item.is_queue_protected() && item.has_queue_id(id))
+    }
+
+    fn has_editable_row(state: &State, id: &str) -> bool {
+        state
+            .pending_inputs
+            .iter()
+            .any(|item| item.is_queue_editable() && item.has_queue_id(id))
+    }
+
+    pub(crate) async fn handle_hold_edit(&self, id: String) {
+        let mut state = self.state.lock().await;
+        if Self::has_editable_row(&state, &id) {
+            state.edit_holds.insert(id, std::time::Instant::now());
+        }
+    }
+
+    pub(crate) async fn handle_release_edit(&self, id: &str) {
+        let mut state = self.state.lock().await;
+        if Self::has_editable_row(&state, id) {
+            state.edit_holds.remove(id);
+        }
+    }
+
+    pub(super) async fn release_hook_block_hold(&self, reason: &str) {
+        if self.state.lock().await.take_hook_block_hold() {
+            xai_grok_telemetry::unified_log::info(
+                "shell.prompt.hook_block_hold_released",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({"reason": reason})),
+            );
+        }
+    }
+
+    pub(super) async fn has_runnable_queued_user_row(&self) -> bool {
+        let state = self.state.lock().await;
+        let running = state.running_prompt_id();
+        state
+            .pending_inputs
+            .iter()
+            .filter(|item| running != Some(item.prompt_id.as_str()))
+            .find(|item| !item.origin.is_synthetic())
+            .is_some_and(|item| {
+                state
+                    .edit_holds
+                    .get(&item.prompt_id)
+                    .is_none_or(|since| since.elapsed() >= EDIT_HOLD_TTL)
+            })
+    }
+
+    pub(super) async fn has_pending_goal_continuation(&self) -> bool {
+        self.state.lock().await.pending_inputs.iter().any(|item| {
+            matches!(
+                item.origin,
+                crate::session::PromptOrigin::GoalSummary
+                    | crate::session::PromptOrigin::GoalClassifierNudge
+            )
+        })
+    }
+
     /// The running front's user message is not committed yet; a send-now
     /// cancel would invisibly destroy it before the model sees it (Esc/Ctrl+C
     /// still cancels such turns).
@@ -557,6 +636,7 @@ impl SessionActor {
         orchestrating: bool,
     ) -> bool {
         state.running_prompt_id().is_some()
+            && !state.finalization_gate.is_active()
             && !goal_active
             && !orchestrating
             && !Self::front_awaiting_commit(state)
@@ -646,7 +726,7 @@ impl SessionActor {
         let mut promoted = Vec::new();
         loop {
             let Some(pos) = state.pending_inputs.iter().position(|item| {
-                !item.origin.is_synthetic()
+                (item.is_queue_visible() || !item.origin.is_synthetic())
                     && Some(item.prompt_id.as_str()) != running_front_id.as_deref()
             }) else {
                 break;
@@ -656,9 +736,13 @@ impl SessionActor {
                 .queue_meta
                 .as_ref()
                 .and_then(|meta| meta.owner.as_deref());
-            if Self::extract_bash_command(&item.prompt_blocks).is_some()
+            if !item.is_queue_editable()
+                || Self::extract_bash_command(&item.prompt_blocks).is_some()
                 || item.send_now
-                || state.combine_edit_holds.contains(&item.prompt_id)
+                || state
+                    .edit_holds
+                    .get(&item.prompt_id)
+                    .is_some_and(|since| since.elapsed() < EDIT_HOLD_TTL)
                 || item_owner != running_owner.as_deref()
                 || item.tool_overrides_update.is_some()
             {
@@ -705,22 +789,22 @@ impl SessionActor {
         id: &str,
         expected_version: u64,
         owner: Option<&str>,
-    ) {
+    ) -> bool {
         let mut state = self.state.lock().await;
         let mut removed = false;
         if !Self::is_running_prompt(&state, id)
-            && let Some(pos) = state.pending_inputs.iter().position(|item| {
-                item.queue_meta.as_ref().is_some_and(|m| {
-                    m.id == id
-                        && m.version == expected_version
-                        && owner.is_none_or(|o| m.owner.as_deref() == Some(o))
-                })
-            })
+            && let Some(pos) = state
+                .pending_inputs
+                .iter()
+                .position(|item| item.editable_queue_meta_matches(id, expected_version, owner))
         {
             if let Some(item) = state.pending_inputs.remove(pos) {
                 Self::respond_removed_prompt(item.respond_to);
             }
             removed = true;
+        }
+        if !Self::has_protected_row(&state, id) {
+            state.edit_holds.remove(id);
         }
         if !removed {
             tracing::debug!(
@@ -729,8 +813,8 @@ impl SessionActor {
                 "queue remove was a no-op (drained / stale / not owner); rebroadcasting"
             );
         }
-        // Always re-broadcast the authoritative queue so the client reconciles.
         self.broadcast_queue_changed(&state);
+        removed
     }
 
     /// Atomically interject a queued (not-yet-running) prompt into the running
@@ -776,13 +860,8 @@ impl SessionActor {
         let cancel_decision =
             Self::send_now_cancels_running_turn(&state, goal_active, orchestrating);
         let front_awaiting_commit_now = Self::front_awaiting_commit(&state);
-        let row_matches = |item: &InputItem| {
-            item.queue_meta.as_ref().is_some_and(|m| {
-                m.id == id
-                    && m.version == expected_version
-                    && owner.is_none_or(|o| m.owner.as_deref() == Some(o))
-            })
-        };
+        let row_matches =
+            |item: &InputItem| item.editable_queue_meta_matches(id, expected_version, owner);
         let running_is_row = running_front_id.as_deref() == Some(id);
         let pos = if running_is_row {
             None
@@ -793,6 +872,7 @@ impl SessionActor {
         if let Some(pos) = pos
             && let Some(mut item) = state.pending_inputs.remove(pos)
         {
+            state.take_hook_block_hold();
             // Client-edited text wins (LWW).
             if let Some(new_text) = new_text.filter(|t| !t.trim().is_empty()) {
                 Self::apply_queued_prompt_edit(&mut item, new_text.to_string(), owner);
@@ -848,6 +928,7 @@ impl SessionActor {
             // edit as an LWW write so it isn't silently lost. Stale versions
             // get no fallback (LWW); the running turn is never edited.
             Self::apply_queued_prompt_edit(item, new_text.to_string(), owner);
+            state.take_hook_block_hold();
             tracing::info!(
                 queued_id = %id,
                 "send-now no-opped; saved the edit to the queued row"
@@ -860,6 +941,9 @@ impl SessionActor {
                 "queue send-now no-op (running id / stale / drained / not owner); rebroadcasting"
             );
         }
+        if !Self::has_protected_row(&state, id) {
+            state.edit_holds.remove(id);
+        }
         // Always re-broadcast the authoritative queue so the client reconciles.
         self.broadcast_queue_changed(&state);
         cancel_running_turn
@@ -869,72 +953,79 @@ impl SessionActor {
     /// running turn (front, if active) stays pinned at the front; queued items
     /// not named in `ordered_ids` keep their relative order behind the named
     /// ones. Idempotent; re-broadcasts the result.
-    pub(super) async fn handle_reorder_queue(&self, ordered_ids: &[String]) {
+    pub(super) async fn handle_reorder_queue(&self, ordered_ids: &[String]) -> bool {
         let mut state = self.state.lock().await;
+        let order_before: Vec<String> = state
+            .pending_inputs
+            .iter()
+            .filter_map(|item| item.queue_meta.as_ref().map(|meta| meta.id.clone()))
+            .collect();
 
-        // Partition: items we never reorder (running turn front + synthetic /
-        // non-queue items) vs reorderable queued user prompts.
         let running_id = state.running_prompt_id().map(str::to_string);
-        let mut pinned: std::collections::VecDeque<InputItem> = std::collections::VecDeque::new();
-        let mut queued: Vec<InputItem> = Vec::new();
-        for item in std::mem::take(&mut state.pending_inputs) {
-            let is_queueable = item
-                .queue_meta
-                .as_ref()
-                .is_some_and(|m| running_id.as_deref() != Some(m.id.as_str()));
-            if is_queueable {
-                queued.push(item);
-            } else {
-                pinned.push_back(item);
-            }
-        }
-
-        // Stable reorder: named ids first (in requested order), then the rest.
-        let rank = |item: &InputItem| -> usize {
+        let mut queued = Vec::new();
+        let slots: Vec<Option<InputItem>> = std::mem::take(&mut state.pending_inputs)
+            .into_iter()
+            .map(|item| {
+                let is_queueable = item.is_queue_editable()
+                    && item
+                        .queue_meta
+                        .as_ref()
+                        .is_some_and(|meta| running_id.as_deref() != Some(meta.id.as_str()));
+                if is_queueable {
+                    queued.push(item);
+                    None
+                } else {
+                    Some(item)
+                }
+            })
+            .collect();
+        queued.sort_by_key(|item| {
             item.queue_meta
                 .as_ref()
-                .and_then(|m| ordered_ids.iter().position(|x| x == &m.id))
+                .and_then(|meta| ordered_ids.iter().position(|id| id == &meta.id))
                 .unwrap_or(usize::MAX)
-        };
-        queued.sort_by_key(rank);
-
-        let mut rebuilt = pinned;
-        rebuilt.extend(queued);
-        state.pending_inputs = rebuilt;
+        });
+        let mut queued = queued.into_iter();
+        state.pending_inputs = slots
+            .into_iter()
+            .filter_map(|slot| slot.or_else(|| queued.next()))
+            .collect();
 
         self.broadcast_queue_changed(&state);
+        let order_after: Vec<&str> = state
+            .pending_inputs
+            .iter()
+            .filter_map(|item| item.queue_meta.as_ref().map(|meta| meta.id.as_str()))
+            .collect();
+        order_before != order_after
     }
 
     /// Clear queued prompts. When `owner` is `Some`, only that
     /// client's queued items are removed. The running turn is never touched.
-    pub(super) async fn handle_clear_queue(&self, owner: Option<&str>) {
+    pub(super) async fn handle_clear_queue(&self, owner: Option<&str>) -> bool {
         let mut state = self.state.lock().await;
-        // Partition rather than `retain`: each cleared user prompt still has a
-        // client awaiting its `respond_to`, so it must be resolved with
-        // `Cancelled` (see [`respond_removed_prompt`]) instead of being
-        // dropped — a bare drop surfaces as "session failed to respond" and a
-        // spurious "Turn failed" on the running turn.
         let running_id = state.running_prompt_id().map(str::to_string);
         let mut kept = VecDeque::with_capacity(state.pending_inputs.len());
+        let mut cleared_any = false;
         for item in std::mem::take(&mut state.pending_inputs) {
-            let keep = match &item.queue_meta {
-                // Non-queue (synthetic) items always stay.
-                None => true,
-                // Never drop the in-flight turn; keep items NOT owned by the
-                // requester (owner-scoped clear).
-                Some(meta) => {
-                    running_id.as_deref() == Some(meta.id.as_str())
-                        || owner.is_some_and(|o| meta.owner.as_deref() != Some(o))
-                }
-            };
+            let keep = !item.is_queue_editable()
+                || match &item.queue_meta {
+                    None => true,
+                    Some(meta) => {
+                        running_id.as_deref() == Some(meta.id.as_str())
+                            || owner.is_some_and(|o| meta.owner.as_deref() != Some(o))
+                    }
+                };
             if keep {
                 kept.push_back(item);
             } else {
                 Self::respond_removed_prompt(item.respond_to);
+                cleared_any = true;
             }
         }
         state.pending_inputs = kept;
         self.broadcast_queue_changed(&state);
+        cleared_any
     }
 
     /// Replace the text of a queued (not-yet-running) prompt in place
@@ -962,36 +1053,38 @@ impl SessionActor {
         id: &str,
         new_text: String,
         editor: Option<&str>,
-    ) {
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        let mut should_broadcast = false;
         if new_text.trim().is_empty() {
             tracing::debug!(queued_id = %id, "queue edit no-op: empty newText");
-            return;
-        }
-        let mut state = self.state.lock().await;
-        // Locked first: the promoter arms `running_task` under this lock.
-        if Self::is_running_prompt(&state, id) {
+        } else if Self::is_running_prompt(&state, id) {
             tracing::debug!(
                 queued_id = %id,
                 "queue edit no-op: id names the running turn"
             );
-            return;
-        }
-        let Some(item) = state
+        } else if let Some(pos) = state
             .pending_inputs
-            .iter_mut()
-            .find(|item| item.queue_meta.as_ref().is_some_and(|m| m.id == id))
-        else {
+            .iter()
+            .position(|item| item.is_queue_editable() && item.has_queue_id(id))
+        {
+            if let Some(item) = state.pending_inputs.get_mut(pos) {
+                Self::apply_queued_prompt_edit(item, new_text, editor);
+            }
+            should_broadcast = true;
+        } else {
             tracing::debug!(
                 queued_id = %id,
                 "queue edit no-op: id not found (already drained / removed)"
             );
-            return;
-        };
-        Self::apply_queued_prompt_edit(item, new_text, editor);
-        // Clear the hold under the same lock as the text update — see
-        // pager `exit_editing_mode_keeping_hold` for the race this closes.
-        state.combine_edit_holds.remove(id);
-        self.broadcast_queue_changed(&state);
+        }
+        if !Self::has_protected_row(&state, id) {
+            state.edit_holds.remove(id);
+        }
+        if should_broadcast {
+            self.broadcast_queue_changed(&state);
+        }
+        should_broadcast
     }
 
     /// Merge consecutive plain prompts into `pending[0]` via
@@ -1031,8 +1124,9 @@ impl SessionActor {
 
     fn combine_gate(item: &InputItem) -> xai_prompt_queue::CombineGate<'_> {
         let is_bash = Self::extract_bash_command(&item.prompt_blocks).is_some();
-        let is_plain_prompt =
-            item.queue_meta.as_ref().map(|m| m.kind.as_str()) == Some("prompt") && !is_bash;
+        let is_plain_prompt = item.is_queue_editable()
+            && item.queue_meta.as_ref().map(|m| m.kind.as_str()) == Some("prompt")
+            && !is_bash;
         let mut has_text = false;
         let mut has_images = false;
         let mut is_expanded_skill = false;

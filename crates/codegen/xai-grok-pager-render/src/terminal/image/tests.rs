@@ -16,6 +16,72 @@ fn protocol_matrix_matches_supported_terminals() {
 }
 
 #[test]
+fn prompt_preview_protocol_gates_iterm2_on_file_capability() {
+    for (features, is_ssh, expected) in [
+        (Some("TF"), false, GraphicsProtocol::ITerm2),
+        (Some("T"), false, GraphicsProtocol::None),
+        (None, false, GraphicsProtocol::None),
+        (None, true, GraphicsProtocol::ITerm2),
+        (Some("T"), true, GraphicsProtocol::None),
+    ] {
+        assert_eq!(
+            prompt_preview_protocol_for_brand(TerminalName::Iterm2, false, features, is_ssh),
+            expected,
+            "features={features:?} is_ssh={is_ssh}",
+        );
+    }
+    assert_eq!(
+        prompt_preview_protocol_for_brand(TerminalName::Iterm2, true, Some("F"), false),
+        GraphicsProtocol::None,
+    );
+    assert_eq!(
+        prompt_preview_protocol_for_brand(TerminalName::Kitty, false, None, false),
+        GraphicsProtocol::Kitty,
+    );
+    assert_eq!(
+        prompt_preview_protocol_for_brand(TerminalName::Unknown, false, Some("F"), false),
+        GraphicsProtocol::None,
+    );
+}
+
+#[test]
+fn cell_aspect_from_measures_and_rejects_bogus_reports() {
+    use crossterm::terminal::WindowSize;
+    let ws = |columns, rows, width, height| WindowSize {
+        columns,
+        rows,
+        width,
+        height,
+    };
+    assert_eq!(cell_aspect_from(&ws(100, 50, 1000, 1000)), 0.5);
+    assert_eq!(cell_aspect_from(&ws(100, 50, 900, 1000)), 0.45);
+    assert_eq!(cell_aspect_from(&ws(100, 50, 0, 0)), DEFAULT_CELL_ASPECT);
+    assert_eq!(cell_aspect_from(&ws(0, 0, 1000, 1000)), DEFAULT_CELL_ASPECT);
+    assert_eq!(
+        cell_aspect_from(&ws(100, 50, 5000, 1000)),
+        DEFAULT_CELL_ASPECT,
+        "square-or-wider cells are a bogus report"
+    );
+}
+
+#[test]
+fn iterm_overlay_escape_positions_then_restores_cursor() {
+    let escape = build_overlay_image_escapes_for_protocol(
+        GraphicsProtocol::ITerm2,
+        &[0u8; 10],
+        20,
+        10,
+        2,
+        3,
+    )
+    .unwrap();
+    assert!(escape.starts_with("\x1b7"));
+    assert!(escape.ends_with("\x1b8"));
+    assert!(escape.contains("\x1b[4;3H"));
+    assert!(escape.contains("\x1b]1337;File="));
+}
+
+#[test]
 fn scrollback_overlay_excludes_warp() {
     assert!(scrollback_inline_overlay_active_for_brand(
         GraphicsProtocol::Kitty,
@@ -75,26 +141,24 @@ fn kitty_format_and_conversion_produce_png() {
 }
 
 #[test]
-fn iterm_escape_preserves_requested_geometry() {
+fn iterm_escape_fills_requested_geometry_exactly() {
     let escape = render_iterm2_image(&[0u8; 10], 30, 15);
     assert!(escape.starts_with("\x1b]1337;File="));
     assert!(escape.contains("width=30cells"));
     assert!(escape.contains("height=15cells"));
-    assert!(escape.contains("preserveAspectRatio=1"));
+    assert!(escape.contains("preserveAspectRatio=0"));
 }
 
 #[test]
-fn low_level_overlay_separates_transmit_from_placement() {
+fn low_level_overlay_deletes_then_transmits() {
     let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-    let protocol = GraphicsProtocol::Kitty;
-    let first =
-        build_overlay_image_escapes_for_protocol(protocol, &png, 20, 10, 0, 0, true).unwrap();
-    let subsequent =
-        build_overlay_image_escapes_for_protocol(protocol, &png, 20, 10, 0, 0, false).unwrap();
-    assert!(first.contains("a=t") && first.contains("a=p"));
-    assert!(!first.contains("a=T"));
-    assert!(subsequent.contains("a=p"));
-    assert!(!subsequent.contains("a=t"));
+    let escape =
+        build_overlay_image_escapes_for_protocol(GraphicsProtocol::Kitty, &png, 20, 10, 0, 0)
+            .unwrap();
+    assert!(escape.contains("a=d,d=i"));
+    assert!(escape.contains("a=T"));
+    assert!(!escape.contains("a=t,"));
+    assert!(!escape.contains("a=p"));
 }
 
 #[test]
@@ -107,15 +171,14 @@ fn iterm_place_can_skip_inline_data() {
 }
 
 #[test]
-fn placement_only_steady_state_removes_payload_cost() {
+fn unchanged_static_overlay_skips_payload() {
+    let _guard = set_protocol_for_test(GraphicsProtocol::Kitty);
+    crate::terminal::overlay::reset_owner();
     let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
     png.extend(std::iter::repeat_n(0u8, 200_000));
-    let protocol = GraphicsProtocol::Kitty;
-    let first =
-        build_overlay_image_escapes_for_protocol(protocol, &png, 40, 20, 0, 0, true).unwrap();
-    let subsequent =
-        build_overlay_image_escapes_for_protocol(protocol, &png, 40, 20, 0, 0, false).unwrap();
-    assert!(first.len() > 200_000);
-    assert!(subsequent.len() < 200);
-    assert!(!subsequent.contains("a=t"));
+    let first = crate::terminal::overlay::static_image(&png, 40, 20, 0, 0, 9).unwrap();
+    assert!(first.as_str().len() > 200_000);
+    let _ = first.commit();
+    let subsequent = crate::terminal::overlay::static_image(&png, 40, 20, 0, 0, 9).unwrap();
+    assert!(subsequent.as_str().is_empty());
 }

@@ -94,7 +94,7 @@ impl SandboxLogger {
     }
 
     fn log_file_path() -> PathBuf {
-        xai_grok_config::grok_home().join("sandbox-events.jsonl")
+        crate::paths::sandbox_events_log_path()
     }
 }
 

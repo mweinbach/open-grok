@@ -108,9 +108,19 @@ macro_rules! opaque_id {
     };
 }
 
+pub const HUB_RESERVED_SESSION_PREFIX: &str = "__hub:";
+fn validate_session_id(s: &str) -> Result<(), IdError> {
+    if s.starts_with(HUB_RESERVED_SESSION_PREFIX) {
+        return Err(IdError::ReservedPrefix {
+            value: s.to_owned(),
+        });
+    }
+    Ok(())
+}
 opaque_id!(
     /// Session identifier. Service-issued or carried from a JWT claim.
-    SessionId
+    SessionId,
+    extra_validator = validate_session_id
 );
 opaque_id!(
     /// User identifier (the JWT `sub` claim).

@@ -8,6 +8,7 @@ description = "Shared reqwest HTTP clients and User-Agent construction for the g
 [dependencies]
 reqwest = { workspace = true, features = ["blocking"] }
 reqwest-middleware = { workspace = true }
+rustls = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 xai-grok-auth = { workspace = true, features = ["middleware"] }

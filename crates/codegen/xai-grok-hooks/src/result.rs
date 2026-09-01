@@ -4,11 +4,25 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookDecision {
     Allow,
-    Deny { reason: String, hook_name: String },
+    Ask {
+        hook_name: String,
+        reason: Option<String>,
+    },
+    Defer {
+        hook_name: String,
+    },
+    Deny {
+        hook_name: String,
+        reason: String,
+    },
 }
 
-/// Parsed output of one `Stop`/`SubagentStop` gate hook. The dispatcher
-/// aggregates these across hooks; `force_stop` overrides blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptDecision {
+    Allow,
+    Block { reason: String, hook_name: String },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StopHookOutcome {
     pub block_reason: Option<String>,
@@ -22,6 +36,49 @@ pub struct StopOverride {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementKind {
+    Builtin,
+    Mcp,
+}
+
+impl ReplacementKind {
+    pub fn wire_field(self) -> &'static str {
+        match self {
+            Self::Builtin => "updatedToolOutput",
+            Self::Mcp => "updatedMCPToolOutput",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputReplacement {
+    pub kind: ReplacementKind,
+    pub hook_name: String,
+    pub value: serde_json::Value,
+}
+
+impl OutputReplacement {
+    pub fn wire_field(&self) -> &'static str {
+        self.kind.wire_field()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PostToolUseHookOutcome {
+    pub block_reason: Option<String>,
+    pub additional_context: Option<String>,
+    pub output_replacement: Option<OutputReplacement>,
+}
+
+impl PostToolUseHookOutcome {
+    pub fn is_empty(&self) -> bool {
+        self.block_reason.is_none()
+            && self.additional_context.is_none()
+            && self.output_replacement.is_none()
+    }
+}
+
 impl StopHookOutcome {
     pub fn is_empty(&self) -> bool {
         self.block_reason.is_none()
@@ -33,12 +90,7 @@ impl StopHookOutcome {
 /// HTTP execution details for `"http"` hooks, for scrollback enrichment.
 #[derive(Debug, Clone)]
 pub struct HttpInfo {
-    /// Post-expansion target (for SSRF debugging). May contain secrets from
-    /// resolved `${VAR}` substitutions, so user-facing display MUST prefer
-    /// `raw_url` when present.
     pub url: String,
-    /// Pre-expansion source URL as written in the file, safe for display.
-    /// `None` when the spec was built without it (fall back to `url`).
     pub raw_url: Option<String>,
     pub status: Option<u16>,
     pub response_preview: Option<String>,
@@ -51,6 +103,7 @@ pub enum HookRunResult {
         hook_name: String,
         elapsed: Duration,
         http_info: Option<HttpInfo>,
+        system_message: Option<String>,
     },
     Skipped {
         hook_name: String,
@@ -61,6 +114,7 @@ pub enum HookRunResult {
         detail: String,
         elapsed: Duration,
         http_info: Option<HttpInfo>,
+        system_message: Option<String>,
     },
     /// Hook failed (timeout, crash, bad output): fail-open.
     Failed {
@@ -68,5 +122,6 @@ pub enum HookRunResult {
         error: String,
         elapsed: Duration,
         http_info: Option<HttpInfo>,
+        system_message: Option<String>,
     },
 }

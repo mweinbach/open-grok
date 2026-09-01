@@ -982,19 +982,21 @@ async fn compaction_reseed_without_provider_count_matches_plain_estimate() {
 }
 
 #[tokio::test]
-async fn non_compaction_replace_does_not_carry_overhead() {
-    let h = TestHarness::new();
-    h.handle
+async fn non_compaction_replace_carries_confirmed_total() {
+    let harness = TestHarness::new();
+    harness
+        .handle
         .push_user_message(ConversationItem::user("x".repeat(4000)));
-    h.handle.record_token_usage(51_000);
+    harness.handle.record_token_usage(500);
 
-    h.handle
+    harness
+        .handle
         .replace_conversation(vec![ConversationItem::user("q".repeat(4000))]);
 
-    let total = h.handle.get_total_tokens().await;
+    let total = harness.handle.get_total_tokens().await;
     assert_eq!(
-        total, 1_000,
-        "non-compaction replace (e.g. rewind) keeps the plain estimate"
+        total, 500,
+        "same-size replace carries the provider-confirmed count"
     );
 }
 
@@ -5009,4 +5011,956 @@ async fn strip_conversation_images_is_a_noop_without_images() {
         h.drain_persistence().is_empty(),
         "no images stripped must mean no persistence write"
     );
+}
+
+#[tokio::test]
+async fn push_user_messages_batch_appends_and_persists_in_order() {
+    let mut harness = TestHarness::new();
+    harness
+        .handle
+        .try_push_user_messages_batch(vec![
+            ConversationItem::interjection("first"),
+            ConversationItem::interjection("second"),
+        ])
+        .unwrap();
+
+    let conversation = harness.handle.get_conversation().await;
+    assert_eq!(
+        conversation
+            .iter()
+            .map(ConversationItem::text_content)
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    assert_eq!(
+        harness
+            .drain_persistence()
+            .into_iter()
+            .filter_map(|record| match record {
+                PersistenceRecord::Message(item) => Some(item.text_content()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+}
+
+#[test]
+fn user_messages_batch_uses_one_command() {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    let handle = crate::handle::ChatStateHandle::new(cmd_tx);
+
+    handle
+        .try_push_user_messages_batch(vec![
+            ConversationItem::interjection("first"),
+            ConversationItem::interjection("second"),
+        ])
+        .unwrap();
+
+    let command = cmd_rx.try_recv().expect("one batch command");
+    let crate::commands::ChatStateCommand::PushUserMessagesBatch { items } = command else {
+        panic!("expected user-message batch command");
+    };
+    assert_eq!(
+        items
+            .iter()
+            .map(ConversationItem::text_content)
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    assert!(cmd_rx.try_recv().is_err(), "batch must use one send");
+}
+
+#[test]
+fn closed_mailbox_rejects_entire_batch() {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    drop(cmd_rx);
+    let handle = crate::handle::ChatStateHandle::new(cmd_tx);
+
+    assert_eq!(
+        handle.try_push_user_messages_batch(vec![
+            ConversationItem::interjection("first"),
+            ConversationItem::interjection("second"),
+        ]),
+        Err(crate::ChatStateMailboxClosed)
+    );
+}
+
+#[tokio::test]
+async fn provider_counted_model_output_persists_without_bumping_estimate() {
+    let harness = TestHarness::new();
+    harness.handle.record_token_usage(100_000);
+    harness
+        .handle
+        .push_model_output(ConversationItem::Reasoning(
+            xai_grok_sampling_types::synthesized_reasoning_item("r".repeat(4_000)),
+        ));
+
+    assert!(matches!(
+        harness.handle.get_conversation().await.as_slice(),
+        [ConversationItem::Reasoning(_)]
+    ));
+    assert_eq!(harness.handle.get_estimated_total_tokens().await, 100_000);
+}
+
+#[tokio::test]
+async fn unreported_model_output_increases_context_estimate_once() {
+    let harness = TestHarness::new();
+    harness.handle.record_token_usage(100_000);
+    harness
+        .handle
+        .push_unreported_model_output(ConversationItem::Reasoning(
+            xai_grok_sampling_types::synthesized_reasoning_item("r".repeat(4_000)),
+        ));
+    assert_eq!(harness.handle.get_estimated_total_tokens().await, 101_000);
+    assert_eq!(harness.handle.get_conversation().await.len(), 1);
+    harness.handle.record_token_usage(101_000);
+    assert_eq!(harness.handle.get_estimated_total_tokens().await, 101_000);
+}
+
+#[tokio::test]
+async fn estimated_context_query_distinguishes_unavailable_from_empty() {
+    assert_eq!(
+        crate::ChatStateHandle::noop()
+            .try_get_estimated_total_tokens()
+            .await,
+        None
+    );
+    let harness = TestHarness::new();
+    assert_eq!(
+        harness.handle.try_get_estimated_total_tokens().await,
+        Some(0)
+    );
+    harness.handle.record_token_usage(321);
+    harness
+        .handle
+        .push_tool_result(ConversationItem::tool_result("call", "x".repeat(16)));
+    assert_eq!(
+        harness.handle.try_get_estimated_total_tokens().await,
+        Some(325)
+    );
+}
+
+#[tokio::test]
+async fn usage_incomplete_nowait_orders_before_billing_query() {
+    let harness = TestHarness::new();
+    harness.handle.mark_usage_incomplete_nowait(false, true);
+    assert!(
+        harness
+            .handle
+            .try_get_session_usage()
+            .await
+            .unwrap()
+            .incomplete
+    );
+}
+
+#[tokio::test]
+async fn strip_conversation_images_replaces_only_listed_urls_and_persists() {
+    let mut user = match ConversationItem::user("look at this") {
+        ConversationItem::User(user) => user,
+        _ => unreachable!(),
+    };
+    user.add_image("data:image/png;base64,AAAA");
+    let mut later = match ConversationItem::user("and this one") {
+        ConversationItem::User(user) => user,
+        _ => unreachable!(),
+    };
+    later.add_image("data:image/png;base64,BBBB");
+    let mut harness = TestHarness::with_conversation(vec![
+        ConversationItem::User(user),
+        ConversationItem::User(later),
+    ]);
+
+    let outcome = harness
+        .handle
+        .strip_conversation_images(vec!["data:image/png;base64,AAAA".into()])
+        .await;
+    assert_eq!(
+        outcome,
+        crate::StripOutcome::Applied { stripped: 1 },
+        "ack must carry the disk-applied count"
+    );
+
+    let conv = harness.handle.get_conversation().await;
+    assert_eq!(
+        conv.len(),
+        2,
+        "in-place strip must not add or remove conversation items"
+    );
+    let ConversationItem::User(user) = &conv[0] else {
+        panic!("expected user item");
+    };
+    assert!(
+        user.content
+            .iter()
+            .all(|prompt| !matches!(prompt, xai_grok_sampling_types::ContentPart::Image { .. })),
+        "listed image part must be replaced"
+    );
+    let ConversationItem::User(survivor) = &conv[1] else {
+        panic!("expected user item");
+    };
+    assert!(
+        survivor
+            .content
+            .iter()
+            .any(|prompt| matches!(prompt, xai_grok_sampling_types::ContentPart::Image { .. })),
+        "unlisted image must survive the scoped strip"
+    );
+
+    let records = harness.drain_persistence();
+    assert!(
+        records
+            .iter()
+            .any(|reasoning| matches!(reasoning, PersistenceRecord::ReplaceHistoryForStrip(_))),
+        "strip must persist via the backup-gated flavor, got {records:?}"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|reasoning| matches!(reasoning, PersistenceRecord::ReplaceHistory(_))),
+        "strip must not use the unguarded replace, got {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn replace_never_increases_total_tokens() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    harness.handle.record_token_usage(1_500);
+
+    harness
+        .handle
+        .replace_conversation(vec![ConversationItem::user("q".repeat(40_000))]);
+
+    assert_eq!(harness.handle.get_total_tokens().await, 1_500);
+}
+
+#[tokio::test]
+async fn truncate_scales_from_confirmed_total() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    harness.handle.increment_prompt_index();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("y".repeat(4000)));
+    harness.handle.increment_prompt_index();
+    harness.handle.record_token_usage(1_000);
+
+    harness.handle.truncate_to_prompt_index(1).await;
+
+    assert_eq!(harness.handle.get_total_tokens().await, 500);
+}
+
+#[tokio::test]
+async fn build_request_projects_agent_message_for_model_without_mutating_history() {
+    let raw = format!(
+        "{}\npayload starts with the exact label",
+        crate::compaction_utils::AGENT_MESSAGE_MODEL_LABEL
+    );
+    let raw_item = ConversationItem::agent_message(&raw);
+    let raw_bytes = serde_json::to_vec(&raw_item).unwrap();
+    let harness = TestHarness::with_conversation(vec![raw_item]);
+
+    let request = harness
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        request.items[0].text_content(),
+        format!(
+            "{}\n{raw}",
+            crate::compaction_utils::AGENT_MESSAGE_MODEL_LABEL
+        )
+    );
+
+    let persisted = harness.handle.get_conversation().await;
+    assert_eq!(persisted[0].text_content(), raw);
+    assert_eq!(serde_json::to_vec(&persisted[0]).unwrap(), raw_bytes);
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_single_item_matches_last_assistant_text() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("the answer"));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("the answer")
+    );
+    assert_eq!(
+        harness.handle.get_trailing_assistant_report().await,
+        harness.handle.get_last_assistant_text().await,
+        "normal turn must match the single-item query"
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_joins_salvaged_segments() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("seg1"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::length_continue_reminder("continue"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("seg2"));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("seg1seg2")
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_skips_reasoning_between_segments() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness.handle.push_tool_result(ConversationItem::Reasoning(
+        xai_grok_sampling_types::synthesized_reasoning_item("r1"),
+    ));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("seg1"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::length_continue_reminder("continue"));
+    harness.handle.push_tool_result(ConversationItem::Reasoning(
+        xai_grok_sampling_types::synthesized_reasoning_item("r2"),
+    ));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("seg2"));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("seg1seg2"),
+        "reasoning siblings are not report content and not a boundary"
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_stops_at_non_salvage_reminder() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("Analysis done."));
+    harness
+        .handle
+        .push_user_message(ConversationItem::system_reminder("finish your todos"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("Final report: X."));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("Final report: X."),
+        "only the Length-continue reminder joins segments"
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_stops_at_tool_boundary() {
+    use xai_grok_sampling_types::ToolCall;
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("pre-tool commentary"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "my_tool".to_string(),
+            arguments: "{}".into(),
+        }]));
+    harness
+        .handle
+        .push_tool_result(ConversationItem::tool_result("call_1", "ok"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("final report"));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("final report")
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_stops_at_real_user_message() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("previous turn"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q2"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("this turn"));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("this turn")
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_skips_empty_assistant_items() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("real report"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("   \n  "));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("real report")
+    );
+}
+
+#[tokio::test]
+async fn cancel_integrity_repair_drops_stranded_continue_reminder() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("partial"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::length_continue_reminder("continue"));
+
+    harness
+        .handle
+        .repair_dangling_after_harness_halt("test-cancel");
+    let conv = harness.handle.get_conversation().await;
+    assert!(
+        !matches!(
+            conv.last(),
+            Some(ConversationItem::User(user))
+                if user.synthetic_reason
+                    == Some(xai_grok_sampling_types::SyntheticReason::LengthContinue)
+        ),
+        "the stranded reminder must not survive the cancel repair"
+    );
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("partial"),
+        "the committed partial stays"
+    );
+}
+
+#[tokio::test]
+async fn recovery_prompt_drops_stranded_continue_reminder() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("partial"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::length_continue_reminder("continue"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::auto_recovery("try again"));
+
+    let conv = harness.handle.get_conversation().await;
+    assert!(
+        !conv.iter().any(|item| matches!(
+            item,
+            ConversationItem::User(user)
+                if user.synthetic_reason
+                    == Some(xai_grok_sampling_types::SyntheticReason::LengthContinue)
+        )),
+        "the dead continuation's reminder must not precede the recovery prompt"
+    );
+}
+
+#[tokio::test]
+async fn next_real_prompt_drops_stranded_continue_reminder() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("partial"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::length_continue_reminder("continue"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("next q"));
+
+    let conv = harness.handle.get_conversation().await;
+    assert!(
+        !conv.iter().any(|item| matches!(
+            item,
+            ConversationItem::User(user)
+                if user.synthetic_reason
+                    == Some(xai_grok_sampling_types::SyntheticReason::LengthContinue)
+        )),
+        "the stranded reminder must not precede the new prompt"
+    );
+    assert!(matches!(
+        conv.last(),
+        Some(ConversationItem::User(user)) if user.synthetic_reason.is_none()
+    ));
+}
+
+async fn assert_no_continue_reminder(harness: &TestHarness, context: &str) {
+    let conv = harness.handle.get_conversation().await;
+    assert!(
+        !conv.iter().any(|item| matches!(
+            item,
+            ConversationItem::User(user)
+                if user.synthetic_reason
+                    == Some(xai_grok_sampling_types::SyntheticReason::LengthContinue)
+        )),
+        "{context}: the dead continuation's reminder must be popped"
+    );
+}
+
+fn seed_stranded_reminder(harness: &TestHarness) {
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("partial"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::length_continue_reminder("continue"));
+}
+
+#[tokio::test]
+async fn stop_hook_feedback_drops_stranded_continue_reminder() {
+    let harness = TestHarness::new();
+    seed_stranded_reminder(&harness);
+    harness
+        .handle
+        .push_user_message(ConversationItem::stop_hook_feedback("keep going"));
+    assert_no_continue_reminder(&harness, "stop-hook feedback").await;
+}
+
+#[tokio::test]
+async fn goal_directive_drops_stranded_continue_reminder() {
+    let harness = TestHarness::new();
+    seed_stranded_reminder(&harness);
+    harness
+        .handle
+        .push_user_message(ConversationItem::goal_summary("next goal round"));
+    assert_no_continue_reminder(&harness, "goal directive").await;
+}
+
+#[tokio::test]
+async fn drained_interjection_drops_stranded_continue_reminder() {
+    let harness = TestHarness::new();
+    seed_stranded_reminder(&harness);
+    harness
+        .handle
+        .push_user_message(ConversationItem::interjection("also do this"));
+    assert_no_continue_reminder(&harness, "drained interjection").await;
+}
+
+#[tokio::test]
+async fn working_directory_switch_push_drops_stranded_continue_reminder() {
+    let harness = TestHarness::new();
+    seed_stranded_reminder(&harness);
+    harness
+        .handle
+        .push_user_message(ConversationItem::working_directory_switch(
+            "cd /elsewhere",
+            2,
+        ));
+    assert_no_continue_reminder(&harness, "directory-switch push").await;
+}
+
+#[tokio::test]
+async fn working_directory_switch_append_drops_stranded_continue_reminder() {
+    let mut harness = TestHarness::new();
+    seed_stranded_reminder(&harness);
+    harness
+        .handle
+        .append_working_directory_switch_and_ack(
+            "cd /elsewhere".to_string(),
+            NonZeroU64::new(2).expect("nonzero"),
+        )
+        .await
+        .expect("append acked");
+    assert_no_continue_reminder(&harness, "directory-switch append").await;
+    let records = harness.drain_persistence();
+    let append_at = records
+        .iter()
+        .position(|reasoning| matches!(reasoning, PersistenceRecord::AcknowledgedMessage(_)))
+        .expect("the switch append reached persistence");
+    assert!(
+        !records[append_at..]
+            .iter()
+            .any(|reasoning| matches!(reasoning, PersistenceRecord::ReplaceHistory(_))),
+        "no history rewrite may follow the acked append: {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_joins_later_reminderless_segments() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("one, "));
+    harness
+        .handle
+        .push_user_message(ConversationItem::length_continue_reminder("continue"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("two, "));
+    harness.handle.push_tool_result(ConversationItem::Reasoning(
+        xai_grok_sampling_types::synthesized_reasoning_item("r"),
+    ));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("three"));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("one, two, three"),
+        "the budget-2 exhaustion path produces three segments; all must join"
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_joins_into_a_tool_calling_tail() {
+    use xai_grok_sampling_types::ToolCall;
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("cut sen"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::length_continue_reminder("continue"));
+    let mut tail = ConversationItem::assistant_tool_calls(vec![ToolCall {
+        id: "call_1".into(),
+        name: "my_tool".to_string(),
+        arguments: "{}".into(),
+    }]);
+    if let ConversationItem::Assistant(assistant) = &mut tail {
+        assistant.content = "tence, done.".into();
+    }
+    harness.handle.push_assistant_response(tail);
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("cut sentence, done."),
+        "earlier salvage segments join into a tool-calling tail"
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_survives_trailing_reminder() {
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("final report"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::system_reminder("todo impasse"));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("final report")
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_survives_trailing_tool_results() {
+    use xai_grok_sampling_types::ToolCall;
+    let harness = TestHarness::new();
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("commentary then stop"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "my_tool".to_string(),
+            arguments: "{}".into(),
+        }]));
+    harness
+        .handle
+        .push_tool_result(ConversationItem::tool_result("call_1", "ok"));
+
+    assert_eq!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .as_deref(),
+        Some("commentary then stop")
+    );
+}
+
+#[tokio::test]
+async fn get_trailing_assistant_report_no_assistant_text() {
+    let harness = TestHarness::new();
+    assert!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .is_none()
+    );
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("hi"));
+    assert!(
+        harness
+            .handle
+            .get_trailing_assistant_report()
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn build_request_budgets_tool_images_on_request_copy_only() {
+    use xai_grok_sampling_types::{ContentPart, ToolCall};
+
+    let image_url = format!(
+        "data:image/png;base64,{}",
+        "A".repeat(crate::image_budget::IMAGE_COMPACT_TRIGGER_BYTES)
+    );
+    let source = vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"target_file":"image.png"}"#.into(),
+        }]),
+        ConversationItem::tool_result_with_images(
+            "call-1",
+            "tool text",
+            vec![ContentPart::Image {
+                url: image_url.into(),
+            }],
+        ),
+    ];
+    let source_bytes = serde_json::to_vec(&source).unwrap().len();
+    let mut harness = TestHarness::with_conversation(source);
+    let request = harness
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+    let event = harness.next_event().await;
+    let canonical = harness.handle.get_conversation().await;
+
+    let ChatStateEvent::ImageBudget {
+        body_bytes,
+        body_bytes_after,
+        inline_images,
+        needs_image_compaction,
+        evicted,
+        ..
+    } = event
+    else {
+        panic!("expected image budget event");
+    };
+    assert_eq!(body_bytes, source_bytes);
+    assert_eq!(
+        body_bytes_after,
+        serde_json::to_vec(&request.items).unwrap().len()
+    );
+    assert_eq!(inline_images, 1);
+    assert!(needs_image_compaction);
+    assert_eq!(evicted, 1);
+    let ConversationItem::ToolResult(request_result) = &request.items[1] else {
+        panic!("expected request tool result");
+    };
+    assert!(request_result.images.is_empty());
+    assert_eq!(request_result.tool_call_id, "call-1");
+    assert!(request_result.content.starts_with("tool text\n\n"));
+    assert!(
+        request_result
+            .content
+            .contains("images from this tool result were removed")
+    );
+    let ConversationItem::ToolResult(canonical_result) = &canonical[1] else {
+        panic!("expected canonical tool result");
+    };
+    assert_eq!(canonical_result.images.len(), 1);
+    assert_eq!(canonical_result.content.as_ref(), "tool text");
+}
+
+#[tokio::test]
+async fn prefix_stable_after_tool_result_pruning() {
+    let harness = TestHarness::with_context_window(10_000);
+
+    harness
+        .handle
+        .push_user_message(ConversationItem::system("sys"));
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q1"));
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("a1"));
+    harness
+        .handle
+        .push_tool_result(ConversationItem::tool_result("c1", "x".repeat(500)));
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q2"));
+
+    let req1 = harness
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r1".into())
+        .await
+        .unwrap();
+
+    harness
+        .handle
+        .push_assistant_response(ConversationItem::assistant("a2"));
+    harness
+        .handle
+        .push_tool_result(ConversationItem::tool_result("c2", "y".repeat(500)));
+    harness
+        .handle
+        .push_user_message(ConversationItem::user("q3"));
+    harness.handle.record_token_usage(6000);
+
+    let req2 = harness
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r2".into())
+        .await
+        .unwrap();
+
+    let body1 = serialize_via_public_api(&req1);
+    let body2 = serialize_via_public_api(&req2);
+    let input1 = body1["input"].as_array().unwrap();
+    let input2 = body2["input"].as_array().unwrap();
+
+    assert_eq!(
+        input1[0], input2[0],
+        "system prompt must be stable after pruning"
+    );
+    assert!(
+        input2.len() >= input1.len(),
+        "pruned request should still have >= items"
+    );
+
+    let extract_user_texts = |input: &[serde_json::Value]| -> Vec<String> {
+        input
+            .iter()
+            .filter_map(|value| {
+                if value.get("role").and_then(|reasoning| reasoning.as_str()) == Some("user") {
+                    value
+                        .get("content")
+                        .and_then(|content| content.as_str())
+                        .map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let users1 = extract_user_texts(input1);
+    let users2 = extract_user_texts(input2);
+    let mut idx2 = 0;
+    for u1 in &users1 {
+        while idx2 < users2.len() && &users2[idx2] != u1 {
+            idx2 += 1;
+        }
+        assert!(
+            idx2 < users2.len(),
+            "user message {u1:?} from req1 must appear in req2 in same order"
+        );
+        idx2 += 1;
+    }
 }

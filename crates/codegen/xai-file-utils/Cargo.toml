@@ -11,6 +11,7 @@ anyhow = { workspace = true }
 base64.workspace = true
 dunce = { workspace = true }
 xai-circuit-breaker = { workspace = true }
+xai-grok-extra-ca = { workspace = true }
 xai-grok-version = { workspace = true }
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",

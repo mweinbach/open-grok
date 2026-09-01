@@ -305,6 +305,51 @@ impl CompiledPolicy {
     /// Like [`Self::evaluate`], cwd-joining relative tool paths before the
     /// path-glob match.
     pub fn evaluate_with_cwd(&self, access: &AccessKind, cwd: Option<&Path>) -> Option<Decision> {
+        self.evaluate_with_cwd_details(access, cwd).0
+    }
+
+    pub(crate) fn evaluate_with_cwd_details(
+        &self,
+        access: &AccessKind,
+        cwd: Option<&Path>,
+    ) -> (Option<Decision>, bool) {
+        let lexical = self.evaluate_lexical_with_cwd(access, cwd);
+        let Some(path) = native_file_path(access) else {
+            return (lexical, false);
+        };
+        let Some(raw_absolute) = raw_absolute_tool_path(path, cwd) else {
+            return (lexical, false);
+        };
+        let lexical_abs = path_match_string(&absolute_normalized_path(path, cwd));
+        match follow_absolute_symlink(&raw_absolute, &lexical_abs) {
+            SymlinkFollow::Target(resolved) => {
+                let resolved_decision = match self
+                    .evaluate_lexical_with_cwd(&access_with_path(access, resolved), cwd)
+                {
+                    Some(decision @ (Decision::Reject(_) | Decision::Ask)) => Some(decision),
+                    _ => None,
+                };
+                (combine_decisions(lexical, resolved_decision), false)
+            }
+            SymlinkFollow::Unresolvable if self.native_path_restrictions_apply(access) => {
+                (combine_decisions(lexical, Some(Decision::Ask)), true)
+            }
+            SymlinkFollow::Unresolvable | SymlinkFollow::None => (lexical, false),
+        }
+    }
+
+    fn native_path_restrictions_apply(&self, access: &AccessKind) -> bool {
+        self.config.rules.iter().any(|rule| {
+            matches!(rule.action, RuleAction::Deny | RuleAction::Ask)
+                && tool_filter_matches(access, &rule.tool)
+        })
+    }
+
+    pub(crate) fn evaluate_lexical_with_cwd(
+        &self,
+        access: &AccessKind,
+        cwd: Option<&Path>,
+    ) -> Option<Decision> {
         let mut matched_ask = false;
         let mut matched_allow = false;
 
@@ -330,6 +375,7 @@ impl CompiledPolicy {
                         ToolFilter::Mcp => "mcp",
                         ToolFilter::WebFetch => "web_fetch",
                         ToolFilter::WebSearch => "web_search",
+                        ToolFilter::AgentMessage => "agent_message",
                     };
                     let reason = match &rule.pattern {
                         Some(pattern) => format!(
@@ -640,6 +686,7 @@ fn tool_filter_matches(access: &AccessKind, filter: &ToolFilter) -> bool {
         ToolFilter::Mcp => matches!(access, AccessKind::MCPTool { .. }),
         ToolFilter::WebFetch => matches!(access, AccessKind::WebFetch(_)),
         ToolFilter::WebSearch => matches!(access, AccessKind::WebSearch(_)),
+        ToolFilter::AgentMessage => matches!(access, AccessKind::AgentMessage { .. }),
     }
 }
 
@@ -691,12 +738,19 @@ const EXEC_VEHICLE_HEAD_FAMILIES: &[&str] = &["python", "node", "ruby", "perl", 
 /// [`EXEC_VEHICLE_HEADS`] or a versioned [`EXEC_VEHICLE_HEAD_FAMILIES`]
 /// spelling. `pub(crate)` so [`minimum_always_allow_scope`] floors these to
 /// the full command like dangerous verbs.
+pub(crate) fn normalized_command_head(words: &[String]) -> Option<String> {
+    let head = words
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    Some(head.strip_suffix(".exe").unwrap_or(&head).to_owned())
+}
 pub(crate) fn head_is_exec_vehicle(words: &[String]) -> bool {
-    let Some(head) = words.first().and_then(|w| w.rsplit(['/', '\\']).next()) else {
+    let Some(head) = normalized_command_head(words) else {
         return false;
     };
-    let head = head.to_ascii_lowercase();
-    let head = head.strip_suffix(".exe").unwrap_or(&head);
+    let head = head.as_str();
     if EXEC_VEHICLE_HEADS.contains(&head) {
         return true;
     }
@@ -824,6 +878,10 @@ fn pattern_matches(access: &AccessKind, cr: &CompiledRule<'_>, cwd: Option<&Path
         AccessKind::WebSearch(query) => {
             glob_matches(query, MatchContext::Freeform, cr.matcher) || query.starts_with(pattern)
         }
+        AccessKind::AgentMessage { subagent_id } => {
+            glob_matches(subagent_id, MatchContext::Freeform, cr.matcher)
+                || subagent_id.starts_with(pattern)
+        }
     }
 }
 
@@ -894,12 +952,138 @@ fn is_tilde_path(path: &Path) -> bool {
     )
 }
 
+fn native_file_path(access: &AccessKind) -> Option<&str> {
+    match access {
+        AccessKind::Edit(path) => Some(path.as_str()),
+        AccessKind::Read(Some(path)) => Some(path.as_str()),
+        AccessKind::Grep {
+            path: Some(path), ..
+        } => Some(path.as_str()),
+        _ => None,
+    }
+}
+
+fn access_with_path(access: &AccessKind, path: String) -> AccessKind {
+    match access {
+        AccessKind::Edit(_) => AccessKind::Edit(path),
+        AccessKind::Read(_) => AccessKind::Read(Some(path)),
+        AccessKind::Grep { glob, .. } => AccessKind::Grep {
+            path: Some(path),
+            glob: glob.clone(),
+        },
+        _ => unreachable!("caller filters via native_file_path"),
+    }
+}
+
+fn raw_absolute_tool_path(path: &str, cwd: Option<&Path>) -> Option<String> {
+    let raw = Path::new(path);
+    if is_tilde_path(raw) {
+        return None;
+    }
+    let joined = match cwd {
+        Some(cwd) if !raw.is_absolute() => cwd.join(raw),
+        _ => raw.to_path_buf(),
+    };
+    joined.is_absolute().then(|| path_match_string(&joined))
+}
 fn path_match_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
 fn path_has_parent_dir(path: &Path) -> bool {
     path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
+fn path_has_symlink(absolute: &str) -> bool {
+    let path = Path::new(absolute);
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut prefix = PathBuf::new();
+    for comp in path.components() {
+        prefix.push(comp);
+        if std::fs::symlink_metadata(&prefix).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn resolve_symlink_target(absolute: &str) -> Option<String> {
+    let path = Path::new(absolute);
+    if !path.is_absolute() {
+        return None;
+    }
+    let resolved = resolve_following_symlinks(path)?;
+    Some(path_match_string(&normalize_lexically(&resolved)))
+}
+
+pub(crate) fn resolve_following_symlinks(path: &Path) -> Option<PathBuf> {
+    fn walk(path: &Path, depth: usize) -> Option<PathBuf> {
+        const MAX_SYMLINK_DEPTH: usize = 40;
+        if depth > MAX_SYMLINK_DEPTH {
+            return None;
+        }
+        if let Ok(canonical) = dunce::canonicalize(path) {
+            return Some(canonical);
+        }
+        let parent = path.parent()?;
+        let file_name = path.file_name()?;
+        let resolved_parent = walk(parent, depth + 1)?;
+        let candidate = resolved_parent.join(file_name);
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return None,
+        };
+        if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
+            let target = std::fs::read_link(&candidate).ok()?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                resolved_parent.join(target)
+            };
+            return walk(&target, depth + 1);
+        }
+        Some(candidate)
+    }
+    walk(path, 0)
+}
+
+#[derive(Debug)]
+pub(crate) enum SymlinkFollow {
+    None,
+    Target(String),
+    Unresolvable,
+}
+
+pub(crate) fn follow_absolute_symlink(raw_absolute: &str, lexical_absolute: &str) -> SymlinkFollow {
+    match resolve_symlink_target(raw_absolute) {
+        Some(resolved) if resolved != lexical_absolute => SymlinkFollow::Target(resolved),
+        Some(_) => SymlinkFollow::None,
+        None if path_has_symlink(raw_absolute) => SymlinkFollow::Unresolvable,
+        None => SymlinkFollow::None,
+    }
+}
+
+fn decision_rank(decision: &Decision) -> u8 {
+    match decision {
+        Decision::Reject(_) | Decision::PolicyDeny(_) => 3,
+        Decision::Ask => 2,
+        Decision::Allow => 1,
+        Decision::FollowupMessage(_) | Decision::Cancelled => 0,
+    }
+}
+
+pub(crate) fn combine_decisions(a: Option<Decision>, b: Option<Decision>) -> Option<Decision> {
+    match (a, b) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => Some(if decision_rank(&a) >= decision_rank(&b) {
+            a
+        } else {
+            b
+        }),
+    }
 }
 
 fn domain_matches(pattern: &str, url: &str) -> bool {
@@ -966,6 +1150,14 @@ fn webfetch_probes() -> Vec<AccessKind> {
 /// [`pattern_matches`] so detection can't drift: `*://*` and `*__*` are judged as
 /// enforced. `Any` counts when it opens ANY of Bash/MCP/WebFetch (catching
 /// `?*`-class and `*://*` globs); Read/Edit/Grep are file-access only, return `false`.
+fn agent_message_probes() -> Vec<AccessKind> {
+    ["sub-1", "agent-alpha", "019ffeed", "worker_4"]
+        .iter()
+        .map(|subagent_id| AccessKind::AgentMessage {
+            subagent_id: (*subagent_id).to_owned(),
+        })
+        .collect()
+}
 pub(crate) fn rule_is_catchall(rule: &PermissionRule) -> bool {
     // Compile the matcher as `CompiledPolicy::new` does, so probing == enforcement.
     let matcher = rule
@@ -982,8 +1174,12 @@ pub(crate) fn rule_is_catchall(rule: &PermissionRule) -> bool {
         ToolFilter::Bash => opens_all(bash_probes()),
         ToolFilter::Mcp => opens_all(mcp_probes()),
         ToolFilter::WebFetch => opens_all(webfetch_probes()),
+        ToolFilter::AgentMessage => opens_all(agent_message_probes()),
         ToolFilter::Any => {
-            opens_all(bash_probes()) || opens_all(mcp_probes()) || opens_all(webfetch_probes())
+            opens_all(bash_probes())
+                || opens_all(mcp_probes())
+                || opens_all(webfetch_probes())
+                || opens_all(agent_message_probes())
         }
         ToolFilter::Read | ToolFilter::Edit | ToolFilter::Grep | ToolFilter::WebSearch => false,
     }
@@ -1203,6 +1399,53 @@ mod tests {
     }
 
     #[test]
+    fn write_scoped_access_respects_edit_deny_and_not_read_allow() {
+        use crate::permission::rules::parse_permission_rule;
+        use xai_grok_tools::implementations::opencode::edit::EditInput;
+        use xai_grok_tools::types::ToolInput;
+        use xai_tool_types::TaskToolInput;
+
+        let edit = AccessKind::from(&ToolInput::from(EditInput {
+            file_path: "/tmp/denied.txt".into(),
+            old_string: "ORIGINAL".into(),
+            new_string: "BYPASS".into(),
+            replace_all: false,
+        }));
+        let task = AccessKind::from(&ToolInput::Task(TaskToolInput {
+            prompt: "edit config.toml".into(),
+            description: "spawn".into(),
+            subagent_type: "general-purpose".into(),
+            run_in_background: false,
+            capability_mode: None,
+            isolation: None,
+            resume_from: None,
+            cwd: None,
+            model: None,
+            task_id: None,
+            context: None,
+            reasoning_effort: None,
+        }));
+
+        let deny_edits = CompiledPolicy::new(PermissionConfig::new(vec![
+            parse_permission_rule("Edit(*)", RuleAction::Deny).unwrap(),
+        ]));
+        assert!(matches!(
+            deny_edits.evaluate(&edit),
+            Some(Decision::Reject(_))
+        ));
+        assert!(matches!(
+            deny_edits.evaluate(&task),
+            Some(Decision::Reject(_))
+        ));
+
+        let allow_read = CompiledPolicy::new(PermissionConfig::new(vec![
+            parse_permission_rule("Read", RuleAction::Allow).unwrap(),
+        ]));
+        assert!(allow_read.evaluate(&task).is_none());
+        assert!(allow_read.evaluate(&edit).is_none());
+    }
+
+    #[test]
     fn test_web_fetch_domain_matching() {
         let access = AccessKind::WebFetch("https://api.example.com/v1/data".to_string());
         assert!(matches(&access, &domain_rule("example.com")));
@@ -1256,6 +1499,57 @@ mod tests {
         assert!(!tool_filter_matches(
             &AccessKind::Edit("x".into()),
             &ToolFilter::Bash
+        ));
+    }
+
+    #[test]
+    fn legacy_agent_message_policy_alias_preserves_deny_and_ask_semantics() {
+        use crate::permission::rules::parse_permission_rule;
+
+        let access = AccessKind::AgentMessage {
+            subagent_id: "sub-1".into(),
+        };
+        for spelling in ["SendAgentMessage", "SendAgentMessage(*)"] {
+            let deny = PermissionConfig::new(vec![
+                parse_permission_rule(spelling, RuleAction::Deny)
+                    .expect("legacy deny rule must parse"),
+            ]);
+            assert!(matches!(
+                evaluate_policy(&access, &deny),
+                Some(Decision::Reject(_))
+            ));
+
+            let ask = PermissionConfig::new(vec![
+                parse_permission_rule(spelling, RuleAction::Ask)
+                    .expect("legacy ask rule must parse"),
+            ]);
+            assert!(matches!(
+                evaluate_policy(&access, &ask),
+                Some(Decision::Ask)
+            ));
+        }
+    }
+
+    #[test]
+    fn agent_message_filter_is_dedicated_and_any_still_matches() {
+        let access = AccessKind::AgentMessage {
+            subagent_id: "sub-1".into(),
+        };
+        assert!(tool_filter_matches(&access, &ToolFilter::AgentMessage));
+        assert!(tool_filter_matches(&access, &ToolFilter::Any));
+        assert!(!tool_filter_matches(&access, &ToolFilter::Edit));
+        assert!(!tool_filter_matches(&access, &ToolFilter::Read));
+
+        let edit_allow = PermissionConfig::new(vec![PermissionRule {
+            action: RuleAction::Allow,
+            tool: ToolFilter::Edit,
+            pattern: None,
+            pattern_mode: PatternMode::Glob,
+        }]);
+        assert!(evaluate_policy(&access, &edit_allow).is_none());
+        assert!(matches!(
+            evaluate_policy(&AccessKind::Edit("src/main.rs".into()), &edit_allow,),
+            Some(Decision::Allow)
         ));
     }
 
@@ -1357,56 +1651,6 @@ mod tests {
         ]);
         let result = evaluate_policy(&AccessKind::Bash("rm -rf /".into()), &policy);
         assert!(matches!(result, Some(Decision::Reject(_))));
-    }
-
-    /// Session working-directory rules (`/add-dir`) are appended at runtime
-    /// and must be removable without touching configured rules: appending
-    /// grants the added root, resetting drops exactly the appended slice.
-    #[test]
-    fn append_session_rules_grant_and_reset_restores() {
-        use crate::permission::rules::working_directory_rules;
-        let config = PermissionConfig::new(vec![bash_rule(RuleAction::Allow, "cargo *")]);
-        let mut compiled = CompiledPolicy::new(config);
-        let baseline = compiled.rule_count();
-        assert_eq!(baseline, 1);
-
-        // Outside the added root: no decision (falls through to prompts).
-        let outside = AccessKind::Edit("/elsewhere/file.rs".to_string());
-        assert!(compiled.evaluate(&outside).is_none());
-
-        let added = working_directory_rules(std::path::Path::new("/tmp/proj"));
-        compiled.append_rules(added);
-        assert_eq!(compiled.rule_count(), baseline + 2);
-
-        // Reads and edits under the added root are allowed…
-        let inside_edit = AccessKind::Edit("/tmp/proj/src/main.rs".to_string());
-        assert!(matches!(
-            compiled.evaluate(&inside_edit),
-            Some(Decision::Allow)
-        ));
-        let inside_read = AccessKind::Read(Some("/tmp/proj/README.md".to_string()));
-        assert!(matches!(
-            compiled.evaluate(&inside_read),
-            Some(Decision::Allow)
-        ));
-        // …the configured rule still works, and outside stays undecided.
-        assert!(matches!(
-            compiled.evaluate(&AccessKind::Bash("cargo build".into())),
-            Some(Decision::Allow)
-        ));
-        assert!(compiled.evaluate(&outside).is_none());
-
-        // Reset drops exactly the appended rules, leaving config intact.
-        assert_eq!(compiled.reset_session_rules(), 2);
-        assert_eq!(compiled.rule_count(), baseline);
-        assert!(compiled.evaluate(&inside_edit).is_none());
-        assert!(matches!(
-            compiled.evaluate(&AccessKind::Bash("cargo build".into())),
-            Some(Decision::Allow)
-        ));
-        // A second reset is a no-op, not an underflow.
-        assert_eq!(compiled.reset_session_rules(), 0);
-        assert_eq!(compiled.rule_count(), baseline);
     }
 
     #[test]
@@ -2337,5 +2581,322 @@ mod tests {
         ));
         assert!(eval_read_at("docs/sub/deep.md", &rule, cwd).is_none());
         assert!(eval_read_at("docs/../escape.md", &rule, cwd).is_none());
+    }
+    #[cfg(unix)]
+    fn file_rule(action: RuleAction, tool: ToolFilter, pattern: &str) -> PermissionRule {
+        PermissionRule {
+            action,
+            tool,
+            pattern: Some(pattern.to_owned()),
+            pattern_mode: PatternMode::Glob,
+        }
+    }
+
+    #[cfg(unix)]
+    fn symlink_leaf_access(tool: ToolFilter, arg: &str) -> AccessKind {
+        match tool {
+            ToolFilter::Edit => AccessKind::Edit(arg.into()),
+            ToolFilter::Read => AccessKind::Read(Some(arg.into())),
+            ToolFilter::Grep => AccessKind::Grep {
+                path: Some(arg.into()),
+                glob: None,
+            },
+            _ => panic!("unexpected tool"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deny_matches_workspace_symlink_target_for_edit_read_grep() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("deny-secret.txt");
+        std::fs::write(&secret, b"secret").unwrap();
+        std::fs::create_dir(ws.path().join("config")).unwrap();
+        symlink(&secret, ws.path().join("config/notes.txt")).unwrap();
+
+        for tool in [ToolFilter::Edit, ToolFilter::Read, ToolFilter::Grep] {
+            let policy = CompiledPolicy::new(PermissionConfig::new(vec![file_rule(
+                RuleAction::Deny,
+                tool.clone(),
+                "**/deny-secret.txt",
+            )]));
+            let decision = policy.evaluate_with_cwd(
+                &symlink_leaf_access(tool.clone(), "config/notes.txt"),
+                Some(ws.path()),
+            );
+            assert!(
+                matches!(decision, Some(Decision::Reject(_))),
+                "expected Reject for {tool:?} via symlink, got {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn midpath_symlink_deny_on_real_path_rejects() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real_dir = outside.path().join("prohibited-zone");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("data.txt"), b"secret").unwrap();
+        symlink(&real_dir, ws.path().join("linked")).unwrap();
+
+        let policy = CompiledPolicy::new(PermissionConfig::new(vec![file_rule(
+            RuleAction::Deny,
+            ToolFilter::Edit,
+            "**/prohibited-zone/**",
+        )]));
+        let decision =
+            policy.evaluate_with_cwd(&AccessKind::Edit("linked/data.txt".into()), Some(ws.path()));
+        assert!(
+            matches!(decision, Some(Decision::Reject(_))),
+            "expected Reject for mid-path symlink, got {decision:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn physical_dotdot_after_symlink_hits_deny() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let zone = outside.path().join("prohibited-zone");
+        std::fs::create_dir_all(zone.join("dir")).unwrap();
+        std::fs::create_dir_all(zone.join("dir2")).unwrap();
+        std::fs::write(zone.join("dir2/x"), b"secret").unwrap();
+        symlink(zone.join("dir"), ws.path().join("link")).unwrap();
+
+        let policy = CompiledPolicy::new(PermissionConfig::new(vec![file_rule(
+            RuleAction::Deny,
+            ToolFilter::Read,
+            "**/prohibited-zone/**",
+        )]));
+        let decision = policy.evaluate_with_cwd(
+            &AccessKind::Read(Some("link/../dir2/x".into())),
+            Some(ws.path()),
+        );
+        assert!(
+            matches!(decision, Some(Decision::Reject(_))),
+            "expected Reject for physical .. after symlink, got {decision:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dangling_leaf_symlink_deny_on_target_rejects() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret_dir = outside.path().join("prohibited-zone");
+        std::fs::create_dir(&secret_dir).unwrap();
+        symlink(secret_dir.join("new.txt"), ws.path().join("out")).unwrap();
+
+        let policy = CompiledPolicy::new(PermissionConfig::new(vec![file_rule(
+            RuleAction::Deny,
+            ToolFilter::Edit,
+            "**/prohibited-zone/**",
+        )]));
+        let decision = policy.evaluate_with_cwd(&AccessKind::Edit("out".into()), Some(ws.path()));
+        assert!(
+            matches!(decision, Some(Decision::Reject(_))),
+            "expected Reject for dangling symlink create, got {decision:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn allow_on_target_not_granted_via_symlink_arg() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("allowed-outside.txt");
+        std::fs::write(&secret, b"x").unwrap();
+        std::fs::create_dir(ws.path().join("config")).unwrap();
+        symlink(&secret, ws.path().join("config/notes.txt")).unwrap();
+
+        let policy = CompiledPolicy::new(PermissionConfig::new(vec![file_rule(
+            RuleAction::Allow,
+            ToolFilter::Edit,
+            "**/allowed-outside.txt",
+        )]));
+        let decision = policy.evaluate_with_cwd(
+            &AccessKind::Edit("config/notes.txt".into()),
+            Some(ws.path()),
+        );
+        assert!(
+            decision.is_none(),
+            "expected no Allow via symlink arg, got {decision:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ask_matches_resolved_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("ask-target.txt");
+        std::fs::write(&secret, b"x").unwrap();
+        std::fs::create_dir(ws.path().join("config")).unwrap();
+        symlink(&secret, ws.path().join("config/notes.txt")).unwrap();
+
+        let policy = CompiledPolicy::new(PermissionConfig::new(vec![file_rule(
+            RuleAction::Ask,
+            ToolFilter::Edit,
+            "**/ask-target.txt",
+        )]));
+        let decision = policy.evaluate_with_cwd(
+            &AccessKind::Edit("config/notes.txt".into()),
+            Some(ws.path()),
+        );
+        assert!(
+            matches!(decision, Some(Decision::Ask)),
+            "expected Ask via symlink target, got {decision:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deny_on_target_beats_allow_on_link() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("deny-secret.txt");
+        std::fs::write(&secret, b"secret").unwrap();
+        std::fs::create_dir(ws.path().join("config")).unwrap();
+        symlink(&secret, ws.path().join("config/notes.txt")).unwrap();
+
+        let policy = CompiledPolicy::new(PermissionConfig::new(vec![
+            file_rule(RuleAction::Allow, ToolFilter::Edit, "config/notes.txt"),
+            file_rule(RuleAction::Deny, ToolFilter::Edit, "**/deny-secret.txt"),
+        ]));
+        let decision = policy.evaluate_with_cwd(
+            &AccessKind::Edit("config/notes.txt".into()),
+            Some(ws.path()),
+        );
+        assert!(
+            matches!(decision, Some(Decision::Reject(_))),
+            "expected Reject over lexical Allow, got {decision:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unresolvable_symlink_with_restrictions_asks() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        symlink(ws.path().join("b"), ws.path().join("a")).unwrap();
+        symlink(ws.path().join("a"), ws.path().join("b")).unwrap();
+
+        for (tool, access) in [
+            (ToolFilter::Read, AccessKind::Read(Some("a".into()))),
+            (
+                ToolFilter::Grep,
+                AccessKind::Grep {
+                    path: Some("a".into()),
+                    glob: None,
+                },
+            ),
+        ] {
+            let restricted = CompiledPolicy::new(PermissionConfig::new(vec![file_rule(
+                RuleAction::Deny,
+                tool.clone(),
+                "**/unrelated/**",
+            )]));
+            let (decision, fail_closed) =
+                restricted.evaluate_with_cwd_details(&access, Some(ws.path()));
+            assert!(
+                matches!(decision, Some(Decision::Ask)),
+                "expected Ask for {tool:?} cycle, got {decision:?}"
+            );
+            assert!(fail_closed, "expected fail-closed for {tool:?} cycle");
+        }
+
+        let open = CompiledPolicy::new(PermissionConfig::new(vec![]));
+        let (open_decision, open_fail) =
+            open.evaluate_with_cwd_details(&AccessKind::Read(Some("a".into())), Some(ws.path()));
+        assert!(
+            open_decision.is_none(),
+            "expected no Ask without restrictions, got {open_decision:?}"
+        );
+        assert!(!open_fail);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unresolvable_midpath_symlink_asks() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::tempdir().unwrap();
+        symlink(ws.path().join("linkdir2"), ws.path().join("linkdir")).unwrap();
+        symlink(ws.path().join("linkdir"), ws.path().join("linkdir2")).unwrap();
+
+        let policy = CompiledPolicy::new(PermissionConfig::new(vec![file_rule(
+            RuleAction::Deny,
+            ToolFilter::Edit,
+            "**/unrelated/**",
+        )]));
+        let (decision, fail_closed) = policy.evaluate_with_cwd_details(
+            &AccessKind::Edit("linkdir/file.txt".into()),
+            Some(ws.path()),
+        );
+        assert!(
+            matches!(decision, Some(Decision::Ask)),
+            "expected Ask for mid-path cycle, got {decision:?}"
+        );
+        assert!(fail_closed);
+    }
+
+    #[test]
+    fn append_session_rules_grant_and_reset_restores() {
+        use crate::permission::rules::working_directory_rules;
+        let config = PermissionConfig::new(vec![bash_rule(RuleAction::Allow, "cargo *")]);
+        let mut compiled = CompiledPolicy::new(config);
+        let baseline = compiled.rule_count();
+        assert_eq!(baseline, 1);
+
+        let outside = AccessKind::Edit("/elsewhere/file.rs".to_string());
+        assert!(compiled.evaluate(&outside).is_none());
+
+        let added = working_directory_rules(std::path::Path::new("/tmp/proj"));
+        compiled.append_rules(added);
+        assert_eq!(compiled.rule_count(), baseline + 2);
+
+        let inside_edit = AccessKind::Edit("/tmp/proj/src/main.rs".to_string());
+        assert!(matches!(
+            compiled.evaluate(&inside_edit),
+            Some(Decision::Allow)
+        ));
+        let inside_read = AccessKind::Read(Some("/tmp/proj/README.md".to_string()));
+        assert!(matches!(
+            compiled.evaluate(&inside_read),
+            Some(Decision::Allow)
+        ));
+        assert!(matches!(
+            compiled.evaluate(&AccessKind::Bash("cargo build".into())),
+            Some(Decision::Allow)
+        ));
+        assert!(compiled.evaluate(&outside).is_none());
+
+        assert_eq!(compiled.reset_session_rules(), 2);
+        assert_eq!(compiled.rule_count(), baseline);
+        assert!(compiled.evaluate(&inside_edit).is_none());
+        assert!(matches!(
+            compiled.evaluate(&AccessKind::Bash("cargo build".into())),
+            Some(Decision::Allow)
+        ));
+        assert_eq!(compiled.reset_session_rules(), 0);
+        assert_eq!(compiled.rule_count(), baseline);
     }
 }

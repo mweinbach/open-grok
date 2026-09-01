@@ -52,6 +52,14 @@ impl AgentView {
             action: xai_grok_telemetry::events::PromptSuggestionAction::Shown,
             chars,
             words,
+            model: None,
+            latency_ms: None,
+            request_id: None,
+            session_id: self
+                .session
+                .session_id
+                .as_ref()
+                .map(|session_id| session_id.0.to_string()),
         });
     }
 

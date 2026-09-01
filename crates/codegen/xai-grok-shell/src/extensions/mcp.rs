@@ -50,7 +50,7 @@ pub mod mcp_methods {
     pub const INIT_PROGRESS: &str = "x.ai/mcp/init_progress";
 }
 use crate::agent::MvpAgent;
-use crate::session::mcp_servers::{McpClient, McpServerName, McpState};
+use crate::session::mcp_servers::{McpClient, McpState};
 
 // ── Wire types: mcp/list ────────────────────────────────────────────
 
@@ -773,13 +773,12 @@ pub(crate) async fn init_agent_mcp_pool(
     }
 
     let noop = xai_grok_session_events::EventWriter::noop();
-    // session_less picks Interactive to preserve prior deferred-OAuth behavior. A session-less SDK
-    // agent can reach this non-interactively; threading real non-interactivity is a deliberate follow-up.
-    let ctx = crate::session::mcp_servers::McpSpawnCtx::session_less(&noop);
+    let ctx = crate::session::mcp_servers::McpSpawnCtx::standalone(&noop)
+        .with_oauth_discovery(crate::session::mcp_servers::McpOauthDiscovery::Network);
     let meta = Default::default();
     let oauth = Default::default();
     let results = start_mcp_servers(configs, Some(cwd), &meta, &oauth, &ctx).await;
-    let clients: HashMap<McpServerName, Arc<McpClient>> = results
+    let clients: xai_grok_mcp::owned_clients::OwnedClients = results
         .into_iter()
         .filter_map(|r| match r {
             Ok(client) => {
@@ -1946,6 +1945,136 @@ async fn handle_delete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agent_pool_discovers_oauth_without_starting_interactive_auth() {
+        use axum::response::IntoResponse;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{origin}/mcp");
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_auth = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_paths = Arc::clone(&paths);
+        let handler_received_auth = Arc::clone(&received_auth);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let paths = Arc::clone(&handler_paths);
+            let received_auth = Arc::clone(&handler_received_auth);
+            let origin = origin.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                paths.lock().unwrap().push(path.clone());
+                if request
+                    .headers()
+                    .contains_key(axum::http::header::AUTHORIZATION)
+                {
+                    received_auth.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                if path.contains("oauth-authorization-server") {
+                    return axum::Json(serde_json::json!({
+                        "issuer": origin,
+                        "authorization_endpoint": format!("{origin}/authorize"),
+                        "token_endpoint": format!("{origin}/token"),
+                        "registration_endpoint": format!("{origin}/register"),
+                        "response_types_supported": ["code"],
+                        "code_challenge_methods_supported": ["S256"],
+                    }))
+                    .into_response();
+                }
+                axum::http::StatusCode::NOT_FOUND.into_response()
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let directory = tempfile::tempdir().unwrap();
+        let pool = Arc::new(TokioMutex::new(McpState::new(vec![
+            acp::McpServer::Http(acp::McpServerHttp::new("sdk-oauth", url.clone())),
+            acp::McpServer::Http(acp::McpServerHttp::new("sdk-key", url).headers(vec![
+                acp::HttpHeader::new("Authorization", "Bearer sdk-key-fixture"),
+            ])),
+        ])));
+
+        init_agent_mcp_pool(&pool, directory.path()).await;
+
+        {
+            let state = pool.lock().await;
+            assert_eq!(state.owned_clients.len(), 2);
+            assert!(state.owned_clients.get("sdk-oauth").unwrap().has_auth());
+            let key_client = state.owned_clients.get("sdk-key").unwrap();
+            assert!(!key_client.has_auth());
+            assert!(key_client.has_configured_auth_header());
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            call_mcp_tool(&pool, "sdk-oauth", None, "echo", serde_json::json!({})),
+        )
+        .await
+        .expect("an SDK tool call must not wait for interactive browser consent");
+        assert!(result.is_err());
+        let observed = paths.lock().unwrap().clone();
+        assert!(
+            observed
+                .iter()
+                .any(|path| path.contains("oauth-authorization-server"))
+        );
+        assert!(
+            observed
+                .iter()
+                .all(|path| !matches!(path.as_str(), "/register" | "/authorize" | "/token"))
+        );
+        assert!(!received_auth.load(std::sync::atomic::Ordering::SeqCst));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_pool_owns_named_clients_until_pool_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let configs = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                acp::McpServer::Http(
+                    acp::McpServerHttp::new(name, "https://shared.example.test/mcp").headers(vec![
+                        acp::HttpHeader::new("Authorization", format!("Bearer {name}-fixture")),
+                    ]),
+                )
+            })
+            .collect();
+        let pool = Arc::new(TokioMutex::new(McpState::new(configs)));
+
+        init_agent_mcp_pool(&pool, directory.path()).await;
+
+        let clients = {
+            let state = pool.lock().await;
+            assert!(state.is_initialized());
+            assert_eq!(state.owned_clients.len(), 2);
+            state
+                .owned_clients
+                .iter()
+                .map(|(name, client)| {
+                    assert!(client.http_headers_match(&HashMap::from([(
+                        "Authorization".to_string(),
+                        format!("Bearer {name}-fixture"),
+                    )])));
+                    (name.clone(), Arc::downgrade(client))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(clients.iter().all(|(_, client)| client.upgrade().is_some()));
+
+        init_agent_mcp_pool(&pool, directory.path()).await;
+
+        {
+            let state = pool.lock().await;
+            for (name, client) in &clients {
+                assert!(std::sync::Weak::ptr_eq(
+                    client,
+                    &Arc::downgrade(state.owned_clients.get(name).unwrap()),
+                ));
+            }
+        }
+
+        drop(pool);
+        assert!(clients.iter().all(|(_, client)| client.upgrade().is_none()));
+    }
 
     /// The emit-only reverse method (`x.ai/mcp/sdk_call`) shares the `x.ai/mcp/`
     /// prefix, so `mvp_agent`'s dispatcher routes an inbound copy of it to this

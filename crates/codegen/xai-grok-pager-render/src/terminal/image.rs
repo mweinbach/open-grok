@@ -187,6 +187,45 @@ pub fn protocol_for_brand(brand: TerminalName, is_windows: bool) -> GraphicsProt
     }
 }
 
+static PROMPT_PREVIEW_PROTOCOL: OnceLock<GraphicsProtocol> = OnceLock::new();
+
+pub fn prompt_preview_graphics_protocol() -> GraphicsProtocol {
+    let base = detect_graphics_protocol();
+    if base != GraphicsProtocol::None || test_protocol_override_active() {
+        return base;
+    }
+    *PROMPT_PREVIEW_PROTOCOL.get_or_init(|| {
+        let ctx = terminal_context();
+        if ctx.graphics_protocol_skip_reason().is_some() {
+            return GraphicsProtocol::None;
+        }
+        prompt_preview_protocol_for_brand(
+            ctx.brand,
+            cfg!(target_os = "windows"),
+            ctx.term_features.as_deref(),
+            ctx.is_ssh,
+        )
+    })
+}
+
+pub fn prompt_preview_protocol_for_brand(
+    brand: TerminalName,
+    is_windows: bool,
+    term_features: Option<&str>,
+    is_ssh: bool,
+) -> GraphicsProtocol {
+    if !is_windows && brand == TerminalName::Iterm2 {
+        let display_allowed = match term_features {
+            Some(features) => features.contains('F'),
+            None => is_ssh,
+        };
+        if display_allowed {
+            return GraphicsProtocol::ITerm2;
+        }
+    }
+    protocol_for_brand(brand, is_windows)
+}
+
 // -------------------------------------------------------------------------
 // Kitty graphics protocol
 // -------------------------------------------------------------------------
@@ -426,7 +465,7 @@ pub fn place_kitty_image_cropped(
 
 /// Build a Kitty escape sequence to delete a specific image by ID.
 pub fn clear_kitty_image(image_id: u32) -> String {
-    format!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id)
+    format!("\x1b_Ga=d,d=i,i={image_id},q=2\x1b\\")
 }
 
 // -------------------------------------------------------------------------
@@ -435,15 +474,12 @@ pub fn clear_kitty_image(image_id: u32) -> String {
 
 /// Build an iTerm2 inline image escape sequence.
 ///
-/// Uses `\x1b]1337;File=inline=1;width=Ncells;height=Ncells;preserveAspectRatio=1:BASE64\x07`.
+/// Uses `\x1b]1337;File=inline=1;width=Ncells;height=Ncells;preserveAspectRatio=0:BASE64\x07`.
 pub fn render_iterm2_image(image_data: &[u8], cols: u16, rows: u16) -> String {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(image_data);
     format!(
-        "\x1b]1337;File=inline=1;width={cols}cells;height={rows}cells;preserveAspectRatio=1:{b64}\x07",
-        cols = cols,
-        rows = rows,
-        b64 = b64,
+        "\x1b]1337;File=inline=1;width={cols}cells;height={rows}cells;preserveAspectRatio=0:{b64}\x07",
     )
 }
 
@@ -454,19 +490,7 @@ pub fn render_iterm2_image(image_data: &[u8], cols: u16, rows: u16) -> String {
 /// Build the full escape-sequence string to render image data at a cell
 /// position using the provided graphics protocol.
 ///
-/// For Kitty: transmits image data once (`a=t`) then places it (`a=p`). Pass
-/// `retransmit = false` on subsequent frames to emit only the placement escape
-/// (~50 bytes) instead of re-uploading the full image every redraw.
-///
-/// For iTerm2: always emits the full inline image escape (no separate transmit
-/// primitive). Callers should pass `retransmit = false` after the first frame
-/// to avoid re-decoding the same image every tick.
-///
 /// Returns `None` when no graphics protocol is available.
-///
-/// Pass `retransmit = false` on subsequent frames to skip the data upload
-/// (Kitty: place-only; iTerm2: no-op).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_overlay_image_escapes_for_protocol(
     protocol: GraphicsProtocol,
     image_data: &[u8],
@@ -474,7 +498,6 @@ pub(super) fn build_overlay_image_escapes_for_protocol(
     rows: u16,
     cell_x: u16,
     cell_y: u16,
-    retransmit: bool,
 ) -> Option<String> {
     if protocol == GraphicsProtocol::None {
         return None;
@@ -482,32 +505,18 @@ pub(super) fn build_overlay_image_escapes_for_protocol(
 
     let mut esc = String::new();
     // ANSI cursor positioning is 1-based.
-    esc.push_str(&format!("\x1b[{};{}H", cell_y + 1, cell_x + 1));
     match protocol {
         GraphicsProtocol::Kitty => {
-            if retransmit {
-                // Transmit once, then place — never use a=T (transmit+display)
-                // on every frame; that re-uploads the full image at ~10fps and
-                // balloons native GPU surface counts in long-lived sessions.
-                // Place-only frames do not need image bytes / format detection.
-                let format = kitty_format_from_bytes(image_data)?;
-                esc.push_str(&transmit_kitty_image(
-                    image_data,
-                    format,
-                    KITTY_PLACEMENT_ID,
-                ));
-            }
-            esc.push_str(&place_kitty_image(
-                KITTY_PLACEMENT_ID,
-                cols,
-                rows,
-                1, // above text (modal overlays)
-            ));
+            let format = kitty_format_from_bytes(image_data)?;
+            esc.push_str(&clear_kitty_image(KITTY_PLACEMENT_ID));
+            esc.push_str(&format!("\x1b[{};{}H", cell_y + 1, cell_x + 1));
+            esc.push_str(&render_kitty_image_z(image_data, format, cols, rows, 1));
         }
         GraphicsProtocol::ITerm2 => {
-            if retransmit {
-                esc.push_str(&render_iterm2_image(image_data, cols, rows));
-            }
+            esc.push_str("\x1b7");
+            esc.push_str(&format!("\x1b[{};{}H", cell_y + 1, cell_x + 1));
+            esc.push_str(&render_iterm2_image(image_data, cols, rows));
+            esc.push_str("\x1b8");
         }
         GraphicsProtocol::None => unreachable!(),
     }
@@ -596,6 +605,37 @@ pub fn place_inline_image(
     Some(esc)
 }
 
+const DEFAULT_CELL_ASPECT: f64 = 0.5;
+
+fn cell_aspect() -> f64 {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        DEFAULT_CELL_ASPECT
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        static CELL_ASPECT: OnceLock<f64> = OnceLock::new();
+        *CELL_ASPECT.get_or_init(|| {
+            crossterm::terminal::window_size()
+                .map(|ws| cell_aspect_from(&ws))
+                .unwrap_or(DEFAULT_CELL_ASPECT)
+        })
+    }
+}
+
+#[cfg_attr(feature = "test-support", allow(dead_code))]
+fn cell_aspect_from(ws: &crossterm::terminal::WindowSize) -> f64 {
+    if ws.columns == 0 || ws.rows == 0 || ws.width == 0 || ws.height == 0 {
+        return DEFAULT_CELL_ASPECT;
+    }
+    let aspect =
+        (f64::from(ws.width) / f64::from(ws.columns)) / (f64::from(ws.height) / f64::from(ws.rows));
+    if (0.3..=0.8).contains(&aspect) {
+        aspect
+    } else {
+        DEFAULT_CELL_ASPECT
+    }
+}
 /// Compute the cell dimensions (`cols`, `rows`) to display an image at
 /// its correct aspect ratio within a bounding box of `max_cols × max_rows`.
 ///
@@ -611,7 +651,7 @@ pub fn fit_image_to_cells(img_w: u32, img_h: u32, max_cols: u16, max_rows: u16) 
     // Cell aspect ratio: width / height. Typical monospace cell is ~0.5
     // (half as wide as tall). This converts between pixel-space and
     // cell-space so the image doesn't appear stretched.
-    let cell_aspect: f64 = 0.5;
+    let cell_aspect = cell_aspect();
 
     // Image aspect ratio in pixel space.
     let img_aspect = img_w as f64 / img_h as f64;

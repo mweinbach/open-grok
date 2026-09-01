@@ -78,7 +78,7 @@ async fn run_rg_search(
     limit: usize,
     cwd: &Path,
 ) -> Result<Vec<String>, String> {
-    let rg_exec = rg_path();
+    let rg_exec = rg_path().map_err(|error| error.to_string())?;
     let mut command = Command::new(rg_exec);
     command
         .current_dir(cwd)

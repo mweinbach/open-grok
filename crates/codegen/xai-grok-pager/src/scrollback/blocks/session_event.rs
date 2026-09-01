@@ -42,6 +42,9 @@ pub enum SessionEvent {
         /// Wall-clock elapsed time before cancellation.
         elapsed: Duration,
     },
+    TurnBlockedByHook {
+        elapsed: Duration,
+    },
     /// Agent turn was halted by the system (e.g. doom loop detection).
     TurnHalted {
         /// Wall-clock elapsed time before the turn was halted.
@@ -165,6 +168,9 @@ impl SessionEvent {
             SessionEvent::TurnCompleted { elapsed: None } => "Turn completed.".to_string(),
             SessionEvent::TurnCancelled { elapsed } => {
                 format!("Turn cancelled by user in {}.", format_duration(*elapsed))
+            }
+            SessionEvent::TurnBlockedByHook { elapsed } => {
+                format!("Turn blocked by a hook in {}.", format_duration(*elapsed))
             }
             SessionEvent::TurnHalted { elapsed } => {
                 format!(
@@ -320,6 +326,7 @@ impl SessionEvent {
             self,
             SessionEvent::TurnCompleted { .. }
                 | SessionEvent::TurnCancelled { .. }
+                | SessionEvent::TurnBlockedByHook { .. }
                 | SessionEvent::TurnHalted { .. }
                 | SessionEvent::TurnFailed { .. }
         )
@@ -696,6 +703,16 @@ mod tests {
     }
 
     #[test]
+    fn hook_blocked_turn_message_and_terminal_classification() {
+        let event = SessionEvent::TurnBlockedByHook {
+            elapsed: Duration::from_millis(700),
+        };
+        assert_eq!(event.message(), "Turn blocked by a hook in 0.7s.");
+        assert!(event.is_turn_terminal());
+        assert!(!event.is_warning_banner());
+    }
+
+    #[test]
     fn goal_completed_message_shows_end_to_end_time() {
         let event = SessionEvent::GoalCompleted {
             elapsed: Duration::from_secs(619),
@@ -820,10 +837,7 @@ mod tests {
             headline: "Server error (500)".into(),
             detail: "upstream exploded".into(),
         };
-        assert_eq!(
-            event.message(),
-            "Server error (500) \u{2014} upstream exploded"
-        );
+        assert_eq!(event.message(), "Server error (500): upstream exploded");
         let block = SessionEventBlock::new(event);
         let theme = Theme::current();
         assert_eq!(

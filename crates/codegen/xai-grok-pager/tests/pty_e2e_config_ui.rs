@@ -8,6 +8,11 @@
 #[path = "pty_e2e/common.rs"]
 mod common;
 
+#[path = "pty_e2e/extensions_modal_workflows_tab_pty.rs"]
+mod extensions_modal_workflows_tab_pty;
+#[path = "pty_e2e/fullscreen_external_editor_round_trip.rs"]
+mod fullscreen_external_editor_round_trip;
+
 #[path = "pty_e2e/agent_type_mismatch_modal_on_model_switch.rs"]
 mod agent_type_mismatch_modal_on_model_switch;
 #[path = "pty_e2e/agent_type_mismatch_no_keeps_current_session.rs"]

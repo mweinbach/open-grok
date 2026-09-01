@@ -115,6 +115,7 @@ impl SessionActor {
                     .session_turn_active
                     .load(std::sync::atomic::Ordering::Acquire)
                 || state.lifecycle_mutation.is_some()
+                || state.finalization_gate.is_active()
             {
                 return;
             }
@@ -379,6 +380,7 @@ impl SessionActor {
                 reasoning_effort: Some(sampling_config.reasoning_effort),
                 resolved_tool_policy: Some(resolved_tool_policy),
             });
+        self.emit_status_snapshot_detached();
         Ok(model_id)
     }
     /// Rebuild the active provider harness between turns.

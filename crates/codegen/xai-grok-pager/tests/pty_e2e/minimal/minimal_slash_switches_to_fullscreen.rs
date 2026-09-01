@@ -31,7 +31,7 @@ async fn minimal_slash_switches_to_fullscreen() {
     inject_keys_paced(&mut harness, b"/fullscreen");
     harness
         .wait_for_text(
-            "Reopen this session in fullscreen mode",
+            "Switch this session to fullscreen mode",
             Duration::from_secs(5),
         )
         .expect("slash dropdown offers /fullscreen");
