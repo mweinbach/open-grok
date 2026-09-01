@@ -54,13 +54,26 @@ unchanged.
 
 ## Publish exact bytes
 
+An ordinary push to `main`, a version bump, or a commit named `Release ...`
+does **not** publish a release. The workflow runs only on explicit dispatch or
+a push that changes `.github/release-target`. Pushing a tag alone is also not
+a workflow trigger. Always pass `--repo mweinbach/open-grok` to `gh`: in a fork
+checkout its inferred repository can be the upstream `xai-org/grok-build`.
+
 1. Push the exact source commit and tag.
 2. Check GitHub CLI auth without inherited overrides: `env -u GH_TOKEN -u GITHUB_TOKEN gh auth status`.
-3. Dispatch `.github/workflows/release.yml` with the existing version tag. The
+3. Dispatch `gh workflow run release.yml --repo mweinbach/open-grok --ref main
+   -f tag=<existing-version-tag>`. Record the returned run URL and wait for
+   **all platform jobs and publication verification to succeed**. The
    workflow checks out the tag, builds all four supported platforms, smokes the
    macOS and Linux installers, publishes all twelve unique assets, re-downloads
    them, and verifies that the release is Latest.
 4. Do not use browser upload as the primary path when local file access is blocked.
+
+If publication fails or is still running, report it as incomplete, not released.
+Confirm `gh api repos/mweinbach/open-grok/releases/latest --jq .tag_name`
+returns the intended tag before testing self-update. The updater consumes the
+published Latest release, not the version file on `main`.
 
 If another publisher races this release, compare tag peel, asset size, and digest before replacing anything. Never assume an existing same-version asset was built from the current head.
 

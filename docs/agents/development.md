@@ -204,6 +204,14 @@ Windows x86_64, Apple Silicon macOS, Linux x86_64, and Linux arm64, builds and
 verifies all four asset sets, publishes one full GitHub Release, re-downloads
 the public bytes, and verifies the tag is Latest.
 
+Neither an ordinary push to `main` nor a tag push starts publication. The
+workflow requires explicit dispatch (or a push changing `.github/release-target`).
+Use `gh workflow run release.yml --repo mweinbach/open-grok --ref main
+-f tag=<existing-version-tag>` and wait for the returned run to finish, including
+publication verification. Always specify the fork repository with `gh`; its
+inferred default may be upstream. A release commit alone does not make an
+update available: self-update reads GitHub's published Latest release.
+
 Release CI preserves Cargo workspace artifacts across fresh GitHub checkouts by
 recording the cached source revision and restoring Git commit mtimes only for
 tracked files unchanged since that revision. Changed, renamed, and new files
