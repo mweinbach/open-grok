@@ -224,6 +224,11 @@ mod tests {
                 for s in &summaries {
                     assert_eq!(s.source, MissionSource::FactoryDroid);
                     assert!(!s.id.is_empty());
+                    if s.id == "6542d338-44c1-43e7-98e7-746950896862" {
+                        assert_eq!(s.total_features, 116);
+                        assert_eq!(s.state, MissionState::Paused);
+                        assert_eq!(s.working_directory.as_deref(), Some("/Users/mweinbach/Projects/agent-coworker"));
+                    }
                 }
             }
         }
