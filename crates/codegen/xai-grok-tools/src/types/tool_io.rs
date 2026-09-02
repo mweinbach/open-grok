@@ -124,6 +124,11 @@ pub enum ToolInput {
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListInput),
     UpdateGoal(UpdateGoalInput),
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolInput),
+    ProposeMission(crate::implementations::grok_build::mission::ProposeMissionInput),
+    StartMissionRun(crate::implementations::grok_build::mission::StartMissionRunInput),
+    DismissHandoffItems(crate::implementations::grok_build::mission::DismissHandoffItemsInput),
+    InspectMissionReadiness(crate::implementations::grok_build::mission::InspectMissionReadinessInput),
+    EndFeatureRun(crate::implementations::grok_build::mission::EndFeatureRunInput),
     /// Dynamic input for runtime-registered tools (MCP, etc.)
     Dynamic(serde_json::Value),
 }

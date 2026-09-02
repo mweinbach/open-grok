@@ -696,6 +696,11 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::TodoWriteTool>();
         b.register::<grok_build::UpdateGoalTool>();
         b.register::<grok_build::WorkflowTool>();
+        b.register::<grok_build::ProposeMissionTool>();
+        b.register::<grok_build::StartMissionRunTool>();
+        b.register::<grok_build::DismissHandoffItemsTool>();
+        b.register::<grok_build::InspectMissionReadinessTool>();
+        b.register::<grok_build::EndFeatureRunTool>();
         b.register::<grok_build::TaskOutputTool>();
         b.register::<grok_build::GetTerminalCommandOutputTool>();
         b.register::<grok_build::WaitTasksTool>();

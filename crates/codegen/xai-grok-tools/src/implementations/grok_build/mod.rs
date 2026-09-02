@@ -26,6 +26,7 @@ pub mod init_or_update_app {
 pub mod kill_task;
 pub mod list_dir;
 pub mod lsp;
+pub mod mission;
 pub mod monitor;
 pub mod read_file;
 pub mod scheduler;
@@ -63,6 +64,13 @@ pub use init_or_update_app::INIT_OR_UPDATE_APP_TOOL_NAME;
 pub use kill_task::{KillTaskTool, KillTerminalCommandTool};
 pub use list_dir::ListDirTool;
 pub use lsp::LspTool;
+pub use mission::{
+    DISMISS_HANDOFF_ITEMS_TOOL_NAME, DismissHandoffItemsTool,
+    END_FEATURE_RUN_TOOL_NAME, EndFeatureRunTool,
+    INSPECT_MISSION_READINESS_TOOL_NAME, InspectMissionReadinessTool,
+    PROPOSE_MISSION_TOOL_NAME, ProposeMissionTool,
+    START_MISSION_RUN_TOOL_NAME, StartMissionRunTool,
+};
 pub use monitor::tool::MonitorTool;
 pub use read_file::ReadFileTool;
 pub use scheduler::create::{

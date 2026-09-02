@@ -138,7 +138,7 @@ pub enum WorkerSuccessState {
 }
 
 /// Discovered issue reported in a worker handoff.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredIssue {
     /// "blocking" or "non_blocking".
@@ -150,7 +150,7 @@ pub struct DiscoveredIssue {
 }
 
 /// Structured record of commands executed during verification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandRunRecord {
     pub command: String,
@@ -159,7 +159,7 @@ pub struct CommandRunRecord {
 }
 
 /// Interactive manual/PTY check executed during verification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractiveCheckRecord {
     pub action: String,
@@ -167,7 +167,7 @@ pub struct InteractiveCheckRecord {
 }
 
 /// Verification section of a worker handoff.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct VerificationSection {
     #[serde(default)]
@@ -177,7 +177,7 @@ pub struct VerificationSection {
 }
 
 /// Test case description inside a test file report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TestCaseRecord {
     pub name: String,
@@ -185,7 +185,7 @@ pub struct TestCaseRecord {
 }
 
 /// Test file additions reported in a worker handoff.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TestFileRecord {
     pub file: String,
@@ -194,7 +194,7 @@ pub struct TestFileRecord {
 }
 
 /// Tests section of a worker handoff.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TestsSection {
     #[serde(default)]
@@ -206,7 +206,7 @@ pub struct TestsSection {
 }
 
 /// Worker skill feedback.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillFeedback {
     #[serde(default)]
@@ -218,7 +218,7 @@ pub struct SkillFeedback {
 }
 
 /// The structured handoff produced by a worker via `end_feature_run`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerHandoff {
     /// Concise executive summary of what was accomplished.
