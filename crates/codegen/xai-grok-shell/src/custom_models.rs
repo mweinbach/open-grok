@@ -212,8 +212,16 @@ impl CustomModelRecord {
             .as_deref()
             .and_then(|raw| parse_provider(raw).ok())
             == Some(ModelProvider::Custom);
-        (is_user_endpoint && self.api_backend.as_deref() == Some("messages"))
-            .then_some(xai_grok_sampler::AuthScheme::XApiKey)
+        if is_user_endpoint {
+            match self.api_backend.as_deref() {
+                Some("messages") => return Some(xai_grok_sampler::AuthScheme::XApiKey),
+                Some("google_ai_studio" | "ai_studio" | "gemini" | "google") => {
+                    return Some(xai_grok_sampler::AuthScheme::XGoogApiKey);
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     pub fn to_override(&self) -> ConfigModelOverride {
@@ -322,18 +330,19 @@ fn parse_provider(raw: &str) -> Result<ModelProvider> {
     }
 }
 
-/// Parse the `auth_scheme` config value (`bearer` or `x_api_key`).
+/// Parse the `auth_scheme` config value (`bearer`, `x_api_key`, or `x_goog_api_key`).
 fn parse_auth_scheme(raw: &str) -> Result<xai_grok_sampler::AuthScheme> {
     serde_json::from_value::<xai_grok_sampler::AuthScheme>(serde_json::Value::String(
         raw.trim().to_owned(),
     ))
-    .map_err(|_| anyhow::anyhow!("invalid auth_scheme `{raw}`; expected bearer or x_api_key"))
+    .map_err(|_| anyhow::anyhow!("invalid auth_scheme `{raw}`; expected bearer, x_api_key, or x_goog_api_key"))
 }
 
 fn auth_scheme_as_str(scheme: xai_grok_sampler::AuthScheme) -> &'static str {
     match scheme {
         xai_grok_sampler::AuthScheme::Bearer => "bearer",
         xai_grok_sampler::AuthScheme::XApiKey => "x_api_key",
+        xai_grok_sampler::AuthScheme::XGoogApiKey => "x_goog_api_key",
     }
 }
 
@@ -342,8 +351,11 @@ fn parse_api_backend(raw: &str) -> Result<ApiBackend> {
         "chat_completions" => Ok(ApiBackend::ChatCompletions),
         "responses" => Ok(ApiBackend::Responses),
         "messages" => Ok(ApiBackend::Messages),
+        "google_ai_studio" | "ai_studio" | "gemini" | "google" => {
+            Ok(ApiBackend::GoogleAiStudio)
+        }
         other => bail!(
-            "invalid api_backend `{other}`; expected chat_completions, responses, or messages"
+            "invalid api_backend `{other}`; expected chat_completions, responses, messages, or google_ai_studio"
         ),
     }
 }
@@ -353,6 +365,7 @@ fn api_backend_as_str(backend: ApiBackend) -> &'static str {
         ApiBackend::ChatCompletions => "chat_completions",
         ApiBackend::Responses => "responses",
         ApiBackend::Messages => "messages",
+        ApiBackend::GoogleAiStudio => "google_ai_studio",
     }
 }
 
@@ -630,5 +643,28 @@ mod tests {
         let json = serde_json::to_value(&public).unwrap();
         assert!(json.get("api_key").is_none());
         assert_eq!(json.get("has_api_key"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn google_ai_studio_api_backend_and_auth_scheme_in_custom_models() {
+        let (record, _) = normalize_custom_model(CustomModelRecord {
+            provider: Some("custom".into()),
+            api_backend: Some("google_ai_studio".into()),
+            base_url: Some("https://generativelanguage.googleapis.com/v1beta".into()),
+            api_key: Some("AIzaSyTestKey".into()),
+            ..record("gemini-custom", "gemini-2.5-flash")
+        })
+        .unwrap();
+        assert_eq!(
+            record.to_override().api_backend,
+            Some(ApiBackend::GoogleAiStudio)
+        );
+        assert_eq!(
+            record.to_override().auth_scheme,
+            Some(xai_grok_sampler::AuthScheme::XGoogApiKey)
+        );
+        let public = override_to_public("gemini-custom", &record.to_override());
+        assert_eq!(public.api_backend.as_deref(), Some("google_ai_studio"));
+        assert_eq!(public.auth_scheme.as_deref(), Some("x_goog_api_key"));
     }
 }

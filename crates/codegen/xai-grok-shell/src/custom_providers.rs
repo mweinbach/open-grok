@@ -46,16 +46,24 @@ pub enum CustomWireFormat {
     Responses,
     /// Anthropic Messages (`{base}/messages`).
     Messages,
+    /// Google AI Studio (`{base}/models/{model}:generateContent`).
+    GoogleAiStudio,
 }
 
 impl CustomWireFormat {
-    pub const ALL: [Self; 3] = [Self::ChatCompletions, Self::Responses, Self::Messages];
+    pub const ALL: [Self; 4] = [
+        Self::ChatCompletions,
+        Self::Responses,
+        Self::Messages,
+        Self::GoogleAiStudio,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
             Self::Messages => "messages",
+            Self::GoogleAiStudio => "google_ai_studio",
         }
     }
 
@@ -65,6 +73,7 @@ impl CustomWireFormat {
             Self::ChatCompletions => "OpenAI Chat Completions",
             Self::Responses => "OpenAI Responses",
             Self::Messages => "Anthropic Messages",
+            Self::GoogleAiStudio => "Google AI Studio",
         }
     }
 
@@ -77,6 +86,7 @@ impl CustomWireFormat {
             }
             "responses" | "openai_responses" | "response" => Some(Self::Responses),
             "messages" | "anthropic" | "anthropic_messages" | "claude" => Some(Self::Messages),
+            "google_ai_studio" | "ai_studio" | "gemini" | "google" => Some(Self::GoogleAiStudio),
             _ => None,
         }
     }
@@ -86,6 +96,7 @@ impl CustomWireFormat {
             Self::ChatCompletions => ApiBackend::ChatCompletions,
             Self::Responses => ApiBackend::Responses,
             Self::Messages => ApiBackend::Messages,
+            Self::GoogleAiStudio => ApiBackend::GoogleAiStudio,
         }
     }
 
@@ -96,6 +107,7 @@ impl CustomWireFormat {
         match self {
             Self::ChatCompletions | Self::Responses => "bearer",
             Self::Messages => "x_api_key",
+            Self::GoogleAiStudio => "x_goog_api_key",
         }
     }
 
@@ -105,6 +117,7 @@ impl CustomWireFormat {
             Self::ChatCompletions => "chat/completions",
             Self::Responses => "responses",
             Self::Messages => "messages",
+            Self::GoogleAiStudio => "models",
         }
     }
 }
@@ -325,6 +338,7 @@ async fn list_models(
             CustomWireFormat::Messages => request
                 .header("x-api-key", api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION),
+            CustomWireFormat::GoogleAiStudio => request.header("x-goog-api-key", api_key),
             CustomWireFormat::ChatCompletions | CustomWireFormat::Responses => {
                 request.bearer_auth(api_key)
             }
@@ -400,7 +414,7 @@ fn parse_model_entries(value: &serde_json::Value, base_url: &str) -> Vec<Discove
         } else {
             continue;
         }
-        let name = ["display_name", "name", "title"]
+        let name = ["display_name", "displayName", "name", "title"]
             .iter()
             .filter_map(|field| entry.get(*field).and_then(serde_json::Value::as_str))
             .map(str::trim)
@@ -412,6 +426,7 @@ fn parse_model_entries(value: &serde_json::Value, base_url: &str) -> Vec<Discove
             "context_length",
             "max_model_len",
             "max_input_tokens",
+            "inputTokenLimit",
         ]
         .iter()
         .filter_map(|field| entry.get(*field).and_then(serde_json::Value::as_u64))
@@ -632,12 +647,28 @@ mod tests {
             CustomWireFormat::from_canonical("openai_chat_completions"),
             Some(CustomWireFormat::ChatCompletions)
         );
+        assert_eq!(
+            CustomWireFormat::from_canonical("google_ai_studio"),
+            Some(CustomWireFormat::GoogleAiStudio)
+        );
+        assert_eq!(
+            CustomWireFormat::from_canonical("gemini"),
+            Some(CustomWireFormat::GoogleAiStudio)
+        );
         assert_eq!(CustomWireFormat::from_canonical("grpc"), None);
         assert_eq!(CustomWireFormat::Messages.auth_scheme(), "x_api_key");
         assert_eq!(CustomWireFormat::Responses.auth_scheme(), "bearer");
         assert_eq!(
+            CustomWireFormat::GoogleAiStudio.auth_scheme(),
+            "x_goog_api_key"
+        );
+        assert_eq!(
             CustomWireFormat::Responses.api_backend(),
             xai_grok_sampling_types::ApiBackend::Responses
+        );
+        assert_eq!(
+            CustomWireFormat::GoogleAiStudio.api_backend(),
+            xai_grok_sampling_types::ApiBackend::GoogleAiStudio
         );
     }
 

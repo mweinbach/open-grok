@@ -4821,6 +4821,8 @@ impl ConfigModelOverride {
         }
         if let Some(v) = self.auth_scheme {
             entry.info.auth_scheme = v;
+        } else if entry.info.api_backend == ApiBackend::GoogleAiStudio {
+            entry.info.auth_scheme = AuthScheme::XGoogApiKey;
         }
         if self.base_url.is_none()
             && entry.info.provider.profile().session_auth.is_api_key_only()

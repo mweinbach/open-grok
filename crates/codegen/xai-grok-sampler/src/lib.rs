@@ -71,7 +71,7 @@ pub use standalone_web_search::{
     StandaloneSearchRole, StandaloneSearchSettings,
 };
 pub use stream::{
-    collect_response, stream_chat_completions, stream_messages, stream_responses,
-    stream_responses_with_client_custom_tools,
+    collect_response, stream_chat_completions, stream_google_ai_studio, stream_messages,
+    stream_responses, stream_responses_with_client_custom_tools,
 };
 pub use types::RequestId;

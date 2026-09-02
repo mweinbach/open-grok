@@ -1385,11 +1385,8 @@ async fn test_responses_backend_hits_responses_endpoint_not_chat_completions() {
                 client.conversation_stream_responses(request).await.unwrap();
             while stream.next().await.is_some() {}
         }
-        ApiBackend::ChatCompletions => {
-            panic!("Expected Responses backend but got ChatCompletions");
-        }
-        ApiBackend::Messages => {
-            panic!("Expected Responses backend but got Messages");
+        ApiBackend::ChatCompletions | ApiBackend::Messages | ApiBackend::GoogleAiStudio => {
+            panic!("Expected Responses backend but got {:?}", client.api_backend());
         }
     }
 
@@ -1423,11 +1420,8 @@ async fn test_chat_completions_backend_hits_chat_endpoint_not_responses() {
             let (mut stream, _metadata) = client.conversation_stream(request).await.unwrap();
             while stream.next().await.is_some() {}
         }
-        ApiBackend::Responses => {
-            panic!("Expected ChatCompletions backend but got Responses");
-        }
-        ApiBackend::Messages => {
-            panic!("Expected ChatCompletions backend but got Messages");
+        ApiBackend::Responses | ApiBackend::Messages | ApiBackend::GoogleAiStudio => {
+            panic!("Expected ChatCompletions backend but got {:?}", client.api_backend());
         }
     }
 
@@ -1439,4 +1433,19 @@ async fn test_chat_completions_backend_hits_chat_endpoint_not_responses() {
         !server.has_responses_request(),
         "Should NOT have called /v1/responses"
     );
+}
+
+#[tokio::test]
+async fn test_google_ai_studio_backend_routing() {
+    let server = MockInferenceServer::start().await.unwrap();
+    server.set_response("OK");
+    let mut config = test_sampler_config(&server.url(), ApiBackend::GoogleAiStudio, &[]);
+    config.provider = xai_grok_sampling_types::ModelProvider::Gemini;
+    config.auth_scheme = xai_grok_sampler::AuthScheme::XGoogApiKey;
+    let client = Client::new(config).unwrap();
+
+    match client.api_backend() {
+        ApiBackend::GoogleAiStudio => {}
+        other => panic!("Expected GoogleAiStudio backend but got {other:?}"),
+    }
 }

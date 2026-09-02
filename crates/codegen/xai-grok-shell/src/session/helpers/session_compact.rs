@@ -826,6 +826,86 @@ pub(crate) async fn generate_session_compact(
                 itl_max_ms: timing.itl_max_ms(),
             }
         }
+        ApiBackend::GoogleAiStudio => {
+            let request = ConversationRequest {
+                model: Some(sampling_config.model.to_owned()),
+                items: chat_history.to_vec(),
+                tools,
+                tool_choice: Some(conversation_tool_choice),
+                temperature: Some(1.0),
+                x_grok_conv_id: Some(session_id.to_string()),
+                x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
+                x_grok_session_id: Some(session_id.to_string()),
+                x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+                ..Default::default()
+            };
+            let stream_result =
+                await_unless_cancelled(cancel, client.conversation_stream_google_ai_studio(request))
+                    .await?;
+            let mut stream = match stream_result {
+                Ok((s, _metadata)) => s,
+                Err(e) => return Err(classify_sampling_error(e)),
+            };
+            let mut timing = StreamTiming::new();
+            let mut truncated = false;
+            let mut stop_reason: Option<String> = None;
+            let mut content = String::new();
+            let mut last_progress_at = std::time::Instant::now();
+            loop {
+                let idle_remaining = idle_timeout.saturating_sub(last_progress_at.elapsed());
+                let chunk_result = match next_stream_step(&mut stream, idle_remaining, cancel)
+                    .await?
+                {
+                    StreamStep::Item(item) => item,
+                    StreamStep::Ended => break,
+                    StreamStep::IdleTimeout => {
+                        return Err(CompactFailure::Transient(
+                            acp::Error::internal_error().data(format!(
+                                "{COMPACT_FAILED_PREFIX}stream idle timeout after {idle_timeout:?} ({} chars received)",
+                                content.chars().count()
+                            )),
+                        ));
+                    }
+                };
+                if wall_clock_budget_secs > 0 && timing.elapsed_secs() >= wall_clock_budget_secs {
+                    return Err(CompactFailure::Transient(
+                        acp::Error::internal_error().data(format!(
+                            "{COMPACT_FAILED_PREFIX}exceeded wall-clock budget {wall_clock_budget_secs}s (runaway generation)"
+                        )),
+                    ));
+                }
+                match chunk_result {
+                    Ok(resp) => {
+                        last_progress_at = std::time::Instant::now();
+                        for candidate in resp.candidates {
+                            if let Some(finish_reason) = candidate.finish_reason {
+                                truncated = finish_reason
+                                    == xai_grok_sampling_types::google_ai_studio::FinishReason::MaxTokens;
+                                stop_reason = Some(format!("{finish_reason:?}"));
+                            }
+                            if let Some(c) = candidate.content {
+                                for part in c.parts {
+                                    if let Some(text) = part.text {
+                                        timing.record_delta();
+                                        content.push_str(&text);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => return Err(classify_sampling_error(e)),
+                }
+            }
+            CompactOutput {
+                content,
+                stop_reason,
+                truncated,
+                ttft_ms: timing.ttft_ms(),
+                stream_ms: timing.stream_ms(),
+                delta_count: timing.count,
+                itl_max_ms: timing.itl_max_ms(),
+            }
+        }
     };
     if output.content.is_empty() {
         Err(CompactFailure::Transient(
